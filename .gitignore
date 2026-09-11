@@ -36,3 +36,5 @@ venv/
 
 # Third-party tool clones (track provenance in a note, not the source)
 tools/mtkclient/
+
+tools/aoa-inject/.venv/
