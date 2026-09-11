@@ -45,3 +45,27 @@ Options (see chosen path in docs/plan.md):
    USB passthrough into a VM is itself flaky).
 3. **Keep retrying on macOS** with `--crash` (crash preloader into BROM) — low
    effort, may remain flaky.
+
+## 3b. Update: it's a short preloader window, NOT serial-driver contention
+Follow-up testing corrected the theory in #3:
+- With `--serialport DETECT`, mtkclient still fails identically, and **no
+  `/dev/cu.*` node ever appears** when the preloader shows. So the preloader is a
+  raw MediaTek bulk-USB device, not a CDC-ACM serial port — there is nothing for
+  the Apple serial driver to grab. Driver contention ruled out.
+- `--crash` also fails at the same initial-handshake step (crash needs a
+  successful handshake first, so it never engages).
+- The log shows `Preloader` then `Handshake failed after retries` repeating
+  within a single boot = the device enters preloader and boots on to Android
+  faster than the handshake completes. **The USB-download window is just too
+  short.**
+
+Conclusion: we must hold the chip in download mode. The BROM/USBDL key makes the
+preloader WAIT for the host indefinitely instead of booting on. Easiest no-plug-
+timing method (USB stays connected the whole time):
+  1. USB already plugged in; unit fully OFF.
+  2. Press and HOLD the head volume-up button.
+  3. While still holding it, briefly tap POWER to start boot.
+  4. Keep holding volume-up for ~10s. mtkclient (already polling) catches the
+     held-open download mode.
+If vol-up doesn't hold it, try vol-down, then both. If none hold on macOS, the
+remaining reliable options are the eMMC/BROM test point or a Linux host.
