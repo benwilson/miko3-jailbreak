@@ -9,7 +9,7 @@ firmware/*
 *.zip
 
 # ADB / logcat captures
-*.log
+recon/captures/*.log
 logcat-*.txt
 recon/captures/
 
