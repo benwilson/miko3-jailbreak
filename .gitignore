@@ -1,0 +1,35 @@
+# Firmware images, dumps, and partition blobs — large and often device-specific
+firmware/*
+!firmware/.gitkeep
+!firmware/README.md
+*.img
+*.bin
+*.dump
+*.tar.md5
+*.zip
+
+# ADB / logcat captures
+*.log
+logcat-*.txt
+recon/captures/
+
+# Extracted filesystems
+extracted/
+out/
+build/
+
+# Secrets: device serials, tokens, wifi creds pulled off the device
+secrets/
+*.pem
+*.key
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
