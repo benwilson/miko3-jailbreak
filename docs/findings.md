@@ -110,3 +110,56 @@ Full mgdproductions writeup retrieved off-network. Raw text + digest archived in
    nothing enumerated, lower priority until the cable is cleared.
 4. **fastboot unlock** — blocked per the writeup by a volume-up confirm that the
    head button doesn't trigger; parked.
+
+## 2026-09-11 (later) — what actually works on this unit, measured
+
+**Input path: AOAv2 HID over the existing micro-USB, no OTG adapter.**
+`scripts/aoa-inject.sh` negotiates AOA (`GET_PROTOCOL` = 2) and registers HID on
+the control endpoint. Both channels reach the display:
+
+- keyboard chords land (`meta+n` opens the shade on every attempt, before *and*
+  after the boot animation — the "only during boot animation" assumption was
+  wrong for this firmware)
+- the relative pointer is rendered (a cursor dot traces a rectangle during
+  `--wiggle`)
+- AOA gives exactly **two HID slots**. If the keyboard is registered last it
+  survives; registering the mouse afterwards is what produced the earlier
+  `Errno 32 Pipe error` wall. The scripts now register mouse first, keyboard
+  second, then confirm with an empty report.
+
+**What the UI exposes.**
+
+- Shade contents: Wi-Fi, Bluetooth, Do Not Disturb, Lock rotation, Battery,
+  Airplane mode, then "No notifications". Clock/date top-left, Wi-Fi bars
+  top-right. **There is no settings cog at all**, so the upstream
+  "pull the shade, tap the gear" step cannot be followed literally.
+- Focus walking works and is visible: `tab` lands on tiles (`tab` x3 → DND),
+  arrows move between tiles and wrap. There is one extra **unlabelled focus stop
+  under Airplane mode**; `enter` there does nothing.
+- Tiles respond to a click/`enter`. A stationary **long-press does nothing** on
+  them (tested by hand and over HID).
+- Typed characters only land when an edit field already holds focus — proved by
+  `text:develop` appearing in the "enter network name" box on the Wi-Fi page.
+  With nothing focused, keystrokes are dropped. `meta+a` does nothing (no app
+  drawer on this launcher).
+- Wi-Fi setup is not a shortcut: after connecting it lands on the "couldn't get
+  unlock code" parental-gate page.
+
+**AOA string handshake is not enough on this firmware.** `--ads AdsDebug` and
+`--ads Ace` both complete (protocol 2, strings + `START` accepted) and the unit
+immediately re-enumerates under Google's VID as PID `0x2d00`, i.e. accessory mode
+really engages — but `adb devices` stays empty and the interface triplet stays
+`ff/ff/00`. A host-side port reset (`--reset`) drops it back to PID `0x2008`
+without rebooting the unit, so no cable walk is needed between attempts.
+
+**Machine-readable success check.** Read the interface triplet instead of parsing
+`adb devices`: `scripts/aoa-inject.sh --ifaces`. Locked-down state is one
+interface `ff/ff/00`; enabling USB debugging should show `ff/42/01`. This works
+even before any RSA authorization, which `adb devices` does not. Also confirmed:
+nothing listens on TCP 5555 anywhere on the LAN while USB debugging is off, so
+there is no wireless-adb back door to aim at instead.
+
+**Boot ladder, measured.** Preloader (`MT65xx Preloader`, PID `0x2000`) is up
+~2.6 s per appearance and returns several times during boot (one capture:
+t+26.4s, t+38.2s, t+54.3s). BROM is PID `0x0003`. Captures in
+`recon/captures/boot-modes-*.txt`.

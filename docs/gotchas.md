@@ -69,3 +69,21 @@ timing method (USB stays connected the whole time):
      held-open download mode.
 If vol-up doesn't hold it, try vol-down, then both. If none hold on macOS, the
 remaining reliable options are the eMMC/BROM test point or a Linux host.
+
+## 4. Only two HID slots over AOA — register the mouse BEFORE the keyboard
+With AOAv2, a second `REGISTER_HID` on the free slot makes later `SEND_HID_EVENT`
+calls on the first slot return `[Errno 32] Pipe error` until you re-register.
+Order that works: mouse/touch first, keyboard last, then confirm the keyboard with
+one empty report and fall back to keyboard-only if that confirm fails. Getting
+this wrong looks exactly like "the device ignores keystrokes".
+
+## 5. `adb devices` is the wrong success check here
+It stays empty until an RSA key is accepted, so a successful "USB debugging on"
+flip can look like a failure. Read the descriptor triplet instead
+(`aoa-inject.sh --ifaces`): `ff/ff/00` = debugging off, `ff/42/01` = adb present.
+`ioreg` also keeps listing the unit after libusb stops seeing it in accessory
+mode, so use ioreg for presence and libusb for I/O.
+
+## 6. AdsDebug/Ace accessory strings engage accessory mode but do not enable adb
+Expected from AOSP notes, measured here on Android 9: PID flips to `0x2d00`, adb
+still absent. Do not spend more cycles on it; the UI route or BROM is the way.

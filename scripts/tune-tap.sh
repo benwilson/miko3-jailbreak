@@ -3,10 +3,10 @@
 # tune-tap.sh — find which injected burst actually reaches Developer options, with
 # no human watching the display.
 #
-# The trick is that the check does not need eyes. Enabling USB debugging makes
-# Android re-compute its USB configuration, so the composite re-enumerates: the
-# interface count under the device goes up and `adb devices` stops being empty.
-# That is observable from the host alone, so each candidate burst can score itself.
+# The trick is that the check does not need eyes. Enabling USB debugging changes the
+# interface descriptors the composite exposes: the plain kiosk gadget is a single
+# FF/FF/00 vendor interface, and adb shows up as FF/42/01. Reading that triplet from
+# the host is enough to score each candidate burst without watching the display.
 #
 # Usage:        scripts/tune-tap.sh [settle_seconds]
 # Example:      scripts/tune-tap.sh 4
@@ -22,14 +22,15 @@ mkdir -p "$here/recon/captures"
 
 inj=("$here/scripts/aoa-inject.sh")
 
-iface_count() {
-  ioreg -p IOUSB -w0 -l -r -n MIKO3 2>/dev/null | grep -c '+-o'
+iface_state() {
+  "$here/scripts/aoa-inject.sh" --ifaces 2>/dev/null | tail -n +2 \
+    | sed -E 's/.*: //' | paste -sd, -
 }
 
 state() {
   local adb_ifaces
   adb_ifaces="$(adb devices 2>/dev/null | sed -n '2,$p' | grep -c . )"
-  printf 'ifaces=%s adb=%s' "$(iface_count)" "${adb_ifaces:-0}"
+  printf 'ifaces=%s adb=%s' "$(iface_state)" "${adb_ifaces:-0}"
 }
 
 say() { printf '%s\n' "$*" | tee -a "$log"; }

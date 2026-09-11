@@ -303,8 +303,8 @@ def parse_step(step):
         return kind, val
     if step in ("click", "re-reg"):
         return step, ""
-    if step in ("click", "re-reg"):
-        return step, ""
+    if step.startswith("hold:"):
+        return "hold", step[len("hold:") :]
     if step.startswith("move:"):
         return "move", step[len("move:"):]
     if step.startswith("nudge:"):
@@ -323,6 +323,9 @@ def run_step(dev, step, mouse_ok=True):
     elif kind == "swipe":
         if mouse_ok:
             do_swipe(dev, val)
+    elif kind == "hold":
+        if mouse_ok:
+            mouse_longpress(dev, float(val) if val else 1.5)
     elif kind == "click":
         if mouse_ok:
             do_click(dev)
@@ -508,6 +511,14 @@ def main():
     ap.add_argument("--interval-ms", type=int, default=50, help="poll/resend interval (default 50)")
     ap.add_argument("--duration", type=int, default=180, help="seconds to keep polling (default 180)")
     ap.add_argument("--probe", action="store_true", help="only negotiate AOA + print protocol; send NO keys")
+    ap.add_argument("--reset", action="store_true",
+                    help="force a fresh enumeration from the host side (this unit restarts "
+                         "Android on a port reset, which is exactly what is needed to pick up "
+                         "a just-enabled adb interface without walking to the cable)")
+    ap.add_argument("--ifaces", action="store_true",
+                    help="print each interface's class/subclass/protocol and exit — this is the "
+                         "machine-readable read-out of whether USB debugging is on "
+                         "(adb shows up as FF/42/01)")
     ap.add_argument("--once", action="store_true", help="send the chord exactly ONCE (clean press+release), then exit")
     ap.add_argument("--mouse-longpress", type=float, default=None, metavar="SEC",
                     help="do ONE clean left-button long-press (this many seconds) at the current cursor position, then exit")
@@ -571,6 +582,41 @@ def main():
     release = bytes(8)
 
     # AOA string handshake: the non-keystroke route to a live adbd.
+    # Descriptor read-out: the adb interface is FF/42/01, the plain kiosk gadget is
+    # FF/FF/00. Cheaper and more reliable than `adb devices`, because it does not
+    # depend on an RSA authorization already having happened.
+    if args.reset:
+        dev = find_target(vid, pid)
+        if dev is None:
+            print("no device on bus")
+            return
+        try:
+            dev.reset()
+            print(f"port reset sent ({ioreg_state()})")
+        except usb.core.USBError as e:
+            print(f"reset failed: {e}")
+        return
+
+    if args.ifaces:
+        dev = find_target(vid, pid)
+        if dev is None:
+            print("no device on bus")
+            return
+        try:
+            cfg = dev.get_active_configuration()
+        except usb.core.USBError:
+            try:
+                dev.set_configuration()
+                cfg = dev.get_active_configuration()
+            except usb.core.USBError as e:
+                print(f"could not read configuration: {e}")
+                return
+        print(f"PID={hex(dev.idProduct)} configs={dev.bNumConfigurations}")
+        for intf in cfg:
+            print(f"  iface {intf.bInterfaceNumber}: "
+                  f"{intf.bInterfaceClass:02x}/{intf.bInterfaceSubClass:02x}/{intf.bInterfaceProtocol:02x}")
+        return
+
     if args.ads:
         print(f"[aoa] AOA strings handshake with Model={args.ads!r}")
         deadline = time.time() + 20
@@ -588,6 +634,17 @@ def main():
             try:
                 aoa_strings(dev, args.ads)
                 print(f"[aoa] strings + START sent (proto={proto})")
+                # Give the framework a moment to act on the strings on its own before
+                # forcing anything — an immediate reset can cut the ADB-enable path short.
+                for attempt in range(1, 6):
+                    time.sleep(2 * attempt)
+                    out = shell(["adb", "devices"])
+                    line = " | ".join(x for x in out.splitlines()
+                                       if x and "List of" not in x) or "empty"
+                    print(f"[aoa] adb devices: {line}; on bus: {ioreg_state()}")
+                    if line != "empty":
+                        print("[aoa] adb is up")
+                        return
                 try:
                     dev.reset()
                     print("[aoa] host-side USB reset sent so the new config takes effect")
