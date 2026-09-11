@@ -19,7 +19,13 @@ usb_line(){ ioreg -p IOUSB -w0 -l 2>/dev/null | grep -iE '"idVendor"|"idProduct"
 echo "=== MIKO detect @ $(date -u +%FT%TZ) ==="
 
 # MediaTek device present?
-mtk="$(ioreg -p IOUSB -w0 -l 2>/dev/null | grep -B2 -A2 '"idVendor" = 3725' || true)"
+# One ioreg record per USB device: split the tree on "+-o " and keep the record
+# that carries MediaTek's VID. Using -r -n MIKO3 alone is not enough, because in
+# preloader/BROM mode the product name is not "MIKO3".
+mtk="$(ioreg -p IOUSB -w0 -l 2>/dev/null | awk 'BEGIN{RS="\\+-o "} /"idVendor" = 3725/ {
+  match($0, /"idProduct" = [0-9]+/);  pid = substr($0, RSTART, RLENGTH);
+  match($0, /"USB Product Name" = "[^"]*"/); nm = substr($0, RSTART, RLENGTH);
+  split($0, a, "\n"); print a[1]; print pid; print nm }')"
 if [ -n "$mtk" ]; then
   pid_dec="$(printf '%s' "$mtk" | grep '"idProduct"' | head -1 | grep -oE '[0-9]+')"
   pid="$(hex "${pid_dec:-0}")"
@@ -28,7 +34,8 @@ if [ -n "$mtk" ]; then
   case "$pid" in
     0x0003) echo "  -> MODE: BROM (boot ROM). mtkclient can talk directly. BEST for locked units." ;;
     0x2000|0x2001|0x2003) echo "  -> MODE: PRELOADER. mtkclient can talk (may need matching DA)." ;;
-    0x2008) echo "  -> MODE: normal Android USB gadget (vendor iface). NOT a mtkclient mode." ;;
+    0x2008) echo "  -> MODE: normal Android gadget (vendor iface 255/255/0, no adb iface)."
+            echo "     Inject the Settings ladder over AOA HID: ./scripts/aoa-inject.sh --ladder" ;;
     *)      echo "  -> MODE: unknown MediaTek PID ${pid}; try mtkclient anyway." ;;
   esac
 else

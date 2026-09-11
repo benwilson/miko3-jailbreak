@@ -2,6 +2,22 @@
 
 ## Where we are (2026-09-11)
 
+Goal is narrow: **get adb up**, then everything else is ordinary adb work. Two
+entries exist, one per boot stage:
+
+- **Fully booted (`0x0e8d:0x2008`)** — Android's own UI, driven by injected HID
+  keystrokes over the micro USB. Enable USB debugging here. See
+  `docs/method-otg-keyboard-adb.md` for the ladder and what this unit's shade
+  actually contains.
+- **Boot ROM (`0x0e8d:0x0003`)** — reachable by holding a head/volume button while
+  plugging USB in. The ROM waits for the host, so `scripts/mtk.sh printgpt`
+  handshakes there rather than racing the preloader window.
+
+`scripts/boot-modes.sh 60 50` logs which stage is enumerated when, at 50 ms
+resolution, into `recon/captures/boot-modes-*.txt`.
+
+Original baseline notes:
+
 Confirmed about the unit:
 - SoC: **MediaTek** (VID 0x0E8D). Normal Android enumerates as `MIKO3` / vendor
   `alps`, PID 0x2008, serial `MIKO3250XXM3Q0636CB`.

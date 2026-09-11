@@ -56,7 +56,47 @@ notification shade, which is what makes this work.
 this is the "hardened newer revision" behavior. Any ADB-persistence approach must
 neutralize this watchdog, which is exactly what the boot-agent claims to do.
 
-## 2026-09-11 — AOA HID injection WORKS (no OTG adapter, no adb)
+## 2026-09-11 — what our unit's shade actually shows
+
+The upstream writeup assumes a gear icon in the bottom-right of the shade. On this
+unit it is not there. Confirmed contents of the opened shade:
+
+- top-left: the shade handle, top-right: the date, plus the Wi-Fi indicator
+- tiles: Wi-Fi, Bluetooth, Do Not Disturb (circle with a minus), Lock rotation,
+  Battery, Airplane mode
+- then "No notifications" — and **no settings cog at all**
+
+So the "pull the shade, tap the cog" step cannot be followed literally here. What
+the injections did establish:
+
+1. **Keyboard codes reach the UI.** `meta+n` opened the shade on every attempt.
+2. **Relative-pointer events appear inert.** Drag-to-expand, wheel scroll and a
+   corner click produced no visible change at all — plausible on a touch-only
+   panel that never gets a pointer. Do not build a ladder that depends on pointer
+   position or on a click landing on a specific icon.
+3. **Typed letters are dropped on the home page.** There is no focused edit field,
+   so type-to-search and Settings-search shortcuts do not apply. Keyboard-only
+   navigation (`tab`, `enter`, arrows, `pgdn`) inside the shade is the only
+   input style worth trying.
+
+### Practical consequence
+
+Because the cog is absent, the in-UI route to Developer options has to be reached
+by keyboard focus walking inside the quick-settings panel — `meta+n`, then
+`pgdn`/`down` to scroll, `tab` to focus the cog, `enter` to open it — with the
+whole chain fired as **one burst**, since the input window is only about a second
+wide (measured bursts: 891 ms and 1917 ms end to end):
+
+```bash
+scripts/aoa-inject.sh --sequence meta+n wait:300 pgdn wait:250 tab wait:200 enter
+```
+
+After flipping USB debugging, **unplug and replug the micro USB**: the accessory
+configuration is what is enumerated while AOA is driving, and the adb interface
+only shows up on the next enumeration. Verify with `scripts/miko-detect.sh`.
+
+## AOA HID injection is the input path (no OTG adapter, no adb)
+
 Confirmed on our unit: `scripts/aoa-inject.sh --chord meta+n --interval-ms 50`
 polling across a cold boot successfully **pulled the notification shade down** via
 AOAv2 HID over the control endpoint, with the Mac as USB host and NO OTG adapter

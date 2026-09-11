@@ -12,6 +12,15 @@ Why this exists (Miko 3 context):
   during the boot "slot machine" eye animation where injected input reaches the
   UI before the kiosk locks it, so we poll hard and fire repeatedly.
 
+Modes:
+  --probe            negotiate AOA, print protocol, send nothing
+  --chord META+N     single chord, resent every tick (default)
+  --once             one clean press+release, then exit
+  --sequence ...     ordered burst (chords + waits + mouse swipe/wheel/click + text)
+  --ladder           the built-in DEFAULT_LADDER burst
+  --timeline         monitor-only, ms-stamped boot-window phase capture to recon/captures
+  --mouse-longpress  one clean stationary long-press
+
 What it does each poll tick (default every 50 ms):
   1. find the target (default VID 0x0e8d = MediaTek);
   2. AOA GET_PROTOCOL (req 51) — needs >= 2 for HID;
@@ -26,6 +35,7 @@ SAFETY: --probe only negotiates AOA and prints the protocol version; it sends no
   keystrokes. Use it first to learn whether this firmware supports AOA at all.
 """
 import argparse
+import os
 import sys
 import time
 
@@ -41,7 +51,40 @@ AOA_UNREGISTER_HID    = 55
 AOA_SET_HID_REPORT_DESC = 56
 AOA_SEND_HID_EVENT    = 57
 
-HID_ID = 1
+HID_ID = 1        # keyboard
+HID_ID_MOUSE = 2  # mouse
+
+# Minimal USB HID relative-mouse report descriptor.
+# Report = [buttons, dx, dy, wheel] (4 bytes). Button bit0 = left.
+MOUSE_REPORT_DESC = bytes([
+    0x05, 0x01,  # Usage Page (Generic Desktop)
+    0x09, 0x02,  # Usage (Mouse)
+    0xA1, 0x01,  # Collection (Application)
+    0x09, 0x01,  #   Usage (Pointer)
+    0xA1, 0x00,  #   Collection (Physical)
+    0x05, 0x09,  #     Usage Page (Buttons)
+    0x19, 0x01,  #     Usage Min (1)
+    0x29, 0x03,  #     Usage Max (3)
+    0x15, 0x00,  #     Logical Min (0)
+    0x25, 0x01,  #     Logical Max (1)
+    0x95, 0x03,  #     Report Count (3)
+    0x75, 0x01,  #     Report Size (1)
+    0x81, 0x02,  #     Input (Data,Var,Abs) -> 3 button bits
+    0x95, 0x01,  #     Report Count (1)
+    0x75, 0x05,  #     Report Size (5)
+    0x81, 0x01,  #     Input (Const)        -> padding
+    0x05, 0x01,  #     Usage Page (Generic Desktop)
+    0x09, 0x30,  #     Usage (X)
+    0x09, 0x31,  #     Usage (Y)
+    0x09, 0x38,  #     Usage (Wheel)
+    0x15, 0x81,  #     Logical Min (-127)
+    0x25, 0x7F,  #     Logical Max (127)
+    0x75, 0x08,  #     Report Size (8)
+    0x95, 0x03,  #     Report Count (3)
+    0x81, 0x06,  #     Input (Data,Var,Rel) -> dx, dy, wheel
+    0xC0,        #   End Collection
+    0xC0,        # End Collection
+])
 
 # Minimal USB HID boot-keyboard report descriptor (8-byte input reports:
 # [modifiers, reserved, key1..key6]).
@@ -74,10 +117,26 @@ KBD_REPORT_DESC = bytes([
 # HID modifier bits
 MOD = {"ctrl": 0x01, "shift": 0x02, "alt": 0x04, "meta": 0x08,
        "gui": 0x08, "win": 0x08, "cmd": 0x08}
-# A few HID usage codes (US keyboard)
+# HID boot-keyboard usage codes (Usage Page 0x07, US layout). Letters, digits,
+# and the nav keys needed to walk the Settings app blind.
 KEY = {**{chr(ord('a') + i): 0x04 + i for i in range(26)},
-       "enter": 0x28, "esc": 0x29, "tab": 0x2B, "space": 0x2C,
-       "home": 0x4A, "n": 0x11}
+       **{str(i): 0x1E + i - 1 for i in range(1, 10)}, "0": 0x27,
+       "enter": 0x28, "esc": 0x29, "backspace": 0x2A, "tab": 0x2B, "space": 0x2C,
+       "-": 0x2D, "=": 0x2E, "[": 0x2F, "]": 0x30, ";": 0x33,
+       "'": 0x34, ",": 0x36, ".": 0x37, "/": 0x38,
+       "ins": 0x49, "home": 0x4A, "pgup": 0x4B, "del": 0x4C, "end": 0x4D,
+       "pgdn": 0x4E, "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,
+       "f1": 0x3A, "f2": 0x3B, "f3": 0x3C, "f4": 0x3D,
+       "n": 0x11}
+# Characters that need the Shift bit with the same usage code.
+SHIFTED = {chr(ord('A') + i): 0x04 + i for i in range(26)}
+SHIFTED.update({":": 0x33, "?": 0x38, "_": 0x2D, "+": 0x2E})
+
+# Default ladder: what to fire inside the boot window to get from a cold boot to
+# Developer options -> USB debugging, on a shade that shows NO settings gear.
+# Each step is one HID transaction; the gaps are short on purpose.
+DEFAULT_LADDER = ["meta+n", "wait:300", "swipe:down", "wait:300", "swipe:down",
+                  "wait:300", "move:right", "move:down", "wait:200", "click"]
 
 
 def parse_chord(s):
@@ -124,6 +183,192 @@ def send_report(dev, report8):
     ctrl_out(dev, AOA_SEND_HID_EVENT, value=HID_ID, index=0, data=report8)
 
 
+def register_hid_mouse(dev):
+    ctrl_out(dev, AOA_REGISTER_HID, value=HID_ID_MOUSE, index=len(MOUSE_REPORT_DESC))
+    ctrl_out(dev, AOA_SET_HID_REPORT_DESC, value=HID_ID_MOUSE, index=0, data=MOUSE_REPORT_DESC)
+
+
+def send_mouse(dev, buttons=0, dx=0, dy=0, wheel=0):
+    # signed -> unsigned byte
+    b = lambda v: v & 0xFF
+    ctrl_out(dev, AOA_SEND_HID_EVENT, value=HID_ID_MOUSE, index=0,
+             data=bytes([buttons & 0x07, b(dx), b(dy), b(wheel)]))
+
+
+def encode_char(ch):
+    """'A' -> (shift, usage). Returns None for characters we cannot encode."""
+    if ch == " ":
+        return 0, KEY["space"]
+    low = ch.lower()
+    if low in SHIFTED and ch.isupper():
+        return MOD["shift"], SHIFTED[low]
+    if low in KEY:
+        return 0, KEY[low]
+    return None
+
+
+def type_text(dev, text):
+    """Type a literal string (Settings search box, etc.)."""
+    for ch in text:
+        enc = encode_char(ch)
+        if enc is None:
+            continue
+        mods, key = enc
+        send_report(dev, bytes([mods, 0, key, 0, 0, 0, 0, 0]))
+        time.sleep(0.02)
+        send_report(dev, bytes(8))
+        time.sleep(0.02)
+
+
+def do_wheel(dev, clicks):
+    for _ in range(abs(clicks) or 1):
+        send_mouse(dev, wheel=1 if clicks >= 0 else -1)
+        time.sleep(0.03)
+        send_mouse(dev, wheel=0)
+
+
+def do_click(dev):
+    """Left click wherever the pointer currently is."""
+    send_mouse(dev, buttons=0x01)
+    time.sleep(0.04)
+    send_mouse(dev, buttons=0x00)
+
+
+def do_move(dev, direction, reps=8):
+    """Walk the pointer to an edge. Android clamps the pointer to the screen, so a
+    few max-size relative moves home it onto that edge deterministically — which is
+    what makes a blind corner-tap possible on a tiny display."""
+    for _ in range(reps):
+        if direction == "right":
+            send_mouse(dev, dx=127)
+        elif direction == "left":
+            send_mouse(dev, dx=-127)
+        elif direction == "up":
+            send_mouse(dev, dy=-127)
+        else:
+            send_mouse(dev, dy=127)
+        time.sleep(0.02)
+    send_mouse(dev)
+
+
+def do_swipe(dev, direction):
+    """Drag with the left button held — this is what EXPANDS a collapsed shade on a
+    small panel. Distance matters: Android only counts a drag past ~16 px, and a
+    single 127 px hop can be read as a fling, so the travel is spread over several
+    smaller held steps."""
+    step = 50 if direction == "down" else -50
+    send_mouse(dev, buttons=0x01)
+    time.sleep(0.03)
+    for _ in range(4):
+        send_mouse(dev, buttons=0x01, dy=step)
+        time.sleep(0.03)
+    send_mouse(dev, buttons=0x00)
+
+
+def parse_step(step):
+    """'wheel:down' / 'click' / 'meta+n' / 'text:developer' -> (kind, payload)."""
+    if ":" in step:
+        kind, _, val = step.partition(":")
+        return kind, val
+    if step in ("click", "re-reg"):
+        return step, ""
+    if step in ("click", "re-reg"):
+        return step, ""
+    if step.startswith("move:"):
+        return "move", step[len("move:"):]
+    return "chord", step
+
+
+def run_step(dev, step, mouse_ok=True):
+    kind, val = parse_step(step)
+    if kind == "wait":
+        time.sleep(int(val) / 1000)
+    elif kind == "wheel":
+        clicks = {"down": -3, "up": 3}.get(val, 3)
+        if mouse_ok:
+            do_wheel(dev, clicks)
+    elif kind == "swipe":
+        if mouse_ok:
+            do_swipe(dev, val)
+    elif kind == "click":
+        if mouse_ok:
+            do_click(dev)
+    elif kind == "move":
+        direction, _, reps = val.partition(":")
+        do_move(dev, direction, int(reps) if reps else 8)
+    elif kind == "text":
+        type_text(dev, val)
+    elif kind == "re-reg":
+        return register_both(dev)
+    elif kind == "chord":
+        mods, key = parse_chord(val)
+        send_report(dev, bytes([mods, 0, key, 0, 0, 0, 0, 0]))
+        time.sleep(0.03)
+        send_report(dev, bytes(8))
+    else:
+        raise SystemExit(f"unknown step kind: {kind!r} (in step {step!r})")
+    return mouse_ok
+
+
+def find_target(vid, pid):
+    kw = {"idVendor": vid}
+    if pid is not None:
+        kw["idProduct"] = pid
+    return usb.core.find(**kw)
+
+
+def aoa_ready(dev):
+    """Protocol version if this dev is AOA v2+ capable, else None."""
+    proto = aoa_protocol(dev)
+    if not proto or proto < 2:
+        return None
+    return proto
+
+
+def confirm_kbd(dev):
+    """Touch the keyboard HID with an empty report; raises USBError when the
+    firmware stopped routing reports for it."""
+    send_report(dev, bytes(8))
+    time.sleep(0.02)
+
+
+def register_both(dev):
+    """Register the HIDs needed for a burst; return True if mouse steps are usable.
+
+    AOA v2 allows exactly TWO HID devices (keyboard=1, mouse=2), but plenty of
+    firmware keeps only the LAST registered one alive. So register the mouse
+    FIRST and the keyboard LAST, confirm the keyboard still answers, and fall
+    back to keyboard-only when it does not. Registering once per burst also
+    matters: re-registering mid-burst resets the pointer and drops focus."""
+    try:
+        register_hid_mouse(dev)
+        register_hid(dev)
+        confirm_kbd(dev)
+        return True
+    except usb.core.USBError:
+        pass
+    try:
+        ctrl_out(dev, AOA_UNREGISTER_HID, value=HID_ID_MOUSE)
+    except usb.core.USBError:
+        pass
+    try:
+        register_hid(dev)
+        confirm_kbd(dev)
+    except usb.core.USBError:
+        return False
+    return False
+
+
+def mouse_longpress(dev, hold_s):
+    """Clean long-press at the CURRENT cursor position: button-down, hold, up.
+    Sends zero movement so Android reads it as a stationary long-press."""
+    register_hid_mouse(dev)
+    time.sleep(0.05)
+    send_mouse(dev, buttons=0x01, dx=0, dy=0)   # left button DOWN
+    time.sleep(hold_s)
+    send_mouse(dev, buttons=0x00, dx=0, dy=0)   # release
+
+
 def main():
     ap = argparse.ArgumentParser(description="AOA HID keystroke injector with boot-window polling")
     ap.add_argument("--vid", default="0x0e8d", help="target USB VID (default 0x0e8d MediaTek)")
@@ -132,14 +377,202 @@ def main():
     ap.add_argument("--interval-ms", type=int, default=50, help="poll/resend interval (default 50)")
     ap.add_argument("--duration", type=int, default=180, help="seconds to keep polling (default 180)")
     ap.add_argument("--probe", action="store_true", help="only negotiate AOA + print protocol; send NO keys")
+    ap.add_argument("--once", action="store_true", help="send the chord exactly ONCE (clean press+release), then exit")
+    ap.add_argument("--mouse-longpress", type=float, default=None, metavar="SEC",
+                    help="do ONE clean left-button long-press (this many seconds) at the current cursor position, then exit")
     ap.add_argument("--verbose", action="store_true", help="log every tick")
+    ap.add_argument("--sequence", nargs="+", metavar="STEP", default=None,
+                    help="fire an ordered burst of steps in one pass, e.g. "
+                         "--sequence meta+n wait:250 swipe:down tab enter "
+                         "(kinds: chord | wait:MS | wheel:down|up | swipe:down|up | "
+                         "click | text:str | re-reg)")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="how many times to run the --sequence burst (default 1)")
+    ap.add_argument("--cycle-ms", type=int, default=1500,
+                    help="gap between --sequence bursts (default 1500)")
+    ap.add_argument("--step", default=None, metavar="STEP",
+                    help="fire exactly ONE step, then exit — use this to walk the ladder "
+                         "one press at a time and watch the display between presses")
+    ap.add_argument("--ladder", action="store_true",
+                    help="run the built-in DEFAULT_LADDER burst")
+    ap.add_argument("--list-chords", action="store_true",
+                    help="print the chord/step ladder with what each is for; sends nothing")
+    ap.add_argument("--timeline", action="store_true",
+                    help="monitor-only: log ms-stamped boot-window state transitions, send no keys")
+    ap.add_argument("--out-dir", default="recon/captures",
+                    help="where --timeline writes its capture (default recon/captures)")
     args = ap.parse_args()
+
+    if args.list_chords:
+        print("Chord / step ladder (fire inside the boot window, most reliable first):")
+        for step in DEFAULT_LADDER:
+            print(f"  {step}")
+        print("\nOther chords worth a slot, by what they are supposed to reach:")
+        for line in [
+            "meta+n        notification shade (confirmed on this unit)",
+            "meta+shift+n  second shade pass — some builds only reveal the gear here",
+            "swipe:down    expand a collapsed shade; the gear is often below the fold",
+            "move:right / move:down   home the pointer to the bottom-right corner (AOSP puts the", 
+            "                          Settings cog there in the EXPANDED quick-settings panel)",
+            "tab / enter   walk QS focus to the gear, then open Settings",
+            "down / enter  same idea with arrow focus instead of Tab",
+            "esc           dismiss a blocking dialog; also collapses the shade",
+            "home          fall back to the launcher if a dialog ate the input",
+            "text:set        only lands if some view already holds an edit-field focus — on this",
+            "                unit's home page typed letters are dropped, so never rely on it",
+        ]:
+            print("  " + line)
+        return
 
     vid = int(args.vid, 0)
     pid = int(args.pid, 0) if args.pid else None
     mods, key = parse_chord(args.chord)
     press = bytes([mods, 0, key, 0, 0, 0, 0, 0])
     release = bytes(8)
+
+    # Burst mode: the whole path in one pass, so a short boot window is enough.
+    if args.sequence or args.ladder or args.step:
+        steps = args.sequence or ([args.step] if args.step else DEFAULT_LADDER)
+        print(f"[aoa] burst of {len(steps)} steps x{args.repeat}, "
+              f"interval={args.interval_ms}ms, cycle gap={args.cycle_ms}ms")
+        print("[aoa] polling — power-cycle / boot the device now; Ctrl-C to stop")
+        deadline = time.time() + args.duration
+        registered_for = None
+        mouse_ok = False
+        cycles = 0
+        while time.time() < deadline and cycles < args.repeat:
+            dev = find_target(vid, pid)
+            if dev is None:
+                print("[aoa] waiting for device...")
+                time.sleep(args.interval_ms / 1000)
+                continue
+            proto = aoa_ready(dev)
+            if proto is None:
+                print("[aoa] device present, AOA not ready yet")
+                time.sleep(args.interval_ms / 1000)
+                continue
+            try:
+                if registered_for != id(dev):
+                    mouse_ok = register_both(dev)
+                    registered_for = id(dev)
+                    print(f"[aoa] HID registered (proto={proto}, mouse={'yes' if mouse_ok else 'no'})")
+                t0 = time.time()
+                for step in steps:
+                    mouse_ok = run_step(dev, step, mouse_ok)
+                cycles += 1
+                print(f"[aoa] burst {cycles} done in {(time.time() - t0) * 1000:.0f}ms: "
+                      + " ".join(steps))
+            except usb.core.USBError as e:
+                print(f"[aoa] USBError mid-burst (re-registering): {e}")
+                registered_for = None
+            time.sleep(args.cycle_ms / 1000)
+        if not cycles:
+            print("[aoa] gave up: never saw an AOA-ready device in the window")
+            sys.exit(1)
+        return
+
+    # Monitor-only mode: document how wide the input window actually is.
+    if args.timeline:
+        os.makedirs(args.out_dir, exist_ok=True)
+        out = os.path.join(args.out_dir,
+                           f"boot-window-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.txt")
+        print(f"[aoa] timeline monitor, {args.interval_ms}ms polling -> {out}")
+        print("[aoa] power-cycle the unit now")
+        fh = open(out, "w")
+        phases = {}
+        t_start = time.time()
+        deadline = t_start + args.duration
+        last = None
+        sends = 0
+        try:
+            while time.time() < deadline:
+                now = time.time()
+                t_ms = int((now - t_start) * 1000)
+                dev = find_target(vid, pid)
+                if dev is None:
+                    state = "absent"
+                    extra = f"PID={'-' if pid is None else hex(pid)}"
+                else:
+                    proto = aoa_ready(dev)
+                    if proto is None:
+                        state = "present-no-aoa"
+                        extra = f"PID={hex(dev.idProduct)}"
+                    else:
+                        state = "aoa-ready"
+                        extra = f"PID={hex(dev.idProduct)} proto={proto}"
+                        try:
+                            register_both(dev)
+                            send_report(dev, bytes(8))
+                            sends += 1
+                            state = "hid-accepted"
+                        except usb.core.USBError as e:
+                            state = "hid-rejected"
+                            extra += f" err={e}"
+                if state != last:
+                    phases.setdefault(state, t_ms)
+                    line = f"t+{t_ms:>6}ms  {state}  {extra}"
+                    print(line)
+                    fh.write(line + "\n")
+                    fh.flush()
+                    last = state
+                time.sleep(args.interval_ms / 1000)
+        finally:
+            first = min(phases.values()) if phases else 0
+            widths = {k: v - first for k, v in phases.items()}
+            summary = (f"[aoa] window summary: first AOA-ready at t+{phases.get('aoa-ready', -1)}ms, "
+                       f"reports accepted={sends}, phase offsets={widths}")
+            print(summary)
+            fh.write(summary + "\n")
+            fh.close()
+        return
+
+    # One-shot mouse long-press mode (positions come from wherever the cursor already is).
+    if args.mouse_longpress is not None:
+        print(f"[aoa] mouse long-press {args.mouse_longpress}s at current cursor position")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            kw = {"idVendor": vid}
+            if pid is not None:
+                kw["idProduct"] = pid
+            dev = usb.core.find(**kw)
+            if dev is None:
+                print("[aoa] waiting for device..."); time.sleep(0.2); continue
+            proto = aoa_protocol(dev)
+            if not proto or proto < 2:
+                print(f"[aoa] AOA not ready (proto={proto})"); time.sleep(0.2); continue
+            try:
+                mouse_longpress(dev, args.mouse_longpress)
+                print("[aoa] long-press sent (down -> hold -> up)")
+                return
+            except usb.core.USBError as e:
+                print(f"[aoa] USBError during long-press: {e}"); time.sleep(0.2)
+        print("[aoa] gave up waiting for device"); sys.exit(1)
+
+    # One-shot single keystroke.
+    if args.once:
+        print(f"[aoa] one-shot chord {args.chord!r}")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            kw = {"idVendor": vid}
+            if pid is not None:
+                kw["idProduct"] = pid
+            dev = usb.core.find(**kw)
+            if dev is None:
+                time.sleep(0.2); continue
+            proto = aoa_protocol(dev)
+            if not proto or proto < 2:
+                time.sleep(0.2); continue
+            try:
+                register_hid(dev)
+                time.sleep(0.05)
+                send_report(dev, press)
+                time.sleep(0.03)
+                send_report(dev, release)
+                print("[aoa] chord sent once")
+                return
+            except usb.core.USBError as e:
+                print(f"[aoa] USBError: {e}"); time.sleep(0.2)
+        print("[aoa] gave up waiting for device"); sys.exit(1)
 
     print(f"[aoa] target VID={hex(vid)} PID={hex(pid) if pid else 'any'} chord={args.chord!r} "
           f"({'PROBE only' if args.probe else 'INJECT'}) interval={args.interval_ms}ms duration={args.duration}s")
