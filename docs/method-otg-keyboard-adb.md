@@ -70,22 +70,53 @@ So the "pull the shade, tap the cog" step cannot be followed literally here. Wha
 the injections did establish:
 
 1. **Keyboard codes reach the UI.** `meta+n` opened the shade on every attempt.
-2. **Relative-pointer events appear inert.** Drag-to-expand, wheel scroll and a
-   corner click produced no visible change at all — plausible on a touch-only
-   panel that never gets a pointer. Do not build a ladder that depends on pointer
-   position or on a click landing on a specific icon.
+2. **The pointer is rendered.** A 2-second `--wiggle` shows a cursor dot tracing a
+   rectangle, so pointer input does reach this display. A click outside the panel
+   dismisses it, which is why a click in the extreme corner looks like "nothing
+   happened" — inset from the homed edge before clicking.
 3. **Typed letters are dropped on the home page.** There is no focused edit field,
-   so type-to-search and Settings-search shortcuts do not apply. Keyboard-only
-   navigation (`tab`, `enter`, arrows, `pgdn`) inside the shade is the only
-   input style worth trying.
+   so type-to-search and Settings-search shortcuts do not apply.
 
-### Practical consequence
+### Input channels confirmed on this unit
 
-Because the cog is absent, the in-UI route to Developer options has to be reached
-by keyboard focus walking inside the quick-settings panel — `meta+n`, then
-`pgdn`/`down` to scroll, `tab` to focus the cog, `enter` to open it — with the
-whole chain fired as **one burst**, since the input window is only about a second
-wide (measured bursts: 891 ms and 1917 ms end to end):
+| Channel | Result |
+|---------|--------|
+| Keyboard codes (`meta+n`, `tab`, `enter`, arrows) | Work — the shade opens on every attempt |
+| Relative pointer (`move:*`, `click`) | Works — a cursor dot is visible and travels; a click outside the panel dismisses it |
+| Typed letters on the home page | Dropped — nothing holds an edit-field focus, so type-to-search does not apply |
+| Absolute touch (`tap:x,y`) | Descriptor registered; not yet distinguished from the relative pointer in practice |
+
+Because the pointer really is rendered, the reliable way to hit the quick-settings
+area is: home the pointer against an edge with repeated max-size moves (Android
+clamps it, so starting position stops mattering), then `nudge:0,-40` to get inside
+the panel, then `click`. Clicking the extreme corner dismisses the panel instead.
+
+## AOA strings handshake — the shorter route to adb
+
+`scripts/aoa-inject.sh --ads AdsDebug` performs the full AOAv2 string handshake
+(`GET_PROTOCOL`, four `SEND_STRING`s, `START`) with `Manufacturer="Android"` and
+`Model="AdsDebug"`. AOSP's `UsbDeviceManager` special-cases that Model value and
+enables adb without any UI navigation, which is why this is worth trying before
+any keystroke ladder. Observed on this unit:
+
+- protocol answered `2`, strings plus `START` accepted
+- the unit re-enumerated immediately as VID `0x18d1` PID `0x2d00` — Google's
+  accessory PID, so accessory mode did take effect
+- the accessory configuration is accessory-only, and macOS left it unclaimed: `ioreg`
+  still listed the device while pyusb stopped seeing it, and `adb devices` stayed empty
+
+So this route needs a **replug after the handshake** for the host to claim the new
+configuration — which is also when an adb interface would be added. `Ace` is the
+other special Model value (`adb` with the RSA confirmation dialog) and is worth a
+second attempt for the same reason. `scripts/miko-detect.sh` now recognises both
+VIDs and the accessory PID range, so it tells you which of these states you are in.
+
+## Reaching Developer options without the cog
+
+Because the cog is missing, the in-UI route has to be reached by focusing whatever
+the panel does expose: `meta+n`, then `pgdn`/`down` to scroll, `tab` to move focus,
+`enter` to activate — fired as **one burst**, since the input window is only about a
+second wide (measured bursts: 891 ms and 1917 ms end to end):
 
 ```bash
 scripts/aoa-inject.sh --sequence meta+n wait:300 pgdn wait:250 tab wait:200 enter

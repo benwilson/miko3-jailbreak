@@ -10,6 +10,7 @@ Repo-local helpers. All are macOS/zsh-friendly and support `-h` / `--help`.
 | `aoa-inject.sh [flags]` | AOAv2 HID injector: `--probe`, `--step`, `--sequence`, `--ladder`, `--timeline`, `--chord` | `tools/aoa-inject` venv (pyusb) |
 | `miko-detect.sh` | One-shot: is the Miko visible and in what mode (Android / ADB / fastboot / MediaTek preloader / BROM), and is anything (Chrome WebUSB) holding it | `ioreg` (built-in); `adb`/`fastboot` optional |
 | `mtk.sh [args...]` | Friendly wrapper around mtkclient: activates its venv, checks setup, forwards args (e.g. `scripts/mtk.sh printgpt`) | `tools/mtkclient` venv (see `tools/README.md`) |
+| `tune-tap.sh [settle_s]` | Try each candidate burst in turn and score it automatically — enabling USB debugging makes the unit re-enumerate, so the winner is detected without watching the screen | `ioreg`, `adb` |
 
 ## Install the optional dependencies
 
@@ -39,8 +40,10 @@ mtkclient needs the device in **preloader** or **BROM** mode, not normal Android
 | Stage | Enumeration | What works there |
 |-------|-------------|------------------|
 | BROM | `0x0e8d:0x0003`, no product string | mtkclient handshake lands here — the ROM waits for the host instead of booting on. Reach it by holding a volume/head button while plugging USB in. |
-| Preloader | `0x0e8d:0x2000`-family, very brief | Detected on every boot, handshake usually misses because the window is so short |
+| Preloader | `MT65xx Preloader`, `0x0e8d:0x2000` | Detected on every boot. Measured width: about **2.6 s per appearance**, and it comes back several times in the first minute (one run: t+26.4s, t+38.2s, t+54.3s) — not one sub-second blip, so start the poller before powering on and it gets several attempts per boot |
 | Android | `MIKO3 / alps`, `0x0e8d:0x2008`, one interface 255/255/0 | AOA HID keystrokes (`aoa-inject.sh`); no adb interface is offered |
+| Accessory | `MIKO3`, `0x18d1:0x2d00` | Reached by the AOAv2 strings handshake (`--ads AdsDebug`). Accessory-only config, so macOS may leave it unclaimed — replug to get a usable handle |
 
 `scripts/boot-modes.sh 60 50` records those transitions with ms timestamps in
-`recon/captures/boot-modes-*.txt`.
+`recon/captures/boot-modes-*.txt`. Both it and `miko-detect.sh` match VID `0x0e8d`
+**and** `0x18d1`, since the unit changes VID between these stages.

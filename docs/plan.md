@@ -16,6 +16,21 @@ entries exist, one per boot stage:
 `scripts/boot-modes.sh 60 50` logs which stage is enumerated when, at 50 ms
 resolution, into `recon/captures/boot-modes-*.txt`.
 
+### Route order (current)
+
+1. `scripts/aoa-inject.sh --ads AdsDebug` — AOAv2 strings handshake. No UI
+   navigation, works in the booted stage, and the accessory switch was observed to
+   take effect immediately. Needs a replug afterwards for the host to claim the new
+   configuration.
+2. **BROM (`0x0e8d:0x0003`)** by holding a head/volume button while plugging USB in,
+   with `scripts/mtk.sh` already polling. The ROM waits for the host, so there is no
+   race.
+3. Keystroke ladder in the booted stage — the fallback if the first two stay stuck.
+
+The preloader window is wider than first assumed: about **2.6 s per appearance**,
+recurring several times during boot (see `scripts/README.md`), which is why
+"poll before powering on" is worth one honest attempt before reaching for hardware.
+
 Original baseline notes:
 
 Confirmed about the unit:

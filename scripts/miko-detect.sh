@@ -20,20 +20,31 @@ echo "=== MIKO detect @ $(date -u +%FT%TZ) ==="
 
 # MediaTek device present?
 # One ioreg record per USB device: split the tree on "+-o " and keep the record
-# that carries MediaTek's VID. Using -r -n MIKO3 alone is not enough, because in
-# preloader/BROM mode the product name is not "MIKO3".
-mtk="$(ioreg -p IOUSB -w0 -l 2>/dev/null | awk 'BEGIN{RS="\\+-o "} /"idVendor" = 3725/ {
+# that belongs to the unit. Match on either VID the firmware uses — 0x0e8d MediaTek
+# in normal/bootloader stages, 0x18d1 Google once AOA accessory mode is active — or
+# on the product string, since -r -n MIKO3 alone misses the unnamed preloader node.
+mtk="$(ioreg -p IOUSB -w0 -l 2>/dev/null | awk 'BEGIN{RS="\\+-o "} /"idVendor" = 3725|"idVendor" = 6353/ {
   match($0, /"idProduct" = [0-9]+/);  pid = substr($0, RSTART, RLENGTH);
   match($0, /"USB Product Name" = "[^"]*"/); nm = substr($0, RSTART, RLENGTH);
-  split($0, a, "\n"); print a[1]; print pid; print nm }')"
+  match($0, /"idVendor" = [0-9]+/);   vid = substr($0, RSTART, RLENGTH);
+  gsub(/.*= /, "", pid); gsub(/.*= /, "", vid);
+  gsub(/.*= "/, "", nm); gsub(/".*/, "", nm);
+  print "\"idProduct\" = " pid;
+  print "\"idVendor\" = " vid;
+  print "\"USB Product Name\" = \"" nm "\"" }')"
 if [ -n "$mtk" ]; then
   pid_dec="$(printf '%s' "$mtk" | grep '"idProduct"' | head -1 | grep -oE '[0-9]+')"
   pid="$(hex "${pid_dec:-0}")"
   name="$(printf '%s' "$mtk" | grep '"USB Product Name"' | head -1 | sed -E 's/.*= "?([^"]*)"?/\1/')"
-  echo "MediaTek device present: name='${name:-?}' VID=0x0e8d PID=${pid}"
+  echo "MediaTek/Google VID device present: name='${name:-?}' VID=$(printf '%s' "$mtk" | grep '"idVendor"' | head -1 | grep -oE '[0-9]+') PID=${pid}"
   case "$pid" in
     0x0003) echo "  -> MODE: BROM (boot ROM). mtkclient can talk directly. BEST for locked units." ;;
     0x2000|0x2001|0x2003) echo "  -> MODE: PRELOADER. mtkclient can talk (may need matching DA)." ;;
+    0x2d00|0x2d01|0x2d02|0x2d03|0x2d04|0x2d05)
+            echo "  -> MODE: AOA accessory. Strings handshake took effect; config is accessory-only."
+            echo "     Replug the micro USB so the host claims the new config, then check adb." ;;
+    0x4e11|0x4e12|0x4e21|0x4e22|0x4e23|0x4e24)
+            echo "  -> MODE: adb interface present. adb should list the unit now." ;;
     0x2008) echo "  -> MODE: normal Android gadget (vendor iface 255/255/0, no adb iface)."
             echo "     Inject the Settings ladder over AOA HID: ./scripts/aoa-inject.sh --ladder" ;;
     *)      echo "  -> MODE: unknown MediaTek PID ${pid}; try mtkclient anyway." ;;

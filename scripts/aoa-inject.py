@@ -114,9 +114,40 @@ KBD_REPORT_DESC = bytes([
     0xC0,        # End Collection
 ])
 
+# Minimal USB HID touchscreen (digitizer) report descriptor with ABSOLUTE
+# coordinates: report = [tip-switch, x, y] on a 0..255 grid that Android scales to
+# the panel. Absolute positioning is what makes a blind tap land on a specific
+# glyph of a 320-ish px display; a relative mouse cannot be homed reliably.
+#   report = [tip-switch, x, y] on a 0..255 grid that Android scales to the panel.
+TOUCH_REPORT_DESC = bytes([
+    0x05, 0x0D,  # Usage Page (Digitizer)
+    0x09, 0x04,  # Usage (Touch Screen)
+    0xA1, 0x01,  # Collection (Application)
+    0x05, 0x0D,  #   Usage Page (Digitizer)
+    0x09, 0x42,  #   Usage (Tip Switch)
+    0x15, 0x00,  #   Logical Min (0)
+    0x25, 0x01,  #   Logical Max (1)
+    0x75, 0x01,  #   Report Size (1)
+    0x95, 0x01,  #   Report Count (1)
+    0x81, 0x02,  #   Input (Data,Var,Abs)   -> tip switch bit
+    0x95, 0x07,  #   Report Count (7)
+    0x75, 0x01,  #   Report Size (1)
+    0x81, 0x03,  #   Input (Const)          -> pad to a whole byte
+    0x05, 0x01,  #   Usage Page (Generic Desktop)
+    0x09, 0x30,  #   Usage (X)
+    0x09, 0x31,  #   Usage (Y)
+    0x15, 0x00,  #   Logical Min (0)
+    0x25, 0xFF,  #   Logical Max (255)
+    0x75, 0x08,  #   Report Size (8)
+    0x95, 0x02,  #   Report Count (2)
+    0x81, 0x02,  #   Input (Data,Var,Abs)   -> absolute X, Y
+    0xC0,        # End Collection
+])
+
 # HID modifier bits
 MOD = {"ctrl": 0x01, "shift": 0x02, "alt": 0x04, "meta": 0x08,
        "gui": 0x08, "win": 0x08, "cmd": 0x08}
+HID_ID_TOUCH = HID_ID_MOUSE  # AOA v2 gives us exactly two slots: keyboard + one pointer/touch
 # HID boot-keyboard usage codes (Usage Page 0x07, US layout). Letters, digits,
 # and the nav keys needed to walk the Settings app blind.
 KEY = {**{chr(ord('a') + i): 0x04 + i for i in range(26)},
@@ -135,8 +166,8 @@ SHIFTED.update({":": 0x33, "?": 0x38, "_": 0x2D, "+": 0x2E})
 # Default ladder: what to fire inside the boot window to get from a cold boot to
 # Developer options -> USB debugging, on a shade that shows NO settings gear.
 # Each step is one HID transaction; the gaps are short on purpose.
-DEFAULT_LADDER = ["meta+n", "wait:300", "swipe:down", "wait:300", "swipe:down",
-                  "wait:300", "move:right", "move:down", "wait:200", "click"]
+DEFAULT_LADDER = ["meta+n", "wait:350", "move:right", "move:down",
+                  "nudge:0,-40", "wait:150", "click"]
 
 
 def parse_chord(s):
@@ -276,6 +307,8 @@ def parse_step(step):
         return step, ""
     if step.startswith("move:"):
         return "move", step[len("move:"):]
+    if step.startswith("nudge:"):
+        return "nudge", step[len("nudge:"):]
     return "chord", step
 
 
@@ -296,6 +329,16 @@ def run_step(dev, step, mouse_ok=True):
     elif kind == "move":
         direction, _, reps = val.partition(":")
         do_move(dev, direction, int(reps) if reps else 8)
+    elif kind == "nudge":
+        xs, _, ys = val.partition(",")
+        if not ys:
+            raise SystemExit(f"nudge needs dx,dy — got {val!r}")
+        nudge(dev, int(xs), int(ys))
+    elif kind == "tap":
+        xs, _, ys = val.partition(",")
+        if not ys:
+            raise SystemExit(f"tap needs x,y — got {val!r}")
+        tap(dev, int(xs), int(ys))
     elif kind == "text":
         type_text(dev, val)
     elif kind == "re-reg":
@@ -311,10 +354,18 @@ def run_step(dev, step, mouse_ok=True):
 
 
 def find_target(vid, pid):
-    kw = {"idVendor": vid}
-    if pid is not None:
-        kw["idProduct"] = pid
-    return usb.core.find(**kw)
+    """Look up the unit. The firmware uses VID 0x0e8d normally and 0x18d1 once AOA
+    accessory mode is active, so fall through to the other VID before giving up."""
+    def _one(v):
+        kw = {"idVendor": v}
+        if pid is not None:
+            kw["idProduct"] = pid
+        return usb.core.find(**kw)
+
+    dev = _one(vid)
+    if dev is None and vid == 0x0E8D:
+        dev = _one(0x18D1)
+    return dev
 
 
 def aoa_ready(dev):
@@ -332,23 +383,28 @@ def confirm_kbd(dev):
     time.sleep(0.02)
 
 
-def register_both(dev):
-    """Register the HIDs needed for a burst; return True if mouse steps are usable.
+def register_both(dev, second="mouse"):
+    """Register the pointer/touch HID FIRST and the keyboard LAST; return whether
+    the second device is usable.
 
-    AOA v2 allows exactly TWO HID devices (keyboard=1, mouse=2), but plenty of
-    firmware keeps only the LAST registered one alive. So register the mouse
-    FIRST and the keyboard LAST, confirm the keyboard still answers, and fall
-    back to keyboard-only when it does not. Registering once per burst also
-    matters: re-registering mid-burst resets the pointer and drops focus."""
+    AOA v2 allows exactly TWO HID devices (keyboard=1, pointer/touch=2), but plenty
+    of firmware keeps only the LAST registered one alive. So register the pointer
+    first, confirm the keyboard still answers, and fall back to keyboard-only.
+    Registering once per burst also matters: re-registering mid-burst resets the
+    pointer and drops focus.
+    """
+    def _second(d):
+        register_touch(d) if second == "touch" else register_hid_mouse(d)
+
     try:
-        register_hid_mouse(dev)
+        _second(dev)
         register_hid(dev)
         confirm_kbd(dev)
         return True
     except usb.core.USBError:
         pass
     try:
-        ctrl_out(dev, AOA_UNREGISTER_HID, value=HID_ID_MOUSE)
+        ctrl_out(dev, AOA_UNREGISTER_HID, value=HID_ID_TOUCH)
     except usb.core.USBError:
         pass
     try:
@@ -357,6 +413,81 @@ def register_both(dev):
     except usb.core.USBError:
         return False
     return False
+
+
+def register_touch(dev):
+    ctrl_out(dev, AOA_REGISTER_HID, value=HID_ID_TOUCH, index=len(TOUCH_REPORT_DESC))
+    ctrl_out(dev, AOA_SET_HID_REPORT_DESC, value=HID_ID_TOUCH, index=0, data=TOUCH_REPORT_DESC)
+
+
+def send_touch(dev, x=255, y=255, tip=1):
+    """Absolute tap on a 0..255 grid — 255,255 is the bottom-right corner."""
+    ctrl_out(dev, AOA_SEND_HID_EVENT, value=HID_ID_TOUCH, index=0,
+             data=bytes([tip & 0x01, x & 0xFF, y & 0xFF]))
+
+
+def nudge(dev, dx, dy):
+    """One small relative move. move:* clamps to an edge; nudge:* is for insetting a
+    known number of pixels from that edge, so a click can land inside the shade
+    rather than on the scrim that dismisses it."""
+    send_mouse(dev, dx=dx, dy=dy)
+    time.sleep(0.02)
+    send_mouse(dev)
+
+
+def wiggle(dev, seconds=2.0):
+    """Move a relative pointer in a small loop. Android draws a cursor for a pointer
+    device, so this is the quickest way to tell whether pointer input reaches this
+    unit at all — and therefore whether tap coordinates are worth chasing."""
+    register_hid_mouse(dev)
+    time.sleep(0.05)
+    end = time.time() + seconds
+    while time.time() < end:
+        for dx, dy in ((40, 0), (0, 30), (-40, 0), (0, -30)):
+            send_mouse(dev, dx=dx, dy=dy)
+            time.sleep(0.04)
+    send_mouse(dev)
+
+
+def tap(dev, x, y, hold_s=0.05):
+    send_touch(dev, x, y, 1)
+    time.sleep(hold_s)
+    send_touch(dev, x, y, 0)
+
+
+def aoa_strings(dev, model):
+    """Full AOA v2 string handshake. AOSP's UsbDeviceManager special-cases the
+    Model string: "AdsDebug" starts adbd straight away, "Ace" starts it with the
+    RSA confirmation dialog. Manufacturer must be exactly "Android" for the
+    special-case to apply, and START is what commits the strings."""
+    strings = ["Android", model, "miko3 adb bridge", "1.0", "about:blank", "0"]
+    for i, s in enumerate(strings):
+        ctrl_out(dev, AOA_SEND_STRING, value=0, index=i,
+                 data=(s + "\0").encode("utf-8"))
+    ctrl_out(dev, AOA_START)
+
+
+def ioreg_state():
+    """Present-at-USB state from ioreg. More reliable than pyusb after accessory
+    mode: once the config is accessory-only macOS may leave it unmatched, and then
+    pyusb stops listing it while ioreg still shows it."""
+    out = shell(["sh", "-c",
+                 "ioreg -p IOUSB -w0 -l | awk 'BEGIN{RS=\"\\\\+-o \"} "
+                 "/\"idVendor\" = 3725|\"idVendor\" = 6353/ { "
+                 "match($0, /\"idProduct\" = [0-9]+/); pid = substr($0, RSTART, RLENGTH); "
+                 "gsub(/.*= /, \"\", pid); printf \"%s\", pid }'"])
+    try:
+        return f"PID=0x{int(out):04x}" if out else "gone"
+    except ValueError:
+        return out or "gone"
+
+
+def shell(args, timeout=6):
+    import subprocess
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except Exception as e:  # noqa: BLE001
+        return f"<{e}>"
 
 
 def mouse_longpress(dev, hold_s):
@@ -390,6 +521,13 @@ def main():
                     help="how many times to run the --sequence burst (default 1)")
     ap.add_argument("--cycle-ms", type=int, default=1500,
                     help="gap between --sequence bursts (default 1500)")
+    ap.add_argument("--ads", default=None, metavar="MODEL",
+                    help="run the full AOA string handshake with MODEL as the Model string "
+                         "(try 'AdsDebug' or 'Ace') — AOSP starts adbd for these",
+                    )
+    ap.add_argument("--wiggle", action="store_true",
+                    help="move a relative pointer in a loop so you can see whether pointer "
+                         "input reaches the display at all; sends no keys")
     ap.add_argument("--step", default=None, metavar="STEP",
                     help="fire exactly ONE step, then exit — use this to walk the ladder "
                          "one press at a time and watch the display between presses")
@@ -412,8 +550,10 @@ def main():
             "meta+n        notification shade (confirmed on this unit)",
             "meta+shift+n  second shade pass — some builds only reveal the gear here",
             "swipe:down    expand a collapsed shade; the gear is often below the fold",
-            "move:right / move:down   home the pointer to the bottom-right corner (AOSP puts the", 
-            "                          Settings cog there in the EXPANDED quick-settings panel)",
+            "move:right / move:down   home a RELATIVE pointer to an edge, then click",
+            "nudge:dx,dy   one small relative move, to inset from a homed edge",
+            "tap:x,y       absolute touch tap on a 0..255 grid (255,255 = bottom-right);",
+            "              does not depend on where a relative pointer was parked",
             "tab / enter   walk QS focus to the gear, then open Settings",
             "down / enter  same idea with arrow focus instead of Tab",
             "esc           dismiss a blocking dialog; also collapses the shade",
@@ -429,6 +569,70 @@ def main():
     mods, key = parse_chord(args.chord)
     press = bytes([mods, 0, key, 0, 0, 0, 0, 0])
     release = bytes(8)
+
+    # AOA string handshake: the non-keystroke route to a live adbd.
+    if args.ads:
+        print(f"[aoa] AOA strings handshake with Model={args.ads!r}")
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            dev = find_target(vid, pid)
+            if dev is None:
+                print("[aoa] waiting for device...")
+                time.sleep(args.interval_ms / 1000)
+                continue
+            proto = aoa_ready(dev)
+            if proto is None:
+                print(f"[aoa] no AOA yet (PID={hex(dev.idProduct)})")
+                time.sleep(args.interval_ms / 1000)
+                continue
+            try:
+                aoa_strings(dev, args.ads)
+                print(f"[aoa] strings + START sent (proto={proto})")
+                try:
+                    dev.reset()
+                    print("[aoa] host-side USB reset sent so the new config takes effect")
+                except usb.core.USBError as e:
+                    print(f"[aoa] dev.reset() unavailable: {e}")
+            except usb.core.USBError as e:
+                print(f"[aoa] USBError during handshake: {e}")
+                time.sleep(0.3)
+                continue
+            for _ in range(10):
+                time.sleep(2)
+                out = shell(["adb", "devices"])
+                line = " | ".join(x for x in out.splitlines() if x and "List of" not in x) or "empty"
+                print(f"[aoa] adb devices: {line}; on bus: {ioreg_state()}")
+                if line != "empty":
+                    print("[aoa] adb is up")
+                    return
+            print("[aoa] adb still not listed after 20s — the accessory config is often left "
+                  "unclaimed by the host; replug the micro USB and rerun --ads, or check "
+                  "scripts/miko-detect.sh for the PID it settled on")
+            return
+        print("[aoa] gave up waiting for device")
+        sys.exit(1)
+
+    if args.wiggle:
+        print("[aoa] wiggle — watching for 2s of pointer movement once AOA is up")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            dev = find_target(vid, pid)
+            if dev is None:
+                print("[aoa] waiting for device...")
+                time.sleep(args.interval_ms / 1000)
+                continue
+            if aoa_ready(dev) is None:
+                time.sleep(args.interval_ms / 1000)
+                continue
+            try:
+                wiggle(dev)
+                print("[aoa] wiggle done — did a cursor dot travel in a rectangle?")
+                return
+            except usb.core.USBError as e:
+                print(f"[aoa] USBError during wiggle: {e}")
+                time.sleep(0.2)
+        print("[aoa] gave up waiting for device")
+        sys.exit(1)
 
     # Burst mode: the whole path in one pass, so a short boot window is enough.
     if args.sequence or args.ladder or args.step:
@@ -453,7 +657,8 @@ def main():
                 continue
             try:
                 if registered_for != id(dev):
-                    mouse_ok = register_both(dev)
+                    second = "touch" if any(s.startswith("tap:") for s in steps) else "mouse"
+                    mouse_ok = register_both(dev, second)
                     registered_for = id(dev)
                     print(f"[aoa] HID registered (proto={proto}, mouse={'yes' if mouse_ok else 'no'})")
                 t0 = time.time()

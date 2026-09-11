@@ -33,9 +33,10 @@ now_ms() {
   fi
 }
 
-# One ioreg record per USB device -> "ProductName/pid" for the MediaTek VID.
+# One ioreg record per USB device -> "ProductName/pid". Matches both VIDs the unit
+# uses: 0x0e8d MediaTek normally, 0x18d1 Google once AOA accessory mode is active.
 probe() {
-  ioreg -p IOUSB -w0 -l 2>/dev/null | awk 'BEGIN{RS="\\+-o "} /"idVendor" = 3725/ {
+  ioreg -p IOUSB -w0 -l 2>/dev/null | awk 'BEGIN{RS="\\+-o "} /"idVendor" = 3725|"idVendor" = 6353/ {
     match($0, /"idProduct" = [0-9]+/);       pid = substr($0, RSTART, RLENGTH);
     match($0, /"USB Product Name" = "[^"]*"/); nm = substr($0, RSTART, RLENGTH);
     gsub(/.*= /, "", pid); gsub(/.*= "/, "", nm); gsub(/".*/, "", nm);
