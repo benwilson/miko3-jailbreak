@@ -55,3 +55,12 @@ notification shade, which is what makes this work.
 `com.example.ServiceExam` actively reboots the unit if it sees adbd running --
 this is the "hardened newer revision" behavior. Any ADB-persistence approach must
 neutralize this watchdog, which is exactly what the boot-agent claims to do.
+
+## 2026-09-11 — AOA HID injection WORKS (no OTG adapter, no adb)
+Confirmed on our unit: `scripts/aoa-inject.sh --chord meta+n --interval-ms 50`
+polling across a cold boot successfully **pulled the notification shade down** via
+AOAv2 HID over the control endpoint, with the Mac as USB host and NO OTG adapter
+and NO adb. This replaces the missing keyboard/OTG hardware entirely.
+Note: run the injector so it is already polling BEFORE powering the unit on, to
+catch the brief boot-time input window. Stop the loop once the shade is down so it
+does not keep toggling.

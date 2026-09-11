@@ -11,5 +11,6 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 py="$here/tools/aoa-inject/.venv/bin/python"
 [ -x "$py" ] || { echo "error: venv missing; run: python3 -m venv tools/aoa-inject/.venv && tools/aoa-inject/.venv/bin/pip install pyusb" >&2; exit 1; }
+export PYTHONUNBUFFERED=1
 export DYLD_LIBRARY_PATH="$(brew --prefix libusb)/lib:${DYLD_LIBRARY_PATH:-}"
 exec "$py" "$here/scripts/aoa-inject.py" "$@"
