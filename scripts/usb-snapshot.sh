@@ -1,7 +1,24 @@
 #!/usr/bin/env bash
-# Snapshot USB + serial state so before/after power-on can be diffed.
-# Usage: scripts/usb-snapshot.sh <label>     e.g. ./scripts/usb-snapshot.sh before-poweron
+#
+# usb-snapshot.sh — snapshot USB + serial state to a file for before/after diffs.
+#
+# Usage:   scripts/usb-snapshot.sh [label]
+# Example: scripts/usb-snapshot.sh before-poweron
+#          scripts/usb-snapshot.sh after-poweron
+#          diff recon/captures/usb-before-poweron.txt recon/captures/usb-after-poweron.txt
+#
+# Output:  recon/captures/usb-<label>.txt   (label defaults to a timestamp)
+#
+# Dependencies: macOS built-ins (ioreg, ls); adb + fastboot optional (Homebrew
+#   `android-platform-tools`) — reported as "(not installed)" if absent.
+#
 set -euo pipefail
+
+case "${1:-}" in
+  -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+command -v ioreg >/dev/null || { echo "error: ioreg not found (are you on macOS?)" >&2; exit 1; }
 
 label="${1:-$(date +%Y%m%d-%H%M%S)}"
 outdir="recon/captures"
