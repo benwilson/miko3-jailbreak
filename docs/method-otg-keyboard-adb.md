@@ -18,6 +18,10 @@ notification shade, which is what makes this work.
   better for hitting the timing than a human on a keyboard.
 - An **SD card** loaded with the boot-agent APK (below).
 
+Both are optional on this unit. AOAv2 HID over the control endpoint delivers the
+same keystrokes with the Mac as USB host and **no OTG adapter** — see
+`scripts/aoa-inject.py` — so the keyboard kit is a fallback, not a prerequisite.
+
 ## Steps (verbatim from the author)
 > For latest firmware with Privacy Policy long press -> Share blocked (and OTG
 > input blocked by default), you have to time it correctly. Start miko up, wait
@@ -39,7 +43,9 @@ notification shade, which is what makes this work.
 4. During the **"slot machine" eye animation** (boot window), jam **Win+N**
    (Meta+N) to open the notification shade.
 5. Pull the notifications drawer down; tap the **gear icon (bottom-right)** ->
-   Settings.
+   Settings. On this unit there is no cog — see the shade contents below, so the
+   in-shade route ends at the tiles and the preloader's META console is how a
+   shell is actually reached.
 6. (Optional, author did it anyway) enable Developer Options.
 7. Settings -> **Storage** -> open the SD card -> install the
    **miko3-adb-boot-agent** APK.
@@ -94,7 +100,7 @@ the panel, then `click`. Clicking the extreme corner dismisses the panel instead
 ## AOA strings handshake — the shorter route to adb
 
 `scripts/aoa-inject.sh --ads AdsDebug` performs the full AOAv2 string handshake
-(`GET_PROTOCOL`, four `SEND_STRING`s, `START`) with `Manufacturer="Android"` and
+(`GET_PROTOCOL`, six `SEND_STRING`s, `START`) with `Manufacturer="Android"` and
 `Model="AdsDebug"`. AOSP's `UsbDeviceManager` special-cases that Model value and
 enables adb without any UI navigation, which is why this is worth trying before
 any keystroke ladder. Observed on this unit:

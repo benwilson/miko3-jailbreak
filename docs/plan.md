@@ -2,30 +2,38 @@
 
 ## Where we are (2026-09-11)
 
-Goal is narrow: **get adb up**, then everything else is ordinary adb work. Two
+Goal is narrow: **get adb up**, then everything else is ordinary adb work. Three
 entries exist, one per boot stage:
 
 - **Fully booted (`0x0e8d:0x2008`)** — Android's own UI, driven by injected HID
   keystrokes over the micro USB. Enable USB debugging here. See
   `docs/method-otg-keyboard-adb.md` for the ladder and what this unit's shade
   actually contains.
-- **Boot ROM (`0x0e8d:0x0003`)** — reachable by holding a head/volume button while
-  plugging USB in. The ROM waits for the host, so `scripts/mtk.sh printgpt`
-  handshakes there rather than racing the preloader window.
+- **Preloader (`0x0e8d:0x2000`)** — MediaTek's META console on a fresh CDC-ACM node.
+  Handshake, then write `FASTBOOT` to move the unit into fastboot. This is the entry
+  that actually worked on macOS; see `scripts/brom-probe.py` and
+  `docs/solutions/tooling-decisions/mediatek-preloader-meta-console-route.md`.
+- **Boot ROM (`0x0e8d:0x0003`)** — held open by a BROM/USBDL test point; the accessible
+  buttons do not hold download mode on this unit (tested below). The ROM waits for the
+  host, so `scripts/mtk.sh printgpt` handshakes there rather than racing the preloader
+  window.
 
 `scripts/boot-modes.sh 60 50` logs which stage is enumerated when, at 50 ms
 resolution, into `recon/captures/boot-modes-*.txt`.
 
 ### Route order (current)
 
-1. `scripts/aoa-inject.sh --ads AdsDebug` — AOAv2 strings handshake. No UI
+1. `scripts/fastboot-once.sh` — catch the preloader's META console during boot,
+   write `FASTBOOT`, then read fastboot in the same pass. This is what produced a
+   listed serial on macOS.
+2. `scripts/aoa-inject.sh --ads AdsDebug` — AOAv2 strings handshake. No UI
    navigation, works in the booted stage, and the accessory switch was observed to
    take effect immediately. Needs a replug afterwards for the host to claim the new
-   configuration.
-2. **BROM (`0x0e8d:0x0003`)** by holding a head/volume button while plugging USB in,
-   with `scripts/mtk.sh` already polling. The ROM waits for the host, so there is no
-   race.
-3. Keystroke ladder in the booted stage — the fallback if the first two stay stuck.
+   configuration. Known limit: accessory mode engages, adb still does not.
+3. **BROM (`0x0e8d:0x0003`)** by holding a head/volume button while plugging USB in,
+   with `scripts/mtk.sh` already polling — tested here as unreliable: the buttons usually
+   just boot normally. The ROM waits for the host once it is reached, so there is no race.
+4. Keystroke ladder in the booted stage — the fallback if the routes above stay stuck.
 
 The preloader window is wider than first assumed: about **2.6 s per appearance**,
 recurring several times during boot (see `scripts/README.md`), which is why
@@ -43,17 +51,23 @@ Confirmed about the unit:
 ### The mtkclient blocker (fully characterized)
 - mtkclient **reliably detects the MediaTek preloader** on every boot, but the
   low-level **handshake fails every time** on macOS.
-- Not driver contention: preloader is raw bulk USB, no `/dev/cu.*` node appears;
-  `--serialport DETECT` and `--crash` fail identically.
-- Root cause: the preloader's USB-download window is **too short** — the chip
-  boots on to Android before macOS/libusb completes the handshake.
+- Not driver contention: a fresh `/dev/cu.*` node does appear during the preloader
+  stage, and a fixed `--serialport` beats `DETECT` because the always-present ACM node
+  belongs to the LG monitor.
+- Root cause: `tools/mtkclient/mtkclient/Library/Port.py`, in `run_handshake()` compares a per-byte inverted
+  echo, while this chip answers the SYNC once with ASCII `READ` then repeated `READY`
+  — the shape `tools/mtkclient/mtkclient/Library/meta.py` expects. Window length (~2.6 s of stage, ~1.1 s
+  of live serial node) is a secondary constraint on top of that mismatch.
 - **The accessible buttons do NOT hold download mode open.** Tested head
   volume-up and volume-down, each with USB connected + tap power + hold ~10s:
   both just boot normally (normal boot logo, no USB-download device). The robot's
   buttons are not wired to the SoC download-mode key (KPCOL0) — consistent with
   the mgdproductions note that the head volume-up didn't trigger fastboot unlock.
 
-## Decision point — two real paths left (macOS-compatible)
+## Decision point — two hardware-ish paths left (macOS-compatible)
+
+Both are backups now: the preloader's META console reaches fastboot from macOS
+without either one.
 
 1. **eMMC / BROM test point (hardware).** Short the correct pad to ground while
    powering on to force **BROM mode (PID 0x0003)**, which waits for the host

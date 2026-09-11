@@ -159,10 +159,13 @@ even before any RSA authorization, which `adb devices` does not. Also confirmed:
 nothing listens on TCP 5555 anywhere on the LAN while USB debugging is off, so
 there is no wireless-adb back door to aim at instead.
 
-**Boot ladder, measured.** Preloader (`MT65xx Preloader`, PID `0x2000`) is up
-~2.6 s per appearance and returns several times during boot (one capture:
-t+26.4s, t+38.2s, t+54.3s). BROM is PID `0x0003`. Captures in
-`recon/captures/boot-modes-*.txt`.
+**Boot ladder, measured.** Preloader (`MT65xx Preloader`, PID `0x2000`) is on the bus
+~2.6 s per appearance (measured 2.59 / 2.59 / 2.68 s in
+`recon/captures/boot-modes-20260911T194341Z.txt`) and returns several times during
+boot (same capture: t+26.4s, t+38.2s, t+54.3s). Its CDC-ACM node is visible for a
+shorter slice inside that window — about 1.1 s (t+37225ms to t+38307ms in
+`recon/captures/brom-probe-215904.log`) — so size a handshake attempt against the node,
+not the stage. BROM is PID `0x0003`. Captures in `recon/captures/boot-modes-*.txt`.
 
 ## 2026-09-11 (later still) — the working route to a real console: preloader META port
 
@@ -177,7 +180,7 @@ Measured ladder from a cold power-on (USB stays connected the whole time):
 |------|-----------|------------|
 | t+0 s | PID `0x2008`, name `MIKO3`, iface `ff/ff/00` | Android already up (previous boot) |
 | t+9…27 s | bus silent | power-off / reset gap |
-| ~t+25 s | PID `0x2000`, name `MT65xx Preloader`, fresh node `/dev/cu.usbmodem2100` | preloader, open for **~2.3 s** |
+| ~t+25 s | PID `0x2000`, name `MT65xx Preloader`, fresh node `/dev/cu.usbmodem2100` | preloader, on the bus ~2.6 s; its serial node is usable for ~1.1 s of that |
 | ~t+44 s | PID `0x201c`, name `Android`, iface `ff/42/03` | fastboot gadget, after we write `FASTBOOT` |
 
 The handshake on `/dev/cu.usbmodem2100 @ 115200`:
@@ -188,30 +191,39 @@ The handshake on `/dev/cu.usbmodem2100 @ 115200`:
   fastboot on the next enumeration (PID `0x201c`, interface `ff/42/03`)
 - `fastboot devices` then lists `MIKO3250XXM3Q0636CB`
 
-So the chain is: **power-cycle → catch the ~2.3 s preloader window → talk META over its
-CDC-ACM node → name the mode we want.** No buttons, no OTG adapter, no UI navigation.
+So the chain is: **power-cycle → catch the ~2.6 s preloader stage (≈1 s of live serial
+node) → talk META over its CDC-ACM node → name the mode we want.** No buttons, no OTG
+adapter, no UI navigation.
 `scripts/brom-probe.py` does the watch-and-write; `scripts/fastboot-once.sh` wraps the
 whole cycle and issues the first fastboot read itself.
 
 **Why mtkclient reported `Handshake failed` on a link that demonstrably works.** Its
-`Library/Port.py:run_handshake` writes the SYNC one byte at a time and requires each
+`tools/mtkclient/mtkclient/Library/Port.py` — in `run_handshake()` — writes the SYNC one byte at a time and requires each
 byte echoed back inverted (`0xa0` → `0x5f`, …), which is classic BROM behaviour. This
 chip answers the whole SYNC at once with ASCII `READ` instead, so the per-byte
 comparison never matches and it gives up after five retries — while the port itself is
-perfectly responsive. `Library/meta.py` in the same project *does* match this
+perfectly responsive. `tools/mtkclient/mtkclient/Library/meta.py` *does* match this
 behaviour (read until `READY`, then write a mode string), which is the shape our probe
 copies. Related: pass a fixed port (`--serialport /dev/cu.usbmodem2100`) rather than
-`DETECT`, because Android's own node (`usbmodem208NTXR9D2662`) is present most of the
-time and detection can pick it instead.
+`DETECT`. The only persistent ACM node on this Mac belongs to the LG monitor
+(`usbmodem208NTXR9D2662`, see `docs/recon.md`), and detection can claim that one instead
+of the preloader's node. The booted Android gadget itself exposes no serial node at all —
+just one vendor interface, `ff/ff/00`.
 
-**Fastboot on this unit is minimal.** The first command after the mode switch answered
-(`getvar all` → `(remote: 'unknown command')`), later ones in the same run stalled
-until timeout, and `fastboot -s serial:<n> getvar …` sits at `<waiting for …>` even
-though plain `fastboot devices` lists the unit. Practical rule: enter fastboot and
-issue the read immediately, in one short-lived process — which is exactly what
-`scripts/fastboot-once.sh` does.
+**Fastboot on this unit is minimal but not dead.** Named getvars answer one after another
+in a single pass: `secure: yes`, `product: tb8168p1_64_bsp`, `version: 0.5`,
+`version-bootloader: tb8168p1_64_bsp-a95430d-20230610183654-20230610224324`,
+`serialno: MIKO3250XXM3Q0636CB`, `hw-revision: 0`, `battery-voltage: 4003mV`,
+`max-download-size: 0x8000000`, `partition-size:boot: 1000000`,
+`partition-size:system: 211008000` (the `a95430d` inside `version-bootloader` is the
+bootloader's own build tag, not a git ref in this repo). `getvar all` and `getvar unlocked` instead return
+`(remote: 'unknown command')`, `partition-size:vendor` and the keys after it time out at
+15 s, and `fastboot -s serial:<n> getvar …` sits at `< waiting for any device >` even
+though plain `fastboot devices` lists the unit. Practical rule: ask for the specific keys
+you need, in one bounded pass — which is exactly what `scripts/fastboot-once.sh` does.
 
-**Also confirmed:** Android's persistent ACM node is not a console — silent at 115200,
-921600, 1500000 and 3000000 baud, with and without a CR/LF. And the AOAv2 model-string
+**Also confirmed:** the persistent ACM node (`usbmodem208NTXR9D2662`, the LG monitor's) is
+not a console — silent at 115200, 921600, 1500000 and 3000000 baud, with and without a
+CR/LF. And the AOAv2 model-string
 trick (`AdsDebug` / `Ace`) still only flips the unit into accessory mode; `adb devices`
 stayed empty through a replug and a reboot.
