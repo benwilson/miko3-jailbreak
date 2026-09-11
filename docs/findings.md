@@ -78,3 +78,35 @@ not electrically reaching the Mac. Candidate causes, in order:
 - [ ] If cable is good: try entering bootloader/loader mode via a button-hold at
       power-on (combo TBD from primary sources) and re-watch USB.
 - [ ] Inspect the board for other connectors / UART test pads.
+
+## 2026-09-11 (update) — primary source retrieved; key corrections
+
+Full mgdproductions writeup retrieved off-network. Raw text + digest archived in
+`recon/sources/`. Corrections and additions to the above:
+
+- **SoC is MediaTek, not Rockchip.** The writeup calls it a "vulnerable mediatek
+  chip that should be able to be unlocked with tools like mtkclient" — though the
+  author's mtkclient attempt errored out. Exact model/RAM/storage: still unknown.
+- **Two internal USB ports.** External port = charge-only. A *hidden* internal
+  micro-USB (reached by removing bottom screws and lifting the top) is the data
+  port that gave ADB root.
+- **Our unit:** cabled to the hidden data port, powered on and booted, yet the
+  host logged **zero** USB events across a controlled unplug/replug. That is
+  consistent with a charge-only cable (D+/D- not wired) or data lines not reaching
+  the host — NOT with a live-but-locked device, which would still log connect/reset.
+
+### Revised route options (in priority order)
+
+1. **Rule out the cable first** — same cable Mac↔known Android phone; it must at
+   least log a USB event / show in `adb devices`. Until this passes, every other
+   test is ambiguous.
+2. **MediaTek BROM / preloader path (mtkclient).** MTK SoCs enumerate as USB VID
+   `0x0e8d` in BROM mode at the very start of power-on (or held there via a test
+   point / key), *independent of bootloader lock or Android build*. If the data
+   port is wired, an mtkclient handshake during the power-on window should produce
+   a USB event even on a hardened unit. This is the most promising route for a
+   locked/newer revision. Needs `mtkclient` installed + libusb.
+3. **Normal-boot ADB** — only works if this is an older userdebug revision. Given
+   nothing enumerated, lower priority until the cable is cleared.
+4. **fastboot unlock** — blocked per the writeup by a volume-up confirm that the
+   head button doesn't trigger; parked.

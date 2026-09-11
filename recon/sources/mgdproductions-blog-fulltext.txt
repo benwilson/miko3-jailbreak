@@ -1,0 +1,386 @@
+Article
+Video Calling Vulnerabilities in Miko Smart Kid Robots
+Marcel
+28 Mar 2026 • 10 min read
+
+Note: All vulnerabilities detailed in this post were responsibly disclosed to Miko in June 2025 and have since been fully patched. Miko deployed fixes three weeks after the initial report, all robots are required to update to a patched version before they can be used online. Miko says no evidence exists that these vulnerabilities were exploited in the wild and that they continue to invest in platform security. Miko has engaged with me throughout the reporting process.
+
+Introduction
+
+Over the last few years i have had a strange interest in locked down android devices. My interest once again piqued when i came across this video. The video shows a kid accessing the android bluetooth settings from the share menu by selecting text in the privacy policy webview on a robot toy.
+
+The robot in question is the MIKO 3. The robot has great reviews on amazon, almost 4.000 of them, averaging 4 stars. If you take a rough estimate that maybe 2-3% of people leave an amazon review, this would mean that Miko has probably sold over 100.000 robots just from amazon alone. Their app on the play store also has 100k+ downloads. Miko also has their own storefront and sell through Walmart, Target and a few other stores.
+
+The robots include a camera (with a physical cover switch) and a microphone. The robots have to be linked with a parent app in order for them to be used. With the parent app, parents can monitor their child's progression in the various educational activities present on miko. There is also the possibility of 2 way video calling. The child can initiate a call from the robot to the parent app, and parents can initiate a call from the parent app to the robot. Parents can only call the robot with which they are linked, robots can't call other parents or other robots. With the microphone, the child can also ask miko questions and it will respond with the help of AI.
+
+This online functionality would make these robots a potential target for bad actors. So, i went ahead and bought one, with the intention of responsibly disclosing any issues to miko first if i found any through their responsible disclosure program.
+
+Getting some sort of access
+
+Immediately when i received the robot i tried to access the bluetooth menu, that was still possible. From there i could get to the stock android settings app and enable developer options and OEM unlocking.
+
+0:00
+/0:33
+1×
+
+However, the outside usb port does not do data at all. It only does charging.
+
+So, i took the robot apart, hoping for some deeper access. All i had to do was take out a few screws from the bottom to lift the top off. This gave me access to a hidden micro usb port that actually provided data!
+
+I connected to the USB port that provided data to me. These robots also have a vulnerable mediatek chip that should be able to be unlocked with tools like mtkclient. But for some unknown reason, that didn't work and it gave me a strange error.
+
+Unlocking the bootloader through fastboot requires confirmation from the volume up button. But the volume up button on the head of the robot didn't trigger this.
+
+At first i didn't try accessing an ADB shell yet, because i assumed it would only have user level access. However it turned out to be root by default!
+
+The robot runs on a userdebug rom. This allows root access by default and has the ability to debug running apps (inspect memory, etc).
+
+Just root access wouldn't really be an immediate remote danger, you would still need physical access. So, with the access that i had i decided to dump the rom to inspect it further. Since i also have root access, i also did some network inspection.
+
+Vulnerable API endpoints
+
+All miko robots communicate to a central domain. Doing a subdomain scan revealed a simulator dashboard of some sorts that required a username and password to access. Unfortunately i didn't take a screenshot or archive the page, it was just a way to test the AI functionality of the robots.
+
+An unauthenticated endpoint
+/v1/checkAuthentication/{robot_id}
+This endpoint is used by the robot to check it's link to the parent app and any details associated with it. This endpoint required no authentication from the robot and was able to be accessed without any specific headers. The only thing needed is the robot id and you will get sensitive parent information like emails and phone numbers.
+
+This is an example response, sensitive details have been replaced by default/mock values.
+
+{
+  "product_id": 1,
+  "profile_id": null,
+  "username": "M3E045543",
+  "password": "55ABC1",
+  "parent": "cFuGEa8a0a20KiTbIBaAmF",
+  "parent_email": "example@example.com",
+  "parent_phone": "+310612345678",
+  "status": 1,
+  "created_date": "2023-10-13T09:12:46",
+  "updated_date": "2025-06-15T10:41:15",
+  "relinking_status": -2,
+  "device_name": null
+}
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+
+The password here is the static linking code for the robot to link with a parent app. The relinking status tells the parent app if the robot is currently linked or not. Robots can not be linked to another parent app unless they are specifically reset through the currently linked parent app. (Or by contacting Miko and providing proof of purchase)
+
+How to get a robot id
+A robot id is very easy to obtain or brute force. It contains a model number and a device specific number. The entire id is listed on the bottom of the miko robot.
+
+My robot id is M3E045543
+ M3E = Robot model number (Miko 3)
+045543 = Robot specific id (numeric)
+It is possible to loop over all of the million robot ids and get their linking information. Just by incrementing the last digit 10 times past mine, i already found about 7 other users.
+
+Authorized endpoints:
+The robot makes a call to /login_user to authenticate itself with a token to the rest of the endpoints. It has the following request body:
+
+{
+  "key": "0",
+  "password": "08ACA8",
+  "username": "M3E045543"
+}
+1
+2
+3
+4
+5
+
+In response you will receive:
+
+{
+  "access_token": "<long jwt>",
+  "refresh_token": "<long jwt>",
+  "product_id": 1
+}
+1
+2
+3
+4
+5
+
+How is the required password generated?
+By decompiling the update app i found the logic to morph the 6 digits of the robot id into the authentication password, it looked something like this:
+
+public class Main {
+    public static void main(String[] args) {
+        String password = "045544";
+        int parseInt = (Integer.parseInt(password, 16) + 852) * 2;
+        password = String.format("%06X", Integer.valueOf(parseInt));
+        System.out.println(password);
+    }
+}
+1
+2
+3
+4
+5
+6
+7
+8
+
+Now, just by having access to a robot id, you can find the password to get an auth token for authenticated endpoints. These credentials were also valid for the simulator dashboard.
+
+The authenticated endpoints
+
+With a valid JWT obtained through the method above, it was possible to authenticate to additional endpoints on behalf of other robot IDs.
+
+Getting child info:
+
+/v2/getChildProfile/{robot_id}
+This endpoint returns the details of the child connected to the robot, such as Name, Age, Date of birth, Race, Gender and interests. Interests are preset options from the parent app (Sports, Music etc...)
+
+This information can also be updated with this endpoint:
+/v2/updateChildProfile/{robot_id}
+
+Getting more API credentials:
+
+/v1/getappConfiguration1/{robot_id}
+This endpoint gets a whole list of API endpoints and credentials. Most notably:
+
+LINODE_URL
+LINODE_BUCKET
+LINODE_SECRET_KEY
+LINODE_ACCESS_KEY
+
+These can be used against the google storage bucket to list and download all available OTA updates. However writing is not permitted. The OTA updates are not standard android signed payload.bin files but instead they include new apks and also include arbitrary OS commands, the OTA updates contain a structure like this:
+
+{
+  "files": [
+    {"target":"device", "source": "device_pkg_v1.bin"},
+    {"target":"", "source": "system_recovery.dat"},
+    {"target":"com.example.system.coreservice", "source": "module_a.arc"},
+    {"target":"com.example.app.companion", "source": "module_b.arc"}
+  ],
+  "commands": [
+    "mv /sdcard/device/setup/version.cfg /sdcard/device",
+    "rm -f /sdcard/device/audio/en_US/prompt_silence.res",
+    "rm -f /sdcard/device/audio/en_US/prompt_retry.res",
+    "rm -f /sdcard/device/audio/intro_splash.res",
+    "rm -f /sdcard/device/audio/intro_splash.ogg"
+  ]
+}
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+
+Sending arbitrary push notifications to any parent app:
+
+/api/v2/push-notification
+This endpoint can send arbitrary notifications with images and payloads to parent apps.
+
+Body:
+
+{
+  "alert": "Get hacked lol",
+  "bot_id": "M3E045543",
+  "image": "http://via.placeholder.com/10x10",
+  "payload": {
+    "link": "https://<redacted>/talent-camera"
+  },
+  "title": "Miko",
+  "user_id": "cFuGEa8a0a20KiTbIBaAmF"
+}
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+This endpoint does not check if the user_id is currently linked to the bot_id. By getting the parent id from /checkAuthentication you can now send arbitrary notifications to any parent app.
+
+Result:
+
+Directory listings in buckets
+
+Some google storage buckets used by the miko robot publicly exposed their directory listings. These only contained asset files and no actual user information, however they did include content for Miko MAX.
+
+Miko MAX is Miko's subscription model which allows access to more content on the robot.
+
+So what about video calling?
+
+The miko robots use agora.io as their video calling service.
+
+When initiating a video call, a robot requests an agora room token with:
+/api/v2/agora/token
+
+{
+  "channel_name": "M3E045543",
+  "user_id": 1763851546
+}
+1
+2
+3
+4
+
+The channel name is again, solely based on the robot id. The user_id is the current epoch timestamp.
+
+When 2 users are in the same agora room, the video call is established. No more than 2 users can be in a room at the same time. A theoretical way to establish video call connections is to get a token for each one of the million agora rooms, sit in all of them and wait for someone to join. But that is a bit unfeasible. It is better to find a way to directly push a call notification to parents and robots.
+
+Direct video calls to other parent apps:
+
+As discussed earlier, miko robots can send arbitrary notifications to parent apps. This is what the calling mechanism uses to send parents an incoming call.
+
+By making a request to /push-notification with the notification title set to "Mikonnect call", instead of triggering a notification, it triggers an incoming call just like you would normally receive a call. Picking up redirects to the app.
+
+{
+  "alert": "Mikonnect call",
+  "bot_id": "M3E045543",
+  "image": "http://via.placeholder.com/10x10",
+  "payload": {
+    "link": "https://<redacted>/talent-camera"
+  },
+  "title": "Mikonnect call",
+  "user_id": "cFuGEa8a0a20KiTbIBaAmF"
+}
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+user_id can be modified to send the notification to any parent app, since user_id is not checked against bot_id it is possible to direct the parent app to join the agora room of a different robot id than the one they have linked.
+
+These issues could be chained together, starting from robot ID enumeration and ending with initiating a call to the associated parent app.
+
+See this scenario in action:
+
+Direct video calls to other robots:
+
+The parent app is secure and seems to authenticate all endpoints with a JWT obtained from logging in with valid credentials. It also checks that this JWT is not trying to manage bots that aren't linked.
+
+The only way to video call other robots directly would be to somehow unlink them from their parent app, then link them to a new parent app with the static linking code.
+
+It is only possible to unlink robots through the parent app or by contacting Miko and providing proof of purchase. There is no menu on the robot to factory reset.
+
+However, in the decompiled robot launcher apk i found an abandoned/developer API endpoint: /v1/full_data_reset/{robot_id}
+Using this body:
+
+{
+    "username": "M3E045543",
+    "max_user": false
+}
+1
+2
+3
+4
+
+After executing this request, the robot is now unlinked from the original parent app. When this normally happens through the parent app endpoint, the robot factory resets. This also gets rid of the network connection so the robot can no longer be reached unless physically setup with a new network. However with this abandoned/dev endpoint, the factory reset does not happen.
+
+This means that it is possible to unlink any robot and pair it to another parent app. When the robot refreshes the connection to the websocket (happens pretty often) it can now be called by the attacker's parent app. The robot also calls out to the attacker's parent app.
+
+It is also now possible to do a chain from getting a robot id, to force unlink the robot from it's old parent app and re-link it to a new parent app which is able to then call the robot.
+
+Other things that happen because of this parent app swap:
+
+The original parent would need to contact Miko support with proof of purchase to restore the link to their account.
+Calls initiated from the robot would be directed to the newly linked parent app instead of the original parent app.
+The only indication that this swap has happened is visible in the robot's settings under the parent app info.
+
+See this scenario in action:
+
+Fixes implemented by Miko
+
+3 weeks after reporting the issues to miko, i have observed the following fixes:
+
+The token endpoint is now authenticated with a more difficult, way longer password generated by a natively obfuscated library. It only generates a correct password on an actual Miko robot. So it is no longer easily possible to obtain valid credentials for arbitrary robots.
+/checkAuthentication is now an authenticated endpoint. This means that parent linking details should no longer be able to be obtained without valid robot credentials.
+Endpoints which have a robot id in the url now check if this robot id matches the auth token. It is no longer possible to execute actions on behalf of another robot without valid authentication for that specific robot.
+Directory listings on google cloud buckets have been turned off. So Miko content is no longer able to be freely downloaded.
+The robot simulator tool has been taken down. This was an internal tool to test AI functionality of the robots which didn't impact users.
+The robot reset endpoint is no longer functional. It is no longer possible to unlink robots from other parent apps without valid parent credentials.
+
+Some issues were already found:
+
+Kaspersky has seemingly found similar issues in 2024, though their writeup did not name Miko specifically. While some fixes were implemented at that time, my research identified that certain vulnerabilities remained, which Miko has now addressed with this disclosure.
+
+Timeline:
+
+12-06-2025: Discovered ADB root access.
+13-06-2025: Discovered vulnerable endpoints, calling parent apps.
+14-06-2025: Discovered unlinking endpoint, calling robots.
+16-06-2025: Reported all issues to MIKO.
+~a week later: First issues starting to get fixed (directory listing on buckets)
+~3 weeks later: Most issues have been fixed, forced OTA has rolled out.
+09-07-2025: First acknowledgement via email.
+05-08-2025: Google meet call to discuss bounty details.
+15-08-2025: Second call, Miko asked for edits to the blog post.
+14-02-2026: I sent Miko an email where i stated my intentions to publish this post. Miko wanted to review the blog first.
+02-03-2026: I sent my intentions to publish this post on 13-03-2026.
+13-03-2026: Call to discuss coordinated disclosure and correct any non-factual statements in my version of the disclosure.
+28-03-2026: Public Disclosure.
+
+Clarifications from Miko:
+Miko has clarified to me that their bounty program was managed by an external security company, which is why replies have taken longer.
+Miko claims that i had an older robot hardware revision which has a userdebug rom with ADB root access available. I have not been able to verify this statement myself as i only have one robot.
+Miko is looking into further collaboration with me.
+
+Public Statement from Miko:
+
+Miko thanks the researcher for the thorough and responsible disclosure that led
+to meaningful product improvements. The company values independent security
+research and continues to strengthen its platforms through regular testing,
+external audits, and ongoing partnerships with ethical researchers. Together, we
+share a commitment to creating safe, secure, and trusted technology experiences
+for children around the world.
+
+Support my research: https://ko-fi.com/mgdproductions
+
+Share
+Topic
+Miko
+Miko robot
+AI
+Android
+Firmware
+MarcelD505
+Smart kid robot
+Smart child robot
+Vulnerability
+Hack
+Exploit
+video calling
+Cracking into a Just Eat / Takeaway.com terminal with an NFC card
+
+So this is a pretty interesting one, i found this one on…
+
+28 Oct 2024
+
+MGD Blog © 2026
+Self hosted Ghost • Theme Attila (Modified) •
