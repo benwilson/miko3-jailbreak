@@ -51,3 +51,30 @@ Working knowledge base. Primary sources:
 3. The head volume-up button reportedly does not confirm fastboot unlock — so if
    we go the fastboot route, we may need to find the real confirm input (another
    button, a test pad, or the actual vol-up line on the board).
+
+## 2026-09-11 — power-on + hotplug test: internal micro USB shows NO data path
+
+Powered the unit on with the internal micro USB cabled to the Mac. Nothing
+enumerated: no new `/dev/cu.*` node, no `adb` device, no `fastboot` device, no
+new USB VID/PID.
+
+Ran a controlled unplug/replug with timestamped snapshots
+(`recon/captures/hotplug-*.txt`) and a full macOS USB-stack log dump across the
+window. **Zero USB events** were logged on either unplug or replug.
+
+Conclusion: the host receives **no USB data-line signal** from this cable+port.
+On a live host controller, a plug event always logs at least a connect/reset even
+when enumeration fails — so the absence of *any* event means the data lines are
+not electrically reaching the Mac. Candidate causes, in order:
+
+1. **Charge-only micro-USB cable** (D+/D- not wired). Most common.
+2. Port's data lines not connected to the host in normal Android boot (some boards
+   only bring USB-device up in a loader/fastboot mode).
+3. Wrong connector — this one may be power/factory-only if there are others.
+
+### Next actions
+- [ ] **Cable sanity check**: same cable Mac↔known Android phone. Phone must show
+      in `adb devices` (even as `unauthorized`). If it doesn't → charge-only cable.
+- [ ] If cable is good: try entering bootloader/loader mode via a button-hold at
+      power-on (combo TBD from primary sources) and re-watch USB.
+- [ ] Inspect the board for other connectors / UART test pads.
