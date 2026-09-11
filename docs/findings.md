@@ -163,3 +163,55 @@ there is no wireless-adb back door to aim at instead.
 ~2.6 s per appearance and returns several times during boot (one capture:
 t+26.4s, t+38.2s, t+54.3s). BROM is PID `0x0003`. Captures in
 `recon/captures/boot-modes-*.txt`.
+
+## 2026-09-11 (later still) — the working route to a real console: preloader META port
+
+This is the breakthrough. Everything below is reproduced from
+`recon/captures/brom-probe-*.log` and is stable across four consecutive boots.
+
+**The MediaTek preloader on this unit exposes a text console, not just a bulk pipe.**
+
+Measured ladder from a cold power-on (USB stays connected the whole time):
+
+| Time | Bus state | What it is |
+|------|-----------|------------|
+| t+0 s | PID `0x2008`, name `MIKO3`, iface `ff/ff/00` | Android already up (previous boot) |
+| t+9…27 s | bus silent | power-off / reset gap |
+| ~t+25 s | PID `0x2000`, name `MT65xx Preloader`, fresh node `/dev/cu.usbmodem2100` | preloader, open for **~2.3 s** |
+| ~t+44 s | PID `0x201c`, name `Android`, iface `ff/42/03` | fastboot gadget, after we write `FASTBOOT` |
+
+The handshake on `/dev/cu.usbmodem2100 @ 115200`:
+
+- write `a0 0a 50 05`, read `52 45 41 44` = ASCII **`READ`**, ~300 ms after the stage appears
+- the port then streams ASCII `READY` repeatedly — MediaTek's META handshake prompt
+- writing a mode name right after `READY` is honoured: `FASTBOOT` moved the unit into
+  fastboot on the next enumeration (PID `0x201c`, interface `ff/42/03`)
+- `fastboot devices` then lists `MIKO3250XXM3Q0636CB`
+
+So the chain is: **power-cycle → catch the ~2.3 s preloader window → talk META over its
+CDC-ACM node → name the mode we want.** No buttons, no OTG adapter, no UI navigation.
+`scripts/brom-probe.py` does the watch-and-write; `scripts/fastboot-once.sh` wraps the
+whole cycle and issues the first fastboot read itself.
+
+**Why mtkclient reported `Handshake failed` on a link that demonstrably works.** Its
+`Library/Port.py:run_handshake` writes the SYNC one byte at a time and requires each
+byte echoed back inverted (`0xa0` → `0x5f`, …), which is classic BROM behaviour. This
+chip answers the whole SYNC at once with ASCII `READ` instead, so the per-byte
+comparison never matches and it gives up after five retries — while the port itself is
+perfectly responsive. `Library/meta.py` in the same project *does* match this
+behaviour (read until `READY`, then write a mode string), which is the shape our probe
+copies. Related: pass a fixed port (`--serialport /dev/cu.usbmodem2100`) rather than
+`DETECT`, because Android's own node (`usbmodem208NTXR9D2662`) is present most of the
+time and detection can pick it instead.
+
+**Fastboot on this unit is minimal.** The first command after the mode switch answered
+(`getvar all` → `(remote: 'unknown command')`), later ones in the same run stalled
+until timeout, and `fastboot -s serial:<n> getvar …` sits at `<waiting for …>` even
+though plain `fastboot devices` lists the unit. Practical rule: enter fastboot and
+issue the read immediately, in one short-lived process — which is exactly what
+`scripts/fastboot-once.sh` does.
+
+**Also confirmed:** Android's persistent ACM node is not a console — silent at 115200,
+921600, 1500000 and 3000000 baud, with and without a CR/LF. And the AOAv2 model-string
+trick (`AdsDebug` / `Ace`) still only flips the unit into accessory mode; `adb devices`
+stayed empty through a replug and a reboot.
