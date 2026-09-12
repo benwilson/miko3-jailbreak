@@ -33,6 +33,9 @@ Full documentation: [`docs/method-factory-root.md`](docs/method-factory-root.md)
 |------|----------|
 | `docs/` | Writeups: teardown, boot chain, findings, factory root method |
 | `docs/method-factory-root.md` | **The canonical root method** |
+| `docs/update-mechanism.md` | Reverse-engineered OTA engine (APPS.zip / `3_files.l` / `.ia`) |
+| `docs/mishap-recovery.md` | The "robo mishap" incident: cause + recovery steps |
+| `docs/secrets-and-auth.md` | Where the secrets live + how we derived them (redacted) |
 | `recon/` | Enumeration results, USB captures, probe logs |
 | `recon/captures/` | Timestamped logs from every probe and session |
 | `firmware/dump/` | Full firmware backup with SHA-256 manifest (22 images, 8.8 GB) |

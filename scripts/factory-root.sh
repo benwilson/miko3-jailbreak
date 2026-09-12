@@ -135,10 +135,23 @@ if [ "$root_check" != "0" ]; then
 fi
 info "Root confirmed (uid=0)."
 
-# ── Disable watchdog (first time only) ──────────────────────────
-warn "Disabling watchdog..."
-adb shell "mv /data/app/com.example.root.serviceexam-* /data/app/com.example.root.serviceexam-disabled 2>/dev/null" 2>/dev/null
-info "Watchdog disabled."
+# ── Disable watchdog (bind-mount no-op over /system/bin/reboot) ─
+warn "Neutering watchdog (bind-mount no-op over /system/bin/reboot)..."
+adb shell "
+  # Only neuter if not already done
+  if grep -q 'exit 0' /system/bin/reboot 2>/dev/null; then
+    echo 'watchdog already neutered'
+  else
+    # Write no-op reboot script
+    echo '#!/system/bin/sh' > /data/local/tmp/nr
+    echo 'exit 0' >> /data/local/tmp/nr
+    chmod 755 /data/local/tmp/nr
+    # Bind-mount over real reboot (global namespace - works for ServiceExam)
+    mount --bind /data/local/tmp/nr /system/bin/reboot 2>/dev/null || true
+    echo 'watchdog neutered'
+  fi
+" 2>/dev/null
+info "Watchdog neutered (reboot is now a no-op)."
 
 # ── Optional: dump firmware ────────────────────────────────────
 if [ "$dump" -eq 1 ]; then
