@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Miko 3 boot agent — a purpose-built APK that brings root adb up at every normal boot.
+     It replicates how any launcher auto-starts: a manifest BOOT_COMPLETED receiver. On boot it
+     execs /system/bin/su (world-exec setuid root on this unit) to start neuterd (which shadows
+     /system/bin/reboot in init's global mount namespace), then enables adb on USB and TCP 5555.
+     Derived from ne3d-4-steve/miko3-adb-boot-agent; see bootagent/README.md and the plan. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.miko3.bootagent"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+
+    <application
+        android:label="Miko3 Boot Agent"
+        android:allowBackup="false">
+
+        <!-- Launcher activity: lets the app be started once to clear Android's post-install
+             "stopped" state, which arms the boot receiver. Kept for parity with the upstream
+             agent; the factory-mode install path clears the stopped flag directly instead. -->
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <receiver android:name=".BootReceiver" android:exported="true" android:enabled="true">
+            <intent-filter android:priority="999">
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
