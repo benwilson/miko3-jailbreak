@@ -41,3 +41,19 @@ The looping startup animation a kiosk shows while it waits for the service init 
 ## Watchdog
 
 The kiosk-side watchdog process that keeps the unit's single-purpose screen up and reboots the unit when it observes the adb daemon running, which is why a console that depends on the OS staying up is less dependable than one caught during the preloader window.
+
+## Boot agent
+
+The app that runs the root payload on every normal boot: a manifest `BOOT_COMPLETED` receiver that execs the setuid `su` and then brings adb up. It is the only way to run a root command at boot on this unit, because verity keeps the system and vendor init read-only and no init trigger consumes an adb property. Being installed means the receiver is registered and past the stopped state, not merely that the APK is present.
+
+## Neuterd
+
+The small freestanding arm64 daemon, reused from the openmiko research, that keeps the reboot no-op in place. It enters init's global mount namespace and re-applies the shadow whenever the real reboot binary reappears, so the neuter survives whatever wipes it. It exists because the mount has to be made in the namespace the watchdog actually sees.
+
+## Global mount namespace
+
+The namespace init owns, as opposed to the private one an app process gets. A bind mount made from an app lands in the app's namespace and is invisible to the watchdog, a zygote child in the global one, so a neuter is only real when it is made after entering init's namespace. It is why the watchdog fix needs a native daemon rather than an app-side mount.
+
+## Stopped state
+
+Android's per-package flag, recorded in the per-user package-restrictions file, that keeps a freshly installed app from receiving broadcasts until it has been launched once. It is what makes a boot receiver silent, and the reason installation cannot stop at placing the APK: this unit has no activity manager in factory mode, so the flag is cleared directly rather than by launching the app.
