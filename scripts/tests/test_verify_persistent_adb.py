@@ -82,8 +82,32 @@ class RebootMagicTest(unittest.TestCase):
     def test_shadow_script_is_not_elf(self):
         self.assertFalse(v.parse_reboot_magic(" 23 21 2f 73"))
 
-    def test_unreadable_output_is_not_elf(self):
-        self.assertFalse(v.parse_reboot_magic(""))
+    def test_unreadable_probe_is_unknown_not_a_shadow(self):
+        """An empty read is not evidence the shadow is in place."""
+        self.assertIsNone(v.parse_reboot_magic(""))
+
+    def test_unreadable_probe_is_reported_as_failed(self):
+        up, lines = v.assess_usb(uid="0", adbd="running", usb_config="mtp,adb",
+                                 reboot_is_real=None, neuterd_alive=True, watcher_alive=True,
+                                 auth_state="device")
+        self.assertFalse(up)
+        self.assertTrue(any("unreadable" in line for line in lines), lines)
+
+
+class TimestampParserTest(unittest.TestCase):
+    def test_parse_epoch(self):
+        self.assertEqual(v.parse_epoch("1694467200\n"), 1694467200)
+        self.assertIsNone(v.parse_epoch(""))
+
+    def test_parse_uptime_secs(self):
+        self.assertEqual(v.parse_uptime_secs("9005.42 12000.10\n"), 9005.42)
+        self.assertIsNone(v.parse_uptime_secs(""))
+
+    def test_parsers_drive_the_freshness_verdict(self):
+        log_mtime = v.parse_epoch("9005")
+        now = v.parse_epoch("10000")
+        up = v.parse_uptime_secs("1000.0 2000.0")
+        self.assertTrue(v.log_is_fresh(log_mtime, now, up))
 
 
 class BootLogFreshnessTest(unittest.TestCase):
@@ -223,13 +247,59 @@ class TransportTargetingTest(unittest.TestCase):
 
 
 class PreconditionTest(unittest.TestCase):
+    def _fake_adb(self, listing):
+        return lambda *a, **k: types.SimpleNamespace(stdout=listing, stderr="", returncode=0)
+
     def test_no_device_raises_rather_than_reporting_a_boot(self):
-        empty = types.SimpleNamespace(stdout="List of devices attached\n\n", stderr="",
-                                      returncode=0)
-        with mock.patch.object(v, "adb", lambda *a, **k: empty):
+        with mock.patch.object(v, "adb", self._fake_adb("List of devices attached\n\n")):
             with self.assertRaises(v.VerifyError) as ctx:
                 v.require_device(v.DEFAULT_USB_SERIAL)
         self.assertIn("no device attached", str(ctx.exception))
+
+    def test_other_device_attached_does_not_satisfy_the_gate(self):
+        """The verdict must describe the unit the operator named, not whatever is attached."""
+        listing = "List of devices attached\n10.0.0.5:5555\tdevice\n\n"
+        with mock.patch.object(v, "adb", self._fake_adb(listing)):
+            with self.assertRaises(v.VerifyError) as ctx:
+                v.require_device(v.DEFAULT_USB_SERIAL)
+        self.assertIn("named transport is not attached", str(ctx.exception))
+
+
+class ReassertTest(unittest.TestCase):
+    """AE2: reading the current value cannot show the re-assertion ever happened."""
+
+    def test_restored_config_is_reported(self):
+        seq = []
+
+        def fake_sh(cmd, serial=None):
+            seq.append(cmd)
+            if cmd.startswith("getprop sys.usb.config") and len(seq) == 1:
+                return "mtp,adb"          # before the perturbation
+            return "mtp,adb"              # watcher re-asserted it
+
+        with mock.patch.object(v, "sh", fake_sh), \
+                mock.patch.object(v.time, "sleep", lambda s: None):
+            self.assertEqual(v.check_reassert("SERIAL", wait_secs=0), "mtp,adb")
+
+    def test_config_is_restored_when_adb_does_not_come_back(self):
+        state = {"config": "mtp,adb"}
+        seq = []
+
+        def fake_sh(cmd, serial=None):
+            seq.append(cmd)
+            if cmd.startswith("setprop sys.usb.config mtp,adb"):
+                state["config"] = "mtp,adb"
+            elif cmd.startswith("setprop sys.usb.config mtp"):
+                state["config"] = "mtp"
+            return state["config"]
+
+        with mock.patch.object(v, "sh", fake_sh), \
+                mock.patch.object(v.time, "sleep", lambda s: None):
+            after = v.check_reassert("SERIAL", wait_secs=0)
+
+        self.assertEqual(after, "mtp")
+        self.assertIn("setprop sys.usb.config mtp,adb", seq,
+                      "verifying must not cost the operator the channel it verified over")
 
 
 class VerifyCompositionTest(unittest.TestCase):

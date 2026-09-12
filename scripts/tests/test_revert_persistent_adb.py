@@ -132,9 +132,52 @@ class ProtectedPackagesTest(unittest.TestCase):
             self.assertNotIn(f"rm -rf /data/app/{name}", src)
             self.assertNotIn(f"mv /data/app/{name}", src)
 
-    def test_staged_removal_targets_only_the_agent_directory(self):
+    def test_directory_removal_is_separate_from_the_process_kills(self):
+        """The /data/app removal must not run alongside the kills; see the ordering test."""
         joined = " ".join(rev.staged_removal_cmds())
-        self.assertIn(f"/data/app/{rev.PKG}-*==", joined)
+        self.assertNotIn("/data/app/", joined)
+        self.assertIn(f"/data/app/{rev.PKG}-*==", rev.remove_agent_dir_cmd())
+
+
+class RemovalOrderingTest(unittest.TestCase):
+    """P0: a surviving packages.xml entry whose directory is gone is the recorded purge trigger."""
+
+    def _run_main(self, order):
+        def fake_sh(cmd, serial=None, check=True):
+            if cmd.startswith("rm -rf /data/app/"):
+                order.append("rmdir")
+            elif cmd.startswith("stat -c"):
+                return types.SimpleNamespace(stdout="660\n", stderr="", returncode=0)
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        def fake_adb(*args, serial=None, check=True):
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        def fake_edit(serial, path, fn, label):
+            order.append("edit:" + path)
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(rev, "sh", fake_sh), \
+                mock.patch.object(rev, "adb", fake_adb), \
+                mock.patch.object(rev, "edit_agent_entries", fake_edit), \
+                mock.patch.object(rev, "latest_backup", lambda: Path(td)), \
+                mock.patch.object(rev, "require_root", lambda s: None), \
+                mock.patch.object(rev, "agent_installed", lambda s: True), \
+                mock.patch.object(rev, "restore_adb_keys", lambda s, b: None), \
+                mock.patch.object(rev, "assert_protected", lambda s: []), \
+                mock.patch.object(rev, "write_capture", lambda p: Path(td)), \
+                mock.patch.object(rev.sys, "argv", ["revert-persistent-adb.py", "--no-reboot"]):
+            rev.main()
+
+    def test_entries_are_removed_before_the_directory(self):
+        order = []
+        self._run_main(order)
+        self.assertIn("rmdir", order, f"the directory removal never ran: {order}")
+        self.assertIn("edit:" + rev.PACKAGES_XML, order, f"packages.xml was never edited: {order}")
+        self.assertLess(order.index("edit:" + rev.PACKAGES_XML), order.index("rmdir"),
+                        f"packages.xml entry must be removed before its directory: {order}")
+        self.assertLess(order.index("edit:" + rev.RESTRICTIONS_XML), order.index("rmdir"),
+                        f"package-restrictions entry must be removed before the directory: {order}")
 
 
 class RemovalCleanupTest(unittest.TestCase):

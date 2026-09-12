@@ -61,6 +61,10 @@ PROTECTED = ("com.example.root.serviceexam", "com.miko.mikoplus")
 
 DEFAULT_USB_SERIAL = "MIKO3250XXM3Q0636CB"
 
+# A device that stops answering must fail, not hang: revert's destructive window sits between
+# two device round trips.
+ADB_TIMEOUT = 120
+
 
 class RevertError(SystemExit):
     """A revert precondition or step failed."""
@@ -69,7 +73,13 @@ class RevertError(SystemExit):
 def adb(*args, serial=None, check=True):
     cmd = ["adb"] + (["-s", serial] if serial else []) + list(args)
     print("  $ " + " ".join(cmd), flush=True)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=ADB_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RevertError(
+            f"!! adb timed out after {ADB_TIMEOUT}s: {' '.join(cmd)}\n"
+            "   The unit stopped answering mid-revert. Do NOT power it off; check USB and "
+            "re-run, then follow docs/mishap-recovery.md if the kiosk does not return.")
     if check and r.returncode != 0:
         raise RevertError(f"!! adb failed ({r.returncode}): {' '.join(cmd)}\n{r.stderr.strip()}")
     return r
@@ -80,10 +90,18 @@ def sh(cmd, serial=None, check=True):
 
 
 def require_root(serial):
+    """Refuse unless the session is root.
+
+    Revert runs from whichever root adb session exists: usually the running agent on a normal
+    boot, or factory mode (scripts/factory-root.sh) when it is not. It deliberately does not
+    require factory mode — the common case is reverting a *working* agent, which by definition
+    is a normal boot.
+    """
     uid = sh("id -u", serial).stdout.strip()
     if uid != "0":
-        raise RevertError(f"!! not a root session (id -u={uid!r}); enter factory mode with "
-                          "scripts/factory-root.sh first.")
+        raise RevertError(f"!! not a root session (id -u={uid!r}). Revert needs a root adb "
+                          "session: either the running agent, or factory mode "
+                          "(scripts/factory-root.sh).")
 
 
 # --- pure helpers (unit-tested) ---------------------------------------------------------
@@ -122,6 +140,20 @@ def opening_gate(agent_installed, backup):
     return "error" if agent_installed else "nothing-to-do"
 
 
+def adb_keys_backup_dir():
+    """The EARLIEST backup dir carrying an adb_keys record, or None.
+
+    Earliest, not newest: a second install backs up the key the first install wrote, so the
+    newest record describes the installed state rather than the pre-install state.
+    """
+    if not BACKUP_ROOT.exists():
+        return None
+    for d in sorted(x for x in BACKUP_ROOT.iterdir() if x.is_dir()):
+        if (d / "adb_keys").exists() or (d / "adb_keys.absent").exists():
+            return d
+    return None
+
+
 def adb_keys_action(backup):
     """'restore', 'delete', or 'unknown' for /data/misc/adb/adb_keys.
 
@@ -138,14 +170,26 @@ def adb_keys_action(backup):
 
 
 def staged_removal_cmds():
-    """The device commands that remove only the agent (no directory before its entry)."""
+    """Device commands that stop the agent and clear its scratch files.
+
+    The agent's /data/app directory is deliberately NOT in this list. It is removed only
+    after its packages.xml entry is gone; see remove_agent_dir_cmd.
+    """
     return [
         "pkill -f /data/local/tmp/miko3-usb-watch.sh 2>/dev/null; true",
         "pkill -f /data/local/tmp/neuterd 2>/dev/null; true",
-        f"rm -rf /data/app/{PKG}-*==",
         "rm -f /data/local/tmp/miko3-bootagent.apk /data/local/tmp/miko3-boot.log "
         f"/data/local/tmp/miko3-usb-watch.sh /data/local/tmp/neuterd {NEUTER_SRC}",
     ]
+
+
+def remove_agent_dir_cmd():
+    """The agent's directory removal, run only after its XML entries are gone.
+
+    A surviving packages.xml entry whose directory has been deleted is the state recorded in
+    docs/mishap-recovery.md as feeding the package manager's purge of all of /data/app.
+    """
+    return f"rm -rf /data/app/{PKG}-*=="
 
 
 # --- device steps -----------------------------------------------------------------------
@@ -165,18 +209,19 @@ def edit_agent_entries(serial, path, remove_fn, label):
     PackageManagerService has written since install, and the recorded failure mode for this
     unit is a stale or partial packages.xml causing a purge of all of /data/app.
     """
-    tmp = Path(tempfile.mkdtemp()) / Path(path).name
-    adb("pull", path, str(tmp), serial=serial)
-    original = tmp.read_text()
-    edited, removed = remove_fn(original)
-    if removed == 0:
-        print(f"   {label}: no {PKG} entry present")
-        return 0
-    before_mode = sh(f"stat -c '%a' {path}", serial, check=False).stdout.strip() or "660"
-    before_owner = sh(f"stat -c '%U:%G' {path}", serial, check=False).stdout.strip() or "system:system"
-    tmp.write_text(edited)
-    adb("push", str(tmp), path, serial=serial)
-    sh(f"chown {before_owner} {path}; chmod {before_mode} {path}", serial)
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / Path(path).name
+        adb("pull", path, str(tmp), serial=serial)
+        edited, removed = remove_fn(tmp.read_text())
+        if removed == 0:
+            print(f"   {label}: no {PKG} entry present")
+            return 0
+        before_mode = sh(f"stat -c '%a' {path}", serial, check=False).stdout.strip() or "660"
+        before_owner = sh(f"stat -c '%U:%G' {path}", serial,
+                          check=False).stdout.strip() or "system:system"
+        tmp.write_text(edited)
+        adb("push", str(tmp), path, serial=serial)
+        sh(f"chown {before_owner} {path}; chmod {before_mode} {path}", serial)
     print(f"   {label}: removed the agent's entry")
     return removed
 
@@ -236,7 +281,8 @@ def main():
                                 (RESTRICTIONS_XML, remove_restriction_entry,
                                  "package-restrictions.xml")):
             print(f"  surgically remove the {PKG} entry from {path} ({label})")
-        print(f"  adb_keys action: {adb_keys_action(backup)}")
+        print(f"  {remove_agent_dir_cmd()}")
+        print(f"  adb_keys action: {adb_keys_action(adb_keys_backup_dir() or backup)}")
         print(f"backup: {backup or '(none found)'}")
         return 0
 
@@ -255,21 +301,30 @@ def main():
             "restore firmware (scripts/restore-firmware.sh) or re-enter factory mode "
             "(scripts/factory-root.sh) and re-run install first.")
 
+    # Stop the agent and clear its scratch files first; these touch nothing boot-critical.
     for cmd in staged_removal_cmds():
         sh(cmd, serial, check=False)
-    print("== agent processes and files removed ==")
+    print("== agent processes stopped; scratch files removed ==")
 
-    # Entries before the directory: a surviving entry whose directory is gone is the
-    # documented purge trigger.
-    edit_agent_entries(serial, PACKAGES_XML, remove_package_entry, "packages.xml")
-    edit_agent_entries(serial, RESTRICTIONS_XML, remove_restriction_entry,
-                       "package-restrictions.xml")
+    # Entries before the directory. The reverse order leaves a packages.xml entry whose
+    # directory is gone, which is the state docs/mishap-recovery.md records as feeding the
+    # package manager's purge of all of /data/app.
+    for path, remove_fn, label in ((PACKAGES_XML, remove_package_entry, "packages.xml"),
+                                   (RESTRICTIONS_XML, remove_restriction_entry,
+                                    "package-restrictions.xml")):
+        edit_agent_entries(serial, path, remove_fn, label)
 
-    restore_adb_keys(serial, backup)
+    sh(remove_agent_dir_cmd(), serial, check=False)
+    print("== agent /data/app directory removed ==")
+
+    # The EARLIEST adb_keys record is the pre-install state; a later install would have
+    # recorded the key the previous one wrote.
+    restore_adb_keys(serial, adb_keys_backup_dir() or backup)
 
     missing = assert_protected(serial)
     if missing:
         print(f"   !! protected apps missing after revert: {', '.join(missing)}")
+        print("   Follow the restore steps in docs/mishap-recovery.md before rebooting.")
     else:
         print("== ServiceExam and MikoPlus still installed ==")
 
@@ -285,7 +340,9 @@ def main():
         # the shadow intercepts for the rest of the boot even after neuterd is killed.
         print("   rebooting via adb's reboot service (bypasses the reboot shadow) ...")
         adb("reboot", serial=serial)
-    return 0
+    # A missing protected app is the condition this script exists to detect, so it must not
+    # report success.
+    return 1 if missing else 0
 
 
 if __name__ == "__main__":

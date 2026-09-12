@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Tests for scripts/install-persistent-adb.py.
 
-Covers the pure registration helpers (stopped-flag clearing, packages.xml entry
-build/insert) and the factory-mode precondition, plus the invariant that the
-script never removes ServiceExam or MikoPlus. The device install itself is proved
-by the plan's device proof, not here.
+Covers the pure helpers (stopped-flag clearing, the arm decision), the
+factory-mode precondition, transport targeting, the device commands the install
+emits (APK placement and the adb key write), and the invariant that the script
+never removes ServiceExam or MikoPlus. The device install itself is proved by the
+plan's device proof, not here.
 """
 import importlib.util
 import tempfile
@@ -35,14 +36,6 @@ RESTRICTIONS = """<?xml version="1.0" encoding="utf-8"?>
   <pkg name="com.miko.launcher_app" stopped="true" />
 </package-restrictions>
 """
-
-PACKAGES = """<?xml version="1.0" encoding="utf-8"?>
-<packages>
-    <package name="com.example.root.serviceexam" codePath="/data/app/x" version="92">
-    </package>
-</packages>
-"""
-
 
 class ClearStoppedTest(unittest.TestCase):
     def test_removes_stopped_from_target(self):
@@ -178,6 +171,90 @@ class ProtectedPackagesTest(unittest.TestCase):
         for name in inst.PROTECTED:
             self.assertNotIn(f"rm -rf /data/app/{name}", src)
             self.assertNotIn(f"mv /data/app/{name}", src)
+
+
+class DeviceCommandTest(unittest.TestCase):
+    """The owner/mode the install writes are part of the contract, not incidental."""
+
+    def _capture(self, fn, *args):
+        cmds = []
+
+        def fake_sh(cmd, check=True):
+            cmds.append(cmd)
+            # the adb_keys write is read back; answer that probe as a landed write
+            out = "1\n" if cmd.startswith("wc -l") else ""
+            return types.SimpleNamespace(stdout=out, stderr="", returncode=0)
+
+        def fake_adb(*a, **k):
+            cmds.append("adb " + " ".join(str(x) for x in a))
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        with mock.patch.object(inst, "sh", fake_sh), mock.patch.object(inst, "adb", fake_adb):
+            fn(*args)
+        return cmds
+
+    def test_place_apk_sets_expected_owner_and_modes(self):
+        cmds = self._capture(inst.place_apk, "abc==")
+        joined = "\n".join(cmds)
+        self.assertIn("chmod 755", joined)
+        self.assertIn("chmod 644", joined)
+        self.assertIn("chown -R system:system", joined)
+
+    def test_authorize_host_key_appends_rather_than_replaces(self):
+        """Replacing the file would revoke every other host already authorized."""
+        key = Path.home() / ".android" / "adbkey.pub"
+        if not key.exists() or not key.read_text().strip():
+            self.skipTest("no host adbkey.pub on this machine")
+        cmds = self._capture(inst.authorize_host_key)
+        joined = "\n".join(cmds)
+        self.assertIn("grep -qxF", joined, "the key must be appended only when absent")
+        self.assertNotIn("> " + inst.ADB_KEYS + ".tmp", joined,
+                         "the previous implementation replaced the whole file")
+        self.assertIn(f"chmod 640 {inst.ADB_KEYS}", joined)
+
+    def test_agent_registered_probes_packages_xml_not_the_package_manager(self):
+        """The arm path must work in factory mode, which has no package manager (KTD4)."""
+        src = INSTALL_PY.read_text()
+        self.assertIn("def agent_registered()", src)
+        self.assertNotIn('sh(f"pm path {PKG}', src,
+                         "a package-manager probe is unreachable from factory mode")
+
+
+class ArmTest(unittest.TestCase):
+    def test_registered_but_suppressed_clears_the_stopped_flag(self):
+        pushed = []
+
+        def fake_sh(cmd, check=True):
+            if cmd.startswith("grep -o"):
+                return types.SimpleNamespace(stdout='name="com.miko3.bootagent"\n',
+                                             stderr="", returncode=0)
+            if cmd.startswith("stat -c"):
+                return types.SimpleNamespace(stdout="660\n", stderr="", returncode=0)
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        def fake_adb(*args, **kwargs):
+            if args and args[0] == "pull":
+                Path(args[2]).write_text(RESTRICTIONS)
+            if args and args[0] == "push":
+                pushed.append(Path(args[1]).read_text())
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        with mock.patch.object(inst, "sh", fake_sh), mock.patch.object(inst, "adb", fake_adb):
+            rc = inst.arm()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(pushed), 1, "expected exactly one write-back")
+        self.assertNotIn('name="com.miko3.bootagent" ceDataInode="123" stopped="true"', pushed[0])
+        self.assertIn("com.example.root.serviceexam", pushed[0])
+
+    def test_never_registered_routes_to_factory_mode_recovery(self):
+        def fake_sh(cmd, check=True):
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        with mock.patch.object(inst, "sh", fake_sh):
+            with self.assertRaises(inst.InstallError) as ctx:
+                inst.arm()
+        self.assertIn("never registered", str(ctx.exception))
 
 
 if __name__ == "__main__":

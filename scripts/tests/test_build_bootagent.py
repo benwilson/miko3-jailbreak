@@ -11,6 +11,7 @@ import io
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 import zipfile
 from pathlib import Path
@@ -72,17 +73,15 @@ class NormalizeZipTest(unittest.TestCase):
         with zipfile.ZipFile(buf, "w") as z:
             info = zipfile.ZipInfo("a.txt", date_time=(2026, 9, 12, 0, 32, 0))
             z.writestr(info, b"hello")
-        tmp = Path("/tmp/_norm_test.zip")
-        tmp.write_bytes(buf.getvalue())
-        try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td) / "_norm_test.zip"
+            tmp.write_bytes(buf.getvalue())
             build.normalize_zip_timestamps(tmp)
             with zipfile.ZipFile(tmp) as z:
                 names = z.namelist()
                 self.assertEqual(names, ["a.txt"])
                 self.assertEqual(z.read("a.txt"), b"hello")
                 self.assertEqual(z.infolist()[0].date_time, (2020, 1, 1, 0, 0, 0))
-        finally:
-            tmp.unlink(missing_ok=True)
 
 
 class SourceInvariantTest(unittest.TestCase):
@@ -156,11 +155,23 @@ class CommittedApkTest(unittest.TestCase):
                          "Android build-tools not on PATH; byte-stability is proved by the "
                          "Verification Contract's build proof instead")
     def test_rebuild_is_byte_stable(self):
-        """U3: the committed keystore plus normalized zip timestamps reproduce the APK."""
+        """U3: the committed keystore plus normalized zip timestamps reproduce the APK.
+
+        The build runs against a scratch COPY of the tree, so a failed rebuild can never
+        overwrite the committed artifact.
+        """
         before = APK.read_bytes()
-        r = subprocess.run([sys.executable, str(BUILD_PY)], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(APK.read_bytes(), before, "rebuild produced a different APK")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "scripts").mkdir()
+            shutil.copytree(REPO / "bootagent", root / "bootagent")
+            shutil.copy2(BUILD_PY, root / "scripts" / "build-bootagent.py")
+            r = subprocess.run([sys.executable, str(root / "scripts" / "build-bootagent.py")],
+                               capture_output=True, text=True, cwd=str(root))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            rebuilt = (root / "bootagent" / "miko3-bootagent.apk").read_bytes()
+        self.assertEqual(rebuilt, before, "rebuild produced a different APK")
+        self.assertEqual(APK.read_bytes(), before, "the committed APK must not be modified")
 
 
 class NeuterdBinaryTest(unittest.TestCase):

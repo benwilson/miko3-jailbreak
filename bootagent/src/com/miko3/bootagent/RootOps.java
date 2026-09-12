@@ -3,6 +3,7 @@ package com.miko3.bootagent;
 import android.util.Log;
 
 import java.io.OutputStream;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The privileged boot payload. Empirically grounded on this unit (Android 9 / mt8167, verity
@@ -26,6 +27,9 @@ import java.io.OutputStream;
 public final class RootOps {
 
     private static final String TAG = "Miko3Boot";
+
+    /** Upper bound on the root payload's runtime, so a blocked su cannot hang the receiver. */
+    private static final int SU_TIMEOUT_SECS = 90;
 
     /** neuterd (arm64 ELF, freestanding) as base64 — regenerated from native/neuterd by build-bootagent.py. */
     private static final String NEUTERD_B64 = "@@NEUTERD_B64@@";
@@ -90,7 +94,15 @@ public final class RootOps {
             os.write(PAYLOAD.getBytes("UTF-8"));
             os.flush();
             os.close();
-            int rc = p.waitFor();
+            // Bounded: a payload that blocks inside su would hang the receiver thread with no
+            // log and no failure surface.
+            if (!p.waitFor(SU_TIMEOUT_SECS, TimeUnit.SECONDS)) {
+                p.destroy();
+                throw new IllegalStateException(
+                        "miko3 boot payload timed out after " + SU_TIMEOUT_SECS + "s"
+                                + " (see /data/local/tmp/miko3-boot.log)");
+            }
+            int rc = p.exitValue();
             Log.i(TAG, "boot payload exit=" + rc);
             if (rc != 0) {
                 throw new IllegalStateException("miko3 boot payload exited non-zero: " + rc

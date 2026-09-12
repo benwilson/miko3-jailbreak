@@ -273,11 +273,15 @@ def sign(withdex, bt, keytool, java_home_dir):
              "-storepass", KEYSTORE_PASS, "-keypass", KEYSTORE_PASS,
              "-dname", "CN=Miko3 Boot Agent"], env=env)
         print(f"   generated {KEYSTORE}")
+    # Sign to a build path and verify there, then publish. Signing straight onto the
+    # committed artifact would leave the repository holding an unsigned APK if signing failed.
+    signed = BUILD / "signed.apk"
     run([bt / "apksigner", "sign", "--ks", str(KEYSTORE),
          "--ks-pass", f"pass:{KEYSTORE_PASS}", "--key-pass", f"pass:{KEYSTORE_PASS}",
          "--v4-signing-enabled", "false",
-         "--min-sdk-version", "28", "--out", str(APK), str(aligned)])
-    run([bt / "apksigner", "verify", "--print-certs", str(APK)])
+         "--min-sdk-version", "28", "--out", str(signed), str(aligned)])
+    run([bt / "apksigner", "verify", "--print-certs", str(signed)])
+    shutil.move(str(signed), str(APK))
 
 
 def main():

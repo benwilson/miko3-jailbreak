@@ -29,7 +29,7 @@ device" — which reads as Wi-Fi DOWN while it is up, or attributes USB's answer
 Usage:
   python3 scripts/verify-persistent-adb.py               # human-readable verdict
   python3 scripts/verify-persistent-adb.py --json        # machine-readable
-  python3 scripts/verify-persistent-adb.py --usb-serial <serial> --tcp-serial <ip:5555>
+  python3 scripts/verify-persistent-adb.py --usb-serial <serial> --reassert
 
 Dependencies: python3, adb.
 """
@@ -57,15 +57,24 @@ TCP_PORT = 5555
 # /system/bin/reboot's real binary is an ELF; the no-op shadow is a shell script.
 ELF_MAGIC_HEX = "7f454c46"
 
+# A device that stops answering must fail, not hang: revert's destructive window sits between
+# two device round trips.
+ADB_TIMEOUT = 120
+
 
 class VerifyError(SystemExit):
     """A verify precondition failed; message is actionable."""
 
 
 def adb(*args, serial=None, check=False):
-    """Run adb, naming the transport explicitly (KTD10)."""
+    """Run adb, naming the transport explicitly (KTD10) and bounding every call."""
     cmd = ["adb"] + (["-s", serial] if serial else []) + list(args)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=ADB_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        if check:
+            raise VerifyError(f"!! adb timed out after {ADB_TIMEOUT}s: {' '.join(cmd)}")
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
     if check and r.returncode != 0:
         raise VerifyError(f"!! adb failed: {' '.join(cmd)}\n{r.stderr.strip()}")
     return r
@@ -103,8 +112,13 @@ def parse_reboot_magic(raw):
     """True when the first bytes are ELF magic, i.e. the real binary is back.
 
     A byte-size check cannot tell a shadow from a truncated real binary; the magic can.
+    Returns None when the probe produced nothing — an unreadable probe is not evidence that
+    the shadow is in place, and must not be reported as one.
     """
-    return "".join((raw or "").split()).lower().startswith(ELF_MAGIC_HEX)
+    hexed = "".join((raw or "").split()).lower()
+    if not hexed:
+        return None
+    return hexed.startswith(ELF_MAGIC_HEX)
 
 
 def parse_uptime_secs(raw):
@@ -149,8 +163,12 @@ def assess_usb(uid, adbd, usb_config, reboot_is_real, neuterd_alive, watcher_ali
     has_adb = "adb" in (usb_config or "")
     lines.append(f"sys.usb.config = {usb_config or '?'} (want *adb*)")
     ok &= has_adb
-    lines.append(f"{REBOOT} is ELF = {reboot_is_real} (want False = shadowed)")
-    ok &= not reboot_is_real
+    if reboot_is_real is None:
+        lines.append(f"{REBOOT} = unreadable (probe failed; shadow NOT established)")
+        ok = False
+    else:
+        lines.append(f"{REBOOT} is ELF = {reboot_is_real} (want False = shadowed)")
+        ok &= not reboot_is_real
     lines.append(f"neuterd running = {neuterd_alive} (want True)")
     ok &= neuterd_alive
     lines.append(f"usb watcher running = {watcher_alive} (want True)")
@@ -219,11 +237,18 @@ def tcp_root(ip):
 def check_reassert(serial, wait_secs=4):
     """AE2: perturb sys.usb.config and re-read it, proving the watcher restores adb.
 
-    Reading the current value cannot show the re-assertion ever happened.
+    Reading the current value cannot show the re-assertion ever happened. The value from
+    before the perturbation is restored when adb does not come back, so verifying never costs
+    the operator the channel they were verifying over.
     """
+    before = sh("getprop sys.usb.config", serial)
     sh("setprop sys.usb.config mtp", serial)
     time.sleep(wait_secs)
-    return sh("getprop sys.usb.config", serial)
+    after = sh("getprop sys.usb.config", serial)
+    if "adb" not in after:
+        sh(f"setprop sys.usb.config {before or 'mtp,adb'}", serial)
+        sh("setprop ctl.restart adbd", serial)
+    return after
 
 
 def write_capture(result):
@@ -236,10 +261,11 @@ def write_capture(result):
 
 
 def require_device(usb_serial):
-    """Refuse to report a verdict with no device attached.
+    """Refuse to report a verdict unless the named transport is attached.
 
     Without this, empty getprop output reads as 'still booting' and a missing unit is
-    misreported as a boot in progress.
+    misreported as a boot in progress — or the verdict describes whichever device happened
+    to be attached instead of the one the operator named.
     """
     devices = parse_adb_devices(adb("devices").stdout)
     if not devices:
@@ -247,10 +273,15 @@ def require_device(usb_serial):
             "!! no device attached (adb devices is empty).\n"
             "   Connect USB, and confirm the agent is installed "
             "(scripts/install-persistent-adb.py) before verifying.")
+    if usb_serial not in devices:
+        raise VerifyError(
+            f"!! the named transport is not attached: {usb_serial!r}.\n"
+            f"   Attached: {', '.join(sorted(devices)) or '(none)'}\n"
+            "   Pass --usb-serial for the unit you mean to verify.")
     return devices
 
 
-def verify(json_out=False, usb_serial=DEFAULT_USB_SERIAL, tcp_serial=None, reassert=False):
+def verify(json_out=False, usb_serial=DEFAULT_USB_SERIAL, reassert=False):
     devices = require_device(usb_serial)
     auth_state = devices.get(usb_serial)
 
@@ -327,12 +358,10 @@ def main():
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--usb-serial", default=DEFAULT_USB_SERIAL,
                     help=f"USB transport serial (default: {DEFAULT_USB_SERIAL})")
-    ap.add_argument("--tcp-serial", default=None, help="TCP transport, e.g. 10.0.0.5:5555")
     ap.add_argument("--reassert", action="store_true",
                     help="prove AE2 by perturbing sys.usb.config and re-reading it")
     args = ap.parse_args()
-    return verify(json_out=args.json, usb_serial=args.usb_serial,
-                  tcp_serial=args.tcp_serial, reassert=args.reassert)
+    return verify(json_out=args.json, usb_serial=args.usb_serial, reassert=args.reassert)
 
 
 if __name__ == "__main__":

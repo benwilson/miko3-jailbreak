@@ -46,12 +46,16 @@ RESTRICTIONS_XML = "/data/system/users/0/package-restrictions.xml"
 ADB_KEYS = "/data/misc/adb/adb_keys"
 REMOTE_STAGE = "/data/local/tmp/miko3-bootagent.apk"
 REMOTE_BACKUP = "/data/local/tmp/miko3-agent-backup"
+BOOT_LOG = "/data/local/tmp/miko3-boot.log"
 
 # packages this script must never remove or edit
 PROTECTED = ("com.example.root.serviceexam", "com.miko.mikoplus")
 
 # The documented unit profile (docs/device-intel.md); override with --usb-serial.
 DEFAULT_USB_SERIAL = "MIKO3250XXM3Q0636CB"
+
+# A device that stops answering must fail, not hang.
+ADB_TIMEOUT = 120
 
 
 class InstallError(SystemExit):
@@ -67,7 +71,12 @@ SERIAL = None
 def adb(*args, check=True):
     cmd = ["adb"] + (["-s", SERIAL] if SERIAL else []) + list(args)
     print("  $ " + " ".join(cmd), flush=True)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=ADB_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise InstallError(
+            f"!! adb timed out after {ADB_TIMEOUT}s: {' '.join(cmd)}\n"
+            "   The unit stopped answering. Check the USB connection and re-run.")
     if check and r.returncode != 0:
         raise InstallError(f"!! adb failed ({r.returncode}): {' '.join(cmd)}\n{r.stderr.strip()}")
     return r
@@ -154,24 +163,32 @@ def place_apk(suffix):
 
 
 def authorize_host_key():
-    """Pre-authorize the host adb key so USB/TCP need no on-device confirmation (KTD5)."""
+    """Pre-authorize the host adb key so USB/TCP need no on-device confirmation (KTD5).
+
+    The key is pushed as a file rather than interpolated into a shell command, and it is
+    APPENDED only when absent — replacing the file would silently revoke every other host
+    already authorized on the unit. The write is read back, so a key that did not land is
+    reported instead of being announced as pre-authorized.
+    """
     key = Path.home() / ".android" / "adbkey.pub"
-    if not key.exists():
-        print(f"   !! host key {key} not found; skipping pre-authorization")
+    if not key.exists() or not key.read_text().strip():
+        print(f"   !! host key {key} missing or empty; skipping pre-authorization")
         return False
-    pub = key.read_text().strip()
-    sh(f"mkdir -p /data/misc/adb")
-    # write via a temp file to avoid quoting issues, then set owner/mode
-    sh(f"printf '%s\\n' '{pub}' > {ADB_KEYS}.tmp")
-    sh(f"mv {ADB_KEYS}.tmp {ADB_KEYS}")
+    staged = "/data/local/tmp/miko3-adbkey.pub"
+    adb("push", str(key), staged)
+    sh("mkdir -p /data/misc/adb")
+    sh(f"if ! grep -qxF \"$(cat {staged})\" {ADB_KEYS} 2>/dev/null; then "
+       f"cat {staged} >> {ADB_KEYS}; fi")
+    sh(f"rm -f {staged}")
     sh(f"chown system:system {ADB_KEYS}; chmod 640 {ADB_KEYS}")
+    written = sh(f"wc -l < {ADB_KEYS} 2>/dev/null", check=False).stdout.strip()
+    if not written or written == "0":
+        raise InstallError(f"!! the host key did not land in {ADB_KEYS}; aborting rather than "
+                           "leaving the unit without the authorization the install promised.")
     return True
 
 
 # --- pure helpers (unit-tested) ---------------------------------------------------------
-
-STOPPED_ATTR = re.compile(r'(<pkg\s+name="%s"[^>]*?)\s+stopped="true"')
-
 
 def clear_stopped(xml, pkg=PKG):
     """Remove stopped="true" from the package's entry in package-restrictions.xml.
@@ -199,11 +216,21 @@ def status():
     suffixes = existing_suffixes()
     print(f"package: {PKG}")
     print(f"placed:  {'yes, ' + ', '.join(suffixes) if suffixes else 'no'}")
-    log = sh(f"cat {REPO_LOG} 2>/dev/null | tail -5", check=False)
+    log = sh(f"cat {BOOT_LOG} 2>/dev/null | tail -5", check=False).stdout.strip()
+    print("boot log (tail):")
+    print(f"  {log}" if log else "  (none — the agent has not run on this unit)")
     return 0
 
 
-REPO_LOG = "/data/local/tmp/miko3-boot.log"
+def agent_registered():
+    """True when packages.xml carries the agent's <package> block.
+
+    A file probe, not `pm path`: the only session that can reach an un-armed unit is factory
+    mode, which has no package manager, so a package-manager probe would always answer "no"
+    and the arm path could never do the job it exists for (KTD4).
+    """
+    out = sh(f"grep -o 'name=\"{PKG}\"' {PACKAGES_XML} 2>/dev/null | head -1", check=False)
+    return bool(out.stdout.strip())
 
 
 def arm():
@@ -212,25 +239,26 @@ def arm():
     Registration is asserted first, so "registered but refused the broadcast" and "never
     registered" get different answers instead of one silent failure.
     """
-    registered = bool(sh(f"pm path {PKG} 2>/dev/null", check=False).stdout.strip())
-    decision = arm_decision(registered)
+    decision = arm_decision(agent_registered())
     if decision == "recover":
         raise InstallError(
             "!! the agent never registered, so there is no entry to correct — the "
             "install-time backup predates the APK and cannot hold its package block.\n"
             "   Recover by re-entering factory mode (scripts/factory-root.sh) and re-running "
             "install.")
-    tmp = Path(tempfile.mkdtemp()) / "package-restrictions.xml"
-    adb("pull", RESTRICTIONS_XML, str(tmp))
-    edited, n = clear_stopped(tmp.read_text())
-    if n == 0:
-        print("   the agent is registered and not marked stopped; nothing to arm")
-        return 0
-    mode = sh(f"stat -c '%a' {RESTRICTIONS_XML}", check=False).stdout.strip() or "660"
-    owner = sh(f"stat -c '%U:%G' {RESTRICTIONS_XML}", check=False).stdout.strip() or "system:system"
-    tmp.write_text(edited)
-    adb("push", str(tmp), RESTRICTIONS_XML)
-    sh(f"chown {owner} {RESTRICTIONS_XML}; chmod {mode} {RESTRICTIONS_XML}")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "package-restrictions.xml"
+        adb("pull", RESTRICTIONS_XML, str(tmp))
+        edited, n = clear_stopped(tmp.read_text())
+        if n == 0:
+            print("   the agent is registered and not marked stopped; nothing to arm")
+            return 0
+        mode = sh(f"stat -c '%a' {RESTRICTIONS_XML}", check=False).stdout.strip() or "660"
+        owner = sh(f"stat -c '%U:%G' {RESTRICTIONS_XML}",
+                   check=False).stdout.strip() or "system:system"
+        tmp.write_text(edited)
+        adb("push", str(tmp), RESTRICTIONS_XML)
+        sh(f"chown {owner} {RESTRICTIONS_XML}; chmod {mode} {RESTRICTIONS_XML}")
     print(f"   cleared the stopped flag for {PKG}; reboot to let BOOT_COMPLETED through")
     return 0
 
