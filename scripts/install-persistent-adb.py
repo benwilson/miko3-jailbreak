@@ -50,13 +50,22 @@ REMOTE_BACKUP = "/data/local/tmp/miko3-agent-backup"
 # packages this script must never remove or edit
 PROTECTED = ("com.example.root.serviceexam", "com.miko.mikoplus")
 
+# The documented unit profile (docs/device-intel.md); override with --usb-serial.
+DEFAULT_USB_SERIAL = "MIKO3250XXM3Q0636CB"
+
 
 class InstallError(SystemExit):
     """An install precondition or step failed; message is actionable."""
 
 
+# Set from --usb-serial. Every device command names its transport (KTD10): once the unit is
+# on normal boot adbd may be reachable over TCP as well, and an untargeted `adb shell` then
+# fails with "more than one device".
+SERIAL = None
+
+
 def adb(*args, check=True):
-    cmd = ["adb", *args]
+    cmd = ["adb"] + (["-s", SERIAL] if SERIAL else []) + list(args)
     print("  $ " + " ".join(cmd), flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if check and r.returncode != 0:
@@ -217,10 +226,14 @@ REPO_LOG = "/data/local/tmp/miko3-boot.log"
 
 
 def main():
+    global SERIAL
     ap = argparse.ArgumentParser(description="Install the Miko 3 boot agent from factory mode.")
     ap.add_argument("--no-reboot", action="store_true", help="do everything except the reboot")
     ap.add_argument("--status", action="store_true", help="report placement and exit")
+    ap.add_argument("--usb-serial", default=DEFAULT_USB_SERIAL,
+                    help=f"USB transport serial (default: {DEFAULT_USB_SERIAL})")
     args = ap.parse_args()
+    SERIAL = args.usb_serial
 
     if args.status:
         return status()

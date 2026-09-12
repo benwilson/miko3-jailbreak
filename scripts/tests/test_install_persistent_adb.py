@@ -162,6 +162,21 @@ class BackupSystemStateTest(unittest.TestCase):
             self.assertFalse(any(c.startswith("adb pull " + inst.ADB_KEYS) for c in calls))
 
 
+class TransportTargetingTest(unittest.TestCase):
+    """KTD10: every device command names its transport."""
+
+    def test_adb_names_the_usb_transport(self):
+        with mock.patch.object(inst, "SERIAL", "MIKO3250XXM3Q0636CB"), \
+                mock.patch.object(inst.subprocess, "run") as run_mock:
+            run_mock.return_value = types.SimpleNamespace(stdout="", stderr="", returncode=0)
+            inst.adb("shell", "id -u")
+        cmd = run_mock.call_args[0][0]
+        self.assertEqual(cmd[:3], ["adb", "-s", "MIKO3250XXM3Q0636CB"], cmd)
+
+    def test_default_serial_is_the_documented_unit(self):
+        self.assertEqual(inst.DEFAULT_USB_SERIAL, "MIKO3250XXM3Q0636CB")
+
+
 class ProtectedPackagesTest(unittest.TestCase):
     def test_never_removes_protected(self):
         """R8: the script must not remove or rename ServiceExam or MikoPlus."""
