@@ -7,7 +7,7 @@ artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
 product_contract_source: ce-brainstorm
 execution: code
-deepened: 2026-09-11
+deepened: 2026-09-12
 ---
 
 # Persistent ADB Root (USB + Wi-Fi) - Plan
@@ -111,6 +111,7 @@ The only root ADB available today is factory mode, reached by power-cycling into
 
 - **Deferred for later:** an app or command that displays the device's DHCP address; surviving a Miko OTA that changes `su`, `reboot`, or ServiceExam; support for units other than the documented one.
 - **Outside this work's identity:** anything touching Miko's servers, other people's units, or accounts; disabling or replacing the kiosk; making the device headless.
+- **Deferred to Follow-Up Work:** `docs/method-factory-root.md:66-69` still tells the operator to disable the watchdog by renaming `/data/app/com.example.root.serviceexam-*` to `…-disabled`. That is the action `docs/mishap-recovery.md` records as having broken the kiosk, and `scripts/factory-root.sh` already supersedes it with the bind-mount shadow. Correcting the stale doc is a separate change; nothing in U4-U6 may follow that manual step.
 
 ### Dependencies / Assumptions
 
@@ -140,12 +141,14 @@ The only root ADB available today is factory mode, reached by power-cycling into
 - KTD1. **Reuse `neuterd` verbatim as the reboot-shadow mechanism.** The freestanding arm64 daemon `setns`es into init's global mount namespace and keeps a no-op bind-mounted over `/system/bin/reboot`, self-healing every 5 s. The payload starts it before adbd; an app-side mount would be invisible to ServiceExam, which is a zygote child in the global namespace. (session-settled: user-directed — chosen over a separate fork or the unmodified upstream APK: one reproducible build and no external dependency.) Governs R2, R17.
 - KTD2. **Set the adb USB combo only after `neuterd` is up, and never via `persist.sys.usb.config`.** `/init.usb.rc` applies `persist.sys.usb.config` to `sys.usb.config` at boot, and the `sys.usb.config=mtp,adb` trigger starts adbd — so persisting the adb combo would start adbd before the neuter exists and let the watchdog reboot the unit. Governs R4.
 - KTD3. **A root shell watcher re-asserts the USB config and adbd liveness.** The payload starts a small `setsid` loop that restores `sys.usb.config=mtp,adb` when ServiceExam changes it and restarts adbd if it stops. A shell loop avoids writing a native property client. Governs R5.
-- KTD4. **Register by placement, verify, then fall back.** Install writes the signed APK to `/data/app/com.miko3.bootagent-<suffix>==/base.apk` (owner `system:system`) and lets PackageManagerService register it on the next boot; a `stopped` flag in `package-restrictions.xml` is cleared directly only when the boot log shows the agent did not run. The explicit `packages.xml` insertion from `docs/kiosk-recovery-fix.md` is the fallback when registration does not occur. Governs R6, R7.
+- KTD4. **Register by placement, verify, then fall back to a verbatim entry.** Install writes the signed APK to `/data/app/com.miko3.bootagent-<suffix>==/base.apk` (owner `system:system`) and lets PackageManagerService register it on the next boot; a `stopped` flag in `package-restrictions.xml` is cleared directly only when the boot log shows the agent did not run. The fallback when registration does not occur is the `<package>` block insertion from `docs/kiosk-recovery-fix.md`, where the block is **extracted verbatim from the install-time backup** — never synthesized — because a `packages.xml` `<cert key=…>` holds signature bytes, not a digest of the certificate. Governs R6, R7. **(session-settled carrier: the `/data/app` + `packages.xml` Key Decision above. Conflict call-out: every documented success with hand-placement on this unit restored a package that was *already registered*, with its original block re-inserted verbatim; there is no recorded case of PMS registering a never-before-seen package from a hand-placed directory alone. Placement-then-verify remains the right order and the fallback stays, but the never-registered variant is unproven until the first normal boot proves it — U5's registration assertion is what settles it.)**
 - KTD5. **Pre-authorize the host key in `/data/misc/adb/adb_keys`.** Install writes the host's `adbkey.pub` there (owner `system`, mode `0640`), so USB and TCP authorization do not depend on `ro.adb.secure` on normal boot. Governs R12.
 - KTD6. **Pipe the payload to `/system/bin/su` on stdin.** This `su` has no `-c`, so `RootOps` execs `su` and writes the script to its stdin, matching the openmiko payload shape. Governs R1.
-- KTD7. **adbd over TCP is `service.adb.tcp.port=5555` plus a `ctl.restart adbd`.** Governs R3, R11.
+- KTD7. **adbd over TCP is `service.adb.tcp.port=5555` plus an unconditional `ctl.restart adbd`.** Setting the property alone only moves a *fresh* adbd onto TCP: if adbd is already running without it, nothing retries and TCP stays off for the whole boot. The restart runs after the neuter is up, so it cannot race the watchdog. Governs R3, R11.
 - KTD8. **The build bootstraps its own toolchain and is skippable.** `build-bootagent.py` installs the Android command-line tools and `lld` when absent, then drives `javac` → `d8` → `aapt2` → `zipalign` → `apksigner` and compiles `neuterd`; the committed APK means normal use never runs it. Governs R15, R16.
-- KTD9. **Revert removes only the agent.** It kills `neuterd` and the watcher, deletes the agent's `/data/app` directory and any inserted `packages.xml` / `package-restrictions.xml` entries, and restores the backed-up system-state files. Governs R14.
+- KTD9. **Revert removes only the agent.** It kills `neuterd` and the watcher, deletes the agent's `/data/app` directory, and removes the agent's `packages.xml` / `package-restrictions.xml` entries surgically. It restores a backup only when the surgical removal cannot leave the file coherent. Governs R14.
+- KTD10. **Every device command names its transport.** The toolkit targets `adb -s <usb-serial>` or `adb -s <ip>:5555` explicitly rather than relying on the default device. Once Wi-Fi is up, `adb devices` lists two transports and an untargeted `adb shell` fails with "more than one device" — which reads as Wi-Fi DOWN while it is up, and can attribute the USB transport's answer to Wi-Fi. Governs R10, R11, R13.
+- KTD11. **Verify asserts identity and liveness, not a proxy.** U5 asserts registration (`pm path com.miko3.bootagent`), the reboot shadow, and the `neuterd` and watcher processes as separate facts, and reports the adb authorization state. A missing boot log currently collapses "registered but payload failed" and "never registered" into one verdict, and a byte-size check on `/system/bin/reboot` cannot distinguish a shadow from a truncated real binary. Governs R13.
 
 ### High-Level Technical Design
 
@@ -160,7 +163,8 @@ flowchart TB
   N2 -->|no, retry every 5s| N1
   N2 -->|yes| P1[setprop service.adb.tcp.port 5555]
   P1 --> P2[setprop sys.usb.config mtp,adb]
-  P2 --> P3[start watcher: re-assert usb config, restart adbd]
+  P2 --> PR[ctl.restart adbd - KTD7]
+  PR --> P3[start watcher: re-assert usb config, restart adbd]
   P3 --> P4[settings put global stay_on_while_plugged_in 3]
 ```
 
@@ -208,18 +212,33 @@ stateDiagram-v2
   Placed --> Absent: revert
 ```
 
+Revert ordering (KTD9). The order exists to keep the device out of the dangling-entry state, so it is a safety constraint rather than a preference:
+
+```mermaid
+flowchart TB
+  R0[revert] --> R1{kill watcher + neuterd}
+  R1 --> R2[remove agent entries from packages.xml / package-restrictions.xml]
+  R2 --> R3[remove /data/app/com.miko3.bootagent-*]
+  R3 --> R4[restore adb_keys to recorded pre-install state]
+  R4 --> R5{backup present?}
+  R5 -->|no| R6[hard error, stop]
+  R5 -->|yes| R7[dumpsys ServiceExam + MikoPlus]
+  R7 --> R8[reboot, capture transcript]
+```
+
 ### Assumptions
 
 - `ro.adb.secure` is unset or `0` on normal boot as it is in factory mode; KTD5 makes this non-load-bearing by pre-authorizing the key.
 - Wi-Fi associates automatically on normal boot to a network the host can reach, so the TCP listener is addressable.
-- A reboot from factory mode returns the unit to normal boot, as `scripts/factory-root.sh` documents for a power cycle; if it does not, a physical power cycle is required and is the one manual step.
+- A reboot issued from factory mode returns the unit to normal boot. **Unverified:** `scripts/factory-root.sh` makes no such claim, and nothing in the repo confirms that a warm reboot from a `ro.bootmode=factory` session leaves factory mode. U4's install and U5's `classify_boot` both depend on the transition, so the physical power cycle stays the declared fallback and is the one manual step.
 - PackageManagerService registers an APK hand-placed under a conforming `/data/app/<pkg>-<suffix>==` directory on the next boot; KTD4 verifies this and carries the `packages.xml` fallback if it fails.
 
 ### Risks & Dependencies
 
 - **Boot race.** If adbd ever starts before `neuterd` applies the shadow, ServiceExam reboots the unit. KTD2 exists to prevent this; the payload starts `neuterd` first and waits for the shadow before touching the USB config.
 - **Registration uncertainty.** If PackageManagerService does not register the hand-placed APK, or marks it stopped, no adb comes up on the first normal boot and factory mode must be re-entered. KTD4's verification and `packages.xml` fallback are the mitigation.
-- **System-state integrity.** `packages.xml` and `package-restrictions.xml` are load-bearing system databases; a malformed edit prevents boot. Mitigation: the primary path never edits `packages.xml`, and R9's backups plus the restore path in `docs/mishap-recovery.md` are the rollback.
+- **System-state integrity.** `packages.xml` and `package-restrictions.xml` are load-bearing system databases; a malformed edit prevents boot, and a stale wholesale restore rolls back every entry PackageManagerService has written since install. Mitigation: the primary path never edits `packages.xml`; U6 removes the agent's own entries surgically (KTD9) and treats a missing backup as a hard error rather than a note. R9's backups plus the restore path in `docs/mishap-recovery.md` are the rollback.
+- **Wholesale-restore cascade.** `docs/mishap-recovery.md` records the one documented breakage on this unit: deleting a `/data/app` directory whose `packages.xml` entry survived — or rewriting the file with a cleared/partial one — made the package manager purge all of `/data/app`, taking the updated MikoPlus and every `oat/` with it. This is why U6's directory removal and entry removal are ordered against each other deliberately, and why "no backup found" must stop rather than proceed.
 - **Toolchain install.** KTD8 needs network access for the Android command-line tools and `lld`; without them only the committed APK is usable and R16 is unverified.
 - **Hardware risk.** The unit is already modified and backed up under `firmware/`; a mis-written system-state file can prevent boot. The rollback ladder is: restore the backed-up system-state files (U6), then `scripts/restore-firmware.sh` from `firmware/`, then re-enter factory mode with `scripts/factory-root.sh`.
 
@@ -245,11 +264,12 @@ stateDiagram-v2
   1. Package `com.miko3.bootagent`; manifest declares a `RECEIVE_BOOT_COMPLETED` receiver for `BOOT_COMPLETED` and the QUICKBOOT actions, and a launcher activity kept only for parity.
   2. `BootReceiver` uses `goAsync()` and a background thread so the broadcast window is not a constraint.
   3. `RootOps` holds the payload as a string with a `@@NEUTERD_B64@@` placeholder, execs `/system/bin/su`, writes the payload to stdin, and surfaces a non-zero exit rather than swallowing it.
-  4. The payload starts `neuterd` first, waits for the reboot shadow, then applies KTD6 and KTD7 and starts the KTD3 watcher.
+  4. The payload starts `neuterd` first, waits for the reboot shadow, then sets the adbd TCP property, sets the USB config, restarts adbd (KTD7), and starts the KTD3 watcher.
 - **Patterns to follow:** `recon/sources/miko3-adb-boot-agent/src/com/openmiko/bootagent/` (`BootReceiver`, `MainActivity`, `RootOps`).
 - **Test scenarios:**
   - Manifest declares the receiver for `BOOT_COMPLETED` (assert on the built APK in U3).
   - The payload string contains, in order, the neuterd start, the adbd TCP property, the USB config set, and the watcher start.
+  - The payload restarts adbd unconditionally after setting the TCP property, rather than only on a not-running adbd (KTD7).
   - `RootOps` execs `su` and writes to stdin rather than passing a `-c` argument.
 - **Verification:** source compiles under U3 and the manifest dump shows the receiver.
 
@@ -273,7 +293,7 @@ stateDiagram-v2
 - **Dependencies:** U1, U2
 - **Files:** `scripts/build-bootagent.py`, `bootagent/miko3-bootagent.keystore`, `bootagent/miko3-bootagent.apk`, `bootagent/README.md`, `scripts/tests/test_build_bootagent.py`
 - **Approach:**
-  1. Bootstrap the Android command-line tools, `platforms;android-28`, build-tools, and `lld` when missing, with an actionable error if installation cannot proceed (KTD8).
+  1. Bootstrap the Android command-line tools, `platforms;android-28`, build-tools, `lld`, and `zip` when missing, with an actionable error if installation cannot proceed (KTD8). `zip` is an external binary the build shells out to, so it belongs in the same precondition check as the SDK components.
   2. Compile `neuterd`, base64 it, and inject it into `RootOps.java`.
   3. `javac` → `d8` → `aapt2 link` → add `classes.dex` → `zipalign` → `apksigner`, generating the debug keystore on first run.
   4. Commit the resulting APK and keystore.
@@ -292,19 +312,20 @@ stateDiagram-v2
 - **Dependencies:** U3
 - **Files:** `scripts/install-persistent-adb.py`, `scripts/tests/test_install_persistent_adb.py`
 - **Approach:**
-  1. Refuse to run unless `adb shell id -u` is `0` and `ro.bootmode` is `factory`.
-  2. Back up `/data/system/packages.xml` and `/data/system/users/0/package-restrictions.xml` to a timestamped directory on the host and on the device (R9).
+  1. Refuse to run unless the targeted session's `id -u` is `0` and `ro.bootmode` is `factory`.
+  2. Back up every system-state file the install writes or replaces — `/data/system/packages.xml`, `/data/system/users/0/package-restrictions.xml`, and `/data/misc/adb/adb_keys` — to a timestamped directory on the host and on the device (R9). Record `adb_keys` as *absent* when it does not exist, so revert can restore absence rather than leaving the host key behind.
   3. Push the committed APK and place it at `/data/app/com.miko3.bootagent-<suffix>==/base.apk`, owned `system:system`, directory `0755`, file `0644`.
   4. Write the host `adbkey.pub` to `/data/misc/adb/adb_keys`, owned `system:system`, mode `0640` (KTD5).
   5. Reboot to normal boot.
-  6. When the boot log shows the agent did not run, clear a `stopped` flag for the package and, if registration still failed, insert the `packages.xml` entry from `docs/kiosk-recovery-fix.md` (KTD4).
+  6. Provide the KTD4 fallback as a reachable step, not a library: a post-boot arm path that reads the boot log, clears a `stopped` flag for the package when the receiver was registered but suppressed, and — only when registration itself failed — inserts the agent's `<package>` block **extracted verbatim from the step-2 backup** into `packages.xml` (KTD4). The fallback must never synthesize an entry.
 - **Patterns to follow:** `docs/kiosk-recovery-fix.md`; `scripts/factory-root.sh` (device-root preconditions, `say`-style output).
 - **Test scenarios:**
   - Aborts when the session is not root or not factory mode.
-  - Creates backups before any device write.
+  - Creates backups of all three system-state files before any device write, and records `adb_keys` absence when the file is missing.
   - Places the APK with the expected owner and mode.
   - Writes `adb_keys` as `system` `0640`.
   - Re-running install is idempotent and does not duplicate entries.
+  - The fallback entry is extracted verbatim from the backup and is byte-identical to the backup's block, never a synthesized entry with a digest in place of signature bytes.
   - Never touches `com.example.root.serviceexam` or `com.miko.mikoplus` (Covers AE4).
 - **Verification:** after the reboot, `pm path com.miko3.bootagent` resolves and the boot log exists.
 
@@ -315,17 +336,28 @@ stateDiagram-v2
 - **Dependencies:** U4
 - **Files:** `scripts/verify-persistent-adb.py`, `scripts/tests/test_verify_persistent_adb.py`
 - **Approach:**
-  1. Detect normal boot (`sys.boot_completed=1`, `ro.bootmode` not `factory`); report clearly when the unit is still in factory mode.
-  2. Over USB, check `id -u` is `0`, `init.svc.adbd` is `running`, `sys.usb.config` contains `adb`, `/system/bin/reboot` is under 100 bytes, and the boot log is fresh.
-  3. Read the `wlan0` address and `adb connect <ip>:5555`, then re-check root over TCP.
-  4. Print a per-transport verdict (USB, Wi-Fi) and the neuter state.
-- **Patterns to follow:** `scripts/miko-detect.sh` (plain-English verdict), `scripts/aoa-inject.sh --ifaces` (machine-readable check preferred over parsing `adb devices`).
+  1. Gate on preconditions before reporting anything: a connected device, and the agent installed by U4. With no device attached the current shape reads empty properties as "still booting" and misreports a missing unit as a boot in progress.
+  2. Detect normal boot (`sys.boot_completed=1`, `ro.bootmode` not `factory`). In factory mode say so, and state that factory mode has no Wi-Fi rather than reporting Wi-Fi as "not on the network".
+  3. Report the adb authorization state explicitly (`device` vs `unauthorized` vs no transport, or the interface triplet via `aoa-inject.py --ifaces`), so a failed KTD5 key pre-authorization is distinguishable from a payload that never ran. Without this, AE5 has no observable signal.
+  4. Assert registration separately from execution: `pm path com.miko3.bootagent` resolves, and the boot log is fresh against `/proc/uptime` rather than merely present. "Registered but payload failed" and "never registered" are different failures and must not collapse into one verdict.
+  5. Over USB, target the USB serial (KTD10) and check `id -u` is `0`, `init.svc.adbd` is `running`, and `sys.usb.config` contains `adb`. Read the first four bytes of `/system/bin/reboot` for ELF magic rather than the byte-size heuristic (KTD11).
+  6. Assert the `neuterd` process and the watcher process are alive, as facts separate from the shadow. The shadow is a bind mount that outlives the daemon for the rest of the boot, so "reboot is shadowed" does not imply the re-assertion R5 asks for is running.
+  7. Read the `wlan0` address, `adb connect <ip>:5555`, then target `<ip>:5555` explicitly (KTD10) and re-check root.
+  8. Print a per-transport verdict (USB, Wi-Fi) plus the neuter, registration, and authorization states, and write the verdict as JSON to `recon/captures/verify-persistent-adb-<utc>.json`.
+- **Execution note:** AE2 is a behaviour, not a state — prove it by perturbation (set `sys.usb.config` to MTP-only, wait past the watcher's interval, re-read) rather than by reading the current value, which cannot show the re-assertion ever happened.
+- **Patterns to follow:** `scripts/miko-detect.sh` (plain-English verdict, UTC-stamped header), `scripts/aoa-inject.py --ifaces` (interface-triplet check preferred over parsing `adb devices`), `scripts/restore-kiosk.sh` (root-precondition gate).
 - **Test scenarios:**
   - Reports USB up / TCP up independently, and both up.
+  - With both transports present, the Wi-Fi check reads UP — the regression that an untargeted `adb shell` produces, where Wi-Fi reads DOWN while it is up (KTD10).
+  - With only TCP reachable, the Wi-Fi check does not report USB's answer as Wi-Fi's.
+  - With no device attached, reports the missing device rather than a boot in progress.
   - Detects a non-root shell and reports it as failure.
-  - Detects factory mode and says so rather than reporting a false negative.
-  - Covers AE1: reports the reboot shadow present and adbd running.
-- **Verification:** the verdict names each transport as up or down, with the evidence line for each.
+  - Detects factory mode and says so, and names factory mode — not "not on Wi-Fi" — as the reason Wi-Fi is unavailable.
+  - Reports `unauthorized` distinctly from a missing adbd, so a failed KTD5 pre-authorization is visible (Covers AE5).
+  - Distinguishes a registered-but-not-run agent from a never-registered one.
+  - Covers AE1: reports the reboot shadow present, and separately reports the `neuterd` and watcher processes running.
+  - Covers AE2: after the perturbation, reports adb restored on the USB interface.
+- **Verification:** the verdict names each transport as up or down with its evidence line, distinguishes registration from execution, and its JSON lands in `recon/captures/`.
 
 ### U6. Revert
 
@@ -334,16 +366,23 @@ stateDiagram-v2
 - **Dependencies:** U4
 - **Files:** `scripts/revert-persistent-adb.py`, `scripts/tests/test_revert_persistent-adb.py`
 - **Approach:**
-  1. Kill the watcher and `neuterd`.
-  2. Remove `/data/app/com.miko3.bootagent-*` and any `packages.xml` / `package-restrictions.xml` entries for the package.
-  3. Restore the backups from U4 when present.
-  4. Reboot.
-- **Patterns to follow:** `scripts/restore-kiosk.sh` (targeted restore, no collateral removal).
+  1. Kill the watcher and `neuterd`, targeting the device's transport explicitly (KTD10).
+  2. Remove the agent's own entries from `packages.xml` and `package-restrictions.xml` surgically, using the string-level helpers that already exist for the purpose. Leave every other entry untouched — including everything PackageManagerService has written since install.
+  3. Remove `/data/app/com.miko3.bootagent-*`, ordered against step 2 so the device never sits in the state where a `packages.xml` entry survives its directory. That state is what `docs/mishap-recovery.md` records as feeding the package-manager purge and the reinstall crash.
+  4. Restore `/data/misc/adb/adb_keys` to its recorded pre-install state — delete the file when U4 recorded it absent. A revert that leaves the host key behind has not restored the pre-install state (R14).
+  5. Treat a missing backup as a hard error, not a note. The current shape prints a note and proceeds, leaving the removal unverified on the one path where it matters.
+  6. Re-assert the preserved state on the device: `dumpsys package` for ServiceExam and MikoPlus, as `scripts/restore-kiosk.sh` does, so R8/AE4 are provable rather than only reviewable.
+  7. Reboot, and capture the removal transcript to `recon/captures/`.
+- **Patterns to follow:** `scripts/restore-kiosk.sh` (root-precondition gate, targeted restore, no collateral removal, positive re-assertion of the preserved apps).
 - **Test scenarios:**
-  - Removes only the agent package; ServiceExam and MikoPlus are untouched.
-  - Restores the backed-up system-state files.
+  - Removes only the agent package's entries; ServiceExam and MikoPlus are untouched — asserted against the emitted command list, not only against the source text, and mirroring the `PROTECTED` guard test that `test_install_persistent_adb.py` already carries.
+  - No emitted command removes or renames a `/data/app/com.example.root.serviceexam-*` or `/data/app/com.miko.mikoplus-*` path (Covers AE4).
+  - Removes the agent's `packages.xml` and `package-restrictions.xml` entries via the surgical helpers, and leaves unrelated entries byte-identical.
+  - Never writes a backup file over the live `packages.xml` when surgical removal succeeded.
+  - Errors out when no backup is present rather than printing a note and continuing.
+  - Restores `adb_keys` to absence when U4 recorded it absent, and to its backed-up content when it existed.
   - Is idempotent when the agent was never installed.
-- **Verification:** after the reboot the agent is absent and normal boot has no adb, with the kiosk working.
+- **Verification:** after the reboot the agent is absent and normal boot has no adb, with the kiosk working. Note that "no adb after a normal boot" is also what a *correct* post-revert boot looks like once ServiceExam drives the USB config, so absence of adb is the expected result here and not a failure of U5's checks.
 
 ---
 
@@ -352,9 +391,12 @@ stateDiagram-v2
 The repo has no test runner; the toolkit's pure logic is covered by stdlib `unittest`, and the device behavior is proved by the verify script on the unit.
 
 - **Unit tests:** `python3 -m unittest discover scripts/tests`.
+  - The toolkit scripts are not importable by name (hyphenated filenames), so tests load them through `importlib.util.spec_from_file_location`, following the `load()` helper in `scripts/tests/test_install_persistent_adb.py`.
+  - Unit tests stub the module-level `sh`/`adb` seam with `unittest.mock` and must never invoke a real device. Tests for the verify script patch `read_device_state` and `tcp_root`, since the composition bug the transport targeting fixes is only reachable through them.
+  - Assertions on the protected apps are made against the emitted command list, not only against source text.
 - **Build proof:** `python3 scripts/build-bootagent.py` then `apksigner verify bootagent/miko3-bootagent.apk` and `aapt2 dump badging bootagent/miko3-bootagent.apk`.
-- **Device proof (the decisive check):** `python3 scripts/verify-persistent-adb.py` after a normal boot reports USB up and Wi-Fi up, `id -u` is `0` on both, and the reboot shadow is present.
-- **Revert proof:** `python3 scripts/revert-persistent-adb.py` followed by a normal boot shows the agent absent and no adb.
+- **Device proof (the decisive check):** `python3 scripts/verify-persistent-adb.py` after a normal boot reports USB up and Wi-Fi up, `id -u` is `0` on both, the agent registered, and the reboot shadow plus the `neuterd` and watcher processes present.
+- **Revert proof:** `python3 scripts/revert-persistent-adb.py` followed by a normal boot shows the agent absent and no adb, with ServiceExam and MikoPlus still installed at their expected versions.
 
 ---
 
@@ -366,3 +408,5 @@ The repo has no test runner; the toolkit's pure logic is covered by stdlib `unit
 - The kiosk still boots and ServiceExam/MikoPlus are intact (AE4).
 - `scripts/revert-persistent-adb.py` returns the unit to stock normal boot.
 - Abandoned-attempt code and temporary device state are removed; no stray `neuterd` or watcher process, no leftover `/data/local/tmp` staging files.
+- The working tree carries no scratch unrelated to the units: the cosmetic `bootagent/native/build-neuterd.sh` diff is either folded into U2 or reverted, and editor swap files are gone.
+- Every unit's declared test scenarios are actually implemented, not merely listed — U2's aarch64 ELF assertion, U3's badging and rebuild-stability checks, and the new U5/U6 files included.
