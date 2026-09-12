@@ -93,16 +93,26 @@ def ensure_toolchain(sdk, bootstrap):
     need_sdk = sdk is None or not (sdk / "build-tools" / BUILD_TOOLS).exists() \
         or not (sdk / "platforms" / PLATFORM / "android.jar").exists()
     need_lld = which("ld.lld") is None and not Path("/opt/homebrew/opt/lld/bin/ld.lld").exists()
+    # `zip` is an external binary the packaging step shells out to, and javac/keytool need a JDK;
+    # both are reported up front so a host missing them gets one actionable message rather than
+    # a failure at the first tool the build happens to invoke.
+    need_zip = which("zip") is None
+    need_java = which("javac") is None or which("keytool") is None
 
-    if (need_sdk or need_lld) and not bootstrap:
+    if (need_sdk or need_lld or need_zip or need_java) and not bootstrap:
         missing = []
         if need_sdk:
             missing.append(f"Android SDK (build-tools;{BUILD_TOOLS} + platforms;{PLATFORM})")
         if need_lld:
             missing.append("lld (ld.lld)")
+        if need_zip:
+            missing.append("zip")
+        if need_java:
+            missing.append("a JDK (javac + keytool)")
         raise BuildError(
             "!! toolchain missing: " + ", ".join(missing)
             + "\n   Install with: brew install lld && brew install --cask android-commandlinetools"
+            + "\n   plus a JDK (e.g. brew install openjdk@17) and zip,"
             + "\n   then re-run, or pass --sdk <path>. (Normal use needs no build: the APK is committed.)"
         )
 

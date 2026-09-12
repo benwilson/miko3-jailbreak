@@ -10,6 +10,7 @@ import importlib.util
 import io
 import shutil
 import subprocess
+import sys
 import unittest
 import zipfile
 from pathlib import Path
@@ -20,6 +21,7 @@ BUILD_PY = REPO / "scripts" / "build-bootagent.py"
 ROOTOPS = REPO / "bootagent" / "src" / "com" / "miko3" / "bootagent" / "RootOps.java"
 MANIFEST = REPO / "bootagent" / "AndroidManifest.xml"
 APK = REPO / "bootagent" / "miko3-bootagent.apk"
+NEUTERD = REPO / "bootagent" / "native" / "neuterd"
 
 
 def load_build_module():
@@ -43,6 +45,18 @@ class ToolchainFailureTest(unittest.TestCase):
         self.assertIn("toolchain missing", msg)
         self.assertIn("brew install lld", msg)
         self.assertIn("android-commandlinetools", msg)
+
+    def test_missing_jdk_is_reported_with_the_other_preconditions(self):
+        """U3: a missing JDK fails up front, not at the first javac the build happens to call."""
+        real_which = build.which
+
+        def fake_which(name):
+            return None if name in ("javac", "keytool") else real_which(name)
+
+        with mock.patch.object(build, "which", side_effect=fake_which):
+            with self.assertRaises(build.BuildError) as ctx:
+                build.ensure_toolchain(None, bootstrap=False)
+        self.assertIn("JDK", str(ctx.exception))
 
     def test_no_bootstrap_never_installs(self):
         """--no-bootstrap must not shell out to brew; it fails fast instead."""
@@ -85,6 +99,22 @@ class SourceInvariantTest(unittest.TestCase):
         self.assertLess(neuterd, tcp, "neuterd must be materialized before the TCP property")
         self.assertLess(neuterd, usb, "neuterd must be materialized before the USB combo")
 
+    def test_payload_restarts_adbd_unconditionally(self):
+        """KTD7: setting the TCP property only moves a *fresh* adbd onto TCP.
+
+        An adbd already running without the property never picks it up, so TCP 5555
+        stays off for the whole boot unless the payload restarts adbd itself. The
+        watcher's own conditional restart does not cover this, so the assertion is
+        that a restart precedes the watcher's creation rather than merely existing.
+        """
+        text = ROOTOPS.read_text()
+        usb = text.index("sys.usb.config mtp,adb")
+        restart = text.index("ctl.restart adbd")
+        watcher = text.index("<<'WEOF'")
+        self.assertLess(usb, restart, "adbd must be restarted after the USB combo is set")
+        self.assertLess(restart, watcher,
+                        "the payload must restart adbd itself, not only inside the watcher loop")
+
     def test_su_piped_on_stdin_not_c_argument(self):
         """Miko's su has no -c; the payload must go on stdin."""
         text = ROOTOPS.read_text()
@@ -107,6 +137,40 @@ class CommittedApkTest(unittest.TestCase):
         r = subprocess.run(["apksigner", "verify", str(APK)],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    @unittest.skipUnless(shutil.which("aapt2"), "aapt2 not on PATH (Android build-tools)")
+    def test_apk_declares_package_and_boot_receiver(self):
+        """U3: the built APK carries the package id and the BOOT_COMPLETED receiver."""
+        badging = subprocess.run(["aapt2", "dump", "badging", str(APK)],
+                                 capture_output=True, text=True)
+        self.assertEqual(badging.returncode, 0, badging.stdout + badging.stderr)
+        self.assertIn("com.miko3.bootagent", badging.stdout)
+        tree = subprocess.run(
+            ["aapt2", "dump", "xmltree", "--file", "AndroidManifest.xml", str(APK)],
+            capture_output=True, text=True)
+        self.assertEqual(tree.returncode, 0, tree.stdout + tree.stderr)
+        self.assertIn("BOOT_COMPLETED", tree.stdout)
+        self.assertIn("BootReceiver", tree.stdout)
+
+    @unittest.skipUnless(shutil.which("aapt2") and shutil.which("apksigner"),
+                         "Android build-tools not on PATH; byte-stability is proved by the "
+                         "Verification Contract's build proof instead")
+    def test_rebuild_is_byte_stable(self):
+        """U3: the committed keystore plus normalized zip timestamps reproduce the APK."""
+        before = APK.read_bytes()
+        r = subprocess.run([sys.executable, str(BUILD_PY)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(APK.read_bytes(), before, "rebuild produced a different APK")
+
+
+class NeuterdBinaryTest(unittest.TestCase):
+    def test_committed_neuterd_is_aarch64_elf(self):
+        """U2: the daemon is a 64-bit AArch64 ELF — the only shape this unit can exec."""
+        data = NEUTERD.read_bytes()
+        self.assertEqual(data[:4], b"\x7fELF", "neuterd is not an ELF")
+        self.assertEqual(data[4], 2, "neuterd is not a 64-bit ELF")
+        machine = int.from_bytes(data[18:20], "little")
+        self.assertEqual(machine, 0xB7, f"e_machine={machine:#x} is not AArch64 (0xB7)")
 
 
 if __name__ == "__main__":

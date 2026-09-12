@@ -55,6 +55,10 @@ public final class RootOps {
             // 4) only now bring adb up: TCP 5555 and the USB combo (KTD2, KTD7)
             "setprop service.adb.tcp.port 5555\n" +
             "setprop sys.usb.config mtp,adb\n" +
+            // KTD7: the property alone only moves a *fresh* adbd onto TCP. If adbd is already
+            // running without it, nothing retries and TCP 5555 stays off for the whole boot, so
+            // the restart is unconditional rather than left to the watcher's liveness check.
+            "setprop ctl.restart adbd\n" +
             "echo \"  adb tcp 5555 + usb mtp,adb requested; init.svc.adbd=$(getprop init.svc.adbd)\" >> \"$LOG\"\n" +
             // 5) watcher (KTD3): re-assert the USB config and restart adbd if ServiceExam reverts it
             "cat > \"$W\" <<'WEOF'\n" +
