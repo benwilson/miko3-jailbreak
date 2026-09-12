@@ -28,11 +28,11 @@ Dependencies: python3, adb (a device in factory mode with root adb).
 """
 import argparse
 import base64
-import os
 import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -183,35 +183,16 @@ def clear_stopped(xml, pkg=PKG):
     return pattern.subn(r"\1", xml)
 
 
-def build_package_entry(pkg, code_path, cert_hex, version=1, ts="0"):
-    """Build a <package> block for packages.xml (the KTD4 fallback registration)."""
-    return (
-        f'    <package name="{pkg}" codePath="{code_path}" '
-        f'nativeLibraryPath="{code_path}/lib" primaryCpuAbi="arm64-v8a" '
-        f'publicFlags="0" privateFlags="0" ft="{ts}" it="{ts}" ut="{ts}" version="{version}">\n'
-        f'        <sigs count="1" schemeVersion="2"><cert index="0" key="{cert_hex}" /></sigs>\n'
-        f'    </package>\n'
-    )
+def arm_decision(registered):
+    """What the KTD4 post-boot arm path should do.
 
-
-def insert_package_entry(xml, entry, pkg=PKG):
-    """Insert a package block before </packages> unless the package is already present."""
-    if f'name="{pkg}"' in xml:
-        return xml, 0
-    return xml.replace("</packages>", entry + "</packages>", 1), 1
-
-
-def apk_signing_cert_hex():
-    """The APK signer's certificate as uppercase hex DER (for packages.xml)."""
-    apksigner = os.environ.get("APKSIGNER", "apksigner")
-    r = subprocess.run([apksigner, "verify", "--print-certs", str(APK)],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        raise InstallError("!! apksigner verify failed; cannot read the signing cert")
-    m = re.search(r"SHA-256 digest:\s*([0-9a-fA-F]+)", r.stdout)
-    if not m:
-        raise InstallError("!! could not parse the signing cert from apksigner")
-    return m.group(1).upper()
+    'clear-stopped' when the receiver registered but never ran: Android refuses
+    BOOT_COMPLETED to a package still marked stopped, and factory mode has no activity
+    manager to clear it with `am start` (R7). 'recover' when the package never registered
+    at all — there, no entry exists to correct and the documented recovery is to re-enter
+    factory mode and re-place (KTD4).
+    """
+    return "clear-stopped" if registered else "recover"
 
 
 def status():
@@ -225,15 +206,49 @@ def status():
 REPO_LOG = "/data/local/tmp/miko3-boot.log"
 
 
+def arm():
+    """The KTD4 post-boot arm path: run after a normal boot that produced no adb.
+
+    Registration is asserted first, so "registered but refused the broadcast" and "never
+    registered" get different answers instead of one silent failure.
+    """
+    registered = bool(sh(f"pm path {PKG} 2>/dev/null", check=False).stdout.strip())
+    decision = arm_decision(registered)
+    if decision == "recover":
+        raise InstallError(
+            "!! the agent never registered, so there is no entry to correct — the "
+            "install-time backup predates the APK and cannot hold its package block.\n"
+            "   Recover by re-entering factory mode (scripts/factory-root.sh) and re-running "
+            "install.")
+    tmp = Path(tempfile.mkdtemp()) / "package-restrictions.xml"
+    adb("pull", RESTRICTIONS_XML, str(tmp))
+    edited, n = clear_stopped(tmp.read_text())
+    if n == 0:
+        print("   the agent is registered and not marked stopped; nothing to arm")
+        return 0
+    mode = sh(f"stat -c '%a' {RESTRICTIONS_XML}", check=False).stdout.strip() or "660"
+    owner = sh(f"stat -c '%U:%G' {RESTRICTIONS_XML}", check=False).stdout.strip() or "system:system"
+    tmp.write_text(edited)
+    adb("push", str(tmp), RESTRICTIONS_XML)
+    sh(f"chown {owner} {RESTRICTIONS_XML}; chmod {mode} {RESTRICTIONS_XML}")
+    print(f"   cleared the stopped flag for {PKG}; reboot to let BOOT_COMPLETED through")
+    return 0
+
+
 def main():
     global SERIAL
     ap = argparse.ArgumentParser(description="Install the Miko 3 boot agent from factory mode.")
     ap.add_argument("--no-reboot", action="store_true", help="do everything except the reboot")
     ap.add_argument("--status", action="store_true", help="report placement and exit")
+    ap.add_argument("--arm", action="store_true",
+                    help="post-boot: clear a stopped flag when the receiver registered but never ran")
     ap.add_argument("--usb-serial", default=DEFAULT_USB_SERIAL,
                     help=f"USB transport serial (default: {DEFAULT_USB_SERIAL})")
     args = ap.parse_args()
     SERIAL = args.usb_serial
+
+    if args.arm:
+        return arm()
 
     if args.status:
         return status()

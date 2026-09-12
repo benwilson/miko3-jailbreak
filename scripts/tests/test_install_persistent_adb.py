@@ -69,26 +69,19 @@ class ClearStoppedTest(unittest.TestCase):
         self.assertIn('name="com.other.app" stopped="true"', new)
 
 
-class PackageEntryTest(unittest.TestCase):
-    def test_entry_has_fields(self):
-        entry = inst.build_package_entry("com.miko3.bootagent", "/data/app/x", "AABB")
-        self.assertIn('name="com.miko3.bootagent"', entry)
-        self.assertIn('codePath="/data/app/x"', entry)
-        self.assertIn('<cert index="0" key="AABB" />', entry)
+class ArmDecisionTest(unittest.TestCase):
+    """KTD4: the two post-boot failures get different answers, not one silent no-op."""
 
-    def test_insert_once(self):
-        entry = inst.build_package_entry("com.miko3.bootagent", "/data/app/x", "AABB")
-        new, n = inst.insert_package_entry(PACKAGES, entry)
-        self.assertEqual(n, 1)
-        self.assertIn('name="com.miko3.bootagent"', new)
-        self.assertTrue(new.index("com.miko3.bootagent") < new.index("</packages>"))
+    def test_registered_but_suppressed_clears_the_stopped_flag(self):
+        self.assertEqual(inst.arm_decision(True), "clear-stopped")
 
-    def test_insert_idempotent(self):
-        entry = inst.build_package_entry("com.miko3.bootagent", "/data/app/x", "AABB")
-        once, _ = inst.insert_package_entry(PACKAGES, entry)
-        twice, n = inst.insert_package_entry(once, entry)
-        self.assertEqual(n, 0)
-        self.assertEqual(once, twice)
+    def test_never_registered_routes_to_factory_mode_recovery(self):
+        self.assertEqual(inst.arm_decision(False), "recover")
+
+    def test_synthesizing_a_package_entry_is_gone(self):
+        """KTD4 forbids synthesizing: a <cert key=...> holds signature bytes, not a digest."""
+        self.assertFalse(hasattr(inst, "build_package_entry"))
+        self.assertFalse(hasattr(inst, "insert_package_entry"))
 
 
 class NamingTest(unittest.TestCase):
