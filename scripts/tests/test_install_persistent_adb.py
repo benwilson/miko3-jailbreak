@@ -7,6 +7,7 @@ script never removes ServiceExam or MikoPlus. The device install itself is prove
 by the plan's device proof, not here.
 """
 import importlib.util
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -122,6 +123,43 @@ class PreconditionTest(unittest.TestCase):
     def test_accepts_root_factory(self):
         with mock.patch.object(inst, "sh", self._fake_sh("0", "factory")):
             self.assertEqual(inst.require_root_factory(), ("0", "factory"))
+
+
+class BackupSystemStateTest(unittest.TestCase):
+    """R9: install backs up every system-state file it modifies, adb_keys included."""
+
+    def _run_backup(self, adb_keys_present, tmpdir):
+        calls = []
+
+        def fake_sh(cmd, check=True):
+            calls.append(cmd)
+            if cmd.startswith("["):  # the adb_keys presence probe
+                return types.SimpleNamespace(
+                    stdout=("yes" if adb_keys_present else "no") + "\n", stderr="", returncode=0)
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        def fake_adb(*args, check=True):
+            calls.append("adb " + " ".join(args))
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        with mock.patch.object(inst, "sh", fake_sh), \
+                mock.patch.object(inst, "adb", fake_adb), \
+                mock.patch.object(inst, "BACKUP_ROOT", Path(tmpdir)):
+            return inst.backup_system_state("20260912T000000Z"), calls
+
+    def test_backs_up_adb_keys_when_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            host_dir, calls = self._run_backup(True, td)
+            self.assertFalse((host_dir / "adb_keys.absent").exists())
+            self.assertTrue(any(c.startswith("adb pull " + inst.ADB_KEYS) for c in calls),
+                            f"adb_keys was not pulled: {calls}")
+
+    def test_records_adb_keys_absence(self):
+        """R14: with no pre-install adb_keys, revert must delete it — so record absence."""
+        with tempfile.TemporaryDirectory() as td:
+            host_dir, calls = self._run_backup(False, td)
+            self.assertTrue((host_dir / "adb_keys.absent").exists())
+            self.assertFalse(any(c.startswith("adb pull " + inst.ADB_KEYS) for c in calls))
 
 
 class ProtectedPackagesTest(unittest.TestCase):

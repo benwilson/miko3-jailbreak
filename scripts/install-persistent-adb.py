@@ -104,7 +104,12 @@ def existing_suffixes():
 
 
 def backup_system_state(ts):
-    """Back up both system-state files to the host and on the device (R9)."""
+    """Back up every system-state file the install writes or replaces (R9).
+
+    `adb_keys` is included, and its *absence* is recorded explicitly when it does not
+    exist pre-install: revert has to delete it in that case, or the pre-install state is
+    not restored and the host key survives the uninstall (R14).
+    """
     host_dir = BACKUP_ROOT / ts
     host_dir.mkdir(parents=True, exist_ok=True)
     dev_dir = f"{REMOTE_BACKUP}-{ts}"
@@ -113,7 +118,16 @@ def backup_system_state(ts):
         name = Path(path).name
         adb("pull", path, str(host_dir / name))
         sh(f"cp {path} {dev_dir}/{name}")
-    print(f"   backed up to {host_dir} and {dev_dir}")
+    present = sh(f"[ -e {ADB_KEYS} ] && echo yes || echo no").stdout.strip() == "yes"
+    if present:
+        adb("pull", ADB_KEYS, str(host_dir / "adb_keys"))
+        sh(f"cp {ADB_KEYS} {dev_dir}/adb_keys")
+        print(f"   backed up to {host_dir} and {dev_dir}")
+    else:
+        (host_dir / "adb_keys.absent").write_text(
+            "adb_keys did not exist before install; revert must delete it.\n")
+        sh(f"rm -f {dev_dir}/adb_keys")
+        print(f"   backed up to {host_dir} and {dev_dir} (adb_keys absent pre-install, recorded)")
     return host_dir
 
 
