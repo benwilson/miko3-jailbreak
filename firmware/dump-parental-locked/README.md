@@ -1,0 +1,79 @@
+# Dump #2 — "parental locked" (working kiosk) state
+
+Full dump of the Miko 3 in its **restored, working** state: normal boot
+reaches the kiosk (`com.miko.mikoplus.activity.appui.MikoActivity`),
+MikoPlus v69 + ServiceExam v92 installed.
+
+- Captured: 2026-09-12 (factory mode, root ADB, `scripts/dump-all.sh`)
+- Method: `adb exec-out busybox dd if=/dev/block/<node> bs=1M` streamed to host
+- Scope: every GPT partition (p1–p31) + both preloader regions + GPT header
+- Size: 29 GB, 34 images
+
+## What changed vs dump #1 (`firmware/dump/`)
+
+The **entire boot chain is byte-identical** — we never flashed anything:
+boot, recovery, system, vendor, lk, lk2, vbmeta, seccfg, preloader,
+preloader2, dtbo, logo, nvram, persist, para, proinfo, frp, tee1, tee2,
+gpt_header all match dump #1 exactly.
+
+Only data partitions differ, plus the ones dump #1 skipped:
+
+| Partition | Status vs dump #1 |
+|-----------|-------------------|
+| boot_para | new (not in dump #1) |
+| cache | new |
+| cam_vpu1/2/3 | new |
+| dkb, kb | new |
+| expdb | new |
+| metadata | new |
+| protect1, protect2 | new |
+| userdata | new (20 GB) |
+| nvcfg | changed |
+| nvdata | changed |
+
+## Manifest
+
+```
+93f52117b950f567830403f57a539e2bb24e774d3905c705ce35c7d2b5e26e53  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/boot_para.img
+de36ec6c22419da8ff1c7af3068c6265aa0f945e0539d4b8fd7d9273114483d0  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/boot.img
+86ebfd0f21912775df56ff35cb4d8c61ae034fbfc36b1ad420ac142d54855dfa  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/cache.img
+c5c5f1bc1009aac82a0ada582b7cdbf4f0c4c57b97533c32d4f30c436782af15  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/cam_vpu1.img
+afa0fbb4446efe4c0e02bb84dd64a8accc719b294db42d74e257c3ad173ce392  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/cam_vpu2.img
+3f96812d2f2eb5c0c415e94fcad69447ec8c24aa6052e61125a74e1d471c2000  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/cam_vpu3.img
+5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/dkb.img
+4c2f8cdfcd1296efc52b19fb8c62ba11f150b343b1fb3e0d7f1386f901210069  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/dtbo.img
+1d4f49768f3426ac3251454fd2e8fc26d2fd7fd7587b3e1c189ab23630356a34  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/expdb.img
+eccfa95f82fcbfbf9c15a9f2f50749a33b6fd5d66604c0768ec8daa1612e7a36  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/frp.img
+9bd14de76b0376694247dc27a28c0346e62201326b4f25849d9110c3267f3d83  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/gpt_header.img
+5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/kb.img
+08f02a425aead4664ad5e69553e590297fa121b148eac9a7de8926c553f871cf  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/lk.img
+08f02a425aead4664ad5e69553e590297fa121b148eac9a7de8926c553f871cf  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/lk2.img
+6a8969e40606e4851b88a001e45490de9118147be593e4b99538f75311db8f72  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/logo.img
+83ee47245398adee79bd9c0a8bc57b821e92aba10f5f9ade8a5d1fae4d8c4302  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/metadata.img
+ac0fba480be3fe88443004b74c33e5500ff1698f2c0f15c7ba2fd35340fbd5e6  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/nvcfg.img
+5ff7eb0608646f580f8fa680843403d76783a7c3e1817d5737e513f0d22ba688  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/nvdata.img
+fda64993f5c5067003d9dae279b482a3231c4264790127e023083420898f540a  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/nvram.img
+fa25dd82dddd4eccf4b69ae94ad350f148a682e4e7091d9153713ae3413960f9  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/para.img
+152ba99dbaf6c7dde5955a8484835194ed4fc0f20a0ea774667f148a25cb03c4  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/persist.img
+3cacb7b8dbc536965a3eb3eb9c199e55b03f192212cf8b5a2d651c3b1cf9a000  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/preloader.img
+bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/preloader2.img
+692fba3fc2f88decc6ce367878dd2bdd4c13409f69c97b6ab52d1e6460a2450c  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/proinfo.img
+e5b844cc57f57094ea4585e235f36c78c1cd222262bb89d53c94dcb4d6b3e55d  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/protect1.img
+e5b844cc57f57094ea4585e235f36c78c1cd222262bb89d53c94dcb4d6b3e55d  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/protect2.img
+f9dd5c6375f5000be9efad0438cffd536abd12a3e14d5ad0506c89cb066526c2  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/recovery.img
+6315cb87ed108c450833a4be30e0a6b1c16940b12c6b470281823c3248876578  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/seccfg.img
+2c65101daf11cff05ca147069033fa653c48e9a1af98b3dc730503e8ed4852c6  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/system.img
+48be5834db47a0f20aed32832d86179f67f9dc27e91d3f9e46ae15e7865ee724  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/tee1.img
+48be5834db47a0f20aed32832d86179f67f9dc27e91d3f9e46ae15e7865ee724  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/tee2.img
+fcb5f019baaa5f80626b4b42714aa4edf01271d1d39568436a7fab45cf47eb4a  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/userdata.img
+b4cb658d08c245446b12d7d807e6ade6692ddd4cf14577930babeaed381d6218  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/vbmeta.img
+729bcad1dc124dce9c43cb32e925f810040d04ba2bd4ca1bbd95e41f9fe8b2f1  /Users/bwilson/Documents/miko3-jailbreak/firmware/dump-parental-locked/vendor.img
+```
+
+## Restoring from this dump
+
+See `docs/kiosk-recovery-fix.md`. The two-partition minimum for a working
+kiosk is: **system + userdata** (system carries the app bases; userdata
+carries the MikoPlus v69 / ServiceExam v92 update dirs and their data).
+The boot chain partitions here are identical to dump #1, so either dump's
+copy works for those.

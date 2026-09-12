@@ -2,6 +2,14 @@
 firmware/*
 !firmware/.gitkeep
 !firmware/README.md
+# Track only the per-dump manifests/readmes (hashes are safe to publish)
+!firmware/dump/
+!firmware/dump/README.md
+!firmware/dump/SHA256SUMS
+!firmware/dump-parental-locked/
+!firmware/dump-parental-locked/README.md
+!firmware/dump-parental-locked/SHA256SUMS
+firmware/**/*.img
 *.img
 *.bin
 *.dump

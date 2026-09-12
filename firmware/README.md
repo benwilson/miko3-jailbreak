@@ -6,6 +6,19 @@ dumped, from where, and how to reproduce the dump or restore from it.
 
 Images are stored locally in `firmware/dump/` (gitignored).
 
+## Dump Inventory
+
+Two dumps exist. Both live locally (gitignored); only their manifests are tracked.
+
+| Dump | Dir | State | Scope |
+|------|-----|-------|-------|
+| #1 | `firmware/dump/` | original, pre-modification | critical partitions (22 images) |
+| #2 | `firmware/dump-parental-locked/` | **restored working kiosk** (MikoPlus v69 + ServiceExam v92) | **every** partition + preloader (34 images, 29 GB) |
+
+The entire boot chain is **byte-identical** between the two — we never flashed
+anything. Only data partitions differ. Full detail: each dump's own `README.md`
+and `SHA256SUMS`.
+
 ## Device Context
 
 - **Device:** Miko 3 (Chidakashi Technologies)
