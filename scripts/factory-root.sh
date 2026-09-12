@@ -177,7 +177,7 @@ info "the next power-cycle. To make ADB permanent across normal"
 info "boots, the watchdog must stay disabled (done above)."
 echo ""
 
-# Drop to shell if requested
-if [ "$mode" = "shell" ]; then
+# Drop to shell if requested (only in interactive terminal)
+if [ "$mode" = "shell" ] && [ -t 0 ]; then
   exec adb shell
 fi
