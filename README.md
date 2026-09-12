@@ -35,6 +35,8 @@ Full documentation: [`docs/method-factory-root.md`](docs/method-factory-root.md)
 | `docs/method-factory-root.md` | **The canonical root method** |
 | `docs/update-mechanism.md` | Reverse-engineered OTA engine (APPS.zip / `3_files.l` / `.ia`) |
 | `docs/mishap-recovery.md` | The "robo mishap" incident: cause + recovery steps |
+| `docs/kiosk-recovery-fix.md` | **The actual fix**: MikoPlus v69 + ServiceExam v92 (matching AIDL) |
+| `docs/firmware-download-investigation.md` | Firmware download attempts, hosts, walls |
 | `docs/secrets-and-auth.md` | Where the secrets live + how we derived them (redacted) |
 | `recon/` | Enumeration results, USB captures, probe logs |
 | `recon/captures/` | Timestamped logs from every probe and session |
