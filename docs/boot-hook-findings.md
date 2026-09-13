@@ -8,6 +8,13 @@ This records what was actually measured while trying to install the boot agent, 
 none of it has to be re-derived. Three of the four sections are things that *do not
 work* — those cost the most to find.
 
+## DO THIS NEXT — the one open question
+
+**Why does `unzipUsingLibray1` produce no extracted files?** That is the single
+blocker on the no-SD-card route, and it is answerable **at a desk, with no device
+and no failed boot**. See §3c for the evidence and §7 for the recipe. Everything
+else here is either settled or waiting on a microSD card.
+
 ---
 
 ## 1. The install premise is false
@@ -106,10 +113,24 @@ which is gated on a `"DOWNLOADS"` state inside the app's own update flow. That f
 runs `APIS.init(...)` and a bot-details fetch against Miko's servers first.
 
 ### 3c. The unzip extracts nothing — the current blocker
-Across two attempts with two different archives, `unzipUsingLibray1()` (zip4j)
-produced **nothing** in `/sdcard/klug/downloads/ENC/`; only the engine's own
-`enc_k.kf` / `enc_m.kf` appeared. With no other files, the listing is empty and the
-engine calls `downloadStatus(0, 0, -22)` → **"Oops, the update failed."**
+**Observation (two attempts, two different archives):** after the run,
+`/sdcard/klug/downloads/ENC/` contains **only** the engine's own
+`enc_k.kf` / `enc_m.kf` — never our `3_files.l` or `miko3.z`. The listing is
+therefore empty and the engine calls `downloadStatus(0, 0, -22)` →
+**"Oops, the update failed."**
+
+**Note the careful reading — an earlier draft of this over-claimed.** The keys are
+created by `generateSaveKeys1()`, which runs at the *start* of
+`processInstall(dir, …)`, and that is only reached when the unzip returns `"0"`.
+So the evidence is consistent with **three** different mechanisms, and they have not
+been separated:
+
+1. the extraction produced nothing (archive rejected by `isValidZipFile`);
+2. the extraction produced files that something consumed before we looked — the
+   listing we observe is the *post-run* state, not the state the engine saw;
+3. the extraction failed *and* `processInstall(ENC)` was reached by another caller.
+
+Distinguishing them is exactly what the host-side reproduction in §7 is for.
 
 `unzipUsingLibray1` is a plain zip4j extraction with no password and no
 encryption requirement, and `file1.ia` / `file2.ia` / `klug_42.z` on the device all
@@ -185,6 +206,28 @@ the network.
 ---
 
 ## 7. Where to go next
+
+### 7a. Next action: settle the zip4j question (no device needed)
+
+Reproduce the engine's extraction on the host, against the exact archive that
+failed. `hooks/sd-free/APPS.zip` is committed and is the archive in question.
+
+- The routine is `FileUtils.unzipUsingLibray1(src, dst, cb, i, i2)`: pure **zip4j**,
+  no password, no encryption. Success is the *string* `"0"`.
+- It rejects via `zipFile.isValidZipFile()` → returns `"-2"`, and any exception
+  returns the exception text instead — so a non-`"0"` return silently skips
+  `processInstall` entirely.
+- Both failing archives were built with **macOS `zip`**. That is the leading
+  suspect: macOS produces `__MACOSX/` entries and `._` resource forks.
+- Try, in order: (a) run the archive through zip4j in a JVM harness and inspect
+  `isValidZipFile()` / `getFileHeaders()`; (b) rebuild the archive with a different
+  tool (`python -m zipfile`, `7z`) and diff the entry list; (c) check whether
+  macOS entries alone break `isValidZipFile`.
+
+This either fixes Route B outright or rules it out — **without another failed boot
+and factory-mode rescue.**
+
+### 7b. Otherwise: Route A, blocked only on hardware
 
 **Route A is the sound design and is blocked only on hardware — a microSD card.**
 It is not a workaround: it never unzips, never talks to the network, calls the
