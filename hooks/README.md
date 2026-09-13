@@ -49,7 +49,7 @@ miko3/payload.sh                      payload
 miko3/neuterd                         arm64 daemon
 ```
 
-### Route B — no SD card
+### Route B — no SD card (weaker; network-dependent)
 
 `UpdateActivity.onCreate` branches only on the `LAUNCHED_BY` intent extra:
 
@@ -60,26 +60,23 @@ miko3/neuterd                         arm64 daemon
 | `SERVICE` / `MOCK` | **`launchedByLauncher = false`** |
 
 With `launchedByLauncher == false` the engine takes the branch that reads
-**`/sdcard/klug/downloads/APPS.zip`** — writable, persistent emulated storage.
+`/sdcard/klug/downloads/APPS.zip` — writable, persistent emulated storage — and the
+launcher reaches that app through `apps.json`, whose launch call passes `null`
+extras (`AppUtils.openApp1(this, parent, false, name, null, …)`).
 
-The launcher reaches that app through `apps.json`, and its launch call passes
-`null` extras:
+**Caveat found after writing this: `pu.processInstall()` is not reached directly.**
+In `UpdateActivity` it is called only from `updateProcess()`, which is gated:
 
 ```java
-AppUtils.openApp1(this, parent, false, name, null, checkIfAppInForeground());
+if (str.equals("DOWNLOADS") && z) { updateProcess(); }   // -> pu.processInstall()
 ```
 
-so `LAUNCHED_BY` is absent, defaults to `FTUE`, and the APPS.zip branch runs.
+`str` is a state in the app's update flow, which fetches bot details from Miko's
+servers (`prod-userproperties.miko-robot.in`). So Route B **depends on that network
+flow**, and the app may overwrite `APPS.zip` from its own download before processing
+it. Route A has neither problem — the launcher calls the engine directly at boot.
 
-```
-/sdcard/klug/APPS/apps.json           repointed at com.miko.update_app
-/sdcard/klug/downloads/APPS.zip       contains 3_files.l
-/sdcard/klug/miko3/payload.sh         payload
-/sdcard/klug/miko3/neuterd            arm64 daemon
-```
-
-Because `apps.json` then points at the updater instead of the kiosk, the payload
-starts the kiosk itself with `am start`, so the display is unchanged.
+Treat Route B as a fallback to try only if Route A cannot be used.
 
 ## Persistence
 
@@ -99,3 +96,6 @@ lives on `/sdcard`, which an OTA may rewrite.
 - **Not yet verified on hardware.** The 2026-09-12 attempt could not exercise either
   route: Route A had no SD card inserted (`/storage/sdcard1` absent), and the test
   `.l` placed for Route B relied on the property override that turned out to be dead.
+- **Route A is the sound one**: the launcher calls the engine directly from
+  `onCreate`, with `launchedByLauncher=true`, so no network is in the path. Route B
+  goes through `UpdateActivity`'s download state and therefore through Miko's servers.
