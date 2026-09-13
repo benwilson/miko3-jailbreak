@@ -181,10 +181,13 @@ def authorize_host_key():
        f"cat {staged} >> {ADB_KEYS}; fi")
     sh(f"rm -f {staged}")
     sh(f"chown system:system {ADB_KEYS}; chmod 640 {ADB_KEYS}")
-    written = sh(f"wc -l < {ADB_KEYS} 2>/dev/null", check=False).stdout.strip()
-    if not written or written == "0":
-        raise InstallError(f"!! the host key did not land in {ADB_KEYS}; aborting rather than "
-                           "leaving the unit without the authorization the install promised.")
+    # Byte size, not line count: an adb public key carries no trailing newline, so `wc -l`
+    # reports 0 for a correctly written single-key file. Measured on the unit.
+    size = sh(f"wc -c < {ADB_KEYS} 2>/dev/null", check=False).stdout.strip()
+    if not size.isdigit() or int(size) == 0:
+        raise InstallError(f"!! the host key did not land in {ADB_KEYS} (0 bytes); aborting "
+                           "rather than leaving the unit without the authorization the install "
+                           "promised.")
     return True
 
 

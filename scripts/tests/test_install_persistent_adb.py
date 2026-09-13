@@ -181,8 +181,9 @@ class DeviceCommandTest(unittest.TestCase):
 
         def fake_sh(cmd, check=True):
             cmds.append(cmd)
-            # the adb_keys write is read back; answer that probe as a landed write
-            out = "1\n" if cmd.startswith("wc -l") else ""
+            # the adb_keys write is read back by BYTE SIZE; `wc -l` would report 0 for a
+            # correctly written key, since adb public keys carry no trailing newline
+            out = "719\n" if cmd.startswith("wc -c") else ""
             return types.SimpleNamespace(stdout=out, stderr="", returncode=0)
 
         def fake_adb(*a, **k):
@@ -211,6 +212,44 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertNotIn("> " + inst.ADB_KEYS + ".tmp", joined,
                          "the previous implementation replaced the whole file")
         self.assertIn(f"chmod 640 {inst.ADB_KEYS}", joined)
+
+    def test_read_back_measures_bytes_not_lines(self):
+        """Found on the unit: adb public keys have no trailing newline, so `wc -l` is 0."""
+        cmds = []
+        key = Path.home() / ".android" / "adbkey.pub"
+        if not key.exists() or not key.read_text().strip():
+            self.skipTest("no host adbkey.pub on this machine")
+
+        def fake_sh(cmd, check=True):
+            cmds.append(cmd)
+            if cmd.startswith("wc -c"):
+                return types.SimpleNamespace(stdout="719\n", stderr="", returncode=0)
+            if cmd.startswith("wc -l"):
+                return types.SimpleNamespace(stdout="0\n", stderr="", returncode=0)
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        with mock.patch.object(inst, "sh", fake_sh), \
+                mock.patch.object(inst, "adb", lambda *a, **k: types.SimpleNamespace(
+                    stdout="", stderr="", returncode=0)):
+            self.assertTrue(inst.authorize_host_key())
+        self.assertTrue(any(c.startswith("wc -c") for c in cmds),
+                        "the read-back must measure bytes; wc -l cannot see a newline-less key")
+
+    def test_read_back_fails_on_a_zero_byte_write(self):
+        key = Path.home() / ".android" / "adbkey.pub"
+        if not key.exists() or not key.read_text().strip():
+            self.skipTest("no host adbkey.pub on this machine")
+
+        def fake_sh(cmd, check=True):
+            return types.SimpleNamespace(stdout="0\n" if cmd.startswith("wc -c") else "",
+                                         stderr="", returncode=0)
+
+        with mock.patch.object(inst, "sh", fake_sh), \
+                mock.patch.object(inst, "adb", lambda *a, **k: types.SimpleNamespace(
+                    stdout="", stderr="", returncode=0)):
+            with self.assertRaises(inst.InstallError) as ctx:
+                inst.authorize_host_key()
+        self.assertIn("0 bytes", str(ctx.exception))
 
     def test_agent_registered_probes_packages_xml_not_the_package_manager(self):
         """The arm path must work in factory mode, which has no package manager (KTD4)."""
