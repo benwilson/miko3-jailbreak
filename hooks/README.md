@@ -90,12 +90,31 @@ lives on `/sdcard`, which an OTA may rewrite.
 
 ## Status
 
-- **Verified by decompilation**: the `HOME` category, the `onCreate` → `processInstall`
-  call path, the unconditional `su`, the `LAUNCHED_BY` branches, the APPS.zip branch,
-  the `.l` format, and the dead property merge.
-- **Not yet verified on hardware.** The 2026-09-12 attempt could not exercise either
-  route: Route A had no SD card inserted (`/storage/sdcard1` absent), and the test
-  `.l` placed for Route B relied on the property override that turned out to be dead.
-- **Route A is the sound one**: the launcher calls the engine directly from
-  `onCreate`, with `launchedByLauncher=true`, so no network is in the path. Route B
-  goes through `UpdateActivity`'s download state and therefore through Miko's servers.
+Full technical findings — including the four dead ends and the device facts
+measured — are in **`docs/boot-hook-findings.md`**. Summary:
+
+- **Route A**: mechanism confirmed by decompilation; **never blocked on anything
+  but hardware.** Not yet exercised (no SD card was inserted). It never unzips and
+  never touches the network, so it avoids every failure Route B hit.
+- **Route B**: **three separate blockers, and it does not currently work.**
+  1. A `version.txt` advertising `version_code: 42` — the already-installed
+     version — made the app stall at 0% before reaching the engine.
+  2. The updater's flow is cloud-gated (`APIS.init`, bot-details fetch).
+  3. **Current blocker:** `unzipUsingLibray1` (zip4j) extracts nothing from our
+     `APPS.zip`; `ENC/` ends up holding only the engine's own `enc_k.kf`/`enc_m.kf`,
+     so the listing is empty and the engine reports `-22` → "Oops, the update
+     failed". Why the extraction yields nothing is **undetermined**.
+
+If Route B is pursued, the narrow open question is #3. Both archives that failed
+were built with macOS `zip`; a host-side zip4j reproduction, or an archive built
+with a different tool, would settle it.
+
+## Deployed-and-restored log
+
+Every device write in this work has a timestamped backup beside it:
+
+- `apps.json.pre-hook-<stamp>` / `.pre-hook2-` / `.pre-hook3-` in `/sdcard/klug/APPS/`
+  and `/sdcard/klug/RECOVERY/`
+- `miko.properties.pre-hook-<stamp>` in `/sdcard/klug/`
+
+Restore with `cp <file>.pre-hook3-<stamp> <file>`, then reboot.
