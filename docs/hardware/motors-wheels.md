@@ -1,5 +1,66 @@
 # Motors / wheels — locomotion hardware control
 
+## FIX LANDED: `ACTIVE_OTHERS` state handshake — rotation now genuinely, reliably moves the robot from an external AIDL client (2026-09-14, session 2 continued)
+
+**The real root cause of "the MCU acks the command but nothing moves," found and fixed in product code (`shared/src/com/miko3/shared/RobotControlClient.java`, commit `65fdc16`), not just diagnosed.**
+
+`ServiceClientInterface`'s code-122 handler (`ServiceClientInterface.java:590`)
+is how a controlling app tells `MikoStateMachine` it's the active interactive
+session — `str.equals("ACTIVE_OTHERS")` → `statemachine.onEvent(isRoot)` (or
+`isOthers`), gated on the same `activeAppModel.isRoot()` flag
+`MikoStateMachine`'s own idle-mode-expression gate checks. **No app in this
+project — not `RobotControlClient`, not the earlier `spike-drive-test`
+harness — ever sent this before issuing drive commands.** Adding a single
+`GameEvent(122, "ACTIVE_OTHERS")` call right after the AIDL handshake
+completes, before anything else, is the fix.
+
+### Confirmed with full triangulation, twice
+
+1. First run (`spike-drive-test`, `active_others_test2.log`, 13:57:33–36):
+   sent the handshake, then six `angular=20` rotate commands. A **new signal,
+   never observed in any of this session's ~20+ prior attempts without the
+   handshake**, appeared: `expressionEvent` callback
+   `{"message":"MOTION_COMPLETE","type":"MOTION_CALLBACK"}`, once per
+   command. Wheel-encoder telemetry (`Left=`/`Right=`) moved smoothly and
+   continuously in step with the commands (`-000005223,-000008131` →
+   `-000005840,-000007522`). The operator watched and confirmed real
+   rotation, count matching the commands sent.
+2. Landed the identical fix in `RobotControlClient.java` itself, rebuilt and
+   reinstalled `mode-remote-control` from source
+   (`scripts/build-mode-remote-control.py`), retested **forward** through
+   the real product app/web UI this time, cleanly isolated (fresh encoder
+   baseline immediately before, live full-logcat capture, single-direction
+   test): **zero `MOTION_COMPLETE`, frozen encoder, operator confirmed no
+   movement** — see next section. Rotation's fix is confirmed general (product
+   code, not a spike-test-only artifact); forward's separate block survives
+   it, cleanly isolated from the state-gate issue for the first time this
+   session.
+
+### What this settles vs. what's still open
+
+**Settled**: the `Idle`-state-timing theory from the section below is
+superseded as the primary explanation — it isn't really about `Idle` per se,
+it's `activeAppModel.isRoot()`/the `ACTIVE_OTHERS` handshake, which the
+robot's own internal idle-mode engine naturally satisfies as part of its own
+invocation context (which is also why every confirmed-real movement all
+session happened to correlate with an `Idle`-state transition — that
+transition's own code path happens to also flip the `isRoot()`-adjacent
+state, not because `Idle` itself is the gate). **Rotation and (per the
+operator's earlier live-UI testing) back are now expected to work reliably
+from any client that sends this handshake — this is a real, general, product
+fix, not a workaround specific to one test.**
+
+**Still open**: forward (`linear>0`) has an additional, separate block that
+this fix does not clear. Leading unconfirmed lead, from the section below:
+`TOFIR=16383` never changed once across this entire session, including
+during every confirmed-real movement — a frozen/sentinel obstacle-sensor
+reading the firmware may be treating defensively as "unknown terrain ahead,
+don't drive forward," independent of the state-machine gate this fix
+addresses. Finding and reading the actual `TOFIR` threshold/gating code is
+the concrete next step, not done this pass.
+
+---
+
 ## UPDATE: forward is asymmetrically worse than the other three directions, live-UI-tested (2026-09-14, session 2 continued)
 
 **Revises the section directly below** (which found rotation *also* dead
