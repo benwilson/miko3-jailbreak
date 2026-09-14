@@ -183,6 +183,53 @@ public class ModeApp extends Application {
                 }
             }
         });
+        // U13: a persistent channel for drive commands, replacing the old
+        // repeated-fetch()-every-300ms approach — each of those fetches paid a
+        // fresh HTTPS/TLS handshake, which over WiFi was slow enough to
+        // routinely blow past DriveController's 750ms watchdog and cause
+        // visible start/stop jank (confirmed live: "straight, jank, jank,
+        // straight, jank"). The client still resends "drive x y" every ~200ms
+        // while a control is held (same repeat-while-held shape as before), but
+        // now as a cheap WS frame over an already-open socket instead of a new
+        // connection each time.
+        server.websocketRoute("/drive-ws", new RoutingHttpServer.WebSocketHandler() {
+            @Override
+            public void handle(HttpRequest req, com.miko3.shared.WebSocketConnection ws) throws IOException {
+                String token = req.queryParam("ct", null);
+                DriveController dc = driveController;
+                if (dc == null || token == null) {
+                    return;
+                }
+                String msg;
+                try {
+                    while ((msg = ws.readText()) != null) {
+                        try {
+                            if (msg.startsWith("drive ")) {
+                                String[] parts = msg.substring(6).trim().split("\\s+");
+                                if (parts.length >= 2) {
+                                    dc.drive(token, HttpUtil.parseIntOr(parts[0], 0), HttpUtil.parseIntOr(parts[1], 0));
+                                }
+                            } else if ("stop".equals(msg)) {
+                                dc.drive(token, 0, 0);
+                            }
+                        } catch (DriveController.StaleClientException e) {
+                            ws.sendText("conflict");
+                            break; // a newer connection took over — nothing left for this one to do
+                        } catch (android.os.RemoteException e) {
+                            Log.w(TAG, "drive-ws drive() failed", e);
+                        }
+                    }
+                } finally {
+                    // Best-effort final stop as soon as the connection ends (tab closed,
+                    // network dropped, "stop" never made it) — defense in depth alongside
+                    // DriveController's own 750ms watchdog, which would also catch this.
+                    try {
+                        dc.drive(token, 0, 0);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        });
         server.route("/exit", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {

@@ -9,6 +9,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -50,9 +54,21 @@ public final class RoutingHttpServer implements Runnable {
         void handle(HttpRequest req, HttpResponse res) throws IOException;
     }
 
+    /** U13: a persistent, low-latency channel for drive commands — see
+     * mode-remote-control/ModeApp's "/drive-ws" route for why a WebSocket
+     * replaced repeated short-lived HTTPS requests (each one paying a fresh
+     * TLS handshake, which over WiFi was slow enough to routinely blow past
+     * the drive watchdog and cause visible start/stop jank). */
+    public interface WebSocketHandler {
+        void handle(HttpRequest req, WebSocketConnection ws) throws IOException;
+    }
+
+    private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
     private final Context appContext;
     private final int port;
     private final Map<String, RouteHandler> routes = new HashMap<String, RouteHandler>();
+    private final Map<String, WebSocketHandler> wsRoutes = new HashMap<String, WebSocketHandler>();
     private volatile boolean running = true;
     private volatile ServerSocket serverSocket;
     private volatile ServerSocket httpsServerSocket;
@@ -67,6 +83,10 @@ public final class RoutingHttpServer implements Runnable {
 
     public void route(String path, RouteHandler handler) {
         routes.put(path, handler);
+    }
+
+    public void websocketRoute(String path, WebSocketHandler handler) {
+        wsRoutes.put(path, handler);
     }
 
     public Context appContext() {
@@ -106,14 +126,10 @@ public final class RoutingHttpServer implements Runnable {
     }
 
     /**
-     * Binds with SO_REUSEADDR (so a just-closed socket on this same port
-     * from another process — e.g. the launcher and the mode app trading
-     * off the same port pair on a mode launch/exit, see LauncherApp's and
-     * ModeApp's startServer()/stopServer() — doesn't leave the new bind
-     * failing on a lingering TIME_WAIT) plus a short retry: the outgoing
-     * side's close() and the incoming side's bind() are two independent
-     * process's calls with no direct handoff signal between them, so a
-     * few hundred ms of overlap is expected, not a bug.
+     * Binds with SO_REUSEADDR (so a quick app restart reusing this same port
+     * — an APK reinstall, a crash-and-relaunch — doesn't fail its bind on a
+     * lingering TIME_WAIT from the previous process's socket) plus a short
+     * retry, since that previous socket's teardown isn't instantaneous.
      */
     private static ServerSocket bindWithRetry(ServerSocket socket, int port) throws IOException {
         socket.setReuseAddress(true);
@@ -252,6 +268,37 @@ public final class RoutingHttpServer implements Runnable {
             InputStream body = bodyStream(rawIn, headers);
             HttpRequest req = new HttpRequest(method, path, HttpRequest.parseQuery(queryString), headers, body);
 
+            WebSocketHandler wsHandler = wsRoutes.get(path);
+            if (wsHandler != null && isWebSocketUpgrade(headers)) {
+                String wsKey = headers.get("sec-websocket-key");
+                if (wsKey == null) {
+                    res.sendText(400, "Bad Request", "text/plain; charset=utf-8", "missing Sec-WebSocket-Key");
+                    client.close();
+                    return;
+                }
+                String handshake = "HTTP/1.1 101 Switching Protocols\r\n"
+                        + "Upgrade: websocket\r\n"
+                        + "Connection: Upgrade\r\n"
+                        + "Sec-WebSocket-Accept: " + computeAcceptKey(wsKey) + "\r\n\r\n";
+                out.write(handshake.getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                // No read timeout on a WS connection: it's meant to sit open and idle
+                // between drive commands (that's the whole point — no per-command
+                // reconnect cost), so the 30s timeout below (meant for an ordinary
+                // request/response exchange) would otherwise kill it while the
+                // operator simply isn't pressing anything.
+                client.setSoTimeout(0);
+                WebSocketConnection ws = new WebSocketConnection(client, rawIn, out);
+                try {
+                    wsHandler.handle(req, ws);
+                } catch (IOException e) {
+                    Log.w(TAG, "websocket handler for " + path + " failed", e);
+                } finally {
+                    ws.close();
+                }
+                return;
+            }
+
             RouteHandler handler = routes.get(path);
             if (handler == null) {
                 res.sendText(404, "Not Found", "text/plain; charset=utf-8", "not found");
@@ -272,6 +319,23 @@ public final class RoutingHttpServer implements Runnable {
                 client.close();
             } catch (IOException ignored) {
             }
+        }
+    }
+
+    private static boolean isWebSocketUpgrade(Map<String, String> headers) {
+        String upgrade = headers.get("upgrade");
+        return upgrade != null && upgrade.toLowerCase().contains("websocket");
+    }
+
+    /** RFC 6455 §1.3: base64(SHA-1(client's Sec-WebSocket-Key + the spec's fixed GUID)). */
+    private static String computeAcceptKey(String wsKey) {
+        try {
+            MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+            byte[] digest = sha1.digest((wsKey + WEBSOCKET_GUID).getBytes(StandardCharsets.US_ASCII));
+            return Base64.getEncoder().encodeToString(digest);
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-1 is a mandatory JCA algorithm on every Android version this targets.
+            throw new AssertionError(e);
         }
     }
 
