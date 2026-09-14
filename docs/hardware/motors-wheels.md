@@ -1,5 +1,133 @@
 # Motors / wheels — locomotion hardware control
 
+## UPDATE: forward is asymmetrically worse than the other three directions, live-UI-tested (2026-09-14, session 2 continued)
+
+**Revises the section directly below** (which found rotation *also* dead
+across a scripted curl test) — the operator directly exercised the real web
+UI's buttons (not a scripted loop) and reports: **left/right work,
+back "kind of works — one pulse," forward does nothing at all.** This is a
+real, live, hands-on-the-actual-buttons result and takes priority over my
+own scripted curl test's flatter "nothing works" finding — the likely
+reconciliation is that the `Idle`-state gate below is real but
+inconsistent/timing-dependent (a click can land inside or outside the
+window), and my own tests, run back-to-back with no idle gaps between them,
+consistently missed it, while the operator's more scattered manual clicking
+over a longer session occasionally landed inside a live window for
+rotate/back but apparently never for forward.
+
+**One concrete, checkable lead for why forward specifically fares worse:**
+`TOFIR=16383` in the `SocialInteraction` telemetry (`"PI3 callback
+string"`) never once changed, across this entire session, including during
+confirmed real movement — `16383` = `0x3FFF`, a suspicious sentinel/max-value
+that never fluctuates even slightly, more consistent with "no valid
+reading" than a live ToF distance. `com.models.sensor.tofIR` (found earlier
+this session in MikoPlus) and the ServiceExam strings `"TOF is above
+threshold"`/`"TOF is below threshold"`/`EDGE_OBSTACLE`/
+`edge_obstacle_detected` (from `com.models.sensor.Power`) all point at a
+real forward-facing obstacle/edge sensor somewhere in this firmware. **If a
+stuck/invalid ToF reading is treated defensively as "don't drive forward,
+unknown terrain ahead" — without the same caution applied to
+backward/rotation, which don't face into unscanned territory the same way —
+that would explain a forward-specific block independent of the `Idle`-state
+timing issue.** Not confirmed: the exact threshold/parsing code that reads
+`TOFIR` and decides whether to gate `linear>0` specifically was not located
+this pass — the class name and log strings are known, the actual gating
+logic is not.
+
+**Net picture, both effects likely stacking**: (1) the `Idle`-state gate
+below applies to all directions and makes any external command a
+coin-flip depending on timing, and (2) forward may have an *additional*,
+harder block from the frozen/sentinel ToF reading that the other three
+directions don't share. Confirming (2) would need finding and reading the
+actual `TOFIR` threshold check, not yet done.
+
+---
+
+## ROOT CAUSE OF "EXTERNAL DRIVE COMMANDS DON'T MOVE THE ROBOT" (2026-09-14, session 2 continued): gated on `MikoStateMachine` entering `Idle`, not axis-specific
+
+**Supersedes the framing of "the forward button doesn't work" — it isn't
+forward-specific. No externally-triggered AIDL drive command, on either
+axis, has ever been confirmed to move the robot. The only confirmed
+physical movement all session has come from the robot's own internal idle
+behavior, never from an app.**
+
+### The controlled A/B that settled it
+
+Rebuilt `mode-remote-control` fresh from the current, already-fixed source
+(`scripts/build-mode-remote-control.py`; the other session had already
+independently found and fixed the same envelope bug this doc documents
+below, commit `1538f31`) and reinstalled it. With a live full-logcat capture
+running and the operator watching throughout:
+
+1. **Forward** (`linear=20`, six repeats, 13:41:59–13:42:01): `NEWAIDL`
+   shows the correct payload every time, `D/ack: Motion/VEL1
+   Completion:CPL=1` every time, zero exceptions. Encoder telemetry
+   (`Left=`/`Right=`) never changed. Operator confirmed no movement.
+2. **Rotation** (`angular=20`, same method, 13:42:18–13:42:20), immediately
+   after, same build, same session: identical result — clean `CPL=1` every
+   time, encoder frozen, no movement.
+3. Operator moved the unit out of a box it had been sitting in (raising a
+   legitimate "was it just physically blocked" question) and **forward was
+   retested a third time** (13:43:45–13:43:47): still zero encoder change,
+   operator confirmed still no movement. Rules out physical confinement as
+   the explanation.
+
+So: same fixed payload, same confirmed-reaching-hardware pipeline, same MCU
+acknowledgment, tested on both axes, out of any box — no movement. This
+directly contradicts nothing found earlier (the "DEFINITIVE RESULT" section
+below already showed CPL=1-with-no-movement for rotation); it closes the
+"maybe it's just forward, or maybe the earlier no-movement result was a
+fluke" questions.
+
+### What actually correlates with real movement — `MikoStateMachine` entering `Idle`
+
+While the operator was watching (unprompted by any test from this project),
+the robot moved twice more, and the second time was caught in the
+still-running live capture, with `StatMach`-tagged log lines immediately
+preceding:
+```
+13:44:07.338 E/StatMach: StateChangeThread switching to Idle from inactiveKeyword
+13:44:07.338 E/StatMach: Entered Idle state = DISCONNECTED
+13:44:07.354 E/StatMach: Playing Idle Mode Expression - name is IDLE_MODE.txt expType: Offline
+```
+This is the identical pattern the first spontaneous-movement event (section
+below) showed: `StateChangeThread switching to Idle from inactiveKeyword` →
+`Entered Idle state` → `Playing Idle Mode Expression - name is
+IDLE_MODE.txt`, immediately followed by real, encoder-confirmed motion.
+**Both confirmed-real movement events, and zero of the ~15+ confirmed-dead
+external AIDL attempts across this session, correlate with the state
+machine being in `Idle` and running its own internal idle-mode expression
+queue** — occurring roughly 20 seconds after the last external interaction
+in this instance, consistent with a natural idle-timeout entering that
+state once nothing else is contending for the robot's attention.
+
+The one code-level lead not yet chased down to a conclusion:
+`MikoStateMachine.java`'s idle-mode-expression gate checks
+`MikoStateMachine.uinterface.activeAppModel.isRoot()`
+(`com.emotix.arya.app_utils.ActiveAppModel.isRoot()`) alongside the `Idle`
+state check — worth reading in full; possibly the actual gate on whether a
+given expression (including its motion payload) is allowed to reach
+hardware, with `Idle` state being necessary but not sufficient. Not
+completed this pass.
+
+### Practical implication for anyone building a drive feature against this device right now
+
+**As of this pass, there is no known way to make an external AIDL client
+(this project's own mode apps included) physically drive the robot.** The
+protocol layer is fully correct and reaches the hardware every time
+(`CPL=1`), but something gates actual motor engagement on the robot's own
+internal state-machine context that an external `GameEvent` call does not
+enter. This is not a payload/envelope problem — that class of bug is fully
+fixed and verified. Next investigative step, not yet done: read
+`MikoStateMachine`'s full `Idle`-state entry/expression-queue code path to
+find the exact condition, and check whether it's satisfiable from outside
+ServiceExam at all (e.g. is there any AIDL-reachable way to request the
+robot enter `Idle` or to mark a caller's expression as an "idle mode"
+expression) or whether this is a closed loop only the robot's own internal
+timers can enter.
+
+---
+
 ## WHEELS CONFIRMED WORKING (2026-09-14, session 2 continued): operator-witnessed movement, corroborated by live encoder telemetry — but not yet reproduced from an external AIDL call
 
 **Resolves the headline open question of this entire document.** Shortly
