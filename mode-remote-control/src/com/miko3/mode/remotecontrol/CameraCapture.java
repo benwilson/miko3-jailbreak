@@ -54,6 +54,15 @@ final class CameraCapture {
     // (Camera2's close() only *starts* teardown; the HAL isn't actually free until
     // the corresponding state callback fires).
     private volatile CountDownLatch closedLatch;
+    // Confirmed live: with no target FPS set, this session ran at the camera's
+    // default (likely native max, e.g. 30fps) rate — measured via `top`, this
+    // process alone was using ~90% of a quad-core SoC's total CPU capacity, and
+    // system-wide CPU idle jumped from 8% to 84% the moment this app was stopped.
+    // That contention is a direct, plausible cause of the reported inconsistent
+    // drive-command latency ("sometimes works, sometimes janky"): an MJPEG preview
+    // doesn't need 30fps to look reasonable, so start() picks the slowest
+    // available range (>=10fps if one exists) and onConfigured() applies it.
+    private android.util.Range<Integer> targetFpsRange;
 
     CameraCapture(Context context, MjpegBroadcaster broadcaster, ErrorListener errorListener) {
         this.context = context.getApplicationContext();
@@ -86,6 +95,9 @@ final class CameraCapture {
             CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
             Integer hwLevel = characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL);
             Log.i(TAG, "camera " + cameraId + " INFO_SUPPORTED_HARDWARE_LEVEL=" + hwLevel);
+
+            targetFpsRange = pickLowFpsRange(characteristics);
+            Log.i(TAG, "using target FPS range " + targetFpsRange);
 
             StreamConfigurationMap map = characteristics.get(
                     CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
@@ -162,6 +174,30 @@ final class CameraCapture {
         return ids.length > 0 ? ids[0] : null;
     }
 
+    /** Prefers the slowest range with a max of at least 10fps (still reasonable for
+     * an MJPEG preview) over the single slowest range available, since some devices
+     * report a very low special-purpose range (e.g. long-exposure/low-light) whose
+     * max would make the preview look like a slideshow. Falls back to the overall
+     * slowest range, or null (no override — camera default) if none are reported. */
+    private android.util.Range<Integer> pickLowFpsRange(CameraCharacteristics characteristics) {
+        android.util.Range<Integer>[] ranges = characteristics.get(
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        if (ranges == null || ranges.length == 0) {
+            return null;
+        }
+        android.util.Range<Integer> bestOverall = ranges[0];
+        android.util.Range<Integer> bestAtLeast10 = null;
+        for (android.util.Range<Integer> r : ranges) {
+            if (r.getUpper() < bestOverall.getUpper()) {
+                bestOverall = r;
+            }
+            if (r.getUpper() >= 10 && (bestAtLeast10 == null || r.getUpper() < bestAtLeast10.getUpper())) {
+                bestAtLeast10 = r;
+            }
+        }
+        return bestAtLeast10 != null ? bestAtLeast10 : bestOverall;
+    }
+
     private Size pickSmallestJpegSize(StreamConfigurationMap map) {
         if (map == null) {
             return null;
@@ -230,6 +266,9 @@ final class CameraCapture {
                 CaptureRequest.Builder builder =
                         cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
                 builder.addTarget(imageReader.getSurface());
+                if (targetFpsRange != null) {
+                    builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetFpsRange);
+                }
                 session.setRepeatingRequest(builder.build(), null, backgroundHandler);
             } catch (CameraAccessException e) {
                 Log.e(TAG, "setRepeatingRequest failed", e);
