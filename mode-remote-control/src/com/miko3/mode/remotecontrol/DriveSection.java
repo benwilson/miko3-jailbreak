@@ -62,9 +62,17 @@ final class DriveSection {
             + "btn.addEventListener('pointercancel',stopHold);"
             + "});"
             + "document.getElementById('btn-exit').addEventListener('click',function(){"
+            // Previously just updated the status text and left the operator sitting
+            // on this same page — the request succeeded server-side (the robot's own
+            // screen did return to the launcher) but nothing told a *remote* browser
+            // to go anywhere, so it looked broken from there. Navigates to the
+            // launcher either way (success or failure): if /exit genuinely failed,
+            // being on the launcher's own page to retry is still more useful than
+            // being stuck here.
+            + "status.textContent='Exiting...';"
             + "fetch('/exit?ct='+encodeURIComponent(CLIENT_TOKEN))"
-            + ".then(function(){status.textContent='Exited — returning to launcher.';})"
-            + ".catch(function(){status.textContent='Exit request failed.';});"
+            + ".catch(function(){})"
+            + ".then(function(){window.location.href='https://'+location.hostname+':8443/';});"
             + "});"
             + "})();"
             + "</script>"

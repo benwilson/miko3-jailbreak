@@ -23,6 +23,17 @@ final class ModePage {
         // can tell this page's requests apart from a stale/older one's.
         html.append("<script>const CLIENT_TOKEN=").append(jsonString(clientToken)).append(";</script>");
         html.append("</head><body><main class=\"container\">");
+        // Always-visible way back to the launcher, independent of whether the
+        // "Exit mode" button's own /exit request succeeds — a network hiccup or a
+        // mode that's already mid-teardown shouldn't leave the operator stuck on a
+        // dead page with no way out. LauncherApp.HTTPS_PORT is hardcoded here (no
+        // shared constant between the two apps' build units) — keep the literal
+        // 8443 in sync if that ever changes. Uses the current page's own hostname
+        // rather than a baked-in one, since the robot's WiFi IP isn't known at
+        // build time (same pattern RoutingHttpServer's redirect uses).
+        html.append("<p><a id=\"home-link\" href=\"/\">&larr; Robot Home</a></p>");
+        html.append("<script>document.getElementById('home-link').href="
+                + "'https://'+location.hostname+':8443/';</script>");
         html.append("<h1>Remote Control / Telepresence</h1>");
         html.append(CameraSection.HTML);
         html.append(DriveSection.HTML);
