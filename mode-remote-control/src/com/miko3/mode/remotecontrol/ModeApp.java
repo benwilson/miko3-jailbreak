@@ -25,6 +25,12 @@ public class ModeApp extends Application {
 
     private RoutingHttpServer server;
     private final MjpegBroadcaster mjpegBroadcaster = new MjpegBroadcaster();
+    // Reuses MjpegBroadcaster's generic JPEG fan-out for the reverse direction:
+    // a remote browser's own webcam (captured client-side via getUserMedia, since
+    // only it has both the camera and the user's consent) uploads frames here one
+    // at a time; the on-device WebView's operator-video-img subscribes to the
+    // resulting stream exactly like the main camera view does to mjpegBroadcaster.
+    private final MjpegBroadcaster operatorVideoBroadcaster = new MjpegBroadcaster();
     private CameraCapture cameraCapture;
     private volatile String cameraError;
     private volatile DriveController driveController;
@@ -197,6 +203,47 @@ public class ModeApp extends Application {
                 // failure on `out` (the client disconnected) and notifies us, rather
                 // than returning immediately and letting RoutingHttpServer close the
                 // socket out from under a still-live stream.
+                synchronized (doneLock) {
+                    while (!done[0]) {
+                        try {
+                            doneLock.wait(5000);
+                        } catch (InterruptedException e) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        server.route("/operator-video-upload", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                // No client-token gate here (unlike /drive): this only ever publishes
+                // frames into a broadcaster real viewers pull from, so a stray/late
+                // upload from a client that lost the drive lease is harmless, not a
+                // safety issue the way a stray motor command would be.
+                byte[] jpeg = HttpUtil.readAll(req.body);
+                if (jpeg.length > 0) {
+                    operatorVideoBroadcaster.publishFrame(jpeg);
+                }
+                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+            }
+        });
+        server.route("/operator-video-stream", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                res.startStreaming(200, "OK", operatorVideoBroadcaster.contentType(), null);
+                OutputStream out = res.rawOutputStream();
+                final Object doneLock = new Object();
+                final boolean[] done = {false};
+                operatorVideoBroadcaster.subscribe(out, new Runnable() {
+                    @Override
+                    public void run() {
+                        synchronized (doneLock) {
+                            done[0] = true;
+                            doneLock.notifyAll();
+                        }
+                    }
+                });
                 synchronized (doneLock) {
                     while (!done[0]) {
                         try {

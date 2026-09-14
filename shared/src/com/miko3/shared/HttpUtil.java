@@ -25,15 +25,22 @@ public final class HttpUtil {
     public static byte[] readAssetBytes(Context ctx, String name) throws IOException {
         InputStream in = ctx.getAssets().open(name);
         try {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) != -1) {
-                out.write(buf, 0, n);
-            }
-            return out.toByteArray();
+            return readAll(in);
         } finally {
             in.close();
         }
+    }
+
+    /** Reads a stream to EOF into memory — e.g. an uploaded request body
+     * (HttpRequest.body is already Content-Length-bounded, so this stops
+     * there rather than blocking). Does not close the stream. */
+    public static byte[] readAll(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) != -1) {
+            out.write(buf, 0, n);
+        }
+        return out.toByteArray();
     }
 }

@@ -8,14 +8,27 @@ package com.miko3.mode.remotecontrol;
  * fetches raw PCM from /audio.pcm and schedules it through the Web Audio
  * API.
  *
- * The other two toggles are the operator-capture ones KTD7's document-
- * review correction scoped to on-device-only for this version (they need
- * getUserMedia's secure-context exception, which only the on-device
- * loopback qualifies for) — and this device's WebView can't actually run
- * getUserMedia audio capture at all (verified: NotReadableError), so both
- * use the native fallback (NativeCaptureBridge, exposed as
- * "AndroidCapture") instead of browser APIs. They no-op with a status
- * message when AndroidCapture isn't present, i.e. from a remote browser.
+ * Operator mic -> robot speaker: this device's WebView can't actually run
+ * getUserMedia audio capture at all (verified: NotReadableError), so it
+ * uses the native fallback (NativeCaptureBridge, exposed as
+ * "AndroidCapture") instead of a browser API, and no-ops with a status
+ * message when AndroidCapture isn't present (i.e. from a remote browser —
+ * still on-device-only for this version, per R6/R7's scoping).
+ *
+ * Operator video -> robot screen: genuinely bidirectional now. Only a
+ * *remote* browser has both a real webcam and the user sitting in front of
+ * it to consent to it, so capture happens there via getUserMedia (secure
+ * context: works from any https:// origin or, same as every other route
+ * this project tunnels through, the http://127.0.0.1 loopback exception —
+ * see docs/hardware — no TLS needed). Captured frames are periodically
+ * canvas-encoded to JPEG and POSTed to /operator-video-upload; the
+ * on-device WebView side (detected via window.AndroidCapture's presence,
+ * same test the mic toggle uses) instead just points operator-video-img at
+ * /operator-video-stream, the server-side re-broadcast of whatever was last
+ * uploaded (ModeApp.operatorVideoBroadcaster, a second MjpegBroadcaster
+ * instance reusing the same fan-out the main camera view uses). A remote
+ * browser also gets a small local self-preview so it's obvious capture is
+ * actually running.
  */
 final class ToggleSection {
     private ToggleSection() {
@@ -28,10 +41,12 @@ final class ToggleSection {
             + "<label><input type=\"checkbox\" id=\"toggle-robot-mic\">Robot mic &rarr; operator</label>"
             + "<label><input type=\"checkbox\" id=\"toggle-operator-mic\">Operator mic &rarr; robot speaker"
             + " <small>(on-device only)</small></label>"
-            + "<label><input type=\"checkbox\" id=\"toggle-operator-video\">Operator video &rarr; robot screen"
-            + " <small>(on-device only)</small></label>"
-            + "<img id=\"operator-video-img\" hidden alt=\"operator video (on-device loopback)\""
+            + "<label><input type=\"checkbox\" id=\"toggle-operator-video\">Operator video &rarr; robot screen</label>"
+            + "<img id=\"operator-video-img\" hidden alt=\"operator video, as shown on the robot's screen\""
             + " style=\"max-width:100%\">"
+            + "<video id=\"operator-video-preview\" hidden autoplay playsinline muted"
+            + " style=\"max-width:200px\"></video>"
+            + "<canvas id=\"operator-video-canvas\" hidden></canvas>"
             + "<audio id=\"robot-mic-audio\" hidden></audio>"
             + "<script>"
             + "(function(){"
@@ -93,21 +108,59 @@ final class ToggleSection {
             + "}"
             + "});"
 
-            // Operator video -> robot screen: on-device-only loopback demo, reusing
-            // the same MJPEG stream U6 already proved works, no separate capture.
-            + "document.getElementById('toggle-operator-video').addEventListener('change',function(e){"
+            // Operator video -> robot screen. On-device WebView: subscribe to the
+            // re-broadcast stream. Remote browser: capture the operator's own webcam
+            // and upload frames to it.
+            + "var operatorVideoStream=null;var operatorVideoUploadTimer=null;"
+            + "function startOperatorVideoOnDevice(){"
             + "var img=document.getElementById('operator-video-img');"
-            // A distinct query string, not just the same /stream.mjpeg the main camera
-            // <img> already holds open indefinitely, is required here: this WebView
-            // appears to coalesce a second request to an identical URL behind the
-            // first rather than opening its own connection, and since an MJPEG stream
-            // never completes, the second request then never fires at all (confirmed
-            // live: img.src/hidden were set correctly but no connection ever formed
-            // until this was added). The query string is stripped server-side
-            // (RoutingHttpServer routes by path only), so both still hit the same handler
-            // and share the one capture session (KTD4).
-            + "if(e.target.checked){img.src='/stream.mjpeg?viewer=operator';img.hidden=false;}"
-            + "else{img.hidden=true;img.src='';}"
+            + "img.src='/operator-video-stream';img.hidden=false;"
+            + "}"
+            + "function stopOperatorVideoOnDevice(){"
+            + "var img=document.getElementById('operator-video-img');"
+            + "img.hidden=true;img.src='';"
+            + "}"
+            + "function startOperatorVideoRemote(){"
+            + "if(!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)){"
+            + "reportError('This browser has no camera API (getUserMedia) available.');"
+            + "return;"
+            + "}"
+            + "navigator.mediaDevices.getUserMedia({video:true}).then(function(stream){"
+            + "operatorVideoStream=stream;"
+            + "var preview=document.getElementById('operator-video-preview');"
+            + "preview.srcObject=stream;preview.hidden=false;"
+            + "var canvas=document.getElementById('operator-video-canvas');"
+            + "var ctx=canvas.getContext('2d');"
+            + "operatorVideoUploadTimer=setInterval(function(){"
+            + "if(preview.videoWidth===0)return;"
+            + "canvas.width=preview.videoWidth;canvas.height=preview.videoHeight;"
+            + "ctx.drawImage(preview,0,0);"
+            + "canvas.toBlob(function(blob){"
+            + "if(!blob)return;"
+            + "fetch('/operator-video-upload',{method:'POST',body:blob}).catch(function(){});"
+            + "},'image/jpeg',0.7);"
+            + "},200);"
+            + "}).catch(function(err){"
+            + "reportError('Camera access failed: '+err.message);"
+            + "document.getElementById('toggle-operator-video').checked=false;"
+            + "});"
+            + "}"
+            + "function stopOperatorVideoRemote(){"
+            + "if(operatorVideoUploadTimer){clearInterval(operatorVideoUploadTimer);operatorVideoUploadTimer=null;}"
+            + "if(operatorVideoStream){"
+            + "operatorVideoStream.getTracks().forEach(function(t){t.stop();});"
+            + "operatorVideoStream=null;"
+            + "}"
+            + "var preview=document.getElementById('operator-video-preview');"
+            + "preview.hidden=true;preview.srcObject=null;"
+            + "}"
+            + "document.getElementById('toggle-operator-video').addEventListener('change',function(e){"
+            + "var onDevice=!!(window.AndroidCapture);"
+            + "if(e.target.checked){"
+            + "if(onDevice){startOperatorVideoOnDevice();}else{startOperatorVideoRemote();}"
+            + "}else{"
+            + "if(onDevice){stopOperatorVideoOnDevice();}else{stopOperatorVideoRemote();}"
+            + "}"
             + "});"
             + "})();"
             + "</script>"
