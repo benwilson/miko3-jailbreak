@@ -52,6 +52,7 @@ public class MainActivity extends Activity {
         settings.setJavaScriptEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setDomStorageEnabled(true);
+        webView.addJavascriptInterface(new NativeCaptureBridge(this), "AndroidCapture");
         setContentView(webView);
 
         requestRuntimePermissionsThenLoad();

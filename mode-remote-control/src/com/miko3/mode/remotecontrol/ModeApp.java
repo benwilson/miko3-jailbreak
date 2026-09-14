@@ -27,6 +27,9 @@ public class ModeApp extends Application {
     private volatile DriveController driveController;
     private volatile Runnable exitRunnable;
     private final java.util.Random tokenRandom = new java.util.Random();
+    private final AudioBroadcaster audioBroadcaster = new AudioBroadcaster();
+    private MicCapture micCapture;
+    private volatile String micError;
 
     @Override
     public void onCreate() {
@@ -43,6 +46,60 @@ public class ModeApp extends Application {
                     dc.claimClient(token);
                 }
                 res.sendText(200, "OK", "text/html; charset=utf-8", ModePage.buildIndexHtml(token));
+            }
+        });
+        server.route("/audio.pcm", new ModeHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                if (micError != null) {
+                    res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8",
+                            "mic unavailable: " + micError);
+                    return;
+                }
+                res.startStreaming(200, "OK", "application/octet-stream",
+                        "X-Sample-Rate: " + MicCapture.SAMPLE_RATE + "\r\n"
+                        + "X-Sample-Format: s16le\r\n"
+                        + "X-Channels: 1\r\n");
+                OutputStream out = res.rawOutputStream();
+                final Object doneLock = new Object();
+                final boolean[] done = {false};
+                audioBroadcaster.subscribe(out, new Runnable() {
+                    @Override
+                    public void run() {
+                        synchronized (doneLock) {
+                            done[0] = true;
+                            doneLock.notifyAll();
+                        }
+                    }
+                });
+                synchronized (doneLock) {
+                    while (!done[0]) {
+                        try {
+                            doneLock.wait(5000);
+                        } catch (InterruptedException e) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        server.route("/toggle-mic", new ModeHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                DriveController dc = driveController;
+                String token = req.queryParam("ct", null);
+                if (dc != null && !dc.acceptsClient(token)) {
+                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
+                            "control taken by another connection");
+                    return;
+                }
+                boolean on = "true".equals(req.queryParam("on", "false"));
+                if (on) {
+                    startMic();
+                } else {
+                    stopMic();
+                }
+                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
             }
         });
         server.route("/drive", new ModeHttpServer.RouteHandler() {
@@ -174,6 +231,28 @@ public class ModeApp extends Application {
         if (cameraCapture != null) {
             cameraCapture.stop();
             cameraCapture = null;
+        }
+    }
+
+    private void startMic() {
+        if (micCapture != null) {
+            return;
+        }
+        micError = null;
+        micCapture = new MicCapture(this, audioBroadcaster, new MicCapture.ErrorListener() {
+            @Override
+            public void onMicError(String reason) {
+                micError = reason;
+                Log.e(TAG, "mic error: " + reason);
+            }
+        });
+        micCapture.start();
+    }
+
+    private void stopMic() {
+        if (micCapture != null) {
+            micCapture.stop();
+            micCapture = null;
         }
     }
 
