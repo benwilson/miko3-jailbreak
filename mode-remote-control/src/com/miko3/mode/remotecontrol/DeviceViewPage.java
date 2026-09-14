@@ -10,20 +10,22 @@ package com.miko3.mode.remotecontrol;
  * project, so the idle state is drawn with plain CSS/JS rather than shipping
  * a new image.
  *
- * Styled after WALL-E's eyes (U17, by request), not generic cartoon
- * eyeballs: real WALL-E's eyes are a pair of circular binocular lenses (the
- * production design literally reused disassembled binocular lenses) mounted
- * on a connecting bar, each one independently raised/lowered by its own
- * servo — the character's expressions come almost entirely from that
- * eyebrow-like vertical tilt of the whole lens, not from a pupil darting
- * around inside a socket, and the glass lenses' reflective glint is what
- * animators/builders credit with giving the design its "soul." This page
- * reproduces that: two metallic-bezeled dark lenses on a bar, each one
- * independently drifting up/down on its own randomized timer (mostly
- * together, sometimes asymmetric for a curious/quizzical look), with a
- * fixed glint per lens and an occasional synchronized blink (a brief
- * vertical squash). No pupil, no independent left/right wandering inside a
- * socket — that was the previous (pre-U17) generic-eyeball design.
+ * Styled after WALL-E's eyes (U17), not generic cartoon eyeballs: real
+ * WALL-E's eyes are a pair of circular binocular lenses mounted in a
+ * weathered-metal housing, each one servo-driven — the character's
+ * expressions come from the lens itself moving as a rigid unit (not a pupil
+ * darting inside a socket), and the glass lenses' reflective glint is what
+ * animators/builders credit with giving the design its "soul."
+ *
+ * U19 (by request, reference image): the lenses now move together toward a
+ * shared, periodically-retargeted 2D point — both X and Y, not just the
+ * original vertical-only drift — so they read as *watching something*
+ * happening off-screen (tracking a point of interest, with a mix of quick
+ * glances and longer held gazes) rather than idly wandering on their own.
+ * A tiny per-eye offset keeps them from looking perfectly welded together.
+ * The blink is now a blink/fade-out cross: alongside the vertical squash it
+ * also dims toward near-transparent at the peak of the blink, rather than
+ * just squashing at full opacity.
  *
  * The <img> stays hidden until its first "load" event — which a
  * multipart/x-mixed-replace stream (ModeApp.operatorVideoBroadcaster) fires
@@ -86,8 +88,15 @@ final class DeviceViewPage {
             // without ever fully leaving the hole it sits in.
             + ".eye-mount{width:50vmin;height:50vmin;position:absolute;top:50%;left:50%;"
             + "margin-top:-25vmin;margin-left:-25vmin;z-index:1;"
-            + "transition:transform 0.9s cubic-bezier(.4,0,.2,1)}"
-            + "@keyframes blink{0%,92%,100%{transform:scaleY(1)}96%{transform:scaleY(0.08)}}"
+            // Transition duration is set per-move from JS (quick glances vs. slower
+            // settles read differently), so no fixed duration here — see gazeTo().
+            + "transition:transform ease}"
+            // Blink/fade-out cross (U19): the squash alone read as a normal blink;
+            // dropping opacity at the same peak moment gives it the "fade" half of
+            // the requested cross, like the lens itself is briefly powering down
+            // rather than just a mechanical eyelid.
+            + "@keyframes blink{0%,90%,100%{transform:scaleY(1);opacity:1}"
+            + "95%{transform:scaleY(0.08);opacity:0.2}}"
             // The lens itself: metallic bezel ring (radial-gradient, brushed-steel
             // look) around a dark glass center — no white sclera, no pupil.
             + ".eye{width:100%;height:100%;border-radius:50%;position:relative;overflow:hidden;"
@@ -123,21 +132,31 @@ final class DeviceViewPage {
             + "var rig=document.getElementById('rig');"
             + "img.addEventListener('load',function(){rig.style.display='none';img.style.display='block';});"
             + "img.src='/operator-video-stream';"
-            // Each mount drifts up/down on its own independent, randomized timer —
-            // mostly a shared range so both eyes usually move together, but never
-            // synchronized to the same clock, so they sometimes land asymmetric for
-            // a curious/quizzical tilt (real WALL-E's two eyes are independently
-            // servo-driven, not locked to each other).
+            // U19: both eyes track one shared, periodically-retargeted point rather
+            // than drifting independently — the "watching something happening" look
+            // requested. A tiny per-eye offset (+/-0.4vmin) keeps them from reading
+            // as one welded unit. Glance timing mixes quick look-overs (short hold,
+            // fast move) with longer held gazes (as if watching something of actual
+            // interest before moving on), rather than one uniform cadence.
             + "var mounts=document.getElementsByClassName('eye-mount');"
-            + "function drift(mount){"
-            + "var y=(Math.random()*10-5);"
-            + "var tilt=(Math.random()*8-4);"
-            + "mount.style.transform='translateY('+y+'vmin) rotate('+tilt+'deg)';"
-            + "setTimeout(function(){drift(mount);},1200+Math.random()*2200);"
-            + "}"
+            + "function gazeTo(x,y,tilt,speedMs){"
             + "for(var i=0;i<mounts.length;i++){"
-            + "(function(m,delay){setTimeout(function(){drift(m);},delay);})(mounts[i],Math.random()*600);"
+            + "var jx=x+(i===0?-0.4:0.4);"
+            + "mounts[i].style.transition='transform '+speedMs+'ms cubic-bezier(.34,1.2,.4,1)';"
+            + "mounts[i].style.transform='translate('+jx+'vmin,'+y+'vmin) rotate('+tilt+'deg)';"
             + "}"
+            + "}"
+            + "function nextGlance(){"
+            + "var x=(Math.random()*8-4);"
+            + "var y=(Math.random()*7-3.5);"
+            + "var tilt=(Math.random()*6-3);"
+            + "var quick=Math.random()<0.35;"
+            + "var speedMs=quick?220+Math.random()*180:550+Math.random()*500;"
+            + "gazeTo(x,y,tilt,speedMs);"
+            + "var hold=quick?400+Math.random()*500:1500+Math.random()*2500;"
+            + "setTimeout(nextGlance,speedMs+hold);"
+            + "}"
+            + "setTimeout(nextGlance,300);"
             + "</script>"
             + "</body></html>";
 }
