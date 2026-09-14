@@ -119,7 +119,7 @@ public class MainActivity extends Activity {
             // would have produced.
             Log.i(TAG, "reactivating in place (redelivered launch intent, not currently active)");
             activateDriveController();
-            webView.loadUrl("http://127.0.0.1:" + ModeApp.PORT + "/");
+            webView.loadUrl("http://127.0.0.1:" + ModeApp.PORT + "/device-view");
         }
     }
 
@@ -179,7 +179,10 @@ public class MainActivity extends Activity {
         // capture-error path when their capture actually fails to start, matching
         // how U6's camera-open-failure handling works, rather than blocking the
         // whole page on a permission the operator might grant later from Settings.
-        webView.loadUrl("http://127.0.0.1:" + ModeApp.PORT + "/");
+        // ?localview=1: see ModeApp's "/" route comment — this is the robot's own
+        // on-device view of the page, not a remote operator, and must not compete
+        // for drive control just by virtue of loading.
+        webView.loadUrl("http://127.0.0.1:" + ModeApp.PORT + "/device-view");
     }
 
     @Override

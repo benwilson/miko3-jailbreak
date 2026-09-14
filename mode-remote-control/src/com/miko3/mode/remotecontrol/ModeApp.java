@@ -331,6 +331,13 @@ public class ModeApp extends Application {
             }
         });
 
+        server.route("/device-view", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                res.sendText(200, "OK", "text/html; charset=utf-8", DeviceViewPage.HTML);
+            }
+        });
+
         Thread t = new Thread(server, "mode-http-server");
         t.setDaemon(true);
         t.start();
