@@ -35,6 +35,15 @@ import java.io.IOException;
  */
 public class LauncherApp extends Application {
     private static final String TAG = "LauncherApp";
+    // Robot Home's dedicated port pair (U12): every app — launcher included —
+    // now gets its own fixed ports instead of sharing one pair (U11's shared-port
+    // design was reverted after live testing kept surfacing handoff-timing bugs:
+    // dropped listeners, stale reactivated instances, races between which
+    // process currently owned the port). 8443 is the fixed "always reachable"
+    // home HTTPS port every mode's page links back to (see mode-remote-control's
+    // ModePage.java/DriveSection.java); other apps increment from here (see
+    // ModeApp.PORT/HTTPS_PORT). No handoff logic needed anymore — this server
+    // just runs for the launcher process's whole lifetime.
     static final int PORT = 8080;
     static final int HTTPS_PORT = 8443;
 
@@ -78,21 +87,12 @@ public class LauncherApp extends Application {
     }
 
     /**
-     * Creates a fresh RoutingHttpServer, registers every route, and starts
-     * both its listeners. Idempotent-safe to call again after stopServer()
-     * (e.g. MainActivity.onResume() reclaiming the port once a mode exits
-     * back to the launcher) — a stopped RoutingHttpServer isn't reused, a
-     * new one is built instead, since re-registering a handful of route()
-     * calls is simpler than making the class itself restart-safe.
+     * Creates and starts the RoutingHttpServer, registering every route.
+     * Called once from onCreate() — the launcher's own dedicated port pair
+     * (see class javadoc) means this server never needs to stop for another
+     * app's sake, so it just runs for the lifetime of the process.
      */
-    boolean startServer() {
-        if (server != null) {
-            return false; // already running — a mode's exit and this Activity's
-                           // onResume can both race to reclaim the port; only the
-                           // first should act, and the caller (MainActivity) uses
-                           // this return value to decide whether its WebView needs
-                           // reloading (server was actually down, not just already up).
-        }
+    private void startServer() {
         server = new RoutingHttpServer(this, PORT);
 
         server.route("/", new RoutingHttpServer.RouteHandler() {
@@ -196,20 +196,6 @@ public class LauncherApp extends Application {
         } else {
             Log.w(TAG, "HTTPS certificate failed to load — serving plain HTTP only");
         }
-        return true;
-    }
-
-    /**
-     * Stops the current server and drops the reference so startServer() can
-     * rebuild it later. Called from launchModeGracefully() right before
-     * handing off to the mode app, so the mode's own RoutingHttpServer can
-     * bind the same port the launcher was just using.
-     */
-    void stopServer() {
-        if (server != null) {
-            server.stop();
-            server = null;
-        }
     }
 
     /**
@@ -276,13 +262,11 @@ public class LauncherApp extends Application {
             }
         }
 
-        // Releases the shared port pair (PORT/HTTPS_PORT) before the mode app tries
-        // to bind them — both apps now serve on the same ports (U11: "why is remote
-        // control on a different port" had no good answer once asked), so exactly
-        // one of the two processes can hold the listeners at a time. bindWithRetry()
-        // on the mode's side absorbs the brief TIME_WAIT/handoff race after this.
-        stopServer();
-
+        // No server stop/handoff needed here (U12 reverted U11's shared-port design:
+        // each app now has its own dedicated port pair — see ModeApp.PORT/HTTPS_PORT
+        // comment for why). The launcher's own server keeps running the whole time a
+        // mode is active, so "Robot Home" is reachable at every point in this flow,
+        // not just once the launcher's Activity happens to be back in the foreground.
         Intent launch = new Intent();
         launch.setClassName(MODE_PACKAGE, MODE_ACTIVITY);
         launch.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);

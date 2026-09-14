@@ -22,17 +22,15 @@ import java.io.OutputStream;
  */
 public class ModeApp extends Application {
     private static final String TAG = "ModeApp";
-    // Matches launcher/LauncherApp's PORT/HTTPS_PORT literal-for-literal (U11:
-    // "why is remote control on a different port" had no good answer once asked).
-    // No shared constant between the two apps' build units (separate APKs, only
-    // shared/ is compiled into both) — same pattern ModePage.java's home-link
-    // already used for HTTPS_PORT; keep both literals in sync if either changes.
-    // Only one of the two apps' RoutingHttpServer instances holds these at a
-    // time — the launcher releases them in launchModeGracefully() before handing
-    // off, and this app's exitMode() releases them back before returning to the
-    // launcher, which reclaims them in its own MainActivity.onResume().
-    static final int PORT = 8080;
-    static final int HTTPS_PORT = 8443;
+    // U12: each app now gets its own dedicated port pair rather than sharing
+    // one (see launcher/LauncherApp.java's PORT/HTTPS_PORT comment for why
+    // U11's shared-port design was reverted). launcher/LauncherApp owns the
+    // fixed 8080/8443 "Robot Home" pair; this is the next app, incrementing
+    // by one from there. No shared constant between the two apps' build units
+    // (separate APKs, only shared/ is compiled into both) — keep this literal
+    // in sync with LauncherApp.PORT/HTTPS_PORT + 1 if either ever changes.
+    static final int PORT = 8081;
+    static final int HTTPS_PORT = 8444;
 
     private RoutingHttpServer server;
     private final MjpegBroadcaster mjpegBroadcaster = new MjpegBroadcaster();
@@ -59,16 +57,12 @@ public class ModeApp extends Application {
     }
 
     /**
-     * Creates a fresh RoutingHttpServer, registers every route, and starts
-     * both its listeners. Mirrors LauncherApp's identical method — see its
-     * javadoc for why a fresh instance is built each time rather than reusing
-     * one across a stop()/start() cycle, and why this is a no-op (returns
-     * false) if a server is already running.
+     * Creates and starts the RoutingHttpServer, registering every route.
+     * Called once from onCreate() — this app's own dedicated port pair (see
+     * class field comment) means this server never needs to stop for the
+     * launcher's sake, so it just runs for the lifetime of the process.
      */
-    boolean startServer() {
-        if (server != null) {
-            return false;
-        }
+    private void startServer() {
         server = new RoutingHttpServer(this, PORT);
         server.route("/", new RoutingHttpServer.RouteHandler() {
             @Override
@@ -295,19 +289,6 @@ public class ModeApp extends Application {
             server.startHttps(HTTPS_PORT, httpsContext);
         } else {
             Log.w(TAG, "HTTPS certificate failed to load — serving plain HTTP only");
-        }
-        return true;
-    }
-
-    /**
-     * Stops the current server and drops the reference so startServer() can
-     * rebuild it later. Called from MainActivity.exitMode() before returning
-     * to the launcher, so LauncherApp can rebind the same port pair.
-     */
-    void stopServer() {
-        if (server != null) {
-            server.stop();
-            server = null;
         }
     }
 

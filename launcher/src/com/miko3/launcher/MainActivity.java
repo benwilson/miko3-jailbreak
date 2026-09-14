@@ -67,22 +67,6 @@ public class MainActivity extends Activity {
     }
 
     @Override
-    protected void onResume() {
-        super.onResume();
-        // Reclaims the shared HTTP/HTTPS port pair when this Activity comes back
-        // to the foreground after a mode app exits (LauncherApp.launchModeGracefully()
-        // stopped the launcher's own server before handing off, U11's port-unification:
-        // both apps now serve on the same ports, so only one can hold them at a time).
-        // startServer() is a no-op if the server never actually stopped (e.g. this
-        // Activity's very first onResume right after onCreate) — the WebView only
-        // needs reloading when the server was genuinely down and this call restarted it.
-        boolean restarted = ((LauncherApp) getApplication()).startServer();
-        if (restarted) {
-            webView.reload();
-        }
-    }
-
-    @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQ_LOCATION && grantResults.length > 0

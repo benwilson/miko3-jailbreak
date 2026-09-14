@@ -114,13 +114,12 @@ public class MainActivity extends Activity {
         if (driveController != null) {
             driveController.release();
         }
-        ModeApp app = (ModeApp) getApplication();
-        app.setDriveController(null);
-        // Releases the shared port pair (U11: launcher and this mode now serve on
-        // the same PORT/HTTPS_PORT) so LauncherApp.MainActivity's onResume() can
-        // rebind them once this mode's Activity finishes and the launcher's own
-        // Activity comes back to the foreground.
-        app.stopServer();
+        // Without this, onNewIntent()'s "reactivating in place" check
+        // (driveController == null) never fires for this same singleTop instance
+        // if it's reused after an exit — leaving it resumed with a stale,
+        // already-released controller that never gets recreated.
+        driveController = null;
+        ((ModeApp) getApplication()).setDriveController(null);
         finish();
     }
 
