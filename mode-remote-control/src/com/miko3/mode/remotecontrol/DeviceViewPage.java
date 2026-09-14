@@ -39,9 +39,9 @@ final class DeviceViewPage {
             // Glossy white eyeball look (per reference image) via a radial-gradient
             // instead of a flat fill, with overflow:hidden so the wandering pupil
             // below can never poke outside the round eyeball.
-            + ".eye{width:18vmin;height:18vmin;margin:0 6vmin;border-radius:50%;position:relative;"
+            + ".eye{width:54vmin;height:54vmin;margin:0 5vmin;border-radius:50%;position:relative;"
             + "overflow:hidden;background:radial-gradient(circle at 38% 32%,#fff,#e2e2e2 65%,#bbb 100%);"
-            + "box-shadow:inset 0 -0.6vmin 1.2vmin rgba(0,0,0,0.25);animation:blink 4.5s infinite}"
+            + "box-shadow:inset 0 -1.8vmin 3.6vmin rgba(0,0,0,0.25);animation:blink 4.5s infinite}"
             + ".eye:nth-child(2){animation-delay:0.2s}"
             // The pupil wanders (JS below moves left/top independently per eye,
             // uncoordinated on purpose); the transition is what makes each move a
