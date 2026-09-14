@@ -61,3 +61,7 @@ The namespace init owns, as opposed to the private one an app process gets. A bi
 ## Stopped state
 
 Android's per-package flag, recorded in the per-user package-restrictions file, that keeps a freshly installed app from receiving broadcasts until it has been launched once. It is what makes a boot receiver silent, and the reason installation cannot stop at placing the APK: this unit has no activity manager in factory mode, so the flag is cleared directly rather than by launching the app.
+
+## Mode
+
+A purpose-built robot capability — remote control, telepresence, autonomous operation, and others planned — that ships as its own installed app rather than a feature bolted onto the custom launcher. The launcher starts a mode and regains the home screen when the operator exits it; only one mode's control logic drives the robot at a time. A shared module gives every mode the same robot-control and UI plumbing instead of each one reimplementing it.
