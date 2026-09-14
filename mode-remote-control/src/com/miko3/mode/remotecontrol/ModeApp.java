@@ -463,7 +463,21 @@ public class ModeApp extends Application {
         return generation;
     }
 
+    // TEMPORARY (U18) diagnostic switch: camera capture has been a recurring source
+    // of instability this session (HAL errors, a system-level cameraserver crash,
+    // heavy CPU/bandwidth use), and driving has intermittently frozen entirely
+    // regardless of several unrelated fixes already made to the drive-command path.
+    // Flip to false to isolate whether the camera is a contributing factor to that
+    // freeze, independent of everything already tried. /stream.mjpeg still responds
+    // (503, camera disabled) rather than hanging open with no explanation. Revert
+    // to true once isolated either way — this is not meant to ship disabled.
+    private static final boolean CAMERA_ENABLED = false;
+
     void startCamera() {
+        if (!CAMERA_ENABLED) {
+            cameraError = "camera temporarily disabled for diagnostics";
+            return;
+        }
         // Guards against a leaked, still-open camera handle if this is somehow
         // called twice without an intervening stopCamera() — the camera HAL is
         // exclusive-access, so an unreleased prior CameraCapture here would make
