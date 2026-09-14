@@ -58,6 +58,7 @@ tools/aoa-inject/.venv/
 # source .apk/.zip rather than tracking, they're large and derived
 *_extracted/
 *-extracted/
+*_jadx/
 tools/extracted-system/
 hooks/sd-free-test/
 hooks/sd-free/miko3-test/
