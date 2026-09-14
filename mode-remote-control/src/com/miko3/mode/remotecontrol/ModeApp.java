@@ -5,11 +5,10 @@ import android.util.Log;
 
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
+import com.miko3.shared.HttpUtil;
 import com.miko3.shared.RoutingHttpServer;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 
 /**
@@ -34,6 +33,7 @@ public class ModeApp extends Application {
     private final AudioBroadcaster audioBroadcaster = new AudioBroadcaster();
     private MicCapture micCapture;
     private volatile String micError;
+    private volatile byte[] cssBytes;
 
     @Override
     public void onCreate() {
@@ -90,11 +90,8 @@ public class ModeApp extends Application {
         server.route("/toggle-mic", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                DriveController dc = driveController;
-                String token = req.queryParam("ct", null);
-                if (dc != null && !dc.acceptsClient(token)) {
-                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
-                            "control taken by another connection");
+                authorizeClient(req, res, false);
+                if (res.isHeadersSent()) {
                     return;
                 }
                 boolean on = "true".equals(req.queryParam("on", "false"));
@@ -109,19 +106,12 @@ public class ModeApp extends Application {
         server.route("/drive", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                DriveController dc = driveController;
+                DriveController dc = authorizeClient(req, res, true);
                 if (dc == null) {
-                    res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8", "mode not ready");
                     return;
                 }
-                String token = req.queryParam("ct", null);
-                if (!dc.acceptsClient(token)) {
-                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
-                            "control taken by another connection");
-                    return;
-                }
-                int linear = parseIntOr(req.queryParam("linear", "0"), 0);
-                int angular = parseIntOr(req.queryParam("angular", "0"), 0);
+                int linear = HttpUtil.parseIntOr(req.queryParam("linear", "0"), 0);
+                int angular = HttpUtil.parseIntOr(req.queryParam("angular", "0"), 0);
                 try {
                     dc.drive(linear, angular);
                     res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
@@ -134,15 +124,8 @@ public class ModeApp extends Application {
         server.route("/keepalive", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                DriveController dc = driveController;
+                DriveController dc = authorizeClient(req, res, true);
                 if (dc == null) {
-                    res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8", "mode not ready");
-                    return;
-                }
-                String token = req.queryParam("ct", null);
-                if (!dc.acceptsClient(token)) {
-                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
-                            "control taken by another connection");
                     return;
                 }
                 dc.keepalive();
@@ -152,11 +135,8 @@ public class ModeApp extends Application {
         server.route("/exit", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                DriveController dc = driveController;
-                String token = req.queryParam("ct", null);
-                if (dc != null && !dc.acceptsClient(token)) {
-                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
-                            "control taken by another connection");
+                authorizeClient(req, res, false);
+                if (res.isHeadersSent()) {
                     return;
                 }
                 res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
@@ -169,8 +149,10 @@ public class ModeApp extends Application {
         server.route("/assets/pico.min.css", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                byte[] css = readAsset("pico.min.css");
-                res.sendBytes(200, "OK", "text/css; charset=utf-8", css);
+                if (cssBytes == null) {
+                    cssBytes = HttpUtil.readAssetBytes(ModeApp.this, "pico.min.css");
+                }
+                res.sendBytes(200, "OK", "text/css; charset=utf-8", cssBytes);
             }
         });
         server.route("/stream.mjpeg", new RoutingHttpServer.RouteHandler() {
@@ -217,6 +199,32 @@ public class ModeApp extends Application {
 
     RoutingHttpServer server() {
         return server;
+    }
+
+    /**
+     * R17's client-token check, shared by every route that gates on the
+     * currently-authorized client: writes a 409 if a live controller says the
+     * request's token isn't current. When requireReady is true, a null
+     * controller (mode not yet ready) also writes a 503, and the returned
+     * value alone tells the caller whether to proceed. When requireReady is
+     * false, a null controller is not itself a failure (the caller proceeds
+     * regardless) — callers there must check res.isHeadersSent() instead,
+     * since a null return no longer means "stop."
+     */
+    private DriveController authorizeClient(HttpRequest req, HttpResponse res, boolean requireReady)
+            throws IOException {
+        DriveController dc = driveController;
+        if (dc == null) {
+            if (requireReady) {
+                res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8", "mode not ready");
+            }
+            return null;
+        }
+        if (!dc.acceptsClient(req.queryParam("ct", null))) {
+            res.sendText(409, "Conflict", "text/plain; charset=utf-8", "control taken by another connection");
+            return null;
+        }
+        return dc;
     }
 
     void startCamera() {
@@ -268,26 +276,4 @@ public class ModeApp extends Application {
         exitRunnable = runnable;
     }
 
-    private static int parseIntOr(String s, int fallback) {
-        try {
-            return Integer.parseInt(s);
-        } catch (NumberFormatException e) {
-            return fallback;
-        }
-    }
-
-    private byte[] readAsset(String name) throws IOException {
-        InputStream in = getAssets().open(name);
-        try {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) != -1) {
-                out.write(buf, 0, n);
-            }
-            return out.toByteArray();
-        } finally {
-            in.close();
-        }
-    }
 }

@@ -10,6 +10,7 @@ import android.os.SystemClock;
 import android.util.Log;
 
 import com.miko3.shared.DriveLease;
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotControlClient;
 
 /**
@@ -27,7 +28,7 @@ import com.miko3.shared.RobotControlClient;
  */
 public class DriveLeaseService extends Service {
     private static final String TAG = "DriveLeaseService";
-    public static final String ACTION_BIND = "com.miko3.launcher.DRIVE_LEASE";
+    public static final String ACTION_BIND = LauncherProtocol.DRIVE_LEASE_ACTION;
 
     /** ~3x R13's ~750ms drive-command watchdog window (KTD3). */
     private static final long TTL_MS = 2250;

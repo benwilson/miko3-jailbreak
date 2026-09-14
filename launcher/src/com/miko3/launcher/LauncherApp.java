@@ -13,11 +13,11 @@ import android.util.Log;
 import com.miko3.shared.DriveLease;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
+import com.miko3.shared.HttpUtil;
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RoutingHttpServer;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 
 /**
  * Starts the launcher's HTTP server and the drive-lease coordinator once
@@ -41,11 +41,11 @@ public class LauncherApp extends Application {
     // speculatively ahead of there being a second mode to design it against.
     private static final String MODE_PACKAGE = "com.miko3.mode.remotecontrol";
     private static final String MODE_ACTIVITY = MODE_PACKAGE + ".MainActivity";
-    private static final String EXTRA_FORCE_EXIT = "com.miko3.launcher.EXTRA_FORCE_EXIT";
 
     private RoutingHttpServer server;
     private WifiHttpHandler wifi;
     private volatile DriveLease leaseClient;
+    private volatile byte[] cssBytes;
 
     private final ServiceConnection leaseConnection = new ServiceConnection() {
         @Override
@@ -77,7 +77,10 @@ public class LauncherApp extends Application {
         server.route("/assets/pico.min.css", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                res.sendBytes(200, "OK", "text/css; charset=utf-8", readAsset("pico.min.css"));
+                if (cssBytes == null) {
+                    cssBytes = HttpUtil.readAssetBytes(LauncherApp.this, "pico.min.css");
+                }
+                res.sendBytes(200, "OK", "text/css; charset=utf-8", cssBytes);
             }
         });
         server.route("/wifi/connect", new RoutingHttpServer.RouteHandler() {
@@ -97,7 +100,7 @@ public class LauncherApp extends Application {
         server.route("/wifi/connect-saved", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                int id = parseIntOr(req.queryParam("id", ""), -1);
+                int id = HttpUtil.parseIntOr(req.queryParam("id", ""), -1);
                 if (id >= 0) {
                     wifi.connectSaved(id);
                 }
@@ -107,7 +110,7 @@ public class LauncherApp extends Application {
         server.route("/wifi/forget", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                int id = parseIntOr(req.queryParam("id", ""), -1);
+                int id = HttpUtil.parseIntOr(req.queryParam("id", ""), -1);
                 if (id >= 0) {
                     wifi.forget(id);
                 }
@@ -126,6 +129,14 @@ public class LauncherApp extends Application {
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 boolean started = wifi.startScan();
                 res.redirect("/?status=" + urlEncode(started ? "Scanning..." : "Scan request failed (throttled?)"));
+            }
+        });
+        server.route("/device-status", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                int battery = DeviceInfo.batteryPercent(LauncherApp.this);
+                String batteryStr = battery < 0 ? "unknown" : (battery + "%");
+                res.sendText(200, "OK", "text/plain; charset=utf-8", batteryStr + "|" + DeviceInfo.uptime());
             }
         });
         server.route("/wifi/status", new RoutingHttpServer.RouteHandler() {
@@ -181,7 +192,7 @@ public class LauncherApp extends Application {
             Log.i(TAG, "mode switch: requesting outgoing mode (holder='" + holder + "') to exit");
             Intent exitRequest = new Intent();
             exitRequest.setClassName(MODE_PACKAGE, MODE_ACTIVITY);
-            exitRequest.putExtra(EXTRA_FORCE_EXIT, true);
+            exitRequest.putExtra(LauncherProtocol.EXTRA_FORCE_EXIT, true);
             exitRequest.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             try {
                 startActivity(exitRequest);
@@ -226,34 +237,11 @@ public class LauncherApp extends Application {
         startActivity(launch);
     }
 
-    private static int parseIntOr(String s, int fallback) {
-        try {
-            return Integer.parseInt(s);
-        } catch (NumberFormatException e) {
-            return fallback;
-        }
-    }
-
     private static String urlEncode(String s) {
         try {
             return java.net.URLEncoder.encode(s, "UTF-8");
         } catch (Exception e) {
             return s;
-        }
-    }
-
-    private byte[] readAsset(String name) throws IOException {
-        InputStream in = getAssets().open(name);
-        try {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) != -1) {
-                out.write(buf, 0, n);
-            }
-            return out.toByteArray();
-        } finally {
-            in.close();
         }
     }
 }

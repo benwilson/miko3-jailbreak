@@ -89,7 +89,7 @@ public final class RoutingHttpServer implements Runnable {
         try {
             client.setSoTimeout(30000);
             InputStream rawIn = new BufferedInputStream(client.getInputStream());
-            String requestLine = readLine(rawIn);
+            String requestLine = LineReader.readLine(rawIn);
             if (requestLine == null || requestLine.isEmpty()) {
                 client.close();
                 return;
@@ -112,7 +112,7 @@ public final class RoutingHttpServer implements Runnable {
 
             Map<String, String> headers = new HashMap<String, String>();
             String headerLine;
-            while ((headerLine = readLine(rawIn)) != null && !headerLine.isEmpty()) {
+            while ((headerLine = LineReader.readLine(rawIn)) != null && !headerLine.isEmpty()) {
                 int colon = headerLine.indexOf(':');
                 if (colon > 0) {
                     headers.put(headerLine.substring(0, colon).trim().toLowerCase(),
@@ -162,22 +162,6 @@ public final class RoutingHttpServer implements Runnable {
             }
         }
         return new BoundedInputStream(raw, 0);
-    }
-
-    private static String readLine(InputStream in) throws IOException {
-        StringBuilder sb = new StringBuilder();
-        int c;
-        boolean any = false;
-        while ((c = in.read()) != -1) {
-            any = true;
-            if (c == '\n') {
-                break;
-            }
-            if (c != '\r') {
-                sb.append((char) c);
-            }
-        }
-        return any ? sb.toString() : null;
     }
 
     /** Reads exactly `limit` bytes from the underlying stream, then reports EOF. */

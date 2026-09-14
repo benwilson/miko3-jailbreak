@@ -12,6 +12,8 @@ import android.util.Log;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 
+import com.miko3.shared.LauncherProtocol;
+
 /**
  * Full-screen WebView shell hosting the mode's own served page (R11).
  * Launched by the launcher via explicit Intent, not HOME. Requests the
@@ -36,7 +38,6 @@ import android.webkit.WebView;
 public class MainActivity extends Activity {
     private static final String TAG = "ModeMainActivity";
     private static final int REQ_PERMISSIONS = 2001;
-    static final String EXTRA_FORCE_EXIT = "com.miko3.launcher.EXTRA_FORCE_EXIT";
 
     private WebView webView;
     private DriveController driveController;
@@ -58,7 +59,7 @@ public class MainActivity extends Activity {
         requestRuntimePermissionsThenLoad();
         activateDriveController();
 
-        if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_FORCE_EXIT, false)) {
+        if (getIntent() != null && getIntent().getBooleanExtra(LauncherProtocol.EXTRA_FORCE_EXIT, false)) {
             exitMode();
         }
     }
@@ -93,7 +94,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        if (intent != null && intent.getBooleanExtra(EXTRA_FORCE_EXIT, false)) {
+        if (intent != null && intent.getBooleanExtra(LauncherProtocol.EXTRA_FORCE_EXIT, false)) {
             exitMode();
         } else if (driveController == null) {
             // A plain (non-exit) launch Intent redelivered to this already-existing

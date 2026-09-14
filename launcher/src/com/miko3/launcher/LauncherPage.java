@@ -31,9 +31,23 @@ final class LauncherPage {
         html.append("<section id=\"info\"><h2>Device</h2><table>");
         html.append("<tr><td>Model</td><td>").append(model).append("</td></tr>");
         html.append("<tr><td>Serial</td><td>").append(serial).append("</td></tr>");
-        html.append("<tr><td>Battery</td><td>").append(batteryStr).append("</td></tr>");
-        html.append("<tr><td>Uptime</td><td>").append(uptime).append("</td></tr>");
+        html.append("<tr><td>Battery</td><td id=\"battery\">").append(batteryStr).append("</td></tr>");
+        html.append("<tr><td>Uptime</td><td id=\"uptime\">").append(uptime).append("</td></tr>");
         html.append("</table></section>");
+
+        // Battery/uptime go stale without some refresh, but a full page reload
+        // every few seconds (the original approach) re-fetches pico.min.css and
+        // re-renders the whole Wi-Fi section (a WifiManager query) for two numbers
+        // that change every second regardless. A lightweight poll-and-patch avoids
+        // both — the Wi-Fi section itself still refreshes on its own real state-change
+        // events (see MainActivity's wifiReceiver), not on this timer.
+        html.append("<script>");
+        html.append("setInterval(function(){fetch('/device-status').then(function(r){return r.text();})");
+        html.append(".then(function(t){var parts=t.split('|');");
+        html.append("document.getElementById('battery').textContent=parts[0];");
+        html.append("document.getElementById('uptime').textContent=parts[1];");
+        html.append("});},5000);");
+        html.append("</script>");
 
         html.append("<section id=\"modes\"><h2>Modes</h2>");
         html.append("<a href=\"/launch-mode\" role=\"button\">Remote Control / Telepresence</a>");

@@ -12,6 +12,7 @@ import android.os.RemoteException;
 import android.util.Log;
 
 import com.miko3.shared.DriveLease;
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotControlClient;
 
 /**
@@ -109,8 +110,8 @@ final class DriveController {
         });
         robotClient.connect();
 
-        Intent intent = new Intent(DRIVE_LEASE_ACTION);
-        intent.setPackage(LAUNCHER_PACKAGE);
+        Intent intent = new Intent(LauncherProtocol.DRIVE_LEASE_ACTION);
+        intent.setPackage(LauncherProtocol.LAUNCHER_PACKAGE);
         boolean bound = context.bindService(intent, leaseConnection, Context.BIND_AUTO_CREATE);
         if (!bound) {
             handleCoordinatorUnreachable("bindService to DriveLeaseService failed");
@@ -217,7 +218,4 @@ final class DriveController {
             robotClient.disconnect();
         }
     }
-
-    private static final String DRIVE_LEASE_ACTION = "com.miko3.launcher.DRIVE_LEASE";
-    private static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 }

@@ -34,7 +34,7 @@ final class ChunkedInputStream extends InputStream {
         if (remainingInChunk == 0) {
             remainingInChunk = readChunkSize();
             if (remainingInChunk == 0) {
-                readLine(); // trailing CRLF after the terminating 0-size chunk
+                LineReader.readLine(raw); // trailing CRLF after the terminating 0-size chunk
                 finished = true;
                 return -1;
             }
@@ -47,13 +47,13 @@ final class ChunkedInputStream extends InputStream {
         }
         remainingInChunk -= n;
         if (remainingInChunk == 0) {
-            readLine(); // CRLF that terminates this chunk's data
+            LineReader.readLine(raw); // CRLF that terminates this chunk's data
         }
         return n;
     }
 
     private long readChunkSize() throws IOException {
-        String line = readLine();
+        String line = LineReader.readLine(raw);
         if (line == null) {
             finished = true;
             return 0;
@@ -68,21 +68,5 @@ final class ChunkedInputStream extends InputStream {
         } catch (NumberFormatException e) {
             throw new IOException("malformed chunk size: " + line);
         }
-    }
-
-    private String readLine() throws IOException {
-        StringBuilder sb = new StringBuilder();
-        int c;
-        boolean any = false;
-        while ((c = raw.read()) != -1) {
-            any = true;
-            if (c == '\n') {
-                break;
-            }
-            if (c != '\r') {
-                sb.append((char) c);
-            }
-        }
-        return any ? sb.toString() : null;
     }
 }

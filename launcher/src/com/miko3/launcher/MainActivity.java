@@ -9,7 +9,6 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
-import android.os.Handler;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 
@@ -32,15 +31,6 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private WifiManager wifiManager;
-    private final Handler handler = new Handler();
-
-    private final Runnable periodicReload = new Runnable() {
-        @Override
-        public void run() {
-            webView.reload();
-            handler.postDelayed(this, 5000);
-        }
-    };
 
     private final BroadcastReceiver wifiReceiver = new BroadcastReceiver() {
         @Override
@@ -84,18 +74,6 @@ public class MainActivity extends Activity {
             wifiManager.startScan();
             webView.reload();
         }
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        handler.post(periodicReload);
-    }
-
-    @Override
-    protected void onPause() {
-        handler.removeCallbacks(periodicReload);
-        super.onPause();
     }
 
     @Override
