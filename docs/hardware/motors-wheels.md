@@ -1,5 +1,52 @@
 # Motors / wheels — locomotion hardware control
 
+## FINAL PICTURE THIS SESSION: forward is asymmetrically, specifically blocked — likely a deliberate firmware safety restriction, not a bug (2026-09-14, session 2 continued)
+
+**Closes out this session's forward-direction investigation.** With the
+`ACTIVE_OTHERS` fix applied (previous section — confirmed general, working
+in the real product app), two further isolated tests:
+
+1. **Forward, large magnitude** (`linear=100`, 5x the earlier value, fresh
+   baseline, live capture, operator watching): zero `MOTION_COMPLETE`,
+   encoder completely frozen, no observed movement. Rules out "just needs a
+   bigger value" — the block is categorical, not a threshold on the `linear`
+   value itself.
+2. **Backward** (`linear=-20`, same method): encoder moved a **small** amount
+   (`-000005880,-000007950` → `-000005934,-000007977`) but still **no**
+   `MOTION_COMPLETE` callback. Matches the operator's earlier live-UI report
+   ("back kind of works — one pulse") — real but weak/partial, unlike
+   rotation's full, clean, repeatedly-confirmed motion.
+
+**Ruled out as the explanation**: both plausible Android-app-layer gates —
+`com.models.sensor.tofIR.threshold()` and `com.models.sensor.Power
+.edge_obstacle_detected` — are dead code. `threshold()` only ever
+`System.out.print`s a message; nothing reads its result or feeds it into a
+motor decision. `edge_obstacle_detected` has no setter anywhere in the
+decompiled ServiceExam source. **There is no app-layer (Android/Java) code
+that gates motion on the ToF/IR sensor readings.** If a real obstacle/edge
+check is what's blocking forward, it's implemented entirely inside the
+peripheral MCU's own firmware — not extractable or readable from this
+Android-focused toolchain (no firmware dump of that separate chip was taken
+this session).
+
+**Working conclusion**: the pattern — rotation fully allowed, backward
+weakly/partially allowed, forward flatly refused, independent of command
+magnitude, with the MCU still cleanly acknowledging receipt of every command
+regardless — has the shape of a deliberate safety policy (most consumer
+robots restrict driving toward whatever's in front of them more strictly
+than backing away or turning in place) rather than an unfinished feature or
+software bug. This is inference, not confirmed by reading the actual
+firmware logic; it's the best-supported explanation given everything
+reachable from the Android side has now been checked. Further progress
+would need either the peripheral MCU's firmware image (out of scope for
+this session — no path to dump it was established) or empirical
+firmware-behavior probing beyond what this session did (e.g., systematically
+varying `time`/`type`/other `MotionFrame` fields, not just `linear`
+magnitude, in case some other field distinguishes "real" motion requests
+from ones the firmware treats as advisory).
+
+---
+
 ## FIX LANDED: `ACTIVE_OTHERS` state handshake — rotation now genuinely, reliably moves the robot from an external AIDL client (2026-09-14, session 2 continued)
 
 **The real root cause of "the MCU acks the command but nothing moves," found and fixed in product code (`shared/src/com/miko3/shared/RobotControlClient.java`, commit `65fdc16`), not just diagnosed.**
