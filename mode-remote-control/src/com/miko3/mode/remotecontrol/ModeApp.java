@@ -24,6 +24,9 @@ public class ModeApp extends Application {
     private final MjpegBroadcaster mjpegBroadcaster = new MjpegBroadcaster();
     private CameraCapture cameraCapture;
     private volatile String cameraError;
+    private volatile DriveController driveController;
+    private volatile Runnable exitRunnable;
+    private final java.util.Random tokenRandom = new java.util.Random();
 
     @Override
     public void onCreate() {
@@ -32,7 +35,74 @@ public class ModeApp extends Application {
         server.route("/", new ModeHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                res.sendText(200, "OK", "text/html; charset=utf-8", ModePage.buildIndexHtml());
+                String token = Long.toHexString(tokenRandom.nextLong());
+                DriveController dc = driveController;
+                if (dc != null) {
+                    // A fresh page load is "a newer connection" (R17) — it takes over
+                    // control outright rather than waiting to be first to send a command.
+                    dc.claimClient(token);
+                }
+                res.sendText(200, "OK", "text/html; charset=utf-8", ModePage.buildIndexHtml(token));
+            }
+        });
+        server.route("/drive", new ModeHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                DriveController dc = driveController;
+                if (dc == null) {
+                    res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8", "mode not ready");
+                    return;
+                }
+                String token = req.queryParam("ct", null);
+                if (!dc.acceptsClient(token)) {
+                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
+                            "control taken by another connection");
+                    return;
+                }
+                int linear = parseIntOr(req.queryParam("linear", "0"), 0);
+                int angular = parseIntOr(req.queryParam("angular", "0"), 0);
+                try {
+                    dc.drive(linear, angular);
+                    res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+                } catch (android.os.RemoteException e) {
+                    res.sendText(502, "Bad Gateway", "text/plain; charset=utf-8",
+                            "drive failed: " + e.getMessage());
+                }
+            }
+        });
+        server.route("/keepalive", new ModeHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                DriveController dc = driveController;
+                if (dc == null) {
+                    res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8", "mode not ready");
+                    return;
+                }
+                String token = req.queryParam("ct", null);
+                if (!dc.acceptsClient(token)) {
+                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
+                            "control taken by another connection");
+                    return;
+                }
+                dc.keepalive();
+                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+            }
+        });
+        server.route("/exit", new ModeHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                DriveController dc = driveController;
+                String token = req.queryParam("ct", null);
+                if (dc != null && !dc.acceptsClient(token)) {
+                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
+                            "control taken by another connection");
+                    return;
+                }
+                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+                Runnable r = exitRunnable;
+                if (r != null) {
+                    r.run();
+                }
             }
         });
         server.route("/assets/pico.min.css", new ModeHttpServer.RouteHandler() {
@@ -104,6 +174,22 @@ public class ModeApp extends Application {
         if (cameraCapture != null) {
             cameraCapture.stop();
             cameraCapture = null;
+        }
+    }
+
+    void setDriveController(DriveController controller) {
+        driveController = controller;
+    }
+
+    void setExitRunnable(Runnable runnable) {
+        exitRunnable = runnable;
+    }
+
+    private static int parseIntOr(String s, int fallback) {
+        try {
+            return Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            return fallback;
         }
     }
 
