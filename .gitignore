@@ -46,3 +46,26 @@ venv/
 tools/mtkclient/
 
 tools/aoa-inject/.venv/
+
+# Compound Engineering local scratch
+.context/compound-engineering/
+.compound-engineering/
+
+# pi tool local config
+.pi/
+
+# Extracted archive contents and decompiled dumps — regenerate from the
+# source .apk/.zip rather than tracking, they're large and derived
+*_extracted/
+*-extracted/
+tools/extracted-system/
+hooks/sd-free-test/
+hooks/sd-free/miko3-test/
+
+# Downloaded/recon'd APKs and third-party jars — large binaries, not source
+*.apk
+*.jar
+*.class
+
+# autonomous-recovery.py's own runtime cache of staged Route A files
+scripts/route-a-cache/

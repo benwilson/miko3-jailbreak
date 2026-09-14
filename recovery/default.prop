@@ -1,0 +1,40 @@
+#
+# ADDITIONAL_DEFAULT_PROPERTIES
+#
+ro.actionable_compatible_property.enabled=true
+ro.secure=0
+security.perf_harden=0
+ro.allow.mock.location=0
+ro.debuggable=1
+tombstoned.max_tombstone_count=50
+dalvik.vm.image-dex2oat-Xms=64m
+dalvik.vm.image-dex2oat-Xmx=64m
+dalvik.vm.dex2oat-Xms=64m
+dalvik.vm.dex2oat-Xmx=512m
+dalvik.vm.usejit=true
+dalvik.vm.usejitprofiles=true
+dalvik.vm.dexopt.secondary=true
+dalvik.vm.appimageformat=lz4
+pm.dexopt.first-boot=quicken
+pm.dexopt.boot=verify
+pm.dexopt.install=speed-profile
+pm.dexopt.bg-dexopt=speed-profile
+pm.dexopt.ab-ota=speed-profile
+pm.dexopt.inactive=verify
+pm.dexopt.shared=speed
+dalvik.vm.dex2oat-minidebuginfo=true
+debug.atrace.tags.enableflags=0
+ro.mediatek.platform=MT8168
+ro.mediatek.version.branch=alps-mp-p0.mp12
+ro.mediatek.version.release=alps-mp-p0.mp12-V1.48
+persist.vendor.connsys.coredump.mode=2
+ro.com.android.mobiledata=true
+ro.base_build=noah
+service.adb.tcp.port=5555
+#
+# BOOTIMAGE_BUILD_PROPERTIES
+#
+ro.bootimage.build.date=Sat Jun 10 22:41:21 CST 2023
+ro.bootimage.build.date.utc=1686408081
+ro.bootimage.build.fingerprint=MIKO3/full_tb8168p1_64_bsp/tb8168p1_64_bsp:9/PPR1.180610.011/zhangwei06102241:userdebug/test-keys
+persist.sys.usb.config=adb

@@ -10,10 +10,11 @@ work* — those cost the most to find.
 
 ## DO THIS NEXT — the one open question
 
-**Why does `unzipUsingLibray1` produce no extracted files?** That is the single
-blocker on the no-SD-card route, and it is answerable **at a desk, with no device
-and no failed boot**. See §3c for the evidence and §7 for the recipe. Everything
-else here is either settled or waiting on a microSD card.
+**Why does `unzipUsingLibray1` produce no extracted files?** The archive-format
+theory is **ruled out** (see §3c update): the actual zip4j 2.11.5 library extracts
+both our synthetic `APPS.zip` and a real recon'd `APPS.zip` cleanly on the host, so
+the failure is device-side, not in the zip itself. See §3c for the evidence.
+Everything else here is either settled or waiting on a microSD card.
 
 ---
 
@@ -44,6 +45,7 @@ thing this work exists to create.
 lost only our entry; `/data/app` kept exactly the two kiosk apps at v69/v92.
 
 ### What a valid entry would need
+
 `<cert index="N" key="…"/>` holds the certificate's **DER bytes**
 (observed `key="308204a8 30820390 a0030201 …"`), **not** a SHA-256 digest — a
 synthesized entry that writes a digest is writing the wrong thing into a
@@ -100,6 +102,7 @@ properly" path.
 ## 3. Why Route B fails — three separate, localised blockers
 
 ### 3a. A `version.txt` advertising the installed version stalls it
+
 `UpdateActivity` compares the archive's version against what is installed. The
 unit's real `version.txt` has `"version_code": "42"`, and the payload is
 literally `klug_42.z` — **42 is the current version**. Including it made the app
@@ -108,11 +111,13 @@ Omitting it restored the engine path. *This was my own error, introduced while
 "fixing" a difference that was load-bearing.*
 
 ### 3b. The update app's flow is cloud-gated
+
 `pu.processInstall()` in `UpdateActivity` is reached only from `updateProcess()`,
 which is gated on a `"DOWNLOADS"` state inside the app's own update flow. That flow
 runs `APIS.init(...)` and a bot-details fetch against Miko's servers first.
 
 ### 3c. The unzip extracts nothing — the current blocker
+
 **Observation (two attempts, two different archives):** after the run,
 `/sdcard/klug/downloads/ENC/` contains **only** the engine's own
 `enc_k.kf` / `enc_m.kf` — never our `3_files.l` or `miko3.z`. The listing is
@@ -136,6 +141,23 @@ Distinguishing them is exactly what the host-side reproduction in §7 is for.
 encryption requirement, and `file1.ia` / `file2.ia` / `klug_42.z` on the device all
 begin `50 4b 03 04` — plain ZIPs. So the routine *should* work; why it does not is
 **not determined**.
+
+**Update 2026-09-13 — mechanism (1) is ruled out.** Ran zip4j 2.11.5 itself
+(`tools/TestZip4jLocal.java`, `java -cp zip4j-2.11.5.jar:… TestZip4jLocal <zip>`)
+against both `hooks/sd-free/APPS.zip` (our synthetic archive) and a real recon'd
+`recon/APPS.zip` (a genuine 346 MB OTA payload, all six real files). Both report
+`isValidZipFile: true` and both extract completely and correctly on the host —
+including ours. The macOS-`zip`-artifact theory is dead: zip4j does not care about
+the `__MACOSX`/`._` entries or the Info-ZIP Unix extra field (`0x5455`) our archive
+carries, versus the real archive's NTFS extra field (`0x000a`, "made by" 6.3/Unix).
+That extra-field difference is cosmetic, not causal.
+
+**This narrows §3c to mechanisms (2) or (3), or a device-side transfer/environment
+difference** (e.g. the file that lands at `/sdcard/klug/downloads/APPS.zip` isn't
+byte-identical to what was pushed, a permissions/space issue on that path, or the
+app's bundled zip4j build behaving differently from the standalone jar). The next
+device session should checksum the on-device file against the pushed one before
+re-running the flow, rather than re-deriving the archive-format question.
 
 **Route A has none of these three problems** — it never unzips and never touches
 the network.
@@ -168,7 +190,7 @@ the network.
 ## 5. Device facts measured (reusable)
 
 | Fact | Value |
-|---|---|
+| --- | --- |
 | Normal boot | PID `0x2008`, product `MIKO3`, interface triplet **`ff/ff/00`** → **no adb** |
 | Factory mode | PID `0x2006` / `mt6763`; `id -u` 0; **no package manager** (`pm path` → "Can't find service: package") |
 | Factory-mode neuter | `/system/bin/reboot` = 24 bytes, first bytes `23 21 2f 73` (`#!/s`) |
@@ -182,6 +204,7 @@ the network.
 | `version.txt` | `{"app_id":"1","version_code":"42","update":"8.3",…}` |
 
 **Two measurement traps hit in this session:**
+
 - **`wc -l` on `adb_keys` returns 0 for a correct write.** Adb public keys have no
   trailing newline, so a single-key file counts zero lines. Use **`wc -c`**. This
   aborted a live install and was fixed in `ac9c9a9`.
@@ -235,6 +258,7 @@ engine directly at boot, and the card is physically separate from the device so 
 manufacturer OTA cannot remove it.
 
 Artifacts are committed:
+
 - `hooks/sd/` — Route A (`1_miko3.l`, `payload.sh`, `neuterd`)
 - `hooks/sd-free/` — Route B (`APPS.zip`, `3_files.l`, `payload.sh`, `neuterd`)
 - `hooks/deploy.sh` — deployment, with `--sd` and `--verify`

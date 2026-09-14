@@ -11,9 +11,12 @@ if [ -z "$LLD" ]; then
   LLD="$(command -v ld.lld 2>/dev/null || true)"
   [ -z "$LLD" ] && [ -x /opt/homebrew/opt/lld/bin/ld.lld ] && LLD=/opt/homebrew/opt/lld/bin/ld.lld
 fi
-[ -n "$LLD" ] || { echo "!! ld.lld not found — install it (brew install lld) or set LLD=/path/to/ld.lld" >&2; exit 1; }
+[ -n "$LLD" ] || {
+  echo "!! ld.lld not found — install it (brew install lld) or set LLD=/path/to/ld.lld" >&2
+  exit 1
+}
 
 clang --target=aarch64-linux-gnu -O2 -nostdlib -static -ffreestanding \
   -fuse-ld="$LLD" -Wl,-e,_start -o "$DIR/neuterd" "$DIR/neuterd.c"
 file "$DIR/neuterd"
-echo "built $DIR/neuterd ($(wc -c < "$DIR/neuterd") bytes)"
+echo "built $DIR/neuterd ($(wc -c <"$DIR/neuterd") bytes)"
