@@ -1,5 +1,137 @@
 # Motors / wheels — locomotion hardware control
 
+## DEFINITIVE RESULT (2026-09-14, session 2 continued): full software round-trip succeeds, MCU acknowledges, zero physical movement, operator-witnessed
+
+**Every software-layer bug in the chain is now fixed and verified; the command reaches the peripheral motor-board and gets a positive completion ACK; the operator watched and confirmed no physical movement occurred. This is the strongest evidence this session can produce, short of opening the unit.**
+
+### Standalone diagnostic app (`spike-drive-test/`)
+
+Rather than wait on the other session's fix to `RobotControlClient.java` (active
+WIP code not ours to patch), built a minimal standalone Android app
+(`spike-drive-test/`, `com.miko3.spiketest`) that binds directly to
+ServiceExam's `MyService` and sends a hand-built `GameEvent` payload — same
+AIDL handshake as every other client on this device (`UIEventAIDL.init()` →
+`TouchEventAIDL.init()` callback hands back `GameControllerAIDL`), but full
+control over the exact envelope bytes. Built with a from-scratch pipeline
+mirroring `scripts/build-bootagent.py` (`javac -> d8 -> aapt2 link ->
+zipalign -> apksigner`, `spike-drive-test/build.py`), reusing the
+already-provisioned Android SDK. Source for the six `com.root.aidlFiles.*`
+AIDL stub classes was copied verbatim from the already-decompiled
+`com.miko3.mode.remotecontrol` (same package, same interfaces, across every
+client on this device — ServiceExam's AIDL surface is not project-specific).
+
+### Three real bugs found and fixed in sequence, each confirmed via ServiceExam's own live logcat
+
+Iterated by capturing ServiceExam's full logcat (unfiltered, to a file, via
+`adb logcat -v time > file &`) around each attempt — the ring buffer's
+eviction by `SocialInteraction`'s own ~10Hz telemetry chatter makes a
+filtered/live tail unreliable for anything slower than a couple seconds; a
+full capture read back afterward is the reliable method.
+
+1. **Envelope encoding** (this project's `RobotControlClient.java`, not
+   fixed there — reproduced correctly in the standalone app instead):
+   `ServiceData.data` is `HashMap<Integer, String>` — the code-135 entry's
+   value must be the `ServiceRequest` **JSON-encoded as a string**, not
+   nested as a raw object. Sending it as a raw object threw
+   `JsonSyntaxException: Expected a string but was BEGIN_OBJECT` inside
+   ServiceExam and silently fell through to an unrelated "speak tts" default
+   path — never reaching real dispatch. See the "ROOT CAUSE FOUND" analysis
+   below (kept, still accurate) for the full trace.
+2. **Wrong `ServiceRequest` field.** Code 135's actual handler
+   (`ServiceClientInterface.12`, `ServiceClientInterface.java:1391`) does
+   **not** read `ServiceRequest.data` for the expression payload — it calls
+   `loadExpressionString(serviceRequest.getPath())`. `data` is read
+   separately and, if non-empty, becomes **spoken TTS text**
+   (`SocialInteraction_SpeechChat.create_TTS(serviceRequest.getData())`),
+   layered onto `expressionMsgLoadExpressionString.tx`. Sending the motion
+   payload via `data` (matching this project's client, and matching this
+   doc's own earlier "Route (a)" Kotlin example — **both wrong** in the same
+   way) leaves `path` null, and `loadExpressionString`'s first line,
+   `Log.e("yy", str)`, throws `NullPointerException: println needs a
+   message` — `android.util.Log.e(tag, msg)` throws exactly this if `msg`
+   is null. `ServiceRequest.data` must still be present as `""` (not
+   omitted/null) — it's read unconditionally via `.length()` with no null
+   check, a second latent NPE if skipped.
+3. **Wrong payload shape for the direct path.** `loadExpressionString(String
+   str)` is `Log.e("yy", str); return gson.fromJson(str, ExpressionMsg.class);`
+   — it Gson-parses `str` **directly as JSON**. The `<block>\n<expression>{json}
+   </expression>\n</block>` XML wrapper this doc's earlier examples used
+   (matching `startDOAThread()`'s confirmed-live call) is only meaningful to
+   the **other** method, `parseAIMLexpression(String xml, ...)`, which
+   parses the XML, extracts each `<expression>` element's text content, and
+   calls `loadExpressionString` on *that* — unwrapped. Code 135 calls
+   `loadExpressionString` **directly**, so `ServiceRequest.path` must be the
+   raw `{"tx":...,"mx":...,"ix":...,"rx":...,"id":N}` JSON with no XML
+   wrapper at all. Sending the XML-wrapped form here throws
+   `JsonSyntaxException: Expected BEGIN_OBJECT but was STRING at line 1
+   column 1 path $` — Gson sees text starting with `<`, not `{`.
+
+**Net implication for `docs/hardware/aidl-dispatch.md`'s and this doc's
+earlier "Route (a)" examples**: those were reverse-engineered from
+`startDOAThread()`, which calls `parseAIMLexpression()` (the XML-wrapped
+path) — a **different** entry point than a third-party AIDL client actually
+reaches for code 135, which goes through `ServiceClientInterface.12`'s
+direct `loadExpressionString` call instead. The two entry points expect
+different payload shapes for what is otherwise the same underlying
+`ExpressionMsg`/`MotionMsg` pipeline. Anyone building a client should use
+the shape confirmed working below, not the XML-wrapped form documented
+elsewhere in this file for the (never independently confirmed reachable
+from outside ServiceExam) `parseAIMLexpression` path.
+
+### Confirmed-working payload (verified via live ServiceExam logcat, zero exceptions, full pipeline completion)
+
+```json
+{"data":{"135":"{\"name\":\"\",\"path\":\"{\\\"tx\\\":{\\\"type\\\":0,\\\"size\\\":0,\\\"loop\\\":0,\\\"seqCount\\\":0,\\\"seq\\\":[]},\\\"ax\\\":{\\\"type\\\":0,\\\"size\\\":0,\\\"loop\\\":0,\\\"seqCount\\\":0,\\\"seq\\\":[]},\\\"mx\\\":{\\\"type\\\":4,\\\"size\\\":0,\\\"motion_type\\\":4,\\\"loop\\\":1,\\\"kp\\\":0,\\\"ki\\\":0,\\\"kd\\\":0,\\\"pidcontrol\\\":0,\\\"seqCount\\\":1,\\\"seq\\\":[{\\\"linear\\\":0,\\\"angular\\\":20,\\\"time\\\":10,\\\"type\\\":1,\\\"id\\\":0}]},\\\"ix\\\":{\\\"type\\\":0,\\\"size\\\":0,\\\"imagetype\\\":0,\\\"loop\\\":0,\\\"seqCount\\\":0},\\\"rx\\\":{\\\"type\\\":0,\\\"size\\\":0,\\\"loop\\\":0,\\\"seqCount\\\":0,\\\"seq\\\":[]},\\\"id\\\":420}\",\"data\":\"\",\"audioPath\":\"\"}"}}
+```
+(i.e. `{"data":{"135": <ServiceRequest as a JSON string, with .path = the raw expression JSON, .data = "">}}`, sent to a live `GameControllerAIDL` obtained via the standard `UIEventAIDL.init()`/`TouchEventAIDL.init()` handshake — see `spike-drive-test/src/com/miko3/spiketest/MainActivity.java` for the working reference implementation.)
+
+### Confirmed reaching real hardware (CONFIRMED, live logcat, not inferred)
+
+With the corrected payload, ServiceExam's own log shows **zero exceptions**
+and the full pipeline completing, ending in a positive round-trip
+acknowledgment from the peripheral MCU itself:
+```
+V/SocialInteraction: PI3 callback string is VEL1=<binary padded frame>
+E/EE: completed VEL1
+E/SocialInteraction: rrr something new xx:VEL1=<binary padded frame>
+D/ack: Motion/VEL1 Completion:CPL=1
+```
+This is the deepest point any software-only test can confirm: the exact
+`"VEL1="`-tagged frame this doc's byte-level analysis (below) predicted,
+written via `sensorModule.writeUART()`, received and **acknowledged
+complete** by the physical peripheral board over the UART. Six repeated
+attempts (small-magnitude rotate, `angular=20`), all completing cleanly with
+`CPL=1`, no `ERROR_UART`, no exception.
+
+### Operator-witnessed result: no physical movement (CONFIRMED, negative)
+
+The device owner watched the physical unit for the entire attempt window
+and confirmed: **no movement, no effect.** ServiceExam's own live
+wheel-encoder-shaped telemetry (`Left=`/`Right=` in the `"PI3 callback
+string"` heartbeat) also never changed — one single frozen value
+(`Left=-000000637,Right=-000000561`) across this entire session's ~20+ total
+drive attempts, including this final, fully-successful-at-the-software-layer
+one.
+
+### Assessment, updated
+
+Every software bug in the app→AIDL→ServiceExam→UART chain is now
+eliminated and the command chain is proven to reach and be acknowledged by
+the physical peripheral board. The "does this unit have working drive
+wheels" question from the original static-analysis pass (below) now has a
+much better-supported answer: **the motion command pipeline is fully
+functional end-to-end in software and firmware-communication terms, but
+produces no observed physical effect on this specific unit.** That points
+at something downstream of the UART link and the MCU's own acknowledgment
+logic — a motor/driver stage that isn't actually populated, wired, or
+functional on this board, a safety interlock this pass didn't identify
+(e.g. a stand/orientation/lift sensor gating actual motor engagement even
+though the command itself is accepted and ACK'd), or a genuine hardware
+fault specific to this individual unit — not a protocol, software, or
+"wrong app" problem. Distinguishing between those would need physical
+inspection of the board (out of scope for this pass) or finding and
+triggering whatever safety interlock might exist, if one does.
+
 ## ROOT CAUSE FOUND (2026-09-14, session 2 continued): malformed AIDL envelope in this project's own client code — not a hardware limitation
 
 **Supersedes the `bluetooth_flag` hypothesis in the section directly below (kept for the record, but ruled out) and explains the full negative spike-test battery.**
