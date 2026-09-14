@@ -403,12 +403,18 @@ device node.
 
 ## Open questions
 
-1. **Not verified on the live device**: does `bindService()` from an
-   unprivileged third-party app actually succeed against `MyService` as the
-   manifest/code above implies? Android's manifest permission enforcement
-   for bound services is normally solid, but this needs a live test (out of
-   scope per the task's read-only/no-device-interaction constraint) before
-   relying on it for the custom launcher.
+1. ~~**Not verified on the live device**~~ **RESOLVED (2026-09-14, `docs/plans/2026-09-14-1035-feat-launcher-mode-architecture-plan.md` U1):**
+   confirmed on the physical device from a real installed third-party APK
+   (`com.miko3.launcher`, no shared signing identity with any Miko app).
+   `bindService(Intent("my.service").setPackage("com.example.root.serviceexam"), ...)`
+   returned `true`, `onServiceConnected` fired with a live binder, and
+   `UIEventAIDL.init(...)` completed with no `RemoteException` or
+   `SecurityException` — ServiceExam handed back a connected
+   `GameControllerAIDL`/`AnalyticsAIDL` pair via the expected
+   `TouchEventAIDL.init()` callback, immediately followed by live
+   `updateUIData`/`expressionEvent` callbacks (device config, default-mode
+   expression). No signature or permission gate beyond the normal `INTERNET`
+   permission blocks this in practice, matching the static analysis above.
 2. `WifiService` (`action="wifi_service"`, same `INTERNET`-only gating) and
    the two overlay services (`OverlayScreenServiceLib`/
    `SystemOverlayServiceLib`, exported with **no** permission attribute at
