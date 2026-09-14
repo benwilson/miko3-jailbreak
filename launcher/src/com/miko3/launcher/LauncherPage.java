@@ -35,6 +35,10 @@ final class LauncherPage {
         html.append("<tr><td>Uptime</td><td>").append(uptime).append("</td></tr>");
         html.append("</table></section>");
 
+        html.append("<section id=\"modes\"><h2>Modes</h2>");
+        html.append("<a href=\"/launch-mode\" role=\"button\">Remote Control / Telepresence</a>");
+        html.append("</section>");
+
         if (connectStatusMessage != null) {
             html.append("<p id=\"connect-status\" role=\"status\">")
                     .append(DeviceInfo.escapeHtml(connectStatusMessage)).append("</p>");

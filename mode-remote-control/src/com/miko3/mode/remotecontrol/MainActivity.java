@@ -56,7 +56,17 @@ public class MainActivity extends Activity {
         setContentView(webView);
 
         requestRuntimePermissionsThenLoad();
+        activateDriveController();
 
+        if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_FORCE_EXIT, false)) {
+            exitMode();
+        }
+    }
+
+    /** Creates and starts a fresh DriveController, acquiring the lease. Called from
+     * onCreate (a genuinely new instance) and, defensively, from onNewIntent (see
+     * there) if this instance was reused while not currently active. */
+    private void activateDriveController() {
         String clientId = "mode-" + android.os.Process.myPid() + "-" + System.currentTimeMillis();
         driveController = new DriveController(this, clientId, new DriveController.ErrorListener() {
             @Override
@@ -78,19 +88,24 @@ public class MainActivity extends Activity {
                 });
             }
         });
-
-        handleExitIntent(getIntent());
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        handleExitIntent(intent);
-    }
-
-    private void handleExitIntent(Intent intent) {
         if (intent != null && intent.getBooleanExtra(EXTRA_FORCE_EXIT, false)) {
             exitMode();
+        } else if (driveController == null) {
+            // A plain (non-exit) launch Intent redelivered to this already-existing
+            // singleTop instance instead of creating a fresh one — happens if this
+            // instance is still mid-teardown from an earlier exit request when the
+            // launcher's next launch Intent arrives. Reactivate in place rather than
+            // silently doing nothing: recreate the drive controller and reload the
+            // page so this instance ends up in the same state a truly fresh launch
+            // would have produced.
+            Log.i(TAG, "reactivating in place (redelivered launch intent, not currently active)");
+            activateDriveController();
+            webView.loadUrl("http://127.0.0.1:" + ModeApp.PORT + "/");
         }
     }
 
