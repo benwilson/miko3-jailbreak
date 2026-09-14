@@ -21,6 +21,8 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Opens Camera2 with one hardware-JPEG ImageReader (KTD4: ImageFormat.JPEG
@@ -45,6 +47,13 @@ final class CameraCapture {
     private CameraDevice cameraDevice;
     private CameraCaptureSession captureSession;
     private ImageReader imageReader;
+    // Signaled by onClosed()/onDisconnected()/onError() — stop() waits on this so a
+    // caller's very next start() (ModeApp.startCamera() releases-then-reopens on
+    // every call) never races the still-in-flight async close() with a fresh
+    // openCamera(), which is a confirmed-live source of intermittent open failures
+    // (Camera2's close() only *starts* teardown; the HAL isn't actually free until
+    // the corresponding state callback fires).
+    private volatile CountDownLatch closedLatch;
 
     CameraCapture(Context context, MjpegBroadcaster broadcaster, ErrorListener errorListener) {
         this.context = context.getApplicationContext();
@@ -53,8 +62,13 @@ final class CameraCapture {
     }
 
     void start() {
+        // Armed before any early return: stop()'s wait needs a countDown() on every
+        // path, including the ones below that never actually call openCamera() (no
+        // state callback will ever fire for those, so nothing else would signal it).
+        closedLatch = new CountDownLatch(1);
         if (context.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             errorListener.onCameraError("CAMERA permission not granted");
+            closedLatch.countDown();
             return;
         }
         backgroundThread = new HandlerThread("camera-capture");
@@ -66,6 +80,7 @@ final class CameraCapture {
             String cameraId = pickCameraId(manager);
             if (cameraId == null) {
                 errorListener.onCameraError("no camera found");
+                closedLatch.countDown();
                 return;
             }
             CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
@@ -77,6 +92,7 @@ final class CameraCapture {
             Size jpegSize = pickSmallestJpegSize(map);
             if (jpegSize == null) {
                 errorListener.onCameraError("no JPEG output size available");
+                closedLatch.countDown();
                 return;
             }
             Log.i(TAG, "using JPEG size " + jpegSize.getWidth() + "x" + jpegSize.getHeight());
@@ -85,13 +101,17 @@ final class CameraCapture {
                     android.graphics.ImageFormat.JPEG, 2);
             imageReader.setOnImageAvailableListener(onImageAvailable, backgroundHandler);
 
+            // closedLatch counts down only in onClosed() from here — that's the sole
+            // point Camera2 guarantees the HAL has actually released the device.
             manager.openCamera(cameraId, cameraStateCallback, backgroundHandler);
         } catch (CameraAccessException e) {
             Log.e(TAG, "openCamera failed", e);
             errorListener.onCameraError("camera access failed: " + e.getMessage());
+            closedLatch.countDown();
         } catch (SecurityException e) {
             Log.e(TAG, "openCamera denied", e);
             errorListener.onCameraError("camera permission denied at open time");
+            closedLatch.countDown();
         }
     }
 
@@ -106,6 +126,21 @@ final class CameraCapture {
         if (cameraDevice != null) {
             cameraDevice.close();
             cameraDevice = null;
+        }
+        // Waits for onClosed() (see closedLatch's field comment) BEFORE quitting the
+        // background thread below — onClosed() is delivered on that thread's own
+        // Handler, so quitting it first would silently drop the very callback this
+        // wait depends on, defeating the wait entirely. A bounded timeout means a
+        // wedged HAL delays, but never hangs, the next start().
+        CountDownLatch latch = closedLatch;
+        if (latch != null) {
+            try {
+                if (!latch.await(2, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "camera close did not confirm within 2s — proceeding anyway");
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
         }
         if (imageReader != null) {
             imageReader.close();
@@ -171,6 +206,18 @@ final class CameraCapture {
             camera.close();
             cameraDevice = null;
             errorListener.onCameraError("camera error code " + error);
+        }
+
+        @Override
+        public void onClosed(CameraDevice camera) {
+            // The one point Camera2 guarantees the HAL has actually released this
+            // device — see closedLatch's field comment. Fires after close() from
+            // any of onDisconnected/onError/stop()'s own call, so this is the sole
+            // place that counts it down.
+            CountDownLatch latch = closedLatch;
+            if (latch != null) {
+                latch.countDown();
+            }
         }
     };
 
