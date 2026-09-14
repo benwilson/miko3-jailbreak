@@ -202,31 +202,26 @@ final class DriveController {
                 throw new RemoteException("drive lease not held");
             }
             handler.removeCallbacks(watchdog);
-            // EXPERIMENT (U14, live A/B against the "10" baseline): 15 centiseconds
-            // (~150ms) instead of ~100ms, while DriveSection.java's repeat interval
-            // stays at 80ms -- still comfortably faster than this frame's duration
-            // (so a held direction never sees a gap), but each frame now covers
-            // nearly two repeat cycles instead of ~1.25, testing whether that
-            // reduces how often the motor restarts its own ramp. Measured live via
-            // Chrome DevTools that the 80ms client-side cadence itself is already
-            // rock-solid (±2ms jitter across 39 sends), which rules out send timing
-            // as the source of the reported residual roughness -- if this doesn't
-            // help, the remaining roughness is more likely network/motor-hardware
-            // characteristics than anything left to tune here. Revert to 10 if the
-            // operator reports this feels laggier (would indicate commands queue
-            // rather than interrupt in-flight ones) rather than smoother.
+            // Stay at "10" (centiseconds -> ~100ms), the only value ever confirmed
+            // live (docs/hardware/motors-wheels.md). U14 tried 15 (~150ms) as a live
+            // A/B experiment, hypothesizing that a longer frame would mean fewer
+            // motor ramp-restarts per second of held motion -- operator-tested and
+            // REJECTED: it made things worse ("jerk jerk jerk then stopped, then
+            // nothing"), consistent with drive frames queuing behind each other on
+            // the firmware side rather than each new one interrupting whatever's
+            // still in flight. Do not re-attempt lengthening this value; if the
+            // motor-frame layer needs more headroom, the fix has to come from
+            // shortening DriveSection.java's repeat interval instead, not this.
             //
-            // The "10" (centiseconds -> ~100ms) had been deliberately left at the
-            // only value ever confirmed live (docs/hardware/motors-wheels.md) rather
-            // than lengthened to paper over gaps between repeated calls -- each call
-            // is its own short motion frame, not an extension of the last one, so a
-            // caller that repeats a held direction (see DriveSection.java's JS) MUST
-            // do so faster than this frame's own duration, or the robot visibly stops
+            // The repeat interval itself (see DriveSection.java) already has to stay
+            // faster than this frame's own duration, since each call is its own
+            // short motion frame, not an extension of the last one -- a caller that
+            // repeats a held direction slower than that sees the robot visibly stop
             // between frames even with every command arriving instantly (confirmed
-            // live: this, not network latency, was most of the reported "straight,
-            // jank, jank, straight" -- the old 300ms/WS-era 250ms repeat interval was
-            // already longer than this frame's ~100ms run time).
-            robotClient.drive(linear, angular, 15);
+            // live: this, not network latency, was most of the reported original
+            // "straight, jank, jank, straight" -- the pre-WebSocket 300ms repeat
+            // interval was already longer than this frame's ~100ms run time).
+            robotClient.drive(linear, angular, 10);
             handler.postDelayed(watchdog, WATCHDOG_MS);
         }
     }

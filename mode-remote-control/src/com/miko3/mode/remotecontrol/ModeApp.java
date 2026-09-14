@@ -40,7 +40,19 @@ public class ModeApp extends Application {
     // at a time; the on-device WebView's operator-video-img subscribes to the
     // resulting stream exactly like the main camera view does to mjpegBroadcaster.
     private final MjpegBroadcaster operatorVideoBroadcaster = new MjpegBroadcaster();
-    private CameraCapture cameraCapture;
+    private volatile CameraCapture cameraCapture;
+    // Serializes camera open/close off whichever thread calls startCamera()/
+    // stopCamera() — confirmed live: CameraCapture.stop() can now block for up to
+    // 2s waiting for the HAL to actually release the device (see its own field
+    // comment), and startCamera() calling that synchronously when called from
+    // MainActivity.activateDriveController() (the main/UI thread, on a
+    // reactivation where a camera was already running) blocked the whole
+    // Activity — the WebView's own page load, DriveController's setup, and
+    // anything else on that thread — for up to 2s, degrading into exactly the
+    // "page never finishes loading, drive says not ready" state this was
+    // supposed to prevent, not fix.
+    private final java.util.concurrent.ExecutorService cameraExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
     private volatile String cameraError;
     private volatile DriveController driveController;
     private volatile Runnable exitRunnable;
@@ -402,26 +414,42 @@ public class ModeApp extends Application {
         // Guards against a leaked, still-open camera handle if this is somehow
         // called twice without an intervening stopCamera() — the camera HAL is
         // exclusive-access, so an unreleased prior CameraCapture here would make
-        // the new one fail with "no camera found" (confirmed live).
-        if (cameraCapture != null) {
-            cameraCapture.stop();
-            cameraCapture = null;
-        }
+        // the new one fail with "no camera found" (confirmed live). The actual
+        // stop() (and the fresh start() right after) run on cameraExecutor, off
+        // the calling thread — see that field's comment for why.
+        final CameraCapture old = cameraCapture;
+        cameraCapture = null;
         cameraError = null;
-        cameraCapture = new CameraCapture(this, mjpegBroadcaster, new CameraCapture.ErrorListener() {
+        cameraExecutor.execute(new Runnable() {
             @Override
-            public void onCameraError(String reason) {
-                cameraError = reason;
-                Log.e(TAG, "camera error: " + reason);
+            public void run() {
+                if (old != null) {
+                    old.stop();
+                }
+                CameraCapture fresh = new CameraCapture(ModeApp.this, mjpegBroadcaster,
+                        new CameraCapture.ErrorListener() {
+                            @Override
+                            public void onCameraError(String reason) {
+                                cameraError = reason;
+                                Log.e(TAG, "camera error: " + reason);
+                            }
+                        });
+                cameraCapture = fresh;
+                fresh.start();
             }
         });
-        cameraCapture.start();
     }
 
     void stopCamera() {
-        if (cameraCapture != null) {
-            cameraCapture.stop();
-            cameraCapture = null;
+        final CameraCapture old = cameraCapture;
+        cameraCapture = null;
+        if (old != null) {
+            cameraExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    old.stop();
+                }
+            });
         }
     }
 
