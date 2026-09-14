@@ -146,15 +146,26 @@ final class WifiHttpHandler {
                             && (r.capabilities.contains("WPA") || r.capabilities.contains("WEP"));
                     int level = wifiManager.calculateSignalLevel(r.level, 5); // 0-4
                     String ssidEsc = DeviceInfo.escapeHtml(r.SSID);
-                    String ssidJs = jsStringEscape(r.SSID);
+                    // A Wi-Fi SSID is attacker-controlled by anyone in radio range (no LAN
+                    // membership needed) and can legally contain a literal '"'. This handler
+                    // sits inside an HTML onclick="..." attribute, not a bare JS string: the
+                    // browser HTML-decodes the attribute value before handing it to the JS
+                    // engine, so jsStringEscape() alone (safe only *inside* a JS string
+                    // literal) leaves a raw '"' that still closes the HTML attribute early —
+                    // a real reflected-XSS break-out, not just a JS-escaping nicety. HTML-
+                    // escape the already-JS-escaped snippet so the HTML parser sees it as one
+                    // opaque attribute value; the browser's own HTML-decode step then hands
+                    // the JS engine back exactly the JS-escaped string this was built for.
+                    String onclickJs = "document.getElementById('wifi-ssid').value="
+                            + jsQuote(jsStringEscape(r.SSID)) + ";"
+                            + "document.getElementById('wifi-password').focus();";
                     html.append("<li>");
                     html.append(signalBars(level));
                     if (secured) {
                         html.append(" &#128274;"); // lock icon
                     }
                     html.append(" <a href=\"javascript:void(0)\" onclick=\"")
-                            .append("document.getElementById('wifi-ssid').value=").append(jsQuote(ssidJs)).append(";")
-                            .append("document.getElementById('wifi-password').focus();")
+                            .append(DeviceInfo.escapeHtml(onclickJs))
                             .append("\">").append(ssidEsc).append("</a>");
                     html.append("</li>");
                 }

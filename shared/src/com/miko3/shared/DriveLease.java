@@ -24,8 +24,13 @@ public interface DriveLease extends IInterface {
      */
     boolean acquire(IBinder deathToken, String clientId) throws RemoteException;
 
-    /** Keepalive for a held lease; a no-op if clientId does not hold it. */
-    void renew(String clientId) throws RemoteException;
+    /** Keepalive for a held lease. Returns true if clientId is still the current
+     * holder (the renew took effect), false if the lease was already revoked (e.g.
+     * TTL-expired) — the caller must treat false as "I no longer hold this lease"
+     * and stop driving, not merely log it, since a caller that keeps treating a
+     * non-throwing renew() as proof of ownership can keep driving after a second
+     * mode has already acquired the lease. */
+    boolean renew(String clientId) throws RemoteException;
 
     /** Releases the lease if held by clientId; a no-op otherwise. */
     void release(String clientId) throws RemoteException;
@@ -74,8 +79,9 @@ public interface DriveLease extends IInterface {
                 }
                 case TRANSACTION_renew: {
                     data.enforceInterface(DESCRIPTOR);
-                    renew(data.readString());
+                    boolean stillHeld = renew(data.readString());
                     reply.writeNoException();
+                    reply.writeInt(stillHeld ? 1 : 0);
                     return true;
                 }
                 case TRANSACTION_release: {
@@ -130,7 +136,7 @@ public interface DriveLease extends IInterface {
             }
 
             @Override
-            public void renew(String clientId) throws RemoteException {
+            public boolean renew(String clientId) throws RemoteException {
                 Parcel data = Parcel.obtain();
                 Parcel reply = Parcel.obtain();
                 try {
@@ -138,6 +144,7 @@ public interface DriveLease extends IInterface {
                     data.writeString(clientId);
                     remote.transact(TRANSACTION_renew, data, reply, 0);
                     reply.readException();
+                    return reply.readInt() != 0;
                 } finally {
                     reply.recycle();
                     data.recycle();

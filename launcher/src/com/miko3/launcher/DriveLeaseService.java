@@ -39,23 +39,27 @@ public class DriveLeaseService extends Service {
 
     private String holderId;
     private IBinder holderDeathToken;
+    private IBinder.DeathRecipient holderDeathRecipient;
     private long lastRenewElapsedMs;
-
-    private final IBinder.DeathRecipient deathRecipient = new IBinder.DeathRecipient() {
-        @Override
-        public void binderDied() {
-            Log.w(TAG, "holder '" + holderId + "' died — releasing lease and stopping");
-            releaseInternal("binder_died");
-        }
-    };
+    private volatile boolean stopOwed;
 
     private final Runnable ttlCheck = new Runnable() {
         @Override
         public void run() {
-            if (holderId != null
-                    && SystemClock.elapsedRealtime() - lastRenewElapsedMs > TTL_MS) {
-                Log.w(TAG, "holder '" + holderId + "' TTL expired — releasing lease and stopping");
-                releaseInternal("ttl_expired");
+            // Locks on DriveLeaseService.this — the same monitor every method below
+            // uses — so this main-thread read of holderId/lastRenewElapsedMs can't
+            // race a Binder-thread acquire()/renew()/release() call. Binder methods
+            // used to be `synchronized` (locking the anonymous Stub instance instead
+            // of the enclosing service) while this read held no lock at all: two
+            // different monitors for one critical section, confirmed live as a real
+            // race risk on this hardware's weaker ARM memory ordering, not just a
+            // theoretical JMM violation.
+            synchronized (DriveLeaseService.this) {
+                if (holderId != null
+                        && SystemClock.elapsedRealtime() - lastRenewElapsedMs > TTL_MS) {
+                    Log.w(TAG, "holder '" + holderId + "' TTL expired — releasing lease and stopping");
+                    releaseInternal("ttl_expired");
+                }
             }
             handler.postDelayed(this, TTL_CHECK_INTERVAL_MS);
         }
@@ -63,75 +67,120 @@ public class DriveLeaseService extends Service {
 
     private final DriveLease.Stub binder = new DriveLease.Stub() {
         @Override
-        public synchronized boolean acquire(IBinder deathToken, String clientId) {
-            if (holderId != null && !holderId.equals(clientId)) {
-                return false;
-            }
-            if (holderId == null) {
-                holderId = clientId;
-                holderDeathToken = deathToken;
-                try {
-                    deathToken.linkToDeath(deathRecipient, 0);
-                } catch (RemoteException e) {
-                    // Caller was already dead by the time we tried to link — treat as
-                    // never having acquired it.
-                    holderId = null;
-                    holderDeathToken = null;
+        public boolean acquire(IBinder deathToken, final String clientId) {
+            synchronized (DriveLeaseService.this) {
+                if (holderId != null && !holderId.equals(clientId)) {
                     return false;
                 }
-                Log.i(TAG, "lease acquired by '" + clientId + "'");
-            }
-            lastRenewElapsedMs = SystemClock.elapsedRealtime();
-            return true;
-        }
-
-        @Override
-        public synchronized void renew(String clientId) {
-            if (clientId != null && clientId.equals(holderId)) {
+                if (holderId == null) {
+                    // A DeathRecipient created fresh per acquisition, capturing this
+                    // specific clientId, rather than one shared instance reused across
+                    // every holder: binderDied() carries no argument identifying which
+                    // IBinder died, so a single shared recipient can't tell "the holder
+                    // that just died" from "a different, already-superseded holder" if
+                    // its death notification was merely delayed. Confirmed live-reviewable
+                    // race: holder A crashes, its death notification is still queued when
+                    // holder B legitimately acquires, and the stale callback would clear
+                    // B's session and stop B's robot mid-drive. Checking clientId against
+                    // the *current* holderId before acting closes that window.
+                    final IBinder.DeathRecipient recipient = new IBinder.DeathRecipient() {
+                        @Override
+                        public void binderDied() {
+                            synchronized (DriveLeaseService.this) {
+                                if (!clientId.equals(holderId)) {
+                                    return; // stale notification for a since-superseded holder
+                                }
+                                Log.w(TAG, "holder '" + clientId + "' died — releasing lease and stopping");
+                                releaseInternal("binder_died");
+                            }
+                        }
+                    };
+                    holderId = clientId;
+                    holderDeathToken = deathToken;
+                    holderDeathRecipient = recipient;
+                    try {
+                        deathToken.linkToDeath(recipient, 0);
+                    } catch (RemoteException e) {
+                        // Caller was already dead by the time we tried to link — treat as
+                        // never having acquired it.
+                        holderId = null;
+                        holderDeathToken = null;
+                        holderDeathRecipient = null;
+                        return false;
+                    }
+                    Log.i(TAG, "lease acquired by '" + clientId + "'");
+                }
                 lastRenewElapsedMs = SystemClock.elapsedRealtime();
+                return true;
             }
         }
 
         @Override
-        public synchronized void release(String clientId) {
-            if (clientId != null && clientId.equals(holderId)) {
-                Log.i(TAG, "lease released cleanly by '" + clientId + "'");
-                releaseInternal("clean_release");
+        public boolean renew(String clientId) {
+            synchronized (DriveLeaseService.this) {
+                if (clientId != null && clientId.equals(holderId)) {
+                    lastRenewElapsedMs = SystemClock.elapsedRealtime();
+                    return true;
+                }
+                return false;
             }
         }
 
         @Override
-        public synchronized String getHolder() {
-            return holderId;
+        public void release(String clientId) {
+            synchronized (DriveLeaseService.this) {
+                if (clientId != null && clientId.equals(holderId)) {
+                    Log.i(TAG, "lease released cleanly by '" + clientId + "'");
+                    releaseInternal("clean_release");
+                }
+            }
+        }
+
+        @Override
+        public String getHolder() {
+            synchronized (DriveLeaseService.this) {
+                return holderId;
+            }
         }
     };
 
-    private synchronized void releaseInternal(String reason) {
+    /** Caller must hold the DriveLeaseService.this monitor (see call sites above and
+     * the DeathRecipient below — the one exception, documented at its call site). */
+    private void releaseInternal(String reason) {
         if (holderId == null) {
             return;
         }
-        if (holderDeathToken != null) {
+        if (holderDeathToken != null && holderDeathRecipient != null) {
             try {
-                holderDeathToken.unlinkToDeath(deathRecipient, 0);
+                holderDeathToken.unlinkToDeath(holderDeathRecipient, 0);
             } catch (java.util.NoSuchElementException ignored) {
                 // already unlinked (e.g. binderDied fired concurrently)
             }
         }
         holderId = null;
         holderDeathToken = null;
+        holderDeathRecipient = null;
         issueStop(reason);
     }
 
     private void issueStop(String reason) {
         if (robotClient == null || !robotClient.isConnected()) {
+            // RobotControlClient's own bind to ServiceExam is asynchronous (KTD1/U2) and
+            // can still be pending here, e.g. a mode acquires and crashes before the
+            // coordinator's own connect() has completed. Previously this just logged and
+            // returned, permanently skipping the stop-motors obligation for this release.
+            // Track it and retry once the client actually connects instead.
+            stopOwed = true;
             Log.e(TAG, "cannot issue stop-motors for release (" + reason
-                    + ") — RobotControlClient not connected");
+                    + ") — RobotControlClient not connected; will retry on connect");
             return;
         }
         try {
             robotClient.stop();
+            stopOwed = false;
             Log.i(TAG, "stop-motors issued (" + reason + ")");
         } catch (RemoteException e) {
+            stopOwed = true;
             Log.e(TAG, "stop-motors command failed (" + reason + ")", e);
         }
     }
@@ -143,6 +192,9 @@ public class DriveLeaseService extends Service {
             @Override
             public void onConnected() {
                 Log.i(TAG, "RobotControlClient connected");
+                if (stopOwed) {
+                    issueStop("retry_after_connect");
+                }
             }
 
             @Override

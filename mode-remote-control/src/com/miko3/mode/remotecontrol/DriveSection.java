@@ -39,6 +39,13 @@ final class DriveSection {
             + ".catch(function(){status.textContent='Drive command failed (network error).';});"
             + "}"
             + "function startHold(btn){"
+            // A second pointerdown (e.g. multi-touch, or dragging from one button to
+            // another) before the first pointerup would otherwise overwrite the single
+            // repeatTimer reference with no way left to clear the first interval — it
+            // would then keep sending drive commands every 300ms forever, even after
+            // the user believes they released. Clearing any existing hold first (which
+            // also sends its own stop) guarantees at most one interval is ever live.
+            + "stopHold();"
             + "var linear=btn.getAttribute('data-linear');"
             + "var angular=btn.getAttribute('data-angular');"
             + "drive(linear,angular);"

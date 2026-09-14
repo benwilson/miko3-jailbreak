@@ -32,6 +32,14 @@ final class DriveController {
         void onDriveError(String reason);
     }
 
+    /** Thrown by drive()/keepalive() when the request's client token is no longer the
+     * active one (R17) — checked atomically with the actual dispatch, inside the same
+     * lock, so a request that already passed a separate pre-check can't still land after
+     * a newer page load has taken over in between (confirmed reachable: ModeApp's route
+     * handlers run on RoutingHttpServer's one-thread-per-connection model). */
+    static final class StaleClientException extends RuntimeException {
+    }
+
     private final Context context;
     private final String clientId;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -42,6 +50,14 @@ final class DriveController {
     private DriveLease lease;
     private volatile boolean leaseHeld;
     private volatile boolean coordinatorUnreachable;
+
+    /** Guards leaseHeld together with the actual robotClient.drive()/stop() calls and
+     * the watchdog schedule, so a concurrent HTTP thread's drive() and another thread's
+     * release() (e.g. the UI's "Exit mode" running on the main thread) can't interleave
+     * into a state where a drive command is sent after the lease was already released —
+     * confirmed reachable given RoutingHttpServer's one-thread-per-connection model,
+     * where /drive and /exit can be handled by two different threads at once. */
+    private final Object driveLock = new Object();
 
     /** R17: only the most recently connected browser client's commands are honored. */
     private volatile String currentClientToken;
@@ -65,8 +81,23 @@ final class DriveController {
         public void run() {
             if (leaseHeld && lease != null) {
                 try {
-                    lease.renew(clientId);
+                    boolean stillHeld = lease.renew(clientId);
                     coordinatorUnreachable = false;
+                    if (!stillHeld) {
+                        // The coordinator revoked this lease (e.g. TTL-expired because a
+                        // prior renew was delayed past ~2.25s) but this call itself didn't
+                        // throw — treating a non-throwing renew() as proof of ownership
+                        // would let this mode keep driving after a second mode has already
+                        // acquired the now-free lease, breaking "exactly one mode drives."
+                        Log.w(TAG, "renew() reports lease no longer held — stopping");
+                        synchronized (driveLock) {
+                            leaseHeld = false;
+                            handler.removeCallbacks(watchdog);
+                        }
+                        sendStopBestEffort();
+                        errorListener.onDriveError("drive lease revoked — stopped");
+                        return;
+                    }
                 } catch (RemoteException e) {
                     handleCoordinatorUnreachable("renew() failed: " + e.getMessage());
                 }
@@ -161,19 +192,31 @@ final class DriveController {
         return coordinatorUnreachable;
     }
 
-    void drive(int linear, int angular) throws RemoteException {
-        if (!leaseHeld) {
-            throw new RemoteException("drive lease not held");
+    /** @throws StaleClientException if token is no longer the active client (R17) */
+    void drive(String token, int linear, int angular) throws RemoteException {
+        synchronized (driveLock) {
+            if (!acceptsClient(token)) {
+                throw new StaleClientException();
+            }
+            if (!leaseHeld) {
+                throw new RemoteException("drive lease not held");
+            }
+            handler.removeCallbacks(watchdog);
+            robotClient.drive(linear, angular, 10);
+            handler.postDelayed(watchdog, WATCHDOG_MS);
         }
-        handler.removeCallbacks(watchdog);
-        robotClient.drive(linear, angular, 10);
-        handler.postDelayed(watchdog, WATCHDOG_MS);
     }
 
-    /** A keepalive with no motion — resets the watchdog without sending a new drive frame. */
-    void keepalive() {
-        handler.removeCallbacks(watchdog);
-        handler.postDelayed(watchdog, WATCHDOG_MS);
+    /** A keepalive with no motion — resets the watchdog without sending a new drive frame.
+     * @throws StaleClientException if token is no longer the active client (R17) */
+    void keepalive(String token) {
+        synchronized (driveLock) {
+            if (!acceptsClient(token)) {
+                throw new StaleClientException();
+            }
+            handler.removeCallbacks(watchdog);
+            handler.postDelayed(watchdog, WATCHDOG_MS);
+        }
     }
 
     private void sendStopBestEffort() {
@@ -191,8 +234,11 @@ final class DriveController {
     private void handleCoordinatorUnreachable(String reason) {
         Log.e(TAG, "coordinator unreachable (" + reason + ") — commanding stop independently");
         coordinatorUnreachable = true;
-        leaseHeld = false;
         handler.removeCallbacks(renewLoop);
+        synchronized (driveLock) {
+            leaseHeld = false;
+            handler.removeCallbacks(watchdog);
+        }
         sendStopBestEffort();
         errorListener.onDriveError("lost contact with drive coordinator — stopped");
     }
@@ -200,15 +246,17 @@ final class DriveController {
     /** R16: explicit clean release, from the "Exit mode" control or an exit request. */
     void release() {
         handler.removeCallbacks(renewLoop);
-        handler.removeCallbacks(watchdog);
-        if (leaseHeld && lease != null) {
-            try {
-                lease.release(clientId);
-            } catch (RemoteException e) {
-                Log.w(TAG, "release() failed (coordinator likely already unreachable)", e);
+        synchronized (driveLock) {
+            handler.removeCallbacks(watchdog);
+            if (leaseHeld && lease != null) {
+                try {
+                    lease.release(clientId);
+                } catch (RemoteException e) {
+                    Log.w(TAG, "release() failed (coordinator likely already unreachable)", e);
+                }
             }
+            leaseHeld = false;
         }
-        leaseHeld = false;
         try {
             context.unbindService(leaseConnection);
         } catch (IllegalArgumentException ignored) {

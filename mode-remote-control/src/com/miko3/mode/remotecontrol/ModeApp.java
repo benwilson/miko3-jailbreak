@@ -106,15 +106,25 @@ public class ModeApp extends Application {
         server.route("/drive", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                DriveController dc = authorizeClient(req, res, true);
+                // R17's client-token check happens INSIDE dc.drive() itself, atomically
+                // with the actual dispatch (see DriveController.StaleClientException) —
+                // not as a separate pre-check here, since a pre-check-then-act split
+                // leaves a window where a newer page's claimClient() lands in between,
+                // letting an already-authorized stale request still reach the motors.
+                DriveController dc = driveController;
                 if (dc == null) {
+                    res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8", "mode not ready");
                     return;
                 }
                 int linear = HttpUtil.parseIntOr(req.queryParam("linear", "0"), 0);
                 int angular = HttpUtil.parseIntOr(req.queryParam("angular", "0"), 0);
+                String token = req.queryParam("ct", null);
                 try {
-                    dc.drive(linear, angular);
+                    dc.drive(token, linear, angular);
                     res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+                } catch (DriveController.StaleClientException e) {
+                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
+                            "control taken by another connection");
                 } catch (android.os.RemoteException e) {
                     res.sendText(502, "Bad Gateway", "text/plain; charset=utf-8",
                             "drive failed: " + e.getMessage());
@@ -124,12 +134,19 @@ public class ModeApp extends Application {
         server.route("/keepalive", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                DriveController dc = authorizeClient(req, res, true);
+                DriveController dc = driveController;
                 if (dc == null) {
+                    res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8", "mode not ready");
                     return;
                 }
-                dc.keepalive();
-                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+                String token = req.queryParam("ct", null);
+                try {
+                    dc.keepalive(token);
+                    res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+                } catch (DriveController.StaleClientException e) {
+                    res.sendText(409, "Conflict", "text/plain; charset=utf-8",
+                            "control taken by another connection");
+                }
             }
         });
         server.route("/exit", new RoutingHttpServer.RouteHandler() {
