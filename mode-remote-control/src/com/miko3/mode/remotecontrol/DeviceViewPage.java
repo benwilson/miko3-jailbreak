@@ -44,16 +44,34 @@ final class DeviceViewPage {
             + "html,body{margin:0;height:100%;background:#000;overflow:hidden}"
             + "#rig{width:100%;height:100%;display:flex;align-items:center;justify-content:center;"
             + "position:relative}"
-            // The bracket/yoke connecting the two lenses, like WALL-E's binocular
-            // bar — sits behind the lenses (z-index below .eye-mount) so only the
-            // segment between them peeks out.
+            // The head housing — WALL-E's eyes sit in a boxy, worn/rusty binocular
+            // unit, not floating on a thin bar; a wide plate behind everything else
+            // (lowest z-index) makes the two lenses read as mounted INTO a single
+            // weathered-metal head instead of two separate floating balls.
             // Centered via top/left + negative margins, not transform:translate(-50%,
             // -50%) — both work here, but margins are the more universally-safe bet
             // on this old WebView given how many newer CSS features have already
-            // silently no-op'd on it this session.
-            + "#bar{position:absolute;top:50%;left:50%;width:62vmin;height:5vmin;"
-            + "margin-top:-2.5vmin;margin-left:-31vmin;border-radius:2.5vmin;"
-            + "background:linear-gradient(#4a4e52,#1c1e20);box-shadow:0 0.4vmin 1vmin rgba(0,0,0,.6)}"
+            // silently no-op'd on it this session (see below).
+            + "#frame{position:absolute;top:50%;left:50%;width:126vmin;height:70vmin;"
+            + "margin-top:-35vmin;margin-left:-63vmin;border-radius:6vmin;"
+            + "background:linear-gradient(155deg,#9a7a48,#6b4f28 45%,#4a3618 100%);"
+            + "border:0.6vmin solid #3a2a14;"
+            + "box-shadow:inset 0 0 5vmin rgba(0,0,0,.5), inset 0 1vmin 1.5vmin rgba(255,255,255,.15),"
+            + "0 1vmin 2vmin rgba(0,0,0,.6)}"
+            // Corner rivets — small dark studs, the kind of worn-industrial detail
+            // that reads as "WALL-E's battered chassis" rather than a clean modern
+            // gadget.
+            + ".rivet{position:absolute;width:3.2vmin;height:3.2vmin;border-radius:50%;"
+            + "background:radial-gradient(circle at 35% 30%,#c9b088,#5a4020 70%,#2a1c0c 100%);"
+            + "box-shadow:inset 0 0 0.6vmin rgba(0,0,0,.6)}"
+            + "#r1{left:6vmin;top:6vmin}#r2{right:6vmin;top:6vmin}"
+            + "#r3{left:6vmin;bottom:6vmin}#r4{right:6vmin;bottom:6vmin}"
+            // The socket each lens sits in — a fixed, non-moving dark collar mounted
+            // in the frame, so the lens above it reads as a tube telescoping out of a
+            // round hole in the housing rather than a ball floating in front of it.
+            + ".socket{width:56vmin;height:56vmin;margin:0 2vmin;border-radius:50%;position:relative;"
+            + "background:radial-gradient(circle at 40% 35%,#2a2012,#100c06 75%);"
+            + "box-shadow:inset 0 0.8vmin 2vmin rgba(0,0,0,.8)}"
             // Explicit vmin width+height rather than width+aspect-ratio, and margin
             // rather than the flex container's gap: this page renders inside a
             // low-level system WebView on an Android 9 device, old enough that
@@ -63,16 +81,20 @@ final class DeviceViewPage {
             // .eye-mount is what actually moves (translateY, independently timed
             // per eye) — real WALL-E's expression comes from each lens being
             // raised/lowered on its own servo, not from anything moving inside a
-            // fixed eye socket.
-            + ".eye-mount{width:50vmin;height:50vmin;margin:0 2vmin;position:relative;z-index:1;"
+            // fixed eye socket. Centered inside its .socket the same margin-based way
+            // as #frame, so the lens (smaller than the socket) can drift within it
+            // without ever fully leaving the hole it sits in.
+            + ".eye-mount{width:50vmin;height:50vmin;position:absolute;top:50%;left:50%;"
+            + "margin-top:-25vmin;margin-left:-25vmin;z-index:1;"
             + "transition:transform 0.9s cubic-bezier(.4,0,.2,1)}"
             + "@keyframes blink{0%,92%,100%{transform:scaleY(1)}96%{transform:scaleY(0.08)}}"
             // The lens itself: metallic bezel ring (radial-gradient, brushed-steel
             // look) around a dark glass center — no white sclera, no pupil.
             + ".eye{width:100%;height:100%;border-radius:50%;position:relative;overflow:hidden;"
             + "background:radial-gradient(circle at 35% 30%,#9aa0a6,#4a4e52 55%,#1c1e20 100%);"
-            + "box-shadow:inset 0 0 3vmin rgba(0,0,0,.7);animation:blink 6s infinite}"
-            + ".eye-mount:nth-child(2) .eye{animation-delay:0.15s}"
+            + "box-shadow:inset 0 0 3vmin rgba(0,0,0,.7), 0 0 1vmin rgba(0,0,0,.9);"
+            + "animation:blink 6s infinite}"
+            + ".socket:nth-child(2) .eye{animation-delay:0.15s}"
             + ".lens{position:absolute;left:13%;top:13%;width:74%;height:74%;border-radius:50%;"
             + "background:radial-gradient(circle at 38% 32%,#3d5a66,#0c1113 62%,#000 100%)}"
             // The glass glint — per the production design's own explanation for why
@@ -84,12 +106,15 @@ final class DeviceViewPage {
             + "</style>"
             + "</head><body>"
             + "<div id=\"rig\">"
-            + "<div id=\"bar\"></div>"
+            + "<div id=\"frame\">"
+            + "<div class=\"rivet\" id=\"r1\"></div><div class=\"rivet\" id=\"r2\"></div>"
+            + "<div class=\"rivet\" id=\"r3\"></div><div class=\"rivet\" id=\"r4\"></div>"
+            + "</div>"
             + "<div id=\"eyes\" style=\"display:flex;position:relative\">"
-            + "<div class=\"eye-mount\"><div class=\"eye\"><div class=\"lens\"><div class=\"glint\">"
-            + "</div></div></div></div>"
-            + "<div class=\"eye-mount\"><div class=\"eye\"><div class=\"lens\"><div class=\"glint\">"
-            + "</div></div></div></div>"
+            + "<div class=\"socket\"><div class=\"eye-mount\"><div class=\"eye\"><div class=\"lens\">"
+            + "<div class=\"glint\"></div></div></div></div></div>"
+            + "<div class=\"socket\"><div class=\"eye-mount\"><div class=\"eye\"><div class=\"lens\">"
+            + "<div class=\"glint\"></div></div></div></div></div>"
             + "</div>"
             + "</div>"
             + "<img id=\"video\" alt=\"\">"
