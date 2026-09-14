@@ -40,7 +40,9 @@ The looping startup animation a kiosk shows while it waits for the service init 
 
 ## Watchdog
 
-The kiosk-side watchdog process that keeps the unit's single-purpose screen up and reboots the unit when it observes the adb daemon running, which is why a console that depends on the OS staying up is less dependable than one caught during the preloader window.
+The kiosk-side watchdog that unconditionally disables adb access on every normal boot, and separately, on an ongoing timer, reboots the unit if it observes the adb daemon running anyway — two independent hostile actions, not one, so defeating the reboot alone does not keep adb reachable.
+
+The adb-disable runs once, early, before the reboot check starts polling, which is why a countermeasure that only defeats the reboot arrives too late to matter unless it also blocks the disable itself.
 
 ## Boot agent
 
@@ -48,7 +50,9 @@ The app that runs the root payload on every normal boot: a manifest `BOOT_COMPLE
 
 ## Neuterd
 
-The small freestanding arm64 daemon, reused from the openmiko research, that keeps the reboot no-op in place. It enters init's global mount namespace and re-applies the shadow whenever the real reboot binary reappears, so the neuter survives whatever wipes it. It exists because the mount has to be made in the namespace the watchdog actually sees.
+The small freestanding arm64 daemon, reused from the openmiko research, that keeps the watchdog's hostile actions neutered by shadowing the system commands it uses to perform them. It enters init's global mount namespace once, then continuously re-applies each shadow whenever the command it targets reverts to its real, unshadowed form, so the neuter survives whatever wipes it. It exists because the mount has to be made in the namespace the watchdog actually sees, not an app's private one.
+
+A shadow is not always a blanket no-op: it can instead filter, letting a targeted command through unchanged except for the one specific call it exists to block, which matters when the same command is also needed for legitimate purposes.
 
 ## Global mount namespace
 

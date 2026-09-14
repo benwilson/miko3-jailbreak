@@ -128,8 +128,8 @@ value the hostile write actually produces, plus a startup grace period
         ...
 ```
 
-Landed in commit `feat(bootagent): shadow /system/bin/settings to defeat
-disableADB() at the source` (888833b). Verified live: adb stayed reachable
+Landed in commit message `feat(bootagent): shadow /system/bin/settings to
+defeat disableADB() at the source`. Verified live: adb stayed reachable
 and the watched service ran normally (no crash, same pid throughout) past
 150+ seconds of uptime on a normal boot, versus dropping within 25-30
 seconds on every prior attempt.
