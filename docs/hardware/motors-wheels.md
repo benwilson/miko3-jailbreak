@@ -1,5 +1,111 @@
 # Motors / wheels — locomotion hardware control
 
+## Live-device spike test (2026-09-14, session 2): AIDL commands accepted, zero observed physical movement — likely cause found
+
+**Provenance correction first — this matters for interpreting everything below.**
+`com.miko3.launcher` and `com.miko3.mode.remotecontrol`, pulled live off the
+device this session, are **not stock Miko software**. They're this project's
+own in-development custom launcher + first "mode" app — source lives in this
+repo (`launcher/`, `mode-remote-control/`, `shared/`), plan doc at
+`docs/plans/2026-09-14-1035-feat-launcher-mode-architecture-plan.md`
+("Launcher Mode Architecture"). An earlier pass this session wrongly
+described `com.miko3.mode.remotecontrol` as "a shipped Miko feature" — that
+was wrong; the naming similarity to the vendor's `com.miko.*` packages
+(`com.miko.launcher_app`, `com.miko.mikoplus`) is coincidental/thematic, not
+evidence of vendor origin. The underlying motor-command **protocol** it
+drives (`GameControllerAIDL.GameEvent()`, code 135, the `mx` JSON shape) is
+still the real, vendor-original `com.example.root.serviceexam` channel
+documented elsewhere in this file — only the calling app's provenance was
+misattributed.
+
+### `DriveLeaseService` (`com.miko3.launcher`) — confirmed from live source
+
+Server-side arbitration coordinator for the drive channel, not previously
+documented: lease TTL 2250ms, checked every 500ms; holder death tracked via
+`IBinder.linkToDeath` so a crashed client auto-releases. On any release path
+(clean `release()`, TTL expiry, or binder death) the service itself
+independently calls `RobotControlClient.stop()` — a second, server-side
+safety net layered on top of the drive-client's own 750ms local command
+watchdog. Two independent fail-safes, not one.
+
+### `game_robot_maker.apk` ruled out (closes an old open question, negatively)
+
+Pulled and decompiled (`es.monkimun.game_robot_maker`) — this is an
+unrelated kids' game from the same Spanish studio that made
+`bathroom_game`/`game_pastry_maker`/etc., also bundled on this device. Zero
+references to `MotionMsg`/`HeadMsg`/`GameControllerAIDL`/any hardware class.
+The "highest-value next step" flagged in the section below was a dead end;
+don't re-open it in a future pass.
+
+### Live spike test battery: command accepted, zero physical movement observed (human-witnessed)
+
+Six attempts sent via `com.miko3.mode.remotecontrol`'s `/drive` endpoint
+(which reaches ServiceExam through the exact AIDL chain documented below),
+directly witnessed by the device's owner watching the physical unit — not
+inferred from a camera-frame diff, which an earlier attempt this session
+over-trusted (a rotation command's camera view shifted between two frames;
+that was wrongly called "confirmed" movement before a human witness was
+available — retract that claim, see below):
+
+| ID | Params | Result |
+|---|---|---|
+| ROT-1 | `angular=20`, ~1.5s | No movement observed |
+| LIN-1b | `linear=20`, ~1.5s | No movement observed |
+| LIN-2 | `linear=100`, ~2s (large magnitude) | No movement observed |
+| LIN-3 | `linear=-100`, ~2s (backward, large magnitude) | No movement observed |
+| ARC-1 | `linear=60,angular=30` combined | No movement observed |
+
+Every command returned `HTTP 200`/`"ok"` — the full app→AIDL→ServiceExam
+chain completes without error every time. The robot was free-standing (not
+docked/cradled) for all of this, ruling out the "blocked by a charging dock"
+explanation. **This is a clean, controlled negative result across the full
+parameter range tried (small/large, forward/back, rotate, combined) — not
+one failed attempt.**
+
+### Leading hypothesis: `bluetooth_flag` gate silently no-ops the hardware write
+
+`SocialInteraction_SpeechChat.SendData(byte[], boolean)`
+(`tools/serviceexam_jadx/sources/com/common_source/emotix/interaction/interaction/SocialInteraction_SpeechChat.java:2465-2509`)
+is the terminal call of the confirmed-live motion chain (see "The real
+motion channel" section below) — `sensorModule.writeUART(bArr)` only runs
+**inside** `if (this.uinterface.bluetooth_flag) { ... }`. That field defaults
+`true` (`AndroidUnityInterface.java:182`), but `RobotConnectCallback(int)`
+(`SocialInteraction_SpeechChat.java:2871-2913`) sets it permanently `false`
+for the remainder of that boot if the peripheral motor-board's own
+connection handshake reports failure more than twice
+(`"ROBOT_CONNECTION_FAILURE3"` / `Log.e(TAG, "connection error >2")` at line
+2912). If that's what happened at this boot, every subsequent `writeUART()`
+call — motion, head, RGB, everything — becomes a **silent no-op**: no
+exception surfaces to the AIDL caller, no error in the HTTP response,
+nothing. This exactly matches the observed pattern (clean `HTTP 200`s, zero
+physical effect).
+
+**Despite the name, this is not actually about Bluetooth/networking, and not
+about how the operator is connected.** `com.miko.app_bluetooth.*`/
+`TransportLayer` (see "Transport" section below) is a generic transport
+abstraction that backs onto a **wired UART** on this hardware (`/dev/ttyS2`)
+— the class names are inherited from an earlier hardware generation that
+apparently used real Bluetooth for this link. `bluetooth_flag` gates
+ServiceExam's own **internal** connection from the main SoC to the separate
+motor-controller peripheral board, established automatically at boot,
+regardless of whether the app issuing a drive command is local, remote, the
+stock vendor app, or this project's own client. Being "connected locally"
+does not route around this gate — it was never a networking gate.
+
+**Not yet confirmed** — this is the leading hypothesis, not a settled
+finding. The actual boot-time `RobotConnectCallback`/`"connection error"`
+log lines from this session's reboot were already evicted from the logcat
+ring buffer by `SECURITY_MONITOR`'s own noisy `ps -ef` dump (fires every 2s)
+before they could be captured. Logcat has been cleared and a live filtered
+watch armed for the next reboot (whenever it happens) to catch
+`RobotConnectCallback`'s actual argument and settle this definitively. If
+confirmed, the next question is *why* the handshake fails on this
+particular unit/state — a wiring/pairing issue specific to this hardware
+revision, a side effect of the rooted/modified boot state, or something
+else — not yet investigated.
+
+---
+
 ## CORRECTION / major update (2026-09-14, ServiceExam AIDL-dispatch pass)
 
 **The "no motor/wheel code exists" headline finding below is superseded for
