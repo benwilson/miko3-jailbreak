@@ -196,13 +196,27 @@ def stage_assets(asset_sources, build_dir):
     return merged if found_any else None
 
 
-def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None):
+def compile_resources(bt, res_dir, build_dir):
+    """Compile an app's res/ directory (e.g. res/xml/network_security_config.xml)
+    into a flat archive aapt2 link can consume via -R. Returns None if res_dir
+    is absent or empty — most of this repo's apps have no res/ at all yet."""
+    res_dir = Path(res_dir)
+    if not res_dir.exists() or not any(res_dir.rglob("*.xml")):
+        return None
+    compiled = build_dir / "compiled_res.zip"
+    run([bt / "aapt2", "compile", "--dir", str(res_dir), "-o", str(compiled)])
+    return compiled
+
+
+def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None, res_zip=None):
     print("== 2/4 aapt2 link + add dex ==")
     unsigned = build_dir / "unsigned.apk"
     cmd = [bt / "aapt2", "link", "-I", str(android_jar), "--manifest", str(manifest),
            "--min-sdk-version", "28", "--target-sdk-version", "28", "-o", str(unsigned)]
     if assets_dir is not None:
         cmd += ["-A", str(assets_dir)]
+    if res_zip is not None:
+        cmd += ["-R", str(res_zip)]
     run(cmd)
     withdex = build_dir / "withdex.apk"
     shutil.copy(unsigned, withdex)
@@ -248,10 +262,11 @@ def sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore
 
 def build_apk(src_dirs, manifest, android_jar, javac, bt, keytool, java_home_dir,
               build_dir, keystore, keystore_alias, keystore_pass, keystore_cn,
-              apk_out, asset_sources=None):
-    """Full pipeline: compile_java -> stage_assets -> link_and_pack -> sign."""
+              apk_out, asset_sources=None, res_dir=None):
+    """Full pipeline: compile_java -> stage_assets -> compile_resources -> link_and_pack -> sign."""
     compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir)
     assets_dir = stage_assets(asset_sources, build_dir) if asset_sources else None
-    withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir)
+    res_zip = compile_resources(bt, res_dir, build_dir) if res_dir else None
+    withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip)
     sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore_pass,
          keystore_cn, build_dir, apk_out)

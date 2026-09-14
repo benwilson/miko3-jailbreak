@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Miko 3 remote-control/telepresence mode — combined per the launcher-mode
+     plan's Key Decisions (share the same camera/mic/drive plumbing; only
+     toggle defaults differ). Launched by the launcher via explicit Intent
+     (not HOME) and returns control to it on exit. See
+     docs/plans/2026-09-14-1035-feat-launcher-mode-architecture-plan.md. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.miko3.mode.remotecontrol"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>
+
+    <application
+        android:label="Miko3 Remote Control"
+        android:name=".ModeApp"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:allowBackup="false">
+
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

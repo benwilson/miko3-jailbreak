@@ -27,6 +27,7 @@ REPO = Path(__file__).resolve().parent.parent
 APP_DIR = REPO / "mode-remote-control"
 SHARED_DIR = REPO / "shared"
 SRC = APP_DIR / "src"
+RES = APP_DIR / "res"
 SHARED_SRC = SHARED_DIR / "src"
 SHARED_ASSETS = SHARED_DIR / "assets"
 MANIFEST = APP_DIR / "AndroidManifest.xml"
@@ -61,6 +62,7 @@ def main():
         keystore_cn=KEYSTORE_CN,
         apk_out=APK,
         asset_sources=[SHARED_ASSETS],
+        res_dir=RES,
     )
     print(f"\n== 4/4 BUILT: {APK.relative_to(REPO)} ({APK.stat().st_size} bytes) ==")
     return 0
