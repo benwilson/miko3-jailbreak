@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Miko 3 custom launcher — proof of concept.
      Replaces the stock home app (com.miko.launcher_app) as the default HOME
-     activity. Shows basic device info on-screen and serves the same info as
-     a read-only web page over Wi-Fi (see InfoHttpServer). Also offers basic
-     Wi-Fi connect/disconnect/forget, since the stock kiosk UI has no
-     reachable Wi-Fi settings screen and the device may not be on a network
-     at all otherwise.
+     activity. Serves a single page (device info + Wi-Fi management) over
+     Wi-Fi, rendered through the same on-device WebView + Pico.css approach
+     as modes (R8/R11) — see LauncherApp/WifiHttpHandler/LauncherPage. Also
+     offers basic Wi-Fi connect/disconnect/forget, since the stock kiosk UI
+     has no reachable Wi-Fi settings screen and the device may not be on a
+     network at all otherwise.
      Install/restore: scripts/install-custom-launcher.py,
      scripts/restore-stock-launcher.py. See launcher/README.md. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -22,6 +23,7 @@
     <application
         android:label="Miko3 Launcher"
         android:name=".LauncherApp"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:allowBackup="false">
 
         <activity android:name=".MainActivity" android:exported="true">

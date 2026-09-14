@@ -24,6 +24,17 @@ public final class HttpResponse {
         sendBytes(status, statusText, contentType, bytes);
     }
 
+    /** A 302 redirect — the get-then-redirect-to-"/" pattern the launcher's Wi-Fi
+     * action routes use so a reload always shows freshly re-read WifiManager state. */
+    public void redirect(String location) throws IOException {
+        String headers = "HTTP/1.0 302 Found\r\n"
+                + "Location: " + location + "\r\n"
+                + "Connection: close\r\n\r\n";
+        out.write(headers.getBytes(StandardCharsets.US_ASCII));
+        out.flush();
+        headersSent = true;
+    }
+
     public void sendBytes(int status, String statusText, String contentType, byte[] body) throws IOException {
         StringBuilder headers = new StringBuilder();
         headers.append("HTTP/1.0 ").append(status).append(' ').append(statusText).append("\r\n");
