@@ -7,7 +7,6 @@ import android.content.ServiceConnection;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
-import android.os.Looper;
 import android.os.RemoteException;
 import android.util.Log;
 
@@ -43,7 +42,15 @@ final class DriveController {
 
     private final Context context;
     private final String clientId;
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    // Confirmed live: on the main Looper, the lease renew loop (scheduled every
+    // RENEW_INTERVAL_MS, needing to beat the coordinator's ~2.25s TTL) could miss
+    // that window under real system load (camera capture, WebView, everything else
+    // competing for main-thread time) -- the coordinator then revokes the lease
+    // outright, surfacing as driving working briefly then stopping completely
+    // ("drive lease not held"), not just getting rougher. A dedicated thread means
+    // this timing no longer depends on how busy the UI thread happens to be.
+    private final android.os.HandlerThread handlerThread = new android.os.HandlerThread("drive-controller");
+    private final Handler handler;
     private final IBinder deathToken = new Binder();
     private final ErrorListener errorListener;
 
@@ -122,6 +129,8 @@ final class DriveController {
         this.context = context.getApplicationContext();
         this.clientId = clientId;
         this.errorListener = errorListener;
+        handlerThread.start();
+        handler = new Handler(handlerThread.getLooper());
     }
 
     void start() {
@@ -291,5 +300,6 @@ final class DriveController {
         if (robotClient != null) {
             robotClient.disconnect();
         }
+        handlerThread.quitSafely();
     }
 }
