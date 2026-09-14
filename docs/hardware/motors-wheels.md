@@ -1,5 +1,101 @@
 # Motors / wheels — locomotion hardware control
 
+## RESOLVED: forward drives correctly — root cause was a bent pin on the ToF sensor connector (2026-09-14, session 2 continued)
+
+**Closes out this entire investigation. Physical root cause found and fixed
+by the operator; forward driving confirmed working through the exact same
+software already committed this session, no further code changes needed.**
+
+The operator opened the unit and found a bent pin on the ToF/edge sensor's
+connector — a plausible, textbook explanation for a sensor that's
+electrically present enough for the firmware not to treat it as fully absent,
+but not communicating correctly: exactly the "stuck/fault, not a live
+reading" signature this session's diagnostics pointed at. After straightening
+it and rebooting:
+
+- **`TOFIR` immediately started reading real, plausible, fluctuating values**
+  (`00194` → `00201` across two live reads seconds apart) — the first time
+  this field showed anything other than the `16383` sentinel at any point
+  this entire session, including through hours of testing, physical
+  handling, and repositioning.
+- **The obstacle-flag bit alongside it flipped from `1` to `0`** (clear).
+- **A forward drive command, sent immediately after, moved the robot** —
+  operator-confirmed ("It moved forward"), with fresh positive wheel-encoder
+  ticks from a post-reboot zero baseline (`Left=0000000061,Right=0000000016`)
+  as independent corroboration, the same triangulation method (code path +
+  encoder telemetry + direct observation) used throughout this session.
+
+### Full chain, start to finish
+
+1. External AIDL drive commands got a positive low-level ack (`Motion/VEL1
+   Completion:CPL=1`) but never moved the robot → traced to a missing
+   `ACTIVE_OTHERS` state-machine handshake, fixed in
+   `RobotControlClient.java` (commit `65fdc16`) → rotation and backward
+   confirmed genuinely fixed.
+2. Forward specifically still didn't move even with that fix → traced to a
+   *second*, separate ack code (`CPL=2`, "tof and edge detection") that
+   `SocialInteraction_SpeechChat.processMotionCallback()` routes to
+   `EDGE_OBSTACLE` instead of `MOTION_COMPLETE` — a real, working
+   edge/obstacle-detection safety feature, confirmed from source, not
+   inferred.
+3. The `TOFIR` telemetry value backing that check had been frozen at a
+   suspicious sentinel (`16383` = `0x3FFF`) for the entire session,
+   including while covering the sensor by hand produced zero change —
+   strong evidence it wasn't a live reading.
+4. Physical inspection found the actual fault (bent connector pin) —
+   confirming the "faulty sensor," not "correctly detecting a real
+   obstacle" or "hardware design limitation," reading of the two
+   hypotheses this doc had narrowed it to.
+5. Fixed physically, verified working end-to-end in software with the
+   identical, already-committed drive code.
+
+No further action anticipated on the wheels/motors front — all four
+directions (forward, backward, left, right) now have a confirmed-working
+path from an external client, through `RobotControlClient`'s
+`ACTIVE_OTHERS`-primed `GameEvent(135)` calls.
+
+---
+
+## SENSOR CONFIRMED FAULTY/DISCONNECTED, NOT DETECTING A REAL OBSTACLE (2026-09-14, session 2 continued)
+
+**Closes the "is the sensor actually seeing something, or stuck" question
+left open by the section directly below — with a live physical test, not
+just log analysis.**
+
+The operator physically covered the (presumed) ToF/edge sensor window on
+the unit's front with a hand while a live watch on the `TOFIR=` telemetry
+field ran. Result: **`TOFIR=16383` did not change at all**, before, during,
+or after covering it — identical to every other reading this entire
+session. A functioning ToF sensor reads a hand placed directly against it
+as the closest possible target — the smallest representable distance, a
+dramatic change from whatever it read before. Seeing zero change under
+direct physical blocking is strong, direct evidence the sensor is not
+producing a live reading at all, confirming the "stuck/faulty/disconnected"
+reading of the two hypotheses the section below left open, over "genuinely,
+correctly sensing something every time."
+
+(Also directly confirmed in the same test: `CPL=2`/`EDGE_OBSTACLE` still
+fired for a forward command sent while the sensor was covered — consistent
+with the firmware gating on *some* signal from this sensor path regardless
+of what it currently reads, matching the fail-safe reading below.)
+
+### Practical implication
+
+This reframes the forward-block from "this hardware generation doesn't
+support forward driving" (a design limitation) to **"a fail-safe firmware
+check is currently latched on because its sensor input isn't producing
+valid data — likely a hardware fault (disconnected, damaged, or
+miswired sensor) rather than the robot correctly detecting real
+obstacles."** If that sensor gets fixed (reseated connector, sensor
+replacement, or whatever the actual physical fault turns out to be),
+forward driving may work correctly through the exact same software already
+built and committed this session (`RobotControlClient.java`'s
+`ACTIVE_OTHERS` fix) — no further code changes anticipated. Diagnosing the
+physical fault itself (open the unit, inspect the sensor and its
+connector/wiring) is outside what this session's toolchain reaches.
+
+---
+
 ## WHY FORWARD IS BLOCKED — CONFIRMED FROM CODE, NOT INFERRED (2026-09-14, session 2 continued)
 
 **Answers the question the previous section below left as inference: forward
