@@ -56,6 +56,17 @@ public class ModeApp extends Application {
     private volatile String cameraError;
     private volatile DriveController driveController;
     private volatile Runnable exitRunnable;
+    // Applies drive commands off "/drive-ws"'s own read loop (see that route's
+    // comment) — a single worker that always runs the most recently submitted
+    // command and drops anything superseded before it got to run, rather than a
+    // plain queue that would fall behind and replay stale commands late. Every
+    // "drive x y" sent while a control is held is a redundant re-assertion of the
+    // same intent anyway, so dropping a stale one costs nothing.
+    private final Object driveTaskLock = new Object();
+    private Runnable pendingDriveTask;
+    private boolean driveWorkerBusy;
+    private final java.util.concurrent.ExecutorService driveExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
     // Confirmed live: MainActivity's launchMode="singleTop" + onNewIntent()
     // reactivation means an old instance's teardown (onPause/onDestroy) can run
     // AFTER a newer instance's setup (onResume/onNewIntent's reactivation) when
@@ -208,32 +219,31 @@ public class ModeApp extends Application {
         server.websocketRoute("/drive-ws", new RoutingHttpServer.WebSocketHandler() {
             @Override
             public void handle(HttpRequest req, com.miko3.shared.WebSocketConnection ws) throws IOException {
-                String token = req.queryParam("ct", null);
-                DriveController dc = driveController;
+                final String token = req.queryParam("ct", null);
+                final DriveController dc = driveController;
                 if (dc == null || token == null) {
                     return;
                 }
                 String msg;
                 try {
                     while ((msg = ws.readText()) != null) {
-                        try {
-                            if (msg.startsWith("drive ")) {
-                                String[] parts = msg.substring(6).trim().split("\\s+");
-                                if (parts.length >= 2) {
-                                    dc.drive(token, HttpUtil.parseIntOr(parts[0], 0), HttpUtil.parseIntOr(parts[1], 0));
-                                }
-                            } else if ("stop".equals(msg)) {
-                                dc.drive(token, 0, 0);
+                        // Dispatched onto driveExecutor (coalescing — see its field
+                        // comment) rather than calling dc.drive() inline here: that call
+                        // makes a synchronous AIDL Binder call into ServiceExam, and
+                        // under this session's confirmed heavy system load that call
+                        // could itself be slow. Blocking THIS loop on it would stop
+                        // draining the socket, backing up every WS frame behind it —
+                        // exactly the "works once, then nothing for 750ms+" failure
+                        // pattern confirmed live, even though the browser kept sending
+                        // right on schedule the whole time.
+                        if (msg.startsWith("drive ")) {
+                            String[] parts = msg.substring(6).trim().split("\\s+");
+                            if (parts.length >= 2) {
+                                submitDrive(dc, token, HttpUtil.parseIntOr(parts[0], 0),
+                                        HttpUtil.parseIntOr(parts[1], 0));
                             }
-                        } catch (DriveController.StaleClientException e) {
-                            // Only reachable now if this connection's own token were somehow
-                            // empty (see DriveController.acceptsClient()'s comment) — control
-                            // is shared as of U15, so this is no longer "someone else took
-                            // over."  Kept as a defensive backstop, not an expected path.
-                            ws.sendText("conflict");
-                            break;
-                        } catch (android.os.RemoteException e) {
-                            Log.w(TAG, "drive-ws drive() failed", e);
+                        } else if ("stop".equals(msg)) {
+                            submitDrive(dc, token, 0, 0);
                         }
                     }
                 } finally {
@@ -386,6 +396,44 @@ public class ModeApp extends Application {
      * regardless) — callers there must check res.isHeadersSent() instead,
      * since a null return no longer means "stop."
      */
+    /** Coalescing dispatch for "/drive-ws" — see driveExecutor's field comment. */
+    private void submitDrive(final DriveController dc, final String token, final int linear, final int angular) {
+        synchronized (driveTaskLock) {
+            pendingDriveTask = new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        dc.drive(token, linear, angular);
+                    } catch (Exception e) {
+                        Log.w(TAG, "drive-ws drive() failed", e);
+                    }
+                }
+            };
+            if (!driveWorkerBusy) {
+                driveWorkerBusy = true;
+                driveExecutor.execute(driveWorkerLoop);
+            }
+        }
+    }
+
+    private final Runnable driveWorkerLoop = new Runnable() {
+        @Override
+        public void run() {
+            while (true) {
+                Runnable task;
+                synchronized (driveTaskLock) {
+                    task = pendingDriveTask;
+                    pendingDriveTask = null;
+                    if (task == null) {
+                        driveWorkerBusy = false;
+                        return;
+                    }
+                }
+                task.run();
+            }
+        }
+    };
+
     private DriveController authorizeClient(HttpRequest req, HttpResponse res, boolean requireReady)
             throws IOException {
         DriveController dc = driveController;
