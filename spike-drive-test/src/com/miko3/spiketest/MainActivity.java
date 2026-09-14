@@ -62,8 +62,15 @@ public class MainActivity extends Activity {
         public void init(AnalyticsAIDL analyticsAIDL, GameControllerAIDL g) {
             Log.e(TAG, "handshake complete, GameControllerAIDL obtained");
             gameController = g;
+            setStatus("CONNECTED - sending ACTIVE_OTHERS state-machine handshake");
+            try {
+                gameController.GameEvent("{\"data\":{\"122\":\"ACTIVE_OTHERS\"}}");
+                Log.e(TAG, "sent code 122 ACTIVE_OTHERS");
+            } catch (Exception e) {
+                Log.e(TAG, "ACTIVE_OTHERS send failed", e);
+            }
             setStatus("CONNECTED - firing drive sequence");
-            int base = 500;
+            int base = 1500;
             int step = 350;
             for (int i = 0; i < 6; i++) {
                 final int n = i;
