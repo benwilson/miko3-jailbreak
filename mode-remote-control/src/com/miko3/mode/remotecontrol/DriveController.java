@@ -32,11 +32,12 @@ final class DriveController {
         void onDriveError(String reason);
     }
 
-    /** Thrown by drive()/keepalive() when the request's client token is no longer the
-     * active one (R17) — checked atomically with the actual dispatch, inside the same
-     * lock, so a request that already passed a separate pre-check can't still land after
-     * a newer page load has taken over in between (confirmed reachable: ModeApp's route
-     * handlers run on RoutingHttpServer's one-thread-per-connection model). */
+    /** Thrown by drive()/keepalive() when the request carries no usable client token
+     * (missing or empty "ct" param) — see acceptsClient()'s comment: as of U15,
+     * control is shared rather than exclusive, so this is no longer thrown for a
+     * merely-not-the-most-recent token, only for a genuinely absent one. Kept as its
+     * own exception (rather than dropped) since ModeApp's routes already handle it
+     * as "reject with 409" and there's still a real, if narrower, case to reject. */
     static final class StaleClientException extends RuntimeException {
     }
 
@@ -59,7 +60,8 @@ final class DriveController {
      * where /drive and /exit can be handled by two different threads at once. */
     private final Object driveLock = new Object();
 
-    /** R17: only the most recently connected browser client's commands are honored. */
+    /** The most recently seen client token — as of U15 this is informational only
+     * (see acceptsClient()'s comment), not a gate on whose commands are honored. */
     private volatile String currentClientToken;
 
     private final ServiceConnection leaseConnection = new ServiceConnection() {
@@ -166,20 +168,25 @@ final class DriveController {
         }
     }
 
-    /** R17: called when a request arrives; returns true if it's from the active client
-     * (claiming a not-yet-seen token as the new active one, per "newer connection wins"). */
+    /** U15: R17's original "newest connection wins" exclusivity is gone, by explicit
+     * request — every one of this session's own reloads and test connections kept
+     * silently kicking out the operator's own real browser tab ("control taken by
+     * another connection"), and in practice this robot only ever has one person
+     * actually driving it at a time anyway, so the exclusivity was pure friction with
+     * no real benefit. Any request carrying a non-empty token (still required so a
+     * stray/malformed request can't drive) is accepted — control is shared, not
+     * claimed. currentClientToken is kept only so an already-connected client's own
+     * requests are recognizably "known", not to gate anyone out. */
     boolean acceptsClient(String token) {
         if (token == null || token.isEmpty()) {
             return false;
         }
-        if (currentClientToken == null) {
-            currentClientToken = token;
-            return true;
-        }
-        return currentClientToken.equals(token);
+        currentClientToken = token;
+        return true;
     }
 
-    /** A fresh page load claims control outright, superseding any previous client. */
+    /** Records the token as seen; kept for callers of the old claim-on-page-load
+     * pattern, but no longer has any gating effect — see acceptsClient()'s comment. */
     void claimClient(String token) {
         currentClientToken = token;
     }

@@ -91,8 +91,9 @@ public class ModeApp extends Application {
                 String token = Long.toHexString(tokenRandom.nextLong());
                 DriveController dc = driveController;
                 if (dc != null) {
-                    // A fresh page load is "a newer connection" (R17) — it takes over
-                    // control outright rather than waiting to be first to send a command.
+                    // No longer exclusive as of U15 (see DriveController.acceptsClient()'s
+                    // comment) — this just registers the token as known/seen so this
+                    // page's own first drive command isn't rejected for looking unfamiliar.
                     dc.claimClient(token);
                 }
                 res.sendText(200, "OK", "text/html; charset=utf-8", ModePage.buildIndexHtml(token));
@@ -225,8 +226,12 @@ public class ModeApp extends Application {
                                 dc.drive(token, 0, 0);
                             }
                         } catch (DriveController.StaleClientException e) {
+                            // Only reachable now if this connection's own token were somehow
+                            // empty (see DriveController.acceptsClient()'s comment) — control
+                            // is shared as of U15, so this is no longer "someone else took
+                            // over."  Kept as a defensive backstop, not an expected path.
                             ws.sendText("conflict");
-                            break; // a newer connection took over — nothing left for this one to do
+                            break;
                         } catch (android.os.RemoteException e) {
                             Log.w(TAG, "drive-ws drive() failed", e);
                         }
