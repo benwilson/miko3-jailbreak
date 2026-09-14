@@ -42,6 +42,11 @@ public class MainActivity extends Activity {
     private WebView webView;
     private DriveController driveController;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    // See ModeApp.bumpGeneration()'s javadoc: captured whenever this instance
+    // (re)activates, compared against ModeApp.currentGeneration() before this
+    // instance tears down shared (camera/drive) state, so a stale instance's
+    // delayed teardown can't clobber a newer instance's already-live state.
+    private long myGeneration;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -68,6 +73,8 @@ public class MainActivity extends Activity {
      * onCreate (a genuinely new instance) and, defensively, from onNewIntent (see
      * there) if this instance was reused while not currently active. */
     private void activateDriveController() {
+        ModeApp app = (ModeApp) getApplication();
+        myGeneration = app.bumpGeneration();
         String clientId = "mode-" + android.os.Process.myPid() + "-" + System.currentTimeMillis();
         driveController = new DriveController(this, clientId, new DriveController.ErrorListener() {
             @Override
@@ -76,7 +83,6 @@ public class MainActivity extends Activity {
             }
         });
         driveController.start();
-        ModeApp app = (ModeApp) getApplication();
         app.setDriveController(driveController);
         app.setExitRunnable(new Runnable() {
             @Override
@@ -119,7 +125,14 @@ public class MainActivity extends Activity {
         // if it's reused after an exit — leaving it resumed with a stale,
         // already-released controller that never gets recreated.
         driveController = null;
-        ((ModeApp) getApplication()).setDriveController(null);
+        ModeApp app = (ModeApp) getApplication();
+        // Only clear the app-wide controller if a newer instance hasn't already
+        // taken over (see ModeApp.bumpGeneration()'s javadoc) — confirmed live
+        // that without this check, rapid repeated launches could have this
+        // stale instance's exit wipe out a newer instance's already-active state.
+        if (myGeneration == app.currentGeneration()) {
+            app.setDriveController(null);
+        }
         finish();
     }
 
@@ -128,19 +141,28 @@ public class MainActivity extends Activity {
         if (driveController != null) {
             driveController.release();
         }
-        ((ModeApp) getApplication()).setDriveController(null);
+        ModeApp app = (ModeApp) getApplication();
+        if (myGeneration == app.currentGeneration()) {
+            app.setDriveController(null);
+        }
         super.onDestroy();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        ((ModeApp) getApplication()).startCamera();
+        ModeApp app = (ModeApp) getApplication();
+        if (myGeneration == app.currentGeneration()) {
+            app.startCamera();
+        }
     }
 
     @Override
     protected void onPause() {
-        ((ModeApp) getApplication()).stopCamera();
+        ModeApp app = (ModeApp) getApplication();
+        if (myGeneration == app.currentGeneration()) {
+            app.stopCamera();
+        }
         super.onPause();
     }
 

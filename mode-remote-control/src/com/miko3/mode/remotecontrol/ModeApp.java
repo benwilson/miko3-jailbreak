@@ -44,6 +44,15 @@ public class ModeApp extends Application {
     private volatile String cameraError;
     private volatile DriveController driveController;
     private volatile Runnable exitRunnable;
+    // Confirmed live: MainActivity's launchMode="singleTop" + onNewIntent()
+    // reactivation means an old instance's teardown (onPause/onDestroy) can run
+    // AFTER a newer instance's setup (onResume/onNewIntent's reactivation) when
+    // launch intents arrive in quick succession (e.g. repeated /launch-mode
+    // hits) — the old instance's teardown then wipes out the camera/drive
+    // state the new instance just established, even though it's still active.
+    // Each MainActivity captures the current generation when it (re)activates
+    // and only tears down shared state here if it's still current.
+    private volatile long generation = 0;
     private final java.util.Random tokenRandom = new java.util.Random();
     private final AudioBroadcaster audioBroadcaster = new AudioBroadcaster();
     private MicCapture micCapture;
@@ -322,7 +331,28 @@ public class ModeApp extends Application {
         return dc;
     }
 
+    /** Bumps and returns the new "generation" — call once whenever a
+     * MainActivity instance (re)establishes itself as the active one (its own
+     * onCreate() or onNewIntent()'s reactivation branch), then compare against
+     * currentGeneration() before tearing down camera/drive state so a stale,
+     * still-finishing older instance can't clobber a newer one's setup. */
+    long bumpGeneration() {
+        return ++generation;
+    }
+
+    long currentGeneration() {
+        return generation;
+    }
+
     void startCamera() {
+        // Guards against a leaked, still-open camera handle if this is somehow
+        // called twice without an intervening stopCamera() — the camera HAL is
+        // exclusive-access, so an unreleased prior CameraCapture here would make
+        // the new one fail with "no camera found" (confirmed live).
+        if (cameraCapture != null) {
+            cameraCapture.stop();
+            cameraCapture = null;
+        }
         cameraError = null;
         cameraCapture = new CameraCapture(this, mjpegBroadcaster, new CameraCapture.ErrorListener() {
             @Override
