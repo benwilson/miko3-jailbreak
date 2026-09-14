@@ -32,5 +32,14 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+
+        <!-- Drive-lease arbitration coordinator (R3/R13-R15, KTD3). Exported so
+             mode apps can bindService() to it by action, matching how ServiceExam's
+             own MyService is reached (KTD10). -->
+        <service android:name=".DriveLeaseService" android:exported="true">
+            <intent-filter>
+                <action android:name="com.miko3.launcher.DRIVE_LEASE"/>
+            </intent-filter>
+        </service>
     </application>
 </manifest>
