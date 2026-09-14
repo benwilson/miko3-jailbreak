@@ -73,6 +73,28 @@ static const char REB[]  = "/system/bin/reboot";
 static const char NSP[]  = "/proc/1/ns/mnt";
 static const char NOOP[] = "#!/system/bin/sh\nexit 0\n";
 
+/*
+ * 2026-09-14 extension: ServiceExam's disableADB() (SocialInteraction_
+ * SpeechChat.init(), runs unconditionally, before SecurityMonitor even
+ * starts) execs the plain shell command `settings put global adb_enabled 0`
+ * as root. /system/bin/settings on this build is itself just a 35-byte
+ * wrapper script (`#!/system/bin/sh\ncmd settings "$@"` — the real logic is
+ * in the separate `cmd` binary), so it's exactly as shadowable as `reboot`
+ * was. Unlike reboot, we don't want to block ALL settings writes — only
+ * this one specific call — so the shadow filters instead of no-opping.
+ * needs_patch() distinguishes "still the stock wrapper" from "already our
+ * filter" by checking for the `adb_enabled` marker, since both are shell
+ * scripts (no ELF-vs-script magic-byte trick like reboot's).
+ */
+static const char SET[]   = "/system/bin/settings";
+static const char NS2[]   = "/data/local/tmp/ns2";
+static const char SFILT[] =
+    "#!/system/bin/sh\n"
+    "if [ \"$1\" = \"put\" ] && [ \"$2\" = \"global\" ] && [ \"$3\" = \"adb_enabled\" ] && [ \"$4\" = \"0\" ]; then\n"
+    "exit 0\n"
+    "fi\n"
+    "exec cmd settings \"$@\"\n";
+
 /* File mode 0755 (rwxr-xr-x) as hex, to satisfy the repo's no-octal-literal rule. */
 #define MODE_0755 0x1ED
 
@@ -97,6 +119,35 @@ static int reboot_is_real(void) {
     return (unsigned char)buf[0] == 0x7f;
 }
 
+static int contains(const char *hay, long haylen, const char *needle) {
+    long nlen = (long)slen(needle);
+    for (long i = 0; i + nlen <= haylen; i++) {
+        long j = 0;
+        while (j < nlen && hay[i + j] == needle[j]) j++;
+        if (j == nlen) return 1;
+    }
+    return 0;
+}
+
+/* True if /system/bin/settings is still the stock wrapper (needs our filter applied). */
+static int settings_needs_patch(void) {
+    long fd = sys(SYS_openat, AT_FDCWD, (long)SET, O_RDONLY, 0, 0);
+    if (fd < 0) return 1;  /* can't read -> assume it needs patching (fail safe) */
+    char buf[128];
+    long r = sys(SYS_read, fd, (long)buf, sizeof(buf), 0, 0);
+    sys(SYS_close, fd, 0, 0, 0, 0);
+    if (r <= 0) return 1;
+    return !contains(buf, r, "adb_enabled");
+}
+
+static void write_sfilt(void) {
+    long fd = sys(SYS_openat, AT_FDCWD, (long)NS2, O_WRONLY | O_CREAT | O_TRUNC, MODE_0755, 0);
+    if (fd < 0) return;
+    sys(SYS_write, fd, (long)SFILT, (long)slen(SFILT), 0, 0);
+    sys(SYS_close, fd, 0, 0, 0, 0);
+    sys(SYS_fchmodat, AT_FDCWD, (long)NS2, MODE_0755, 0, 0);
+}
+
 void _start(void) {
     /* 1) enter init's (global) mount namespace, once. */
     long nsfd = sys(SYS_openat, AT_FDCWD, (long)NSP, O_RDONLY, 0, 0);
@@ -113,6 +164,10 @@ void _start(void) {
             /* bind-mount the no-op over the real reboot, in the GLOBAL ns we joined above.
              * Guarded by reboot_is_real() so we never stack duplicate mounts. */
             sys(SYS_mount, (long)NR, (long)REB, 0 /*fstype*/, MS_BIND, 0 /*data*/);
+        }
+        if (settings_needs_patch()) {
+            write_sfilt();
+            sys(SYS_mount, (long)NS2, (long)SET, 0 /*fstype*/, MS_BIND, 0 /*data*/);
         }
         sys(SYS_nanosleep, (long)&ts, 0, 0, 0, 0);
     }

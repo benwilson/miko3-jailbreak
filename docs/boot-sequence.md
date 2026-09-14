@@ -454,3 +454,93 @@ itself to keep both of ServiceExam's ADB-hostile mechanisms harmless.
 **Never kill, force-stop, or otherwise suppress ServiceExam's process** —
 doing so doesn't buy safety, it risks permanently wedging the kiosk with no
 recovery path except a physical power cycle.
+
+## 2026-09-14 — `usb1/authorized` ruled out; it's not about our adb link
+
+Checked directly from a factory-mode root shell (`ls -la
+/sys/bus/usb/devices/`, then `cat` each attribute under `usb1`):
+
+```
+usb1: idVendor=1d6b idProduct=0002 product="xHCI Host Controller"
+      manufacturer="Linux 4.14.87 xhci-hcd"
+```
+
+`1d6b:0002` is the Linux kernel's generic USB 2.0 root-hub identifier — this
+is the device's own **host-mode** controller (for USB peripherals plugged
+*into* the tablet), a completely different subsystem from the **gadget**
+function that presents this device as a peripheral to our Mac (that's
+`/config/usb_gadget/g1`, ConfigFS, confirmed present and separate). So
+`AppUtils.runCommands("echo 0 > /sys/bus/usb/devices/usb1/authorized")` in
+`SocialInteraction_SpeechChat.init()` cannot be disrupting our adb-over-USB
+link — it deauthorizes some other host-mode peripheral, unrelated to this
+investigation. The only mechanism that actually threatens the adb
+connection is the already-confirmed `disableADB()` (`settings put global
+adb_enabled 0`), which the adb-defense guard's 0.5s re-assertion loop
+already counters. The `usb1/authorized` re-assertion added to the guard loop
+out of caution is harmless but unnecessary; leaving it in costs nothing.
+
+Also worth recording since it explains an otherwise-confusing session
+detail: **the older, still-committed `RACE_SCRIPT` guard loop killed its own
+background re-assertion job (`kill $GUARD_PID`) the instant `neuterd`'s
+shadow was confirmed** — typically 10-15s into boot — long before
+`SocialInteraction_SpeechChat.init()` is reached (~28-33s, gated on
+MikoPlus's AIDL bind). That left `disableADB()`'s later, unconditional
+one-shot disable completely unopposed, which is why adb kept dropping again
+minutes after a "successful" neuter in earlier attempts this session. Fixed
+by detaching the guard loop with `setsid` and letting it run its own full
+duration (10 minutes) regardless of when the neuter lands, instead of tying
+its lifetime to that unrelated event.
+
+## 2026-09-14 — SOLVED: persistent root adb survives in kiosk mode
+
+**Confirmed live, stable at 150+ seconds uptime, kiosk running normally.**
+`settings get global adb_enabled` → `1`, `/system/bin/reboot` still the
+24-byte no-op shim, `com.example.root.serviceexam` running normally (not
+crash-looped, not killed) with its `MyService` alive.
+
+The fix: `/system/bin/settings` on this build is itself just a 35-byte
+wrapper script (`#!/system/bin/sh\ncmd settings "$@"` — confirmed by reading
+it directly; the real logic lives in the separate `cmd` binary), so it's
+exactly as shadowable as `/system/bin/reboot` was. `neuterd` (see
+`bootagent/native/neuterd.c`) now shadows **both** files via the same
+setns-into-init's-global-namespace + self-healing bind-mount mechanism:
+
+- `/system/bin/reboot` → unconditional no-op (unchanged from before) —
+  defeats `SecurityMonitor`'s reboot-on-`adbd` check.
+- `/system/bin/settings` → a **filter**, not a blanket no-op: silently
+  `exit 0`s only the exact call `put global adb_enabled 0` (matched
+  positionally on `$1 $2 $3 $4`) and `exec`s the real `cmd settings "$@"`
+  passthrough for everything else. This defeats `disableADB()` at the
+  source, surgically, without touching ServiceExam's process or any other
+  settings key.
+
+`neuterd` distinguishes "still the stock wrapper" from "already our filter"
+by checking for the `adb_enabled` substring in the first 128 bytes (both are
+shell scripts, so the ELF-vs-script magic-byte trick used for `reboot`
+doesn't apply here) — see `settings_needs_patch()` in the source.
+
+**Verified in isolation first, in factory mode** (no system_server there, so
+`cmd settings` itself always fails with "Can't find service" — expected and
+irrelevant): six manual `settings` calls (`put ... 1`, `get`, `put ... 0`,
+`get`, plus two unrelated-key calls) produced exactly one silent exit (the
+`put ... 0` call) and five passthrough attempts, each failing only on the
+missing service — confirming the filter logic itself before ever testing it
+against the real watchdog on a normal boot.
+
+**A second, self-inflicted bug found and fixed along the way:** the
+on-device guard loop that self-reboots on a *confirmed* `disableADB()` firing
+(the self-reboot mechanism from the "third correction" above, in
+`scripts/autonomous-recovery.py`'s `RACE_SCRIPT`) originally checked
+`[ "$cur" != "1" ]`. Its very first check ran immediately after the race
+launched — before `system_server`'s Settings service is reliably up this
+early in boot — so `settings get global adb_enabled` could return
+empty/error, which that condition misread as "just got disabled" and
+triggered an immediate false-positive self-reboot (observed live: cycles
+that should take ~25-30s were completing in under 15s). Fixed by requiring
+an exact `"0"` match (the literal value `disableADB()` writes) instead of
+"anything other than 1", plus a 3s startup grace delay before the first
+check.
+
+This closes out the original goal of this document and
+`docs/persistent-adb-normal-boot.md`: root adb now survives indefinitely on
+a normal boot, with the kiosk running unmodified.

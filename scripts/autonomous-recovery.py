@@ -100,21 +100,22 @@ COUNTERS = {
 _STAGE_STARTED_AT = {"t": time.time(), "stage": "init"}
 
 NSINJECT_LOCAL = os.path.join(REPO, "bootagent", "native", "nsinject")
+NEUTERD_LOCAL = os.path.join(REPO, "bootagent", "native", "neuterd")
 STAGED_CACHE_DIR = os.path.join(REPO, "scripts", "route-a-cache")
 STAGED_FILES = {
     "/data/local/tmp/nsinject": NSINJECT_LOCAL,
+    "/data/local/tmp/neuterd": NEUTERD_LOCAL,
     "/data/local/tmp/1_miko3.l": os.path.join(STAGED_CACHE_DIR, "1_miko3.l"),
     "/data/local/tmp/route_a_payload.sh": os.path.join(STAGED_CACHE_DIR, "route_a_payload.sh"),
     "/data/local/tmp/route_a_neuterd": os.path.join(STAGED_CACHE_DIR, "route_a_neuterd"),
 }
 MIN_SIZES = {
     "/data/local/tmp/nsinject": 1000,
+    "/data/local/tmp/neuterd": 500,
     "/data/local/tmp/1_miko3.l": 10,
     "/data/local/tmp/route_a_payload.sh": 100,
     "/data/local/tmp/route_a_neuterd": 500,
 }
-
-LAUNCHER_PKG = "com.miko.launcher_app"
 
 # 2026-09-14 finding (docs/boot-sequence.md): the ~30s "crash" is NOT a
 # hardware watchdog. ServiceExam v92's SecurityMonitor polls `ps -ef` for
@@ -139,30 +140,62 @@ LAUNCHER_PKG = "com.miko.launcher_app"
 # restart attempts scheduled). Neutering `reboot` and re-asserting
 # adb_enabled/sys.usb.config is sufficient on its own — ServiceExam is left
 # completely alone here now.
+#
+# 2026-09-14 second correction: this used to wait for com.miko.launcher_app's
+# pid and then run `nsinject` — the Route A trick of writing files into the
+# launcher's own private mount namespace so its privileged su-capable
+# processInstall() would (indirectly) start a neuterd for us. That's dead
+# weight now: docs/persistent-adb-normal-boot.md's later discovery is that
+# OUR OWN adb shell already has genuine root (via the factory-mode +
+# persist.sys.usb.config path this daemon itself sets up), so neuterd can be
+# launched directly, immediately, with no need to wait for any app process
+# to appear at all. Waiting on the launcher pid was pure lost time against a
+# watchdog with a zero-initial-delay first tick — confirmed live this
+# session: nsinject kept reporting rc=0 but REBOOT_NEUTERED never appeared
+# before the watchdog rebooted the device. Launching neuterd directly is the
+# same mechanism scripts/auto-persistent-adb.py's step_neuter_race already
+# proved reliable (landed on the first attempt, twice).
+#
+# 2026-09-14 third correction: re-asserting `settings put global adb_enabled
+# 1` in a loop to fight disableADB() was NOT reliable in practice — confirmed
+# live, twice, with an operator physically present to verify: adb stayed
+# down after disableADB() fired regardless of the guard loop running. Best
+# guess is the USB gadget's re-enumeration after toggling that setting takes
+# longer than our re-assertion interval, so the loop kept interrupting its
+# own recovery. Rather than keep tuning that race with no way to verify
+# results overnight (no one present to power-cycle on a bad guess), this
+# guard now does something guaranteed to make forward progress instead:
+# the moment it sees adb_enabled get forced back to 0 (disableADB() firing),
+# it deliberately reboots the device itself, via a backed-up copy of the
+# genuine reboot binary saved before neuterd shadows the canonical path
+# (`/data/local/tmp/real_reboot` — same escape-hatch idea as
+# auto-persistent-adb.py's step_backup_real_reboot, now also wired in here).
+# That reboot is caught by this same daemon's own preloader-watching loop
+# (repair_needed re-arms the instant normal boot is confirmed — see below),
+# forcing factory mode again with no human involved. Net effect: instead of
+# one attempt per human-triggered power cycle, this runs an unattended
+# fresh-attempt loop roughly every 30-40s, forever, until something actually
+# keeps adb up past this point.
 RACE_SCRIPT = r'''
-(
-  for i in $(seq 1 600); do
-    settings put global adb_enabled 1 2>/dev/null
-    case "$(getprop sys.usb.config)" in
-      adb) : ;;
-      *) setprop sys.usb.config adb 2>/dev/null ;;
-    esac
-    sleep 0.5
-  done
-) &
-GUARD_PID=$!
+[ -s /data/local/tmp/real_reboot ] || cp /system/bin/reboot /data/local/tmp/real_reboot
+chmod 755 /data/local/tmp/real_reboot 2>/dev/null
 
-P=""
-for i in $(seq 1 6000); do
-  P=$(pidof ''' + LAUNCHER_PKG + r''' 2>/dev/null)
-  [ -n "$P" ] && break
-done
-echo "RACE pid=$P iter=$i uptime=$(cat /proc/uptime)"
-if [ -n "$P" ]; then
-  echo "$P" > /data/local/tmp/nsinject_pid
-  /data/local/tmp/nsinject
-  echo "RACE nsinject_rc=$? uptime=$(cat /proc/uptime)"
-fi
+setsid /data/local/tmp/neuterd </dev/null >/data/local/tmp/neuterd.log 2>&1 &
+echo "RACE neuterd_launch_rc=$? uptime=$(cat /proc/uptime)"
+
+setsid sh -c '
+  sleep 3
+  for i in $(seq 1 300); do
+    cur=$(settings get global adb_enabled 2>/dev/null)
+    if [ "$cur" = "0" ]; then
+      echo "$(date +%s) adb_enabled=$cur -- disableADB fired, self-rebooting via real_reboot" >> /data/local/tmp/adb_guard.log
+      /data/local/tmp/real_reboot
+      exit 0
+    fi
+    sleep 1
+  done
+' </dev/null >/data/local/tmp/adb_guard_stdout.log 2>&1 &
+echo "RACE guard_launch_rc=$? uptime=$(cat /proc/uptime)"
 
 for i in $(seq 1 25); do
   sleep 1
@@ -173,7 +206,6 @@ for i in $(seq 1 25); do
   fi
 done
 
-kill $GUARD_PID 2>/dev/null
 echo "RACE_DONE uptime=$(cat /proc/uptime)"
 '''
 
@@ -470,18 +502,13 @@ def handle_factory_mode(serial, work_dir):
 
 
 def _parse_race_output(out: str) -> dict:
-    """Pull pid/iter/uptime and nsinject_rc out of RACE_SCRIPT's stdout for
-    structured logging (how many pidof iterations before the pid appeared,
-    what uptime that was at, whether nsinject itself reported success)."""
+    """Pull neuterd_launch_rc/uptime out of RACE_SCRIPT's stdout for
+    structured logging (whether the direct `setsid neuterd &` launch itself
+    reported success, and at what device uptime)."""
     fields = {}
     for line in out.splitlines():
         line = line.strip()
-        if line.startswith("RACE pid="):
-            for tok in line.split():
-                if "=" in tok:
-                    k, v = tok.split("=", 1)
-                    fields[k] = v
-        elif line.startswith("RACE nsinject_rc="):
+        if line.startswith("RACE neuterd_launch_rc="):
             for tok in line.split():
                 if "=" in tok:
                     k, v = tok.split("=", 1)
@@ -501,7 +528,7 @@ def do_race(serial):
         log(f"  race stderr: {err.strip()}")
 
     race_fields = _parse_race_output(out)
-    if not race_fields.get("pid"):
+    if not race_fields.get("neuterd_launch_rc"):
         COUNTERS["race_no_pid_found"] += 1
     log_event("race_attempt", serial=serial, race_wall_s=race_wall_s,
                adb_rc=rc, stderr=err.strip()[:500], **race_fields)
@@ -623,6 +650,13 @@ def main():
                     stage = "factory"
                 rebooted = handle_factory_mode(serial, work_dir)
                 if rebooted:
+                    # 2026-09-14: disarm for exactly this one transition. The
+                    # reboot we just triggered ourselves has to be allowed to
+                    # pass through the preloader stage uncontested or it can
+                    # never reach normal boot at all — re-forcing FACTFACT on
+                    # our own deliberate reboot would loop forever in factory
+                    # mode. re-armed the instant normal boot is confirmed
+                    # below, so this window covers only this one pass-through.
                     repair_needed = False
                     if once:
                         log("--once specified, exiting after factory-mode reboot")
@@ -638,14 +672,30 @@ def main():
                 log(f"device {serial} present, bootmode='{bootmode}'")
                 enter_stage("normal", serial=serial, bootmode=bootmode)
                 stage = "normal"
+                # Re-arm immediately: the one deliberate pass-through is used
+                # up the moment we confirm we're actually on a normal boot.
+                # Any reboot from here on — watchdog, crash, anything — gets
+                # caught at the next preloader sighting and forced back to
+                # factory mode, with no one present to power-cycle instead.
+                repair_needed = True
 
             if not raced_this_cycle:
                 raced_this_cycle = True
                 success = do_race(serial)
                 if success:
-                    log("SUCCESS CONDITION MET — stopping daemon")
-                    log_summary()
-                    return
+                    # 2026-09-14: do NOT stop here. A neutered `reboot` only
+                    # defeats SecurityMonitor; it does nothing about
+                    # disableADB() (unconditional, fires later in
+                    # ServiceExam's init() once it reaches that point) or the
+                    # unconfirmed usb1/authorized deauth line. Both can drop
+                    # adb — or the whole USB link — with no reboot at all,
+                    # invisibly to this check. With no one present to
+                    # power-cycle on a bad outcome, this daemon must keep
+                    # watching for the rest of the session so it can force
+                    # factory mode again the moment it sees anything go
+                    # wrong, rather than declaring victory and exiting.
+                    log("neuter confirmed — continuing to watch (not exiting; "
+                        "disableADB()/usb-deauth can still drop adb later this boot)")
                 if once:
                     log("--once specified, exiting after first race")
                     log_summary()
