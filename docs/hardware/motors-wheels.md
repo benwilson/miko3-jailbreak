@@ -1,5 +1,95 @@
 # Motors / wheels — locomotion hardware control
 
+## WHY FORWARD IS BLOCKED — CONFIRMED FROM CODE, NOT INFERRED (2026-09-14, session 2 continued)
+
+**Answers the question the previous section below left as inference: forward
+is blocked by the robot's own edge/obstacle-detection safety system, and
+this is now confirmed directly from the actual protocol-handler code, not
+guessed from correlation.**
+
+### The signal that was missing: a third `CPL=` ack type
+
+All along, `D/ack` log lines carried more than the `Motion/VEL1
+Completion:CPL=1` this doc's earlier sections tracked — a **second, distinct
+ack line appears specifically during forward attempts and never during
+backward**:
+```
+D/ack: Motion/VEL1 Completion:CPL=1
+D/ack: tof and edge detectionCPL=2        <-- only seen with linear>0 commands
+```
+Direct comparison across this session's own capture files: the isolated
+forward test (`forward_isolated.log`, `forward_large.log`) shows `CPL=2`
+lines interleaved with every attempt; the isolated backward test
+(`backward_test.log`) shows **zero** — clean `CPL=1` only. The earlier pure
+rotation test (`active_others_test2.log`, 13:57:33–36 window) also shows
+zero — `CPL=2` only starts appearing in that same continuous capture once a
+later, forward-containing test phase begins.
+
+### The exact handler, `SocialInteraction_SpeechChat.processMotionCallback()` (`:3623-3736`)
+
+Parses the MCU's `CPL=` suffix into a switch:
+
+```java
+case 2:  // "CPL=2"
+    Log.d("ack", "tof and edge detection" + str);
+    this.cpl = true;
+    this.uinterface.sendMotionCallback("EDGE_OBSTACLE");
+    this.uinterface.sendEvent(AndroidUnityInterface.MOTION_PLAY, str, false);
+    // ...MixPanel "Obstacle Detected" analytics event...
+    APIS.dynamic_analytics_api1(TAG, "EDGE_DETECTED");
+    motionCompleteCallback(2);   // note: NOT the same code path as real success
+    break;
+```
+Compare to the success path, `case 1` ("CPL=1"): `sendMotionCallback("MOTION_COMPLETE")` /
+`motionCompleteCallback(-1)` (or `"LOW_BATTERY"`/`"CHARGER_CONNECTED"` variants
+if those specific conditions apply instead). **`CPL=2` never reaches
+`MOTION_COMPLETE`** — it's a structurally different, blocked outcome, not a
+slower version of success.
+
+For completeness, the full status-code set this method handles, all
+confirmed from the same switch: `CPL=1` motion completed, `CPL=2` edge/
+obstacle detected (motion refused), `CPL=3` charger connected (motion
+stopped), `CPL=4` motor stall detected (motion stopped), `CPL=5`/`CPL=H`/
+`CPL=9` head-motion-completion variants. This is a real, fairly complete
+safety/status protocol the peripheral MCU implements — edge/obstacle
+detection is one deliberate case among several (alongside stall detection
+and charger-safety), not a leftover or a bug.
+
+### What this means
+
+**Forward is refused by a genuine, working, intentional safety feature —
+the robot's own edge/obstacle detection — not a missing capability, a
+software bug, or a state-machine gate.** The MCU receives and structurally
+accepts every forward `VEL1` frame this session (matching the always-present
+`Motion/VEL1 Completion:CPL=1`-shaped initial ack), but its own onboard
+sensor check vetoes actually completing the motion and reports back `CPL=2`
+instead, which ServiceExam turns into `EDGE_OBSTACLE` — mirroring almost
+exactly what the never-changing `TOFIR=16383` telemetry value (documented
+earlier in this file) already suggested: the ToF/edge sensor is reporting
+something the firmware treats as "edge or obstacle ahead," continuously,
+every single time, regardless of the room's actual layout at each test.
+
+**Two live hypotheses for *why* the sensor reads this way, neither confirmed
+this session** (would need physical inspection, not further decompilation):
+1. The sensor is genuinely working and correctly detecting something in its
+   field of view every time (an actual edge, a nearby object, or the unit's
+   own chassis/mounting obstructing its view) that this session's various
+   physical positions on a desk never happened to clear.
+2. The sensor itself (or its `SensorModule`/UART data path) has a fault and
+   is stuck reporting a sentinel/error value that the firmware conservatively
+   treats as "assume danger" — `16383` (`0x3FFF`) never fluctuating even
+   slightly, across every test all session including ones with real
+   confirmed physical movement, is at least as consistent with "stuck/no
+   signal" as with "genuinely sensing an obstacle every time."
+
+**Deliberately not attempted this session**: bypassing or spoofing this
+check in software. It's a real collision/fall-avoidance safety system on a
+device marketed for children; disabling it to force forward motion is a
+different, materially riskier kind of change than anything else done this
+session, and wasn't asked for.
+
+---
+
 ## FINAL PICTURE THIS SESSION: forward is asymmetrically, specifically blocked — likely a deliberate firmware safety restriction, not a bug (2026-09-14, session 2 continued)
 
 **Closes out this session's forward-direction investigation.** With the
