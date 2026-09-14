@@ -12,6 +12,8 @@ import java.net.Socket;
 import java.util.HashMap;
 import java.util.Map;
 
+import javax.net.ssl.SSLContext;
+
 /**
  * A small routing HTTP/1.0 server, originally factored out of the mode
  * app's first hand-rolled server (which itself extended launcher's
@@ -25,6 +27,21 @@ import java.util.Map;
  * Deliberately narrow: no keep-alive, no gzip, minimal header parsing.
  * Every route handler is registered up front; unmatched paths get a
  * plain 404.
+ *
+ * Can additionally serve the exact same routes over TLS — call {@link
+ * #startHttps} with an {@link SSLContext} from {@link
+ * HttpsSupport#loadServerContext} after registering routes and before/after
+ * starting the primary {@code run()} thread, on a second port, from a
+ * second daemon thread this method spawns itself. Needed so `getUserMedia`
+ * (operator webcam capture, see mode-remote-control's ToggleSection) has a
+ * secure context once the robot is reached over a real WiFi IP instead of
+ * the http://127.0.0.1 adb-tunnel loopback exception — plain HTTP to a LAN
+ * IP does not qualify as secure, self-signed HTTPS does (once the
+ * browser's certificate warning is accepted). Both listeners share this
+ * instance's one `routes` map and `handle()` dispatch — {@link
+ * javax.net.ssl.SSLServerSocket} extends {@link ServerSocket}, so the same
+ * accept-loop shape and {@code Socket}-based `handle()` work unchanged for
+ * either.
  */
 public final class RoutingHttpServer implements Runnable {
     private static final String TAG = "RoutingHttpServer";
@@ -38,6 +55,10 @@ public final class RoutingHttpServer implements Runnable {
     private final Map<String, RouteHandler> routes = new HashMap<String, RouteHandler>();
     private volatile boolean running = true;
     private volatile ServerSocket serverSocket;
+    private volatile ServerSocket httpsServerSocket;
+    /** Set by startHttps(); &gt; 0 once HTTPS is actually up, so the plain
+     * listener knows to redirect instead of serving directly. */
+    private volatile int httpsPort = -1;
 
     public RoutingHttpServer(Context ctx, int port) {
         this.appContext = ctx.getApplicationContext();
@@ -58,6 +79,10 @@ public final class RoutingHttpServer implements Runnable {
             if (serverSocket != null) serverSocket.close();
         } catch (IOException ignored) {
         }
+        try {
+            if (httpsServerSocket != null) httpsServerSocket.close();
+        } catch (IOException ignored) {
+        }
     }
 
     @Override
@@ -65,27 +90,61 @@ public final class RoutingHttpServer implements Runnable {
         try (ServerSocket server = new ServerSocket(port)) {
             serverSocket = server;
             Log.i(TAG, "listening on port " + port);
-            while (running) {
-                try {
-                    final Socket client = server.accept();
-                    Thread t = new Thread(new Runnable() {
-                        @Override
-                        public void run() {
-                            handle(client);
-                        }
-                    }, "routing-http-conn");
-                    t.setDaemon(true);
-                    t.start();
-                } catch (IOException e) {
-                    if (running) Log.w(TAG, "accept failed", e);
-                }
-            }
+            acceptLoop(server, false);
         } catch (IOException e) {
             Log.e(TAG, "failed to start server on port " + port, e);
         }
     }
 
-    private void handle(Socket client) {
+    /**
+     * Starts a second, TLS-wrapped listener on its own daemon thread,
+     * sharing this instance's routes. Safe to call any time after
+     * construction (route registration order relative to this call doesn't
+     * matter — routes are looked up per-request, not snapshotted). Logs and
+     * returns (does not throw) if the port is already in use or the
+     * context fails to bind, since HTTPS is additive — plain HTTP already
+     * works regardless.
+     */
+    public void startHttps(final int httpsPortArg, final SSLContext sslContext) {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try (ServerSocket server = sslContext.getServerSocketFactory().createServerSocket(httpsPortArg)) {
+                    httpsServerSocket = server;
+                    // Set only once bound: if this fails (port in use, bad context), the
+                    // plain listener keeps serving directly rather than redirecting
+                    // everyone to a port nothing is actually listening on.
+                    httpsPort = httpsPortArg;
+                    Log.i(TAG, "listening on port " + httpsPortArg + " (https)");
+                    acceptLoop(server, true);
+                } catch (IOException e) {
+                    Log.e(TAG, "failed to start HTTPS server on port " + httpsPortArg, e);
+                }
+            }
+        }, "routing-https-server");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void acceptLoop(ServerSocket server, final boolean isTls) {
+        while (running) {
+            try {
+                final Socket client = server.accept();
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        handle(client, isTls);
+                    }
+                }, "routing-http-conn");
+                t.setDaemon(true);
+                t.start();
+            } catch (IOException e) {
+                if (running) Log.w(TAG, "accept failed", e);
+            }
+        }
+    }
+
+    private void handle(Socket client, boolean isTls) {
         try {
             client.setSoTimeout(30000);
             InputStream rawIn = new BufferedInputStream(client.getInputStream());
@@ -120,10 +179,29 @@ public final class RoutingHttpServer implements Runnable {
                 }
             }
 
-            InputStream body = bodyStream(rawIn, headers);
-            HttpRequest req = new HttpRequest(method, path, HttpRequest.parseQuery(queryString), headers, body);
             OutputStream out = client.getOutputStream();
             HttpResponse res = new HttpResponse(out);
+
+            // Once HTTPS is actually up, the plain listener only ever redirects —
+            // never serves content directly — so getUserMedia (which requires a
+            // secure context) always ends up used from an https:// origin, not a
+            // page that happened to load over http:// this one time. Uses the
+            // request's own Host header (host:port as the client sent it) rather
+            // than a hardcoded hostname, since the robot's WiFi IP isn't known at
+            // build time; strips any :port suffix and substitutes the HTTPS one.
+            if (!isTls && httpsPort > 0) {
+                String host = headers.get("host");
+                if (host != null) {
+                    int colon = host.indexOf(':');
+                    if (colon >= 0) host = host.substring(0, colon);
+                    res.redirect("https://" + host + ":" + httpsPort + rawPath);
+                    client.close();
+                    return;
+                }
+            }
+
+            InputStream body = bodyStream(rawIn, headers);
+            HttpRequest req = new HttpRequest(method, path, HttpRequest.parseQuery(queryString), headers, body);
 
             RouteHandler handler = routes.get(path);
             if (handler == null) {

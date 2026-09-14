@@ -13,6 +13,7 @@ import android.util.Log;
 import com.miko3.shared.DriveLease;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
+import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.HttpUtil;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RoutingHttpServer;
@@ -35,6 +36,7 @@ import java.io.IOException;
 public class LauncherApp extends Application {
     private static final String TAG = "LauncherApp";
     static final int PORT = 8080;
+    static final int HTTPS_PORT = 8443;
 
     // The one mode that exists today (U10). A future second mode needs a real
     // registry mapping lease-holder clientId -> package/Activity; not built
@@ -156,6 +158,16 @@ public class LauncherApp extends Application {
         Thread t = new Thread(server, "launcher-http-server");
         t.setDaemon(true);
         t.start();
+
+        // See mode-remote-control/ModeApp's identical block for why: getUserMedia
+        // needs a secure context, which plain HTTP to a WiFi LAN IP doesn't
+        // qualify as. Once bound, the plain listener above starts redirecting here.
+        javax.net.ssl.SSLContext httpsContext = HttpsSupport.loadServerContext(this);
+        if (httpsContext != null) {
+            server.startHttps(HTTPS_PORT, httpsContext);
+        } else {
+            Log.w(TAG, "HTTPS certificate failed to load — serving plain HTTP only");
+        }
 
         // Binds to (and so creates) DriveLeaseService itself, via bindService()
         // rather than startService(): Application.onCreate() is not guaranteed to

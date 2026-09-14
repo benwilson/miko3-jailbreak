@@ -5,6 +5,7 @@ import android.util.Log;
 
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
+import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.HttpUtil;
 import com.miko3.shared.RoutingHttpServer;
 
@@ -22,6 +23,7 @@ import java.io.OutputStream;
 public class ModeApp extends Application {
     private static final String TAG = "ModeApp";
     static final int PORT = 8090;
+    static final int HTTPS_PORT = 8453;
 
     private RoutingHttpServer server;
     private final MjpegBroadcaster mjpegBroadcaster = new MjpegBroadcaster();
@@ -259,6 +261,18 @@ public class ModeApp extends Application {
         Thread t = new Thread(server, "mode-http-server");
         t.setDaemon(true);
         t.start();
+
+        // getUserMedia (operator webcam capture) needs a secure context once this
+        // page is reached over the robot's real WiFi IP rather than the
+        // http://127.0.0.1 adb-tunnel loopback exception. The plain HTTP listener
+        // above starts redirecting to this the moment it's actually bound (see
+        // RoutingHttpServer.startHttps's javadoc).
+        javax.net.ssl.SSLContext httpsContext = HttpsSupport.loadServerContext(this);
+        if (httpsContext != null) {
+            server.startHttps(HTTPS_PORT, httpsContext);
+        } else {
+            Log.w(TAG, "HTTPS certificate failed to load — serving plain HTTP only");
+        }
     }
 
     RoutingHttpServer server() {
