@@ -1,5 +1,69 @@
 # Motors / wheels — locomotion hardware control
 
+## ROOT CAUSE FOUND (2026-09-14, session 2 continued): malformed AIDL envelope in this project's own client code — not a hardware limitation
+
+**Supersedes the `bluetooth_flag` hypothesis in the section directly below (kept for the record, but ruled out) and explains the full negative spike-test battery.**
+
+Captured ServiceExam's own logcat (filtered to its PID) live during a real
+`/drive` attempt from `com.miko3.mode.remotecontrol`. Two findings, in order:
+
+1. **`RobotConnectCallback`'s peripheral-board handshake succeeds** (`connection successful112 0`, the `i==0` branch) on this boot — `bluetooth_flag` stays at its default `true`. The earlier hypothesis (gate closed from a failed handshake) is **ruled out**.
+2. **The AIDL envelope this project's client sends is malformed**, and ServiceExam's own log shows the exact failure:
+   ```
+   E/NEWAIDL: GameEvent = {"data":{"135":{"name":"","data":"<block>...</block>","audioPath":""}}}
+   E/OMKar: In Send String{"data":{"135":{...}}}
+   E/IPC_AIDL: calling speak tts event
+   E/IPC_AIDL: The data from null
+   W/System.err: com.google.gson.JsonSyntaxException: java.lang.IllegalStateException: Expected a string but was BEGIN_OBJECT at line 1 column 17 path $.data.
+       at com.example.root.serviceexam.IPC_AIDL$4$1.run(IPC_AIDL.java:381)
+   ```
+   Traced the exact deserialization contract (`tools/serviceexam_jadx/sources/com/example/root/serviceexam/IPC_AIDL.java:193-215`,
+   `.../com/emotix/arya/required/ServiceData.java`):
+   ```java
+   // IPC_AIDL.java, GameEvent(String str) handler:
+   ServiceData serviceData = gson.fromJson(str, ServiceData.class);
+   HashMap<Integer, String> data = serviceData.getData();   // note: Map<Integer, STRING>
+   for (int code : data.keySet()) {
+       ServiceClientInterface.callEvent(code, data.get(code));  // callEvent does its own
+   }                                                             // gson.fromJson(str, ServiceRequest.class)
+   // ServiceData.java: `HashMap<Integer, String> data;` — the map VALUE must be a
+   // JSON-encoded STRING (a serialized ServiceRequest), not a nested raw object.
+   ```
+   This project's `RobotControlClient.drive()` (`shared/src/com/miko3/shared/RobotControlClient.java`)
+   currently builds `{"data":{"135": <ServiceRequest object> }}` — nesting the
+   `ServiceRequest` directly. It needs to be `{"data":{"135": "<ServiceRequest serialized to a JSON string>" }}`
+   — double-encoded, matching what `ServiceData`/`callEvent` actually deserialize.
+   Because of this, **every drive command sent by this app since it was
+   written has failed to parse**, silently: no exception crosses the AIDL
+   boundary (it's caught and only `e.printStackTrace()`'d inside ServiceExam's
+   own process), the client sees a clean `HTTP 200`, and the malformed request
+   falls through to an unrelated default path (`"calling speak tts event"`)
+   instead of ever reaching `ServiceClientInterface.callEvent`'s real code-135
+   dispatch.
+
+**Corroborating telemetry, not just a log line**: ServiceExam's own live
+sensor stream (`SocialInteraction`'s `"PI3 callback string"`, ~10Hz,
+containing `POWER=`/`IMUAC=`/`IMUGY=`/`GLPOS=`/`TOFIR=`/`Left=`/`Right=`
+fields — `Left=`/`Right=` read as wheel-encoder counts) was captured across
+the entire multi-attempt spike-test window this session. **The `Left=`/`Right=`
+values never changed — not once, across ~6 separate drive attempts spanning
+small/large, forward/back, rotate, and combined arc.** That's independent,
+device-side evidence (not just "no error was thrown") that the wheels never
+actually turned during any of this session's attempts — fully consistent
+with the request never reaching real motion dispatch.
+
+**This is a bug in this project's own in-development client code, not a
+vendor firmware or hardware limitation, and not the earlier `bluetooth_flag`
+theory.** The fix is a specific, small change to how `RobotControlClient`
+serializes its AIDL payload (see above) — not investigated further this
+pass since it's active WIP code under a collaborator's edit, not something
+to patch unilaterally. Once fixed, re-run the same spike-test battery
+(`ROT-1`/`LIN-1`/`LIN-2`/`LIN-3`/`ARC-1` shapes below) with a human witness
+and/or the same live-logcat-plus-telemetry method to get a real answer to
+"does this unit have working drive wheels" — that question is **still
+open**, now for a different reason: no attempt has yet sent a
+correctly-formed command.
+
 ## Live-device spike test (2026-09-14, session 2): AIDL commands accepted, zero observed physical movement — likely cause found
 
 **Provenance correction first — this matters for interpreting everything below.**
