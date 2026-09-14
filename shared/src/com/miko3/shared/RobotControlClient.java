@@ -23,14 +23,22 @@ import java.util.Random;
 
 /**
  * Wraps ServiceExam's AIDL surface (com.example.root.serviceexam) with a
- * connect()/drive() API for robot-control modes. Reproduces
- * parseAIMLexpression() -> packData1() -> SendData() -> writeUART() by
- * sending the same motion-expression payload MikoPlus sends, over the same
- * unmodified AIDL stubs (see shared/src/com/root/aidlFiles), rather than
- * touching libmiko_drivers.so directly.
+ * connect()/drive() API for robot-control modes. Sends a GameEvent(135)
+ * motion-expression request through ServiceClientInterface.12's direct
+ * loadExpressionString(ServiceRequest.path) dispatch — a different entry
+ * point, with a different payload shape (raw JSON in .path, no XML
+ * wrapper, since loadExpressionString Gson-parses its argument directly),
+ * from parseAIMLexpression()'s XML-wrapped path that startDOAThread() uses
+ * internally. Reuses the same underlying ExpressionMsg/MotionMsg/
+ * writeUART() pipeline either way, over the same unmodified AIDL stubs
+ * (see shared/src/com/root/aidlFiles), rather than touching
+ * libmiko_drivers.so directly.
  *
  * See docs/hardware/aidl-dispatch.md (bind/init sequence) and
- * docs/hardware/motors-wheels.md (motion-expression payload, AIDL code 135).
+ * docs/hardware/motors-wheels.md's "DEFINITIVE RESULT" section (the
+ * confirmed-working payload shape, live-verified via ServiceExam's own
+ * logcat reaching the peripheral motor board with a positive completion
+ * ACK).
  */
 public class RobotControlClient {
     private static final String TAG = "RobotControlClient";
@@ -163,18 +171,46 @@ public class RobotControlClient {
         if (controller == null) {
             throw new RemoteException("not connected to ServiceExam");
         }
-        String expressionXml = buildMotionExpressionXml(linear, angular, timeCentiseconds);
+        String expressionJson = buildMotionExpressionJson(linear, angular, timeCentiseconds);
         JSONObject request = new JSONObject();
         try {
             request.put("name", "");
-            request.put("data", expressionXml);
+            // Code 135's real handler (ServiceClientInterface.12) reads
+            // ServiceRequest.path via loadExpressionString(), NOT .data — .data is
+            // read separately and, if non-empty, becomes spoken TTS text layered on
+            // top. loadExpressionString() Gson-parses its argument directly as JSON,
+            // with no XML wrapper — the "<block><expression>...</expression></block>"
+            // wrapping is only meaningful to the *other* entry point,
+            // parseAIMLexpression() (what startDOAThread() calls), which this AIDL
+            // client never reaches. Sending the payload via .data with an XML wrapper
+            // (as this method originally did) throws inside ServiceExam on both counts
+            // once the envelope-encoding bug is fixed: a NullPointerException from
+            // loadExpressionString(null) since .path was never set, or (if a
+            // placeholder .path were sent) a JsonSyntaxException from parsing text
+            // starting with '<' as JSON. .data must still be present as "" — it's
+            // read unconditionally via .length() with no null check. See
+            // docs/hardware/motors-wheels.md's "DEFINITIVE RESULT" section — this
+            // exact shape was confirmed via live ServiceExam logcat reaching the
+            // physical peripheral board with a positive CPL=1 completion ACK.
+            request.put("path", expressionJson);
+            request.put("data", "");
             request.put("audioPath", "");
         } catch (JSONException e) {
             throw new RemoteException("failed to build drive payload: " + e.getMessage());
         }
         JSONObject envelope = new JSONObject();
         try {
-            envelope.put("data", new JSONObject().put(String.valueOf(CODE_EXPRESSION_PLAYBACK), request));
+            // ServiceExam's ServiceData deserializes "data" as Map<Integer, String> — the
+            // value at each code must be a JSON-encoded STRING (a serialized ServiceRequest),
+            // not a nested raw object. Sending the JSONObject directly here previously made
+            // every drive command fail Gson deserialization silently inside ServiceExam's own
+            // process (JsonSyntaxException: "Expected a string but was BEGIN_OBJECT"): the
+            // AIDL call itself returned cleanly with no exception, so this went undetected
+            // until a live logcat capture of ServiceExam's own process caught the parse
+            // failure and corroborated it against unchanging wheel-encoder telemetry across
+            // a full multi-attempt drive-command battery. See
+            // docs/hardware/motors-wheels.md's "ROOT CAUSE FOUND" section.
+            envelope.put("data", new JSONObject().put(String.valueOf(CODE_EXPRESSION_PLAYBACK), request.toString()));
         } catch (JSONException e) {
             throw new RemoteException("failed to build drive envelope: " + e.getMessage());
         }
@@ -186,15 +222,19 @@ public class RobotControlClient {
         drive(0, 0, 10);
     }
 
-    private String buildMotionExpressionXml(int linear, int angular, int timeCentiseconds) {
+    /** Raw JSON only — no XML wrapper. loadExpressionString() (what code 135 actually
+     * calls) Gson-parses its argument directly as ExpressionMsg; the
+     * "&lt;block&gt;&lt;expression&gt;...&lt;/expression&gt;&lt;/block&gt;" wrapping some
+     * earlier analysis assumed is only meaningful to parseAIMLexpression(), a different
+     * entry point this AIDL client never reaches. */
+    private String buildMotionExpressionJson(int linear, int angular, int timeCentiseconds) {
         String mx = "{\"type\":4,\"size\":0,\"motion_type\":4,\"loop\":1,\"kp\":0,\"ki\":0,\"kd\":0,"
                 + "\"pidcontrol\":0,\"seqCount\":1,\"seq\":[{\"linear\":" + linear
                 + ",\"angular\":" + angular + ",\"time\":" + timeCentiseconds
                 + ",\"type\":1,\"id\":0}]}";
         String empty = "{\"type\":0,\"size\":0,\"loop\":0,\"seqCount\":0,\"seq\":[]}";
-        String json = "{\"tx\":" + empty + ",\"ax\":" + empty + ",\"mx\":" + mx
+        return "{\"tx\":" + empty + ",\"ax\":" + empty + ",\"mx\":" + mx
                 + ",\"ix\":{\"type\":0,\"size\":0,\"imagetype\":0,\"loop\":0,\"seqCount\":0}"
                 + ",\"rx\":" + empty + ",\"id\":" + Math.abs(idGen.nextInt(1000)) + "}";
-        return "<block>\n<expression>" + json + "</expression>\n</block>";
     }
 }
