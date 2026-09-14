@@ -40,6 +40,18 @@ public class MainActivity extends Activity {
         requestRuntimePermissionsThenLoad();
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        ((ModeApp) getApplication()).startCamera();
+    }
+
+    @Override
+    protected void onPause() {
+        ((ModeApp) getApplication()).stopCamera();
+        super.onPause();
+    }
+
     private void logWebViewCapability() {
         PackageInfo wv = WebView.getCurrentWebViewPackage();
         if (wv != null) {
