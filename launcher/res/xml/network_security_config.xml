@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- targetSdkVersion 28 blocks cleartext HTTP by default (KTD6); this app's own
+     WebView talks to its own 127.0.0.1 HTTP server and needs cleartext allowed
+     for loopback. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>
