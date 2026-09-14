@@ -202,6 +202,16 @@ final class DriveController {
                 throw new RemoteException("drive lease not held");
             }
             handler.removeCallbacks(watchdog);
+            // The "10" (centiseconds -> ~100ms) is deliberately left at the only
+            // value ever confirmed live (docs/hardware/motors-wheels.md) rather than
+            // lengthened to paper over gaps between repeated calls -- each call is
+            // its own short motion frame, not an extension of the last one, so a
+            // caller that repeats a held direction (see DriveSection.java's JS) MUST
+            // do so faster than this frame's own duration, or the robot visibly stops
+            // between frames even with every command arriving instantly (confirmed
+            // live: this, not network latency, was most of the reported "straight,
+            // jank, jank, straight" -- the old 300ms/WS-era 250ms repeat interval was
+            // already longer than this frame's ~100ms run time).
             robotClient.drive(linear, angular, 10);
             handler.postDelayed(watchdog, WATCHDOG_MS);
         }

@@ -5,15 +5,17 @@ package com.miko3.mode.remotecontrol;
  * buttons (mouse/touch) and arrow keys (U13), both driving over one persistent
  * WebSocket connection to ModeApp's "/drive-ws" route instead of a plain HTTP
  * request per command (U7's original approach) — each of those paid a fresh
- * HTTPS/TLS handshake, which over WiFi was slow enough to routinely blow past
- * the server's ~750ms watchdog and cause visible start/stop jank ("straight,
- * jank, jank, straight"). The hold-and-repeat shape is unchanged (still resends
- * the current command every 250ms while held, comfortably under the watchdog,
- * so holding a control is its own keepalive, and sends an explicit stop on
- * release) — only the transport changed, to a cheap frame over an
- * already-open socket. Plus an "Exit mode" control that releases the lease
- * and returns to the launcher (R16) — reachable without physical access to
- * the robot.
+ * HTTPS/TLS handshake, slow enough over WiFi to contribute to visible
+ * start/stop jank ("straight, jank, jank, straight"). The bigger contributor,
+ * though (see DriveController.drive()'s comment): each drive command is its
+ * own short ~100ms motor frame, not an extension of the previous one, so the
+ * repeat-while-held interval below has to stay under that or the robot
+ * visibly stops between frames regardless of transport latency — this is why
+ * it resends every 80ms now, not the original 250-300ms. Sends an explicit
+ * stop on release. Only the transport changed to a cheap WS frame over an
+ * already-open socket — the hold-and-repeat shape itself is the same as
+ * before. Plus an "Exit mode" control that releases the lease and returns to
+ * the launcher (R16) — reachable without physical access to the robot.
  */
 final class DriveSection {
     private DriveSection() {
@@ -69,7 +71,14 @@ final class DriveSection {
             + "var linear=btn.getAttribute('data-linear');"
             + "var angular=btn.getAttribute('data-angular');"
             + "drive(linear,angular);"
-            + "repeatTimer=setInterval(function(){drive(linear,angular);},250);"
+            // 80ms, not the original 250-300ms: each drive command is its own short
+            // ~100ms motor frame, not an extension of the previous one (see
+            // DriveController.drive()'s comment) — repeating slower than that leaves
+            // a real gap where the robot visibly stops between frames, independent of
+            // network latency. 80ms keeps comfortable margin under that ~100ms frame
+            // even with normal browser timer jitter; sending this often is cheap now
+            // that it's a WS frame over an already-open socket, not a new connection.
+            + "repeatTimer=setInterval(function(){drive(linear,angular);},80);"
             + "}"
             + "function stopHold(){"
             + "if(repeatTimer){clearInterval(repeatTimer);repeatTimer=null;drive(0,0);}"

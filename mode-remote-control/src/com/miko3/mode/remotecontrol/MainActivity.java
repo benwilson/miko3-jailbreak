@@ -69,12 +69,19 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Creates and starts a fresh DriveController, acquiring the lease. Called from
-     * onCreate (a genuinely new instance) and, defensively, from onNewIntent (see
-     * there) if this instance was reused while not currently active. */
+    /** Creates and starts a fresh DriveController (acquiring the lease) and starts the
+     * camera. Called from onCreate (a genuinely new instance) and, defensively, from
+     * onNewIntent (see there) if this instance was reused while not currently active.
+     * Deliberately NOT tied to onResume/onPause (confirmed live: it was previously,
+     * and the robot's own on-device screen switching away from this Activity — e.g.
+     * back to the launcher, or the screen simply locking — stopped the camera even
+     * while a remote operator was still actively watching the stream over the mode's
+     * always-on server). Camera now runs for as long as this activation is current,
+     * released only in exitMode()/onDestroy(). */
     private void activateDriveController() {
         ModeApp app = (ModeApp) getApplication();
         myGeneration = app.bumpGeneration();
+        app.startCamera();
         String clientId = "mode-" + android.os.Process.myPid() + "-" + System.currentTimeMillis();
         driveController = new DriveController(this, clientId, new DriveController.ErrorListener() {
             @Override
@@ -132,6 +139,7 @@ public class MainActivity extends Activity {
         // stale instance's exit wipe out a newer instance's already-active state.
         if (myGeneration == app.currentGeneration()) {
             app.setDriveController(null);
+            app.stopCamera();
         }
         finish();
     }
@@ -144,26 +152,9 @@ public class MainActivity extends Activity {
         ModeApp app = (ModeApp) getApplication();
         if (myGeneration == app.currentGeneration()) {
             app.setDriveController(null);
-        }
-        super.onDestroy();
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        ModeApp app = (ModeApp) getApplication();
-        if (myGeneration == app.currentGeneration()) {
-            app.startCamera();
-        }
-    }
-
-    @Override
-    protected void onPause() {
-        ModeApp app = (ModeApp) getApplication();
-        if (myGeneration == app.currentGeneration()) {
             app.stopCamera();
         }
-        super.onPause();
+        super.onDestroy();
     }
 
     private void logWebViewCapability() {
