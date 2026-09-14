@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-build-custom-launcher.py — build and sign the Miko 3 custom launcher APK.
+build-mode-remote-control.py — build and sign the remote-control/telepresence
+mode APK (mode-remote-control/).
 
-Proof-of-concept HOME replacement: shows basic device info on-screen and
-serves the same info as a read-only web page over Wi-Fi, plus a minimal
-Wi-Fi connect/disconnect/forget UI. See launcher/README.md.
-
-Same gradle-free pipeline as scripts/build-bootagent.py (javac -> d8 ->
-aapt2 link -> zipalign -> apksigner), minus the native-daemon step this app
-doesn't need — factored into scripts/build_common.py and shared with
-scripts/build-mode-remote-control.py. Also compiles the shared module
-(shared/src) into this APK's own classes.dex (KTD2) and packages its
-vendored assets (e.g. pico.min.css) alongside the launcher's own.
+Same gradle-free pipeline as scripts/build-custom-launcher.py, via
+scripts/build_common.py: compiles this app's own src plus the shared
+module (shared/src) into one classes.dex per APK (KTD2), and packages the
+shared module's vendored assets (e.g. pico.min.css) alongside the app's
+own. See mode-remote-control/README.md.
 
 Usage:
-  python3 scripts/build-custom-launcher.py
-  python3 scripts/build-custom-launcher.py --no-bootstrap
-  python3 scripts/build-custom-launcher.py --sdk /path/to/sdk
+  python3 scripts/build-mode-remote-control.py
+  python3 scripts/build-mode-remote-control.py --no-bootstrap
+  python3 scripts/build-mode-remote-control.py --sdk /path/to/sdk
 
 Dependencies: python3, Homebrew (for bootstrap), a JDK (javac/keytool).
 """
@@ -28,27 +24,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_common as bc
 
 REPO = Path(__file__).resolve().parent.parent
-APP_DIR = REPO / "launcher"
+APP_DIR = REPO / "mode-remote-control"
 SHARED_DIR = REPO / "shared"
 SRC = APP_DIR / "src"
 SHARED_SRC = SHARED_DIR / "src"
 SHARED_ASSETS = SHARED_DIR / "assets"
 MANIFEST = APP_DIR / "AndroidManifest.xml"
-KEYSTORE = APP_DIR / "miko3-launcher.keystore"
-APK = APP_DIR / "miko3-launcher.apk"
+KEYSTORE = APP_DIR / "miko3-mode-remote-control.keystore"
+APK = APP_DIR / "miko3-mode-remote-control.apk"
 BUILD = APP_DIR / "build"
 
-KEYSTORE_ALIAS = "miko3launcher"
-KEYSTORE_PASS = "miko3launcher"
-KEYSTORE_CN = "Miko3 Custom Launcher"
+KEYSTORE_ALIAS = "miko3moderemotecontrol"
+KEYSTORE_PASS = "miko3moderemotecontrol"
+KEYSTORE_CN = "Miko3 Remote Control Mode"
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build and sign the Miko 3 custom launcher APK.")
+    ap = argparse.ArgumentParser(description="Build and sign the remote-control/telepresence mode APK.")
     ap.add_argument("--sdk", help="Android SDK root (default: auto-detect)")
     ap.add_argument("--no-bootstrap", action="store_true",
                     help="fail if the toolchain is missing instead of installing it")
     args = ap.parse_args()
+
+    if not MANIFEST.exists():
+        raise bc.BuildError(f"!! {MANIFEST} not found — build mode-remote-control/ scaffold first")
 
     sdk = bc.find_sdk(args.sdk)
     sdk, bt, android_jar, javac, keytool = bc.ensure_toolchain(sdk, not args.no_bootstrap)
