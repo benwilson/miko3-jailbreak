@@ -52,6 +52,14 @@ public class LauncherApp extends Application {
     // speculatively ahead of there being a second mode to design it against.
     private static final String MODE_PACKAGE = "com.miko3.mode.remotecontrol";
     private static final String MODE_ACTIVITY = MODE_PACKAGE + ".MainActivity";
+    // Must match ModeApp.PORT (no shared constant between the two apps' build
+    // units — see ModeApp's own port comment). Used to send the browser to the
+    // mode's own page after launching it (U12: separate port pairs means "/"
+    // no longer just happens to land there the way it did under U11's shared
+    // port), and to poll for the mode's listener actually being up before
+    // doing so — startActivity() returns long before the target process has
+    // actually bound its port.
+    private static final int MODE_PORT = 8081;
 
     private RoutingHttpServer server;
     private WifiHttpHandler wifi;
@@ -179,7 +187,20 @@ public class LauncherApp extends Application {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 launchModeGracefully();
-                res.redirect("/");
+                // Sends the browser to the mode's own page on its own port (U12:
+                // separate port pairs, so unlike under U11's shared port, "/" here
+                // would just reload the launcher's own home page instead). Uses the
+                // request's own Host header rather than a hardcoded hostname, same
+                // pattern RoutingHttpServer's HTTPS redirect already uses, since the
+                // robot's WiFi IP isn't known at build time.
+                String host = req.headers.get("host");
+                if (host != null) {
+                    int colon = host.indexOf(':');
+                    if (colon >= 0) host = host.substring(0, colon);
+                    res.redirect("http://" + host + ":" + MODE_PORT + "/");
+                } else {
+                    res.redirect("/");
+                }
             }
         });
 
@@ -271,6 +292,37 @@ public class LauncherApp extends Application {
         launch.setClassName(MODE_PACKAGE, MODE_ACTIVITY);
         launch.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         startActivity(launch);
+
+        // startActivity() returns long before the mode's own process has actually
+        // started and bound MODE_PORT — the /launch-mode route below redirects the
+        // browser there right after this method returns, so without this wait the
+        // browser's very first request would hit a nothing's-listening-yet refusal
+        // and (depending on the browser) silently fail, looking like "nothing
+        // happened" when the link was clicked.
+        waitForModePortReady();
+    }
+
+    private static void waitForModePortReady() {
+        long deadline = SystemClock.elapsedRealtime() + 5000;
+        while (SystemClock.elapsedRealtime() < deadline) {
+            try {
+                java.net.Socket probe = new java.net.Socket();
+                try {
+                    probe.connect(new java.net.InetSocketAddress("127.0.0.1", MODE_PORT), 200);
+                    return; // connected — the mode's listener is up
+                } finally {
+                    probe.close();
+                }
+            } catch (IOException e) {
+                try {
+                    Thread.sleep(150);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+        Log.w(TAG, "mode's HTTP port never came up within 5s — redirecting the browser there anyway");
     }
 
     private static String urlEncode(String s) {
