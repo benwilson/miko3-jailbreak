@@ -47,6 +47,8 @@ public class RobotControlClient {
 
     /** AIDL code 135: expression playback (TTM-aware) — used for motion-expression frames. */
     private static final int CODE_EXPRESSION_PLAYBACK = 135;
+    /** AIDL code 122: MikoStateMachine lifecycle event (ServiceClientInterface.java:590). */
+    private static final int CODE_STATE_EVENT = 122;
 
     public interface Listener {
         void onConnected();
@@ -95,6 +97,29 @@ public class RobotControlClient {
             // actually means "ready to drive".
             gameController = controller;
             bound = true;
+            // Without this, GameEvent(135) drive/expression commands still reach
+            // ServiceExam and get a positive UART completion ACK from the peripheral
+            // motor board (Motion/VEL1 Completion:CPL=1) but never actually move the
+            // wheels — no error, no exception, just silent no-op at the motor-engage
+            // step. Root cause (docs/hardware/motors-wheels.md's live-tested finding):
+            // ServiceClientInterface's code-122 "ACTIVE_OTHERS" handler
+            // (ServiceClientInterface.java:590) is how a controlling app tells
+            // MikoStateMachine it's now the active interactive session
+            // (statemachine.onEvent(isRoot/isOthers)) — the same activeAppModel.isRoot()
+            // condition MikoStateMachine's own idle-mode-expression gate checks
+            // alongside its Idle-state check. Sending it once here, before any drive
+            // command, is what a live A/B test confirmed makes the difference: without
+            // it, encoder telemetry (Left=/Right=) never moves across repeated
+            // externally-triggered commands; with it, real continuous encoder movement
+            // plus a new expressionEvent callback (MOTION_CALLBACK "MOTION_COMPLETE",
+            // never observed without this call) follow immediately.
+            try {
+                controller.GameEvent(new JSONObject()
+                        .put("data", new JSONObject().put(String.valueOf(CODE_STATE_EVENT), "ACTIVE_OTHERS"))
+                        .toString());
+            } catch (JSONException | RemoteException e) {
+                Log.e(TAG, "ACTIVE_OTHERS state handshake failed (drive commands may no-op)", e);
+            }
             if (listener != null) {
                 listener.onConnected();
             }
