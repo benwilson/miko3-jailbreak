@@ -106,3 +106,31 @@ mode, so use ioreg for presence and libusb for I/O.
 Expected from AOSP notes, measured here on Android 9: PID flips to `0x2d00`, adb
 still absent. Do not spend more cycles on it; the preloader's META console (item 3b) or
 BROM is the way.
+
+## 8. NEVER risk factory-mode fallback — it is the one recovery path that always works
+
+Factory mode (META → FACTFACT via the preloader, `docs/method-factory-root.md`)
+is the safe fallback for this whole project: ServiceExam doesn't even start in
+it, so nothing in userland (the watchdog, the crash loops, a bricked parent
+lock, a wedged `/storage/emulated/0/klug`) can prevent recovery through it. It
+works below and independently of normal Android boot.
+
+**Never do anything that could compromise the ability to re-enter factory
+mode**, specifically:
+- Never flash, patch, or otherwise write the `preloader` / `preloader2`
+  partitions (hidden `mmcblk0boot0`/`boot1`).
+- Never attempt a bootloader unlock or any operation that changes
+  `lks`/`unlock_ability` state — the locked bootloader is what the META
+  handshake currently depends on responding correctly.
+- Treat any BROM/preloader-level operation as categorically higher-risk than
+  anything done from a rooted Android shell (normal or factory-mode) — a
+  mistake in userdata/`/system` is recoverable via factory mode; a mistake at
+  the preloader layer may not be.
+
+Every real change we've made this project (the 2026-09-14 parent-unlock
+attempt included, see
+`docs/parent-unlock-email-verification-blocker.md`) has stayed confined to
+`/data` and `/storage/emulated/0` — normal Android userland. That's exactly
+why it stayed recoverable (a fresh reboot, or worst case factory mode +
+`scripts/dump-all.sh`-era restore) even when ServiceExam itself crash-looped.
+Keep it that way.
