@@ -174,11 +174,15 @@ final class CameraCapture {
         return ids.length > 0 ? ids[0] : null;
     }
 
-    /** Prefers the slowest range with a max of at least 10fps (still reasonable for
-     * an MJPEG preview) over the single slowest range available, since some devices
-     * report a very low special-purpose range (e.g. long-exposure/low-light) whose
-     * max would make the preview look like a slideshow. Falls back to the overall
-     * slowest range, or null (no override — camera default) if none are reported. */
+    /** Prefers the slowest range with a max of at least 5fps (still watchable for an
+     * MJPEG preview, and confirmed live at 15fps to still be using enough WiFi
+     * bandwidth — ~55-60KB/frame at this device's smallest JPEG size — to plausibly
+     * compete with the tiny but latency-critical drive-command WebSocket frames for
+     * the same radio airtime) over the single slowest range available, since some
+     * devices report a very low special-purpose range (e.g. long-exposure/low-light)
+     * whose max would make the preview look like a slideshow. Falls back to the
+     * overall slowest range, or null (no override — camera default) if none are
+     * reported. */
     private android.util.Range<Integer> pickLowFpsRange(CameraCharacteristics characteristics) {
         android.util.Range<Integer>[] ranges = characteristics.get(
                 CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
@@ -191,7 +195,7 @@ final class CameraCapture {
             if (r.getUpper() < bestOverall.getUpper()) {
                 bestOverall = r;
             }
-            if (r.getUpper() >= 10 && (bestAtLeast10 == null || r.getUpper() < bestAtLeast10.getUpper())) {
+            if (r.getUpper() >= 5 && (bestAtLeast10 == null || r.getUpper() < bestAtLeast10.getUpper())) {
                 bestAtLeast10 = r;
             }
         }

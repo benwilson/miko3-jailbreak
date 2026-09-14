@@ -212,6 +212,15 @@ public final class RoutingHttpServer implements Runnable {
     private void handle(Socket client, boolean isTls) {
         try {
             client.setSoTimeout(30000);
+            // Nagle's algorithm (on by default) batches small writes to reduce packet
+            // count, at the cost of delaying them — the wrong tradeoff for every route
+            // this server has, but especially "/drive-ws" (mode-remote-control): each
+            // drive command is one small frame sent every 80ms while a control is
+            // held, and any added delay eats directly into DriveController's 750ms
+            // watchdog margin. Confirmed live: repeated commands intermittently
+            // stopped reaching the server for 750ms+ even while a real browser kept
+            // sending them on schedule.
+            client.setTcpNoDelay(true);
             InputStream rawIn = new BufferedInputStream(client.getInputStream());
             String requestLine = LineReader.readLine(rawIn);
             if (requestLine == null || requestLine.isEmpty()) {
