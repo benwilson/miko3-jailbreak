@@ -1,5 +1,69 @@
 # Motors / wheels — locomotion hardware control
 
+## WHEELS CONFIRMED WORKING (2026-09-14, session 2 continued): operator-witnessed movement, corroborated by live encoder telemetry — but not yet reproduced from an external AIDL call
+
+**Resolves the headline open question of this entire document.** Shortly
+after the "operator watched, zero movement" result immediately below, with
+no test running from this project's side (`spike-drive-test` was not in the
+foreground, no `GameEvent`/AIDL call was made), the device owner reported:
+first "It just moved... It turned to its left," then minutes later "It just
+spun around in a circle and then went backwards."
+
+A live, unfiltered logcat capture (armed proactively after the first report,
+same method as the rest of this section — a full capture to a file, not a
+filtered live tail, to survive `SocialInteraction`'s buffer-flooding
+telemetry) caught the second event directly:
+
+- Real `"VEL1="` frames firing (`E/EE: completed VEL1`), each preceded by an
+  `AndroidUnityInterface` sequence loading a **named system expression** —
+  an image (`"frame":"eager.json"`) paired with a motion clip (`"string is
+  MOTION1" / "found motion" / "motion play"`) — i.e. exactly the
+  `ExpressionMsg.packData1()` → `map.put("MOTION1", frame)` mechanism this
+  doc's byte-level analysis (below) predicted, firing for real.
+- **No `NEWAIDL`/`GameEvent` log line anywhere near either firing.** This
+  did not come through the AIDL surface `spike-drive-test` or
+  `com.miko3.mode.remotecontrol` use — it's the robot's own internal
+  idle/reactive behavior engine invoking the identical low-level pipeline
+  autonomously.
+- **The `Left=`/`Right=` encoder telemetry — frozen at one single value
+  (`Left=-000000637,Right=-000000561`) across this entire session's 20+
+  prior drive attempts — changed continuously and smoothly** through dozens
+  of distinct values during this window (e.g. `Right` sweeping from
+  `-000002587` through a smooth progression to `-000002122`), independently
+  corroborating the operator's direct observation with real odometry, not
+  just a visual impression.
+
+### What this settles
+
+**The hardware is unambiguously real and functional**: wheels, motor
+driver, and the peripheral MCU's motion firmware all genuinely work on this
+unit. The "does this Miko 3 have working drive wheels" question — open
+since the original static-analysis pass, and still technically open after
+this session's own AIDL testing got a positive MCU ACK with no observed
+effect — is now closed: **yes**, confirmed by direct observation and
+independently by hardware telemetry.
+
+### What's still open
+
+**Why this project's own externally-triggered AIDL command (`GameEvent`
+code 135, fully corrected per the section below — verified reaching
+`loadExpressionString`, packing a real `VEL1=` frame, and getting a
+positive `Motion/VEL1 Completion:CPL=1` ACK from the same MCU) produces no
+observed physical effect, while the robot's own internal trigger for the
+*identical* low-level pipeline does.** Both paths reach the same
+`sensorModule.writeUART()` call and get acknowledged by the MCU; only the
+external path fails to actually move anything. Leading hypothesis, not yet
+tested: a state-machine gate (`MikoStateMachine`'s `Active`/`Sleep`/
+`InActive`/`Update` states, referenced elsewhere in this codebase) that the
+internal reactive-behavior engine satisfies as part of its own normal
+invocation context, but that an external AIDL caller — which never touches
+`MikoStateMachine` at all — does not. Worth checking `si.statemachine`'s
+current state before/during an external attempt, and whether forcing it
+into whatever state the autonomous path runs under (if reachable via AIDL)
+changes the result. Not investigated this pass.
+
+---
+
 ## DEFINITIVE RESULT (2026-09-14, session 2 continued): full software round-trip succeeds, MCU acknowledges, zero physical movement, operator-witnessed
 
 **Every software-layer bug in the chain is now fixed and verified; the command reaches the peripheral motor-board and gets a positive completion ACK; the operator watched and confirmed no physical movement occurred. This is the strongest evidence this session can produce, short of opening the unit.**
