@@ -53,12 +53,33 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         logWebViewCapability();
 
+        // No theme override in AndroidManifest.xml means the default Android theme's
+        // ActionBar/title bar was always showing here — confirmed live via screencap:
+        // "Miko3 Remote Control" across the top, over the blank content below. Harmless
+        // on the old full-content page but out of place now that this screen is
+        // supposed to be just black or the operator's video (U13), nothing else.
+        requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+
         webView = new WebView(this);
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setDomStorageEnabled(true);
         webView.addJavascriptInterface(new NativeCaptureBridge(this), "AndroidCapture");
+        // Confirmed live (screencap showed a blank page under the title bar above):
+        // without a WebViewClient, the default SSL-error handling for the
+        // http://127.0.0.1:PORT load below — which redirects to https://127.0.0.1:
+        // HTTPS_PORT once RoutingHttpServer's HTTPS listener is up — treats our
+        // self-signed certificate as fatal and silently aborts the whole load. Safe to
+        // proceed unconditionally here: this WebView only ever talks to our own
+        // server on the loopback interface, never anything the operator navigates to.
+        webView.setWebViewClient(new android.webkit.WebViewClient() {
+            @Override
+            public void onReceivedSslError(WebView view, android.webkit.SslErrorHandler handler,
+                    android.net.http.SslError error) {
+                handler.proceed();
+            }
+        });
         setContentView(webView);
 
         requestRuntimePermissionsThenLoad();

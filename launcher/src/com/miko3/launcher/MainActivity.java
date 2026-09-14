@@ -48,6 +48,20 @@ public class MainActivity extends Activity {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
+        // Without this, the http://127.0.0.1:PORT load below (which redirects to
+        // https://127.0.0.1:HTTPS_PORT once RoutingHttpServer's HTTPS listener is up)
+        // hits the default SSL-error handling, which treats our self-signed
+        // certificate as fatal and silently aborts the load — confirmed live as the
+        // same root cause behind mode-remote-control/MainActivity's identical fix.
+        // Safe to proceed unconditionally: this WebView only ever talks to our own
+        // server on the loopback interface.
+        webView.setWebViewClient(new android.webkit.WebViewClient() {
+            @Override
+            public void onReceivedSslError(WebView view, android.webkit.SslErrorHandler handler,
+                    android.net.http.SslError error) {
+                handler.proceed();
+            }
+        });
         setContentView(webView);
 
         IntentFilter filter = new IntentFilter();
