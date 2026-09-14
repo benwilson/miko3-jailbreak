@@ -22,8 +22,17 @@ import java.io.OutputStream;
  */
 public class ModeApp extends Application {
     private static final String TAG = "ModeApp";
-    static final int PORT = 8090;
-    static final int HTTPS_PORT = 8453;
+    // Matches launcher/LauncherApp's PORT/HTTPS_PORT literal-for-literal (U11:
+    // "why is remote control on a different port" had no good answer once asked).
+    // No shared constant between the two apps' build units (separate APKs, only
+    // shared/ is compiled into both) — same pattern ModePage.java's home-link
+    // already used for HTTPS_PORT; keep both literals in sync if either changes.
+    // Only one of the two apps' RoutingHttpServer instances holds these at a
+    // time — the launcher releases them in launchModeGracefully() before handing
+    // off, and this app's exitMode() releases them back before returning to the
+    // launcher, which reclaims them in its own MainActivity.onResume().
+    static final int PORT = 8080;
+    static final int HTTPS_PORT = 8443;
 
     private RoutingHttpServer server;
     private final MjpegBroadcaster mjpegBroadcaster = new MjpegBroadcaster();
@@ -46,6 +55,20 @@ public class ModeApp extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        startServer();
+    }
+
+    /**
+     * Creates a fresh RoutingHttpServer, registers every route, and starts
+     * both its listeners. Mirrors LauncherApp's identical method — see its
+     * javadoc for why a fresh instance is built each time rather than reusing
+     * one across a stop()/start() cycle, and why this is a no-op (returns
+     * false) if a server is already running.
+     */
+    boolean startServer() {
+        if (server != null) {
+            return false;
+        }
         server = new RoutingHttpServer(this, PORT);
         server.route("/", new RoutingHttpServer.RouteHandler() {
             @Override
@@ -272,6 +295,19 @@ public class ModeApp extends Application {
             server.startHttps(HTTPS_PORT, httpsContext);
         } else {
             Log.w(TAG, "HTTPS certificate failed to load — serving plain HTTP only");
+        }
+        return true;
+    }
+
+    /**
+     * Stops the current server and drops the reference so startServer() can
+     * rebuild it later. Called from MainActivity.exitMode() before returning
+     * to the launcher, so LauncherApp can rebind the same port pair.
+     */
+    void stopServer() {
+        if (server != null) {
+            server.stop();
+            server = null;
         }
     }
 

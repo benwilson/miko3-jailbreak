@@ -114,7 +114,13 @@ public class MainActivity extends Activity {
         if (driveController != null) {
             driveController.release();
         }
-        ((ModeApp) getApplication()).setDriveController(null);
+        ModeApp app = (ModeApp) getApplication();
+        app.setDriveController(null);
+        // Releases the shared port pair (U11: launcher and this mode now serve on
+        // the same PORT/HTTPS_PORT) so LauncherApp.MainActivity's onResume() can
+        // rebind them once this mode's Activity finishes and the launcher's own
+        // Activity comes back to the foreground.
+        app.stopServer();
         finish();
     }
 

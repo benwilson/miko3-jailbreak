@@ -65,6 +65,34 @@ public class LauncherApp extends Application {
     public void onCreate() {
         super.onCreate();
         wifi = new WifiHttpHandler(this);
+        startServer();
+
+        // Binds to (and so creates) DriveLeaseService itself, via bindService()
+        // rather than startService(): Application.onCreate() is not guaranteed to
+        // run in a foreground-exempted context (confirmed live — startService()
+        // here threw IllegalStateException "not allowed to start service ... app
+        // is in background" depending on device idle state at launch), but a bound
+        // service has no such restriction. This also gives /launch-mode below a
+        // DriveLease handle to query the current holder before switching modes.
+        bindService(new Intent(this, DriveLeaseService.class), leaseConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    /**
+     * Creates a fresh RoutingHttpServer, registers every route, and starts
+     * both its listeners. Idempotent-safe to call again after stopServer()
+     * (e.g. MainActivity.onResume() reclaiming the port once a mode exits
+     * back to the launcher) — a stopped RoutingHttpServer isn't reused, a
+     * new one is built instead, since re-registering a handful of route()
+     * calls is simpler than making the class itself restart-safe.
+     */
+    boolean startServer() {
+        if (server != null) {
+            return false; // already running — a mode's exit and this Activity's
+                           // onResume can both race to reclaim the port; only the
+                           // first should act, and the caller (MainActivity) uses
+                           // this return value to decide whether its WebView needs
+                           // reloading (server was actually down, not just already up).
+        }
         server = new RoutingHttpServer(this, PORT);
 
         server.route("/", new RoutingHttpServer.RouteHandler() {
@@ -168,15 +196,20 @@ public class LauncherApp extends Application {
         } else {
             Log.w(TAG, "HTTPS certificate failed to load — serving plain HTTP only");
         }
+        return true;
+    }
 
-        // Binds to (and so creates) DriveLeaseService itself, via bindService()
-        // rather than startService(): Application.onCreate() is not guaranteed to
-        // run in a foreground-exempted context (confirmed live — startService()
-        // here threw IllegalStateException "not allowed to start service ... app
-        // is in background" depending on device idle state at launch), but a bound
-        // service has no such restriction. This also gives /launch-mode below a
-        // DriveLease handle to query the current holder before switching modes.
-        bindService(new Intent(this, DriveLeaseService.class), leaseConnection, Context.BIND_AUTO_CREATE);
+    /**
+     * Stops the current server and drops the reference so startServer() can
+     * rebuild it later. Called from launchModeGracefully() right before
+     * handing off to the mode app, so the mode's own RoutingHttpServer can
+     * bind the same port the launcher was just using.
+     */
+    void stopServer() {
+        if (server != null) {
+            server.stop();
+            server = null;
+        }
     }
 
     /**
@@ -242,6 +275,13 @@ public class LauncherApp extends Application {
                 Thread.currentThread().interrupt();
             }
         }
+
+        // Releases the shared port pair (PORT/HTTPS_PORT) before the mode app tries
+        // to bind them — both apps now serve on the same ports (U11: "why is remote
+        // control on a different port" had no good answer once asked), so exactly
+        // one of the two processes can hold the listeners at a time. bindWithRetry()
+        // on the mode's side absorbs the brief TIME_WAIT/handoff race after this.
+        stopServer();
 
         Intent launch = new Intent();
         launch.setClassName(MODE_PACKAGE, MODE_ACTIVITY);

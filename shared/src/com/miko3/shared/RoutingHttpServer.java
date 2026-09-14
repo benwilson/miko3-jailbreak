@@ -87,13 +87,52 @@ public final class RoutingHttpServer implements Runnable {
 
     @Override
     public void run() {
-        try (ServerSocket server = new ServerSocket(port)) {
+        ServerSocket server = null;
+        try {
+            server = bindWithRetry(new ServerSocket(), port);
             serverSocket = server;
             Log.i(TAG, "listening on port " + port);
             acceptLoop(server, false);
         } catch (IOException e) {
             Log.e(TAG, "failed to start server on port " + port, e);
+        } finally {
+            if (server != null) {
+                try {
+                    server.close();
+                } catch (IOException ignored) {
+                }
+            }
         }
+    }
+
+    /**
+     * Binds with SO_REUSEADDR (so a just-closed socket on this same port
+     * from another process — e.g. the launcher and the mode app trading
+     * off the same port pair on a mode launch/exit, see LauncherApp's and
+     * ModeApp's startServer()/stopServer() — doesn't leave the new bind
+     * failing on a lingering TIME_WAIT) plus a short retry: the outgoing
+     * side's close() and the incoming side's bind() are two independent
+     * process's calls with no direct handoff signal between them, so a
+     * few hundred ms of overlap is expected, not a bug.
+     */
+    private static ServerSocket bindWithRetry(ServerSocket socket, int port) throws IOException {
+        socket.setReuseAddress(true);
+        IOException lastError = null;
+        for (int attempt = 0; attempt < 15; attempt++) {
+            try {
+                socket.bind(new java.net.InetSocketAddress(port));
+                return socket;
+            } catch (IOException e) {
+                lastError = e;
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        throw lastError != null ? lastError : new IOException("bind failed, no attempts made");
     }
 
     /**
@@ -109,7 +148,10 @@ public final class RoutingHttpServer implements Runnable {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
-                try (ServerSocket server = sslContext.getServerSocketFactory().createServerSocket(httpsPortArg)) {
+                ServerSocket server = null;
+                try {
+                    server = bindWithRetry(
+                            sslContext.getServerSocketFactory().createServerSocket(), httpsPortArg);
                     httpsServerSocket = server;
                     // Set only once bound: if this fails (port in use, bad context), the
                     // plain listener keeps serving directly rather than redirecting
@@ -119,6 +161,13 @@ public final class RoutingHttpServer implements Runnable {
                     acceptLoop(server, true);
                 } catch (IOException e) {
                     Log.e(TAG, "failed to start HTTPS server on port " + httpsPortArg, e);
+                } finally {
+                    if (server != null) {
+                        try {
+                            server.close();
+                        } catch (IOException ignored) {
+                        }
+                    }
                 }
             }
         }, "routing-https-server");
