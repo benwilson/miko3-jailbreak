@@ -1,4 +1,4 @@
-package com.miko3.mode.remotecontrol;
+package com.miko3.shared;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -11,20 +11,20 @@ import java.nio.charset.StandardCharsets;
  * indefinitely (MJPEG multipart frames, a raw-PCM audio feed) until the
  * client disconnects.
  */
-final class HttpResponse {
+public final class HttpResponse {
     private final OutputStream out;
     private boolean headersSent;
 
-    HttpResponse(OutputStream out) {
+    public HttpResponse(OutputStream out) {
         this.out = out;
     }
 
-    void sendText(int status, String statusText, String contentType, String body) throws IOException {
+    public void sendText(int status, String statusText, String contentType, String body) throws IOException {
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         sendBytes(status, statusText, contentType, bytes);
     }
 
-    void sendBytes(int status, String statusText, String contentType, byte[] body) throws IOException {
+    public void sendBytes(int status, String statusText, String contentType, byte[] body) throws IOException {
         StringBuilder headers = new StringBuilder();
         headers.append("HTTP/1.0 ").append(status).append(' ').append(statusText).append("\r\n");
         headers.append("Content-Type: ").append(contentType).append("\r\n");
@@ -39,7 +39,7 @@ final class HttpResponse {
     /** Starts a streaming response with the given headers and no Content-Length; the
      * caller then writes its own body directly via rawOutputStream() until the client
      * disconnects or the caller stops. */
-    void startStreaming(int status, String statusText, String contentType, String extraHeaders) throws IOException {
+    public void startStreaming(int status, String statusText, String contentType, String extraHeaders) throws IOException {
         StringBuilder headers = new StringBuilder();
         headers.append("HTTP/1.0 ").append(status).append(' ').append(statusText).append("\r\n");
         headers.append("Content-Type: ").append(contentType).append("\r\n");
@@ -52,11 +52,11 @@ final class HttpResponse {
         headersSent = true;
     }
 
-    OutputStream rawOutputStream() {
+    public OutputStream rawOutputStream() {
         return out;
     }
 
-    boolean isHeadersSent() {
+    public boolean isHeadersSent() {
         return headersSent;
     }
 }

@@ -1,18 +1,22 @@
-package com.miko3.mode.remotecontrol;
+package com.miko3.shared;
 
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
 
-/** A parsed HTTP request: method, path, query params, headers, and a body stream. */
-final class HttpRequest {
-    final String method;
-    final String path;
-    final Map<String, String> query;
-    final Map<String, String> headers;
-    final InputStream body;
+/**
+ * A parsed HTTP request: method, path, query params, headers, and a body
+ * stream. Shared between the launcher (U9) and mode apps (U5+) — both
+ * serve their own on-device+networked UI through RoutingHttpServer.
+ */
+public final class HttpRequest {
+    public final String method;
+    public final String path;
+    public final Map<String, String> query;
+    public final Map<String, String> headers;
+    public final InputStream body;
 
-    HttpRequest(String method, String path, Map<String, String> query,
+    public HttpRequest(String method, String path, Map<String, String> query,
                 Map<String, String> headers, InputStream body) {
         this.method = method;
         this.path = path;
@@ -21,12 +25,12 @@ final class HttpRequest {
         this.body = body;
     }
 
-    String queryParam(String name, String fallback) {
+    public String queryParam(String name, String fallback) {
         String v = query.get(name);
         return v != null ? v : fallback;
     }
 
-    static Map<String, String> parseQuery(String raw) {
+    public static Map<String, String> parseQuery(String raw) {
         Map<String, String> out = new HashMap<String, String>();
         if (raw == null || raw.isEmpty()) {
             return out;

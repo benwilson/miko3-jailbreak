@@ -3,6 +3,10 @@ package com.miko3.mode.remotecontrol;
 import android.app.Application;
 import android.util.Log;
 
+import com.miko3.shared.HttpRequest;
+import com.miko3.shared.HttpResponse;
+import com.miko3.shared.RoutingHttpServer;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -20,7 +24,7 @@ public class ModeApp extends Application {
     private static final String TAG = "ModeApp";
     static final int PORT = 8090;
 
-    private ModeHttpServer server;
+    private RoutingHttpServer server;
     private final MjpegBroadcaster mjpegBroadcaster = new MjpegBroadcaster();
     private CameraCapture cameraCapture;
     private volatile String cameraError;
@@ -34,8 +38,8 @@ public class ModeApp extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
-        server = new ModeHttpServer(this, PORT);
-        server.route("/", new ModeHttpServer.RouteHandler() {
+        server = new RoutingHttpServer(this, PORT);
+        server.route("/", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 String token = Long.toHexString(tokenRandom.nextLong());
@@ -48,7 +52,7 @@ public class ModeApp extends Application {
                 res.sendText(200, "OK", "text/html; charset=utf-8", ModePage.buildIndexHtml(token));
             }
         });
-        server.route("/audio.pcm", new ModeHttpServer.RouteHandler() {
+        server.route("/audio.pcm", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 if (micError != null) {
@@ -83,7 +87,7 @@ public class ModeApp extends Application {
                 }
             }
         });
-        server.route("/toggle-mic", new ModeHttpServer.RouteHandler() {
+        server.route("/toggle-mic", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 DriveController dc = driveController;
@@ -102,7 +106,7 @@ public class ModeApp extends Application {
                 res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
             }
         });
-        server.route("/drive", new ModeHttpServer.RouteHandler() {
+        server.route("/drive", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 DriveController dc = driveController;
@@ -127,7 +131,7 @@ public class ModeApp extends Application {
                 }
             }
         });
-        server.route("/keepalive", new ModeHttpServer.RouteHandler() {
+        server.route("/keepalive", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 DriveController dc = driveController;
@@ -145,7 +149,7 @@ public class ModeApp extends Application {
                 res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
             }
         });
-        server.route("/exit", new ModeHttpServer.RouteHandler() {
+        server.route("/exit", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 DriveController dc = driveController;
@@ -162,14 +166,14 @@ public class ModeApp extends Application {
                 }
             }
         });
-        server.route("/assets/pico.min.css", new ModeHttpServer.RouteHandler() {
+        server.route("/assets/pico.min.css", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 byte[] css = readAsset("pico.min.css");
                 res.sendBytes(200, "OK", "text/css; charset=utf-8", css);
             }
         });
-        server.route("/stream.mjpeg", new ModeHttpServer.RouteHandler() {
+        server.route("/stream.mjpeg", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 if (cameraError != null) {
@@ -192,7 +196,7 @@ public class ModeApp extends Application {
                 });
                 // Block this connection thread until publishFrame() observes a write
                 // failure on `out` (the client disconnected) and notifies us, rather
-                // than returning immediately and letting ModeHttpServer close the
+                // than returning immediately and letting RoutingHttpServer close the
                 // socket out from under a still-live stream.
                 synchronized (doneLock) {
                     while (!done[0]) {
@@ -211,7 +215,7 @@ public class ModeApp extends Application {
         t.start();
     }
 
-    ModeHttpServer server() {
+    RoutingHttpServer server() {
         return server;
     }
 

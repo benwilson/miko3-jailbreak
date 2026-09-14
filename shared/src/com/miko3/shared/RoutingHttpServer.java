@@ -1,4 +1,4 @@
-package com.miko3.mode.remotecontrol;
+package com.miko3.shared;
 
 import android.content.Context;
 import android.util.Log;
@@ -9,24 +9,27 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * A small routing HTTP/1.0 server, extending InfoHttpServer's
- * ServerSocket/per-connection-thread shape (launcher/InfoHttpServer.java)
- * to support multiple routes and streaming (not close-after-one-response)
- * responses — needed for U6's MJPEG stream and U8's continuous audio feed.
+ * A small routing HTTP/1.0 server, originally factored out of the mode
+ * app's first hand-rolled server (which itself extended launcher's
+ * original InfoHttpServer ServerSocket/per-connection-thread shape) to
+ * support multiple routes and streaming (not close-after-one-response)
+ * responses — needed for U6's MJPEG stream, U8's continuous audio feed,
+ * and now U9's launcher Wi-Fi/system pages, all of which need more than
+ * one route. Shared here (KTD2-style: every APK compiles its own copy)
+ * so the launcher and every mode app use the identical implementation.
  *
- * Deliberately narrow, matching the launcher's existing server: no
- * keep-alive, no gzip, minimal header parsing. Every route handler is
- * registered up front; unmatched paths get a plain 404.
+ * Deliberately narrow: no keep-alive, no gzip, minimal header parsing.
+ * Every route handler is registered up front; unmatched paths get a
+ * plain 404.
  */
-final class ModeHttpServer implements Runnable {
-    private static final String TAG = "ModeHttpServer";
+public final class RoutingHttpServer implements Runnable {
+    private static final String TAG = "RoutingHttpServer";
 
-    interface RouteHandler {
+    public interface RouteHandler {
         void handle(HttpRequest req, HttpResponse res) throws IOException;
     }
 
@@ -36,20 +39,20 @@ final class ModeHttpServer implements Runnable {
     private volatile boolean running = true;
     private volatile ServerSocket serverSocket;
 
-    ModeHttpServer(Context ctx, int port) {
+    public RoutingHttpServer(Context ctx, int port) {
         this.appContext = ctx.getApplicationContext();
         this.port = port;
     }
 
-    void route(String path, RouteHandler handler) {
+    public void route(String path, RouteHandler handler) {
         routes.put(path, handler);
     }
 
-    Context appContext() {
+    public Context appContext() {
         return appContext;
     }
 
-    void stop() {
+    public void stop() {
         running = false;
         try {
             if (serverSocket != null) serverSocket.close();
@@ -70,7 +73,7 @@ final class ModeHttpServer implements Runnable {
                         public void run() {
                             handle(client);
                         }
-                    }, "mode-http-conn");
+                    }, "routing-http-conn");
                     t.setDaemon(true);
                     t.start();
                 } catch (IOException e) {

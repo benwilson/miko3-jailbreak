@@ -1,4 +1,4 @@
-package com.miko3.mode.remotecontrol;
+package com.miko3.shared;
 
 import java.io.IOException;
 import java.io.InputStream;

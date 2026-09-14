@@ -30,7 +30,7 @@ final class MjpegBroadcaster {
 
     /** onDisconnected fires once, off the caller's thread, the first time a write to
      * `out` fails — the connection handler holding `out` open uses this to know when
-     * it may return (and let ModeHttpServer close the socket) instead of polling. */
+     * it may return (and let RoutingHttpServer close the socket) instead of polling. */
     void subscribe(OutputStream out, Runnable onDisconnected) {
         synchronized (subscribers) {
             subscribers.add(out);

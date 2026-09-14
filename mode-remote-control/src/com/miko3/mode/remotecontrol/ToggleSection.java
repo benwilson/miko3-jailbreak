@@ -104,7 +104,7 @@ final class ToggleSection {
             // never completes, the second request then never fires at all (confirmed
             // live: img.src/hidden were set correctly but no connection ever formed
             // until this was added). The query string is stripped server-side
-            // (ModeHttpServer routes by path only), so both still hit the same handler
+            // (RoutingHttpServer routes by path only), so both still hit the same handler
             // and share the one capture session (KTD4).
             + "if(e.target.checked){img.src='/stream.mjpeg?viewer=operator';img.hidden=false;}"
             + "else{img.hidden=true;img.src='';}"
