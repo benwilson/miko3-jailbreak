@@ -247,6 +247,105 @@ public class RobotControlClient {
         drive(0, 0, 10);
     }
 
+    /**
+     * The vendor's autonomous idle-wandering shape (Explore/Linear.txt): two-frame
+     * VEL1, frame.type=25, times 40/2 centiseconds, loop=1 (self-sustains until
+     * interrupted — does not need resending). Confirmed live via GLPOS telemetry
+     * to drive continuously and smoothly for 9-12+ seconds at both magnitude 2
+     * and 20 when sent ONCE; confirmed to lurch/stall exactly like type=24 when
+     * RESENT on any interval. Use this sent once per direction change, not on a
+     * repeat timer — see driveContinuous() below for the alternative
+     * (short-pulse, must-resend) shape TeleConnect's own held-drive feature uses.
+     */
+    public void driveSustained(int linear, int angular) throws RemoteException {
+        GameControllerAIDL controller = gameController;
+        if (controller == null) {
+            throw new RemoteException("not connected to ServiceExam");
+        }
+        String mx = "{\"type\":4,\"size\":0,\"motion_type\":4,\"loop\":1,\"kp\":0,\"ki\":0,\"kd\":0,"
+                + "\"pidcontrol\":0,\"seqCount\":2,\"seq\":["
+                + "{\"linear\":" + linear + ",\"angular\":" + angular + ",\"time\":40,\"type\":25,\"id\":0},"
+                + "{\"linear\":" + linear + ",\"angular\":" + angular + ",\"time\":2,\"type\":25,\"id\":1}"
+                + "]}";
+        String empty = "{\"type\":0,\"size\":0,\"loop\":0,\"seqCount\":0,\"seq\":[]}";
+        String expressionJson = "{\"tx\":" + empty + ",\"ax\":" + empty + ",\"mx\":" + mx
+                + ",\"ix\":{\"type\":0,\"size\":0,\"imagetype\":0,\"loop\":0,\"seqCount\":0}"
+                + ",\"rx\":" + empty + ",\"id\":" + Math.abs(idGen.nextInt(1000)) + "}";
+        JSONObject request = new JSONObject();
+        try {
+            request.put("name", "");
+            request.put("path", expressionJson);
+            request.put("data", "");
+            request.put("audioPath", "");
+        } catch (JSONException e) {
+            throw new RemoteException("failed to build driveSustained payload: " + e.getMessage());
+        }
+        JSONObject envelope = new JSONObject();
+        try {
+            envelope.put("data", new JSONObject().put(String.valueOf(CODE_EXPRESSION_PLAYBACK), request.toString()));
+        } catch (JSONException e) {
+            throw new RemoteException("failed to build driveSustained envelope: " + e.getMessage());
+        }
+        controller.GameEvent(envelope.toString());
+    }
+
+    /**
+     * Sends the EXACT wire shape of TeleConnect's own real, production held-drive
+     * feature (U19g, 2026-09-15) — com.teleconnect.TeleConnect.frontContinous /
+     * leftContinous_new / rightContinous_new, confirmed from source, the same
+     * payloads a real phone-app video call session drives this robot with. A
+     * SINGLE frame (seqCount=1), loop=0 (does NOT self-sustain — must be
+     * resent), magnitude 2 (not this project's earlier assumed "confirmed-safe"
+     * 20), time=10 (100ms), frame.type=1 for forward/back (matches
+     * frontContinous) or frame.type=24 for turning (matches
+     * leftContinous_new/rightContinous_new — turning and linear motion use
+     * DIFFERENT frame types in the real app, not the same one).
+     *
+     * ServiceClientInterface.java's own receiver (~line 1867, code 167
+     * "TELE_CONNECT_ACTION") debounces incoming Motion messages to AT MOST one
+     * processed every 500ms (isDuplecateRestrict) — callers must not resend
+     * faster than that, matching DriveSection.java's own 500ms repeat interval.
+     *
+     * Supersedes this session's own earlier type=25/loop=1/magnitude=20
+     * "Explore"-shaped attempt: that shape is the vendor's AUTONOMOUS
+     * idle-wandering payload, not what a live driven session (phone app or
+     * this project) actually uses — confirmed to still lurch/stall when resent
+     * at any cadence, exactly like the original type=24 guess did. This one
+     * hasn't been live-tested yet; test via GLPOS/encoder telemetry before
+     * trusting a clean CPL=1 ack stream (see this class's own file history).
+     */
+    public void driveContinuous(int linear, int angular) throws RemoteException {
+        GameControllerAIDL controller = gameController;
+        if (controller == null) {
+            throw new RemoteException("not connected to ServiceExam");
+        }
+        int frameType = angular != 0 ? 24 : 1;
+        String mx = "{\"type\":4,\"size\":0,\"motion_type\":4,\"loop\":0,\"kp\":0,\"ki\":0,\"kd\":0,"
+                + "\"pidcontrol\":0,\"seqCount\":1,\"seq\":["
+                + "{\"linear\":" + linear + ",\"angular\":" + angular + ",\"time\":10,\"type\":" + frameType + ",\"id\":0}"
+                + "]}";
+        String empty = "{\"type\":0,\"size\":0,\"loop\":0,\"seqCount\":0,\"seq\":[]}";
+        String expressionJson = "{\"tx\":" + empty + ",\"ax\":" + empty + ",\"mx\":" + mx
+                + ",\"ix1\":{\"type\":0,\"size\":0,\"imagetype\":0,\"loop\":0,\"seqCount\":0}"
+                + ",\"rx\":" + empty + ",\"id\":0}";
+        JSONObject request = new JSONObject();
+        try {
+            request.put("name", "");
+            request.put("path", expressionJson);
+            request.put("data", "");
+            request.put("audioPath", "");
+        } catch (JSONException e) {
+            throw new RemoteException("failed to build driveContinuous payload: " + e.getMessage());
+        }
+        JSONObject envelope = new JSONObject();
+        try {
+            envelope.put("data", new JSONObject().put(String.valueOf(CODE_EXPRESSION_PLAYBACK), request.toString()));
+        } catch (JSONException e) {
+            throw new RemoteException("failed to build driveContinuous envelope: " + e.getMessage());
+        }
+        controller.GameEvent(envelope.toString());
+    }
+
     /** Raw JSON only — no XML wrapper. loadExpressionString() (what code 135 actually
      * calls) Gson-parses its argument directly as ExpressionMsg; the
      * "&lt;block&gt;&lt;expression&gt;...&lt;/expression&gt;&lt;/block&gt;" wrapping some

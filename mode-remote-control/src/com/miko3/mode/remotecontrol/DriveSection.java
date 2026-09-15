@@ -37,9 +37,15 @@ final class DriveSection {
             + "<h2>Drive</h2>"
             + "<p id=\"drive-status\" role=\"status\"></p>"
             + "<div class=\"grid\">"
-            + "<button id=\"btn-left\" data-linear=\"0\" data-angular=\"-20\">&#8630; Left</button>"
+            // Angular sign flipped from the vendor's own leftContinous_new/rightContinous_new
+            // naming convention (negative=left, positive=right there) — confirmed live
+            // (U19j, 2026-09-15) that on THIS unit, applying that convention turns the
+            // wrong physical way: negative angular observably turns right, positive
+            // observably turns left. Do not "fix" this back to match the vendor source's
+            // own labels without re-confirming live which way the robot actually turns.
+            + "<button id=\"btn-left\" data-linear=\"0\" data-angular=\"20\">&#8630; Left</button>"
             + "<button id=\"btn-forward\" data-linear=\"20\" data-angular=\"0\">&#8593; Forward</button>"
-            + "<button id=\"btn-right\" data-linear=\"0\" data-angular=\"20\">&#8631; Right</button>"
+            + "<button id=\"btn-right\" data-linear=\"0\" data-angular=\"-20\">&#8631; Right</button>"
             + "</div>"
             + "<div class=\"grid\">"
             + "<button id=\"btn-back\" data-linear=\"-20\" data-angular=\"0\">&#8595; Back</button>"
@@ -82,12 +88,19 @@ final class DriveSection {
             + "var linear=btn.getAttribute('data-linear');"
             + "var angular=btn.getAttribute('data-angular');"
             + "drive(linear,angular);"
-            // 500ms — see this class's own javadoc (U19c) for why this changed from
-            // 80ms: each driveSustained() call now packs a 150ms kick+sustain
-            // sequence into one message, and resending faster than ServiceExam's own
-            // confirmed-live held-drive cadence (~500ms) is what caused sustained
-            // forward driving to trip the motor firmware's stall protection.
-            + "repeatTimer=setInterval(function(){drive(linear,angular);},500);"
+            // U19i (2026-09-15): pure forward (linear>0, angular==0) is DriveController's
+            // own special case now -- it resends every tick via RobotControlClient.
+            // driveContinuous(), matching TeleConnect's real frontContinous recipe (see
+            // DriveController.drive()'s own comment), instead of the send-once
+            // driveSustained() every other direction uses. A shorter repeat interval
+            // shrinks the visible pause between each ~100ms forward pulse; 100ms was
+            // tried and was visibly jerky (motor-restart artifacts each tick), so 250ms
+            // is a middle ground -- do not drop it further without confirming live that
+            // the jerkiness hasn't come back. Every other direction keeps the proven
+            // 500ms cadence (its own send-once/self-sustaining shape has no reason to
+            // resend faster, and this session found no benefit from doing so for those).
+            + "var interval=(parseInt(linear,10)>0&&parseInt(angular,10)===0)?250:500;"
+            + "repeatTimer=setInterval(function(){drive(linear,angular);},interval);"
             + "}"
             + "function stopHold(){"
             + "if(repeatTimer){clearInterval(repeatTimer);repeatTimer=null;drive(0,0);}"
