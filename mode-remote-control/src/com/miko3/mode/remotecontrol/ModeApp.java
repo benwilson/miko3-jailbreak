@@ -463,13 +463,24 @@ public class ModeApp extends Application {
         return generation;
     }
 
-    // U18's diagnostic isolation is done: the drive freezes it was checking the
-    // camera against turned out to be ServiceExam's own SocialInteraction_SpeechChat
-    // shared lock (see DirectMotorDriver's class javadoc), now moot since driving no
-    // longer goes through ServiceExam's AIDL surface at all, and the camera lifecycle
-    // bugs from around the same time (async-close race, then that fix's own blocking
-    // wait on the main thread) are separately fixed in CameraCapture. Re-enabled.
-    private static final boolean CAMERA_ENABLED = true;
+    // U18's re-enable (moot ServiceExam lock, fixed CameraCapture lifecycle bugs) was
+    // half right and half wrong: those were real, but NOT the whole story. Re-enabling
+    // surfaced a live, ongoing vendor camerahalserver bug — confirmed via logcat, a
+    // continuous "pixel rate should not be zero" HAL error firing many times per
+    // second, each one forking an AEE crash-report worker, independent of whether any
+    // client is even watching /stream.mjpeg (capture runs for the mode's whole
+    // lifetime per this class's own javadoc). Confirmed via `top`: camerahalserver
+    // alone pegged ~76-86% of one core, aggregate CPU with this app running climbed
+    // from ~13% to ~63%+, idle across all 4 cores dropped to ~17% (67/400%) — severe
+    // enough to starve the drive WebSocket connection's own thread, surfacing as held
+    // drive buttons "sticking" (repeat commands still processed, but so delayed that
+    // release's stop trails badly behind, or never visibly catches up). This is a
+    // vendor HAL/driver-level fault, not something fixable from this class — back off
+    // until either the HAL bug itself is addressed (firmware/vendor blob update, or a
+    // capture-parameter tweak that avoids whatever triggers "pixel rate should not be
+    // zero") or a real fix is found. Do not re-enable on the same "isolation is done"
+    // reasoning without first confirming this specific HAL error loop is gone.
+    private static final boolean CAMERA_ENABLED = false;
 
     void startCamera() {
         if (!CAMERA_ENABLED) {
