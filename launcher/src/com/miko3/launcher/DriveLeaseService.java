@@ -3,15 +3,18 @@ package com.miko3.launcher;
 import android.app.Service;
 import android.content.Intent;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.RemoteException;
 import android.os.SystemClock;
 import android.util.Log;
 
+import com.miko3.shared.DirectMotorDriver;
 import com.miko3.shared.DriveLease;
 import com.miko3.shared.LauncherProtocol;
-import com.miko3.shared.RobotControlClient;
+
+import java.io.IOException;
 
 /**
  * Exported bound Service implementing R3/R13-R15's control-arbitration
@@ -35,13 +38,20 @@ public class DriveLeaseService extends Service {
     private static final long TTL_CHECK_INTERVAL_MS = 500;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private RobotControlClient robotClient;
+
+    // issueStop() below does blocking UART IO (DirectMotorDriver.connect()/stop()/
+    // disconnect()) and can be reached from releaseInternal() while the caller holds
+    // this service's own monitor, including from ttlCheck on the main Looper — doing
+    // that IO inline there would risk blocking the main thread for as long as
+    // disconnect()'s keepalive-thread join takes. A dedicated thread keeps that IO off
+    // both the main thread and whichever Binder thread called acquire()/release().
+    private final HandlerThread stopThread = new HandlerThread("drive-lease-stop");
+    private Handler stopHandler;
 
     private String holderId;
     private IBinder holderDeathToken;
     private IBinder.DeathRecipient holderDeathRecipient;
     private long lastRenewElapsedMs;
-    private volatile boolean stopOwed;
 
     private final Runnable ttlCheck = new Runnable() {
         @Override
@@ -163,51 +173,54 @@ public class DriveLeaseService extends Service {
         issueStop(reason);
     }
 
-    private void issueStop(String reason) {
-        if (robotClient == null || !robotClient.isConnected()) {
-            // RobotControlClient's own bind to ServiceExam is asynchronous (KTD1/U2) and
-            // can still be pending here, e.g. a mode acquires and crashes before the
-            // coordinator's own connect() has completed. Previously this just logged and
-            // returned, permanently skipping the stop-motors obligation for this release.
-            // Track it and retry once the client actually connects instead.
-            stopOwed = true;
-            Log.e(TAG, "cannot issue stop-motors for release (" + reason
-                    + ") — RobotControlClient not connected; will retry on connect");
-            return;
-        }
-        try {
-            robotClient.stop();
-            stopOwed = false;
-            Log.i(TAG, "stop-motors issued (" + reason + ")");
-        } catch (RemoteException e) {
-            stopOwed = true;
-            Log.e(TAG, "stop-motors command failed (" + reason + ")", e);
-        }
+    /**
+     * Own DirectMotorDriver connection, independent of any mode's — this coordinator
+     * used to reach the motors via RobotControlClient's AIDL bind to ServiceExam, which
+     * cannot work now that ServiceExam is disabled (see DirectMotorDriver's own class
+     * javadoc for why driving no longer goes through it at all). Unlike
+     * RobotControlClient's async bind, DirectMotorDriver.connect() is synchronous, so
+     * there's no "connect pending" state to track or retry against — a stop either goes
+     * out now or is logged and dropped, matching this class's existing fire-and-forget
+     * contract (same as DriveController's own use of it).
+     *
+     * KNOWN, ACCEPTED RISK: this opens a second, independent writer to /dev/ttyS2 that
+     * can briefly overlap with a still-connected mode's own DirectMotorDriver — e.g. a
+     * clean release, where DriveController.release() calls lease.release() (landing
+     * here) before its own motorDriver.disconnect(). DirectMotorDriver's class javadoc
+     * already documents that this device node doesn't arbitrate between concurrent
+     * writers and two frames landing at once can corrupt each other. Accepted here for
+     * the same reason it was accepted for ServiceExam-vs-DirectMotorDriver overlap
+     * during a drive session: a best-effort stop attempt that might occasionally lose a
+     * race is strictly better than this backstop being permanently unable to reach the
+     * motors at all, which was the actual state once ServiceExam got disabled.
+     */
+    private void issueStop(final String reason) {
+        stopHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                DirectMotorDriver driver = new DirectMotorDriver();
+                if (!driver.connect()) {
+                    Log.e(TAG, "cannot issue stop-motors for release (" + reason
+                            + ") — DirectMotorDriver connect() failed");
+                    return;
+                }
+                try {
+                    driver.stop();
+                    Log.i(TAG, "stop-motors issued (" + reason + ")");
+                } catch (IOException e) {
+                    Log.e(TAG, "stop-motors command failed (" + reason + ")", e);
+                } finally {
+                    driver.disconnect();
+                }
+            }
+        });
     }
 
     @Override
     public void onCreate() {
         super.onCreate();
-        robotClient = new RobotControlClient(this, new RobotControlClient.Listener() {
-            @Override
-            public void onConnected() {
-                Log.i(TAG, "RobotControlClient connected");
-                if (stopOwed) {
-                    issueStop("retry_after_connect");
-                }
-            }
-
-            @Override
-            public void onDisconnected() {
-                Log.w(TAG, "RobotControlClient disconnected");
-            }
-
-            @Override
-            public void onSendFailed(RemoteException e) {
-                Log.e(TAG, "RobotControlClient send failed", e);
-            }
-        });
-        robotClient.connect();
+        stopThread.start();
+        stopHandler = new Handler(stopThread.getLooper());
         handler.postDelayed(ttlCheck, TTL_CHECK_INTERVAL_MS);
     }
 
@@ -219,9 +232,7 @@ public class DriveLeaseService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacks(ttlCheck);
-        if (robotClient != null) {
-            robotClient.disconnect();
-        }
+        stopThread.quitSafely();
         super.onDestroy();
     }
 }
