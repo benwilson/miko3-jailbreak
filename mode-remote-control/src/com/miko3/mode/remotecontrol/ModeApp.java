@@ -40,6 +40,16 @@ public class ModeApp extends Application {
     // at a time; the on-device WebView's operator-video-img subscribes to the
     // resulting stream exactly like the main camera view does to mjpegBroadcaster.
     private final MjpegBroadcaster operatorVideoBroadcaster = new MjpegBroadcaster();
+    // Whether the operator is currently uploading video, independent of
+    // operatorVideoBroadcaster's own subscriber count (that tracks VIEWERS, not
+    // whether anyone is actively publishing) -- DeviceViewPage's own on-device
+    // idle-eyes page polls /operator-video-active rather than relying on its <img>'s
+    // own "error" event firing when disconnectAll() closes its connection, since
+    // confirmed live this WebView's multipart handling doesn't reliably fire that
+    // event for a server-initiated mid-stream close (see /operator-video-stop's own
+    // route comment) -- a dropped connection with no client-visible signal at all
+    // left that page stuck showing the last frame with no way to notice and recover.
+    private volatile boolean operatorVideoActive;
     private volatile CameraCapture cameraCapture;
     // Serializes camera open/close off whichever thread calls startCamera()/
     // stopCamera() — confirmed live: CameraCapture.stop() can now block for up to
@@ -361,9 +371,29 @@ public class ModeApp extends Application {
                 // safety issue the way a stray motor command would be.
                 byte[] jpeg = HttpUtil.readAll(req.body);
                 if (jpeg.length > 0) {
+                    operatorVideoActive = true;
                     operatorVideoBroadcaster.publishFrame(jpeg);
                 }
                 res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+            }
+        });
+        server.route("/operator-video-stop", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                // No client-token gate, matching /operator-video-upload's own reasoning —
+                // this only ever tears down operatorVideoBroadcaster's current
+                // subscribers, which is harmless even from a stray/late request.
+                operatorVideoActive = false;
+                operatorVideoBroadcaster.disconnectAll();
+                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+            }
+        });
+        server.route("/operator-video-active", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                // Polled by DeviceViewPage — see operatorVideoActive's own field comment
+                // for why this exists instead of relying on the <img>'s "error" event.
+                res.sendText(200, "OK", "text/plain; charset=utf-8", operatorVideoActive ? "1" : "0");
             }
         });
         server.route("/operator-video-stream", new RoutingHttpServer.RouteHandler() {

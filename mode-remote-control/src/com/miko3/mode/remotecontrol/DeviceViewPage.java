@@ -32,9 +32,20 @@ package com.miko3.mode.remotecontrol;
  * The <img> stays hidden until its first "load" event — which a
  * multipart/x-mixed-replace stream (ModeApp.operatorVideoBroadcaster) fires
  * on every part, so the very first frame the operator actually uploads
- * swaps the eye for video automatically, with nothing to configure on this
- * side; if nobody ever uploads one, the connection just sits open with zero
- * parts and the eye stays up indefinitely.
+ * swaps the eye for video automatically.
+ *
+ * U19n (2026-09-15): polls ModeApp's own /operator-video-active status every
+ * second to know when to (re)connect the <img> or switch back to the eyes,
+ * rather than driving that off the connection's own lifecycle (a fresh src on
+ * poll-detected start, display swapped back and src cleared on poll-detected
+ * stop) — confirmed live that this WebView's <img> does NOT reliably fire an
+ * "error" event when ModeApp actively closes the underlying multipart
+ * connection server-side (see SubscriberBroadcaster.disconnectAll()), so
+ * relying on that event left this page stuck showing the operator's last
+ * frame forever after they turned video off, with no client-side signal at
+ * all that anything had changed. Do not go back to a load/error-event-only
+ * design without confirming live that this specific WebView's multipart
+ * <img> handling has changed.
  */
 final class DeviceViewPage {
     private DeviceViewPage() {
@@ -119,7 +130,30 @@ final class DeviceViewPage {
             + "var img=document.getElementById('video');"
             + "var rig=document.getElementById('rig');"
             + "img.addEventListener('load',function(){rig.style.display='none';img.style.display='block';});"
-            + "img.src='/operator-video-stream';"
+            // U19m/U19n: polls /operator-video-active (ModeApp's own operatorVideoActive
+            // flag, set true on each /operator-video-upload and false on
+            // /operator-video-stop) rather than relying on this <img>'s own "error" event
+            // to notice the operator stopped -- confirmed live that closing the
+            // connection server-side (SubscriberBroadcaster.disconnectAll(), called from
+            // /operator-video-stop) does NOT reliably fire "error" on this WebView's
+            // multipart <img> handling (same non-standard handling already noted for
+            // "load" firing per-part, not just once): a real live test left this page
+            // stuck showing the last frame indefinitely with zero client-side signal at
+            // all that the connection had even closed. Polling a plain status endpoint
+            // sidesteps that WebView-specific quirk entirely. wasActive tracks the
+            // previous poll's result so img.src is only touched on an actual transition,
+            // not on every poll (reassigning the same src is a wasted request at best).
+            + "var wasActive=false;"
+            + "function pollOperatorVideo(){"
+            + "fetch('/operator-video-active').then(function(r){return r.text();}).then(function(t){"
+            + "var active=(t==='1');"
+            + "if(active&&!wasActive){img.src='/operator-video-stream?r='+Date.now();}"
+            + "else if(!active&&wasActive){img.style.display='none';rig.style.display='flex';img.src='';}"
+            + "wasActive=active;"
+            + "}).catch(function(){});"
+            + "}"
+            + "pollOperatorVideo();"
+            + "setInterval(pollOperatorVideo,1000);"
             + "var glows=document.getElementsByClassName('glow');"
             + "var cores=document.getElementsByClassName('glow-core');"
             + "for(var g=0;g<cores.length;g++){"

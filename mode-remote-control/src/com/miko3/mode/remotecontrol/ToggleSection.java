@@ -41,11 +41,12 @@ final class ToggleSection {
             + "<label><input type=\"checkbox\" id=\"toggle-robot-mic\">Robot mic &rarr; operator</label>"
             + "<label><input type=\"checkbox\" id=\"toggle-operator-mic\">Operator mic &rarr; robot speaker"
             + " <small>(on-device only)</small></label>"
-            + "<label><input type=\"checkbox\" id=\"toggle-operator-video\">Operator video &rarr; robot screen</label>"
-            + "<img id=\"operator-video-img\" hidden alt=\"operator video, as shown on the robot's screen\""
-            + " style=\"max-width:100%\">"
-            + "<video id=\"operator-video-preview\" hidden autoplay playsinline muted"
-            + " style=\"max-width:200px\"></video>"
+            // U19m: the "Operator video -> robot screen" checkbox + its <img>/<video>
+            // moved to CameraSection.java (next to the robot camera feed) -- do not
+            // re-add them here, getElementById() only finds the first of a duplicate id
+            // and a second copy would be a dead, unwired checkbox (confirmed live: this
+            // exact mistake happened once already when the move was first made).
+            // operator-video-canvas has no visible layout, so it stays here.
             + "<canvas id=\"operator-video-canvas\" hidden></canvas>"
             + "<audio id=\"robot-mic-audio\" hidden></audio>"
             + "<script>"
@@ -151,6 +152,15 @@ final class ToggleSection {
             + "operatorVideoStream.getTracks().forEach(function(t){t.stop();});"
             + "operatorVideoStream=null;"
             + "}"
+            // Tells the server to actively disconnect operatorVideoBroadcaster's current
+            // subscribers -- notably DeviceViewPage's own on-device idle-eyes page, which
+            // otherwise has no way to tell "the operator just stopped" apart from "no
+            // frame yet" and would get stuck showing the last uploaded frame forever
+            // instead of switching back to the eyes. Only called here (the actual
+            // uploader stopping), not from stopOperatorVideoOnDevice() -- that path is a
+            // mere VIEWER unsubscribing from the stream, which shouldn't tear down the
+            // broadcast for every other subscriber.
+            + "fetch('/operator-video-stop?ct='+encodeURIComponent(CLIENT_TOKEN)).catch(function(){});"
             + "var preview=document.getElementById('operator-video-preview');"
             + "preview.hidden=true;preview.srcObject=null;"
             + "}"
