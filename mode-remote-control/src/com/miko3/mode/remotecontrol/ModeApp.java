@@ -513,7 +513,7 @@ public class ModeApp extends Application {
     // capture-parameter tweak that avoids whatever triggers "pixel rate should not be
     // zero") or a real fix is found. Do not re-enable on the same "isolation is done"
     // reasoning without first confirming this specific HAL error loop is gone.
-    private static final boolean CAMERA_ENABLED = false;
+    private static final boolean CAMERA_ENABLED = true;
 
     void startCamera() {
         if (!CAMERA_ENABLED) {

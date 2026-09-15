@@ -63,6 +63,7 @@ final class CameraCapture {
     // doesn't need 30fps to look reasonable, so start() picks the slowest
     // available range (>=10fps if one exists) and onConfigured() applies it.
     private android.util.Range<Integer> targetFpsRange;
+    private android.util.Range<Integer> aeCompensationRange;
 
     CameraCapture(Context context, MjpegBroadcaster broadcaster, ErrorListener errorListener) {
         this.context = context.getApplicationContext();
@@ -99,9 +100,28 @@ final class CameraCapture {
             targetFpsRange = pickLowFpsRange(characteristics);
             Log.i(TAG, "using target FPS range " + targetFpsRange);
 
+            // Confirmed live (2026-09-15): this camera exposes JPEG, PRIVATE (opaque,
+            // not readable), and two raw YUV formats (YUV_420_888, YV12) but no
+            // hardware video codec (h.264/etc.) at all -- JPEG via the hardware
+            // encoder (this class's own original KTD4 choice, see class javadoc) is
+            // already the most efficient encode path available on this SoC, not
+            // something to move away from for "better" streaming. The real lever is
+            // resolution: confirmed 9 available JPEG sizes from 320x240 up to
+            // 2560x1920, with 320x240 originally picked as the smallest specifically
+            // to minimize WiFi bandwidth contention with the drive-command WebSocket
+            // (see this method's own pickSmallestJpegSize()). aeCompensationRange is
+            // queried here (not hardcoded) since it's a real per-device camera
+            // characteristic, used below to brighten the image.
+            aeCompensationRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+            Log.i(TAG, "AE compensation range=" + aeCompensationRange
+                    + " step=" + characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+                    + " sensitivityRange=" + characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                    + " exposureTimeRange=" + characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                    + " hasFlash=" + characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE));
+
             StreamConfigurationMap map = characteristics.get(
                     CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            Size jpegSize = pickSmallestJpegSize(map);
+            Size jpegSize = pickTargetJpegSize(map);
             if (jpegSize == null) {
                 errorListener.onCameraError("no JPEG output size available");
                 closedLatch.countDown();
@@ -174,35 +194,56 @@ final class CameraCapture {
         return ids.length > 0 ? ids[0] : null;
     }
 
-    /** Prefers the slowest range with a max of at least 5fps (still watchable for an
-     * MJPEG preview, and confirmed live at 15fps to still be using enough WiFi
-     * bandwidth — ~55-60KB/frame at this device's smallest JPEG size — to plausibly
-     * compete with the tiny but latency-critical drive-command WebSocket frames for
-     * the same radio airtime) over the single slowest range available, since some
-     * devices report a very low special-purpose range (e.g. long-exposure/low-light)
-     * whose max would make the preview look like a slideshow. Falls back to the
-     * overall slowest range, or null (no override — camera default) if none are
-     * reported. */
+    /** REVISED (2026-09-15) to prioritize a genuinely VARIABLE range (lower < upper)
+     * with the lowest floor, over a fixed rate — the original version here picked
+     * the fixed [15,15] range specifically to bound bandwidth, without realizing
+     * that choice also hard-caps every frame's exposure TIME at ~66ms regardless of
+     * scene brightness (CONTROL_AE_TARGET_FPS_RANGE bounds frame duration, which
+     * bounds max exposure time), which is what an operator-reported "looks dark"
+     * traced back to: this camera's sensor supports up to 400ms exposure and ISO
+     * 6400, but a fixed 15fps target never let auto-exposure use more than ~60ms/
+     * ISO 213 no matter how much CONTROL_AE_EXPOSURE_COMPENSATION was requested.
+     * A variable range (confirmed available on this camera: [5, 30]) lets
+     * auto-exposure slow down toward the floor automatically in a dark scene
+     * (more light per frame, no fixed frame-rate tradeoff needed) while still
+     * running fast in good light — strictly better for this problem than any fixed
+     * rate. Falls back to the fixed range with the lowest floor (most exposure
+     * headroom) if no variable range is offered, or null (camera default) if
+     * nothing is reported. */
     private android.util.Range<Integer> pickLowFpsRange(CameraCharacteristics characteristics) {
         android.util.Range<Integer>[] ranges = characteristics.get(
                 CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
         if (ranges == null || ranges.length == 0) {
             return null;
         }
-        android.util.Range<Integer> bestOverall = ranges[0];
-        android.util.Range<Integer> bestAtLeast10 = null;
+        Log.i(TAG, "available FPS ranges: " + Arrays.toString(ranges));
+        android.util.Range<Integer> bestVariable = null;
+        android.util.Range<Integer> bestFixed = ranges[0];
         for (android.util.Range<Integer> r : ranges) {
-            if (r.getUpper() < bestOverall.getUpper()) {
-                bestOverall = r;
-            }
-            if (r.getUpper() >= 5 && (bestAtLeast10 == null || r.getUpper() < bestAtLeast10.getUpper())) {
-                bestAtLeast10 = r;
+            if (r.getLower().equals(r.getUpper())) {
+                if (r.getLower() < bestFixed.getLower()) {
+                    bestFixed = r;
+                }
+            } else if (bestVariable == null || r.getLower() < bestVariable.getLower()) {
+                bestVariable = r;
             }
         }
-        return bestAtLeast10 != null ? bestAtLeast10 : bestOverall;
+        return bestVariable != null ? bestVariable : bestFixed;
     }
 
-    private Size pickSmallestJpegSize(StreamConfigurationMap map) {
+    /** TARGET_JPEG_WIDTH x TARGET_JPEG_HEIGHT is deliberately NOT this camera's
+     * smallest available JPEG size (320x240, confirmed live to be the smallest of
+     * 9 sizes up to 2560x1920) — that choice, made when this stream first shipped,
+     * traded away most of the picture quality headroom to minimize WiFi bandwidth
+     * contention with the drive-command WebSocket, before anyone had actually
+     * measured whether a step up was safe. 640x480 (4x the pixels) is the next
+     * confirmed-available size up; test drive responsiveness and measured
+     * frame/bandwidth under this size live before going any higher, the same way
+     * every other empirical choice in this project was validated. */
+    private static final int TARGET_JPEG_WIDTH = 640;
+    private static final int TARGET_JPEG_HEIGHT = 480;
+
+    private Size pickTargetJpegSize(StreamConfigurationMap map) {
         if (map == null) {
             return null;
         }
@@ -210,6 +251,19 @@ final class CameraCapture {
         if (sizes == null || sizes.length == 0) {
             return null;
         }
+        StringBuilder sb = new StringBuilder("available JPEG sizes:");
+        for (Size s : sizes) {
+            sb.append(' ').append(s.getWidth()).append('x').append(s.getHeight());
+        }
+        Log.i(TAG, sb.toString());
+        for (Size s : sizes) {
+            if (s.getWidth() == TARGET_JPEG_WIDTH && s.getHeight() == TARGET_JPEG_HEIGHT) {
+                return s;
+            }
+        }
+        // Exact target not offered by this camera -- fall back to the smallest size
+        // at or above the target pixel count, or the overall smallest if the target
+        // exceeds everything this camera offers.
         List<Size> sorted = Arrays.asList(sizes);
         java.util.Collections.sort(sorted, new Comparator<Size>() {
             @Override
@@ -217,7 +271,13 @@ final class CameraCapture {
                 return Integer.compare(a.getWidth() * a.getHeight(), b.getWidth() * b.getHeight());
             }
         });
-        return sorted.get(0);
+        int targetPixels = TARGET_JPEG_WIDTH * TARGET_JPEG_HEIGHT;
+        for (Size s : sorted) {
+            if (s.getWidth() * s.getHeight() >= targetPixels) {
+                return s;
+            }
+        }
+        return sorted.get(sorted.size() - 1);
     }
 
     private final CameraDevice.StateCallback cameraStateCallback = new CameraDevice.StateCallback() {
@@ -272,6 +332,19 @@ final class CameraCapture {
                 builder.addTarget(imageReader.getSurface());
                 if (targetFpsRange != null) {
                     builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetFpsRange);
+                }
+                // Operator-reported (2026-09-15): the stream looked dark with no
+                // exposure compensation set at all (auto-exposure default only).
+                // Confirmed live this camera's own CONTROL_AE_COMPENSATION_RANGE is
+                // -4..4 in CONTROL_AE_COMPENSATION_STEP=1/2 EV units (so -2EV..+2EV) --
+                // request the top of that range (brightest available) rather than a
+                // hardcoded guess, so this still does something sane on hardware with a
+                // different range. TEMPLATE_PREVIEW already implies CONTROL_AE_MODE_ON
+                // (auto-exposure enabled), so compensation stacks on top of whatever the
+                // auto-exposure algorithm itself picks, not a replacement for it.
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                if (aeCompensationRange != null) {
+                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, aeCompensationRange.getUpper());
                 }
                 session.setRepeatingRequest(builder.build(), null, backgroundHandler);
             } catch (CameraAccessException e) {
