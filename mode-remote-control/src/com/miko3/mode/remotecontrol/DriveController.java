@@ -86,6 +86,18 @@ final class DriveController {
     private DriveLease lease;
     private volatile boolean leaseHeld;
     private volatile boolean coordinatorUnreachable;
+    // Automatic lease recovery (U19t, 2026-09-15): previously, ANY lease failure --
+    // a transient renew() RemoteException under heavy system load, the launcher's
+    // DriveLeaseService binder connection dropping, or losing an acquire() race
+    // against a not-yet-expired stale holder -- left this DriveController
+    // permanently unable to drive for the rest of its lifetime, with no retry at
+    // all; only a full app restart (confirmed live) re-acquired the lease.
+    // Mirrors ModeApp's own camera retry-with-backoff (see
+    // [[miko3-camera-hal-cpu-bug]]) for the same underlying reason: the operator
+    // has no adb/root access in normal use to notice and manually restart the app.
+    private static final long LEASE_RETRY_BASE_MS = 2000;
+    private static final long LEASE_RETRY_MAX_MS = 30000;
+    private int leaseRetryAttempt;
 
     /** The direction actually sent to the motor last, so repeat calls with the same
      * (linear, angular) for TURNING (self-sustaining, loop=1) are treated as a
@@ -142,6 +154,15 @@ final class DriveController {
                         }
                         sendStopBestEffort();
                         errorListener.onDriveError("drive lease revoked — stopped");
+                        // A THIRD lease-loss path, distinct from handleCoordinatorUnreachable()
+                        // (a thrown RemoteException) and tryAcquire()'s "denied" branch: the
+                        // coordinator itself is still reachable and answered normally, it just
+                        // says this lease is gone (most likely TTL expiry from a renew() that
+                        // arrived too late, e.g. under the same system load this whole project
+                        // keeps running into). Confirmed live (2026-09-15) this path previously
+                        // had NO retry at all -- left driving permanently dead here too, same
+                        // as the other two paths before this fix.
+                        scheduleLeaseRetry();
                         return;
                     }
                 } catch (RemoteException e) {
@@ -159,6 +180,13 @@ final class DriveController {
         public void run() {
             Log.w(TAG, "drive watchdog fired — no command/keepalive within " + WATCHDOG_MS + "ms, stopping");
             sendStopBestEffort();
+        }
+    };
+
+    private final Runnable leaseRetryRunnable = new Runnable() {
+        @Override
+        public void run() {
+            reconnectLeaseService();
         }
     };
 
@@ -180,6 +208,10 @@ final class DriveController {
             Log.e(TAG, "DirectMotorDriver connect() failed");
         }
 
+        bindLeaseService();
+    }
+
+    private void bindLeaseService() {
         Intent intent = new Intent(LauncherProtocol.DRIVE_LEASE_ACTION);
         intent.setPackage(LauncherProtocol.LAUNCHER_PACKAGE);
         boolean bound = context.bindService(intent, leaseConnection, Context.BIND_AUTO_CREATE);
@@ -188,17 +220,47 @@ final class DriveController {
         }
     }
 
+    /** Fully unbinds and rebinds — the same sequence a full app restart already goes
+     * through (confirmed live to reliably re-acquire a lease this stuck), rather
+     * than trying to reuse whatever state leaseConnection/lease are currently in,
+     * which is exactly the state a previous failure already showed can't recover
+     * on its own. */
+    private void reconnectLeaseService() {
+        try {
+            context.unbindService(leaseConnection);
+        } catch (IllegalArgumentException ignored) {
+            // not currently bound -- fine, bindLeaseService() below starts fresh either way
+        }
+        lease = null;
+        bindLeaseService();
+    }
+
+    private void scheduleLeaseRetry() {
+        handler.removeCallbacks(leaseRetryRunnable);
+        leaseRetryAttempt++;
+        long delay = Math.min(LEASE_RETRY_BASE_MS << Math.min(leaseRetryAttempt - 1, 4), LEASE_RETRY_MAX_MS);
+        Log.i(TAG, "retrying drive lease acquisition in " + delay + "ms (attempt " + leaseRetryAttempt + ")");
+        handler.postDelayed(leaseRetryRunnable, delay);
+    }
+
     private void tryAcquire() {
         try {
             boolean granted = lease.acquire(deathToken, clientId);
             if (granted) {
                 leaseHeld = true;
                 coordinatorUnreachable = false;
+                leaseRetryAttempt = 0;
                 Log.i(TAG, "lease acquired");
                 handler.postDelayed(renewLoop, RENEW_INTERVAL_MS);
             } else {
+                // Confirmed live: previously left this DriveController permanently unable
+                // to drive if it lost this race even once -- e.g. against a just-exited
+                // prior instance's not-yet-expired lease (see the coordinator's own TTL).
+                // That kind of holder frees up on its own shortly, so retrying here (not
+                // just logging and giving up) recovers from exactly that case.
                 Log.w(TAG, "lease acquire() denied — already held");
                 errorListener.onDriveError("drive lease already held by another mode");
+                scheduleLeaseRetry();
             }
         } catch (RemoteException e) {
             handleCoordinatorUnreachable("acquire() failed: " + e.getMessage());
@@ -346,11 +408,13 @@ final class DriveController {
         }
         sendStopBestEffort();
         errorListener.onDriveError("lost contact with drive coordinator — stopped");
+        scheduleLeaseRetry();
     }
 
     /** R16: explicit clean release, from the "Exit mode" control or an exit request. */
     void release() {
         handler.removeCallbacks(renewLoop);
+        handler.removeCallbacks(leaseRetryRunnable);
         synchronized (driveLock) {
             handler.removeCallbacks(watchdog);
             if (leaseHeld && lease != null) {
