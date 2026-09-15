@@ -57,14 +57,43 @@ public class ModeApp extends Application {
     private volatile DriveController driveController;
     private volatile Runnable exitRunnable;
     // Applies drive commands off "/drive-ws"'s own read loop (see that route's
-    // comment) — a single worker that always runs the most recently submitted
-    // command and drops anything superseded before it got to run, rather than a
-    // plain queue that would fall behind and replay stale commands late. Every
-    // "drive x y" sent while a control is held is a redundant re-assertion of the
-    // same intent anyway, so dropping a stale one costs nothing.
+    // comment) via a strict FIFO queue, not a single overwritable slot (U19d,
+    // 2026-09-15): the original design ("a single worker that always runs the
+    // most recently submitted command and drops anything superseded before it
+    // got to run") treated every queued command as an interchangeable, redundant
+    // re-assertion of "the current intent" — true for a run of identical "drive
+    // x y" resends from the same held direction, but NOT true for a stop
+    // sandwiched between two drive commands, or a direction change: dropping
+    // either of those isn't "skipping a stale duplicate," it's silently
+    // discarding a real, distinct operator command whenever the worker fell
+    // behind (e.g. the synchronous ServiceExam/motor write this queue exists to
+    // get off the WS read thread taking longer than the next command's arrival —
+    // see this route's own comment). A held-direction's own resends are still
+    // coalesced (only a command identical to the current queue tail is dropped),
+    // so a slow patch doesn't leave a backlog of stale repeats to work through
+    // late, but every stop and every direction change is always queued and
+    // always delivered, in order, no matter how the worker's timing lines up.
     private final Object driveTaskLock = new Object();
-    private Runnable pendingDriveTask;
+    private final java.util.ArrayDeque<DriveCmd> driveQueue = new java.util.ArrayDeque<>();
     private boolean driveWorkerBusy;
+
+    private static final class DriveCmd {
+        final DriveController dc;
+        final String token;
+        final int linear;
+        final int angular;
+
+        DriveCmd(DriveController dc, String token, int linear, int angular) {
+            this.dc = dc;
+            this.token = token;
+            this.linear = linear;
+            this.angular = angular;
+        }
+
+        boolean sameCommand(int linear, int angular) {
+            return this.linear == linear && this.angular == angular;
+        }
+    }
     private final java.util.concurrent.ExecutorService driveExecutor =
             java.util.concurrent.Executors.newSingleThreadExecutor();
     // Confirmed live: MainActivity's launchMode="singleTop" + onNewIntent()
@@ -403,19 +432,13 @@ public class ModeApp extends Application {
      * regardless) — callers there must check res.isHeadersSent() instead,
      * since a null return no longer means "stop."
      */
-    /** Coalescing dispatch for "/drive-ws" — see driveExecutor's field comment. */
+    /** FIFO dispatch for "/drive-ws" — see driveQueue's own field comment. */
     private void submitDrive(final DriveController dc, final String token, final int linear, final int angular) {
         synchronized (driveTaskLock) {
-            pendingDriveTask = new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        dc.drive(token, linear, angular);
-                    } catch (Exception e) {
-                        Log.w(TAG, "drive-ws drive() failed", e);
-                    }
-                }
-            };
+            DriveCmd tail = driveQueue.peekLast();
+            if (tail == null || !tail.sameCommand(linear, angular)) {
+                driveQueue.addLast(new DriveCmd(dc, token, linear, angular));
+            }
             if (!driveWorkerBusy) {
                 driveWorkerBusy = true;
                 driveExecutor.execute(driveWorkerLoop);
@@ -427,16 +450,19 @@ public class ModeApp extends Application {
         @Override
         public void run() {
             while (true) {
-                Runnable task;
+                DriveCmd cmd;
                 synchronized (driveTaskLock) {
-                    task = pendingDriveTask;
-                    pendingDriveTask = null;
-                    if (task == null) {
+                    cmd = driveQueue.pollFirst();
+                    if (cmd == null) {
                         driveWorkerBusy = false;
                         return;
                     }
                 }
-                task.run();
+                try {
+                    cmd.dc.drive(cmd.token, cmd.linear, cmd.angular);
+                } catch (Exception e) {
+                    Log.w(TAG, "drive-ws drive() failed", e);
+                }
             }
         }
     };
