@@ -10,17 +10,28 @@ import android.os.IBinder;
 import android.os.RemoteException;
 import android.util.Log;
 
+import com.miko3.shared.DirectMotorDriver;
 import com.miko3.shared.DriveLease;
 import com.miko3.shared.LauncherProtocol;
-import com.miko3.shared.RobotControlClient;
+
+import java.io.IOException;
 
 /**
- * Wires the mode's drive HTTP routes to U2's RobotControlClient through
+ * Wires the mode's drive HTTP routes to U21's DirectMotorDriver (a direct
+ * /dev/ttyS2 writer, bypassing ServiceExam's AIDL surface and its confirmed
+ * shared-lock/CPU contention entirely — see that class's own javadoc) through
  * U3's DriveLease coordinator, per R5/R13/R15/R16/R17 (U7). Acquires the
  * lease on start, runs a renew() loop well under the coordinator's TTL,
  * runs a local ~750ms drive-command watchdog independent of the
  * coordinator, and — R15's backstop — commands its own stop if the
  * coordinator becomes unreachable, since no coordinator remains to do it.
+ *
+ * Previously used the AIDL-based RobotControlClient (still used by
+ * launcher/DriveLeaseService's own separate, rare stop-backstop path, not yet
+ * converted — see DirectMotorDriver's keepalive requirement, which a
+ * fire-once backstop can't satisfy without its own continuous poll thread).
+ * That path required ServiceExam to be running at all, defeating the point
+ * of bypassing it, so this mode's own drive path switched fully.
  */
 final class DriveController {
     private static final String TAG = "DriveController";
@@ -54,7 +65,7 @@ final class DriveController {
     private final IBinder deathToken = new Binder();
     private final ErrorListener errorListener;
 
-    private RobotControlClient robotClient;
+    private DirectMotorDriver motorDriver;
     private DriveLease lease;
     private volatile boolean leaseHeld;
     private volatile boolean coordinatorUnreachable;
@@ -134,23 +145,14 @@ final class DriveController {
     }
 
     void start() {
-        robotClient = new RobotControlClient(context, new RobotControlClient.Listener() {
-            @Override
-            public void onConnected() {
-                Log.i(TAG, "RobotControlClient connected");
-            }
-
-            @Override
-            public void onDisconnected() {
-                Log.w(TAG, "RobotControlClient disconnected");
-            }
-
-            @Override
-            public void onSendFailed(RemoteException e) {
-                Log.e(TAG, "RobotControlClient send failed", e);
-            }
-        });
-        robotClient.connect();
+        // Synchronous, unlike RobotControlClient.connect() — no Listener needed;
+        // DirectMotorDriver's connect() only starts a root shell + the keepalive
+        // thread (see its own javadoc's REQUIRED KEEPALIVE section), nothing that
+        // needs to wait on ServiceExam or any other external service.
+        motorDriver = new DirectMotorDriver();
+        if (!motorDriver.connect()) {
+            Log.e(TAG, "DirectMotorDriver connect() failed");
+        }
 
         Intent intent = new Intent(LauncherProtocol.DRIVE_LEASE_ACTION);
         intent.setPackage(LauncherProtocol.LAUNCHER_PACKAGE);
@@ -237,7 +239,11 @@ final class DriveController {
             // live: this, not network latency, was most of the reported original
             // "straight, jank, jank, straight" -- the pre-WebSocket 300ms repeat
             // interval was already longer than this frame's ~100ms run time).
-            robotClient.drive(linear, angular, 10);
+            try {
+                motorDriver.drive(linear, angular, 10);
+            } catch (IOException e) {
+                throw new RemoteException(e.getMessage());
+            }
             handler.postDelayed(watchdog, WATCHDOG_MS);
         }
     }
@@ -255,10 +261,10 @@ final class DriveController {
     }
 
     private void sendStopBestEffort() {
-        if (robotClient != null && robotClient.isConnected()) {
+        if (motorDriver != null && motorDriver.isConnected()) {
             try {
-                robotClient.stop();
-            } catch (RemoteException e) {
+                motorDriver.stop();
+            } catch (IOException e) {
                 Log.e(TAG, "stop() failed during watchdog/backstop", e);
             }
         }
@@ -297,8 +303,8 @@ final class DriveController {
         } catch (IllegalArgumentException ignored) {
             // never bound
         }
-        if (robotClient != null) {
-            robotClient.disconnect();
+        if (motorDriver != null) {
+            motorDriver.disconnect();
         }
         handlerThread.quitSafely();
     }
