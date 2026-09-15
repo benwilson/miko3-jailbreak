@@ -1,5 +1,44 @@
 # Motors / wheels — locomotion hardware control
 
+## RESOLVED (truly final): ServiceExam was never actually required — the whole drive path is back on DirectMotorDriver, bypassing ServiceExam entirely (2026-09-15, same day as the section below)
+
+**Supersedes only this file's "Architecture note" from the section directly
+below** — the frame-shape fix in that section (forward=`frontContinous`
+type=1/loop=0, turning=`leftContinous_new` type=24/loop=1) is unchanged and
+still correct.
+
+That section's "Architecture note" reasoned that exhaustive bypass testing
+couldn't reproduce sustained motion outside ServiceExam's own process, so
+the drive path was switched to `RobotControlClient` (ServiceExam's AIDL).
+That reasoning was incomplete, not wrong-but-necessary: every bypass test run
+before that conclusion used the WRONG frame shape (`type=25`/`loop=1`, the
+autonomous-idle-wandering recipe) — the correct `frontContinous`/
+`leftContinous_new` shapes were only found afterward, by decompiling this
+robot's actual companion phone app, and by then were only ever wired through
+`RobotControlClient`. Nobody had actually tested the CORRECT shape via a raw
+bypass yet.
+
+Closed that gap the same day: `scripts/bypass-drive-test.py --shape single
+--frame-type 1 --t1 10 --loop 0 --linear 2 --interval 0.25`, writing directly
+to `/dev/ttyS2` with both `mode-remote-control` and `com.example.root.serviceexam`
+force-stopped the entire time, drove continuously and reliably for a full 15s
+hold — operator-confirmed live. ServiceExam was never actually required.
+
+**Final state**: the whole drive path (forward, back, turning, stop) is back
+on `DirectMotorDriver` — see `buildContinuousFrame()` (forward/back,
+`frontContinous`-shaped) and `buildTurnFrame()` (turning,
+`leftContinous_new`/`rightContinous_new`-shaped, fixed vendor kick=25/
+sustain=8 magnitudes, sign-only from the caller) for the exact byte-level
+recipes. `RobotControlClient` and `DriveController.ensureServiceExamEnabled()`
+are no longer used by the drive path at all. `com.example.root.serviceexam`
+is disabled (`pm disable`) and not running. This also made re-enabling the
+camera (`CAMERA_ENABLED=true` in `mode-remote-control/.../ModeApp.java`) safe
+despite `camerahalserver`'s own still-unfixed CPU-pegging HAL bug — see
+memory `miko3-camera-hal-cpu-bug` for why that stopped mattering once the
+drive path no longer makes a blocking cross-process call at all.
+
+---
+
 ## RESOLVED (final): sustained FORWARD driving specifically still jerked/paused after the type=25 fix below — root cause was using the wrong vendor recipe for forward, not a further hardware issue (2026-09-15, later same day)
 
 **Supersedes the section directly below's fix for forward specifically** (that

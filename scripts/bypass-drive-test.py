@@ -49,6 +49,22 @@ def build_sustained_frame(linear: int, angular: int, frame_type: int = 24,
     return body
 
 
+def build_single_frame(linear: int, angular: int, frame_type: int = 1,
+                        time_cs: int = 10, loop: int = 0) -> bytes:
+    """Byte-exact match for TeleConnect's own frontContinous (type=1, loop=0,
+    time=10, magnitude 2) -- a SINGLE VEL1 frame (seqCount=1, datasize=27),
+    not the two-frame kick+sustain shape build_sustained_frame() builds."""
+    body = b"VEL1="
+    body += u3(4)   # MotionMsg type
+    body += u3(27)  # datasize: 15-byte header + 1x12-byte frame
+    body += u3(4)   # motion_type
+    body += u3(loop)
+    body += u3(1)   # seqCount
+    body += s3(linear) + s3(angular) + u3(time_cs) + u3(frame_type)
+    body += PAD * (FRAME_SIZE - len(body))
+    return body
+
+
 def adb(serial: str, *args: str, check=True) -> subprocess.CompletedProcess:
     return subprocess.run(["adb", "-s", serial, *args], check=check,
                            capture_output=True, text=False)
@@ -68,11 +84,17 @@ def main() -> int:
                      help="seconds of POWER-only keepalive before the first drive frame")
     ap.add_argument("--with-reader", action="store_true",
                      help="also run a background reader draining /dev/ttyS2, matching ServiceExam")
+    ap.add_argument("--shape", choices=["sustained", "single"], default="sustained",
+                     help="'single' replicates frontContinous exactly (single frame, loop=0)")
+    ap.add_argument("--loop", type=int, default=0, help="loop field for --shape single")
     args = ap.parse_args()
 
     power = tagged_frame(b"POWER", POWER_FRAME_SIZE)
     stop = tagged_frame(b"MTSTP", POWER_FRAME_SIZE)
-    drive = build_sustained_frame(args.linear, args.angular, args.frame_type, args.t1, args.t2)
+    if args.shape == "single":
+        drive = build_single_frame(args.linear, args.angular, args.frame_type, args.t1, args.loop)
+    else:
+        drive = build_sustained_frame(args.linear, args.angular, args.frame_type, args.t1, args.t2)
 
     tmp = "/data/local/tmp"
     for name, data in (("power.bin", power), ("stop.bin", stop), ("drive.bin", drive)):
