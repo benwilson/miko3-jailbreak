@@ -25,8 +25,12 @@ package com.miko3.mode.remotecontrol;
  *
  * Sends an explicit stop on release (now the real MTSTP command, not a
  * zero-velocity VEL1 frame — see DirectMotorDriver.stop()'s own comment).
- * Plus an "Exit mode" control that releases the lease and returns to the
- * launcher (R16) — reachable without physical access to the robot.
+ *
+ * R16's "exit mode without physical access to the robot" requirement used to
+ * be its own button rendered here; U19p moved that behavior onto the page's
+ * top breadcrumb link instead (see ModePage's own comment) once Drive and
+ * Audio/Video started rendering side by side and having a second, separate
+ * exit control right next to the persistent breadcrumb was redundant.
  */
 final class DriveSection {
     private DriveSection() {
@@ -51,7 +55,6 @@ final class DriveSection {
             + "<button id=\"btn-back\" data-linear=\"-20\" data-angular=\"0\">&#8595; Back</button>"
             + "</div>"
             + "<p><small>Arrow keys also work while this page has focus.</small></p>"
-            + "<button id=\"btn-exit\" class=\"secondary\">Exit mode</button>"
             + "<script>"
             + "(function(){"
             + "var status=document.getElementById('drive-status');"
@@ -152,19 +155,6 @@ final class DriveSection {
             // key events to a document that isn't focused. Without this, that key
             // stays in heldKeys forever and driving never gets a guaranteed stop.
             + "window.addEventListener('blur',function(){heldKeys={};stopHold();});"
-            + "document.getElementById('btn-exit').addEventListener('click',function(){"
-            // Previously just updated the status text and left the operator sitting
-            // on this same page — the request succeeded server-side (the robot's own
-            // screen did return to the launcher) but nothing told a *remote* browser
-            // to go anywhere, so it looked broken from there. Navigates to the
-            // launcher either way (success or failure): if /exit genuinely failed,
-            // being on the launcher's own page to retry is still more useful than
-            // being stuck here.
-            + "status.textContent='Exiting...';"
-            + "fetch('/exit?ct='+encodeURIComponent(CLIENT_TOKEN))"
-            + ".catch(function(){})"
-            + ".then(function(){window.location.href='https://'+location.hostname+':8443/';});"
-            + "});"
             + "})();"
             + "</script>"
             + "</section>";
