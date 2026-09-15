@@ -161,6 +161,7 @@ public class MainActivity extends Activity {
         if (myGeneration == app.currentGeneration()) {
             app.setDriveController(null);
             app.stopCamera();
+            app.stopSong();
         }
         finish();
     }
@@ -174,6 +175,7 @@ public class MainActivity extends Activity {
         if (myGeneration == app.currentGeneration()) {
             app.setDriveController(null);
             app.stopCamera();
+            app.stopSong();
         }
         super.onDestroy();
     }

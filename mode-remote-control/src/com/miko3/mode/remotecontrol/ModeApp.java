@@ -142,10 +142,17 @@ public class ModeApp extends Application {
     // OperatorSpeakerPlayer's own class comment for why this needs no broadcaster.
     private final OperatorSpeakerPlayer operatorSpeakerPlayer = new OperatorSpeakerPlayer();
     private volatile byte[] cssBytes;
+    // Constructed in onCreate(), not as an eager field initializer -- confirmed live
+    // that ModeApp's own constructor runs before Android attaches its base Context,
+    // so SongPlayer's constructor calling getApplicationContext() on it right away
+    // threw NPE ("Attempt to invoke ... getApplicationContext() on a null object
+    // reference") at app startup, before onCreate() ever ran.
+    private SongPlayer songPlayer;
 
     @Override
     public void onCreate() {
         super.onCreate();
+        songPlayer = new SongPlayer(this);
         startServer();
     }
 
@@ -218,6 +225,22 @@ public class ModeApp extends Application {
                     startMic();
                 } else {
                     stopMic();
+                }
+                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+            }
+        });
+        server.route("/toggle-song", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                authorizeClient(req, res, false);
+                if (res.isHeadersSent()) {
+                    return;
+                }
+                boolean on = "true".equals(req.queryParam("on", "false"));
+                if (on) {
+                    songPlayer.start();
+                } else {
+                    songPlayer.stop();
                 }
                 res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
             }
@@ -679,6 +702,10 @@ public class ModeApp extends Application {
             }
         });
         micCapture.start();
+    }
+
+    void stopSong() {
+        songPlayer.stop();
     }
 
     private void stopMic() {

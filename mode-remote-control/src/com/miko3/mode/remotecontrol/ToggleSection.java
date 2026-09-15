@@ -50,6 +50,7 @@ final class ToggleSection {
             + "<p id=\"toggle-status\" role=\"status\"></p>"
             + "<label><input type=\"checkbox\" id=\"toggle-robot-mic\">Robot mic &rarr; operator</label>"
             + "<label><input type=\"checkbox\" id=\"toggle-operator-mic\">Operator mic &rarr; robot speaker</label>"
+            + "<label><input type=\"checkbox\" id=\"toggle-song\">&#127925; Highway to the Danger Zone</label>"
             // U19m: the "Operator video -> robot screen" checkbox + its <img>/<video>
             // moved to CameraSection.java (next to the robot camera feed) -- do not
             // re-add them here, getElementById() only finds the first of a duplicate id
@@ -106,6 +107,16 @@ final class ToggleSection {
             + "reportError('Control taken by another connection.');return;}"
             + "if(e.target.checked){startRobotMicPlayback();}else{stopRobotMicPlayback();}"
             + "checkFeedbackRisk();"
+            + "});"
+            + "});"
+
+            // Song playback lives entirely server-side (MediaPlayer on the robot's own
+            // speaker, see ModeApp.SongPlayer) -- this toggle is just an on/off switch,
+            // nothing to start/stop in the browser itself.
+            + "document.getElementById('toggle-song').addEventListener('change',function(e){"
+            + "fetch('/toggle-song?on='+e.target.checked+'&ct='+encodeURIComponent(CLIENT_TOKEN)).then(function(r){"
+            + "if(r.status===409){e.target.checked=!e.target.checked;"
+            + "reportError('Control taken by another connection.');}"
             + "});"
             + "});"
 
