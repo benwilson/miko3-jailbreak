@@ -221,7 +221,18 @@ final class ToggleSection {
             + "reportError('This browser has no camera API (getUserMedia) available.');"
             + "return;"
             + "}"
-            + "navigator.mediaDevices.getUserMedia({video:true}).then(function(stream){"
+            // Requested small on purpose (U19u, by request): the operator-video-img/
+            // camera-img display box (CameraSection's own MEDIA_BOX_STYLE) uses
+            // object-fit:cover, which already scales/crops ANY source resolution to
+            // fill it -- so this isn't about "fitting the screen" (that's automatic),
+            // it's purely to cut this feed's own bandwidth and per-frame encode/decode
+            // cost. {width,height}:{ideal:...} is a soft constraint -- some cameras
+            // won't hit it exactly -- so the draw loop below ALSO clamps its own
+            // output size to the same cap regardless of what the camera actually
+            // negotiated, rather than trusting the constraint alone.
+            + "var OPVID_MAX_W=320,OPVID_MAX_H=240;"
+            + "navigator.mediaDevices.getUserMedia({video:{width:{ideal:OPVID_MAX_W},"
+            + "height:{ideal:OPVID_MAX_H}}}).then(function(stream){"
             + "operatorVideoStream=stream;"
             + "var preview=document.getElementById('operator-video-preview');"
             + "preview.srcObject=stream;preview.hidden=false;"
@@ -229,8 +240,10 @@ final class ToggleSection {
             + "var ctx=canvas.getContext('2d');"
             + "operatorVideoUploadTimer=setInterval(function(){"
             + "if(preview.videoWidth===0)return;"
-            + "canvas.width=preview.videoWidth;canvas.height=preview.videoHeight;"
-            + "ctx.drawImage(preview,0,0);"
+            + "var scale=Math.min(1,OPVID_MAX_W/preview.videoWidth,OPVID_MAX_H/preview.videoHeight);"
+            + "canvas.width=Math.round(preview.videoWidth*scale);"
+            + "canvas.height=Math.round(preview.videoHeight*scale);"
+            + "ctx.drawImage(preview,0,0,canvas.width,canvas.height);"
             + "canvas.toBlob(function(blob){"
             + "if(!blob)return;"
             + "fetch('/operator-video-upload',{method:'POST',body:blob}).catch(function(){});"

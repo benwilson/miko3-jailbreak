@@ -46,6 +46,16 @@ package com.miko3.mode.remotecontrol;
  * all that anything had changed. Do not go back to a load/error-event-only
  * design without confirming live that this specific WebView's multipart
  * <img> handling has changed.
+ *
+ * U19v (2026-09-15): the active/inactive poll alone still wasn't enough --
+ * confirmed live the underlying connection can die silently WHILE the
+ * operator keeps uploading the entire time (server logs showed continuous
+ * /operator-video-upload traffic while this page sat on one frozen frame,
+ * byte-identical across screenshots seconds apart), so the true/true case
+ * never re-triggers a reconnect on its own. Now also tracks the last time
+ * the <img>'s own "load" event fired (still reliable per-part, only "error"
+ * on close is the unreliable one) and forces a fresh connection if none
+ * fired in 5s despite the poll still reporting the operator active.
  */
 final class DeviceViewPage {
     private DeviceViewPage() {
@@ -129,7 +139,10 @@ final class DeviceViewPage {
             + "<script>"
             + "var img=document.getElementById('video');"
             + "var rig=document.getElementById('rig');"
-            + "img.addEventListener('load',function(){rig.style.display='none';img.style.display='block';});"
+            + "var lastFrameTime=0;"
+            + "img.addEventListener('load',function(){"
+            + "rig.style.display='none';img.style.display='block';lastFrameTime=Date.now();"
+            + "});"
             // U19m/U19n: polls /operator-video-active (ModeApp's own operatorVideoActive
             // flag, set true on each /operator-video-upload and false on
             // /operator-video-stop) rather than relying on this <img>'s own "error" event
@@ -143,12 +156,30 @@ final class DeviceViewPage {
             // sidesteps that WebView-specific quirk entirely. wasActive tracks the
             // previous poll's result so img.src is only touched on an actual transition,
             // not on every poll (reassigning the same src is a wasted request at best).
+            //
+            // U19v (2026-09-15): that transition-only reconnect isn't enough on its own
+            // -- confirmed live the underlying multipart connection can also die
+            // SILENTLY while the operator is still actively uploading the whole time
+            // (operatorVideoActive stays true throughout, so the false->true edge this
+            // was built around never re-fires): server logs showed a steady stream of
+            // /operator-video-upload requests arriving in real time while this page
+            // displayed a single frozen frame, byte-identical across repeated
+            // screenshots seconds apart. lastFrameTime (bumped by the "load" listener
+            // above, which still fires per multipart part even though "error" doesn't
+            // fire on close) lets the poll notice "no new frame in 5s despite still
+            // being told the operator is active" and force a fresh connection itself,
+            // rather than waiting on a server-side signal that has no way to know this
+            // one subscriber's connection died independent of the operator's own upload
+            // health.
             + "var wasActive=false;"
             + "function pollOperatorVideo(){"
             + "fetch('/operator-video-active').then(function(r){return r.text();}).then(function(t){"
             + "var active=(t==='1');"
-            + "if(active&&!wasActive){img.src='/operator-video-stream?r='+Date.now();}"
+            + "if(active&&!wasActive){img.src='/operator-video-stream?r='+Date.now();lastFrameTime=Date.now();}"
             + "else if(!active&&wasActive){img.style.display='none';rig.style.display='flex';img.src='';}"
+            + "else if(active&&wasActive&&(Date.now()-lastFrameTime>5000)){"
+            + "img.src='/operator-video-stream?r='+Date.now();lastFrameTime=Date.now();"
+            + "}"
             + "wasActive=active;"
             + "}).catch(function(){});"
             + "}"
