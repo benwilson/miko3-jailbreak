@@ -463,15 +463,13 @@ public class ModeApp extends Application {
         return generation;
     }
 
-    // TEMPORARY (U18) diagnostic switch: camera capture has been a recurring source
-    // of instability this session (HAL errors, a system-level cameraserver crash,
-    // heavy CPU/bandwidth use), and driving has intermittently frozen entirely
-    // regardless of several unrelated fixes already made to the drive-command path.
-    // Flip to false to isolate whether the camera is a contributing factor to that
-    // freeze, independent of everything already tried. /stream.mjpeg still responds
-    // (503, camera disabled) rather than hanging open with no explanation. Revert
-    // to true once isolated either way — this is not meant to ship disabled.
-    private static final boolean CAMERA_ENABLED = false;
+    // U18's diagnostic isolation is done: the drive freezes it was checking the
+    // camera against turned out to be ServiceExam's own SocialInteraction_SpeechChat
+    // shared lock (see DirectMotorDriver's class javadoc), now moot since driving no
+    // longer goes through ServiceExam's AIDL surface at all, and the camera lifecycle
+    // bugs from around the same time (async-close race, then that fix's own blocking
+    // wait on the main thread) are separately fixed in CameraCapture. Re-enabled.
+    private static final boolean CAMERA_ENABLED = true;
 
     void startCamera() {
         if (!CAMERA_ENABLED) {
