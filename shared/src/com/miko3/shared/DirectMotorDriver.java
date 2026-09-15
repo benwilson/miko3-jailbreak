@@ -197,25 +197,39 @@ public final class DirectMotorDriver {
     }
 
     /**
-     * The held-drive command — sends a 150ms kick+sustain sequence (see
-     * buildSustainedFrame()'s javadoc) instead of repeated single ~100ms
-     * buildFrame() pulses. REPLACES the original design of calling drive() every
-     * 80ms for as long as a direction is held: confirmed live (2026-09-15) that
-     * repeated single-frame resends this fast caused forward driving specifically
-     * to move only a slight amount, then stop, then repeat on a fixed ~10s cycle —
-     * consistent with the motor firmware's own stall/overload protection
-     * misfiring because linear motion (more resistance than in-place turning)
-     * never got a long enough uninterrupted window to register real movement
-     * before each resend reset it. ServiceExam's own confirmed-live held-drive
-     * feature (TeleConnect's video-call remote control) never re-fires a motion
-     * command faster than ~500ms apart — callers of this method should match
-     * that cadence, not the old 80ms one.
+     * The held-TURN command — matches ServiceExam's own TeleConnect held-drive
+     * feature's leftContinous_new/rightContinous_new exactly (type=24, loop=1,
+     * two-frame kick=25/sustain=8): self-sustains once sent, does not need
+     * resending. Only the SIGN of angular is used (fixed vendor magnitudes, not
+     * scaled) — see buildTurnFrame()'s own javadoc. Do not use this for linear
+     * motion (forward/back) — see driveContinuous() below for why that needs a
+     * completely different shape.
      */
-    public synchronized void driveSustained(int linear, int angular) throws IOException {
+    public synchronized void driveTurnSustained(int angular) throws IOException {
         if (out == null) {
             throw new IOException("not connected");
         }
-        out.write(buildSustainedFrame(linear, angular));
+        out.write(buildTurnFrame(angular > 0));
+        out.flush();
+    }
+
+    /**
+     * The held-LINEAR-drive command (forward/back) — matches ServiceExam's own
+     * TeleConnect held-drive feature's frontContinous exactly (type=1, loop=0,
+     * single frame, time=10): does NOT self-sustain, MUST be resent every tick
+     * (U19j, 2026-09-15's own confirmed-live magnitude of 2 — see
+     * buildContinuousFrame()'s own javadoc for the full story of why the
+     * earlier type=25/loop=1 "Explore" shape looked right in short isolated
+     * tests but degraded under real repeated use, and why this is the actual
+     * correct recipe instead). Callers must resend this periodically (this
+     * project's own DriveSection.java uses 250ms) for as long as the direction
+     * is held, and call stop() on release.
+     */
+    public synchronized void driveContinuous(int linear, int angular) throws IOException {
+        if (out == null) {
+            throw new IOException("not connected");
+        }
+        out.write(buildContinuousFrame(linear, angular));
         out.flush();
     }
 
@@ -294,31 +308,28 @@ public final class DirectMotorDriver {
     }
 
     /**
-     * A two-frame VEL1 sequence, byte-for-byte matching the on-device idle-mode
-     * "Explore" behavior's own motion payload (U19e, 2026-09-15) —
-     * /sdcard/klug/APPS/expressions/AutoMode/Explore/Linear.txt's "mx" field:
-     * motion_type=4, loop=1, seqCount=2, frame1 time=40 (400ms) + frame2 time=2
-     * (20ms), BOTH frame.type=25. This superseded an earlier, WRONG guess
-     * (frame.type=24, times 5/10) that was reverse-engineered from ServiceExam's
-     * TeleConnect held-drive feature and looked plausible from source but was never
-     * actually confirmed live for sustained motion — confirmed live instead (this
-     * session) that repeated type=24 frames, at any resend cadence or magnitude
-     * (20, 5, 2 all tried), moved the robot for ~300ms then froze for a fixed ~10s,
-     * repeating, REGARDLESS of continued valid resends — while a single type=25
-     * frame with this exact shape, sent ONCE, drove continuously (encoder-confirmed
-     * via GLPOS telemetry incrementing every ~100ms with zero gaps) for 8+ seconds
-     * until a real edge/obstacle safety veto (CPL=2) stopped it. type=1 (buildFrame,
-     * used for turning) was never observed to have this stall behavior — only
-     * sustained linear motion did, matching type=25 being specifically the
-     * MCU-side "continuous drive" frame type the vendor's own AutoMode/idle
-     * exploration uses, vs. type=24's presumed one-shot/bounded semantics.
-     * Do not revert to type=24 or invent different frame1/frame2 times without a
-     * live encoder-telemetry test proving the stall pattern is actually gone —
-     * "no exception, CPL=1 every time" is NOT sufficient (see this session's own
-     * "confirmed" log evidence for type=24: it reported CPL=1 success continuously
-     * while the wheel encoders were provably frozen).
+     * A two-frame VEL1 sequence for TURNING ONLY, byte-for-byte matching
+     * ServiceExam's TeleConnect.leftContinous_new/rightContinous_new (U19k,
+     * 2026-09-15) — found by pulling and decompiling this robot's actual
+     * companion phone app (com.miko.mikoplus) and cross-referencing
+     * ServiceClientInterface.java's own playExpressionMap constants: type=24,
+     * loop=1, seqCount=2, kick angular=±25 (50ms) + sustain angular=±8 (100ms),
+     * linear always 0. Magnitudes are FIXED vendor constants, not scaled by the
+     * caller's own angular value — only its sign selects left vs. right.
+     *
+     * This session earlier guessed a DIFFERENT shape for turning AND forward
+     * alike (type=25/loop=1, symmetric magnitude, times 40/2 — the vendor's
+     * AUTONOMOUS idle-wandering recipe from AutoMode/Explore/Linear.txt, not
+     * any held-drive feature). That guess happened to test fine for turning in
+     * isolation but was never the real recipe; forward degraded badly under
+     * real repeated use with it (see driveContinuous()/buildContinuousFrame()'s
+     * own javadoc for the full story and why forward needed a completely
+     * different fix). Turning has stayed reliable throughout using it, but this
+     * is the actual vendor-confirmed shape now that it's been found — matching
+     * it exactly is safer long-term than continuing on the shape that happened
+     * to work.
      */
-    static byte[] buildSustainedFrame(int linear, int angular) {
+    static byte[] buildTurnFrame(boolean positive) {
         byte[] frame = new byte[FRAME_SIZE];
         int i = 0;
         frame[i++] = 'V';
@@ -329,18 +340,70 @@ public final class DirectMotorDriver {
         i = writeUnsigned3(frame, i, 4);  // MotionMsg's own "type"
         i = writeUnsigned3(frame, i, 39); // datasize -- 15-byte header + 2x12-byte frames
         i = writeUnsigned3(frame, i, 4);  // motion_type
-        i = writeUnsigned3(frame, i, 1);  // loop
+        i = writeUnsigned3(frame, i, 1);  // loop -- self-sustains, matches leftContinous_new
         i = writeUnsigned3(frame, i, 2);  // seqCount -- two frames
-        // Frame 1: matches Explore/Linear.txt's first frame (400ms).
+        int kick = positive ? 25 : -25;
+        int sustain = positive ? 8 : -8;
+        // Frame 1: the kick (50ms).
+        i = writeSigned3(frame, i, 0);
+        i = writeSigned3(frame, i, kick);
+        i = writeUnsigned3(frame, i, 5);
+        i = writeUnsigned3(frame, i, 24); // frame.type=24 -- matches leftContinous_new/rightContinous_new
+        // Frame 2: the sustain (100ms).
+        i = writeSigned3(frame, i, 0);
+        i = writeSigned3(frame, i, sustain);
+        i = writeUnsigned3(frame, i, 10);
+        i = writeUnsigned3(frame, i, 24);
+        for (; i < FRAME_SIZE; i++) {
+            frame[i] = 'X';
+        }
+        return frame;
+    }
+
+    /**
+     * A single VEL1 frame for LINEAR DRIVE ONLY (forward/back), byte-for-byte
+     * matching ServiceExam's TeleConnect.frontContinous (U19j, 2026-09-15) —
+     * type=1, loop=0, seqCount=1, time=10 (100ms), magnitude 2. Found the same
+     * way as buildTurnFrame() above.
+     *
+     * loop=0 means this does NOT self-sustain — it must be resent by the
+     * caller for as long as the direction is held (driveContinuous()'s own
+     * javadoc has the calling contract). This is the OPPOSITE of
+     * buildTurnFrame()'s loop=1 self-sustaining shape, and that asymmetry is
+     * real, not an oversight: there is no "backContinous"/frontContinous
+     * loop=1 variant anywhere in the vendor source at all. Confirmed live
+     * (encoder/GLPOS telemetry, not just a CPL=1 ack) that resending THIS
+     * exact frame every 250ms, entirely outside ServiceExam's own process (raw
+     * /dev/ttyS2 writes via scripts/bypass-drive-test.py --shape single, with
+     * both mode-remote-control and ServiceExam force-stopped), drives
+     * continuously and reliably. The earlier type=25/loop=1 "Explore"
+     * (autonomous idle-wandering) shape was WRONG for this direction — it
+     * looked reliable in short isolated tests (including sent once through
+     * this same raw-serial path) but consistently degraded into a lurch/
+     * freeze cycle under real repeated production use, on both this
+     * class's own write path AND ServiceExam's own GameEvent() AIDL call.
+     * Do not go back to a self-sustaining loop=1 shape for forward/back
+     * without a live encoder-telemetry test across many real repeated holds,
+     * not just one or two short ones — that is exactly the kind of test that
+     * validated the wrong shape before.
+     */
+    static byte[] buildContinuousFrame(int linear, int angular) {
+        byte[] frame = new byte[FRAME_SIZE];
+        int i = 0;
+        frame[i++] = 'V';
+        frame[i++] = 'E';
+        frame[i++] = 'L';
+        frame[i++] = '1';
+        frame[i++] = '=';
+        i = writeUnsigned3(frame, i, 4);  // MotionMsg's own "type"
+        i = writeUnsigned3(frame, i, 27); // datasize -- 15-byte header + 1x12-byte frame
+        i = writeUnsigned3(frame, i, 4);  // motion_type
+        i = writeUnsigned3(frame, i, 0);  // loop=0 -- does NOT self-sustain, see this method's own javadoc
+        i = writeUnsigned3(frame, i, 1);  // seqCount -- single frame
         i = writeSigned3(frame, i, linear);
         i = writeSigned3(frame, i, angular);
-        i = writeUnsigned3(frame, i, 40);
-        i = writeUnsigned3(frame, i, 25); // frame.type=25 -- see this method's own javadoc
-        // Frame 2: matches Explore/Linear.txt's second frame (20ms).
-        i = writeSigned3(frame, i, linear);
-        i = writeSigned3(frame, i, angular);
-        i = writeUnsigned3(frame, i, 2);
-        i = writeUnsigned3(frame, i, 25);
+        i = writeUnsigned3(frame, i, 10); // time=10 (100ms) -- matches frontContinous
+        i = writeUnsigned3(frame, i, 1);  // frame.type=1 -- matches frontContinous
         for (; i < FRAME_SIZE; i++) {
             frame[i] = 'X';
         }

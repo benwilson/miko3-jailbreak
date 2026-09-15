@@ -10,46 +10,49 @@ import android.os.IBinder;
 import android.os.RemoteException;
 import android.util.Log;
 
+import com.miko3.shared.DirectMotorDriver;
 import com.miko3.shared.DriveLease;
 import com.miko3.shared.LauncherProtocol;
-import com.miko3.shared.RobotControlClient;
+
+import java.io.IOException;
 
 /**
- * Wires the mode's drive HTTP routes to RobotControlClient (ServiceExam's own
- * GameEvent(135) AIDL surface) through U3's DriveLease coordinator, per
- * R5/R13/R15/R16/R17 (U7). Acquires the lease on start, runs a renew() loop
- * well under the coordinator's TTL, runs a local drive-command watchdog
- * independent of the coordinator, and — R15's backstop — commands its own
- * stop if the coordinator becomes unreachable, since no coordinator remains
- * to do it.
+ * Wires the mode's drive HTTP routes to DirectMotorDriver (a direct
+ * /dev/ttyS2 writer, bypassing ServiceExam's AIDL surface entirely) through
+ * U3's DriveLease coordinator, per R5/R13/R15/R16/R17 (U7). Acquires the
+ * lease on start, runs a renew() loop well under the coordinator's TTL,
+ * runs a local drive-command watchdog independent of the coordinator, and —
+ * R15's backstop — commands its own stop if the coordinator becomes
+ * unreachable, since no coordinator remains to do it.
  *
- * U19h REVERSAL (2026-09-15): U21 had switched this to DirectMotorDriver (a
- * direct /dev/ttyS2 writer bypassing ServiceExam entirely) specifically to
- * avoid ServiceExam's confirmed shared-lock/CPU contention. That tradeoff no
- * longer holds: exhaustive live testing this session (raw serial writes, the
- * real libmiko_drivers.so loaded directly into a different process matching
- * its exact synchronized write+read+ERROR_UART protocol, DirectMotorDriver's
- * own repeated writes) could NOT reproduce sustained, non-stalling drive
- * motion outside ServiceExam's own process no matter how faithfully the wire
- * bytes were replicated — something about staying inside ServiceExam's own
- * session is load-bearing, not just the frame content. Confirmed instead
- * (GLPOS/encoder telemetry, not just a CPL=1 ack) that ServiceExam's own
- * GameEvent(135) AIDL call, sent ONCE per direction with the vendor's own
- * loop=1 "Explore" sustained-drive shape (RobotControlClient.driveSustained(),
- * magnitude 2 — see that method's own javadoc), drives smoothly and
- * continuously for as long as held. This DOES require ServiceExam to be
- * enabled and running (see ensureServiceExamEnabled()) — accepted as a real
- * tradeoff now that DirectMotorDriver's bypass has been shown incapable of
- * sustained motion at all, not just rougher.
+ * U19l REVERSAL (2026-09-15, same day as U19h below): back to DirectMotorDriver,
+ * ServiceExam no longer involved in the drive path at all. U19h had switched
+ * to RobotControlClient (ServiceExam's own GameEvent(135) AIDL) reasoning that
+ * exhaustive testing couldn't reproduce sustained motion outside ServiceExam's
+ * own process "no matter how faithfully the wire bytes were replicated" — that
+ * reasoning was real but incomplete: every one of those bypass tests used the
+ * WRONG frame shape (type=25/loop=1, the vendor's AUTONOMOUS idle-wandering
+ * recipe), never the actual TeleConnect held-drive recipes
+ * (frontContinous/leftContinous_new/rightContinous_new — see
+ * DirectMotorDriver.buildContinuousFrame()/buildTurnFrame()'s own javadoc,
+ * found by decompiling this robot's actual companion phone app) that were
+ * only discovered afterward and, by then, only ever wired through
+ * RobotControlClient. Confirmed live (2026-09-15, later the same day) that
+ * the CORRECT frame shapes, sent via this class's own raw /dev/ttyS2 writes
+ * with ServiceExam fully disabled the entire time
+ * (scripts/bypass-drive-test.py --shape single --frame-type 1 --t1 10
+ * --loop 0), drive continuously and reliably for a full 15s hold — closing
+ * the gap U19h's testing left open. ServiceExam is not required for reliable
+ * driving after all; the CPU/lock-contention cost of keeping it enabled and
+ * running (see [[miko3-camera-hal-cpu-bug]]-adjacent concerns) is not a
+ * tradeoff this app needs to accept anymore.
  */
 final class DriveController {
     private static final String TAG = "DriveController";
     private static final long RENEW_INTERVAL_MS = 1000; // comfortably under KTD3's ~2.25s TTL
-    // 1200, not 750: matches DriveSection.java's own repeat interval, now 500ms
-    // (was 80ms) -- see driveSustained()'s javadoc for why the resend cadence had
-    // to change. 1200 keeps roughly the same multiple-of-the-repeat-interval
-    // margin the old 750/80 pairing had, without being so tight that ordinary
-    // timer jitter on a 500ms cadence false-triggers a stop mid-hold.
+    // 1200: comfortably above both DriveSection.java's repeat intervals (250ms for
+    // forward, 500ms for everything else) without being so tight that ordinary timer
+    // jitter false-triggers a stop mid-hold.
     private static final long WATCHDOG_MS = 1200;
 
     interface ErrorListener {
@@ -79,25 +82,21 @@ final class DriveController {
     private final IBinder deathToken = new Binder();
     private final ErrorListener errorListener;
 
-    private RobotControlClient robotClient;
-    private volatile boolean robotClientConnected;
+    private DirectMotorDriver motorDriver;
     private DriveLease lease;
     private volatile boolean leaseHeld;
     private volatile boolean coordinatorUnreachable;
 
     /** The direction actually sent to the motor last, so repeat calls with the same
-     * (linear, angular) — DriveSection.java's own 500ms held-key resend — are treated
-     * as a watchdog-only keepalive instead of resending the motor command. Resending
-     * driveSustained() on every call, rather than only on a real direction change, is
-     * exactly what reintroduced the lurch/freeze stall this session spent a long time
-     * root-causing (see RobotControlClient.driveSustained()'s own javadoc) — its
-     * loop=1 shape self-sustains once sent; sending it again while the same direction
-     * is already active interrupts and restarts the motion instead of extending it. */
+     * (linear, angular) for TURNING (self-sustaining, loop=1) are treated as a
+     * watchdog-only keepalive instead of resending the motor command — resending an
+     * unchanged turn would interrupt and restart it instead of extending it. Pure
+     * forward/back is the deliberate exception: see drive()'s own comment. */
     private int activeLinear;
     private int activeAngular;
     private boolean hasSentDirection;
 
-    /** Guards leaseHeld together with the actual robotClient.drive()/stop() calls and
+    /** Guards leaseHeld together with the actual motorDriver.drive()/stop() calls and
      * the watchdog schedule, so a concurrent HTTP thread's drive() and another thread's
      * release() (e.g. the UI's "Exit mode" running on the main thread) can't interleave
      * into a state where a drive command is sent after the lease was already released —
@@ -172,26 +171,14 @@ final class DriveController {
     }
 
     void start() {
-        ensureServiceExamEnabled();
-        robotClient = new RobotControlClient(context, new RobotControlClient.Listener() {
-            @Override
-            public void onConnected() {
-                robotClientConnected = true;
-                Log.i(TAG, "RobotControlClient connected");
-            }
-
-            @Override
-            public void onDisconnected() {
-                robotClientConnected = false;
-                Log.w(TAG, "RobotControlClient disconnected");
-            }
-
-            @Override
-            public void onSendFailed(RemoteException e) {
-                Log.e(TAG, "RobotControlClient send failed", e);
-            }
-        });
-        robotClient.connect();
+        // Synchronous — DirectMotorDriver's connect() only opens /dev/ttyS2 and
+        // starts its own POWER keepalive thread, nothing that needs to wait on
+        // ServiceExam or any other external service (see U19l's own class javadoc
+        // for why ServiceExam is no longer involved in the drive path at all).
+        motorDriver = new DirectMotorDriver();
+        if (!motorDriver.connect()) {
+            Log.e(TAG, "DirectMotorDriver connect() failed");
+        }
 
         Intent intent = new Intent(LauncherProtocol.DRIVE_LEASE_ACTION);
         intent.setPackage(LauncherProtocol.LAUNCHER_PACKAGE);
@@ -262,26 +249,22 @@ final class DriveController {
             }
             handler.removeCallbacks(watchdog);
             boolean isStop = linear == 0 && angular == 0;
-            // U19i (2026-09-15): pure FORWARD (linear>0, angular==0) is special-cased to
-            // ALWAYS resend, matching com.teleconnect.TeleConnect's own frontContinous —
-            // confirmed from source that forward uses type=1/loop=0 (does NOT self-sustain,
-            // must be resent) at a fixed magnitude of 2, unlike turning's type=24/loop=1
-            // (self-sustains, sent once) that leftContinous_new/rightContinous_new use.
-            // There is no "backContinous" anywhere in the vendor source at all — TeleConnect
-            // doesn't support held backward driving — so backward keeps using the same
-            // send-once driveSustained() path as turning, which live testing confirmed
-            // works well for both. Forward alone was being sent through the turning-style
-            // shape this whole time, which is what kept degrading after repeated use; a
-            // command actually matching the vendor's own forward recipe, resent every tick
-            // like the real app does, is the only remaining untried, fully vendor-accurate
-            // combination for forward specifically.
-            boolean pureForward = linear > 0 && angular == 0;
-            if (pureForward) {
-                if (!robotClientConnected) {
-                    throw new RemoteException("RobotControlClient not connected");
+            // Pure forward/back (angular==0, linear!=0) is special-cased to ALWAYS
+            // resend, matching TeleConnect's own frontContinous shape (loop=0, does
+            // NOT self-sustain — see DirectMotorDriver.buildContinuousFrame()'s own
+            // javadoc). This is the opposite of turning below, whose loop=1 shape
+            // self-sustains once sent and would be interrupted by resending it.
+            boolean pureLinear = angular == 0 && linear != 0;
+            if (pureLinear) {
+                try {
+                    // Fixed magnitude 2, matching frontContinous exactly — sign only,
+                    // not the browser's own ±20 button value (see buildContinuousFrame()'s
+                    // javadoc: this magnitude is a vendor constant, not scaled).
+                    motorDriver.driveContinuous(linear > 0 ? 2 : -2, 0);
+                } catch (IOException e) {
+                    throw new RemoteException(e.getMessage());
                 }
-                Log.i(TAG, "drive() pure forward -> driveContinuous (always resent, matches frontContinous)");
-                robotClient.driveContinuous(2, 0);
+                Log.i(TAG, "drive() pure forward/back -> driveContinuous (always resent, matches frontContinous)");
                 activeLinear = linear;
                 activeAngular = angular;
                 hasSentDirection = true;
@@ -289,23 +272,25 @@ final class DriveController {
                 return;
             }
             boolean directionChanged = !hasSentDirection || linear != activeLinear || angular != activeAngular;
-            // U19h: for every OTHER direction (turning, backward, stop) only actually send a
-            // motor command when the direction changes (or this is the first command of a
-            // hold) -- see this class's own javadoc and activeLinear/activeAngular's field
-            // comment for why resending an unchanged direction on every held-key tick, rather
-            // than treating repeats as a watchdog-only keepalive, reintroduces the
-            // lurch/freeze stall for THESE shapes (their loop=1 self-sustains; forward's
-            // loop=0 above is the deliberate exception). A command that repeats the
-            // already-active direction just renews the watchdog below.
+            // For turning and stop: only actually send a motor command when the
+            // direction changes (or this is the first command of a hold) — turning's
+            // loop=1 shape self-sustains, so resending an unchanged direction on every
+            // held-key tick would interrupt and restart it instead of extending it. A
+            // command that repeats the already-active direction just renews the
+            // watchdog below.
             if (directionChanged) {
-                if (!robotClientConnected) {
-                    throw new RemoteException("RobotControlClient not connected");
-                }
                 Log.i(TAG, "drive() direction CHANGED -> sending to motor: linear=" + linear + " angular=" + angular);
-                if (isStop) {
-                    robotClient.stop();
-                } else {
-                    robotClient.driveSustained(linear, angular);
+                try {
+                    if (isStop) {
+                        motorDriver.stop();
+                    } else {
+                        // angular != 0 here (pureLinear handled above, isStop handled here) —
+                        // fixed vendor kick/sustain magnitudes, sign only (see
+                        // buildTurnFrame()'s own javadoc).
+                        motorDriver.driveTurnSustained(angular);
+                    }
+                } catch (IOException e) {
+                    throw new RemoteException(e.getMessage());
                 }
                 activeLinear = linear;
                 activeAngular = angular;
@@ -340,10 +325,10 @@ final class DriveController {
             activeAngular = 0;
             hasSentDirection = true;
         }
-        if (robotClient != null && robotClientConnected) {
+        if (motorDriver != null && motorDriver.isConnected()) {
             try {
-                robotClient.stop();
-            } catch (RemoteException e) {
+                motorDriver.stop();
+            } catch (IOException e) {
                 Log.e(TAG, "stop() failed during watchdog/backstop", e);
             }
         }
@@ -382,46 +367,9 @@ final class DriveController {
         } catch (IllegalArgumentException ignored) {
             // never bound
         }
-        if (robotClient != null) {
-            robotClient.disconnect();
+        if (motorDriver != null) {
+            motorDriver.disconnect();
         }
         handlerThread.quitSafely();
-    }
-
-    /** RobotControlClient's GameEvent(135) AIDL path (see this class's own javadoc
-     * for why the drive path switched back to it) requires ServiceExam actually
-     * running, but this jailbreak's other components (launcher, camera-CPU-bug
-     * mitigation) deliberately keep it disabled otherwise — enable it here, on
-     * entering drive mode specifically, via su (matching the same pattern
-     * ServiceExam's own SensorModule.initGPIO() uses for its own chmod calls),
-     * since a regular app can't toggle another package's enabled state itself. */
-    private void ensureServiceExamEnabled() {
-        // Full path, bare stdin close (no "exit") -- matches bootagent/RootOps.java's own
-        // proven-working su invocation pattern on this device; a bare "su" on PATH was NOT
-        // independently confirmed here and is exactly the kind of thing that silently no-ops.
-        Process suProcess = null;
-        try {
-            suProcess = Runtime.getRuntime().exec("/system/bin/su");
-            java.io.OutputStream out = suProcess.getOutputStream();
-            out.write("pm enable com.example.root.serviceexam\n".getBytes("UTF-8"));
-            out.flush();
-            out.close();
-            boolean finished = suProcess.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
-            if (!finished) {
-                Log.e(TAG, "enabling ServiceExam via su timed out — drive commands may no-op");
-                return;
-            }
-            int rc = suProcess.exitValue();
-            Log.i(TAG, "pm enable com.example.root.serviceexam via su exit=" + rc);
-            if (rc != 0) {
-                Log.e(TAG, "pm enable ServiceExam via su exited non-zero: " + rc + " — drive commands may no-op");
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "failed to enable ServiceExam via su — drive commands may no-op", e);
-        } finally {
-            if (suProcess != null) {
-                suProcess.destroy();
-            }
-        }
     }
 }

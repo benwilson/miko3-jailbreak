@@ -88,18 +88,18 @@ final class DriveSection {
             + "var linear=btn.getAttribute('data-linear');"
             + "var angular=btn.getAttribute('data-angular');"
             + "drive(linear,angular);"
-            // U19i (2026-09-15): pure forward (linear>0, angular==0) is DriveController's
-            // own special case now -- it resends every tick via RobotControlClient.
-            // driveContinuous(), matching TeleConnect's real frontContinous recipe (see
-            // DriveController.drive()'s own comment), instead of the send-once
-            // driveSustained() every other direction uses. A shorter repeat interval
+            // U19i/U19l (2026-09-15): pure forward/back (angular==0, linear!=0) is
+            // DriveController's own special case now -- it resends every tick via
+            // DirectMotorDriver.driveContinuous(), matching TeleConnect's real
+            // frontContinous recipe (see DriveController.drive()'s own comment), instead
+            // of the send-once driveTurnSustained() turning uses. A shorter repeat interval
             // shrinks the visible pause between each ~100ms forward pulse; 100ms was
             // tried and was visibly jerky (motor-restart artifacts each tick), so 250ms
             // is a middle ground -- do not drop it further without confirming live that
             // the jerkiness hasn't come back. Every other direction keeps the proven
             // 500ms cadence (its own send-once/self-sustaining shape has no reason to
             // resend faster, and this session found no benefit from doing so for those).
-            + "var interval=(parseInt(linear,10)>0&&parseInt(angular,10)===0)?250:500;"
+            + "var interval=(parseInt(linear,10)!==0&&parseInt(angular,10)===0)?250:500;"
             + "repeatTimer=setInterval(function(){drive(linear,angular);},interval);"
             + "}"
             + "function stopHold(){"
