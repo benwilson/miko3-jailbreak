@@ -64,6 +64,10 @@ def main() -> int:
     ap.add_argument("--t1", type=int, default=5)
     ap.add_argument("--t2", type=int, default=10)
     ap.add_argument("--interval", type=float, default=0.5)
+    ap.add_argument("--warmup", type=float, default=0,
+                     help="seconds of POWER-only keepalive before the first drive frame")
+    ap.add_argument("--with-reader", action="store_true",
+                     help="also run a background reader draining /dev/ttyS2, matching ServiceExam")
     args = ap.parse_args()
 
     power = tagged_frame(b"POWER", POWER_FRAME_SIZE)
@@ -83,12 +87,17 @@ def main() -> int:
     adb(args.serial, "shell", "am", "force-stop", "com.example.root.serviceexam")
 
     drive_iters = max(1, round(args.seconds / args.interval))
-    power_iters = max(1, round(args.seconds * 1000 / 100)) + 20
+    total_power_seconds = args.seconds + args.warmup
+    power_iters = max(1, round(total_power_seconds * 1000 / 100)) + 20
 
+    reader_start = 'cat <&3 > /dev/null &\nREADERPID=$!\n' if args.with_reader else ''
+    reader_kill = 'kill $READERPID 2>/dev/null\n' if args.with_reader else ''
     script = f"""
-exec 3>/dev/ttyS2
-( for i in $(seq 1 {power_iters}); do cat {tmp}/power.bin >&3; sleep 0.1; done ) &
+exec 3<>/dev/ttyS2
+{reader_start}( for i in $(seq 1 {power_iters}); do cat {tmp}/power.bin >&3; sleep 0.1; done ) &
 POWERPID=$!
+echo "warming up POWER-only keepalive for {args.warmup}s..."
+sleep {args.warmup}
 for i in $(seq 1 {drive_iters}); do
   cat {tmp}/drive.bin >&3
   echo "sent drive frame $i at $(date +%s.%N)"
@@ -96,7 +105,7 @@ for i in $(seq 1 {drive_iters}); do
 done
 cat {tmp}/stop.bin >&3
 kill $POWERPID 2>/dev/null
-exec 3>&-
+{reader_kill}exec 3>&-
 echo DONE
 """
     print(f"Driving linear={args.linear} angular={args.angular} for ~{args.seconds}s, "

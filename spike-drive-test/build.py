@@ -17,6 +17,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "src"
+SHARED_SRC = HERE.parent / "shared" / "src"
 MANIFEST = HERE / "AndroidManifest.xml"
 BUILD = HERE / "build"
 KEYSTORE = HERE / "spiketest.keystore"
@@ -61,6 +62,8 @@ def main():
 
     print("== 1/5 javac ==")
     sources = [str(p) for p in sorted(SRC.rglob("*.java"))]
+    sources += [str(SHARED_SRC / "com" / "miko3" / "shared" / "DirectMotorDriver.java"),
+                str(SHARED_SRC / "com" / "miko3" / "shared" / "RobotControlClient.java")]
     run([javac, "-source", "8", "-target", "8", "-encoding", "UTF-8",
          "-bootclasspath", str(android_jar), "-classpath", str(android_jar),
          "-d", str(obj)] + sources)
@@ -76,6 +79,21 @@ def main():
     withdex = BUILD / "withdex.apk"
     shutil.copy(unsigned, withdex)
     run(["zip", "-jq", str(withdex), str(BUILD / "classes.dex")])
+
+    # Bundle our own copy of libmiko_drivers.so (same one ServiceExam ships,
+    # pulled from tools/serviceexam_jadx/resources/lib/arm64-v8a/) so
+    # System.loadLibrary("miko_drivers") resolves it as this app's own native
+    # lib -- loading /system/lib64/libmiko_drivers.so directly via an absolute
+    # System.load() path is blocked by Android's linker namespace isolation
+    # (confirmed live: UnsatisfiedLinkError, "not accessible for the namespace
+    # classloader-namespace"), even though the file itself is world-readable.
+    vendor_so = HERE.parent / "tools" / "serviceexam_jadx" / "resources" / "lib" / "arm64-v8a" / "libmiko_drivers.so"
+    if vendor_so.exists():
+        lib_dir = BUILD / "lib_stage" / "lib" / "arm64-v8a"
+        lib_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(vendor_so, lib_dir / "libmiko_drivers.so")
+        run(["zip", "-q", str(withdex), "lib/arm64-v8a/libmiko_drivers.so"],
+            cwd=str(BUILD / "lib_stage"))
 
     print("== 4/5 zipalign + sign ==")
     aligned = BUILD / "aligned.apk"
