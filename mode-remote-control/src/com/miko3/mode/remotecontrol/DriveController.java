@@ -213,6 +213,14 @@ final class DriveController {
     /** @throws StaleClientException if token is no longer the active client (R17) */
     void drive(String token, int linear, int angular) throws RemoteException {
         synchronized (driveLock) {
+            // TEMPORARY diagnostic (U19b): logs every drive() call with elapsedRealtime
+            // so a reported "stuck"/"doesn't stop" episode can be correlated precisely
+            // against real operator input after the fact, rather than relying only on
+            // how it felt live. Remove once the camera-CPU fix (f1842d5) is confirmed
+            // against real physical hold-and-release input, not just synthetic/CDP
+            // browser automation (see this session's own goal-check discussion).
+            Log.i(TAG, "drive() linear=" + linear + " angular=" + angular
+                    + " t=" + android.os.SystemClock.elapsedRealtime());
             if (!acceptsClient(token)) {
                 throw new StaleClientException();
             }

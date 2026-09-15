@@ -236,6 +236,13 @@ public class ModeApp extends Application {
                         // exactly the "works once, then nothing for 750ms+" failure
                         // pattern confirmed live, even though the browser kept sending
                         // right on schedule the whole time.
+                        // TEMPORARY diagnostic (U19b, see DriveController.drive()'s own
+                        // matching log): timestamps WS message receipt so a real hold-and-
+                        // release test's delay (if any) can be localized to socket read vs.
+                        // coalescing dispatch vs. the actual motor write. Remove alongside
+                        // that other log once confirmed against real physical input.
+                        Log.i(TAG, "drive-ws recv \"" + msg + "\" t="
+                                + android.os.SystemClock.elapsedRealtime());
                         if (msg.startsWith("drive ")) {
                             String[] parts = msg.substring(6).trim().split("\\s+");
                             if (parts.length >= 2) {
