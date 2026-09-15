@@ -2,8 +2,8 @@ package com.miko3.shared;
 
 import android.util.Log;
 
+import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -100,36 +100,27 @@ public final class DirectMotorDriver {
      * the tag itself; confirmed via strace against ServiceExam's own write() calls. */
     private static final byte[] POWER_FRAME = buildPowerFrame();
 
-    private Process suProcess;
-    private OutputStream out;
+    private FileOutputStream out;
     private Thread keepaliveThread;
     private volatile boolean keepaliveRunning;
 
     /**
-     * Opens a root shell and starts a `cat` redirecting its stdin to the UART
-     * device. Everything written to this instance's stream after this point
-     * goes straight to the device, byte for byte, with no shell
-     * interpretation — the command line below hands the shell's own stdin
-     * (which is this process's OutputStream) off to `cat` as its child's
-     * stdin; from then on we're feeding `cat`'s raw-copy loop, not a shell
-     * parser, so arbitrary binary content (including bytes that happen to
-     * look like shell metacharacters or newlines) is safe to write.
+     * Opens the UART device directly — no su, no shell, no subprocess at all.
+     * Confirmed live this session that root was never actually required here:
+     * /dev/ttyS2 is chmod 0666 (world read/write) and this device's SELinux
+     * policy is permissive (denials logged, never enforced), so a plain
+     * FileOutputStream from this app's own unprivileged process opens and
+     * writes to it exactly as successfully as "adb shell cat > /dev/ttyS2"
+     * does with no su involved. An earlier version of this class spent a
+     * long detour trying to get su to elevate from inside the app process
+     * (ProcessBuilder("su"), then the full path "/system/bin/su", matching
+     * bootagent/RootOps.java's own documented pattern) before empirically
+     * confirming, via a bare "adb shell" write with no su prefix, that su
+     * was solving a problem that didn't exist for this specific device node.
      */
     public synchronized boolean connect() {
         try {
-            // Full path, not bare "su": confirmed live (this session's own testing) that
-            // a bare "su" invoked via ProcessBuilder from an app's own process does NOT
-            // actually elevate to root the way "adb shell su -c ..." does -- the child
-            // process silently ran as this app's own unprivileged UID instead, with no
-            // exception thrown, no error, just a normal-looking exit. bootagent/RootOps.
-            // java independently hit and solved the exact same problem for this exact
-            // device's su via Runtime.getRuntime().exec("/system/bin/su") -- matching that
-            // proven-working invocation here rather than relying on PATH resolution,
-            // which apparently differs between an app process and an interactive shell.
-            suProcess = new ProcessBuilder("/system/bin/su").redirectErrorStream(true).start();
-            out = suProcess.getOutputStream();
-            out.write(("cat > " + DEVICE_PATH + "\n").getBytes(StandardCharsets.US_ASCII));
-            out.flush();
+            out = new FileOutputStream(DEVICE_PATH);
             startKeepalive();
             return true;
         } catch (IOException e) {
@@ -195,9 +186,9 @@ public final class DirectMotorDriver {
 
     public void disconnect() {
         // Stops the keepalive thread's loop and waits for it to actually exit BEFORE
-        // tearing down out/suProcess below — it reads those same fields under this
-        // instance's monitor each iteration, so signaling it to stop without waiting
-        // could otherwise race a concurrent close() out from under its next write().
+        // tearing down out below — it reads that same field under this instance's
+        // monitor each iteration, so signaling it to stop without waiting could
+        // otherwise race a concurrent close() out from under its next write().
         keepaliveRunning = false;
         Thread t = keepaliveThread;
         if (t != null) {
@@ -214,11 +205,7 @@ public final class DirectMotorDriver {
                 }
             } catch (IOException ignored) {
             }
-            if (suProcess != null) {
-                suProcess.destroy();
-            }
             out = null;
-            suProcess = null;
         }
         keepaliveThread = null;
     }
