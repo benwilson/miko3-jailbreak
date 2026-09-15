@@ -1,5 +1,83 @@
 # Motors / wheels — locomotion hardware control
 
+## RESOLVED (final): sustained FORWARD driving specifically still jerked/paused after the type=25 fix below — root cause was using the wrong vendor recipe for forward, not a further hardware issue (2026-09-15, later same day)
+
+**Supersedes the section directly below's fix for forward specifically** (that
+section's `type=25`/`loop=1`/sent-once fix remains correct and in production
+for turning and backward — this section only changes forward).
+
+After shipping the `type=25` fix, forward regressed under real repeated
+production use back to "jerk once, then ~10s completely unresponsive,
+repeating" — even on a from-cold-boot, freshly power-cycled robot, which
+ruled out leftover app/process state as the cause. Root-caused by finding and
+decompiling this robot's actual companion phone app (`com.miko.mikoplus`,
+pulled live from `/data/app/.../base.apk`) and its `com.miko.mikonnect`
+video-call remote-control feature ("TeleConnect"), then cross-referencing
+against `ServiceClientInterface.java`'s own `playExpressionMap` constants:
+
+- **`frontContinous`** (real forward held-drive) is `type:1`, **`loop:0`**,
+  magnitude **2**, `time:10` — a single frame that does **not** self-sustain
+  and **must be resent** every tick.
+- **`leftContinous_new`/`rightContinous_new`** (real turning held-drive) is
+  `type:24`, **`loop:1`**, two-frame kick(25)+sustain(8) — self-sustains,
+  sent once.
+- There is **no `backContinous`** anywhere in the vendor source at all —
+  TeleConnect's real app doesn't support held backward driving as a distinct
+  action.
+
+This session's `type=25`/`loop=1` fix (previous section) was reverse-engineered
+from the vendor's *autonomous idle-wandering* behavior
+(`AutoMode/Explore/Linear.txt`), not from any human-driven teleop feature —
+and applying an autonomous-wandering shape to a live-driven forward hold is
+exactly what kept degrading under real, repeated, human-paced use, even
+though it looked identical (and briefly WAS reliable) in short isolated
+tests. The vendor's own phone app never uses a self-sustaining frame for
+forward, only for turning — direct evidence this is a genuine hardware/
+firmware limitation on sustained forward motion specifically, not a gap in
+either implementation.
+
+**Fix**: `DriveController.drive()` special-cases pure forward (`linear>0 &&
+angular==0`) to call `RobotControlClient.driveContinuous()` (the new
+`frontContinous`-shaped method) on **every** tick, unconditionally — the
+opposite of every other direction, which still dedupes to a single send per
+hold. `DriveSection.java`'s JS resends forward specifically every 250ms
+(vs. 500ms for every other direction) to shrink the resulting pause between
+pulses — confirmed live that 100ms is too fast (visible motor-restart
+jerkiness) and 250ms is an acceptable middle ground (a shorter but still
+visible pause, motion is otherwise smooth and reliable). Confirmed via both
+live operator observation over repeated real holds AND `GLPOS`/encoder
+telemetry (continuous, substantial movement for the full duration of a
+~9.7s hold, no flat/frozen stretch anywhere) that this combination is
+reliable where every non-vendor-matching shape eventually was not.
+
+**Architecture note**: this also reverses U21's DirectMotorDriver-bypasses-
+ServiceExam design back to RobotControlClient (ServiceExam's own
+`GameEvent(135)` AIDL surface) for the drive path specifically — exhaustive
+testing this session (raw `/dev/ttyS2` writes, `libmiko_drivers.so` loaded
+directly into a different process via its own real `createUART`/`initUART`/
+`writeUART` natives with the exact synchronized write+read+`ERROR_UART`
+protocol `SocialInteraction_SpeechChat.SendData()` uses, DirectMotorDriver's
+own repeated writes) could not reproduce sustained non-stalling forward
+motion outside ServiceExam's own process, no matter how faithfully the wire
+bytes were replicated. This requires ServiceExam to be enabled and running
+(`DriveController.ensureServiceExamEnabled()`, currently best-effort — its own
+`su` invocation from inside the app fails with exit 255 even though the same
+`pm enable` command works fine from an already-root adb shell, likely an
+unresolved superuser whitelist/grant gap specific to this app's UID; enable
+it externally via `adb shell pm enable com.example.root.serviceexam` until
+that's fixed).
+
+**Also fixed the same day**: the angular sign convention for left/right was
+backwards on this physical unit relative to the vendor source's own naming
+(`leftContinous_new` uses negative angular, `rightContinous_new` positive) —
+confirmed live that applying that convention turns the wrong physical way.
+`DriveSection.java`'s button `data-angular` values are flipped from the
+vendor's own convention to match this unit's actual observed turning
+direction; do not "fix" this back to match the vendor labels without
+re-confirming live which way the robot actually turns.
+
+---
+
 ## RESOLVED: sustained held-driving (forward, and by extension any direction) lurched ~300ms then froze ~10s, repeating — root cause was `frame.type`, not hardware (2026-09-15)
 
 **A regression on top of the section directly below.** After the ToF-pin fix
