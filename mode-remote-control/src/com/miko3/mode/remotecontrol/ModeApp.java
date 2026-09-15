@@ -64,6 +64,24 @@ public class ModeApp extends Application {
     private final java.util.concurrent.ExecutorService cameraExecutor =
             java.util.concurrent.Executors.newSingleThreadExecutor();
     private volatile String cameraError;
+    // Automatic on-device camera recovery (U19r, 2026-09-15): the operator has no
+    // adb/root access to this device in normal use, so a wedged camera used to mean
+    // "broken until someone with a laptop and adb notices and manually force-stops
+    // the app" -- no better than the old ServiceExam-dependent design this project
+    // moved away from for the drive path. A capture failure now retries itself with
+    // exponential backoff (capped) instead of just sitting on cameraError forever.
+    // Only meaningfully safe to lean on now that pickLowFpsRange() no longer ever
+    // requests the variable FPS range that could put camerahalserver into a wedge
+    // NEITHER a service restart NOR a reboot could clear (see that method's own
+    // comment) -- retrying a request that provokes an unrecoverable HAL wedge would
+    // just retry into the same wedge forever. This is a fallback for OTHER,
+    // genuinely transient failures (e.g. another app briefly holding the camera).
+    private static final long CAMERA_RETRY_BASE_MS = 2000;
+    private static final long CAMERA_RETRY_MAX_MS = 60000;
+    private final java.util.concurrent.ScheduledExecutorService cameraRetryScheduler =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+    private volatile java.util.concurrent.ScheduledFuture<?> cameraRetryFuture;
+    private volatile int cameraRetryAttempt;
     private volatile DriveController driveController;
     private volatile Runnable exitRunnable;
     // Applies drive commands off "/drive-ws"'s own read loop (see that route's
@@ -596,6 +614,16 @@ public class ModeApp extends Application {
                             public void onCameraError(String reason) {
                                 cameraError = reason;
                                 Log.e(TAG, "camera error: " + reason);
+                                scheduleCameraRetry();
+                            }
+
+                            @Override
+                            public void onCameraReady() {
+                                if (cameraRetryAttempt > 0) {
+                                    Log.i(TAG, "camera recovered after " + cameraRetryAttempt + " retry attempt(s)");
+                                }
+                                cameraRetryAttempt = 0;
+                                cameraError = null;
                             }
                         });
                 cameraCapture = fresh;
@@ -604,7 +632,28 @@ public class ModeApp extends Application {
         });
     }
 
+    /** Schedules another startCamera() after an exponential-backoff delay (capped),
+     * off a dedicated scheduler rather than cameraExecutor -- the retry itself just
+     * needs to eventually call startCamera() again, not occupy the same thread that
+     * does the actual (potentially slow) open/close work. */
+    private void scheduleCameraRetry() {
+        cameraRetryAttempt++;
+        long delay = Math.min(CAMERA_RETRY_BASE_MS << Math.min(cameraRetryAttempt - 1, 5), CAMERA_RETRY_MAX_MS);
+        Log.i(TAG, "retrying camera in " + delay + "ms (attempt " + cameraRetryAttempt + ")");
+        cameraRetryFuture = cameraRetryScheduler.schedule(new Runnable() {
+            @Override
+            public void run() {
+                startCamera();
+            }
+        }, delay, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
     void stopCamera() {
+        if (cameraRetryFuture != null) {
+            cameraRetryFuture.cancel(false);
+            cameraRetryFuture = null;
+        }
+        cameraRetryAttempt = 0;
         final CameraCapture old = cameraCapture;
         cameraCapture = null;
         if (old != null) {

@@ -36,6 +36,12 @@ final class CameraCapture {
 
     interface ErrorListener {
         void onCameraError(String reason);
+        /** Fired once per start(), the first time a real frame actually arrives (see
+         * onImageAvailable's own comment on why this signal, not session
+         * configuration succeeding, is what "working" has to mean here) — lets a
+         * caller doing its own retry-with-backoff (ModeApp.startCamera()) know when
+         * to reset its attempt counter back to zero. */
+        void onCameraReady();
     }
 
     private final Context context;
@@ -64,6 +70,7 @@ final class CameraCapture {
     // available range (>=10fps if one exists) and onConfigured() applies it.
     private android.util.Range<Integer> targetFpsRange;
     private android.util.Range<Integer> aeCompensationRange;
+    private volatile boolean readyReported;
 
     CameraCapture(Context context, MjpegBroadcaster broadcaster, ErrorListener errorListener) {
         this.context = context.getApplicationContext();
@@ -194,22 +201,39 @@ final class CameraCapture {
         return ids.length > 0 ? ids[0] : null;
     }
 
-    /** REVISED (2026-09-15) to prioritize a genuinely VARIABLE range (lower < upper)
-     * with the lowest floor, over a fixed rate — the original version here picked
-     * the fixed [15,15] range specifically to bound bandwidth, without realizing
-     * that choice also hard-caps every frame's exposure TIME at ~66ms regardless of
-     * scene brightness (CONTROL_AE_TARGET_FPS_RANGE bounds frame duration, which
-     * bounds max exposure time), which is what an operator-reported "looks dark"
-     * traced back to: this camera's sensor supports up to 400ms exposure and ISO
-     * 6400, but a fixed 15fps target never let auto-exposure use more than ~60ms/
-     * ISO 213 no matter how much CONTROL_AE_EXPOSURE_COMPENSATION was requested.
-     * A variable range (confirmed available on this camera: [5, 30]) lets
-     * auto-exposure slow down toward the floor automatically in a dark scene
-     * (more light per frame, no fixed frame-rate tradeoff needed) while still
-     * running fast in good light — strictly better for this problem than any fixed
-     * rate. Falls back to the fixed range with the lowest floor (most exposure
-     * headroom) if no variable range is offered, or null (camera default) if
-     * nothing is reported. */
+    /** REVERTED (2026-09-15, U19q) back to always picking a FIXED range (lowest
+     * floor, for the most exposure headroom a fixed rate allows) after a brief
+     * detour through preferring a variable range earlier the same day.
+     *
+     * That variable-range attempt was a real brightness win when it worked (a
+     * fixed [15,15] target hard-caps every frame's exposure TIME at ~66ms
+     * regardless of scene brightness -- CONTROL_AE_TARGET_FPS_RANGE bounds frame
+     * duration, which bounds max exposure time -- capping this sensor at ~60ms/
+     * ISO 213 even though it supports up to 400ms/ISO 6400; a variable range like
+     * [5, 30] lets auto-exposure slow toward the floor in a dark scene instead).
+     * But confirmed live, later the same day: repeated open/close cycles of the
+     * camera with that [5, 30] range eventually wedge this device's vendor camera
+     * HAL into a full failure -- camerahalserver spins forever logging
+     * "MtkCam/HalSensor: CMD_SENSOR_GET_PIXEL_RATE: pixel rate should not be 0" /
+     * "SeninfDrvImp: pixel rate should not be zero", pegging a full CPU core, and
+     * every subsequent capture session fails with CAMERA_ERROR ("Error
+     * configuring streams: Broken pipe"). This is the SAME chronic vendor bug
+     * CAMERA_ENABLED's own comment already documents (a pixel-rate computation
+     * the HAL gets wrong under some capture-parameter combination) -- now
+     * narrowed down to specifically a variable/non-fixed CONTROL_AE_TARGET_FPS_
+     * RANGE as (at least one) trigger. It does NOT clear on its own: neither
+     * restarting cameraserver/camerahalserver nor a full device reboot fixed it
+     * while this app kept requesting the same variable range on every retry --
+     * confirmed fixed by going back to a fixed range instead.
+     *
+     * Net effect: back to the dimmer ~60ms/ISO 213 ceiling until a fixed-range
+     * approach to the brightness problem is found (e.g. explicitly forcing
+     * SENSOR_EXPOSURE_TIME/SENSOR_SENSITIVITY higher via manual AE control
+     * instead of relying on CONTROL_AE_TARGET_FPS_RANGE to unlock it) -- a
+     * reliably-working dim camera beats an unreliable bright one. Do not go back
+     * to preferring a variable range here without first confirming LIVE, across
+     * many repeated open/close cycles (not just one), that this specific vendor
+     * HAL bug is actually gone. */
     private android.util.Range<Integer> pickLowFpsRange(CameraCharacteristics characteristics) {
         android.util.Range<Integer>[] ranges = characteristics.get(
                 CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
@@ -217,18 +241,13 @@ final class CameraCapture {
             return null;
         }
         Log.i(TAG, "available FPS ranges: " + Arrays.toString(ranges));
-        android.util.Range<Integer> bestVariable = null;
         android.util.Range<Integer> bestFixed = ranges[0];
         for (android.util.Range<Integer> r : ranges) {
-            if (r.getLower().equals(r.getUpper())) {
-                if (r.getLower() < bestFixed.getLower()) {
-                    bestFixed = r;
-                }
-            } else if (bestVariable == null || r.getLower() < bestVariable.getLower()) {
-                bestVariable = r;
+            if (r.getLower().equals(r.getUpper()) && r.getLower() < bestFixed.getLower()) {
+                bestFixed = r;
             }
         }
-        return bestVariable != null ? bestVariable : bestFixed;
+        return bestFixed;
     }
 
     /** TARGET_JPEG_WIDTH x TARGET_JPEG_HEIGHT is deliberately NOT this camera's
@@ -298,6 +317,15 @@ final class CameraCapture {
             Log.w(TAG, "camera disconnected");
             camera.close();
             cameraDevice = null;
+            // Confirmed live (2026-09-15): this fires when another app (e.g. the stock
+            // camera app) takes the device out from under an already-open session --
+            // previously left the stream dead with no signal at all to ModeApp's own
+            // retry-with-backoff, since only onError() (a different callback) reported
+            // failures. Camera2 only delivers onDisconnected() for this kind of
+            // framework-initiated revocation, never for stop()'s own direct
+            // cameraDevice.close() (that path only ever reaches onClosed()), so this
+            // can't turn an intentional stop() into a spurious retry.
+            errorListener.onCameraError("camera disconnected");
         }
 
         @Override
@@ -373,6 +401,17 @@ final class CameraCapture {
                 byte[] jpeg = new byte[buffer.remaining()];
                 buffer.get(jpeg);
                 broadcaster.publishFrame(jpeg);
+                // Confirmed live (2026-09-15): the vendor HAL's chronic "pixel rate
+                // should not be zero" bug (see pickLowFpsRange()'s own comment) can leave
+                // a capture session reporting successful configuration while never
+                // actually producing a frame — onConfigured() succeeding is NOT a
+                // reliable "camera is actually working" signal on this device.  A real
+                // frame arriving here is the only signal that actually is, so this is
+                // where ModeApp's own retry-with-backoff resets its attempt counter.
+                if (!readyReported) {
+                    readyReported = true;
+                    errorListener.onCameraReady();
+                }
             } finally {
                 image.close();
             }
