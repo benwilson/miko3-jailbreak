@@ -119,6 +119,10 @@ public class ModeApp extends Application {
     private final AudioBroadcaster audioBroadcaster = new AudioBroadcaster();
     private MicCapture micCapture;
     private volatile String micError;
+    // R6's genuine remote path: a remote browser captures its own operator's mic and
+    // uploads raw PCM chunks here for direct playback on this robot's speaker -- see
+    // OperatorSpeakerPlayer's own class comment for why this needs no broadcaster.
+    private final OperatorSpeakerPlayer operatorSpeakerPlayer = new OperatorSpeakerPlayer();
     private volatile byte[] cssBytes;
 
     @Override
@@ -421,6 +425,27 @@ public class ModeApp extends Application {
                         }
                     }
                 }
+            }
+        });
+
+        server.route("/operator-audio-upload", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                // No client-token gate, matching /operator-video-upload's own reasoning --
+                // a stray/late chunk only ever reaches operatorSpeakerPlayer's speaker
+                // output, not the motors, so it's harmless rather than a safety issue.
+                byte[] pcm = HttpUtil.readAll(req.body);
+                if (pcm.length > 0) {
+                    operatorSpeakerPlayer.write(pcm, pcm.length);
+                }
+                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
+            }
+        });
+        server.route("/operator-audio-stop", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                operatorSpeakerPlayer.stop();
+                res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
             }
         });
 

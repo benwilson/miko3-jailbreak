@@ -8,12 +8,22 @@ package com.miko3.mode.remotecontrol;
  * fetches raw PCM from /audio.pcm and schedules it through the Web Audio
  * API.
  *
- * Operator mic -> robot speaker: this device's WebView can't actually run
- * getUserMedia audio capture at all (verified: NotReadableError), so it
- * uses the native fallback (NativeCaptureBridge, exposed as
- * "AndroidCapture") instead of a browser API, and no-ops with a status
- * message when AndroidCapture isn't present (i.e. from a remote browser —
- * still on-device-only for this version, per R6/R7's scoping).
+ * Operator mic -> robot speaker (U19o, expanding R6/R7's original
+ * on-device-only scoping): this device's WebView can't actually run
+ * getUserMedia audio capture at all (verified: NotReadableError), so
+ * on-device still uses the native fallback (NativeCaptureBridge, exposed as
+ * "AndroidCapture") — a literal mic-to-speaker loopback on the same
+ * physical unit, kept only as a structural test path (see its own class
+ * comment on why it's never run as a sustained live loop). A *remote*
+ * browser instead captures via getUserMedia, resamples to 16-bit/16kHz/mono
+ * PCM with a ScriptProcessorNode, and POSTs raw chunks to
+ * /operator-audio-upload — ModeApp.OperatorSpeakerPlayer writes each chunk
+ * straight to an AudioTrack on the robot, no container/codec involved, same
+ * KTD8 reasoning as the robot-mic direction. Genuinely two different
+ * physical devices this time, so — unlike the on-device fallback — this
+ * path itself can't feed back on its own; the only remaining feedback risk
+ * is acoustic, on the operator's own end, if both mic toggles are on at
+ * once and they're not on headphones (see checkFeedbackRisk()).
  *
  * Operator video -> robot screen: genuinely bidirectional now. Only a
  * *remote* browser has both a real webcam and the user sitting in front of
@@ -39,8 +49,7 @@ final class ToggleSection {
             + "<h2>Audio / Video</h2>"
             + "<p id=\"toggle-status\" role=\"status\"></p>"
             + "<label><input type=\"checkbox\" id=\"toggle-robot-mic\">Robot mic &rarr; operator</label>"
-            + "<label><input type=\"checkbox\" id=\"toggle-operator-mic\">Operator mic &rarr; robot speaker"
-            + " <small>(on-device only)</small></label>"
+            + "<label><input type=\"checkbox\" id=\"toggle-operator-mic\">Operator mic &rarr; robot speaker</label>"
             // U19m: the "Operator video -> robot screen" checkbox + its <img>/<video>
             // moved to CameraSection.java (next to the robot camera feed) -- do not
             // re-add them here, getElementById() only finds the first of a duplicate id
@@ -96,16 +105,91 @@ final class ToggleSection {
             + "if(r.status===409){e.target.checked=!e.target.checked;"
             + "reportError('Control taken by another connection.');return;}"
             + "if(e.target.checked){startRobotMicPlayback();}else{stopRobotMicPlayback();}"
+            + "checkFeedbackRisk();"
             + "});"
             + "});"
 
-            // Operator mic -> robot speaker: native fallback only.
+            // Both mic directions can be live at once (robot mic -> this browser's
+            // speakers, and this browser's mic -> robot speaker) -- if the operator
+            // isn't on headphones that's a genuine acoustic loop (robot mic hears the
+            // operator's own speakers, which are playing the operator's own mic, which
+            // just came out the robot's speaker...). Nothing here can detect headphones
+            // vs. speakers, so this is a warning, not a block.
+            + "function checkFeedbackRisk(){"
+            + "if(document.getElementById('toggle-robot-mic').checked"
+            + "&&document.getElementById('toggle-operator-mic').checked){"
+            + "status.textContent='Both mics are live -- use headphones on the operator side to avoid feedback.';"
+            + "}else if(status.textContent.indexOf('feedback')!==-1){"
+            + "status.textContent='';"
+            + "}"
+            + "}"
+
+            // Operator mic -> robot speaker. On-device WebView: NativeCaptureBridge's
+            // mic->speaker loopback fallback (see its own class comment -- getUserMedia
+            // audio capture doesn't work in this WebView at all). Remote browser: a
+            // genuine two-device path -- capture via getUserMedia, resample to
+            // MicCapture's own 16000Hz mono s16le PCM with a ScriptProcessorNode (chosen
+            // over MediaRecorder specifically so the server never has to decode a
+            // compressed container -- ModeApp.OperatorSpeakerPlayer writes each chunk
+            // straight to an AudioTrack), and POST each chunk to /operator-audio-upload.
+            + "var operatorMicStream=null,operatorMicCtx=null,operatorMicProcessor=null,operatorMicSource=null;"
+            + "function floatTo16(input){"
+            + "var out=new Int16Array(input.length);"
+            + "for(var i=0;i<input.length;i++){var s=Math.max(-1,Math.min(1,input[i]));"
+            + "out[i]=s<0?s*0x8000:s*0x7fff;}"
+            + "return out;"
+            + "}"
+            + "function resampleTo16k(input,inputRate){"
+            + "if(inputRate===16000)return input;"
+            + "var ratio=inputRate/16000;var outLen=Math.floor(input.length/ratio);"
+            + "var out=new Float32Array(outLen);"
+            + "for(var i=0;i<outLen;i++){out[i]=input[Math.floor(i*ratio)];}"
+            + "return out;"
+            + "}"
+            + "function startOperatorMicRemote(){"
+            + "if(!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)){"
+            + "reportError('This browser has no microphone API (getUserMedia) available.');"
+            + "document.getElementById('toggle-operator-mic').checked=false;"
+            + "return;"
+            + "}"
+            + "navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){"
+            + "operatorMicStream=stream;"
+            + "operatorMicCtx=new (window.AudioContext||window.webkitAudioContext)();"
+            + "operatorMicSource=operatorMicCtx.createMediaStreamSource(stream);"
+            + "operatorMicProcessor=operatorMicCtx.createScriptProcessor(4096,1,1);"
+            // Routed through a silent (gain=0) node rather than left unconnected: Chrome
+            // only keeps firing onaudioprocess while the node is part of a live graph
+            // reaching the destination, and connecting it to the destination directly
+            // would play the operator's own mic back out their own speakers.
+            + "var mute=operatorMicCtx.createGain();mute.gain.value=0;"
+            + "operatorMicSource.connect(operatorMicProcessor);"
+            + "operatorMicProcessor.connect(mute);mute.connect(operatorMicCtx.destination);"
+            + "operatorMicProcessor.onaudioprocess=function(e){"
+            + "var resampled=resampleTo16k(e.inputBuffer.getChannelData(0),operatorMicCtx.sampleRate);"
+            + "var pcm16=floatTo16(resampled);"
+            + "fetch('/operator-audio-upload',{method:'POST',body:pcm16.buffer}).catch(function(){});"
+            + "};"
+            + "checkFeedbackRisk();"
+            + "}).catch(function(err){"
+            + "reportError('Microphone access failed: '+err.message);"
+            + "document.getElementById('toggle-operator-mic').checked=false;"
+            + "});"
+            + "}"
+            + "function stopOperatorMicRemote(){"
+            + "if(operatorMicProcessor){operatorMicProcessor.onaudioprocess=null;operatorMicProcessor.disconnect();"
+            + "operatorMicProcessor=null;}"
+            + "if(operatorMicSource){operatorMicSource.disconnect();operatorMicSource=null;}"
+            + "if(operatorMicCtx){operatorMicCtx.close();operatorMicCtx=null;}"
+            + "if(operatorMicStream){operatorMicStream.getTracks().forEach(function(t){t.stop();});operatorMicStream=null;}"
+            + "fetch('/operator-audio-stop?ct='+encodeURIComponent(CLIENT_TOKEN)).catch(function(){});"
+            + "}"
             + "document.getElementById('toggle-operator-mic').addEventListener('change',function(e){"
-            + "if(window.AndroidCapture&&window.AndroidCapture.toggleOperatorMic){"
-            + "window.AndroidCapture.toggleOperatorMic(e.target.checked);"
+            + "var onDevice=!!(window.AndroidCapture&&window.AndroidCapture.toggleOperatorMic);"
+            + "if(e.target.checked){"
+            + "if(onDevice){window.AndroidCapture.toggleOperatorMic(true);}else{startOperatorMicRemote();}"
             + "}else{"
-            + "e.target.checked=false;"
-            + "reportError('Operator mic is on-device only (not available from a remote browser yet).');"
+            + "if(onDevice){window.AndroidCapture.toggleOperatorMic(false);}else{stopOperatorMicRemote();}"
+            + "checkFeedbackRisk();"
             + "}"
             + "});"
 
