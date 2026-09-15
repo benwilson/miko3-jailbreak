@@ -2,37 +2,39 @@ package com.miko3.mode.remotecontrol;
 
 /**
  * What the robot's own on-device screen shows while this mode is active —
- * deliberately just two states, an idle "eyes" face or the operator's video
- * (U13): a full interactive control page (drive buttons, the robot's own
- * camera preview) makes no sense on the robot's own screen — nobody drives a
- * robot by pressing buttons on the robot itself, and showing the robot's own
+ * deliberately just two states, an idle "eye" or the operator's video (U13):
+ * a full interactive control page (drive buttons, the robot's own camera
+ * preview) makes no sense on the robot's own screen — nobody drives a robot
+ * by pressing buttons on the robot itself, and showing the robot's own
  * camera back to itself is pointless. No dedicated face asset exists in this
  * project, so the idle state is drawn with plain CSS/JS rather than shipping
  * a new image.
  *
- * Styled after WALL-E's eyes (U17), not generic cartoon eyeballs: real
- * WALL-E's eyes are a pair of circular binocular lenses mounted in a
- * weathered-metal housing, each one servo-driven — the character's
- * expressions come from the lens itself moving as a rigid unit (not a pupil
- * darting inside a socket), and the glass lenses' reflective glint is what
- * animators/builders credit with giving the design its "soul."
+ * U20 (by request, reference image — superseding U17/U19's WALL-E design):
+ * styled after HAL 9000's eye (2001: A Space Odyssey) — a circular
+ * chrome-bezeled lens with a glowing red/amber core (bright near-white hot
+ * spot fading through orange to deep red) against black glass, plus a couple
+ * of fixed curved highlights suggesting light catching the lens's convex
+ * surface. Two lenses side by side (by request — the real HAL has one, but
+ * this robot's face keeps a pair, styled in HAL's language instead of
+ * WALL-E's), both tracking the same gaze target so they read as one set of
+ * eyes looking together rather than two independent ones.
  *
- * U19 (by request, reference image): the lenses now move together toward a
- * shared, periodically-retargeted 2D point — both X and Y, not just the
- * original vertical-only drift — so they read as *watching something*
- * happening off-screen (tracking a point of interest, with a mix of quick
- * glances and longer held gazes) rather than idly wandering on their own.
- * A tiny per-eye offset keeps them from looking perfectly welded together.
- * The blink is now a blink/fade-out cross: alongside the vertical squash it
- * also dims toward near-transparent at the peak of the blink, rather than
- * just squashing at full opacity.
+ * "Looking around" is each glow drifting to a shared, periodically
+ * retargeted 2D point within its lens (kept from U19's design, which mixed
+ * quick glances with longer held gazes for a "watching something happening"
+ * feel — that timing logic is unchanged, just driving two glows off one
+ * shared target instead of two eye-mounts). The requested blink is a full
+ * fade to transparent crossed with a squash, standing in for an eyelid
+ * HAL's lens doesn't have — during the blink the glow briefly vanishes
+ * entirely, not just dims.
  *
  * The <img> stays hidden until its first "load" event — which a
  * multipart/x-mixed-replace stream (ModeApp.operatorVideoBroadcaster) fires
  * on every part, so the very first frame the operator actually uploads
- * swaps the eyes for video automatically, with nothing to configure on this
+ * swaps the eye for video automatically, with nothing to configure on this
  * side; if nobody ever uploads one, the connection just sits open with zero
- * parts and the eyes stay up indefinitely.
+ * parts and the eye stays up indefinitely.
  */
 final class DeviceViewPage {
     private DeviceViewPage() {
@@ -44,86 +46,72 @@ final class DeviceViewPage {
             + "<title>Remote Control / Telepresence</title>"
             + "<style>"
             + "html,body{margin:0;height:100%;background:#000;overflow:hidden}"
-            + "#rig{width:100%;height:100%;display:flex;align-items:center;justify-content:center;"
-            + "position:relative}"
-            // The head housing — WALL-E's eyes sit in a boxy, worn/rusty binocular
-            // unit, not floating on a thin bar; a wide plate behind everything else
-            // (lowest z-index) makes the two lenses read as mounted INTO a single
-            // weathered-metal head instead of two separate floating balls.
-            // Centered via top/left + negative margins, not transform:translate(-50%,
-            // -50%) — both work here, but margins are the more universally-safe bet
-            // on this old WebView given how many newer CSS features have already
-            // silently no-op'd on it this session (see below).
-            + "#frame{position:absolute;top:50%;left:50%;width:126vmin;height:70vmin;"
-            + "margin-top:-35vmin;margin-left:-63vmin;border-radius:6vmin;"
-            + "background:linear-gradient(155deg,#9a7a48,#6b4f28 45%,#4a3618 100%);"
-            + "border:0.6vmin solid #3a2a14;"
-            + "box-shadow:inset 0 0 5vmin rgba(0,0,0,.5), inset 0 1vmin 1.5vmin rgba(255,255,255,.15),"
-            + "0 1vmin 2vmin rgba(0,0,0,.6)}"
-            // Corner rivets — small dark studs, the kind of worn-industrial detail
-            // that reads as "WALL-E's battered chassis" rather than a clean modern
-            // gadget.
-            + ".rivet{position:absolute;width:3.2vmin;height:3.2vmin;border-radius:50%;"
-            + "background:radial-gradient(circle at 35% 30%,#c9b088,#5a4020 70%,#2a1c0c 100%);"
-            + "box-shadow:inset 0 0 0.6vmin rgba(0,0,0,.6)}"
-            + "#r1{left:6vmin;top:6vmin}#r2{right:6vmin;top:6vmin}"
-            + "#r3{left:6vmin;bottom:6vmin}#r4{right:6vmin;bottom:6vmin}"
-            // The socket each lens sits in — a fixed, non-moving dark collar mounted
-            // in the frame, so the lens above it reads as a tube telescoping out of a
-            // round hole in the housing rather than a ball floating in front of it.
-            + ".socket{width:56vmin;height:56vmin;margin:0 2vmin;border-radius:50%;position:relative;"
-            + "background:radial-gradient(circle at 40% 35%,#2a2012,#100c06 75%);"
-            + "box-shadow:inset 0 0.8vmin 2vmin rgba(0,0,0,.8)}"
-            // Explicit vmin width+height rather than width+aspect-ratio, and margin
-            // rather than the flex container's gap: this page renders inside a
-            // low-level system WebView on an Android 9 device, old enough that
-            // neither aspect-ratio nor flexbox gap is a safe bet — confirmed live,
-            // both silently no-op here (zero-height boxes with aspect-ratio;
-            // touching boxes with gap unchanged across several values).
-            // .eye-mount is what actually moves (translateY, independently timed
-            // per eye) — real WALL-E's expression comes from each lens being
-            // raised/lowered on its own servo, not from anything moving inside a
-            // fixed eye socket. Centered inside its .socket the same margin-based way
-            // as #frame, so the lens (smaller than the socket) can drift within it
-            // without ever fully leaving the hole it sits in.
-            + ".eye-mount{width:50vmin;height:50vmin;position:absolute;top:50%;left:50%;"
-            + "margin-top:-25vmin;margin-left:-25vmin;z-index:1;"
-            // Transition duration is set per-move from JS (quick glances vs. slower
-            // settles read differently), so no fixed duration here — see gazeTo().
+            + "#rig{width:100%;height:100%;display:flex;align-items:center;justify-content:center}"
+            // The chrome bezel: a metallic gradient filling the WHOLE circle (bright
+            // highlight over gray-to-silver, per a real curved-metal-ring look).
+            // Confirmed live: an earlier single-gradient attempt that faded straight
+            // to black past the highlight never actually formed a visible ring —
+            // once it reaches its last color stop, CSS holds that color all the way
+            // to 100%, so there was no "ring" left uncovered by the black glass
+            // above it, just an off-center gray blob. Stacking a smaller solid-black
+            // .glass circle on top (below) is what actually leaves a ring of this
+            // showing around its edge. Explicit vmin width/height, not aspect-ratio:
+            // this page renders on an Android 9 device old enough that aspect-ratio
+            // silently no-ops on its WebView (confirmed live earlier this session).
+            + ".housing{width:76vmin;height:76vmin;margin:0 6vmin;border-radius:50%;position:relative;"
+            + "background:radial-gradient(circle at 33% 28%,#f5f5f5,#c9c9c9 22%,#8a8a8a 45%,#5a5a5a 70%,"
+            + "#3a3a3a 100%);"
+            + "box-shadow:0 0 4vmin rgba(0,0,0,.8)}"
+            // The black glass, sized smaller than .housing so a ring of the metal
+            // bezel above shows around it. overflow:hidden clips the glow to this
+            // circle rather than the full housing.
+            + ".glass{position:absolute;left:9%;top:9%;width:82%;height:82%;border-radius:50%;"
+            + "overflow:hidden;background:#000;box-shadow:inset 0 0 3vmin rgba(0,0,0,.9)}"
+            // The glow is split into two nested elements on purpose: .glow (outer)
+            // handles gaze position — JS sets its transform:translate(...) below —
+            // and .glow-core (inner) handles the blink's transform:scale(...)/opacity
+            // keyframes. Confirmed live: putting both on ONE element meant the blink
+            // animation's own transform keyframes (running continuously) overrode
+            // whatever translate JS had just set, so the gaze motion was barely
+            // visible — a CSS animation's transform wins over one set via element
+            // style for the same property on the same element. Sized larger than its
+            // visible hot spot so the gradient's outer red has room to fall off to
+            // nothing before it would hit the lens edge in any direction gaze sends it.
+            + ".glow{position:absolute;width:70%;height:70%;left:15%;top:15%;"
             + "transition:transform ease}"
-            // Blink/fade-out cross (U19): the squash alone read as a normal blink;
-            // dropping opacity at the same peak moment gives it the "fade" half of
-            // the requested cross, like the lens itself is briefly powering down
-            // rather than just a mechanical eyelid.
-            + "@keyframes blink{0%,90%,100%{transform:scaleY(1);opacity:1}"
-            + "95%{transform:scaleY(0.08);opacity:0.2}}"
-            // The lens itself: metallic bezel ring (radial-gradient, brushed-steel
-            // look) around a dark glass center — no white sclera, no pupil.
-            + ".eye{width:100%;height:100%;border-radius:50%;position:relative;overflow:hidden;"
-            + "background:radial-gradient(circle at 35% 30%,#9aa0a6,#4a4e52 55%,#1c1e20 100%);"
-            + "box-shadow:inset 0 0 3vmin rgba(0,0,0,.7), 0 0 1vmin rgba(0,0,0,.9);"
-            + "animation:blink 6s infinite}"
-            + ".socket:nth-child(2) .eye{animation-delay:0.15s}"
-            + ".lens{position:absolute;left:13%;top:13%;width:74%;height:74%;border-radius:50%;"
-            + "background:radial-gradient(circle at 38% 32%,#3d5a66,#0c1113 62%,#000 100%)}"
-            // The glass glint — per the production design's own explanation for why
-            // binocular lenses read as alive: a fixed reflective highlight, not
-            // something that needs to move on its own.
-            + ".glint{position:absolute;left:22%;top:16%;width:24%;height:14%;border-radius:50%;"
-            + "background:rgba(255,255,255,.85);transform:rotate(-25deg)}"
+            + ".glow-core{width:100%;height:100%;border-radius:50%;"
+            + "background:radial-gradient(circle at center,#fff6d6 0%,#ffd23f 8%,#ff8a1e 22%,"
+            + "#e2331c 42%,#7a0f0a 62%,rgba(0,0,0,0) 78%)}"
+            // Fixed curved highlights — light catching the lens's convex glass, per
+            // the reference image's own arcing white streaks near the top. Static on
+            // purpose (see class javadoc): the glow moves, these don't. Positioned
+            // relative to .glass (they're inside it in the markup) so they sit over
+            // the dark lens, not the metal ring.
+            + ".hi{position:absolute;border:1.2vmin solid rgba(255,255,255,.65);border-radius:50%;"
+            + "border-right-color:transparent;border-bottom-color:transparent;"
+            + "box-shadow:0 0 1.6vmin rgba(255,255,255,.3)}"
+            + ".hi1{width:34%;height:26%;left:14%;top:8%;transform:rotate(-30deg)}"
+            + ".hi2{width:18%;height:14%;left:60%;top:14%;transform:rotate(50deg)}"
+            // Blink crossed with a fade-out: the glow squashes AND fades all the way
+            // to fully transparent at the peak (opacity:0, not just dimmed), standing
+            // in for an eyelid HAL's lens doesn't physically have.
+            + "@keyframes blink{0%,90%,100%{transform:scale(1);opacity:1}"
+            + "95%{transform:scale(0.85,0.08);opacity:0}}"
             + "#video{display:none;width:100%;height:100%;object-fit:contain}"
             + "</style>"
             + "</head><body>"
             + "<div id=\"rig\">"
-            + "<div id=\"frame\">"
-            + "<div class=\"rivet\" id=\"r1\"></div><div class=\"rivet\" id=\"r2\"></div>"
-            + "<div class=\"rivet\" id=\"r3\"></div><div class=\"rivet\" id=\"r4\"></div>"
+            + "<div class=\"housing\">"
+            + "<div class=\"glass\">"
+            + "<div class=\"glow\"><div class=\"glow-core\"></div></div>"
+            + "<div class=\"hi hi1\"></div><div class=\"hi hi2\"></div>"
             + "</div>"
-            + "<div id=\"eyes\" style=\"display:flex;position:relative\">"
-            + "<div class=\"socket\"><div class=\"eye-mount\"><div class=\"eye\"><div class=\"lens\">"
-            + "<div class=\"glint\"></div></div></div></div></div>"
-            + "<div class=\"socket\"><div class=\"eye-mount\"><div class=\"eye\"><div class=\"lens\">"
-            + "<div class=\"glint\"></div></div></div></div></div>"
+            + "</div>"
+            + "<div class=\"housing\">"
+            + "<div class=\"glass\">"
+            + "<div class=\"glow\"><div class=\"glow-core\"></div></div>"
+            + "<div class=\"hi hi1\"></div><div class=\"hi hi2\"></div>"
+            + "</div>"
             + "</div>"
             + "</div>"
             + "<img id=\"video\" alt=\"\">"
@@ -132,27 +120,28 @@ final class DeviceViewPage {
             + "var rig=document.getElementById('rig');"
             + "img.addEventListener('load',function(){rig.style.display='none';img.style.display='block';});"
             + "img.src='/operator-video-stream';"
-            // U19: both eyes track one shared, periodically-retargeted point rather
-            // than drifting independently — the "watching something happening" look
-            // requested. A tiny per-eye offset (+/-0.4vmin) keeps them from reading
-            // as one welded unit. Glance timing mixes quick look-overs (short hold,
-            // fast move) with longer held gazes (as if watching something of actual
-            // interest before moving on), rather than one uniform cadence.
-            + "var mounts=document.getElementsByClassName('eye-mount');"
-            + "function gazeTo(x,y,tilt,speedMs){"
-            + "for(var i=0;i<mounts.length;i++){"
-            + "var jx=x+(i===0?-0.4:0.4);"
-            + "mounts[i].style.transition='transform '+speedMs+'ms cubic-bezier(.34,1.2,.4,1)';"
-            + "mounts[i].style.transform='translate('+jx+'vmin,'+y+'vmin) rotate('+tilt+'deg)';"
+            + "var glows=document.getElementsByClassName('glow');"
+            + "var cores=document.getElementsByClassName('glow-core');"
+            + "for(var g=0;g<cores.length;g++){"
+            + "cores[g].style.animation='blink 6.5s infinite';"
+            + "cores[g].style.animationDelay=(g*0.2)+'s';"
+            + "}"
+            // "Watching something happening": both glows drift together to one
+            // shared, periodically retargeted point rather than idly wandering on a
+            // uniform clock — mixes quick glances (short hold, fast move) with
+            // longer held gazes, kept from this page's earlier design.
+            + "function gazeTo(x,y,speedMs){"
+            + "for(var g=0;g<glows.length;g++){"
+            + "glows[g].style.transition='transform '+speedMs+'ms cubic-bezier(.34,1.2,.4,1)';"
+            + "glows[g].style.transform='translate('+x+'vmin,'+y+'vmin)';"
             + "}"
             + "}"
             + "function nextGlance(){"
-            + "var x=(Math.random()*8-4);"
-            + "var y=(Math.random()*7-3.5);"
-            + "var tilt=(Math.random()*6-3);"
+            + "var x=(Math.random()*20-10);"
+            + "var y=(Math.random()*18-9);"
             + "var quick=Math.random()<0.35;"
-            + "var speedMs=quick?220+Math.random()*180:550+Math.random()*500;"
-            + "gazeTo(x,y,tilt,speedMs);"
+            + "var speedMs=quick?200+Math.random()*160:500+Math.random()*450;"
+            + "gazeTo(x,y,speedMs);"
             + "var hold=quick?400+Math.random()*500:1500+Math.random()*2500;"
             + "setTimeout(nextGlance,speedMs+hold);"
             + "}"
