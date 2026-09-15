@@ -71,6 +71,13 @@ final class CameraCapture {
     private android.util.Range<Integer> targetFpsRange;
     private android.util.Range<Integer> aeCompensationRange;
     private volatile boolean readyReported;
+    // Manual exposure/ISO (U19s, 2026-09-15): see MANUAL_EXPOSURE_NS's own comment
+    // for why this exists instead of the variable-FPS-range approach it replaces.
+    private static final long MANUAL_EXPOSURE_NS = 140_000_000L; // 140ms
+    private static final int MANUAL_SENSITIVITY = 1600;
+    private android.util.Range<Long> exposureTimeRange;
+    private android.util.Range<Integer> sensitivityRange;
+    private boolean manualExposureSupported;
 
     CameraCapture(Context context, MjpegBroadcaster broadcaster, ErrorListener errorListener) {
         this.context = context.getApplicationContext();
@@ -120,11 +127,22 @@ final class CameraCapture {
             // queried here (not hardcoded) since it's a real per-device camera
             // characteristic, used below to brighten the image.
             aeCompensationRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+            sensitivityRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+            exposureTimeRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
             Log.i(TAG, "AE compensation range=" + aeCompensationRange
                     + " step=" + characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
-                    + " sensitivityRange=" + characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-                    + " exposureTimeRange=" + characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                    + " sensitivityRange=" + sensitivityRange
+                    + " exposureTimeRange=" + exposureTimeRange
                     + " hasFlash=" + characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE));
+            // See MANUAL_EXPOSURE_NS's own comment: only attempt manual AE_MODE_OFF
+            // control if this camera actually lists it as available -- confirmed live
+            // via `dumpsys media.camera` this device's android.control.aeAvailableModes
+            // is [0, 1] (OFF, ON), so it does, but do not assume that's true for every
+            // unit without checking.
+            int[] aeAvailableModes = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES);
+            manualExposureSupported = exposureTimeRange != null && sensitivityRange != null
+                    && aeAvailableModes != null && contains(aeAvailableModes, CaptureRequest.CONTROL_AE_MODE_OFF);
+            Log.i(TAG, "manual exposure supported=" + manualExposureSupported);
 
             StreamConfigurationMap map = characteristics.get(
                     CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
@@ -199,6 +217,23 @@ final class CameraCapture {
     private String pickCameraId(CameraManager manager) throws CameraAccessException {
         String[] ids = manager.getCameraIdList();
         return ids.length > 0 ? ids[0] : null;
+    }
+
+    private static boolean contains(int[] haystack, int needle) {
+        for (int v : haystack) {
+            if (v == needle) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static long clamp(long value, android.util.Range<Long> range) {
+        return Math.max(range.getLower(), Math.min(range.getUpper(), value));
+    }
+
+    private static int clamp(int value, android.util.Range<Integer> range) {
+        return Math.max(range.getLower(), Math.min(range.getUpper(), value));
     }
 
     /** REVERTED (2026-09-15, U19q) back to always picking a FIXED range (lowest
@@ -361,18 +396,43 @@ final class CameraCapture {
                 if (targetFpsRange != null) {
                     builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetFpsRange);
                 }
-                // Operator-reported (2026-09-15): the stream looked dark with no
-                // exposure compensation set at all (auto-exposure default only).
-                // Confirmed live this camera's own CONTROL_AE_COMPENSATION_RANGE is
-                // -4..4 in CONTROL_AE_COMPENSATION_STEP=1/2 EV units (so -2EV..+2EV) --
-                // request the top of that range (brightest available) rather than a
-                // hardcoded guess, so this still does something sane on hardware with a
-                // different range. TEMPLATE_PREVIEW already implies CONTROL_AE_MODE_ON
-                // (auto-exposure enabled), so compensation stacks on top of whatever the
-                // auto-exposure algorithm itself picks, not a replacement for it.
-                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-                if (aeCompensationRange != null) {
-                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, aeCompensationRange.getUpper());
+                if (manualExposureSupported) {
+                    // MANUAL_EXPOSURE_NS (U19s, 2026-09-15): forcing exposure/ISO directly
+                    // instead of widening CONTROL_AE_TARGET_FPS_RANGE (this camera's own
+                    // pickLowFpsRange()'s earlier approach to the same "looks dark"
+                    // problem) — that approach got the same brightness but reliably wedges
+                    // this device's vendor HAL into a full failure that survives even a
+                    // reboot (see pickLowFpsRange()'s own comment). CONTROL_AE_TARGET_
+                    // FPS_RANGE is documented as IGNORED once CONTROL_AE_MODE is OFF, so
+                    // the fixed range set above no longer bounds anything here — frame
+                    // timing is instead whatever SENSOR_FRAME_DURATION says below, fully
+                    // decoupled from the buggy variable-FPS-range path. 140ms/ISO 1600 is
+                    // a fixed middle-ground pick (roughly matching what auto-exposure
+                    // itself converged to under the now-abandoned variable-range
+                    // approach), not adaptive — this scene will over/underexpose if
+                    // lighting changes a lot, which a real auto-exposure loop would not,
+                    // but a static correct-for-typical-indoor-light image beats an
+                    // unreliable camera. SENSOR_FRAME_DURATION must be >= the exposure
+                    // time (Camera2 requirement) — set equal, the minimum that's valid.
+                    long exposureNs = clamp(MANUAL_EXPOSURE_NS, exposureTimeRange);
+                    int sensitivity = clamp(MANUAL_SENSITIVITY, sensitivityRange);
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs);
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, sensitivity);
+                    builder.set(CaptureRequest.SENSOR_FRAME_DURATION, exposureNs);
+                    Log.i(TAG, "manual exposure=" + exposureNs + "ns sensitivity=" + sensitivity);
+                } else {
+                    // Fallback for a camera that doesn't list CONTROL_AE_MODE_OFF as
+                    // available: auto-exposure plus max compensation (this camera's own
+                    // CONTROL_AE_COMPENSATION_RANGE is -4..4 in 1/2 EV steps, so -2EV..
+                    // +2EV) — dimmer than manual control can achieve, but the least-bad
+                    // option without manual control. TEMPLATE_PREVIEW already implies
+                    // CONTROL_AE_MODE_ON, so this is only setting it explicitly for
+                    // clarity; compensation stacks on top of whatever auto-exposure picks.
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                    if (aeCompensationRange != null) {
+                        builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, aeCompensationRange.getUpper());
+                    }
                 }
                 session.setRepeatingRequest(builder.build(), null, backgroundHandler);
             } catch (CameraAccessException e) {
