@@ -98,7 +98,24 @@ public final class DirectMotorDriver {
 
     /** "POWER" (5 ASCII bytes) + 0x58 padding to 500 bytes — no encoded payload beyond
      * the tag itself; confirmed via strace against ServiceExam's own write() calls. */
-    private static final byte[] POWER_FRAME = buildPowerFrame();
+    private static final byte[] POWER_FRAME = buildTaggedFrame("POWER", POWER_FRAME_SIZE);
+
+    /**
+     * "MTSTP" (5 ASCII bytes) + 0x58 padding to 500 bytes — the REAL stop command.
+     * Confirmed via decompiled-source research (2026-09-15) that a zero-velocity
+     * "VEL1=" frame — this class's original stop() implementation — is NOT how
+     * ServiceExam stops the motors: ServiceExam only ever emits "VEL1=" when it has
+     * an actual nonzero motion sequence to run (ExpressionMsg.packData1() only packs
+     * a frame when getSeqCount() > 0), routed through an asynchronous, queued
+     * MOTION_PLAY path. Stopping is a completely separate, synchronous call —
+     * SocialInteraction_SpeechChat.motionStop() — that writes this literal 500-byte
+     * "MTSTP" buffer (serialDevice.generate500ByteData("MTSTP", 500)) straight to
+     * /dev/ttyS2, bypassing the VEL1/motion-queue path entirely. Confirmed live: a
+     * zero-velocity VEL1 frame let the MCU keep executing the last nonzero motion
+     * INDEFINITELY until a new, different VEL1 frame arrived — sending this instead
+     * is the actual fix, not a zero-velocity frame repeated more insistently.
+     */
+    private static final byte[] STOP_FRAME = buildTaggedFrame("MTSTP", POWER_FRAME_SIZE);
 
     private FileOutputStream out;
     private Thread keepaliveThread;
@@ -179,9 +196,38 @@ public final class DirectMotorDriver {
         out.flush();
     }
 
-    /** Convenience: an explicit stop (zero linear, zero angular). */
-    public void stop() throws IOException {
-        drive(0, 0, 10);
+    /**
+     * The held-drive command — sends a 150ms kick+sustain sequence (see
+     * buildSustainedFrame()'s javadoc) instead of repeated single ~100ms
+     * buildFrame() pulses. REPLACES the original design of calling drive() every
+     * 80ms for as long as a direction is held: confirmed live (2026-09-15) that
+     * repeated single-frame resends this fast caused forward driving specifically
+     * to move only a slight amount, then stop, then repeat on a fixed ~10s cycle —
+     * consistent with the motor firmware's own stall/overload protection
+     * misfiring because linear motion (more resistance than in-place turning)
+     * never got a long enough uninterrupted window to register real movement
+     * before each resend reset it. ServiceExam's own confirmed-live held-drive
+     * feature (TeleConnect's video-call remote control) never re-fires a motion
+     * command faster than ~500ms apart — callers of this method should match
+     * that cadence, not the old 80ms one.
+     */
+    public synchronized void driveSustained(int linear, int angular) throws IOException {
+        if (out == null) {
+            throw new IOException("not connected");
+        }
+        out.write(buildSustainedFrame(linear, angular));
+        out.flush();
+    }
+
+    /** The real stop command — see STOP_FRAME's own field comment for why this is
+     * NOT drive(0, 0, ...): a zero-velocity VEL1 frame is not how ServiceExam stops
+     * the motors and, confirmed live, does not reliably stop them here either. */
+    public synchronized void stop() throws IOException {
+        if (out == null) {
+            throw new IOException("not connected");
+        }
+        out.write(STOP_FRAME);
+        out.flush();
     }
 
     public void disconnect() {
@@ -210,12 +256,14 @@ public final class DirectMotorDriver {
         keepaliveThread = null;
     }
 
-    /** "POWER" + 0x58 padding to 500 bytes — see POWER_FRAME's own field comment. */
-    private static byte[] buildPowerFrame() {
-        byte[] frame = new byte[POWER_FRAME_SIZE];
-        byte[] tag = "POWER".getBytes(StandardCharsets.US_ASCII);
-        System.arraycopy(tag, 0, frame, 0, tag.length);
-        for (int i = tag.length; i < POWER_FRAME_SIZE; i++) {
+    /** ASCII tag + 0x58 padding to the given total size — the shape both POWER_FRAME
+     * and STOP_FRAME share (see their own field comments), matching
+     * serialDevice.generate500ByteData()'s own construction. */
+    private static byte[] buildTaggedFrame(String tag, int size) {
+        byte[] frame = new byte[size];
+        byte[] tagBytes = tag.getBytes(StandardCharsets.US_ASCII);
+        System.arraycopy(tagBytes, 0, frame, 0, tagBytes.length);
+        for (int i = tagBytes.length; i < size; i++) {
             frame[i] = 'X';
         }
         return frame;
@@ -241,6 +289,60 @@ public final class DirectMotorDriver {
         i = writeUnsigned3(frame, i, 1);  // frame.type=1 ("normal" velocity frame)
         for (; i < FRAME_SIZE; i++) {
             frame[i] = 'X'; // 0x58 padding, matching ExpressionMsg.packData1()'s own fill byte
+        }
+        return frame;
+    }
+
+    /**
+     * A two-frame VEL1 sequence, byte-for-byte matching the on-device idle-mode
+     * "Explore" behavior's own motion payload (U19e, 2026-09-15) —
+     * /sdcard/klug/APPS/expressions/AutoMode/Explore/Linear.txt's "mx" field:
+     * motion_type=4, loop=1, seqCount=2, frame1 time=40 (400ms) + frame2 time=2
+     * (20ms), BOTH frame.type=25. This superseded an earlier, WRONG guess
+     * (frame.type=24, times 5/10) that was reverse-engineered from ServiceExam's
+     * TeleConnect held-drive feature and looked plausible from source but was never
+     * actually confirmed live for sustained motion — confirmed live instead (this
+     * session) that repeated type=24 frames, at any resend cadence or magnitude
+     * (20, 5, 2 all tried), moved the robot for ~300ms then froze for a fixed ~10s,
+     * repeating, REGARDLESS of continued valid resends — while a single type=25
+     * frame with this exact shape, sent ONCE, drove continuously (encoder-confirmed
+     * via GLPOS telemetry incrementing every ~100ms with zero gaps) for 8+ seconds
+     * until a real edge/obstacle safety veto (CPL=2) stopped it. type=1 (buildFrame,
+     * used for turning) was never observed to have this stall behavior — only
+     * sustained linear motion did, matching type=25 being specifically the
+     * MCU-side "continuous drive" frame type the vendor's own AutoMode/idle
+     * exploration uses, vs. type=24's presumed one-shot/bounded semantics.
+     * Do not revert to type=24 or invent different frame1/frame2 times without a
+     * live encoder-telemetry test proving the stall pattern is actually gone —
+     * "no exception, CPL=1 every time" is NOT sufficient (see this session's own
+     * "confirmed" log evidence for type=24: it reported CPL=1 success continuously
+     * while the wheel encoders were provably frozen).
+     */
+    static byte[] buildSustainedFrame(int linear, int angular) {
+        byte[] frame = new byte[FRAME_SIZE];
+        int i = 0;
+        frame[i++] = 'V';
+        frame[i++] = 'E';
+        frame[i++] = 'L';
+        frame[i++] = '1';
+        frame[i++] = '=';
+        i = writeUnsigned3(frame, i, 4);  // MotionMsg's own "type"
+        i = writeUnsigned3(frame, i, 39); // datasize -- 15-byte header + 2x12-byte frames
+        i = writeUnsigned3(frame, i, 4);  // motion_type
+        i = writeUnsigned3(frame, i, 1);  // loop
+        i = writeUnsigned3(frame, i, 2);  // seqCount -- two frames
+        // Frame 1: matches Explore/Linear.txt's first frame (400ms).
+        i = writeSigned3(frame, i, linear);
+        i = writeSigned3(frame, i, angular);
+        i = writeUnsigned3(frame, i, 40);
+        i = writeUnsigned3(frame, i, 25); // frame.type=25 -- see this method's own javadoc
+        // Frame 2: matches Explore/Linear.txt's second frame (20ms).
+        i = writeSigned3(frame, i, linear);
+        i = writeSigned3(frame, i, angular);
+        i = writeUnsigned3(frame, i, 2);
+        i = writeUnsigned3(frame, i, 25);
+        for (; i < FRAME_SIZE; i++) {
+            frame[i] = 'X';
         }
         return frame;
     }

@@ -36,7 +36,12 @@ import java.io.IOException;
 final class DriveController {
     private static final String TAG = "DriveController";
     private static final long RENEW_INTERVAL_MS = 1000; // comfortably under KTD3's ~2.25s TTL
-    private static final long WATCHDOG_MS = 750; // R13
+    // 1200, not 750: matches DriveSection.java's own repeat interval, now 500ms
+    // (was 80ms) -- see driveSustained()'s javadoc for why the resend cadence had
+    // to change. 1200 keeps roughly the same multiple-of-the-repeat-interval
+    // margin the old 750/80 pairing had, without being so tight that ordinary
+    // timer jitter on a 500ms cadence false-triggers a stop mid-hold.
+    private static final long WATCHDOG_MS = 1200;
 
     interface ErrorListener {
         void onDriveError(String reason);
@@ -228,27 +233,27 @@ final class DriveController {
                 throw new RemoteException("drive lease not held");
             }
             handler.removeCallbacks(watchdog);
-            // Stay at "10" (centiseconds -> ~100ms), the only value ever confirmed
-            // live (docs/hardware/motors-wheels.md). U14 tried 15 (~150ms) as a live
-            // A/B experiment, hypothesizing that a longer frame would mean fewer
-            // motor ramp-restarts per second of held motion -- operator-tested and
-            // REJECTED: it made things worse ("jerk jerk jerk then stopped, then
-            // nothing"), consistent with drive frames queuing behind each other on
-            // the firmware side rather than each new one interrupting whatever's
-            // still in flight. Do not re-attempt lengthening this value; if the
-            // motor-frame layer needs more headroom, the fix has to come from
-            // shortening DriveSection.java's repeat interval instead, not this.
-            //
-            // The repeat interval itself (see DriveSection.java) already has to stay
-            // faster than this frame's own duration, since each call is its own
-            // short motion frame, not an extension of the last one -- a caller that
-            // repeats a held direction slower than that sees the robot visibly stop
-            // between frames even with every command arriving instantly (confirmed
-            // live: this, not network latency, was most of the reported original
-            // "straight, jank, jank, straight" -- the pre-WebSocket 300ms repeat
-            // interval was already longer than this frame's ~100ms run time).
+            // U19c REDESIGN (2026-09-15), superseding the old "single 10cs frame every
+            // 80ms" approach entirely: confirmed live that repeating a single ~100ms
+            // VEL1 frame every 80ms made sustained FORWARD driving specifically move a
+            // slight amount, stop, then repeat on a fixed ~10s cycle for as long as the
+            // key was held -- consistent with the motor firmware's own stall/overload
+            // protection misfiring, since linear motion (more resistance than in-place
+            // turning) never got an uninterrupted window long enough to register real
+            // movement before each resend reset it (turning has much less resistance,
+            // so it visibly worked fine under the same resend pattern). Root-caused via
+            // decompiled-source research into ServiceExam's OWN confirmed-live held-
+            // drive feature (TeleConnect's video-call remote control): it never re-fires
+            // a motion command faster than ~500ms apart, and gets more than ~100ms of
+            // motion per "tick" by packing a 2-frame kick+sustain sequence into ONE
+            // message (see DirectMotorDriver.buildSustainedFrame()), not by resending
+            // faster. driveSustained() replicates that shape; DriveSection.java's own
+            // repeat interval changed from 80ms to 500ms to match -- do not shorten it
+            // back toward 80ms without first confirming this specific stall pattern is
+            // gone, and do not go back to plain drive(linear, angular, 10) for held
+            // input, regardless of resend interval.
             try {
-                motorDriver.drive(linear, angular, 10);
+                motorDriver.driveSustained(linear, angular);
             } catch (IOException e) {
                 throw new RemoteException(e.getMessage());
             }

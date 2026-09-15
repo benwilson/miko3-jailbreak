@@ -6,16 +6,27 @@ package com.miko3.mode.remotecontrol;
  * WebSocket connection to ModeApp's "/drive-ws" route instead of a plain HTTP
  * request per command (U7's original approach) — each of those paid a fresh
  * HTTPS/TLS handshake, slow enough over WiFi to contribute to visible
- * start/stop jank ("straight, jank, jank, straight"). The bigger contributor,
- * though (see DriveController.drive()'s comment): each drive command is its
- * own short ~100ms motor frame, not an extension of the previous one, so the
- * repeat-while-held interval below has to stay under that or the robot
- * visibly stops between frames regardless of transport latency — this is why
- * it resends every 80ms now, not the original 250-300ms. Sends an explicit
- * stop on release. Only the transport changed to a cheap WS frame over an
- * already-open socket — the hold-and-repeat shape itself is the same as
- * before. Plus an "Exit mode" control that releases the lease and returns to
- * the launcher (R16) — reachable without physical access to the robot.
+ * start/stop jank ("straight, jank, jank, straight").
+ *
+ * REPEAT INTERVAL — 500ms, not 80ms (U19c, 2026-09-15): the original 80ms
+ * cadence assumed each drive command needed to arrive faster than its own
+ * ~100ms motor-frame duration to avoid visible gaps between frames. Confirmed
+ * live that resending that fast instead triggered what looks like the motor
+ * firmware's own stall/overload protection for sustained FORWARD driving
+ * specifically (moves a slight amount, stops, repeats on a fixed ~10s cycle
+ * for as long as held) — turning has much less resistance and tolerated the
+ * fast resends, forward didn't. See DriveController.drive()'s own comment and
+ * DirectMotorDriver.driveSustained()/buildSustainedFrame() for the fix:
+ * matching ServiceExam's own confirmed-live held-drive feature, which never
+ * re-fires faster than ~500ms and packs more motion into each single message
+ * (a 2-frame kick+sustain sequence) rather than resending faster. Do not
+ * shorten this back toward 80ms without first confirming that stall pattern
+ * is actually gone.
+ *
+ * Sends an explicit stop on release (now the real MTSTP command, not a
+ * zero-velocity VEL1 frame — see DirectMotorDriver.stop()'s own comment).
+ * Plus an "Exit mode" control that releases the lease and returns to the
+ * launcher (R16) — reachable without physical access to the robot.
  */
 final class DriveSection {
     private DriveSection() {
@@ -71,21 +82,19 @@ final class DriveSection {
             + "var linear=btn.getAttribute('data-linear');"
             + "var angular=btn.getAttribute('data-angular');"
             + "drive(linear,angular);"
-            // 80ms, not the original 250-300ms: each drive command is its own short
-            // ~100ms motor frame, not an extension of the previous one (see
-            // DriveController.drive()'s comment) — repeating slower than that leaves
-            // a real gap where the robot visibly stops between frames, independent of
-            // network latency. 80ms keeps comfortable margin under that ~100ms frame
-            // even with normal browser timer jitter; sending this often is cheap now
-            // that it's a WS frame over an already-open socket, not a new connection.
-            + "repeatTimer=setInterval(function(){drive(linear,angular);},80);"
+            // 500ms — see this class's own javadoc (U19c) for why this changed from
+            // 80ms: each driveSustained() call now packs a 150ms kick+sustain
+            // sequence into one message, and resending faster than ServiceExam's own
+            // confirmed-live held-drive cadence (~500ms) is what caused sustained
+            // forward driving to trip the motor firmware's stall protection.
+            + "repeatTimer=setInterval(function(){drive(linear,angular);},500);"
             + "}"
             + "function stopHold(){"
             + "if(repeatTimer){clearInterval(repeatTimer);repeatTimer=null;drive(0,0);}"
             + "}"
             + "['btn-left','btn-forward','btn-right','btn-back'].forEach(function(id){"
             + "var btn=document.getElementById(id);"
-            + "btn.addEventListener('pointerdown',function(){activeKey=null;startHold(btn);});"
+            + "btn.addEventListener('pointerdown',function(){heldKeys={};startHold(btn);});"
             + "btn.addEventListener('pointerup',stopHold);"
             + "btn.addEventListener('pointerleave',stopHold);"
             + "btn.addEventListener('pointercancel',stopHold);"
@@ -93,27 +102,43 @@ final class DriveSection {
             // Arrow-key driving (U13): keydown starts the same hold-and-repeat a
             // mouse/touch press would, keyup stops it. event.repeat is the OS's own
             // key-repeat firing every keydown while held — ignored here since our
-            // own setInterval already handles the repeat; tracking activeKey (rather
-            // than stopping on any keyup) means switching directly from one arrow
-            // key to another doesn't send a spurious stop, and a keyup for a key
-            // that isn't the one currently driving (e.g. released after another
-            // input already took over) is a no-op.
+            // own setInterval already handles the repeat.
+            //
+            // Tracks a SET of physically-held arrow keys (heldKeys), not a single
+            // "activeKey" variable — confirmed live (2026-09-15) that a single-variable
+            // scheme drops the stop entirely under some real (if not fully pinned-down)
+            // multi-key sequence: e.g. pressing a second arrow key while the first is
+            // still physically held reassigns "the" active key, and if that first key's
+            // own keyup arrives once it's no longer "the" active key, its check against
+            // a single activeKey fails and stopHold() never runs for it — reported live
+            // as arrow-key input sometimes never sending a stop pattern at all. Whichever
+            // key is held most recently still drives (startHold on every non-repeat
+            // keydown, matching the old behavior), but stopHold() now fires whenever
+            // heldKeys becomes completely empty, independent of which specific key's
+            // keyup that was — so a stop is guaranteed once every physically-held arrow
+            // key is actually released, regardless of press/release order.
             + "var arrowToButton={ArrowUp:'btn-forward',ArrowDown:'btn-back',"
             + "ArrowLeft:'btn-left',ArrowRight:'btn-right'};"
-            + "var activeKey=null;"
+            + "var heldKeys={};"
             + "document.addEventListener('keydown',function(e){"
             + "var id=arrowToButton[e.key];"
             + "if(!id)return;"
             + "e.preventDefault();"
             + "if(e.repeat)return;"
-            + "activeKey=e.key;"
+            + "heldKeys[e.key]=true;"
             + "startHold(document.getElementById(id));"
             + "});"
             + "document.addEventListener('keyup',function(e){"
             + "if(!arrowToButton[e.key])return;"
             + "e.preventDefault();"
-            + "if(activeKey===e.key){activeKey=null;stopHold();}"
+            + "delete heldKeys[e.key];"
+            + "if(Object.keys(heldKeys).length===0){stopHold();}"
             + "});"
+            // A key held when focus leaves the page entirely (alt-tab, switching
+            // windows) never gets a keyup at all — the browser simply stops sending
+            // key events to a document that isn't focused. Without this, that key
+            // stays in heldKeys forever and driving never gets a guaranteed stop.
+            + "window.addEventListener('blur',function(){heldKeys={};stopHold();});"
             + "document.getElementById('btn-exit').addEventListener('click',function(){"
             // Previously just updated the status text and left the operator sitting
             // on this same page — the request succeeded server-side (the robot's own
