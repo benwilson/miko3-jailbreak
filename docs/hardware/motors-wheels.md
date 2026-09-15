@@ -1,5 +1,76 @@
 # Motors / wheels — locomotion hardware control
 
+## RESOLVED: sustained held-driving (forward, and by extension any direction) lurched ~300ms then froze ~10s, repeating — root cause was `frame.type`, not hardware (2026-09-15)
+
+**A regression on top of the section directly below.** After the ToF-pin fix
+made forward driving work again, a *new* symptom appeared once the drive UI
+moved to holding a direction down for more than a couple seconds: the robot
+would move for ~300ms, freeze completely for ~10 seconds (wheel encoders and
+`GLPOS` odometry dead flat, MCU still acking every frame `CPL=1` "success" the
+whole time), then repeat. Operator report: "idle mode drives around fine, just
+slower" — the physical drivetrain was never the problem.
+
+**Root cause:** `DirectMotorDriver`'s sustained-drive frame used `frame.type=1`
+(originally) then `frame.type=24` (an unconfirmed guess reverse-engineered from
+ServiceExam's TeleConnect video-call feature) — both wrong. Pulling the actual
+on-device vendor expression files confirmed the real answer empirically:
+
+```
+adb shell find /sdcard/klug/APPS/expressions/AutoMode -type f
+```
+
+Cataloging every file's `mx.seq` (linear/angular/time/type) across all
+categories (`Explore`, `Edge`, `Obstacle`, `Escape`, `Stall`,
+`FaceDetected`/`FaceRecognized`) shows a completely consistent vendor
+convention:
+
+- **`frame.type=25`** — used **exclusively** by every file under `Explore/`
+  (`Linear.txt`, `LinearM.txt`, `LinearS.txt`, `Arc1Left/Right.txt`,
+  `Arc2Left/Right.txt`, `3_Infinity.txt`) — i.e. every *sustained, continuous*
+  driving behavior, forward or arcing. Always `seqCount=2`, frame1
+  `time=40` (400ms) + frame2 `time=2` (20ms), `loop=1`.
+- **`frame.type=1`** and **`frame.type=4`** — used only for short, one-shot
+  *reactive* pulses (obstacle/edge braking bumps, escape turns, face-tracking
+  wiggles, stall-recovery nudges) — every one of these is `time<=10`
+  (≤100ms), never meant to sustain.
+
+Confirmed from `ExpressionMsg.java:318-320` (`packData1()`) that `type` only
+picks ServiceExam's own internal dispatch-map key (`MOTION3` for
+`type∈[6,25)`, `MOTION1` otherwise) — **both paths pack byte-identical wire
+frames.** So the real behavioral difference between type 1/24 (stalls after
+~300ms) and type 25 (sustains indefinitely) lives entirely in the peripheral
+MCU's own firmware interpretation of that byte — not decompilable from the
+APK, only recoverable empirically from the vendor's own known-good payloads.
+
+**Live confirmation (encoder/`GLPOS`-verified, not just `CPL=1` acks — a
+`CPL=1` "success" ack was seen throughout the OLD stalled behavior too, so it
+is not sufficient evidence on its own):**
+- A single `type=24` frame resent every 500ms (the old code): `GLPOS` moves
+  ~300ms, freezes for a fixed ~10s, repeats — reproduced identically via three
+  independent paths (raw `/dev/ttyS2` writes bypassing all app code, the full
+  ServiceExam/AIDL path with `ACTIVE_OTHERS` primed, and the production
+  WebSocket/app path) — ruling out every software layer above the frame
+  itself.
+- A **single** `type=25` frame, sent **once**, matching `Explore/Linear.txt`
+  exactly (`linear=2,angular=0,time=40,type=25` +
+  `linear=2,angular=0,time=2,type=25`, `loop=1`): `GLPOS` incremented every
+  ~100ms with zero gaps for 8+ seconds until a real `CPL=2` edge/obstacle veto
+  stopped it — the MCU sustains the motion on its own via `loop=1`, no
+  resending required for that alone (production code still resends
+  periodically as a renewal/safety mechanism, which is harmless).
+- Retested at the production UI's actual magnitude (20, not the vendor's tiny
+  idle-exploration magnitude of 2): same clean, continuous result — moved
+  steadily for ~12s, stopped cleanly on a real safety trip, no stall/freeze
+  cycling at any point.
+
+**Fix applied:** `DirectMotorDriver.buildSustainedFrame()` now emits
+`frame.type=25` with `time=40`/`time=2` (was `type=24`, `time=5`/`time=10`) —
+see that method's own javadoc. Do not change the type or times back without a
+live `GLPOS`/encoder-telemetry test proving whatever regressed it — a clean
+`CPL=1` ack stream is not evidence of real motion for this device.
+
+---
+
 ## RESOLVED: forward drives correctly — root cause was a bent pin on the ToF sensor connector (2026-09-14, session 2 continued)
 
 **Closes out this entire investigation. Physical root cause found and fixed
@@ -1527,13 +1598,15 @@ actual live observation, so leaving a softer version of this question below.
    INFERRED to be some short duration (centiseconds? a fixed-rate tick
    count?) given the field's name and its role alongside a keyframe
    sequence, not independently confirmed.
-4. **`MotionFrame.type` value space** — confirmed behaviorally significant
-   (type `5` triggers `MotionMsg.packbytes()`'s alternate 50-byte
-   "PID control" framing; types `[6,25)` select the `"MOTION3"` map-key vs
-   `"MOTION1"` for types outside that range, though both produce identical
-   wire bytes) but the full meaning of each type value 0-24+ was not
-   recovered — only `type=1` (the confirmed live turn-command frame) is
-   pinned down.
+4. ~~**`MotionFrame.type` value space**~~ — **RESOLVED empirically 2026-09-15**,
+   see this doc's own top section: `type=25` is the MCU's real "sustained,
+   continuous drive" type (the only type any `Explore/*` vendor expression
+   file uses); `type=1`/`type=4` are short one-shot reactive pulses (`type=5`'s
+   PID-framing behavior, confirmed from source, is unrelated — no vendor
+   expression file was found using it). The `[6,25)` MOTION3-vs-MOTION1
+   dispatch-key split confirmed to have zero effect on wire bytes, so it does
+   not explain any behavioral difference between types — the type's real
+   meaning lives in MCU firmware, not ServiceExam's Java layer.
 5. **Does `Motion2Msg` (kp/ki/kd/PID/scale-factor config, `M1`-`M4` typed)
    get wired up anywhere this pass didn't reach** — e.g. via reflection, a
    dex this multidex jadx pass under-resolved, or a class only present in a
