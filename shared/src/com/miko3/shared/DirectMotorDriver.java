@@ -117,7 +117,16 @@ public final class DirectMotorDriver {
      */
     public synchronized boolean connect() {
         try {
-            suProcess = new ProcessBuilder("su").redirectErrorStream(true).start();
+            // Full path, not bare "su": confirmed live (this session's own testing) that
+            // a bare "su" invoked via ProcessBuilder from an app's own process does NOT
+            // actually elevate to root the way "adb shell su -c ..." does -- the child
+            // process silently ran as this app's own unprivileged UID instead, with no
+            // exception thrown, no error, just a normal-looking exit. bootagent/RootOps.
+            // java independently hit and solved the exact same problem for this exact
+            // device's su via Runtime.getRuntime().exec("/system/bin/su") -- matching that
+            // proven-working invocation here rather than relying on PATH resolution,
+            // which apparently differs between an app process and an interactive shell.
+            suProcess = new ProcessBuilder("/system/bin/su").redirectErrorStream(true).start();
             out = suProcess.getOutputStream();
             out.write(("cat > " + DEVICE_PATH + "\n").getBytes(StandardCharsets.US_ASCII));
             out.flush();
