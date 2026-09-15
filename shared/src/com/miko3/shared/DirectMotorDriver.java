@@ -69,14 +69,41 @@ import java.nio.charset.StandardCharsets;
  * back (confirmed live). Motor commands are fire-and-forget from this
  * class's side, same contract as the existing AIDL-based
  * RobotControlClient, which also never inspects the MCU's ack.
+ *
+ * REQUIRED KEEPALIVE — the actual missing piece, found via strace: a bare
+ * VEL1 write alone does NOT move the wheels if ServiceExam has never
+ * initialized the port this boot, and — more importantly — stops working
+ * again within roughly a second of ServiceExam being stopped, even after it
+ * successfully initialized things earlier. Attaching strace to ServiceExam's
+ * PID while it ran showed it isn't just reading telemetry passively; it's
+ * actively writing a 500-byte "POWER" + 0x58-padding poll frame (see
+ * POWER_FRAME below) to this same fd roughly every 100ms, continuously, for
+ * as long as it runs — and the MCU's own telemetry responses (the
+ * "POWER=..." strings this class's own earlier sniffing captured) are
+ * replies to that poll, not a free-running push. Confirmed live: with
+ * ServiceExam fully disabled, sending nothing but our own periodic
+ * POWER_FRAME poll plus a VEL1 drive frame moved the wheels; without the
+ * poll running, the same VEL1 frame was silently ignored. This reads as a
+ * host-liveness watchdog on the MCU's side (stop polling, the peripheral
+ * assumes the host is gone and ignores motion commands) — connect() below
+ * starts a background thread sending POWER_FRAME every KEEPALIVE_INTERVAL_MS
+ * for as long as this instance stays connected, independent of ServiceExam.
  */
 public final class DirectMotorDriver {
     private static final String TAG = "DirectMotorDriver";
     private static final String DEVICE_PATH = "/dev/ttyS2";
     private static final int FRAME_SIZE = 100;
+    private static final int KEEPALIVE_INTERVAL_MS = 100; // matches ServiceExam's own observed cadence
+    private static final int POWER_FRAME_SIZE = 500;
+
+    /** "POWER" (5 ASCII bytes) + 0x58 padding to 500 bytes — no encoded payload beyond
+     * the tag itself; confirmed via strace against ServiceExam's own write() calls. */
+    private static final byte[] POWER_FRAME = buildPowerFrame();
 
     private Process suProcess;
     private OutputStream out;
+    private Thread keepaliveThread;
+    private volatile boolean keepaliveRunning;
 
     /**
      * Opens a root shell and starts a `cat` redirecting its stdin to the UART
@@ -94,12 +121,46 @@ public final class DirectMotorDriver {
             out = suProcess.getOutputStream();
             out.write(("cat > " + DEVICE_PATH + "\n").getBytes(StandardCharsets.US_ASCII));
             out.flush();
+            startKeepalive();
             return true;
         } catch (IOException e) {
             Log.e(TAG, "connect() failed", e);
             disconnect();
             return false;
         }
+    }
+
+    /** See class javadoc's REQUIRED KEEPALIVE section — without this running
+     * continuously, the MCU stops honoring drive() within about a second. */
+    private void startKeepalive() {
+        keepaliveRunning = true;
+        keepaliveThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (keepaliveRunning) {
+                    try {
+                        synchronized (DirectMotorDriver.this) {
+                            if (out == null) {
+                                break;
+                            }
+                            out.write(POWER_FRAME);
+                            out.flush();
+                        }
+                    } catch (IOException e) {
+                        Log.w(TAG, "keepalive write failed", e);
+                        break;
+                    }
+                    try {
+                        Thread.sleep(KEEPALIVE_INTERVAL_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }, "direct-motor-keepalive");
+        keepaliveThread.setDaemon(true);
+        keepaliveThread.start();
     }
 
     public synchronized boolean isConnected() {
@@ -123,18 +184,45 @@ public final class DirectMotorDriver {
         drive(0, 0, 10);
     }
 
-    public synchronized void disconnect() {
-        try {
-            if (out != null) {
-                out.close();
+    public void disconnect() {
+        // Stops the keepalive thread's loop and waits for it to actually exit BEFORE
+        // tearing down out/suProcess below — it reads those same fields under this
+        // instance's monitor each iteration, so signaling it to stop without waiting
+        // could otherwise race a concurrent close() out from under its next write().
+        keepaliveRunning = false;
+        Thread t = keepaliveThread;
+        if (t != null) {
+            try {
+                t.join(KEEPALIVE_INTERVAL_MS * 2L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
             }
-        } catch (IOException ignored) {
         }
-        if (suProcess != null) {
-            suProcess.destroy();
+        synchronized (this) {
+            try {
+                if (out != null) {
+                    out.close();
+                }
+            } catch (IOException ignored) {
+            }
+            if (suProcess != null) {
+                suProcess.destroy();
+            }
+            out = null;
+            suProcess = null;
         }
-        out = null;
-        suProcess = null;
+        keepaliveThread = null;
+    }
+
+    /** "POWER" + 0x58 padding to 500 bytes — see POWER_FRAME's own field comment. */
+    private static byte[] buildPowerFrame() {
+        byte[] frame = new byte[POWER_FRAME_SIZE];
+        byte[] tag = "POWER".getBytes(StandardCharsets.US_ASCII);
+        System.arraycopy(tag, 0, frame, 0, tag.length);
+        for (int i = tag.length; i < POWER_FRAME_SIZE; i++) {
+            frame[i] = 'X';
+        }
+        return frame;
     }
 
     /** Package-private (not private) so a unit test can call it directly without a device. */
