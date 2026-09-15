@@ -208,7 +208,7 @@ def compile_resources(bt, res_dir, build_dir):
     return compiled
 
 
-def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None, res_zip=None):
+def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None, res_zip=None, native_libs=None):
     print("== 2/4 aapt2 link + add dex ==")
     unsigned = build_dir / "unsigned.apk"
     cmd = [bt / "aapt2", "link", "-I", str(android_jar), "--manifest", str(manifest),
@@ -221,6 +221,20 @@ def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None, res_zip
     withdex = build_dir / "withdex.apk"
     shutil.copy(unsigned, withdex)
     run(["zip", "-jq", str(withdex), str(build_dir / "classes.dex")])
+    # native_libs: [(abi, so_path), ...] -- bundles a prebuilt .so as this app's own
+    # lib/<abi>/<name>.so, e.g. libmiko_drivers.so (see DirectMotorDriver.java's own
+    # comment on why System.loadLibrary() against a bundled copy is used instead of
+    # System.load() against the system-partition original: Android's linker namespace
+    # isolation blocks the latter even when the file is world-readable). Staged into
+    # a scratch dir first and zipped with a relative path + matching cwd so the
+    # archive member name comes out as "lib/<abi>/<name>.so", not an absolute path.
+    for abi, so_path in native_libs or []:
+        so_path = Path(so_path)
+        lib_stage = build_dir / "lib_stage" / "lib" / abi
+        lib_stage.mkdir(parents=True, exist_ok=True)
+        shutil.copy(so_path, lib_stage / so_path.name)
+        run(["zip", "-q", str(withdex), f"lib/{abi}/{so_path.name}"],
+            cwd=str(build_dir / "lib_stage"))
     return withdex
 
 
@@ -262,11 +276,11 @@ def sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore
 
 def build_apk(src_dirs, manifest, android_jar, javac, bt, keytool, java_home_dir,
               build_dir, keystore, keystore_alias, keystore_pass, keystore_cn,
-              apk_out, asset_sources=None, res_dir=None):
+              apk_out, asset_sources=None, res_dir=None, native_libs=None):
     """Full pipeline: compile_java -> stage_assets -> compile_resources -> link_and_pack -> sign."""
     compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir)
     assets_dir = stage_assets(asset_sources, build_dir) if asset_sources else None
     res_zip = compile_resources(bt, res_dir, build_dir) if res_dir else None
-    withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip)
+    withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip, native_libs)
     sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore_pass,
          keystore_cn, build_dir, apk_out)

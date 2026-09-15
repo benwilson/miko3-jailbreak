@@ -63,7 +63,8 @@ def main():
     print("== 1/5 javac ==")
     sources = [str(p) for p in sorted(SRC.rglob("*.java"))]
     sources += [str(SHARED_SRC / "com" / "miko3" / "shared" / "DirectMotorDriver.java"),
-                str(SHARED_SRC / "com" / "miko3" / "shared" / "RobotControlClient.java")]
+                str(SHARED_SRC / "com" / "miko3" / "shared" / "RobotControlClient.java"),
+                str(SHARED_SRC / "emotix" / "com" / "drivers" / "SensorModule.java")]
     run([javac, "-source", "8", "-target", "8", "-encoding", "UTF-8",
          "-bootclasspath", str(android_jar), "-classpath", str(android_jar),
          "-d", str(obj)] + sources)

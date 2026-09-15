@@ -118,7 +118,7 @@ public class MainActivity extends Activity {
      * libmiko_drivers.so and drives through its actual createUART/initUART/
      * writeUART natives (see emotix.com.drivers.SensorModule) instead of
      * reimplementing the UART protocol in Java. */
-    private static final boolean TEST_SENSOR_MODULE_NATIVE = false;
+    private static final boolean TEST_SENSOR_MODULE_NATIVE = true;
 
     /** Set true to run RobotControlClient.driveSustained() repeatedly (every
      * 500ms, matching DriveController's real cadence) through ServiceExam's own
@@ -126,7 +126,7 @@ public class MainActivity extends Activity {
      * the confirmed-working type=25 payload, sent the way production would
      * really send it (resent, not one-shot), while staying inside ServiceExam's
      * own process the whole time. */
-    private static final boolean TEST_RCC_SUSTAINED_RESEND = true;
+    private static final boolean TEST_RCC_SUSTAINED_RESEND = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -184,8 +184,8 @@ public class MainActivity extends Activity {
                 @Override
                 public void run() {
                     try {
-                        driver.driveSustained(20, 0);
-                        Log.e(TAG, "DMD-TEST ONESHOT driveSustained(20,0) sent t=" + System.currentTimeMillis());
+                        driver.driveContinuous(20, 0);
+                        Log.e(TAG, "DMD-TEST ONESHOT driveContinuous(20,0) sent t=" + System.currentTimeMillis());
                         setStatus("ONESHOT sent");
                     } catch (Exception e) {
                         Log.e(TAG, "DMD-TEST ONESHOT failed", e);
@@ -222,10 +222,10 @@ public class MainActivity extends Activity {
                     return;
                 }
                 try {
-                    driver.driveSustained(20, 0);
-                    Log.e(TAG, "DMD-TEST driveSustained(20,0) #" + n[0] + " t=" + System.currentTimeMillis());
+                    driver.driveContinuous(20, 0);
+                    Log.e(TAG, "DMD-TEST driveContinuous(20,0) #" + n[0] + " t=" + System.currentTimeMillis());
                 } catch (Exception e) {
-                    Log.e(TAG, "DMD-TEST driveSustained failed", e);
+                    Log.e(TAG, "DMD-TEST driveContinuous failed", e);
                 }
                 n[0]++;
                 handler.postDelayed(this, 500);
@@ -249,6 +249,15 @@ public class MainActivity extends Activity {
         setStatus("connectUart()=" + connected);
         final byte[] power = taggedFrame("POWER", 500);
         final byte[] stop = taggedFrame("MTSTP", 500);
+        // CAVEAT (confirmed live, 2026-09-15): sustainedFrame() builds the TURN-style
+        // two-frame kick+sustain shape (type=25/loop=1) -- sending it once with
+        // linear=20, angular=0 confirmed clean UART communication (real POWER
+        // telemetry replies, zero stalls, zero ERROR_UART) but did NOT move the
+        // robot, because pure linear motion needs the completely different
+        // frontContinous shape (type=1, loop=0, resent every tick -- see
+        // DirectMotorDriver.buildContinuousFrame()'s own javadoc). This test is still
+        // useful for verifying the UART transport itself is healthy; it does not by
+        // itself prove a drive command's CONTENT is correct.
         final byte[] drive = sustainedFrame(20, 0);
 
         // Replicates SocialInteraction_SpeechChat.SendData()'s exact contract: every

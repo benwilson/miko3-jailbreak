@@ -1,5 +1,149 @@
 # Motors / wheels — locomotion hardware control
 
+## RESOLVED, RESOLVES OPEN QUESTION #13: full chain, ServiceExam's real entry point to the physical wire, including the native UART init a Java-only jadx pass could never see (2026-09-15, later the same day as the section below)
+
+This section answers, in one place, "what is ServiceExam actually doing to make
+movement occur, from the top entry point all the way down to where it touches
+hardware" — the layers below it were already independently confirmed in this
+doc's other sections (cited inline); what's NEW here is the bottom layer
+(native UART init), captured live via `strace`, which closes Open Question
+#13 below (`SensorModule.init()`/`createUART()`'s native-side implementation
+"was not decompiled... out of scope for a Java-source jadx pass").
+
+### The full call chain, top to bottom
+
+1. **Entry point**: `GameControllerAIDL.GameEvent(String json)` — the AIDL
+   surface ServiceExam exposes to any bound client (this project's own
+   `RobotControlClient`, and this project's own `spike-drive-test` app, both
+   use this same entry point). Envelope shape confirmed from source: a
+   `{"data":{"135": "<json>"}}` outer wrapper, `135` being
+   `CODE_EXPRESSION_PLAYBACK`; the inner JSON is an `ExpressionMsg` (`tx`/`ax`/
+   `mx`/`ix`/`rx` channels — `mx` is the motion channel, `MotionMsg`) — see
+   "The real motion channel" section below for the full traced chain and
+   confirmed byte layout.
+2. **Motion command construction**: `MotionMsg`/`ExpressionMsg.packData1()`
+   builds the `"VEL1="` + 27-byte packed frame this project's own
+   `DirectMotorDriver.buildFrame()`/`buildContinuousFrame()`/`buildTurnFrame()`
+   already replicate byte-for-byte (see "Frame format (CONFIRMED, fully
+   recovered byte layout)" below). `frame.type` selects the MCU-side
+   behavior: `type=1` one-shot pulse (this project's `frontContinous`
+   recipe, must be resent), `type=24`/`25` two-frame kick+sustain
+   (self-sustaining), confirmed empirically this same day (see top-of-file
+   "sustained held-driving" section).
+3. **Dispatch + the shared lock**: `SocialInteraction_SpeechChat.SendData()`
+   is the SOLE place any of these tags (`"VEL1="`, `"POWER"`, `"MTSTP"`)
+   actually reach the wire. Confirmed from source: every call is
+   `synchronized` on ONE lock shared with ServiceExam's own speech
+   recognition/TTS/cloud-call machinery (see this class's own field comment
+   in `DirectMotorDriver.java` for why that's a structural cause of
+   ServiceExam-path freezes this project deliberately moved away from).
+   `SendData()`'s real contract, confirmed from source AND now confirmed
+   live: **every write is immediately followed by a synchronous read of the
+   MCU's reply**, with an explicit check for a literal 10-byte `"ERROR_UART"`
+   sentinel — a reply that value means the UART itself needs resetting
+   (`resetUART()` + `initUART()`) before continuing. This project's own
+   `DirectMotorDriver` was write-only (no read-back at all) until this same
+   day's fix — see "The fix" below.
+4. **`SensorModule` (Java JNI declarations)**:
+   `emotix.com.drivers.SensorModule` — `createUART(int bufSize, String
+   path)`, `initUART(long handle)`, `writeUART(long handle, byte[] data)`,
+   `readUART(long handle)`, `resetUART(long handle)`. Thin native-method
+   declarations only; the real work happens in `libmiko_drivers.so`, a
+   prebuilt vendor `.so` (not built from any source in this repo) that
+   ServiceExam ships and this project's own `spike-drive-test`/
+   `mode-remote-control` now bundle a copy of (see "JNI call sequence"
+   section below, and `scripts/build_common.py`'s `native_libs` param).
+5. **`libmiko_drivers.so`'s native UART init — NEW, confirmed live via
+   `strace -f -tt`, resolves Open Question #13**:
+   ```
+   openat(AT_FDCWD, "/dev/ttyS2", O_RDWR|O_NOCTTY) = 44
+   ioctl(44, TCFLSH, TCIFLUSH) = 0
+   ioctl(44, TCSETS, {B460800 -opost -isig -icanon -echo ...}) = 0
+   ```
+   That's the ENTIRE native init sequence — open, flush stale buffered bytes,
+   then one `termios` reconfiguration: **460800 baud** (NOT 2,000,000 — that
+   figure elsewhere in this doc, `com.miko.app_bluetooth.comm.
+   ApplicationLayer.baudRate = 2000000`, is for a completely different
+   serial channel, the Arya/`TransportLayer` 0x3C/0x3E-framed protocol, not
+   this `"VEL1="`/`SensorModule` motion channel — see "Resolving the VEL1=
+   vs 0x3C/0x3E framing question" below), raw mode (no output
+   post-processing, no signal chars, no canonical line editing, no echo).
+   No flow control, no modem-control-line (`TIOCM*`) calls, no magic
+   handshake byte sequence — confirmed by grepping the full trace for every
+   termios/ioctl-family call, only the one `TCSETS` appears. After that,
+   writes/reads on the same fd proceed directly (first observed exchange:
+   `write(44, "VEL1=...", 500)` immediately followed by `read(44, "VEL1=...",
+   499)` — the MCU echoing/acking the frame it just received, matching
+   `SendData()`'s own read-back contract from step 3).
+6. **The physical wire**: `/dev/ttyS2`, confirmed device-specific to this
+   unit's serial number prefix (M3Q) — see "Which device node" section
+   below. World-writable (`chmod 0666` by an OEM boot script), SELinux
+   permissive for this node, so no root/`su` is needed to open or configure
+   it from an unprivileged app process — confirmed live, both for
+   `SensorModule`'s native `open()`+`ioctl()` pair and for this project's
+   own raw-serial testing.
+
+### Why this matters: a plain `FileOutputStream` never does step 5 at all
+
+`DirectMotorDriver`'s ENTIRE history before this fix — every version, all the
+way back to its first commit — opened `/dev/ttyS2` with a bare
+`new FileOutputStream(path)`. That call does exactly one thing: open the file
+descriptor. It never touches termios. A tty's baud rate/mode is kernel-side
+state tied to the DEVICE NODE, not per-fd — so a `FileOutputStream` silently
+inherits whatever the port was last configured to, by whoever last configured
+it (typically ServiceExam itself, the last time it ran). If that's ever
+anything other than 460800/raw — including simply "never configured this
+boot, because ServiceExam has been disabled the whole time" — every write
+and read through the bare `FileOutputStream` path runs at the wrong baud
+rate, desyncing framing at the byte level.
+
+This fully explains this same day's earlier, separately-diagnosed incident:
+"genuinely wedged driving — confirmed no code-level bug, survives an app
+force-stop, a `cameraserver`/`camerahalserver` restart, AND a full `adb
+reboot`" (raw `/dev/ttyS2` writes via `scripts/bypass-drive-test.py`, itself
+also just a bare shell `>&3` redirect with zero termios setup, showed the
+exact same symptom: a consistent, clock-like ~4-second stall every 4 frames).
+**None of those recovery attempts reset the tty's termios state** — only an
+explicit `TCSETS` call does that, and nothing in this project's own code
+ever made one before this fix. A physical power cycle didn't fix it either,
+for the same reason (power-cycling resets the MCU and the Android OS, not
+whatever termios state the kernel driver retains/re-derives on next open —
+unconfirmed which, but empirically irrelevant either way since the actual
+fix needed is a `TCSETS` call, not a reset of anything else).
+
+### The fix (this same day)
+
+`DirectMotorDriver.java` now uses `SensorModule` (JNI, bundled
+`libmiko_drivers.so`) instead of a bare `FileOutputStream`:
+- `connect()` calls `SensorModule.connectUart(path)` (→ native
+  `createUART()`+`initUART()` → the exact `TCFLSH`+`TCSETS` sequence above),
+  guaranteeing correct termios on every connect regardless of whatever state
+  the port was previously left in.
+- Every frame write (`POWER` keepalive, `drive()`, `driveTurnSustained()`,
+  `driveContinuous()`, `stop()`) now goes through one shared `sendFrame()`
+  helper that writes AND reads back a reply, checking for the `"ERROR_UART"`
+  sentinel and resetting the UART (`close()` + `connectUart()` again) if seen
+  — replicating `SocialInteraction_SpeechChat.SendData()`'s own contract from
+  step 3 above, which the previous write-only implementation had no way to
+  do at all.
+
+**Verified live (2026-09-15)**: `strace -f -tt` against a process calling
+`SensorModule.connectUart()` directly confirmed the exact sequence above,
+with clean POWER-frame telemetry replies (e.g. `"POWER=0,0,07356,-024"`) at a
+steady ~124ms cadence and zero stalls over an extended run. After porting
+`DirectMotorDriver` itself onto `SensorModule`, real `/drive` requests
+through the production app (`mode-remote-control`, ServiceExam fully
+disabled the entire time) returned instantly with no lock contention and no
+`ERROR_UART` — **operator-confirmed physical wheel movement** during this
+test. This closes out both this same day's drive-lease/camera resilience
+work and the original "movement is broken" report: the actual root cause
+was the missing termios configuration, not anything in `DriveController`'s
+lease logic, the camera, or system load (all of which were real, separately-
+fixed issues found along the way, but none of which were THE cause of the
+raw-serial-level stall specifically).
+
+---
+
 ## RESOLVED (truly final): ServiceExam was never actually required — the whole drive path is back on DirectMotorDriver, bypassing ServiceExam entirely (2026-09-15, same day as the section below)
 
 **Supersedes only this file's "Architecture note" from the section directly
@@ -1760,10 +1904,12 @@ actual live observation, so leaving a softer version of this question below.
     MCU reflashing becomes relevant to the jailbreak project.
 12. Does `Power.edge_obstacle_detected` (cliff/edge sensor flag) actually get
     set anywhere, and via which serial tag? Not traced to a setter in this pass.
-13. `SensorModule.init()`/`createUART()`'s native-side implementation
-    (whether it's a plain `termios` configuration a non-`SensorModule` app
-    could replicate with a raw `open()`, or does something
-    `libmiko_drivers.so`-specific like a proprietary handshake) was not
-    decompiled (it's native code, out of scope for a Java-source jadx pass)
-    — relevant to how hard §0 route (b) is in practice if route (a) (AIDL)
-    is ever unavailable.
+13. ~~`SensorModule.init()`/`createUART()`'s native-side implementation...~~
+    — **RESOLVED 2026-09-15** (later the same day), via live `strace -f -tt`
+    against the real native call (not further static decompilation, which
+    can't see into a `.so`'s machine code at all): it IS "a plain `termios`
+    configuration", not a proprietary handshake — `ioctl(fd, TCFLSH,
+    TCIFLUSH)` then `ioctl(fd, TCSETS, {B460800 -opost -isig -icanon -echo
+    ...})`, nothing else. See this doc's own top section for the full
+    writeup and why this was the actual root cause of a separate same-day
+    "genuinely wedged driving" incident.

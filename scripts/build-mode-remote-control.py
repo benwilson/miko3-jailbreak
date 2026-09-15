@@ -39,6 +39,13 @@ KEYSTORE_ALIAS = "miko3moderemotecontrol"
 KEYSTORE_PASS = "miko3moderemotecontrol"
 KEYSTORE_CN = "Miko3 Remote Control Mode"
 
+# Bundled so DirectMotorDriver's SensorModule-based UART I/O (see that class's own
+# comment) can System.loadLibrary("miko_drivers") -- the same vendor .so ServiceExam
+# itself ships, pulled from tools/serviceexam_jadx's extracted resources rather than
+# System.load()'d from /system/lib64 directly (blocked by Android's linker namespace
+# isolation even though that file is world-readable -- confirmed live).
+VENDOR_SO = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / "arm64-v8a" / "libmiko_drivers.so"
+
 
 def main():
     ap = argparse.ArgumentParser(description="Build and sign the remote-control/telepresence mode APK.")
@@ -63,6 +70,7 @@ def main():
         apk_out=APK,
         asset_sources=[SHARED_ASSETS],
         res_dir=RES,
+        native_libs=[("arm64-v8a", VENDOR_SO)] if VENDOR_SO.exists() else None,
     )
     print(f"\n== 4/4 BUILT: {APK.relative_to(REPO)} ({APK.stat().st_size} bytes) ==")
     return 0

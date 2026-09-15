@@ -2,7 +2,8 @@ package com.miko3.shared;
 
 import android.util.Log;
 
-import java.io.FileOutputStream;
+import emotix.com.drivers.SensorModule;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
@@ -117,32 +118,47 @@ public final class DirectMotorDriver {
      */
     private static final byte[] STOP_FRAME = buildTaggedFrame("MTSTP", POWER_FRAME_SIZE);
 
-    private FileOutputStream out;
+    private SensorModule sensorModule;
     private Thread keepaliveThread;
     private volatile boolean keepaliveRunning;
 
     /**
-     * Opens the UART device directly — no su, no shell, no subprocess at all.
-     * Confirmed live this session that root was never actually required here:
-     * /dev/ttyS2 is chmod 0666 (world read/write) and this device's SELinux
-     * policy is permissive (denials logged, never enforced), so a plain
-     * FileOutputStream from this app's own unprivileged process opens and
-     * writes to it exactly as successfully as "adb shell cat > /dev/ttyS2"
-     * does with no su involved. An earlier version of this class spent a
-     * long detour trying to get su to elevate from inside the app process
-     * (ProcessBuilder("su"), then the full path "/system/bin/su", matching
-     * bootagent/RootOps.java's own documented pattern) before empirically
-     * confirming, via a bare "adb shell" write with no su prefix, that su
-     * was solving a problem that didn't exist for this specific device node.
+     * Opens the UART via SensorModule (JNI into the same system-installed
+     * libmiko_drivers.so ServiceExam itself uses — see build-mode-remote-control.py's
+     * own comment for how it gets bundled into this app's APK), NOT a bare
+     * FileOutputStream on /dev/ttyS2.
+     *
+     * CONFIRMED LIVE (2026-09-15, via `strace -f` against a process calling
+     * SensorModule.connectUart() directly) that this is not just a style
+     * preference: opening the device node is only half the story. ServiceExam's own
+     * native init does exactly two additional things a bare FileOutputStream never
+     * does at all — `ioctl(fd, TCFLSH, TCIFLUSH)` (flush stale buffered bytes), then
+     * `ioctl(fd, TCSETS, {B460800 -opost -isig -icanon -echo ...})`: sets the port to
+     * **460800 baud, raw mode** (not 2,000,000 — that figure in this doc's own
+     * earlier notes was for a DIFFERENT serial channel, the Arya/TransportLayer one,
+     * not this VEL1/SensorModule motion channel). A plain FileOutputStream inherits
+     * whatever baud/termios settings the device node was already left at by
+     * whatever last configured it (kernel tty state, not per-fd) — if that's ever
+     * anything other than 460800/raw, writes and reads desync at the byte level.
+     * This fully explains this project's own confirmed-live "genuinely wedged
+     * driving, no code-level bug, survives an app restart, a service restart, and
+     * even a full device reboot" incident from earlier the same day: none of those
+     * reset the tty's *termios* state, only SensorModule's own explicit TCSETS call
+     * does. See docs/hardware/motors-wheels.md's "Open questions" #13 (now
+     * resolved) for the full writeup.
      */
     public synchronized boolean connect() {
         try {
-            out = new FileOutputStream(DEVICE_PATH);
+            sensorModule = new SensorModule();
+            // Return value not meaningful (see SensorModule's own class comment,
+            // matching ServiceExam's own SensorModule.init(): initUART()'s 0-success
+            // C return maps to JNI_FALSE) — proceed regardless, matching real usage.
+            sensorModule.connectUart(DEVICE_PATH);
             startKeepalive();
             return true;
-        } catch (IOException e) {
-            Log.e(TAG, "connect() failed", e);
-            disconnect();
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "connect() failed -- libmiko_drivers.so not loadable", e);
+            sensorModule = null;
             return false;
         }
     }
@@ -157,11 +173,10 @@ public final class DirectMotorDriver {
                 while (keepaliveRunning) {
                     try {
                         synchronized (DirectMotorDriver.this) {
-                            if (out == null) {
+                            if (sensorModule == null) {
                                 break;
                             }
-                            out.write(POWER_FRAME);
-                            out.flush();
+                            sendFrame(POWER_FRAME);
                         }
                     } catch (IOException e) {
                         Log.w(TAG, "keepalive write failed", e);
@@ -181,19 +196,47 @@ public final class DirectMotorDriver {
     }
 
     public synchronized boolean isConnected() {
-        return out != null;
+        return sensorModule != null;
+    }
+
+    /** The literal 10-byte reply SocialInteraction_SpeechChat.SendData() checks for
+     * (confirmed from source) that signals the UART itself needs resetting — a
+     * condition a write-only FileOutputStream had no way to ever detect at all. */
+    private static final String ERROR_UART = "ERROR_UART";
+
+    /** Every write to the UART is immediately followed by a synchronous read of the
+     * MCU's reply, matching SocialInteraction_SpeechChat.SendData()'s own contract
+     * exactly (confirmed via decompiled source AND live strace) — callers must hold
+     * this instance's monitor already (every public method here is `synchronized`).
+     * An ERROR_UART reply resets the port (close + reconnectUart, mirroring
+     * SendData()'s own resetUART()+initUART() recovery) before returning, so a
+     * transient UART-level fault self-heals on the very next call instead of
+     * leaving every subsequent write silently degraded. */
+    private void sendFrame(byte[] frame) throws IOException {
+        if (sensorModule == null) {
+            throw new IOException("not connected");
+        }
+        if (!sensorModule.write(frame)) {
+            throw new IOException("SensorModule.write() failed");
+        }
+        byte[] reply = sensorModule.read();
+        if (reply != null && reply.length == ERROR_UART.length()
+                && new String(reply, StandardCharsets.US_ASCII).equals(ERROR_UART)) {
+            Log.w(TAG, "ERROR_UART reply -- resetting UART");
+            sensorModule.close();
+            sensorModule.connectUart(DEVICE_PATH);
+        }
     }
 
     /**
-     * Fire-and-forget, matching RobotControlClient.drive()'s own contract —
-     * see class javadoc's WRITE-ONLY note for why no ack is read back.
+     * Fire-and-forget from the CALLER's perspective (matches RobotControlClient.
+     * drive()'s own contract, and this project's own established convention — see
+     * class javadoc's WRITE-ONLY note) even though sendFrame() now reads a reply
+     * internally: that read is for UART-level health (ERROR_UART detection), not a
+     * per-command application-level ack, so callers still don't get one.
      */
     public synchronized void drive(int linear, int angular, int timeCentiseconds) throws IOException {
-        if (out == null) {
-            throw new IOException("not connected");
-        }
-        out.write(buildFrame(linear, angular, timeCentiseconds));
-        out.flush();
+        sendFrame(buildFrame(linear, angular, timeCentiseconds));
     }
 
     /**
@@ -206,11 +249,7 @@ public final class DirectMotorDriver {
      * completely different shape.
      */
     public synchronized void driveTurnSustained(int angular) throws IOException {
-        if (out == null) {
-            throw new IOException("not connected");
-        }
-        out.write(buildTurnFrame(angular > 0));
-        out.flush();
+        sendFrame(buildTurnFrame(angular > 0));
     }
 
     /**
@@ -226,29 +265,21 @@ public final class DirectMotorDriver {
      * is held, and call stop() on release.
      */
     public synchronized void driveContinuous(int linear, int angular) throws IOException {
-        if (out == null) {
-            throw new IOException("not connected");
-        }
-        out.write(buildContinuousFrame(linear, angular));
-        out.flush();
+        sendFrame(buildContinuousFrame(linear, angular));
     }
 
     /** The real stop command — see STOP_FRAME's own field comment for why this is
      * NOT drive(0, 0, ...): a zero-velocity VEL1 frame is not how ServiceExam stops
      * the motors and, confirmed live, does not reliably stop them here either. */
     public synchronized void stop() throws IOException {
-        if (out == null) {
-            throw new IOException("not connected");
-        }
-        out.write(STOP_FRAME);
-        out.flush();
+        sendFrame(STOP_FRAME);
     }
 
     public void disconnect() {
         // Stops the keepalive thread's loop and waits for it to actually exit BEFORE
-        // tearing down out below — it reads that same field under this instance's
-        // monitor each iteration, so signaling it to stop without waiting could
-        // otherwise race a concurrent close() out from under its next write().
+        // tearing down sensorModule below — it reads that same field under this
+        // instance's monitor each iteration, so signaling it to stop without waiting
+        // could otherwise race a concurrent close() out from under its next write().
         keepaliveRunning = false;
         Thread t = keepaliveThread;
         if (t != null) {
@@ -259,13 +290,10 @@ public final class DirectMotorDriver {
             }
         }
         synchronized (this) {
-            try {
-                if (out != null) {
-                    out.close();
-                }
-            } catch (IOException ignored) {
+            if (sensorModule != null) {
+                sensorModule.close();
             }
-            out = null;
+            sensorModule = null;
         }
         keepaliveThread = null;
     }
