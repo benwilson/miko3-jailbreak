@@ -69,25 +69,20 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 Log.e(TAG, "ACTIVE_OTHERS send failed", e);
             }
-            setStatus("CONNECTED - firing drive sequence");
-            int base = 1500;
-            int step = 350;
-            for (int i = 0; i < 6; i++) {
-                final int n = i;
-                handler.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        sendDrive(0, 20, 10, "ROT");
-                    }
-                }, base + (long) n * step);
-            }
+            setStatus("CONNECTED - firing Explore/Linear.txt-shaped frame ONCE");
+            handler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    sendExploreLinear(20, 0, "EXPLORE-LINEAR");
+                }
+            }, 1500);
             handler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     sendDrive(0, 0, 10, "STOP");
                     setStatus("DONE - sequence complete, check robot");
                 }
-            }, base + 6L * step);
+            }, 1500 + 20000L);
         }
     };
 
@@ -136,6 +131,49 @@ public class MainActivity extends Activity {
                 statusView.setText(s);
             }
         });
+    }
+
+    /** Replicates /sdcard/klug/APPS/expressions/AutoMode/Explore/Linear.txt's exact "mx"
+     * payload verbatim (frame.type=25, seqCount=2, times 40/2) instead of this class's
+     * own hand-built type=1 single-frame payload, to test whether type=25 is what lets
+     * idle-mode driving sustain motion where our own drive path stalls after ~300ms. */
+    private void sendExploreLinear(int linear, int angular, String label) {
+        GameControllerAIDL gc = gameController;
+        if (gc == null) {
+            Log.e(TAG, label + ": sendExploreLinear called but not connected");
+            return;
+        }
+        try {
+            String mx = "{\"type\":4,\"size\":0,\"motion_type\":4,\"loop\":1,\"kp\":0,\"ki\":0,\"kd\":0,"
+                    + "\"pidcontrol\":0,\"seqCount\":2,\"seq\":["
+                    + "{\"linear\":" + linear + ",\"angular\":" + angular + ",\"time\":40,\"type\":25,\"id\":0},"
+                    + "{\"linear\":" + linear + ",\"angular\":" + angular + ",\"time\":2,\"type\":25,\"id\":1}"
+                    + "]}";
+            String rawJson = "{\"tx\":{\"type\":0,\"size\":0,\"loop\":0,\"seqCount\":0,\"seq\":[]},"
+                    + "\"ax\":{\"type\":0,\"size\":0,\"loop\":0,\"seqCount\":0,\"seq\":[]},\"mx\":" + mx + ","
+                    + "\"ix\":{\"type\":0,\"size\":0,\"imagetype\":0,\"loop\":0,\"seqCount\":0},"
+                    + "\"rx\":{\"type\":0,\"size\":0,\"loop\":0,\"seqCount\":0,\"seq\":[]},"
+                    + "\"id\":" + (int) (Math.random() * 1000) + "}";
+
+            JSONObject serviceRequest = new JSONObject();
+            serviceRequest.put("name", "");
+            serviceRequest.put("path", rawJson);
+            serviceRequest.put("data", "");
+            serviceRequest.put("audioPath", "");
+
+            JSONObject dataMap = new JSONObject();
+            dataMap.put("135", serviceRequest.toString());
+            JSONObject envelope = new JSONObject();
+            envelope.put("data", dataMap);
+
+            String payload = envelope.toString();
+            Log.e(TAG, label + ": sending EXPLORE-LINEAR payload: " + payload);
+            gc.GameEvent(payload);
+            setStatus(label + " linear=" + linear + " angular=" + angular);
+        } catch (Exception e) {
+            Log.e(TAG, label + ": sendExploreLinear failed", e);
+            setStatus(label + " failed: " + e);
+        }
     }
 
     /** Builds the CORRECT envelope: {"data":{"135": "<ServiceRequest JSON, as a string>"}} */
