@@ -336,8 +336,9 @@ public final class RoutingHttpServer implements Runnable {
         return upgrade != null && upgrade.toLowerCase().contains("websocket");
     }
 
-    /** RFC 6455 §1.3: base64(SHA-1(client's Sec-WebSocket-Key + the spec's fixed GUID)). */
-    private static String computeAcceptKey(String wsKey) {
+    /** RFC 6455 §1.3: base64(SHA-1(client's Sec-WebSocket-Key + the spec's fixed GUID)).
+     * Package-private so WebSocketClient can check the server's answer with it. */
+    static String computeAcceptKey(String wsKey) {
         try {
             MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
             byte[] digest = sha1.digest((wsKey + WEBSOCKET_GUID).getBytes(StandardCharsets.US_ASCII));
