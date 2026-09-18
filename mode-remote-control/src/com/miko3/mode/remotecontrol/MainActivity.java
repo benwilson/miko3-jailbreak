@@ -157,6 +157,9 @@ public class MainActivity extends Activity {
         // if it's reused after an exit — leaving it resumed with a stale,
         // already-released controller that never gets recreated.
         driveController = null;
+        // This instance's own mic passthrough goes before presence clears, like
+        // the app-wide mic below, so the launcher's wait implies a free mic.
+        releaseCaptureBridge();
         ModeApp app = (ModeApp) getApplication();
         // Only clear the app-wide controller if a newer instance hasn't already
         // taken over (see ModeApp.bumpGeneration()'s javadoc) — confirmed live
@@ -173,7 +176,6 @@ public class MainActivity extends Activity {
             app.stopMicAndSpeaker();
             app.deactivate(myGeneration);
         }
-        releaseCaptureBridge();
         finish();
     }
 
@@ -182,6 +184,7 @@ public class MainActivity extends Activity {
         if (driveController != null) {
             driveController.release();
         }
+        releaseCaptureBridge();
         ModeApp app = (ModeApp) getApplication();
         if (myGeneration == app.currentGeneration()) {
             app.setDriveController(null);
@@ -190,7 +193,6 @@ public class MainActivity extends Activity {
             app.stopMicAndSpeaker();
             app.deactivate(myGeneration);
         }
-        releaseCaptureBridge();
         super.onDestroy();
     }
 

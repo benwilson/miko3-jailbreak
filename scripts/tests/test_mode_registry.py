@@ -43,6 +43,7 @@ HARNESS = REPO / "scripts" / "tests" / "fixtures" / "mode_registry_harness" / "s
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "shared" / "ModeRegistryHarness.java"
 SERVER_P12 = REPO / "shared" / "assets" / "server.p12"
 RC_SRC = REPO / "mode-remote-control" / "src" / "com" / "miko3" / "mode" / "remotecontrol"
+VOICE_SRC = REPO / "mode-voice" / "src" / "com" / "miko3" / "mode" / "voice"
 LAUNCHER_SRC = REPO / "launcher" / "src" / "com" / "miko3" / "launcher"
 
 
@@ -174,7 +175,24 @@ class SourceWiringTest(unittest.TestCase):
                 # Presence clears only after the mic is released.
                 self.assertLess(body.index("app.stopMicAndSpeaker()"), body.index("app.deactivate(myGeneration)"))
                 self.assertIn("releaseCaptureBridge()", body)
+                # The instance's own mic passthrough is released before presence clears too.
+                self.assertLess(body.index("releaseCaptureBridge()"), body.index("app.deactivate(myGeneration)"))
         self.assertIn("captureBridge.toggleOperatorMic(false)", _method_body(activity, "void releaseCaptureBridge()"))
+
+    def test_voice_teardown_releases_mic_before_presence(self):
+        activity = (VOICE_SRC / "MainActivity.java").read_text()
+        for signature in ("private void exitMode()", "protected void onDestroy()"):
+            with self.subTest(path=signature):
+                self.assertIn("releaseIfCurrent()", _method_body(activity, signature))
+        body = _method_body(activity, "private boolean releaseIfCurrent()")
+        self.assertIn("app.stopVoice()", body)
+        self.assertIn("app.deactivate(myGeneration)", body)
+        # Presence clears only after the mic is released, so the launcher's wait
+        # for inactive presence implies a free mic (as in remote-control).
+        self.assertLess(body.index("app.stopVoice()"), body.index("app.deactivate(myGeneration)"))
+        # Stale-instance guard: only the current generation stops the engine.
+        self.assertIn("app.isCurrent(myGeneration)", body)
+        self.assertLess(body.index("app.isCurrent(myGeneration)"), body.index("app.stopVoice()"))
 
     def test_launcher_has_no_hard_coded_mode(self):
         app = (LAUNCHER_SRC / "LauncherApp.java").read_text()

@@ -152,9 +152,11 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Shared by exitMode() and onDestroy(): once per activation, clears presence
-     * and stops the voice engine, but only while this instance is still the
-     * current generation. Returns whether the engine was stopped.
+     * Shared by exitMode() and onDestroy(): once per activation, stops the voice
+     * engine and then clears presence, but only while this instance is still the
+     * current generation. The engine stops first so the launcher, which waits for
+     * presence to go inactive before starting another mode, never finds the
+     * microphone still held. Returns whether the engine was stopped.
      */
     private boolean releaseIfCurrent() {
         if (!activated) {
@@ -162,10 +164,13 @@ public class MainActivity extends Activity {
         }
         activated = false;
         ModeApp app = (ModeApp) getApplication();
-        if (!app.deactivate(myGeneration)) {
+        // Activity callbacks all run on the main thread, so no newer instance can
+        // activate between this check and deactivate() below.
+        if (!app.isCurrent(myGeneration)) {
             return false;
         }
         app.stopVoice();
+        app.deactivate(myGeneration);
         return true;
     }
 

@@ -294,6 +294,12 @@ public class ModeApp extends Application {
         return ++generation;
     }
 
+    /** Whether gen is still the current generation (no newer instance has
+     * activated since). */
+    synchronized boolean isCurrent(long gen) {
+        return gen == generation;
+    }
+
     /**
      * Called from an instance's exit and teardown paths. Clears presence and
      * the exit hook only when gen is still the current generation, and returns
