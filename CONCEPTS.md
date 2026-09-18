@@ -65,3 +65,15 @@ Android's per-package flag, recorded in the per-user package-restrictions file, 
 ## Mode
 
 A purpose-built robot capability — remote control, telepresence, autonomous operation, and others planned — that ships as its own installed app rather than a feature bolted onto the custom launcher. The launcher starts a mode and regains the home screen when the operator exits it; only one mode's control logic drives the robot at a time. A shared module gives every mode the same robot-control and UI plumbing instead of each one reimplementing it.
+
+## Conversation
+
+The window of a voice session that opens when the on-device wake-word spotter hears "Hey Miko" and closes when the relay matches "Goodbye Miko" in the transcript or the silence timeout passes. Only inside a conversation does microphone audio leave the robot; between conversations the mode is listening locally and streams nothing.
+
+## Relay
+
+The owner's own service, on the local network, that sits between a mode app and the hosted speech model. It holds the model session, applies the persona, matches the sleep word, runs the silence timeout, and is where tools will live, so that behavior changes are server-side edits rather than an APK reinstall on the robot.
+
+## Command lane
+
+The relay-to-robot direction of a mode's link to the relay, reserved for physical actions the model may later request. It sits beside the control lane, the small set of messages the link needs in every version (conversation open and close, playback state, flush, keepalive). In the talk-only version nothing travels on the command lane and the robot answers anything it does not recognize with an "unsupported" reply; it exists so adding actions is a server change, not a protocol redesign.
