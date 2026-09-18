@@ -24,7 +24,10 @@ import java.io.IOException;
  *   POST /exit               exit the mode (page token required), then the browser
  *                            is redirected to the launcher's page
  *   GET  /presence           {"mode":"voice","active":true|false}
- *   GET  /device-view        on-device WebView page (placeholder until U7)
+ *   GET  /device-view        on-device WebView page: the shared eyes, restyled per
+ *                            conversation state (VoiceState.DEVICE_VIEW_HTML)
+ *   GET  /voice-state        the current VoiceState's wire name as plain text, no
+ *                            newline (e.g. "speaking"); polled by /device-view
  *   GET  /assets/pico.min.css
  *
  * Never touches the camera, the drive lease, AIDL, or any motor class (R18).
@@ -41,7 +44,11 @@ public class ModeApp extends Application {
     private VoiceSettings settings;
     private final PageToken pageToken = new PageToken();
     private volatile Runnable exitRunnable;
-    private volatile String stateText = SettingsPage.STATE_PLACEHOLDER;
+    // What the eyes show (U7, KTD9). U8's engine sets it; /voice-state reads it
+    // without taking any lock. stateText is optional detail the engine adds to
+    // the settings page's state line after the state's own label.
+    private final VoiceState.Holder voiceState = new VoiceState.Holder();
+    private volatile String stateText;
     private volatile byte[] cssBytes;
 
     // Same stale-instance guard as mode-remote-control's ModeApp: with
@@ -78,7 +85,7 @@ public class ModeApp extends Application {
         server.route("/", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                SettingsPage.handleRoot(req, res, pageToken, settings, stateText);
+                SettingsPage.handleRoot(req, res, pageToken, settings, voiceState.settingsLine(stateText));
             }
         });
         server.route("/exit", new RoutingHttpServer.RouteHandler() {
@@ -109,16 +116,21 @@ public class ModeApp extends Application {
                 res.sendBytes(200, "OK", "text/css; charset=utf-8", cssBytes);
             }
         });
-        // Placeholder for the robot's own screen until U7 replaces this route's page
-        // with the shared eyes (and registers "/state" beside it). Deliberately not
-        // the settings page: rendering that mints a new page token, which would
-        // invalidate the token in a LAN browser's copy of the form.
+        // The robot's own screen (MainActivity's WebView) and any LAN browser.
+        // Deliberately not the settings page: rendering that mints a new page token,
+        // which would invalidate the token in a LAN browser's copy of the form.
         server.route("/device-view", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                res.sendText(200, "OK", "text/html; charset=utf-8",
-                        "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
-                                + "<body style=\"margin:0;background:#000\"></body></html>");
+                res.sendText(200, "OK", "text/html; charset=utf-8", VoiceState.DEVICE_VIEW_HTML);
+            }
+        });
+        // Polled by /device-view at 1 s or 250 ms (KTD9). One volatile read, so it
+        // answers promptly however busy the engine's threads are.
+        server.route("/voice-state", new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                res.sendText(200, "OK", "text/plain; charset=utf-8", voiceState.text());
             }
         });
 
@@ -145,7 +157,18 @@ public class ModeApp extends Application {
         return settings;
     }
 
-    /** The settings page's state line; U8 sets it as the conversation state changes. */
+    /** Sets what the eyes and the settings page's state line show. Called by the
+     * voice engine (U8) on every state change; any thread, never blocks. */
+    void setVoiceState(VoiceState state) {
+        voiceState.set(state);
+    }
+
+    VoiceState voiceState() {
+        return voiceState.get();
+    }
+
+    /** Optional detail shown after the state's label on the settings page (e.g.
+     * the last relay error); null or "" for none. Does not change the eyes. */
     void setStateText(String text) {
         stateText = text;
     }
