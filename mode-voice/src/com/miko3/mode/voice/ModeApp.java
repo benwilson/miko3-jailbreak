@@ -2,6 +2,8 @@ package com.miko3.mode.voice;
 
 import android.app.Application;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.provider.Settings;
 import android.util.Log;
 
 import com.miko3.shared.HttpRequest;
@@ -30,6 +32,11 @@ import java.io.IOException;
  *                            newline (e.g. "speaking"); polled by /device-view
  *   GET  /assets/pico.min.css
  *
+ * Also owns the running voice engine and relay client (U8) between
+ * startVoice() and stopVoice(), which MainActivity calls under its
+ * generation guard; they persist across Activity recreation but not across
+ * an exit.
+ *
  * Never touches the camera, the drive lease, AIDL, or any motor class (R18).
  */
 public class ModeApp extends Application {
@@ -50,6 +57,14 @@ public class ModeApp extends Application {
     private final VoiceState.Holder voiceState = new VoiceState.Holder();
     private volatile String stateText;
     private volatile byte[] cssBytes;
+
+    // The conversation loop (U8), non-null between startVoice() and stopVoice().
+    // Each side reports its own detail; the settings page shows both.
+    private final Object voiceLock = new Object();
+    private VoiceEngine engine;
+    private ConversationClient client;
+    private volatile String clientDetail;
+    private volatile String engineDetail;
 
     // Same stale-instance guard as mode-remote-control's ModeApp: with
     // launchMode="singleTop", an old MainActivity's teardown can run after a newer
@@ -152,13 +167,13 @@ public class ModeApp extends Application {
         return server;
     }
 
-    /** The mode's settings. U8's voice engine registers its relay-address listener here. */
+    /** The mode's settings. The relay client registers its relay-address listener here. */
     VoiceSettings settings() {
         return settings;
     }
 
     /** Sets what the eyes and the settings page's state line show. Called by the
-     * voice engine (U8) on every state change; any thread, never blocks. */
+     * relay client on every state change; any thread, never blocks. */
     void setVoiceState(VoiceState state) {
         voiceState.set(state);
     }
@@ -171,6 +186,115 @@ public class ModeApp extends Application {
      * the last relay error); null or "" for none. Does not change the eyes. */
     void setStateText(String text) {
         stateText = text;
+    }
+
+    /**
+     * Starts the microphone, the spotter and the relay link if they are not
+     * already running. Called by the active MainActivity; idempotent, so a
+     * newer instance activating over an older one keeps the running engine.
+     */
+    void startVoice() {
+        synchronized (voiceLock) {
+            if (engine != null) {
+                return;
+            }
+            clientDetail = null;
+            engineDetail = null;
+            VoiceEngine e = new VoiceEngine(this, settings, new VoiceEngine.DetailListener() {
+                @Override
+                public void onEngineDetail(String detail) {
+                    engineDetail = detail;
+                    updateStateText();
+                }
+            });
+            ConversationClient.Config cfg = new ConversationClient.Config();
+            cfg.robotId = robotId();
+            cfg.appVersion = appVersion();
+            ConversationClient c = new ConversationClient(settings, e, new ConversationClient.StateListener() {
+                @Override
+                public void onState(VoiceState state, String detail) {
+                    setVoiceState(state);
+                    clientDetail = detail;
+                    updateStateText();
+                }
+            }, new ClientLog(), cfg);
+            e.setClient(c);
+            engine = e;
+            client = c;
+            e.start();
+            c.start();
+            Log.i(TAG, "voice engine started (robot id " + cfg.robotId + ")");
+        }
+    }
+
+    /**
+     * Stops everything startVoice() started, synchronously: the speaker is
+     * silent first, then an open conversation is closed (robot_request, best
+     * effort) with the link, then the microphone is released. Only the current
+     * generation's exit calls this (MainActivity), so a stale instance can't
+     * stop a newer one's engine.
+     */
+    void stopVoice() {
+        synchronized (voiceLock) {
+            if (engine == null) {
+                return;
+            }
+            engine.closePlayer();
+            client.stop();
+            engine.stop();
+            engine = null;
+            client = null;
+            Log.i(TAG, "voice engine stopped");
+        }
+    }
+
+    private void updateStateText() {
+        String c = clientDetail;
+        String e = engineDetail;
+        if (c != null && e != null) {
+            setStateText(c + "; " + e);
+        } else {
+            setStateText(c != null ? c : e);
+        }
+    }
+
+    /** Stable per device, sent in hello; the relay keys its link on it. */
+    private String robotId() {
+        String id = null;
+        try {
+            id = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "no ANDROID_ID: " + e);
+        }
+        return id == null || id.isEmpty() ? "miko3" : "miko3-" + id;
+    }
+
+    private String appVersion() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (PackageManager.NameNotFoundException e) {
+            return "unknown";
+        }
+    }
+
+    /** ConversationClient's log, to logcat under VoiceClient. */
+    private static final class ClientLog implements ConversationClient.Logger {
+        private static final String CLIENT_TAG = "VoiceClient";
+
+        @Override
+        public void info(String msg) {
+            Log.i(CLIENT_TAG, msg);
+        }
+
+        @Override
+        public void warn(String msg) {
+            Log.w(CLIENT_TAG, msg);
+        }
+
+        @Override
+        public void error(String msg, Throwable t) {
+            Log.e(CLIENT_TAG, msg, t);
+        }
     }
 
     String presenceJson() {

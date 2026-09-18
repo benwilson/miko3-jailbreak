@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for scripts/build-mode-voice.py (U1: wake-word spike; U6: mode app).
+"""Tests for scripts/build-mode-voice.py (U1: wake-word engine; U6: mode app; U8: engine).
 
 Covers the vendor-library precondition (a missing .so fails with a message
 naming it, before any toolchain work), the vendored JNI surface (package and
@@ -8,7 +8,9 @@ library's JNI symbols will not bind), the copied model asset, and, when the
 Android toolchain is installed, a real build whose APK must carry all three
 vendor libraries under lib/arm64-v8a/ plus the model under assets/, and (U6)
 a manifest with RECORD_AUDIO but no CAMERA, the network security config, and
-the settings page's assets.
+the settings page's assets. U8 replaced U1's spike Activity with the mode's
+own listening path: the spike's source and manifest entry must be gone and
+the voice engine and conversation client must be in the dex.
 
 SettingsHarnessTest (U6, KTD10) compiles the mode's settings helpers for the
 host JVM (no Android harness exists; none of those classes touch android.*)
@@ -139,6 +141,14 @@ class VendoredSourceTest(unittest.TestCase):
         self.assertTrue(vendor, "vendor WakeWord.java has no natives -- wrong path?")
         self.assertEqual(ours, vendor)
 
+    def test_spike_activity_removed(self):
+        """Definition of Done: U1's spike Activity is dead code once U8's engine lands."""
+        voice = VOICE_SRC / "com" / "miko3" / "mode" / "voice"
+        self.assertFalse((voice / "WakeWordSpikeActivity.java").exists())
+        self.assertNotIn("WakeWordSpikeActivity", (REPO / "mode-voice" / "AndroidManifest.xml").read_text())
+        for name in ("VoiceEngine.java", "ConversationClient.java"):
+            self.assertTrue((voice / name).is_file(), f"{name} missing")
+
     def test_model_asset_is_the_vendor_live_model(self):
         """KTD7: the three-class model KeywordTask2 loads, byte-identical."""
         self.assertTrue(OUR_MODEL.is_file(), f"model asset missing at {OUR_MODEL}")
@@ -196,8 +206,11 @@ class ApkContentsTest(unittest.TestCase):
         self.assertIn('".MainActivity"', tree)
         with zipfile.ZipFile(self.apk) as z:
             dex = z.read("classes.dex")
-        for cls in ("ModeApp", "MainActivity"):
-            self.assertIn(f"Lcom/miko3/mode/voice/{cls};".encode(), dex, f"{cls} missing from classes.dex")
+        for cls in ("ModeApp", "MainActivity", "VoiceEngine", "ConversationClient"):
+            # assertTrue, not assertIn: a failing assertIn would print the whole dex.
+            self.assertTrue(f"Lcom/miko3/mode/voice/{cls};".encode() in dex, f"{cls} missing from classes.dex")
+        self.assertFalse(b"WakeWordSpikeActivity" in dex, "U1's spike Activity is removed in U8")
+        self.assertNotIn("WakeWordSpikeActivity", tree)
         self.assertIn("android.intent.action.MAIN", tree)
         self.assertNotIn("android.intent.category.LAUNCHER", tree,
                          "launched by the custom launcher's explicit Intent, never from a stock app drawer")

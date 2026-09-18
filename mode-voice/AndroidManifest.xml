@@ -24,18 +24,5 @@
                 <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
         </activity>
-
-        <!-- U1's wake-word spike, kept until U8 replaces it (removed in U8).
-             Launched by hand over adb (am start -n
-             com.miko3.mode.voice/.WakeWordSpikeActivity); a string extra
-             "source" = "recognition" switches the capture source, see the
-             Activity's own comment. -->
-        <activity android:name=".WakeWordSpikeActivity" android:exported="true"
-            android:launchMode="singleTop">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.DEFAULT"/>
-            </intent-filter>
-        </activity>
     </application>
 </manifest>

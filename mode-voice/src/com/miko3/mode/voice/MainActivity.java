@@ -16,13 +16,16 @@ import com.miko3.shared.LauncherProtocol;
 /**
  * Full-screen WebView shell for the voice mode, launched by the launcher via
  * explicit Intent (not HOME) and modeled on mode-remote-control's
- * MainActivity. Shows the mode's device view on the robot's own screen
- * (a placeholder until U7's eyes); settings live on the LAN-facing page at
- * the server's root, not here.
+ * MainActivity. Shows the mode's device view (the eyes) on the robot's own
+ * screen; settings live on the LAN-facing page at the server's root, not
+ * here. Activating starts the voice engine and relay client (ModeApp
+ * .startVoice); the current generation's exit stops them synchronously
+ * before finishing, so the speaker is silent at once (R17, AE12).
  *
  * Requests RECORD_AUDIO at runtime if it isn't already granted —
  * scripts/install-mode-voice.py grants it at install time, so the dialog
- * normally never appears. A denial is logged, not retried.
+ * normally never appears. A denial is logged, not retried; the engine keeps
+ * retrying the microphone with backoff, so a later grant takes effect.
  *
  * launchMode="singleTop" plus onNewIntent() is the launcher's force-exit
  * path (LauncherProtocol.EXTRA_FORCE_EXIT): the extra is honored in both
@@ -75,8 +78,9 @@ public class MainActivity extends Activity {
         // Activate before honoring a force-exit, as the remote-control mode does:
         // exitMode() then deactivates as the current generation, so presence reads
         // inactive afterwards no matter what an older instance left behind.
-        activate();
-        if (getIntent() != null && getIntent().getBooleanExtra(LauncherProtocol.EXTRA_FORCE_EXIT, false)) {
+        boolean forceExit = isForceExit(getIntent());
+        activate(!forceExit);
+        if (forceExit) {
             Log.i(TAG, "force-exit on a fresh instance");
             exitMode();
             return;
@@ -88,7 +92,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        if (intent != null && intent.getBooleanExtra(LauncherProtocol.EXTRA_FORCE_EXIT, false)) {
+        if (isForceExit(intent)) {
             Log.i(TAG, "force-exit on the running instance");
             exitMode();
         } else if (!activated) {
@@ -96,16 +100,20 @@ public class MainActivity extends Activity {
             // exited (see the remote-control mode's identical branch): reactivate in
             // place so it ends up where a fresh launch would have.
             Log.i(TAG, "reactivating in place (redelivered launch intent, not currently active)");
-            activate();
+            activate(true);
             loadDeviceView();
         }
     }
 
-    /** Marks this instance the active one (presence on) and hooks up /exit. */
-    private void activate() {
+    /** Marks this instance the active one (presence on), hooks up /exit, and
+     * starts the voice engine unless this is a force-exit launch. */
+    private void activate(boolean startVoice) {
         ModeApp app = (ModeApp) getApplication();
         myGeneration = app.activate();
         activated = true;
+        if (startVoice) {
+            app.startVoice();
+        }
         app.setExitRunnable(new Runnable() {
             @Override
             public void run() {
@@ -123,15 +131,17 @@ public class MainActivity extends Activity {
      * The one exit path: the launcher's force-exit Intent and the settings
      * page's Exit button both end here. Clears presence (only if this is still
      * the current generation) and finishes, which lands on the launcher's HOME
-     * Activity underneath. U8 releases the voice engine synchronously inside
+     * Activity underneath. The voice engine is released synchronously inside
      * the current-generation branch, before finish(), so exiting mid-reply stops
-     * audio at once (R17).
+     * audio at once (R17) and a stale instance's exit can't stop a newer
+     * instance's engine.
      */
     private void exitMode() {
         ModeApp app = (ModeApp) getApplication();
         if (activated) {
             activated = false;
             if (app.deactivate(myGeneration)) {
+                app.stopVoice();
                 Log.i(TAG, "exited (generation " + myGeneration + ")");
             }
         }
@@ -142,9 +152,18 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         if (activated) {
             activated = false;
-            ((ModeApp) getApplication()).deactivate(myGeneration);
+            ModeApp app = (ModeApp) getApplication();
+            if (app.deactivate(myGeneration)) {
+                // Destroyed without an exit (e.g. by the system): nothing may keep
+                // the microphone once no Activity is active.
+                app.stopVoice();
+            }
         }
         super.onDestroy();
+    }
+
+    private static boolean isForceExit(Intent intent) {
+        return intent != null && intent.getBooleanExtra(LauncherProtocol.EXTRA_FORCE_EXIT, false);
     }
 
     private void loadDeviceView() {
