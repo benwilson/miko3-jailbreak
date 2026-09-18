@@ -67,6 +67,9 @@ def parse_args(argv=None):
                    help="model server host (webchat/server.py) (default %(default)s)")
     g.add_argument("--model-port", type=int, default=int(env("model-port", MODEL_PORT)),
                    help="model server plain-WebSocket port (default %(default)s)")
+    g.add_argument("--model-path", default=env("model-path", DEFAULTS.model_path),
+                   help="model server WebSocket route; its `/` is the browser page "
+                        "(default %(default)s)")
     g.add_argument("--lane-host", default=env("lane-host", None),
                    help="robot lane bind address (default: this host's LAN address)")
     g.add_argument("--lane-port", type=int, default=int(env("lane-port", LANE_PORT)),
@@ -79,6 +82,11 @@ def parse_args(argv=None):
     g.add_argument("--persona", type=Path, default=Path(env("persona", DEFAULT_PERSONA)),
                    help="persona file, ASCII, sent as the model's system prompt at the "
                         "start of every conversation (default %(default)s)")
+    g.add_argument("--farewell-phrase", default=env("farewell-phrase", DEFAULTS.farewell_phrase),
+                   help="end the conversation once the model's own reply text says this "
+                        "(case, punctuation and whitespace ignored). The persona must tell "
+                        "it to say exactly this, so change both together; \"\" disables it "
+                        "and only the silence timer is left (default %(default)r)")
     g.add_argument("--log-dir", type=Path, default=Path(env("log-dir", DEFAULT_LOG_DIR)),
                    help="per-conversation JSONL logs (default %(default)s)")
 
@@ -91,10 +99,38 @@ def parse_args(argv=None):
             "close at once if no farewell starts this soon after the sleep word")
     seconds("cooldown", DEFAULTS.cooldown, "strict turn-taking: mic stays muted this long "
                                            "after the robot stops speaking")
+    g.add_argument("--reply-silence-ms", type=float,
+                   default=float(env("reply-silence-ms", DEFAULTS.reply_silence_ms)),
+                   help="a reply ends this long after its last non-silent audio chunk. The "
+                        "model server streams reply audio continuously and never sends "
+                        "agent_end when a reply simply finishes, so this is what ends one "
+                        "(default %(default)s ms)")
+    g.add_argument("--reply-start-grace-ms", type=float,
+                   default=float(env("reply-start-grace-ms", DEFAULTS.reply_start_grace_ms)),
+                   help="a reply opened by agent_start waits this long for its first sound "
+                        "before it ends as an empty one. The server's TTS lags its own "
+                        "agent_start by a variable amount, so --reply-silence-ms only starts "
+                        "once the reply has speech (default %(default)s ms)")
+    g.add_argument("--reply-silence-rms", type=float,
+                   default=float(env("reply-silence-rms", DEFAULTS.reply_silence_rms)),
+                   help="reply-channel audio below this RMS counts as silence; the server "
+                        "sends exact digital silence between replies (default %(default)s)")
+    g.add_argument("--uplink-gate-rms", type=float,
+                   default=float(env("uplink-gate-rms", DEFAULTS.uplink_gate_rms)),
+                   help="uplink audio below this RMS is replaced by digital silence before "
+                        "it reaches the model, in 20 ms frames. The robot's microphone "
+                        "floor (RMS 300-470) otherwise latches the model's energy VAD "
+                        "\"voiced\" and its user_end never fires; 0 disables the gate "
+                        "(default %(default)s)")
+    g.add_argument("--uplink-gate-hang-ms", type=float,
+                   default=float(env("uplink-gate-hang-ms", DEFAULTS.uplink_gate_hang_ms)),
+                   help="the uplink gate keeps passing audio this long after the last loud "
+                        "frame, so a word's decaying tail is not clipped; 0 mutes on the "
+                        "first quiet frame (default %(default)s ms)")
     seconds("ready-timeout", DEFAULTS.ready_timeout, "conv.open to conv.ready limit")
     seconds("probe-interval", DEFAULTS.probe_interval, "model health probe period while idle")
     seconds("sleep-settle", DEFAULTS.sleep_settle,
-            "age of the running transcript before the sleep word is matched on it")
+            "age of the running transcript before the dormant sleep word is matched on it")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="debug logging (every lane frame and model event)")
     return p.parse_args(argv)
@@ -116,11 +152,17 @@ def setup_logging(verbose):
 
 async def run(args):
     persona = load_persona(args.persona)
-    config = Config(model_host=args.model_host, model_port=args.model_port, persona=persona,
+    config = Config(model_host=args.model_host, model_port=args.model_port,
+                    model_path=args.model_path, persona=persona,
                     ready_timeout=args.ready_timeout, silence_timeout=args.silence_timeout,
                     drain_cap=args.drain_cap, farewell_start_timeout=args.farewell_start,
                     cooldown=args.cooldown, probe_interval=args.probe_interval,
-                    sleep_settle=args.sleep_settle)
+                    sleep_settle=args.sleep_settle, farewell_phrase=args.farewell_phrase,
+                    reply_silence_ms=args.reply_silence_ms,
+                    reply_start_grace_ms=args.reply_start_grace_ms,
+                    reply_silence_rms=args.reply_silence_rms,
+                    uplink_gate_rms=args.uplink_gate_rms,
+                    uplink_gate_hang_ms=args.uplink_gate_hang_ms)
     logs = ConversationLogs(args.log_dir)
     await logs.start()
     engine = ConversationEngine(config, logs)
@@ -134,7 +176,8 @@ async def run(args):
         log.info("persona %s (%d chars), logs in %s", args.persona, len(persona), args.log_dir)
         print(f"LISTENING lane ws://{lane.host}:{lane.port}/ "
               f"logs http://{http.host}:{http.port}/conversations "
-              f"model ws://{config.model_host}:{config.model_port}/", flush=True)
+              f"model ws://{config.model_host}:{config.model_port}{config.model_path}",
+              flush=True)
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):

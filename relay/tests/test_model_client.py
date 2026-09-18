@@ -3,8 +3,9 @@
 Covers plan U4's scenarios: `reset` then `system` before any audio, the 80 ms zero-frame
 watchdog, bursts and the open-time backlog forwarded unpaced, ordered reply events with the
 audio bytes intact, the running user transcript, error and takeover closes, persona
-validation, and the health probe KTD4 uses. Timelines are kept short so the file runs in a
-few seconds.
+validation, and the health probe KTD4 uses. Also the verified server contract: events keyed
+by `kind`, assistant text in `delta`, and the `system` ack that gates a ready session.
+Timelines are kept short so the file runs in a few seconds.
 """
 import asyncio
 import sys
@@ -16,9 +17,11 @@ if str(RELAY_ROOT) not in sys.path:
     sys.path.insert(0, str(RELAY_ROOT))
 
 from relay.model_client import (  # noqa: E402
+    DEFAULT_PATH,
     ZERO_FRAME,
     AgentEnd,
     AgentStart,
+    AssistantTextDelta,
     AudioChunk,
     Closed,
     Flush,
@@ -27,10 +30,14 @@ from relay.model_client import (  # noqa: E402
     ModelWarning,
     ProbeError,
     Stats,
+    SystemAck,
+    SystemAckTimeout,
     UserEnd,
     UserStart,
     UserText,
     UserTextDelta,
+    model_reachable,
+    model_state,
     probe,
 )
 from tests.fake_model_server import FakeModelServer, Script, Turn, reply_chunks  # noqa: E402
@@ -52,6 +59,15 @@ async def collect(client, timeout=3.0):
     return events
 
 
+def after_ack(events):
+    """The conversation proper: what follows the persona being read in (system_start,
+    progress, the `system` ack), which starts every session."""
+    for i, event in enumerate(events):
+        if isinstance(event, SystemAck):
+            return events[i + 1:]
+    return events
+
+
 async def collect_until(client, predicate, timeout=3.0):
     events = []
     async with asyncio.timeout(timeout):
@@ -62,7 +78,8 @@ async def collect_until(client, predicate, timeout=3.0):
     return events
 
 
-class ModelClientTests(unittest.IsolatedAsyncioTestCase):
+class ClientTestCase(unittest.IsolatedAsyncioTestCase):
+    """Opens clients against a fake server and closes them all at the end."""
 
     async def asyncSetUp(self):
         self.clients = []
@@ -71,11 +88,18 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         for client in self.clients:
             await client.close()
 
-    async def open_client(self, server, backlog=()):
-        client = ModelClient("127.0.0.1", server.port, persona=PERSONA)
+    def new_client(self, server, **kwargs):
+        client = ModelClient("127.0.0.1", server.port, persona=PERSONA, **kwargs)
         self.clients.append(client)
+        return client
+
+    async def open_client(self, server, backlog=()):
+        client = self.new_client(server)
         await client.open(backlog=backlog)
         return client
+
+
+class ModelClientTests(ClientTestCase):
 
     async def test_reset_then_system_before_any_binary_frame(self):
         async with FakeModelServer() as server:
@@ -143,7 +167,7 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         script = Script(turns=[Turn(user_end_at=0.05, reply_delay=0.05, reply_seconds=0.24)], pace=0.1)
         async with FakeModelServer(script) as server:
             client = await self.open_client(server)
-            events = await collect_until(client, lambda e: isinstance(e, AgentEnd))
+            events = after_ack(await collect_until(client, lambda e: isinstance(e, AgentEnd)))
             kinds = [type(e) for e in events]
             self.assertEqual(kinds[:3], [UserStart, UserEnd, AgentStart])
             self.assertEqual(kinds[-1], AgentEnd)
@@ -209,8 +233,8 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         async with FakeModelServer() as server:
             client = await self.open_client(server)
             await client.close()
-            events = await collect(client)
-            self.assertEqual(len(events), 1)
+            events = after_ack(await collect(client))
+            self.assertEqual(len(events), 1)  # nothing but the end after the ack
             self.assertIsInstance(events[0], Closed)
             self.assertFalse(events[0].error)
 
@@ -253,7 +277,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_probe_returns_status_payload(self):
         async with FakeModelServer() as server:
             status = await probe("127.0.0.1", server.port, timeout=1.0)
-            self.assertEqual(status["type"], "status")
+            self.assertEqual(status["kind"], "status")
             self.assertEqual(server.last_session.texts(), [{"type": "status"}])
 
     async def test_probe_fails_when_status_never_answered(self):
@@ -280,6 +304,165 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             await probe("127.0.0.1", server.port, timeout=1.0)
             events = await collect(client)
             self.assertIsInstance(events[-1], Closed)
+
+
+class PathTests(ClientTestCase):
+    """The server's WebSocket lives at /ws; / is the browser page and fails the handshake."""
+
+    async def test_client_targets_the_ws_path_by_default(self):
+        self.assertEqual(DEFAULT_PATH, "/ws")
+        async with FakeModelServer() as server:
+            client = await self.open_client(server)
+            self.assertTrue(client.uri.endswith("/ws"), client.uri)
+            self.assertEqual(server.last_session.path, "/ws")
+
+    async def test_client_path_is_configurable(self):
+        async with FakeModelServer() as server:
+            client = ModelClient("127.0.0.1", server.port, persona=PERSONA, path="/other")
+            self.clients.append(client)
+            await client.open()
+            self.assertEqual(server.last_session.path, "/other")
+
+    async def test_probe_targets_the_ws_path_by_default(self):
+        async with FakeModelServer() as server:
+            await probe("127.0.0.1", server.port, timeout=1.0)
+            self.assertEqual(server.last_session.path, "/ws")
+
+
+class EventKeyTests(ClientTestCase):
+    """The real server keys its events by `kind`; `type` is only a fallback for old fixtures."""
+
+    async def test_event_keyed_by_kind_is_parsed(self):
+        script = Script(events=[(0.02, {"kind": "warning", "message": "backlog high"})],
+                        turns=[Turn(user_end_at=0.06, reply_delay=None)])
+        async with FakeModelServer(script) as server:
+            client = await self.open_client(server)
+            events = await collect_until(client, lambda e: isinstance(e, UserEnd))
+            self.assertEqual([e.message for e in events if isinstance(e, ModelWarning)],
+                             ["backlog high"])
+
+    async def test_event_keyed_by_type_is_still_parsed(self):
+        script = Script(events=[(0.02, {"type": "warning", "message": "old fixture"})],
+                        turns=[Turn(user_end_at=0.06, reply_delay=None)])
+        async with FakeModelServer(script) as server:
+            client = await self.open_client(server)
+            events = await collect_until(client, lambda e: isinstance(e, UserEnd))
+            self.assertEqual([e.message for e in events if isinstance(e, ModelWarning)],
+                             ["old fixture"])
+
+    async def test_kind_wins_over_a_stale_type_on_the_same_frame(self):
+        script = Script(events=[(0.02, {"kind": "warning", "type": "error", "message": "m"})],
+                        turns=[Turn(user_end_at=0.06, reply_delay=None)])
+        async with FakeModelServer(script) as server:
+            client = await self.open_client(server)
+            events = await collect_until(client, lambda e: isinstance(e, UserEnd))
+            self.assertTrue(any(isinstance(e, ModelWarning) for e in events))
+            self.assertFalse(any(isinstance(e, ModelError) for e in events))
+
+    async def test_assistant_delta_text_comes_from_delta(self):
+        script = Script(turns=[Turn(user_end_at=0.02, reply_delay=0.02, reply_seconds=0.08,
+                                    reply_text=["It's ", "sunny"])], pace=0.1)
+        async with FakeModelServer(script) as server:
+            client = await self.open_client(server)
+            events = await collect_until(client, lambda e: isinstance(e, AgentEnd))
+            deltas = [e for e in events if isinstance(e, AssistantTextDelta)]
+            self.assertEqual([d.text for d in deltas], ["It's ", "sunny"])
+
+    async def test_assistant_delta_falls_back_to_text(self):
+        script = Script(events=[(0.02, {"kind": "assistant_text_delta", "text": "hello"})],
+                        turns=[Turn(user_end_at=0.06, reply_delay=None)])
+        async with FakeModelServer(script) as server:
+            client = await self.open_client(server)
+            events = await collect_until(client, lambda e: isinstance(e, UserEnd))
+            deltas = [e for e in events if isinstance(e, AssistantTextDelta)]
+            self.assertEqual([d.text for d in deltas], ["hello"])
+
+
+class SystemAckTests(ClientTestCase):
+    """open() is not ready until the child has finished reading the persona in."""
+
+    async def test_open_is_not_ready_before_the_ack_and_is_after(self):
+        async with FakeModelServer(Script(system_ack_delay=0.4)) as server:
+            client = self.new_client(server)
+            opening = asyncio.create_task(client.open())
+            session = await server.wait_until(lambda: server.last_session)
+            await asyncio.sleep(0.2)
+            self.assertFalse(opening.done())
+            self.assertFalse(client.ready)
+            self.assertEqual(session.binaries(), [])  # not even a watchdog frame yet
+            await asyncio.wait_for(opening, 2.0)
+            self.assertTrue(client.ready)
+            self.assertGreaterEqual(client.system_ms, 350)
+
+    async def test_ack_is_an_observable_event_before_the_first_turn(self):
+        async with FakeModelServer(Script(turns=[Turn(user_end_at=0.05, reply_delay=None)])) as server:
+            client = await self.open_client(server)
+            events = await collect_until(client, lambda e: isinstance(e, UserEnd))
+            kinds = [type(e) for e in events]
+            self.assertEqual(kinds.count(SystemAck), 1)
+            self.assertLess(kinds.index(SystemAck), kinds.index(UserStart))
+
+    async def test_system_start_and_progress_do_not_count_as_the_ack(self):
+        # The fake sends system_start and progress before the ack, as the child does.
+        async with FakeModelServer(Script(system_ack_delay=0.3)) as server:
+            client = self.new_client(server)
+            opening = asyncio.create_task(client.open())
+            await asyncio.sleep(0.15)
+            session = server.last_session
+            sent = [m.get("kind") for m in session.sent]
+            self.assertEqual(sent, ["system_start", "progress"])
+            self.assertFalse(opening.done())
+            await asyncio.wait_for(opening, 2.0)
+            self.assertTrue(client.ready)
+
+    async def test_slow_ack_past_the_timeout_raises(self):
+        async with FakeModelServer(Script(system_ack_delay=1.5)) as server:
+            client = self.new_client(server, system_timeout=0.2)
+            with self.assertRaises(SystemAckTimeout) as caught:
+                await client.open()
+            self.assertIn("0.2", str(caught.exception))
+            self.assertFalse(client.ready)
+
+    async def test_no_ack_at_all_raises(self):
+        async with FakeModelServer(Script(system_ack=False)) as server:
+            client = self.new_client(server, system_timeout=0.2)
+            with self.assertRaises(SystemAckTimeout):
+                await client.open()
+
+    async def test_audio_handed_over_before_the_ack_is_kept_and_sent_in_order(self):
+        backlog = [pcm(1280, 100 + i) for i in range(3)]
+        early = [pcm(1280, 200 + i) for i in range(4)]
+        async with FakeModelServer(Script(system_ack_delay=0.35)) as server:
+            client = self.new_client(server)
+            opening = asyncio.create_task(client.open(backlog=backlog))
+            await asyncio.sleep(0.1)
+            for chunk in early:
+                client.send_audio(chunk)
+            await asyncio.wait_for(opening, 2.0)
+            session = server.last_session
+            await server.wait_until(lambda: len(session.binaries()) >= 7)
+            self.assertEqual([f.data for f in session.binaries()[:7]], backlog + early)
+
+
+class ProbeStateTests(ClientTestCase):
+
+    async def test_ready_state_is_reachable(self):
+        async with FakeModelServer(Script(status_state="ready")) as server:
+            status = await probe("127.0.0.1", server.port, timeout=1.0)
+            self.assertEqual(model_state(status), "ready")
+            self.assertTrue(model_reachable(status))
+
+    async def test_loading_state_is_not_reachable(self):
+        async with FakeModelServer(Script(status_state="loading")) as server:
+            status = await probe("127.0.0.1", server.port, timeout=1.0)
+            self.assertEqual(model_state(status), "loading")
+            self.assertFalse(model_reachable(status))
+
+    async def test_dead_state_is_not_reachable(self):
+        async with FakeModelServer(Script(status_state="dead")) as server:
+            status = await probe("127.0.0.1", server.port, timeout=1.0)
+            self.assertEqual(model_state(status), "dead")
+            self.assertFalse(model_reachable(status))
 
 
 if __name__ == "__main__":

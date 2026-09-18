@@ -112,16 +112,21 @@ def _backlog_frames(stats, frame_ms):
 
 
 def _count_self_interruptions(records, window_ms):
-    """(flushes, flushes with no non-blank user text within window_ms after them)."""
+    """(flushes, flushes with no non-blank user text within window_ms after them).
+
+    Only meaningful with a transcript source: live mode sends no user text at all (see
+    docs/model-server-protocol.md), so against today's server every flush looks lonely."""
     flushes, texts = [], []
     for r in records:
         msg = r.get("msg")
         if r.get("ev") != "model" or not isinstance(msg, dict):
             continue
         t = _time_ms(r)
-        if msg.get("type") == "flush":
+        # The server keys its events by `kind`; `type` is the fallback for older logs.
+        kind = msg.get("kind", msg.get("type"))
+        if kind == "flush":
             flushes.append(t)
-        elif msg.get("type") in USER_TEXT_TYPES and str(msg.get("text") or "").strip():
+        elif kind in USER_TEXT_TYPES and str(msg.get("text") or "").strip():
             texts.append(t)
     lonely = 0
     for f in flushes:

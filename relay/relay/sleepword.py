@@ -1,21 +1,35 @@
-"""The sleep-word matcher (plan KTD2): does the person's transcript say "Goodbye Miko"?
+"""The two matchers that can end a conversation. Only the first one is live today.
 
-The relay feeds it the person's words only, from whatever produces them: today the model
-server's user_text_delta / user_text events (U3); a local recognizer could call the same
-two methods if U3's transcript ever has to be replaced. The model's own words
-(assistant_text_delta) are never fed in, so the robot cannot put itself to sleep.
+FarewellPhraseMatcher (live) watches the MODEL's own reply text for an exact farewell
+phrase, default "talk to you later". It is what ends a conversation on this build: live
+mode transcribes nothing the person says (docs/model-server-protocol.md), so the sleep-word
+matcher below has no input at all. Prompt-declared tools were tried first as the model's
+"I am done" signal -- a plain instruction naming a tool, then a <TOOLS>[...]</TOOLS> JSON
+block -- and neither ever produced a function call; the model just spoke the instruction.
+Telling the persona to end its farewell with an exact phrase worked every time, so that is
+what the relay listens for. The phrase lives in two places that must agree: the relay's
+Config (--farewell-phrase, default below) and the persona file it is told to say it in.
 
-Matching, over the normalized transcript: a farewell token (goodbye, bye, good night)
-within two words of a "Miko" variant from a seeded list, anywhere a six-word window can
-slide. Words the list does not know are scored with difflib similarity; a pair scoring at
-least MATCH_THRESHOLD matches, one scoring from NEAR_MISS_THRESHOLD up to it is a near
+SleepWordMatcher (dormant) is the KTD2 "Goodbye Miko" matcher over the PERSON's transcript.
+It is kept, with its tests, because a local recognizer could feed it the same two methods
+if a transcript ever appears; the engine no longer calls it against the real server. The
+model's own words are never fed to it, so the robot cannot put itself to sleep that way.
+
+Sleep-word matching, over the normalized transcript: a farewell token (goodbye, bye, good
+night) within two words of a "Miko" variant from a seeded list, anywhere a six-word window
+can slide. Words the list does not know are scored with difflib similarity; a pair scoring
+at least MATCH_THRESHOLD matches, one scoring from NEAR_MISS_THRESHOLD up to it is a near
 miss for the log, so the variant list can grow from real transcripts.
 
 Timing: a finished transcript (user_text, or the running one at user_end) is decided at
 once. A running transcript is decided only once it is `settle` seconds old, because the
 recognizer's latest words are the least certain; the caller polls at next_due().
 
-    matcher = SleepWordMatcher()
+    matcher = FarewellPhraseMatcher(config.farewell_phrase)     # live
+    decision = matcher.feed(assistant_text_delta)               # usually None
+    matcher.reset()
+
+    matcher = SleepWordMatcher()                                # dormant
     decision = matcher.feed_partial(running_transcript, now)   # usually None
     decision = matcher.poll(now)                               # at matcher.next_due()
     decision = matcher.feed_final(user_text, now)
@@ -28,6 +42,14 @@ from dataclasses import dataclass
 MATCH = "match"
 NEAR_MISS = "near_miss"
 NONE = "none"
+
+# Decision.source: which matcher decided. "assistant_text" is the live one; "final" and
+# "partial" are the dormant transcript matcher's finished and running transcripts.
+ASSISTANT_TEXT = "assistant_text"
+
+# The words the persona is told to end its farewell with (personas/default.txt and
+# personas/full.txt). Change one and you must change the other.
+DEFAULT_FAREWELL_PHRASE = "talk to you later"
 
 FAREWELLS = ("goodbye", "bye", "goodnight")  # "good bye" and "good night" are joined first
 MIKO_VARIANTS = ("miko", "mico", "meeko", "meko", "mikko", "niko", "nico", "mika", "mica",
@@ -44,10 +66,56 @@ _JOINED = {("good", "bye"): "goodbye", ("good", "night"): "goodnight"}
 @dataclass(frozen=True)
 class Decision:
     kind: str  # MATCH, NEAR_MISS or NONE
-    score: int  # 0-100: the weaker of the farewell's and the name's similarity
-    words: tuple = ()  # the words of the best farewell-and-name pair, in order
-    transcript: str = ""  # the transcript the decision was made on
-    source: str = ""  # "final" or "partial"
+    score: int  # 0-100: the sleep word's weaker similarity; always 100 for a phrase match
+    words: tuple = ()  # the matched words in order: the phrase, or the farewell-and-name pair
+    transcript: str = ""  # the text the decision was made on, normalized
+    source: str = ""  # ASSISTANT_TEXT (live), or "final" / "partial" (dormant matcher)
+
+
+def phrase_words(text):
+    """Lower-case words with punctuation and whitespace dropped, for phrase matching.
+    Unlike normalize() it joins nothing, so a phrase is compared exactly as written."""
+    text = text.lower().replace("'", "").replace("\u2019", "")
+    return re.sub(r"[^a-z0-9]+", " ", text).split()
+
+
+class FarewellPhraseMatcher:
+    """LIVE (see the module docstring): the model's own farewell phrase ends the
+    conversation. Fed one assistant_text_delta at a time; returns a Decision the first time
+    the phrase completes and None otherwise, so a phrase split across deltas -- even
+    mid-word -- still matches. Case, punctuation and whitespace are ignored; the phrase must
+    appear as whole words. An empty phrase never matches (it disables the feature).
+
+    It is fed the model's text only. The person's words never reach it: there is no
+    transcript to reach it with, and nothing the person says should be able to end the
+    conversation by being quoted back."""
+
+    def __init__(self, phrase=DEFAULT_FAREWELL_PHRASE):
+        self._phrase = tuple(phrase_words(phrase))
+        self._text = ""
+        self._keep = 8 * (len(phrase) + 1)  # tail kept, however the deltas split the phrase
+        self._matched = False
+
+    def reset(self):
+        """Forget the text so far: call when a conversation starts."""
+        self._text = ""
+        self._matched = False
+
+    def feed(self, delta):
+        """One assistant_text_delta. A Decision the first time the phrase completes, else
+        None; after a match it stays quiet until reset()."""
+        if self._matched or not self._phrase:
+            return None
+        self._text += delta
+        words = phrase_words(self._text)
+        # Trim only after matching, so one big delta carrying the phrase is never cut.
+        self._text = self._text[-self._keep:]
+        n = len(self._phrase)
+        if not any(tuple(words[i:i + n]) == self._phrase
+                   for i in range(len(words) - n + 1)):
+            return None
+        self._matched = True
+        return Decision(MATCH, 100, self._phrase, " ".join(words), ASSISTANT_TEXT)
 
 
 def normalize(text):

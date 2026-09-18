@@ -31,7 +31,13 @@ def turn(n, user_end=None, robot=None, half_ping=None, stats=None, **extra):
 
 
 def model(rt_ms, type_, **fields):
+    """A model record as older logs wrote it, keyed by `type`."""
     return {"ev": "model", "rt_ms": rt_ms, "msg": {"type": type_, **fields}}
+
+
+def model_kind(rt_ms, kind, **fields):
+    """A model record as the real server's events are logged, keyed by `kind`."""
+    return {"ev": "model", "rt_ms": rt_ms, "msg": {"kind": kind, **fields}}
 
 
 def conversation(*records, reason="sleep_word", duration_ms=30_000, turn_taking="interruptible",
@@ -153,6 +159,14 @@ class SelfInterruptionTests(ReportTestCase):
         r = self.build()
         self.assertEqual(r["self_interruptions"]["flushes"], 1)
         self.assertEqual(r["self_interruptions"]["without_user_text"], 1)
+
+    def test_flush_keyed_by_kind_is_counted_like_a_type_keyed_one(self):
+        # The real server keys its events by `kind`; older logs used `type`.
+        self.logs.write("a", conversation(model_kind(1000, "flush"),
+                                          model_kind(1400, "user_text_delta", text="wait")))
+        r = self.build()
+        self.assertEqual(r["self_interruptions"]["flushes"], 1)
+        self.assertEqual(r["self_interruptions"]["without_user_text"], 0)
 
     def test_flush_followed_by_user_text_is_a_real_barge_in(self):
         self.logs.write("a", conversation(model(1000, "flush"),

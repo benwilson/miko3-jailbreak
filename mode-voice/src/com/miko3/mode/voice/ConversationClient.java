@@ -108,8 +108,12 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         int connectTimeoutMs = 5000;
         /** From hello to welcome; a relay that accepts but never welcomes is down. */
         int welcomeTimeoutMs = 5000;
-        /** Slightly above the relay's own 3 s so the two do not race (KTD4). */
-        int readyTimeoutMs = 3500;
+        /**
+         * Comfortably above the relay's own 12 s so the two cannot race (KTD4). The relay
+         * waits for the model to read the persona in (roughly 80 ms a word) before it
+         * sends conv.ready, so this is long: the relay must always be the one to give up.
+         */
+        int readyTimeoutMs = 15000;
         long backoffBaseMs = 2000;
         long backoffCapMs = 30000;
         /** Mic audio kept between the wake and conv.ready (KTD6), drop-oldest. */
