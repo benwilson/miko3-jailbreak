@@ -18,4 +18,20 @@ public final class LauncherProtocol {
     /** Boolean extra on a launch Intent the launcher sends a mode's Activity, asking
      * it to release its lease and exit through its own normal release path (U10). */
     public static final String EXTRA_FORCE_EXIT = "com.miko3.launcher.EXTRA_FORCE_EXIT";
+
+    /** Registry ids (KTD8, U9): the value of the launcher's /launch-mode?mode= query
+     * parameter and the "mode" field of each mode's presence answer. See ModeRegistry. */
+    public static final String MODE_REMOTE_CONTROL = "remote-control";
+    public static final String MODE_VOICE = "voice";
+
+    /** Launcher route that exits whichever mode is running and launches the one
+     * named by LAUNCH_MODE_PARAM (remote-control when absent, for old links). */
+    public static final String LAUNCH_MODE_PATH = "/launch-mode";
+    public static final String LAUNCH_MODE_PARAM = "mode";
+
+    /** Every mode's presence route: GET answers {"mode":"<id>","active":true|false}
+     * from an explicit flag set while one of its Activity instances is current
+     * (KTD8). RoutingHttpServer serves this path on the plain listener even once
+     * HTTPS is up, so the launcher's loopback probe never sees the HTTPS redirect. */
+    public static final String PRESENCE_PATH = "/presence";
 }

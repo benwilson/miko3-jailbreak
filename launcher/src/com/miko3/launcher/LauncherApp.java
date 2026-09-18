@@ -6,19 +6,20 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.os.IBinder;
-import android.os.RemoteException;
 import android.os.SystemClock;
 import android.util.Log;
 
-import com.miko3.shared.DriveLease;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.HttpUtil;
 import com.miko3.shared.LauncherProtocol;
+import com.miko3.shared.ModeRegistry;
 import com.miko3.shared.RoutingHttpServer;
 
 import java.io.IOException;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Starts the launcher's HTTP server and the drive-lease coordinator once
@@ -47,34 +48,35 @@ public class LauncherApp extends Application {
     static final int PORT = 8080;
     static final int HTTPS_PORT = 8443;
 
-    // The one mode that exists today (U10). A future second mode needs a real
-    // registry mapping lease-holder clientId -> package/Activity; not built
-    // speculatively ahead of there being a second mode to design it against.
-    private static final String MODE_PACKAGE = "com.miko3.mode.remotecontrol";
-    private static final String MODE_ACTIVITY = MODE_PACKAGE + ".MainActivity";
-    // Must match ModeApp.PORT (no shared constant between the two apps' build
-    // units — see ModeApp's own port comment). Used to send the browser to the
-    // mode's own page after launching it (U12: separate port pairs means "/"
-    // no longer just happens to land there the way it did under U11's shared
-    // port), and to poll for the mode's listener actually being up before
-    // doing so — startActivity() returns long before the target process has
-    // actually bound its port.
-    private static final int MODE_PORT = 8081;
+    // Every mode the launcher can start now comes from the shared ModeRegistry
+    // (KTD8, U9): package, Activity, and HTTP port per mode id. The port is used
+    // to send the browser to the mode's own page after launching it (U12:
+    // separate port pairs means "/" no longer just happens to land there the way
+    // it did under U11's shared port), to poll for the mode's listener actually
+    // being up before doing so (startActivity() returns long before the target
+    // process has bound its port), and to ask the mode's presence route whether
+    // it's the one running.
+
+    // Bound for each loopback presence probe (connect and read each). A live
+    // mode answers in a few ms; a dead one refuses at once. Only a wedged
+    // process ever uses the whole bound.
+    private static final int PRESENCE_TIMEOUT_MS = 500;
 
     private RoutingHttpServer server;
     private WifiHttpHandler wifi;
-    private volatile DriveLease leaseClient;
     private volatile byte[] cssBytes;
 
+    // Held only to create and keep alive DriveLeaseService, the modes' motor
+    // arbiter (R3/KTD3). The launcher itself no longer queries the holder: which
+    // mode is running comes from presence (KTD8), since the voice mode never takes
+    // the lease (R18).
     private final ServiceConnection leaseConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
-            leaseClient = DriveLease.Stub.asInterface(binder);
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
-            leaseClient = null;
         }
     };
 
@@ -89,8 +91,7 @@ public class LauncherApp extends Application {
         // run in a foreground-exempted context (confirmed live — startService()
         // here threw IllegalStateException "not allowed to start service ... app
         // is in background" depending on device idle state at launch), but a bound
-        // service has no such restriction. This also gives /launch-mode below a
-        // DriveLease handle to query the current holder before switching modes.
+        // service has no such restriction.
         bindService(new Intent(this, DriveLeaseService.class), leaseConnection, Context.BIND_AUTO_CREATE);
     }
 
@@ -108,8 +109,10 @@ public class LauncherApp extends Application {
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 String status = req.queryParam("status", null);
                 boolean pending = "1".equals(req.queryParam("pending", null));
+                List<ModeRegistry.Mode> running = ModeRegistry.activeModes(ModeRegistry.all(),
+                        ModeRegistry.probeAll(ModeRegistry.all(), PRESENCE_TIMEOUT_MS));
                 res.sendText(200, "OK", "text/html; charset=utf-8",
-                        LauncherPage.buildIndexHtml(LauncherApp.this, wifi, status, pending));
+                        LauncherPage.buildIndexHtml(LauncherApp.this, wifi, status, pending, running));
             }
         });
         server.route("/assets/pico.min.css", new RoutingHttpServer.RouteHandler() {
@@ -183,10 +186,19 @@ public class LauncherApp extends Application {
                 res.sendText(200, "OK", "text/plain; charset=utf-8", wifi.connectionStatus());
             }
         });
-        server.route("/launch-mode", new RoutingHttpServer.RouteHandler() {
+        server.route(LauncherProtocol.LAUNCH_MODE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                launchModeGracefully();
+                // ?mode=<registry id>; no parameter means remote-control, so links
+                // and bookmarks from before the registry keep working.
+                String modeParam = req.queryParam(LauncherProtocol.LAUNCH_MODE_PARAM, null);
+                ModeRegistry.Mode target = ModeRegistry.resolveLaunchTarget(modeParam);
+                if (target == null) {
+                    Log.w(TAG, "launch-mode: unknown mode '" + modeParam + "', nothing launched");
+                    res.redirect("/?status=" + urlEncode("Unknown mode: " + modeParam));
+                    return;
+                }
+                launchModeGracefully(target);
                 // Sends the browser to the mode's own page on its own port (U12:
                 // separate port pairs, so unlike under U11's shared port, "/" here
                 // would just reload the launcher's own home page instead). Uses the
@@ -197,7 +209,7 @@ public class LauncherApp extends Application {
                 if (host != null) {
                     int colon = host.indexOf(':');
                     if (colon >= 0) host = host.substring(0, colon);
-                    res.redirect("http://" + host + ":" + MODE_PORT + "/");
+                    res.redirect("http://" + host + ":" + target.httpPort + "/");
                 } else {
                     res.redirect("/");
                 }
@@ -220,46 +232,52 @@ public class LauncherApp extends Application {
     }
 
     /**
-     * U10: launches the mode app, handing off gracefully if another mode
-     * currently holds the drive lease — never a process kill (the plan's own
-     * cited learning: docs/solutions/runtime-errors/
-     * kill-9-on-watched-service-permanently-disables-restart.md). Instead
-     * requests the outgoing mode exit through its own normal release path
-     * (the same one its own "Exit mode" control uses), waits for the lease
-     * to actually clear, then launches the new mode — release-then-acquire,
-     * never a race where both could hold it.
+     * U10, reworked for the registry (KTD8, U9): launches the target mode,
+     * handing off gracefully from whichever mode is running — never a process
+     * kill (the plan's own cited learning: docs/solutions/runtime-errors/
+     * kill-9-on-watched-service-permanently-disables-restart.md). Asks every
+     * registered mode's presence route which one is active, requests that one
+     * exit through its own normal release path (the same one its own "Exit
+     * mode" control uses), waits for its presence to go inactive, then
+     * launches the target — release-then-acquire, never both at once.
+     *
+     * Presence replaces the old lease-holder poll as the "has it exited" signal;
+     * for the remote-control mode it clears after the same drive release the
+     * lease poll used to wait on (and after its mic release), with the same
+     * 150 ms poll, 5 s bound, and 400 ms grace, so that path's timing is
+     * unchanged. The drive lease itself is untouched and still arbitrates the
+     * motors. synchronized: two overlapping /launch-mode requests would
+     * otherwise interleave their exit and launch steps.
      */
-    private void launchModeGracefully() {
-        DriveLease lease = leaseClient;
-        String holder = null;
-        if (lease != null) {
-            try {
-                holder = lease.getHolder();
-            } catch (RemoteException e) {
-                Log.w(TAG, "getHolder() failed, proceeding as if unheld", e);
-            }
-        }
+    private synchronized void launchModeGracefully(ModeRegistry.Mode target) {
+        List<ModeRegistry.Mode> all = ModeRegistry.all();
+        List<ModeRegistry.Mode> running = ModeRegistry.activeModes(all,
+                ModeRegistry.probeAll(all, PRESENCE_TIMEOUT_MS));
 
-        if (holder != null) {
-            Log.i(TAG, "mode switch: requesting outgoing mode (holder='" + holder + "') to exit");
-            Intent exitRequest = new Intent();
-            exitRequest.setClassName(MODE_PACKAGE, MODE_ACTIVITY);
-            exitRequest.putExtra(LauncherProtocol.EXTRA_FORCE_EXIT, true);
-            exitRequest.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-            try {
-                startActivity(exitRequest);
-            } catch (Exception e) {
-                Log.w(TAG, "could not deliver exit request to outgoing mode", e);
-            }
-
-            long deadline = SystemClock.elapsedRealtime() + 5000;
-            while (SystemClock.elapsedRealtime() < deadline) {
+        if (!running.isEmpty()) {
+            for (ModeRegistry.Mode outgoing : running) {
+                Log.i(TAG, "mode switch: requesting '" + outgoing.id + "' to exit before launching '"
+                        + target.id + "'");
+                Intent exitRequest = new Intent();
+                exitRequest.setClassName(outgoing.packageName, outgoing.activityClassName);
+                exitRequest.putExtra(LauncherProtocol.EXTRA_FORCE_EXIT, true);
+                exitRequest.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
                 try {
-                    if (lease.getHolder() == null) {
-                        break;
-                    }
-                } catch (RemoteException e) {
-                    break; // coordinator unreachable — nothing left to wait on
+                    startActivity(exitRequest);
+                } catch (Exception e) {
+                    Log.w(TAG, "could not deliver exit request to '" + outgoing.id + "'", e);
+                }
+            }
+
+            // A probe that stops answering (the process died mid-exit) counts as
+            // exited: activeModes() only keeps modes that say ACTIVE.
+            long deadline = SystemClock.elapsedRealtime() + 5000;
+            boolean exited = false;
+            while (SystemClock.elapsedRealtime() < deadline) {
+                Map<String, ModeRegistry.Presence> now = ModeRegistry.probeAll(running, PRESENCE_TIMEOUT_MS);
+                if (ModeRegistry.activeModes(running, now).isEmpty()) {
+                    exited = true;
+                    break;
                 }
                 try {
                     Thread.sleep(150);
@@ -268,7 +286,10 @@ public class LauncherApp extends Application {
                     break;
                 }
             }
-            // The lease clearing (above) confirms the outgoing mode's release() ran,
+            if (!exited) {
+                Log.w(TAG, "outgoing mode still reports active after 5s — launching '" + target.id + "' anyway");
+            }
+            // Presence clearing (above) confirms the outgoing mode's release ran,
             // but its finish()/onDestroy() teardown is a separate, unsynchronized
             // Android lifecycle step — confirmed live: launching the new mode
             // immediately after only the lease cleared could still land on the
@@ -289,26 +310,26 @@ public class LauncherApp extends Application {
         // mode is active, so "Robot Home" is reachable at every point in this flow,
         // not just once the launcher's Activity happens to be back in the foreground.
         Intent launch = new Intent();
-        launch.setClassName(MODE_PACKAGE, MODE_ACTIVITY);
+        launch.setClassName(target.packageName, target.activityClassName);
         launch.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         startActivity(launch);
 
         // startActivity() returns long before the mode's own process has actually
-        // started and bound MODE_PORT — the /launch-mode route below redirects the
+        // started and bound its port — the /launch-mode route redirects the
         // browser there right after this method returns, so without this wait the
         // browser's very first request would hit a nothing's-listening-yet refusal
         // and (depending on the browser) silently fail, looking like "nothing
         // happened" when the link was clicked.
-        waitForModePortReady();
+        waitForModePortReady(target.httpPort);
     }
 
-    private static void waitForModePortReady() {
+    private static void waitForModePortReady(int port) {
         long deadline = SystemClock.elapsedRealtime() + 5000;
         while (SystemClock.elapsedRealtime() < deadline) {
             try {
                 java.net.Socket probe = new java.net.Socket();
                 try {
-                    probe.connect(new java.net.InetSocketAddress("127.0.0.1", MODE_PORT), 200);
+                    probe.connect(new java.net.InetSocketAddress("127.0.0.1", port), 200);
                     return; // connected — the mode's listener is up
                 } finally {
                     probe.close();
@@ -322,7 +343,7 @@ public class LauncherApp extends Application {
                 }
             }
         }
-        Log.w(TAG, "mode's HTTP port never came up within 5s — redirecting the browser there anyway");
+        Log.w(TAG, "mode's HTTP port " + port + " never came up within 5s — redirecting the browser there anyway");
     }
 
     private static String urlEncode(String s) {

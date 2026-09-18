@@ -263,7 +263,13 @@ public final class RoutingHttpServer implements Runnable {
             // request's own Host header (host:port as the client sent it) rather
             // than a hardcoded hostname, since the robot's WiFi IP isn't known at
             // build time; strips any :port suffix and substitutes the HTTPS one.
-            if (!isTls && httpsPort > 0) {
+            //
+            // One exception (KTD8): the presence route is answered here directly.
+            // The launcher probes it on loopback plain HTTP and would otherwise only
+            // ever see this 302; it's a tiny JSON status no page loads, so it gains
+            // nothing from the secure context. Keyed off the shared constant so no
+            // mode needs code of its own for this.
+            if (!isTls && httpsPort > 0 && !LauncherProtocol.PRESENCE_PATH.equals(path)) {
                 String host = headers.get("host");
                 if (host != null) {
                     int colon = host.indexOf(':');

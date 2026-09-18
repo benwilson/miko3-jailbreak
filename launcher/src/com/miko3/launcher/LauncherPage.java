@@ -2,6 +2,11 @@ package com.miko3.launcher;
 
 import android.content.Context;
 
+import com.miko3.shared.LauncherProtocol;
+import com.miko3.shared.ModeRegistry;
+
+import java.util.List;
+
 /**
  * Builds the launcher's single served page (R8/R11): device info plus the
  * Wi-Fi section, styled with Pico.css — the same UI approach modes use,
@@ -12,8 +17,10 @@ final class LauncherPage {
     private LauncherPage() {
     }
 
+    /** runningModes: the registered modes whose presence route said active when
+     * this page was requested (normally zero or one). */
     static String buildIndexHtml(Context ctx, WifiHttpHandler wifi, String connectStatusMessage,
-                                  boolean pendingConnect) {
+                                  boolean pendingConnect, List<ModeRegistry.Mode> runningModes) {
         String model = DeviceInfo.escapeHtml(DeviceInfo.model());
         String serial = DeviceInfo.escapeHtml(DeviceInfo.serial());
         int battery = DeviceInfo.batteryPercent(ctx);
@@ -49,8 +56,30 @@ final class LauncherPage {
         html.append("});},5000);");
         html.append("</script>");
 
+        // One link per registered mode (KTD8). Launching any of them first exits
+        // whichever one is running, so the running one's link relaunches it.
         html.append("<section id=\"modes\"><h2>Modes</h2>");
-        html.append("<a href=\"/launch-mode\" role=\"button\">Remote Control / Telepresence</a>");
+        html.append("<p id=\"running-mode\">Running: ");
+        if (runningModes.isEmpty()) {
+            html.append("none");
+        } else {
+            for (int i = 0; i < runningModes.size(); i++) {
+                if (i > 0) html.append(", ");
+                html.append(DeviceInfo.escapeHtml(runningModes.get(i).displayName));
+            }
+        }
+        html.append("</p>");
+        for (ModeRegistry.Mode mode : ModeRegistry.all()) {
+            boolean running = runningModes.contains(mode);
+            html.append("<a href=\"").append(LauncherProtocol.LAUNCH_MODE_PATH).append('?')
+                    .append(LauncherProtocol.LAUNCH_MODE_PARAM).append('=').append(mode.id)
+                    .append("\" role=\"button\"")
+                    .append(running ? " aria-current=\"true\"" : "")
+                    .append(" data-mode=\"").append(mode.id).append("\">")
+                    .append(DeviceInfo.escapeHtml(mode.displayName))
+                    .append(running ? " (running)" : "")
+                    .append("</a> ");
+        }
         html.append("</section>");
 
         if (connectStatusMessage != null) {

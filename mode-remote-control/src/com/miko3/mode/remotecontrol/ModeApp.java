@@ -7,6 +7,8 @@ import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.HttpUtil;
+import com.miko3.shared.LauncherProtocol;
+import com.miko3.shared.ModeRegistry;
 import com.miko3.shared.RoutingHttpServer;
 
 import java.io.IOException;
@@ -133,6 +135,21 @@ public class ModeApp extends Application {
     // Each MainActivity captures the current generation when it (re)activates
     // and only tears down shared state here if it's still current.
     private volatile long generation = 0;
+    // KTD8 presence, answered on /presence for the launcher's mode switch. A
+    // separate flag, not derived from the counter above: the counter only ever
+    // increases, so it can't say "nothing is active now", and a cleanly exited
+    // mode's cached process keeps this server (and its port) up. Set by
+    // bumpGeneration(), cleared by the current generation's deactivate() once its
+    // teardown (drive, camera, mic, speaker) has run — so "inactive" also means
+    // the microphone is free for the next mode.
+    private volatile boolean active;
+    // Whether the mic and operator speaker may be (re)opened. Cleared by
+    // stopMicAndSpeaker() in the same critical section that closes them, and
+    // checked under the same lock by /toggle-mic and /operator-audio-upload, so a
+    // remote page left open after exit can't reopen either one underneath the
+    // next mode (a plain check of `active` would race the release).
+    private final Object audioLock = new Object();
+    private boolean audioAllowed; // guarded by audioLock
     private final java.util.Random tokenRandom = new java.util.Random();
     private final AudioBroadcaster audioBroadcaster = new AudioBroadcaster();
     private MicCapture micCapture;
@@ -213,6 +230,13 @@ public class ModeApp extends Application {
                 }
             }
         });
+        server.route(LauncherProtocol.PRESENCE_PATH, new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                res.sendText(200, "OK", "application/json; charset=utf-8",
+                        ModeRegistry.presenceJson(LauncherProtocol.MODE_REMOTE_CONTROL, active));
+            }
+        });
         server.route("/toggle-mic", new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
@@ -221,10 +245,18 @@ public class ModeApp extends Application {
                     return;
                 }
                 boolean on = "true".equals(req.queryParam("on", "false"));
-                if (on) {
-                    startMic();
-                } else {
-                    stopMic();
+                synchronized (audioLock) {
+                    if (on && !audioAllowed) {
+                        // Exited (process cached, server still up): a remote page left
+                        // open must not re-take the microphone another mode may now use.
+                        res.sendText(409, "Conflict", "text/plain; charset=utf-8", "mode not active");
+                        return;
+                    }
+                    if (on) {
+                        startMic();
+                    } else {
+                        stopMic();
+                    }
                 }
                 res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
             }
@@ -475,9 +507,18 @@ public class ModeApp extends Application {
                 // No client-token gate, matching /operator-video-upload's own reasoning --
                 // a stray/late chunk only ever reaches operatorSpeakerPlayer's speaker
                 // output, not the motors, so it's harmless rather than a safety issue.
+                // Dropped once the mode has exited, though: a remote page still
+                // uploading would otherwise reopen the speaker the exit path just
+                // released, underneath whichever mode runs next.
                 byte[] pcm = HttpUtil.readAll(req.body);
-                if (pcm.length > 0) {
-                    operatorSpeakerPlayer.write(pcm, pcm.length);
+                synchronized (audioLock) {
+                    if (!audioAllowed) {
+                        res.sendText(409, "Conflict", "text/plain; charset=utf-8", "mode not active");
+                        return;
+                    }
+                    if (pcm.length > 0) {
+                        operatorSpeakerPlayer.write(pcm, pcm.length);
+                    }
                 }
                 res.sendText(200, "OK", "text/plain; charset=utf-8", "ok");
             }
@@ -585,7 +626,23 @@ public class ModeApp extends Application {
      * currentGeneration() before tearing down camera/drive state so a stale,
      * still-finishing older instance can't clobber a newer one's setup. */
     long bumpGeneration() {
+        synchronized (audioLock) {
+            audioAllowed = true;
+        }
+        active = true;
         return ++generation;
+    }
+
+    /** Clears presence if gen is still the current generation, returning whether
+     * it was. Called last in an instance's guarded teardown, after the mic and
+     * speaker are released. All callers run on the main thread, like the
+     * currentGeneration() guard around them. */
+    boolean deactivate(long gen) {
+        if (gen != generation) {
+            return false;
+        }
+        active = false;
+        return true;
     }
 
     long currentGeneration() {
@@ -689,6 +746,7 @@ public class ModeApp extends Application {
         }
     }
 
+    // Callers hold audioLock.
     private void startMic() {
         if (micCapture != null) {
             return;
@@ -708,10 +766,21 @@ public class ModeApp extends Application {
         songPlayer.stop();
     }
 
+    // Callers hold audioLock.
     private void stopMic() {
         if (micCapture != null) {
             micCapture.stop();
             micCapture = null;
+        }
+    }
+
+    /** The exit path's audio release: MicCapture.stop() releases the AudioRecord
+     * synchronously, so the microphone is free for the next mode when this returns. */
+    void stopMicAndSpeaker() {
+        synchronized (audioLock) {
+            audioAllowed = false;
+            stopMic();
+            operatorSpeakerPlayer.stop();
         }
     }
 

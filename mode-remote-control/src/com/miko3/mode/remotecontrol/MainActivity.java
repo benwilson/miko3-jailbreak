@@ -47,6 +47,9 @@ public class MainActivity extends Activity {
     // instance tears down shared (camera/drive) state, so a stale instance's
     // delayed teardown can't clobber a newer instance's already-live state.
     private long myGeneration;
+    // Kept so the exit path can stop its on-device mic passthrough (another
+    // AudioRecord holder besides ModeApp's MicCapture).
+    private NativeCaptureBridge captureBridge;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -65,7 +68,8 @@ public class MainActivity extends Activity {
         settings.setJavaScriptEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setDomStorageEnabled(true);
-        webView.addJavascriptInterface(new NativeCaptureBridge(this), "AndroidCapture");
+        captureBridge = new NativeCaptureBridge(this);
+        webView.addJavascriptInterface(captureBridge, "AndroidCapture");
         // Confirmed live (screencap showed a blank page under the title bar above):
         // without a WebViewClient, the default SSL-error handling for the
         // http://127.0.0.1:PORT load below — which redirects to https://127.0.0.1:
@@ -162,7 +166,14 @@ public class MainActivity extends Activity {
             app.setDriveController(null);
             app.stopCamera();
             app.stopSong();
+            // Two modes now use the microphone: release it (and the operator
+            // speaker) here, synchronously, so the next mode's capture doesn't
+            // fail busy while this cached process still holds it. Presence goes
+            // inactive only after, so the launcher's wait implies a free mic.
+            app.stopMicAndSpeaker();
+            app.deactivate(myGeneration);
         }
+        releaseCaptureBridge();
         finish();
     }
 
@@ -176,8 +187,19 @@ public class MainActivity extends Activity {
             app.setDriveController(null);
             app.stopCamera();
             app.stopSong();
+            app.stopMicAndSpeaker();
+            app.deactivate(myGeneration);
         }
+        releaseCaptureBridge();
         super.onDestroy();
+    }
+
+    /** This instance's own on-device mic passthrough, if its page turned it on —
+     * not generation-guarded, since the bridge belongs to this instance's WebView. */
+    private void releaseCaptureBridge() {
+        if (captureBridge != null) {
+            captureBridge.toggleOperatorMic(false);
+        }
     }
 
     private void logWebViewCapability() {
