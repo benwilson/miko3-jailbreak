@@ -6,7 +6,8 @@ build-mode-voice.py — build and sign the voice-conversation mode APK
 Same gradle-free pipeline as scripts/build-mode-remote-control.py, via
 scripts/build_common.py: compiles this app's own src plus the shared module
 (shared/src) into one classes.dex, and packages the shared module's vendored
-assets alongside the app's own (the wake-word model, KTD7).
+assets alongside the app's own (the wake-word model, KTD7), minus the ones the
+voice mode has no use for (SHARED_ASSETS_EXCLUDED).
 
 The vendor's wake-word engine ships inside this APK (KTD7): recognizer.WakeWord
 binds its JNI symbols by class name, and its three native libraries are bundled
@@ -22,7 +23,9 @@ Usage:
 Dependencies: python3, Homebrew (for bootstrap), a JDK (javac/keytool).
 """
 import argparse
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -59,6 +62,28 @@ WAKEWORD_LIBS = (
     "libtensorflowlite_gpu_delegate.so",
 )
 
+# The remote-control mode's 3.6 MB song has no use in this APK. Everything else
+# in shared/assets is needed: pico.min.css styles the settings page and
+# server.p12 is the HTTPS listener's certificate (HttpsSupport).
+SHARED_ASSETS_EXCLUDED = ("danger-zone.mp3",)
+
+
+def stage_shared_assets(dest, src=SHARED_ASSETS, exclude=SHARED_ASSETS_EXCLUDED):
+    """Copy shared/assets into dest, skipping the excluded names. Returns dest.
+
+    Staged outside build_dir, because build_common.compile_java wipes build_dir
+    before stage_assets runs."""
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for item in sorted(Path(src).iterdir()):
+        if item.name in exclude:
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
+        else:
+            shutil.copy(item, dest / item.name)
+    return dest
+
 
 def vendor_native_libs(lib_dir=VENDOR_LIB_DIR):
     """Return [(abi, so_path), ...] for build_common's native_libs, or raise
@@ -84,18 +109,19 @@ def build(sdk=None, bootstrap=True, apk_out=APK, build_dir=BUILD, keystore=KEYST
     sdk = bc.find_sdk(sdk)
     sdk, bt, android_jar, javac, keytool = bc.ensure_toolchain(sdk, bootstrap)
     jh = bc.java_home()
-    bc.build_apk(
-        src_dirs=[SRC, SHARED_SRC],
-        manifest=MANIFEST,
-        android_jar=android_jar, javac=javac, bt=bt, keytool=keytool, java_home_dir=jh,
-        build_dir=Path(build_dir),
-        keystore=Path(keystore), keystore_alias=KEYSTORE_ALIAS, keystore_pass=KEYSTORE_PASS,
-        keystore_cn=KEYSTORE_CN,
-        apk_out=Path(apk_out),
-        asset_sources=[ASSETS, SHARED_ASSETS],
-        res_dir=RES,
-        native_libs=native_libs,
-    )
+    with tempfile.TemporaryDirectory(prefix="mode-voice-shared-assets-") as shared_assets:
+        bc.build_apk(
+            src_dirs=[SRC, SHARED_SRC],
+            manifest=MANIFEST,
+            android_jar=android_jar, javac=javac, bt=bt, keytool=keytool, java_home_dir=jh,
+            build_dir=Path(build_dir),
+            keystore=Path(keystore), keystore_alias=KEYSTORE_ALIAS, keystore_pass=KEYSTORE_PASS,
+            keystore_cn=KEYSTORE_CN,
+            apk_out=Path(apk_out),
+            asset_sources=[ASSETS, stage_shared_assets(shared_assets)],
+            res_dir=RES,
+            native_libs=native_libs,
+        )
     return Path(apk_out)
 
 

@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Tests for scripts/build-mode-voice.py (U1: wake-word spike).
+"""Tests for scripts/build-mode-voice.py (U1: wake-word spike; U6: mode app).
 
 Covers the vendor-library precondition (a missing .so fails with a message
 naming it, before any toolchain work), the vendored JNI surface (package and
 native signatures must match ServiceExam's recognizer.WakeWord exactly, or the
 library's JNI symbols will not bind), the copied model asset, and, when the
 Android toolchain is installed, a real build whose APK must carry all three
-vendor libraries under lib/arm64-v8a/ plus the model under assets/.
+vendor libraries under lib/arm64-v8a/ plus the model under assets/, and (U6)
+a manifest with RECORD_AUDIO but no CAMERA, the network security config, and
+the settings page's assets.
+
+SettingsHarnessTest (U6, KTD10) compiles the mode's settings helpers for the
+host JVM (no Android harness exists; none of those classes touch android.*)
+and runs fixtures/voice_settings_harness, which prints one PASS/FAIL line per
+scenario: address validation, the page-token check, and form handling.
 """
 import hashlib
 import importlib.util
+import os
 import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -25,6 +35,10 @@ VENDOR_WAKEWORD = VENDOR_ROOT / "sources" / "recognizer" / "WakeWord.java"
 VENDOR_MODEL = VENDOR_ROOT / "resources" / "assets" / "miko_wakeword_model.tflite"
 OUR_WAKEWORD = REPO / "mode-voice" / "src" / "recognizer" / "WakeWord.java"
 OUR_MODEL = REPO / "mode-voice" / "assets" / "miko_wakeword_model.tflite"
+VOICE_SRC = REPO / "mode-voice" / "src"
+SHARED_SRC = REPO / "shared" / "src"
+HARNESS = REPO / "scripts" / "tests" / "fixtures" / "voice_settings_harness" / "src"
+HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "voice" / "VoiceSettingsHarness.java"
 
 WAKEWORD_LIBS = (
     "libnative_wakeword_vad_lib.so",
@@ -91,6 +105,24 @@ class VendorLibsTest(unittest.TestCase):
         ba.assert_not_called()
 
 
+class SharedAssetsTest(unittest.TestCase):
+    def test_stages_everything_but_the_excluded_song(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            src.mkdir()
+            for name in ("pico.min.css", "server.p12", "danger-zone.mp3"):
+                (src / name).write_bytes(b"x")
+            out = build.stage_shared_assets(Path(td) / "out", src=src)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["pico.min.css", "server.p12"])
+
+    def test_real_shared_assets_keep_settings_page_and_https_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            names = {p.name for p in build.stage_shared_assets(Path(td)).iterdir()}
+        self.assertIn("pico.min.css", names)
+        self.assertIn("server.p12", names)
+        self.assertNotIn("danger-zone.mp3", names)
+
+
 class VendoredSourceTest(unittest.TestCase):
     NATIVE_RE = re.compile(r"^\s*public native [^;]+;", re.M)
 
@@ -124,6 +156,7 @@ class ApkContentsTest(unittest.TestCase):
             raise unittest.SkipTest(f"Android toolchain unavailable: {exc}")
         cls._td = tempfile.TemporaryDirectory()
         td = Path(cls._td.name)
+        cls.bt = build.bc.ensure_toolchain(build.bc.find_sdk(None), bootstrap=False)[1]
         cls.apk = build.build(bootstrap=False, apk_out=td / "voice.apk",
                               build_dir=td / "build", keystore=td / "test.keystore")
         with zipfile.ZipFile(cls.apk) as z:
@@ -142,6 +175,136 @@ class ApkContentsTest(unittest.TestCase):
 
     def test_apk_has_dex(self):
         self.assertIn("classes.dex", self.names)
+
+    def _manifest_tree(self):
+        r = subprocess.run([str(self.bt / "aapt2"), "dump", "xmltree", "--file", "AndroidManifest.xml",
+                            str(self.apk)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_manifest_requests_record_audio_not_camera(self):
+        tree = self._manifest_tree()
+        self.assertIn("android.permission.RECORD_AUDIO", tree)
+        self.assertIn("android.permission.INTERNET", tree)
+        self.assertNotIn("CAMERA", tree, "R18/Implementation Constraints: the voice mode never opens the camera")
+
+    def test_manifest_declares_mode_app_and_main_activity(self):
+        tree = self._manifest_tree()
+        # aapt2 keeps the manifest's relative names; resolved against package=.
+        self.assertIn('package="com.miko3.mode.voice"', tree)
+        self.assertIn('".ModeApp"', tree)
+        self.assertIn('".MainActivity"', tree)
+        with zipfile.ZipFile(self.apk) as z:
+            dex = z.read("classes.dex")
+        for cls in ("ModeApp", "MainActivity"):
+            self.assertIn(f"Lcom/miko3/mode/voice/{cls};".encode(), dex, f"{cls} missing from classes.dex")
+        self.assertIn("android.intent.action.MAIN", tree)
+        self.assertNotIn("android.intent.category.LAUNCHER", tree,
+                         "launched by the custom launcher's explicit Intent, never from a stock app drawer")
+
+    def test_apk_carries_network_security_config(self):
+        self.assertIn("res/xml/network_security_config.xml", self.names)
+        self.assertIn("networkSecurityConfig", self._manifest_tree())
+
+    def test_apk_carries_settings_page_and_https_assets(self):
+        self.assertIn("assets/pico.min.css", self.names)
+        self.assertIn("assets/server.p12", self.names)
+
+    def test_apk_omits_remote_control_song(self):
+        self.assertNotIn("assets/danger-zone.mp3", self.names)
+
+
+def _find_jdk():
+    """(javac, java) from the JDK build_common picks for the APK builds, else PATH."""
+    home = build.bc.java_home()
+    if home and (Path(home) / "bin" / "javac").exists():
+        return str(Path(home) / "bin" / "javac"), str(Path(home) / "bin" / "java")
+    javac, java = shutil.which("javac"), shutil.which("java")
+    return (javac, java) if javac and java else None
+
+
+class SettingsHarnessTest(unittest.TestCase):
+    """KTD10 settings page on the host JVM; one harness run, one assertion per scenario."""
+
+    SCENARIOS = (
+        "valid_private_address_saves",
+        "saved_address_is_trimmed_and_normalized",
+        "missing_port_refused",
+        "public_ip_refused",
+        "invalid_value_does_not_change_turn_taking",
+        "post_without_token_refused",
+        "post_with_token_in_query_only_refused",
+        "token_from_other_page_load_refused",
+        "forged_token_refused",
+        "listener_fires_once_on_address_change",
+        "removed_listener_not_called",
+        "blank_address_clears_and_notifies",
+        "oversized_form_refused",
+        "get_renders_form_with_token_and_state",
+        "get_marks_turn_taking_checked",
+        "other_methods_refused",
+        "exit_with_issued_token_goes_to_launcher",
+        "exit_without_token_refused",
+        "exit_with_stale_token_refused",
+        "defaults",
+        "tuning_keys_read_from_store",
+        "address_parser_accepts_private_and_link_local",
+        "address_parser_refuses_bad_input",
+        "address_parser_fields",
+        "connect_time_check_on_resolved_ip",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        jdk = _find_jdk()
+        if jdk is None:
+            raise unittest.SkipTest("no JDK (javac + java) found")
+        cls._td = tempfile.TemporaryDirectory(prefix="voice_settings_harness_")
+        out = cls._td.name
+        # Same language level as build_common.compile_java; -Xlint:-options hides
+        # the "source 8 is obsolete" chatter from modern JDKs.
+        sourcepath = os.pathsep.join([str(HARNESS), str(VOICE_SRC), str(SHARED_SRC)])
+        c = subprocess.run([jdk[0], "-source", "8", "-target", "8", "-encoding", "UTF-8", "-Xlint:-options",
+                            "-sourcepath", sourcepath, "-d", out, str(HARNESS_MAIN)],
+                           capture_output=True, text=True)
+        cls.compiled = c.returncode == 0
+        cls.compile_output = (c.stdout + c.stderr)[-3000:]
+        cls.results = {}
+        cls.run_output = ""
+        if c.returncode == 0:
+            r = subprocess.run([jdk[1], "-cp", out, "com.miko3.mode.voice.VoiceSettingsHarness"],
+                               capture_output=True, text=True, timeout=60)
+            cls.run_output = (r.stdout + r.stderr)[-6000:]
+            for line in r.stdout.splitlines():
+                verdict, _, rest = line.partition(" ")
+                if verdict in ("PASS", "FAIL"):
+                    name, _, detail = rest.partition(": ")
+                    cls.results[name] = (verdict, detail)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def setUp(self):
+        self.assertTrue(self.compiled, f"harness failed to compile:\n{self.compile_output}")
+
+    def _assert_pass(self, name):
+        self.assertIn(name, self.results, f"scenario {name} never reported:\n{self.run_output}")
+        verdict, detail = self.results[name]
+        self.assertEqual(verdict, "PASS", f"{name}: {detail}")
+
+    def test_harness_reports_exactly_the_expected_scenarios(self):
+        self.assertEqual(sorted(self.results), sorted(self.SCENARIOS), self.run_output)
+
+
+def _add_scenario_tests():
+    for _name in SettingsHarnessTest.SCENARIOS:
+        def _test(self, name=_name):
+            self._assert_pass(name)
+        setattr(SettingsHarnessTest, f"test_{_name}", _test)
+
+
+_add_scenario_tests()
 
 
 if __name__ == "__main__":

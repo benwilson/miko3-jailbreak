@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Same as mode-remote-control's: targetSdkVersion 28 blocks cleartext HTTP by
+     default, and this app's own WebView loads its own server over
+     http://127.0.0.1 (which then forwards to the HTTPS port). Loopback only.
+     The relay link (U8) is a raw socket, not WebView/HttpURLConnection
+     traffic, so it needs no entry here. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>
