@@ -24,7 +24,6 @@ are the plan's device checks, not this file. Skips cleanly without a JDK that
 accepts -source 8 (or, for the poll test, without node).
 """
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -32,6 +31,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+TESTS = Path(__file__).resolve().parent
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
+import jvm_harness  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "scripts"
@@ -48,28 +52,10 @@ VOICE_HARNESS = HARNESS / "com" / "miko3" / "mode" / "voice" / "VoiceEyesHarness
 STATES = ("listening", "connecting", "conversing", "speaking", "closing", "unreachable")
 
 
-def find_jdk():
-    """(javac, java) from the JDK build_common picks for the APK builds, else PATH."""
-    sys.path.insert(0, str(SCRIPTS))
-    try:
-        import build_common
-        home = build_common.java_home()
-    except Exception:
-        home = ""
-    finally:
-        sys.path.remove(str(SCRIPTS))
-    if home and (Path(home) / "bin" / "javac").exists():
-        return str(Path(home) / "bin" / "javac"), str(Path(home) / "bin" / "java")
-    javac, java = shutil.which("javac"), shutil.which("java")
-    return (javac, java) if javac and java else None
-
-
 def compile_harness(jdk, out_dir, main, source_roots):
     """Returns (ok, output). Same language level as build_common.compile_java;
     -Xlint:-options hides the "source 8 is obsolete" chatter from modern JDKs."""
-    sourcepath = os.pathsep.join(str(p) for p in [HARNESS] + list(source_roots))
-    r = subprocess.run([jdk[0], "-source", "8", "-target", "8", "-encoding", "UTF-8", "-Xlint:-options",
-                        "-sourcepath", sourcepath, "-d", str(out_dir), str(main)],
+    r = subprocess.run(jvm_harness.javac_cmd(jdk[0], out_dir, [main], [HARNESS] + list(source_roots)),
                        capture_output=True, text=True)
     return r.returncode == 0, (r.stdout + r.stderr)[-3000:]
 
@@ -89,7 +75,7 @@ class _HarnessCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.jdk = find_jdk()
+        cls.jdk = jvm_harness.find_jdk()
         if cls.jdk is None:
             raise unittest.SkipTest("no JDK (javac + java) found")
         cls._td = tempfile.TemporaryDirectory(prefix="eyes_golden_")
@@ -156,11 +142,7 @@ class VoiceEyesHarnessTest(_HarnessCase):
             return
         r = cls.run_main("com.miko3.mode.voice.VoiceEyesHarness")
         cls.run_output = (r.stdout + r.stderr)[-6000:]
-        for line in r.stdout.splitlines():
-            verdict, _, rest = line.partition(" ")
-            if verdict in ("PASS", "FAIL"):
-                name, _, detail = rest.partition(": ")
-                cls.results[name] = (verdict, detail)
+        cls.results = jvm_harness.parse_verdicts(r.stdout)
         page = cls.out / "voice.html"
         if cls.run_main("com.miko3.mode.voice.VoiceEyesHarness", "page", str(page)).returncode == 0:
             cls.page = page.read_text(encoding="utf-8")
@@ -198,14 +180,7 @@ class VoiceEyesHarnessTest(_HarnessCase):
         self.assertNotIn("operator-video", self.page)
 
 
-def _add_scenario_tests():
-    for _name in VoiceEyesHarnessTest.SCENARIOS:
-        def _test(self, name=_name):
-            self._assert_pass(name)
-        setattr(VoiceEyesHarnessTest, f"test_{_name}", _test)
-
-
-_add_scenario_tests()
+jvm_harness.add_scenario_tests(VoiceEyesHarnessTest)
 
 
 # Runs the page script in a vm context with just enough DOM for the eyes and the
@@ -266,7 +241,7 @@ class VoicePollRateTest(unittest.TestCase):
         cls.node = shutil.which("node")
         if cls.node is None:
             raise unittest.SkipTest("node not found")
-        jdk = find_jdk()
+        jdk = jvm_harness.find_jdk()
         if jdk is None:
             raise unittest.SkipTest("no JDK (javac + java) found")
         cls._td = tempfile.TemporaryDirectory(prefix="eyes_poll_")

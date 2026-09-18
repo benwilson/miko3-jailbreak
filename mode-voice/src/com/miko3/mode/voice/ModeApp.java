@@ -10,6 +10,8 @@ import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.HttpUtil;
+import com.miko3.shared.LauncherProtocol;
+import com.miko3.shared.ModeRegistry;
 import com.miko3.shared.RoutingHttpServer;
 
 import java.io.IOException;
@@ -116,10 +118,11 @@ public class ModeApp extends Application {
                 }
             }
         });
-        server.route("/presence", new RoutingHttpServer.RouteHandler() {
+        server.route(LauncherProtocol.PRESENCE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                res.sendText(200, "OK", "application/json; charset=utf-8", presenceJson());
+                res.sendText(200, "OK", "application/json; charset=utf-8",
+                        ModeRegistry.presenceJson(LauncherProtocol.MODE_VOICE, active));
             }
         });
         server.route("/assets/pico.min.css", new RoutingHttpServer.RouteHandler() {
@@ -163,23 +166,10 @@ public class ModeApp extends Application {
         }
     }
 
-    RoutingHttpServer server() {
-        return server;
-    }
-
-    /** The mode's settings. The relay client registers its relay-address listener here. */
-    VoiceSettings settings() {
-        return settings;
-    }
-
     /** Sets what the eyes and the settings page's state line show. Called by the
      * relay client on every state change; any thread, never blocks. */
     void setVoiceState(VoiceState state) {
         voiceState.set(state);
-    }
-
-    VoiceState voiceState() {
-        return voiceState.get();
     }
 
     /** Optional detail shown after the state's label on the settings page (e.g.
@@ -295,14 +285,6 @@ public class ModeApp extends Application {
         public void error(String msg, Throwable t) {
             Log.e(CLIENT_TAG, msg, t);
         }
-    }
-
-    String presenceJson() {
-        return "{\"mode\":\"voice\",\"active\":" + active + "}";
-    }
-
-    boolean isActive() {
-        return active;
     }
 
     /** Called when a MainActivity instance (re)establishes itself as the active

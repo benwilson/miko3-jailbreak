@@ -16,6 +16,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *   adb shell "cat > /data/data/com.miko3.mode.voice/shared_prefs/voice_settings.xml"
  *   ... <int name="prebuffer_chunks" value="2" /> ... then restart the app
  *
+ * capture_source is a diagnostics switch written the same way.
+ *
  * The turn-taking value is read at each wake (KTD3), so a change applies at
  * the next conversation. A relay-address change applies at once: save()
  * notifies every RelayAddressListener (the voice engine closes its link,
@@ -32,6 +34,8 @@ final class VoiceSettings {
     static final String KEY_PREBUFFER_CHUNKS = "prebuffer_chunks";
     /** Milliseconds of mic audio per uplink chunk. */
     static final String KEY_UPLINK_CHUNK_MS = "uplink_chunk_ms";
+    /** Diagnostics only: "recognition" captures from VOICE_RECOGNITION (VoiceEngine). */
+    static final String KEY_CAPTURE_SOURCE = "capture_source";
 
     static final boolean DEFAULT_TURN_TAKING = false;
     static final int DEFAULT_PREBUFFER_CHUNKS = 1;
@@ -93,6 +97,16 @@ final class VoiceSettings {
     int uplinkChunkMs() {
         int v = store.getInt(KEY_UPLINK_CHUNK_MS, DEFAULT_UPLINK_CHUNK_MS);
         return v > 0 ? v : DEFAULT_UPLINK_CHUNK_MS;
+    }
+
+    /** True when capture_source is hand-written as "recognition"; false for any
+     * other value, and for a non-string value. */
+    boolean captureFromRecognition() {
+        try {
+            return "recognition".equals(store.getString(KEY_CAPTURE_SOURCE, ""));
+        } catch (ClassCastException e) {
+            return false;
+        }
     }
 
     /**

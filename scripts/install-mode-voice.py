@@ -57,12 +57,17 @@ def _run(cmd, timeout):
                            "   The robot stopped answering. Check it is powered on and on Wi-Fi, then re-run.")
 
 
-def adb(serial, *args, check=True, timeout=ADB_TIMEOUT):
-    r = _run(adb_cmd(serial, *args), timeout)
+def run_step(cmd, check=True, timeout=ADB_TIMEOUT):
+    """Runs a full adb command line; with check, a non-zero exit is an InstallError."""
+    r = _run(cmd, timeout)
     if check and r.returncode != 0:
-        raise InstallError(f"!! adb failed ({r.returncode}): {' '.join(adb_cmd(serial, *args))}\n"
+        raise InstallError(f"!! adb failed ({r.returncode}): {' '.join(cmd)}\n"
                            f"{(r.stdout + r.stderr).strip()}")
     return r
+
+
+def adb(serial, *args, check=True, timeout=ADB_TIMEOUT):
+    return run_step(adb_cmd(serial, *args), check=check, timeout=timeout)
 
 
 def install_commands(serial, apk):
@@ -115,16 +120,16 @@ def main(argv=None):
 
     install, grant, start = install_commands(args.serial, APK)
     print(f"== 2/4 installing {APK.name} ==", flush=True)
-    adb(args.serial, *install[3:])
+    run_step(install)
 
     print(f"== 3/4 granting {PERMISSION} (no dialog on first launch) ==", flush=True)
-    adb(args.serial, *grant[3:])
+    run_step(grant)
     dump = adb(args.serial, "shell", "dumpsys", "package", PKG).stdout
     if f"{PERMISSION}: granted=true" not in dump:
         raise InstallError(f"!! {PERMISSION} does not show granted=true in dumpsys package {PKG}")
 
     print(f"== 4/4 launching {COMPONENT} ==", flush=True)
-    out = adb(args.serial, *start[3:]).stdout
+    out = run_step(start).stdout
     if "Error" in out:
         raise InstallError(f"!! am start failed:\n{out.strip()}")
 

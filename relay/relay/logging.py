@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import secrets
+import threading
 import time
 from pathlib import Path
 
@@ -35,6 +36,32 @@ def new_conversation_id(now=None):
     now = time.time() if now is None else now
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now))
     return f"{stamp}{int(now * 1000) % 1000:03d}-{secrets.token_hex(3)}"
+
+
+def _is_conversation_id(value):
+    return isinstance(value, str) and CONVERSATION_ID.fullmatch(value) is not None
+
+
+def _stat_key(path):
+    st = path.stat()
+    return st.st_size, st.st_mtime_ns
+
+
+def _summarize(path):
+    """(started, close_reason, records) of one log file. Blocking: reads it."""
+    started, close_reason, records = None, None, 0
+    with path.open() as f:
+        for line in f:
+            records += 1
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if started is None:
+                started = record.get("ts")
+            if record.get("ev") == "close":
+                close_reason = record.get("reason")
+    return started, close_reason, records
 
 
 def _clean(value):
@@ -65,6 +92,9 @@ class ConversationLogs:
         self._pending = []  # (conversation id, JSON line), in write order
         self._writer = None
         self._stopping = None
+        # list() runs in worker threads (asyncio.to_thread), so possibly two at once.
+        self._summaries = {}  # path -> ((st_size, st_mtime_ns), summary item)
+        self._summaries_lock = threading.Lock()
 
     async def start(self):
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -80,7 +110,7 @@ class ConversationLogs:
 
     def write(self, conv_id, ev, **fields):
         """Queue one record; False if it was dropped because the queue is full."""
-        if not isinstance(conv_id, str) or not CONVERSATION_ID.fullmatch(conv_id):
+        if not _is_conversation_id(conv_id):
             raise ValueError(f"not a conversation id: {conv_id!r}")
         if len(self._pending) >= self.max_queue:
             self.dropped += 1
@@ -95,7 +125,7 @@ class ConversationLogs:
     def path(self, conv_id):
         """The log file of a relay-generated id, resolved inside the log directory; None
         for anything else (the file need not exist)."""
-        if not isinstance(conv_id, str) or not CONVERSATION_ID.fullmatch(conv_id):
+        if not _is_conversation_id(conv_id):
             return None
         base = self.dir.resolve()
         path = (base / f"{conv_id}.jsonl").resolve()
@@ -104,30 +134,35 @@ class ConversationLogs:
         return path
 
     def list(self):
-        """Summaries of every conversation log, oldest first. Blocking: reads the files."""
+        """Summaries of every conversation log, oldest first. Blocking: reads the files,
+        except those whose size and mtime are unchanged since the last listing."""
+        with self._summaries_lock:
+            cached = dict(self._summaries)
+        fresh = {}
         items = []
         for path in sorted(self.dir.glob("*.jsonl")):
             conv_id = path.stem
             if self.path(conv_id) != path.resolve():
                 continue
-            started, close_reason, records = None, None, 0
             try:
-                with path.open() as f:
-                    for line in f:
-                        records += 1
-                        try:
-                            record = json.loads(line)
-                        except ValueError:
-                            continue
-                        if started is None:
-                            started = record.get("ts")
-                        if record.get("ev") == "close":
-                            close_reason = record.get("reason")
-                size = path.stat().st_size
+                before = _stat_key(path)
+                hit = cached.get(path)
+                if hit is not None and hit[0] == before:
+                    item = hit[1]
+                else:
+                    started, close_reason, records = _summarize(path)
+                    after = _stat_key(path)
+                    item = {"id": conv_id, "started": started, "close_reason": close_reason,
+                            "records": records, "bytes": after[0]}
+                    if after != before:  # written to while being read: summarize it again
+                        items.append(dict(item))
+                        continue
             except OSError:
                 continue
-            items.append({"id": conv_id, "started": started, "close_reason": close_reason,
-                          "records": records, "bytes": size})
+            fresh[path] = (before, item)
+            items.append(dict(item))
+        with self._summaries_lock:
+            self._summaries = fresh
         return items
 
     async def _run(self):

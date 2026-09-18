@@ -13,6 +13,7 @@ the lane (LAN only).
 import asyncio
 import json
 import logging
+from http import HTTPStatus
 from urllib.parse import urlsplit
 
 log = logging.getLogger("relay.http")
@@ -21,8 +22,6 @@ DEFAULT_PORT = 8791
 PREFIX = "/conversations"
 REQUEST_TIMEOUT = 5.0
 MAX_HEAD = 16384
-REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
-           500: "Internal Server Error"}
 
 
 def _read_file(path):
@@ -95,7 +94,7 @@ class LogHttpServer:
         return 200, body, "application/x-ndjson"
 
     async def _send(self, writer, status, body, ctype, head_only=False):
-        head = (f"HTTP/1.1 {status} {REASONS.get(status, '')}\r\n"
+        head = (f"HTTP/1.1 {status} {HTTPStatus(status).phrase}\r\n"
                 f"Content-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
                 f"Connection: close\r\n\r\n").encode()
         writer.write(head if head_only else head + body)

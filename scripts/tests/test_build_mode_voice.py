@@ -19,15 +19,19 @@ scenario: address validation, the page-token check, and form handling.
 """
 import hashlib
 import importlib.util
-import os
 import re
-import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
+
+TESTS = Path(__file__).resolve().parent
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
+import jvm_harness  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 BUILD_PY = REPO / "scripts" / "build-mode-voice.py"
@@ -108,18 +112,43 @@ class VendorLibsTest(unittest.TestCase):
 
 
 class SharedAssetsTest(unittest.TestCase):
+    """build_common.stage_assets's exclude, which this build passes SHARED_ASSETS_EXCLUDED."""
+
+    def _sources(self, td):
+        app, shared = Path(td) / "app", Path(td) / "shared"
+        app.mkdir()
+        shared.mkdir()
+        (app / "miko_wakeword_model.tflite").write_bytes(b"x")
+        for name in ("pico.min.css", "server.p12", "danger-zone.mp3"):
+            (shared / name).write_bytes(b"x")
+        return [app, shared]
+
     def test_stages_everything_but_the_excluded_song(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = build.bc.stage_assets(self._sources(td), Path(td) / "build",
+                                        exclude=build.SHARED_ASSETS_EXCLUDED)
+            self.assertEqual(sorted(p.name for p in out.iterdir()),
+                             ["miko_wakeword_model.tflite", "pico.min.css", "server.p12"])
+
+    def test_default_exclude_stages_everything(self):
+        """The other apps' builds pass no exclude and keep every asset."""
+        with tempfile.TemporaryDirectory() as td:
+            out = build.bc.stage_assets(self._sources(td), Path(td) / "build")
+            self.assertIn("danger-zone.mp3", {p.name for p in out.iterdir()})
+
+    def test_only_excluded_assets_is_no_assets_dir(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src"
             src.mkdir()
-            for name in ("pico.min.css", "server.p12", "danger-zone.mp3"):
-                (src / name).write_bytes(b"x")
-            out = build.stage_shared_assets(Path(td) / "out", src=src)
-            self.assertEqual(sorted(p.name for p in out.iterdir()), ["pico.min.css", "server.p12"])
+            (src / "danger-zone.mp3").write_bytes(b"x")
+            self.assertIsNone(build.bc.stage_assets([src], Path(td) / "build",
+                                                    exclude=build.SHARED_ASSETS_EXCLUDED))
 
     def test_real_shared_assets_keep_settings_page_and_https_files(self):
         with tempfile.TemporaryDirectory() as td:
-            names = {p.name for p in build.stage_shared_assets(Path(td)).iterdir()}
+            out = build.bc.stage_assets([build.SHARED_ASSETS], Path(td),
+                                        exclude=build.SHARED_ASSETS_EXCLUDED)
+            names = {p.name for p in out.iterdir()}
         self.assertIn("pico.min.css", names)
         self.assertIn("server.p12", names)
         self.assertNotIn("danger-zone.mp3", names)
@@ -227,15 +256,6 @@ class ApkContentsTest(unittest.TestCase):
         self.assertNotIn("assets/danger-zone.mp3", self.names)
 
 
-def _find_jdk():
-    """(javac, java) from the JDK build_common picks for the APK builds, else PATH."""
-    home = build.bc.java_home()
-    if home and (Path(home) / "bin" / "javac").exists():
-        return str(Path(home) / "bin" / "javac"), str(Path(home) / "bin" / "java")
-    javac, java = shutil.which("javac"), shutil.which("java")
-    return (javac, java) if javac and java else None
-
-
 class SettingsHarnessTest(unittest.TestCase):
     """KTD10 settings page on the host JVM; one harness run, one assertion per scenario."""
 
@@ -269,16 +289,12 @@ class SettingsHarnessTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        jdk = _find_jdk()
+        jdk = jvm_harness.find_jdk()
         if jdk is None:
             raise unittest.SkipTest("no JDK (javac + java) found")
         cls._td = tempfile.TemporaryDirectory(prefix="voice_settings_harness_")
         out = cls._td.name
-        # Same language level as build_common.compile_java; -Xlint:-options hides
-        # the "source 8 is obsolete" chatter from modern JDKs.
-        sourcepath = os.pathsep.join([str(HARNESS), str(VOICE_SRC), str(SHARED_SRC)])
-        c = subprocess.run([jdk[0], "-source", "8", "-target", "8", "-encoding", "UTF-8", "-Xlint:-options",
-                            "-sourcepath", sourcepath, "-d", out, str(HARNESS_MAIN)],
+        c = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, [HARNESS_MAIN], [HARNESS, VOICE_SRC, SHARED_SRC]),
                            capture_output=True, text=True)
         cls.compiled = c.returncode == 0
         cls.compile_output = (c.stdout + c.stderr)[-3000:]
@@ -288,11 +304,7 @@ class SettingsHarnessTest(unittest.TestCase):
             r = subprocess.run([jdk[1], "-cp", out, "com.miko3.mode.voice.VoiceSettingsHarness"],
                                capture_output=True, text=True, timeout=60)
             cls.run_output = (r.stdout + r.stderr)[-6000:]
-            for line in r.stdout.splitlines():
-                verdict, _, rest = line.partition(" ")
-                if verdict in ("PASS", "FAIL"):
-                    name, _, detail = rest.partition(": ")
-                    cls.results[name] = (verdict, detail)
+            cls.results = jvm_harness.parse_verdicts(r.stdout)
 
     @classmethod
     def tearDownClass(cls):
@@ -310,14 +322,7 @@ class SettingsHarnessTest(unittest.TestCase):
         self.assertEqual(sorted(self.results), sorted(self.SCENARIOS), self.run_output)
 
 
-def _add_scenario_tests():
-    for _name in SettingsHarnessTest.SCENARIOS:
-        def _test(self, name=_name):
-            self._assert_pass(name)
-        setattr(SettingsHarnessTest, f"test_{_name}", _test)
-
-
-_add_scenario_tests()
+jvm_harness.add_scenario_tests(SettingsHarnessTest)
 
 
 if __name__ == "__main__":

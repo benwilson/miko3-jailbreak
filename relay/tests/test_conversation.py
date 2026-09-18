@@ -17,7 +17,6 @@ import time
 import unittest
 from pathlib import Path
 
-from websockets.asyncio.server import serve
 
 RELAY_ROOT = Path(__file__).resolve().parents[1]
 if str(RELAY_ROOT) not in sys.path:
@@ -38,16 +37,9 @@ class PortedFakeServer(FakeModelServer):
     hold the handshake of its next connection for `delay_next` seconds."""
 
     def __init__(self, script=None, port=0):
-        super().__init__(script)
-        self.fixed_port = port
+        super().__init__(script, port)
         self.delay_next = 0.0
         self.connections = 0
-
-    async def __aenter__(self):
-        self._server = await serve(self._handle, "127.0.0.1", self.fixed_port,
-                                   compression=None, process_request=self._process_request)
-        self.port = self._server.sockets[0].getsockname()[1]
-        return self
 
     async def _process_request(self, connection, request):
         self.connections += 1

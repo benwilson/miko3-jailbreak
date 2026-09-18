@@ -341,7 +341,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
                 beginBufferLocked();
             }
         }
-        send("conv.open", id, "turn_taking", strict ? STRICT : INTERRUPTIBLE);
+        send("conv.open", id, "turn_taking", turnTakingName(strict));
         setPhase(Phase.CONNECTING, null);
         readyTimer = schedule(new Runnable() {
             @Override
@@ -439,12 +439,14 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         }
     }
 
+    private static String turnTakingName(boolean strict) {
+        return strict ? STRICT : INTERRUPTIBLE;
+    }
+
     private void onStatus(boolean modelOk) {
         if (phase == Phase.UNREACHABLE && welcomed && modelOk) {
             enterListening();
-        } else if (phase == Phase.LISTENING && !modelOk) {
-            enterUnreachable("the relay reports the model server unreachable");
-        } else if (phase == Phase.UNREACHABLE && welcomed) {
+        } else if (!modelOk && (phase == Phase.LISTENING || (phase == Phase.UNREACHABLE && welcomed))) {
             enterUnreachable("the relay reports the model server unreachable");
         }
     }
@@ -502,11 +504,16 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         cancel(closingTimer);
         setUplink(Uplink.DROP);
         audio.closePlayer();
+        endDropping();
+        conv = null;
+        speaking = false;
+    }
+
+    /** Ends a post-flush drop window, logging what it dropped. */
+    private void endDropping() {
         if (dropping && droppedAfterFlush > 0) {
             log.info("dropped " + droppedAfterFlush + " chunks after the last flush");
         }
-        conv = null;
-        speaking = false;
         dropping = false;
         droppedAfterFlush = 0;
     }
@@ -667,7 +674,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         List<Object> capabilities = Collections.emptyList();
         send("hello", null, "robot_id", cfg.robotId, "proto", PROTO, "app_version", cfg.appVersion,
                 "capabilities", capabilities, "mic_rate", MIC_RATE, "speaker_rate", SPEAKER_RATE,
-                "turn_taking", settings.turnTaking() ? STRICT : INTERRUPTIBLE);
+                "turn_taking", turnTakingName(settings.turnTaking()));
         welcomeTimer = schedule(new Runnable() {
             @Override
             public void run() {
@@ -747,11 +754,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         if (!inReply(msgConv)) {
             return;
         }
-        if (dropping && droppedAfterFlush > 0) {
-            log.info("dropped " + droppedAfterFlush + " chunks after the last flush");
-        }
-        dropping = false;
-        droppedAfterFlush = 0;
+        endDropping();
         audio.replyBegins(replyId);
     }
 
@@ -927,7 +930,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
      * text frames are never dropped.
      */
     private final class Tx implements Runnable {
-        private final ArrayDeque<Object[]> queue = new ArrayDeque<Object[]>();
+        private final ArrayDeque<Frame> queue = new ArrayDeque<Frame>();
         private int binaries;
         private int dropped;
         private boolean finishing;
@@ -940,7 +943,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         }
 
         synchronized void text(WebSocketClient c, String text) {
-            queue.add(new Object[]{c, text});
+            queue.add(new Frame(c, text, null, false));
             notifyAll();
         }
 
@@ -949,8 +952,8 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
                 return;
             }
             if (binaries >= cfg.maxQueuedUplink) {
-                for (Iterator<Object[]> it = queue.iterator(); it.hasNext(); ) {
-                    if (it.next()[1] instanceof byte[]) {
+                for (Iterator<Frame> it = queue.iterator(); it.hasNext(); ) {
+                    if (it.next().isBinary()) {
                         it.remove();
                         binaries--;
                         break;
@@ -961,14 +964,14 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
                     log.warn("uplink congested: " + dropped + " chunks dropped");
                 }
             }
-            queue.add(new Object[]{c, data});
+            queue.add(new Frame(c, null, data, false));
             binaries++;
             notifyAll();
         }
 
         /** Closes the link once everything queued before this has been sent. */
         synchronized void close(WebSocketClient c) {
-            queue.add(new Object[]{c, null});
+            queue.add(new Frame(c, null, null, true));
             notifyAll();
         }
 
@@ -989,9 +992,9 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
                 }
                 // Whatever is left is abandoned; close its links so no socket lingers.
                 List<WebSocketClient> links = new ArrayList<WebSocketClient>();
-                for (Object[] item : queue) {
-                    if (!links.contains(item[0])) {
-                        links.add((WebSocketClient) item[0]);
+                for (Frame item : queue) {
+                    if (!links.contains(item.link)) {
+                        links.add(item.link);
                     }
                 }
                 queue.clear();
@@ -1008,7 +1011,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         @Override
         public void run() {
             while (true) {
-                Object[] item;
+                Frame item;
                 synchronized (this) {
                     while (queue.isEmpty()) {
                         if (finishing) {
@@ -1021,17 +1024,17 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
                         }
                     }
                     item = queue.poll();
-                    if (item[1] instanceof byte[]) {
+                    if (item.isBinary()) {
                         binaries--;
                     }
                 }
-                WebSocketClient c = (WebSocketClient) item[0];
-                if (item[1] == null) {
+                WebSocketClient c = item.link;
+                if (item.close) {
                     c.close();
-                } else if (item[1] instanceof String) {
-                    c.sendText((String) item[1]);
+                } else if (item.text != null) {
+                    c.sendText(item.text);
                 } else {
-                    c.sendBinary((byte[]) item[1]);
+                    c.sendBinary(item.data);
                 }
                 synchronized (this) {
                     if (queue.isEmpty()) {
@@ -1039,6 +1042,26 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
                     }
                 }
             }
+        }
+    }
+
+    /** One item of Tx's queue: a text frame, a binary (uplink) frame, or the
+     * link's close, each bound to the link it was queued for. */
+    private static final class Frame {
+        final WebSocketClient link;
+        final String text;
+        final byte[] data;
+        final boolean close;
+
+        Frame(WebSocketClient link, String text, byte[] data, boolean close) {
+            this.link = link;
+            this.text = text;
+            this.data = data;
+            this.close = close;
+        }
+
+        boolean isBinary() {
+            return data != null;
         }
     }
 

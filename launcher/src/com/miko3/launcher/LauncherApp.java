@@ -48,15 +48,6 @@ public class LauncherApp extends Application {
     static final int PORT = 8080;
     static final int HTTPS_PORT = 8443;
 
-    // Every mode the launcher can start now comes from the shared ModeRegistry
-    // (KTD8, U9): package, Activity, and HTTP port per mode id. The port is used
-    // to send the browser to the mode's own page after launching it (U12:
-    // separate port pairs means "/" no longer just happens to land there the way
-    // it did under U11's shared port), to poll for the mode's listener actually
-    // being up before doing so (startActivity() returns long before the target
-    // process has bound its port), and to ask the mode's presence route whether
-    // it's the one running.
-
     // Bound for each loopback presence probe (connect and read each). A live
     // mode answers in a few ms; a dead one refuses at once. Only a wedged
     // process ever uses the whole bound.
@@ -67,9 +58,9 @@ public class LauncherApp extends Application {
     private volatile byte[] cssBytes;
 
     // Held only to create and keep alive DriveLeaseService, the modes' motor
-    // arbiter (R3/KTD3). The launcher itself no longer queries the holder: which
-    // mode is running comes from presence (KTD8), since the voice mode never takes
-    // the lease (R18).
+    // arbiter (R3/KTD3). The launcher never queries the holder: which mode is
+    // running comes from presence (KTD8), since the voice mode never takes the
+    // lease (R18).
     private final ServiceConnection leaseConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
@@ -232,8 +223,7 @@ public class LauncherApp extends Application {
     }
 
     /**
-     * U10, reworked for the registry (KTD8, U9): launches the target mode,
-     * handing off gracefully from whichever mode is running — never a process
+     * Launches the target mode (KTD8), handing off gracefully from whichever mode is running — never a process
      * kill (the plan's own cited learning: docs/solutions/runtime-errors/
      * kill-9-on-watched-service-permanently-disables-restart.md). Asks every
      * registered mode's presence route which one is active, requests that one
@@ -241,11 +231,9 @@ public class LauncherApp extends Application {
      * mode" control uses), waits for its presence to go inactive, then
      * launches the target — release-then-acquire, never both at once.
      *
-     * Presence replaces the old lease-holder poll as the "has it exited" signal;
-     * for the remote-control mode it clears after the same drive release the
-     * lease poll used to wait on (and after its mic release), with the same
-     * 150 ms poll, 5 s bound, and 400 ms grace, so that path's timing is
-     * unchanged. The drive lease itself is untouched and still arbitrates the
+     * Presence is the "has it exited" signal; for the remote-control mode it
+     * clears after its drive release and its mic release. Polled every 150 ms,
+     * bounded at 5 s, then a 400 ms grace. The drive lease still arbitrates the
      * motors. synchronized: two overlapping /launch-mode requests would
      * otherwise interleave their exit and launch steps.
      */

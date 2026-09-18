@@ -216,11 +216,13 @@ class Session:
 
 
 class FakeModelServer:
-    """Binds 127.0.0.1 on an ephemeral port. Use as an async context manager."""
+    """Binds 127.0.0.1 on `port` (0: an ephemeral one). Use as an async context manager.
+    Subclasses override _process_request to act on each connection before its handshake."""
 
-    def __init__(self, script=None):
+    def __init__(self, script=None, port=0):
         self.script = script or Script()
         self.sessions: list[Session] = []
+        self.bind_port = port
         self.port = None
         self._server = None
         self._active: Session | None = None
@@ -231,9 +233,13 @@ class FakeModelServer:
         return self.sessions[-1] if self.sessions else None
 
     async def __aenter__(self):
-        self._server = await serve(self._handle, "127.0.0.1", 0, compression=None)
+        self._server = await serve(self._handle, "127.0.0.1", self.bind_port, compression=None,
+                                   process_request=self._process_request)
         self.port = self._server.sockets[0].getsockname()[1]
         return self
+
+    async def _process_request(self, connection, request):
+        return None  # go on with the handshake
 
     async def __aexit__(self, *exc):
         self._server.close()

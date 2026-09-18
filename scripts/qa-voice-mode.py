@@ -78,7 +78,6 @@ LAUNCHER_PORT = 8080
 MODE_PORTS = {"remote-control": 8081, "voice": 8082}  # ModeRegistry: presence, plain HTTP
 VOICE_HTTPS_PORT = 8445  # plain 8082 redirects everything but /presence here
 RELAY_HTTP_PORT = 8791
-CONVERSATION_ID = re.compile(r"^[0-9A-Za-z_-]+$")  # relay.logging.CONVERSATION_ID
 
 ADB_TIMEOUT = 30
 CONNECT_TIMEOUT = 15
@@ -333,6 +332,8 @@ class Relay:
             items = json.loads(r.body)["conversations"]
         except (ValueError, KeyError, TypeError):
             raise CheckFailed(f"{self.base}/conversations is not the relay's log listing") from None
+        _use_relay_package()
+        from relay.logging import CONVERSATION_ID
         return [c for c in items if isinstance(c, dict)
                 and isinstance(c.get("id"), str) and CONVERSATION_ID.fullmatch(c["id"])]
 
@@ -417,10 +418,15 @@ def wait_for(what, fn, timeout, interval=0.5):
         time.sleep(interval)
 
 
-def build_report(log_dir, calibration_ms=None):
-    """relay.report's report over log_dir (imported from the relay package, stdlib only)."""
+def _use_relay_package():
+    """Makes the relay package importable (its logging and report modules are stdlib only)."""
     if str(RELAY_ROOT) not in sys.path:
         sys.path.insert(0, str(RELAY_ROOT))
+
+
+def build_report(log_dir, calibration_ms=None):
+    """relay.report's report over log_dir (imported from the relay package, stdlib only)."""
+    _use_relay_package()
     from relay import report
     return report.build_report([log_dir], calibration_ms=calibration_ms)
 
@@ -472,9 +478,7 @@ class Checklist:
                                                      "(--non-interactive)", human)
         try:
             detail = fn()
-        except CheckFailed as exc:
-            return self.record(name, FAIL, str(exc), human)
-        except (AdbError, OSError) as exc:
+        except (CheckFailed, AdbError, OSError) as exc:
             return self.record(name, FAIL, str(exc), human)
         except Exception as exc:  # noqa: BLE001 - a broken step fails, the run goes on
             return self.record(name, FAIL, f"{type(exc).__name__}: {exc}", human)
@@ -528,6 +532,7 @@ class Run:
         self.out_dir = out_dir
         self.open_conv = None  # the conversation the wake check opened, for AE3
         self.original_turn_taking = None
+        self.report_data = None  # relay.report's report, once the report step has run
 
     # helpers
 
@@ -935,7 +940,7 @@ def main(argv=None, input_fn=input):
         if relay_proc is not None:
             relay_proc.stop()
 
-    report = getattr(run, "report_data", None)
+    report = run.report_data
     md = (render_report(report) + "\n" if report else "") + cl.markdown()
     (out_dir / "report.md").write_text(md)
     (out_dir / "report.json").write_text(json.dumps(

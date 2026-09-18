@@ -134,7 +134,8 @@ class Closed(ModelEvent):
     error: bool = False
 
 
-def _check_persona(persona):
+def check_persona(persona):
+    """ValueError naming the first non-ASCII character, which the model server rejects."""
     try:
         persona.encode("ascii")
     except UnicodeEncodeError as exc:
@@ -160,7 +161,7 @@ class ModelClient:
     """
 
     def __init__(self, host, port=DEFAULT_PORT, persona="", *, open_timeout=3.0):
-        _check_persona(persona)
+        check_persona(persona)
         self.host = host
         self.port = port
         self.persona = persona

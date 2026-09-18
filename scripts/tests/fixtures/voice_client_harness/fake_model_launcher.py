@@ -25,8 +25,6 @@ from pathlib import Path
 RELAY_ROOT = Path(__file__).resolve().parents[4] / "relay"
 sys.path.insert(0, str(RELAY_ROOT))
 
-from websockets.asyncio.server import serve  # noqa: E402
-
 from tests.fake_model_server import FakeModelServer, Script, Turn  # noqa: E402
 
 SCRIPTS = {
@@ -57,13 +55,7 @@ class LauncherServer(FakeModelServer):
         self.handshake_delay = 0.0
         self.reported = 0
 
-    async def __aenter__(self):
-        self._server = await serve(self._handle, "127.0.0.1", 0, compression=None,
-                                   process_request=self._hold)
-        self.port = self._server.sockets[0].getsockname()[1]
-        return self
-
-    async def _hold(self, connection, request):
+    async def _process_request(self, connection, request):
         if self.handshake_delay:
             await asyncio.sleep(self.handshake_delay)
         return None

@@ -23,7 +23,6 @@ cleanly without a JDK that accepts -source 8 or without the relay venv (relay/.v
 """
 import atexit
 import json
-import os
 import re
 import shutil
 import signal
@@ -35,6 +34,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
+
+TESTS = Path(__file__).resolve().parent
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
+import jvm_harness  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "scripts"
@@ -57,22 +61,6 @@ TONE_BYTES_PER_SECOND = 22050 * 2
 FAST = {"backoff_base_ms": "250", "backoff_cap_ms": "1000", "connect_ms": "2000"}
 
 
-def find_jdk():
-    """(javac, java) from the JDK build_common picks for the APK builds, else PATH."""
-    sys.path.insert(0, str(SCRIPTS))
-    try:
-        import build_common
-        home = build_common.java_home()
-    except Exception:
-        home = ""
-    finally:
-        sys.path.remove(str(SCRIPTS))
-    if home and (Path(home) / "bin" / "javac").exists():
-        return str(Path(home) / "bin" / "javac"), str(Path(home) / "bin" / "java")
-    javac, java = shutil.which("javac"), shutil.which("java")
-    return (javac, java) if javac and java else None
-
-
 class Harness:
     """Compiles VoiceClientHarness (and, through -sourcepath, the real client) once."""
     _java = None
@@ -87,18 +75,17 @@ class Harness:
             raise AssertionError(cls._error)
         if not RELAY_PYTHON.exists():
             raise unittest.SkipTest(f"relay venv missing ({RELAY_PYTHON})")
-        jdk = find_jdk()
+        jdk = jvm_harness.find_jdk()
         if jdk is None:
             raise unittest.SkipTest("no JDK (javac + java) found")
         out = tempfile.mkdtemp(prefix="voice_client_harness_")
         atexit.register(shutil.rmtree, out, True)
         probe = Path(out) / "Probe.java"
         probe.write_text("class Probe {}\n")
-        base = [jdk[0], "-source", "8", "-target", "8", "-encoding", "UTF-8", "-Xlint:-options"]
-        if subprocess.run(base + ["-d", out, str(probe)], capture_output=True).returncode != 0:
+        if subprocess.run(jvm_harness.javac_cmd(jdk[0], out, [probe]), capture_output=True).returncode != 0:
             raise unittest.SkipTest(f"{jdk[0]} cannot compile -source 8")
-        sourcepath = os.pathsep.join(str(p) for p in (FIXTURE / "src", VOICE_SRC, SHARED_SRC, LOG_STUBS))
-        r = subprocess.run(base + ["-sourcepath", sourcepath, "-d", out, str(HARNESS_MAIN)],
+        r = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, [HARNESS_MAIN],
+                                                 (FIXTURE / "src", VOICE_SRC, SHARED_SRC, LOG_STUBS)),
                            capture_output=True, text=True)
         if r.returncode != 0:
             cls._error = f"harness does not compile:\n{(r.stdout + r.stderr)[-3000:]}"

@@ -137,29 +137,36 @@ public class MainActivity extends Activity {
      * instance's engine.
      */
     private void exitMode() {
-        ModeApp app = (ModeApp) getApplication();
-        if (activated) {
-            activated = false;
-            if (app.deactivate(myGeneration)) {
-                app.stopVoice();
-                Log.i(TAG, "exited (generation " + myGeneration + ")");
-            }
+        if (releaseIfCurrent()) {
+            Log.i(TAG, "exited (generation " + myGeneration + ")");
         }
         finish();
     }
 
     @Override
     protected void onDestroy() {
-        if (activated) {
-            activated = false;
-            ModeApp app = (ModeApp) getApplication();
-            if (app.deactivate(myGeneration)) {
-                // Destroyed without an exit (e.g. by the system): nothing may keep
-                // the microphone once no Activity is active.
-                app.stopVoice();
-            }
-        }
+        // Destroyed without an exit (e.g. by the system): nothing may keep the
+        // microphone once no Activity is active.
+        releaseIfCurrent();
         super.onDestroy();
+    }
+
+    /**
+     * Shared by exitMode() and onDestroy(): once per activation, clears presence
+     * and stops the voice engine, but only while this instance is still the
+     * current generation. Returns whether the engine was stopped.
+     */
+    private boolean releaseIfCurrent() {
+        if (!activated) {
+            return false;
+        }
+        activated = false;
+        ModeApp app = (ModeApp) getApplication();
+        if (!app.deactivate(myGeneration)) {
+            return false;
+        }
+        app.stopVoice();
+        return true;
     }
 
     private static boolean isForceExit(Intent intent) {

@@ -69,7 +69,6 @@ import recognizer.WakeWord;
 final class VoiceEngine implements ConversationClient.Audio {
     private static final String TAG = "VoiceEngine";
 
-    private static final int SAMPLE_RATE = 16000;
     private static final int CHUNK_SAMPLES = WakeWord.AUDIO_CHUNK_SIZE;
     private static final int CHUNK_BYTES = CHUNK_SAMPLES * 2;
     private static final long CHUNK_PERIOD_US = 80000;
@@ -85,10 +84,8 @@ final class VoiceEngine implements ConversationClient.Audio {
     private static final long MIC_RETRY_CAP_MS = 30000;
     /** A capture that ran this long resets the retry backoff. */
     private static final long MIC_HEALTHY_MS = 10000;
-    private static final String PREF_CAPTURE_SOURCE = "capture_source";
 
-    static final int SPEAKER_RATE = 22050;
-    private static final int SPEAKER_CHUNK_FRAMES = SPEAKER_RATE * 80 / 1000; // 1,764
+    private static final int SPEAKER_CHUNK_FRAMES = ConversationClient.SPEAKER_RATE * 80 / 1000; // 1,764
     private static final int SPEAKER_CHUNK_BYTES = SPEAKER_CHUNK_FRAMES * 2; // 3,528
     /** About one second of reply audio (KTD6). */
     private static final int PLAYER_QUEUE_CHUNKS = 13;
@@ -149,14 +146,9 @@ final class VoiceEngine implements ConversationClient.Audio {
             return;
         }
         running = true;
-        try {
-            useRecognitionSource = "recognition".equals(context.getSharedPreferences(VoiceSettings.PREFS_NAME,
-                    Context.MODE_PRIVATE).getString(PREF_CAPTURE_SOURCE, ""));
-        } catch (ClassCastException e) {
-            useRecognitionSource = false;
-        }
+        useRecognitionSource = settings.captureFromRecognition();
         if (useRecognitionSource) {
-            Log.w(TAG, PREF_CAPTURE_SOURCE + "=recognition: capturing from VOICE_RECOGNITION, without the "
+            Log.w(TAG, VoiceSettings.KEY_CAPTURE_SOURCE + "=recognition: capturing from VOICE_RECOGNITION, without the "
                     + "voice-communication echo path (diagnostics only)");
         }
         captureThread = new Thread(new Runnable() {
@@ -392,7 +384,7 @@ final class VoiceEngine implements ConversationClient.Audio {
         int source = useRecognitionSource
                 ? MediaRecorder.AudioSource.VOICE_RECOGNITION
                 : MediaRecorder.AudioSource.VOICE_COMMUNICATION;
-        int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+        int minBuf = AudioRecord.getMinBufferSize(ConversationClient.MIC_RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) {
             detail("microphone unavailable (unsupported AudioRecord configuration " + minBuf + ")");
@@ -400,7 +392,7 @@ final class VoiceEngine implements ConversationClient.Audio {
         }
         AudioRecord rec;
         try {
-            rec = new AudioRecord(source, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+            rec = new AudioRecord(source, ConversationClient.MIC_RATE, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT, Math.max(minBuf, CHUNK_BYTES * 4));
         } catch (RuntimeException e) {
             // SecurityException without RECORD_AUDIO, IllegalArgumentException.
@@ -437,7 +429,8 @@ final class VoiceEngine implements ConversationClient.Audio {
             record = rec;
             echoCanceler = aec;
         }
-        Log.i(TAG, "capturing from " + sourceName() + " at " + SAMPLE_RATE + " Hz, aec=" + (aec != null));
+        Log.i(TAG, "capturing from " + sourceName() + " at " + ConversationClient.MIC_RATE + " Hz, aec="
+                + (aec != null));
         detail(null);
         return rec;
     }
@@ -627,23 +620,27 @@ final class VoiceEngine implements ConversationClient.Audio {
         return numClasses == 1 ? 0f : scores[WakeWord.DETECTION_HELLO_MIKO];
     }
 
+    /** Formatted only in the branches that log it: most chunks log nothing. */
     private void handleResult(int result, float[] scores, long us, Stats stats) {
-        String scoreText = String.format(Locale.US, "scores=%s inference=%.1fms", formatScores(scores), us / 1000f);
         if (result == WakeWord.DETECTION_HEY_MIKO) {
             stats.detections++;
-            Log.i(TAG, "##### DETECTION Hey Miko score=" + heyScore(scores) + " " + scoreText + " #####");
+            Log.i(TAG, "##### DETECTION Hey Miko score=" + heyScore(scores) + " " + scoreText(scores, us) + " #####");
             wakeWord.resetState();
             onHit();
         } else if (result == WakeWord.DETECTION_HELLO_MIKO) {
             // KTD7: the model's second class is logged but never opens a conversation.
             stats.hellos++;
-            Log.i(TAG, "HELLO (not a detection) Hello Miko score=" + helloScore(scores) + " " + scoreText);
+            Log.i(TAG, "HELLO (not a detection) Hello Miko score=" + helloScore(scores) + " " + scoreText(scores, us));
             wakeWord.resetState();
         } else if (result != WakeWord.DETECTION_NONE) {
-            Log.w(TAG, "unexpected processChunk result " + result + " " + scoreText);
+            Log.w(TAG, "unexpected processChunk result " + result + " " + scoreText(scores, us));
         } else if (heyScore(scores) >= NEAR_MISS_FLOOR || helloScore(scores) >= NEAR_MISS_FLOOR) {
-            Log.d(TAG, "chunk " + scoreText);
+            Log.d(TAG, "chunk " + scoreText(scores, us));
         }
+    }
+
+    private static String scoreText(float[] scores, long us) {
+        return String.format(Locale.US, "scores=%s inference=%.1fms", formatScores(scores), us / 1000f);
     }
 
     /** Capture now goes to the client (which starts its pre-ready buffer in onWake)
@@ -780,7 +777,7 @@ final class VoiceEngine implements ConversationClient.Audio {
         private int underrunsAtStart;
 
         static Player create(VoiceEngine engine, int prebufferChunks) {
-            int minBuf = AudioTrack.getMinBufferSize(SPEAKER_RATE, AudioFormat.CHANNEL_OUT_MONO,
+            int minBuf = AudioTrack.getMinBufferSize(ConversationClient.SPEAKER_RATE, AudioFormat.CHANNEL_OUT_MONO,
                     AudioFormat.ENCODING_PCM_16BIT);
             if (minBuf <= 0) {
                 Log.e(TAG, "unsupported speaker configuration (" + minBuf + "); replies will not play");
@@ -794,7 +791,7 @@ final class VoiceEngine implements ConversationClient.Audio {
                                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                                 .build())
                         .setAudioFormat(new AudioFormat.Builder()
-                                .setSampleRate(SPEAKER_RATE)
+                                .setSampleRate(ConversationClient.SPEAKER_RATE)
                                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                                 .build())
@@ -814,7 +811,7 @@ final class VoiceEngine implements ConversationClient.Audio {
             // discards little and the head position tracks what is audible.
             int asked = SPEAKER_CHUNK_FRAMES * prebufferChunks;
             int effective = track.setBufferSizeInFrames(asked);
-            Log.i(TAG, "speaker track ready: 22050 Hz voice-communication, capacity "
+            Log.i(TAG, "speaker track ready: " + ConversationClient.SPEAKER_RATE + " Hz voice-communication, capacity "
                     + track.getBufferCapacityInFrames() + " frames, effective buffer " + effective
                     + " frames (asked " + asked + "), prebuffer " + prebufferChunks + " chunks");
             return new Player(engine, track, prebufferChunks);
@@ -951,7 +948,13 @@ final class VoiceEngine implements ConversationClient.Audio {
                     synchronized (this) {
                         if (running && !flushRequested) {
                             try {
-                                wait(started ? 10 : 50);
+                                if (!started && current == null && queue.isEmpty()) {
+                                    // Idle: only enqueue(), flush() or shutdown() (all notify
+                                    // under this lock) can give the thread work.
+                                    wait();
+                                } else {
+                                    wait(started ? 10 : 50);
+                                }
                             } catch (InterruptedException e) {
                                 return;
                             }
@@ -1040,7 +1043,8 @@ final class VoiceEngine implements ConversationClient.Audio {
                 queued = queue.size();
             }
             long bufferedFrames = Math.max(0, framesWritten - head) + (long) queued * SPEAKER_CHUNK_FRAMES;
-            c.onPlayback(nowPlaying, (int) (bufferedFrames * 1000 / SPEAKER_RATE), firstChunkToPlayMs);
+            c.onPlayback(nowPlaying, (int) (bufferedFrames * 1000 / ConversationClient.SPEAKER_RATE),
+                    firstChunkToPlayMs);
         }
     }
 }

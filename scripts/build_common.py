@@ -171,13 +171,15 @@ def compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir):
         raise BuildError("!! d8 did not produce classes.dex")
 
 
-def stage_assets(asset_sources, build_dir):
+def stage_assets(asset_sources, build_dir, exclude=()):
     """Merge one or more assets directories into build_dir/assets.
 
     asset_sources: list of directories whose contents are copied into one
     merged assets/ tree (e.g. the shared module's vendored pico.min.css
     plus an app's own assets), since aapt2 link's -A takes a single dir.
-    Returns the merged dir, or None if every source is empty/absent.
+    exclude: top-level names skipped in every source (an asset one app
+    doesn't ship). Returns the merged dir, or None if every source is
+    empty/absent once the excluded names are skipped.
     """
     merged = build_dir / "assets"
     found_any = False
@@ -186,6 +188,8 @@ def stage_assets(asset_sources, build_dir):
         if not src.exists():
             continue
         for item in src.iterdir():
+            if item.name in exclude:
+                continue
             found_any = True
             dest = merged / item.name
             merged.mkdir(parents=True, exist_ok=True)
@@ -276,10 +280,10 @@ def sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore
 
 def build_apk(src_dirs, manifest, android_jar, javac, bt, keytool, java_home_dir,
               build_dir, keystore, keystore_alias, keystore_pass, keystore_cn,
-              apk_out, asset_sources=None, res_dir=None, native_libs=None):
+              apk_out, asset_sources=None, res_dir=None, native_libs=None, asset_exclude=()):
     """Full pipeline: compile_java -> stage_assets -> compile_resources -> link_and_pack -> sign."""
     compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir)
-    assets_dir = stage_assets(asset_sources, build_dir) if asset_sources else None
+    assets_dir = stage_assets(asset_sources, build_dir, asset_exclude) if asset_sources else None
     res_zip = compile_resources(bt, res_dir, build_dir) if res_dir else None
     withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip, native_libs)
     sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore_pass,

@@ -73,8 +73,10 @@ def _best(words, start=0, variants=MIKO_VARIANTS):
     """Best (score, lo, hi) over farewell-and-name pairs using some word at index >= start;
     None if no pair reaches the near-miss floor. A name may be split across two words."""
     best = None
-    for i, word in enumerate(words):
-        farewell = _similarity(word, FAREWELLS)
+    # A pair's last word is at most MAX_DISTANCE + 1 past its farewell (a split name),
+    # so farewells before this index only form pairs that end before start.
+    for i in range(max(0, start - MAX_DISTANCE - 1), len(words)):
+        farewell = _similarity(words[i], FAREWELLS)
         if farewell < NEAR_MISS_THRESHOLD:
             continue
         for j in range(max(0, i - MAX_DISTANCE), min(len(words), i + MAX_DISTANCE + 1)):

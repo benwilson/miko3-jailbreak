@@ -35,6 +35,7 @@ from relay.lane import DEFAULT_PORT as LANE_PORT  # noqa: E402
 from relay.lane import LaneServer  # noqa: E402
 from relay.logging import ConversationLogs  # noqa: E402
 from relay.model_client import DEFAULT_PORT as MODEL_PORT  # noqa: E402
+from relay.model_client import check_persona  # noqa: E402
 
 log = logging.getLogger("relay.main")
 
@@ -48,10 +49,9 @@ def load_persona(path):
     """The persona file's text, stripped; the model server takes ASCII only."""
     text = Path(path).read_text(encoding="utf-8").strip()
     try:
-        text.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise SystemExit(f"{path}: persona must be ASCII only; found {text[exc.start]!r} "
-                         f"at character {exc.start}") from None
+        check_persona(text)
+    except ValueError as exc:
+        raise SystemExit(f"{path}: {exc}") from None
     if not text:
         raise SystemExit(f"{path}: persona file is empty")
     return text
