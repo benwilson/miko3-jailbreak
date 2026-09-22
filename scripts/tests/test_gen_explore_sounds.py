@@ -36,13 +36,31 @@ class GeneratedClipsTest(unittest.TestCase):
     def tearDownClass(cls):
         cls._td.cleanup()
 
-    def test_writes_several_startle_variants(self):
-        self.assertGreaterEqual(len(self.paths), 2)
-        for p in self.paths:
-            self.assertTrue(p.name.startswith("startle-") and p.suffix == ".wav", p.name)
+    def startles(self):
+        return [p for p in self.paths if p.name.startswith("startle-")]
 
-    def test_each_clip_is_short_mono_16bit_at_the_expected_rate(self):
-        for p in self.paths:
+    def songs(self):
+        return [p for p in self.paths if p.name.startswith("song-")]
+
+    def test_writes_several_startle_variants(self):
+        self.assertGreaterEqual(len(self.startles()), 2)
+        for p in self.startles():
+            self.assertEqual(p.suffix, ".wav", p.name)
+
+    def test_writes_several_idle_songs(self):
+        # Hummed while he sits still (resting or eyes-only); varied so it doesn't loop one tune.
+        self.assertGreaterEqual(len(self.songs()), 3)
+        self.assertEqual(len(self.paths), len(self.startles()) + len(self.songs()))
+
+    def test_each_song_is_a_short_phrase(self):
+        for p in self.songs():
+            with wave.open(str(p)) as w:
+                self.assertEqual((w.getnchannels(), w.getsampwidth(), w.getframerate()), (1, 2, gen.RATE))
+                seconds = w.getnframes() / w.getframerate()
+            self.assertTrue(2.0 <= seconds <= 5.0, f"{p.name}: {seconds:.2f}s")
+
+    def test_each_startle_is_short_mono_16bit_at_the_expected_rate(self):
+        for p in self.startles():
             with wave.open(str(p)) as w:
                 self.assertEqual(w.getnchannels(), 1)
                 self.assertEqual(w.getsampwidth(), 2)

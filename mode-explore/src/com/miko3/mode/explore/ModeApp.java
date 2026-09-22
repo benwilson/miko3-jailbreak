@@ -187,6 +187,15 @@ public class ModeApp extends Application {
     private final ExploreBrain.Eyes eyes = new ExploreBrain.Eyes() {
         @Override
         public void show(ExploreBrain.EyeState state, ExploreBrain.Direction gaze) {
+            // He sings while parked: resting after being cornered, or eyes-only.
+            ClipPlayer c = clips;
+            if (c != null) {
+                if (state == ExploreBrain.EyeState.RESTING || state == ExploreBrain.EyeState.EYES_ONLY) {
+                    c.startSinging();
+                } else {
+                    c.stopSinging();
+                }
+            }
             switch (state) {
                 case LOOK:
                     setExploreState(ExploreState.look(ExploreState.LOOK,
