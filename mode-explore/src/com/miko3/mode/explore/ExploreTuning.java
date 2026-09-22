@@ -134,7 +134,8 @@ final class ExploreTuning {
         private long startleMs = 400;
         private long staleMs = 300;
         private int tofFault = 16383;
-        // Placeholder until U1's passive baseline measures tof jitter (KTD3).
+        // A still robot's tof jitters by tens of counts, so identical values this
+        // long mean a stuck sensor (docs/hardware/tof-sensor.md).
         private long frozenTofWindowMs = 3000;
         private int recoveryStreak = 3;
         private int capHazards = 3;
@@ -155,7 +156,6 @@ final class ExploreTuning {
         Builder lookLeadMs(long v) { lookLeadMs = v; return this; }
         Builder startleMs(long v) { startleMs = v; return this; }
         Builder staleMs(long v) { staleMs = v; return this; }
-        Builder tofFault(int v) { tofFault = v; return this; }
         Builder frozenTofWindowMs(long v) { frozenTofWindowMs = v; return this; }
         Builder recoveryStreak(int v) { recoveryStreak = v; return this; }
         Builder cap(int hazards, long windowMs, long cooldown) {

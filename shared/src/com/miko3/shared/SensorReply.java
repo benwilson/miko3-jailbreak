@@ -26,10 +26,14 @@ public final class SensorReply {
     /** The TOFIR reading in {@code reply}, stamped {@code timestampMs}, or null when the
      * reply has no TOFIR section or its tof field is not a whole comma-terminated number. */
     public static SensorSnapshot parse(byte[] reply, long timestampMs) {
-        if (reply == null || reply.length == 0) {
+        return reply == null ? null : parse(text(reply), timestampMs);
+    }
+
+    /** As {@link #parse(byte[], long)}, on a reply already decoded with {@link #text}. */
+    public static SensorSnapshot parse(String text, long timestampMs) {
+        if (text == null || text.isEmpty()) {
             return null;
         }
-        String text = new String(reply, StandardCharsets.US_ASCII);
         int start = text.indexOf(TOFIR);
         if (start < 0) {
             return null;
@@ -51,10 +55,14 @@ public final class SensorReply {
     /** The CPL motion-ack value in {@code reply} (2 = the MCU refused forward motion for an
      * edge/obstacle), or ABSENT when the reply carries none. Missing is never read as 0. */
     public static int parseCpl(byte[] reply) {
-        if (reply == null) {
+        return reply == null ? SensorSnapshot.ABSENT : parseCpl(text(reply));
+    }
+
+    /** As {@link #parseCpl(byte[])}, on a reply already decoded with {@link #text}. */
+    public static int parseCpl(String text) {
+        if (text == null) {
             return SensorSnapshot.ABSENT;
         }
-        String text = new String(reply, StandardCharsets.US_ASCII);
         int start = text.indexOf(CPL);
         if (start < 0) {
             return SensorSnapshot.ABSENT;
@@ -65,6 +73,11 @@ public final class SensorReply {
             end++;
         }
         return end == i ? SensorSnapshot.ABSENT : number(text.substring(i, end));
+    }
+
+    /** A reply as the ASCII text both parsers read, so a caller parsing it twice decodes once. */
+    public static String text(byte[] reply) {
+        return new String(reply, StandardCharsets.US_ASCII);
     }
 
     /** From {@code from} up to the next section key: an uppercase letter other than the

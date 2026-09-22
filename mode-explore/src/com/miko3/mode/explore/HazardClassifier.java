@@ -9,8 +9,8 @@ package com.miko3.mode.explore;
  * Unavailable, the conservative answer, whenever any of these holds:
  *  - no calibration, or an incomplete one (KTD9);
  *  - no reading for staleMs (three missed 100 ms polls);
- *  - the latest reading is a fault (ERROR_UART, dead keepalive) or tof is at
- *    its fault value;
+ *  - the latest reading is flagged as a fault, or tof is at its fault value
+ *    without a calibrated IR edge flag agreeing;
  *  - tof has not changed for frozenTofWindowMs, the leftover-TOFDS symptom.
  *    This rule is tof-only: ir1 and ir2 sitting still on a flat desk is normal.
  *

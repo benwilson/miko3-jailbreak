@@ -23,7 +23,8 @@ final class SensorReading {
     final int ir2;
     /** The motion-ack field, or null when the reply did not carry one. 2 = forward refused. */
     final Integer cpl;
-    /** The reply was ERROR_UART, or the keepalive is dead: nothing here can be trusted. */
+    /** Nothing in this reading can be trusted. The device side currently never sets it
+     * (a dead keepalive shows up as staleness instead); it stays for a future producer. */
     final boolean fault;
 
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault) {

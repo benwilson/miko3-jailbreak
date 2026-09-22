@@ -26,7 +26,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-DEFAULT_SERIAL = "192.168.19.74:5555"
 PACKAGE = "com.miko3.mode.explore"
 ACTIVITY = f"{PACKAGE}/.MainActivity"
 CAL_NAME = "explore-calibration.properties"
@@ -271,7 +270,7 @@ def run_step(robot, name, seconds):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--serial", default=DEFAULT_SERIAL)
+    ap.add_argument("--serial", default=sensors_module().DEFAULT_SERIAL)
     ap.add_argument("--only", help="comma-separated steps: " + ",".join(ALL_STEPS))
     ap.add_argument("--seconds", type=float, default=5.0, help="length of each calibration capture")
     args = ap.parse_args()

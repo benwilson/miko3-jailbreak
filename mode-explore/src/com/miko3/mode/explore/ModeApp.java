@@ -198,7 +198,7 @@ public class ModeApp extends Application {
                 case RESTING:
                     setExploreState(ExploreState.of(ExploreState.RESTING));
                     break;
-                case STILL:
+                case EYES_ONLY:
                     setExploreState(ExploreState.of(ExploreState.EYES_ONLY));
                     break;
                 default:

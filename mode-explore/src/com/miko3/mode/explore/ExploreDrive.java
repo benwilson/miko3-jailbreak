@@ -56,8 +56,10 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
 
     private final DirectMotorDriver driver = new DirectMotorDriver();
     private volatile boolean driverConnected;
-    /** Brain-thread only: whether the first reading has been logged yet. */
-    private boolean sawReading;
+    /** Brain-thread only: the snapshot last turned into a reading, and that reading. The
+     * loop polls every tick but the driver publishes a new snapshot only every ~100 ms. */
+    private SensorSnapshot lastSnapshot;
+    private SensorReading lastReading;
     private volatile DriveLease lease;
     private volatile boolean leaseHeld;
     private int leaseRetryAttempt;
@@ -223,8 +225,10 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         if (s == null) {
             return null;
         }
-        if (!sawReading) {
-            sawReading = true;
+        if (s == lastSnapshot) {
+            return lastReading;
+        }
+        if (lastSnapshot == null) {
             Log.i(TAG, "first sensor reading: " + s);
         }
         long refusal = driver.lastRefusalMs();
@@ -232,7 +236,9 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         // fault stays false: SensorSnapshot.fault only means tof read 16383, which the
         // classifier judges itself (it can be an edge when the IR flag agrees). A dead
         // keepalive shows up as the readings going stale.
-        return new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false);
+        lastSnapshot = s;
+        lastReading = new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false);
+        return lastReading;
     }
 
     // ---- ExploreLoop.Hooks ----

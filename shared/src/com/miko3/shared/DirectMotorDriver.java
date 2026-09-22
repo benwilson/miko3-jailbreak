@@ -310,13 +310,14 @@ public final class DirectMotorDriver {
         }
         if (reply != null) {
             long now = SystemClock.elapsedRealtime();
+            String text = SensorReply.text(reply);
             if (frame == POWER_FRAME) {
-                SensorSnapshot reading = SensorReply.parse(reply, now);
+                SensorSnapshot reading = SensorReply.parse(text, now);
                 if (reading != null) {
                     latestSensors = reading;
                 }
             }
-            if (SensorReply.parseCpl(reply) == 2) {
+            if (SensorReply.parseCpl(text) == 2) {
                 lastRefusalMs = now;
             }
         }

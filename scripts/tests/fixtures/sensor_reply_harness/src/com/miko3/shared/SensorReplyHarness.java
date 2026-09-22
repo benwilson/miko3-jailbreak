@@ -75,7 +75,7 @@ public final class SensorReplyHarness {
         check("garbage_gives_no_snapshot",
                 SensorReply.parse(bytes("\u0001\u0002TOFIR=abc,,\u0000"), T) == null
                         && SensorReply.parse(new byte[0], T) == null
-                        && SensorReply.parse(null, T) == null,
+                        && SensorReply.parse((byte[]) null, T) == null,
                 "expected null for garbage/empty/null");
 
         SensorSnapshot dead = SensorReply.parse(bytes("TOFIR=16383,XXXX,0,XXXXGSTFL=0"), T);
@@ -93,6 +93,6 @@ public final class SensorReplyHarness {
 
         check("malformed_cpl_is_unknown",
                 SensorReply.parseCpl(bytes("CPL=X,")) == SensorSnapshot.ABSENT
-                        && SensorReply.parseCpl(null) == SensorSnapshot.ABSENT, "expected ABSENT");
+                        && SensorReply.parseCpl((byte[]) null) == SensorSnapshot.ABSENT, "expected ABSENT");
     }
 }

@@ -16,7 +16,7 @@ import java.util.Random;
  *
  * States, following the Key Flows diagram:
  *
- *   EYES_ONLY  sensors unavailable or no lease: never drives, eyes show STILL (R10, R5)
+ *   EYES_ONLY  sensors unavailable or no lease: never drives, eyes show EYES_ONLY (R10, R5)
  *   PAUSE      standing, eyes glancing (R2); ends on a fresh reading
  *   LOOK       eyes on the new heading for lookLeadMs before the turn (R7)
  *   TURN       turning in place for a fixed duration (R3)
@@ -86,7 +86,7 @@ final class ExploreBrain {
     }
 
     /** What the eyes show: glancing, leading a turn, startled, resting (cornered), not moving (R10). */
-    enum EyeState { IDLE, LOOK, FLINCH, RESTING, STILL }
+    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY }
 
     enum State { EYES_ONLY, PAUSE, LOOK, TURN, HOP, STARTLE, BACK_OFF, CORNERED, STOPPED }
 
@@ -375,7 +375,7 @@ final class ExploreBrain {
             note("eyes only: " + why);
         }
         state = State.EYES_ONLY;
-        show(EyeState.STILL, null);
+        show(EyeState.EYES_ONLY, null);
     }
 
     private void enterPause(long now, long ms, boolean keepEyes) {

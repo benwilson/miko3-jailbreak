@@ -546,7 +546,7 @@ public final class ExploreBrainHarness {
         scenario("ae3_no_readings_never_moves", n -> {
             Rig rig = new Rig(tuning().build(), t -> null).started();
             rig.runUntil(10000);
-            check(n, rig.motions(0, 10001) == 0 && rig.count("eyes STILL") >= 1
+            check(n, rig.motions(0, 10001) == 0 && rig.count("eyes EYES_ONLY") >= 1
                             && rig.brain.state() == ExploreBrain.State.EYES_ONLY,
                     "state=" + rig.brain.state() + " " + rig.tail());
         });
@@ -556,7 +556,7 @@ public final class ExploreBrainHarness {
             int stop = rig.first("stop", rig.first("hop", 0));
             ExploreBrain.State mid = rig.brain.state();
             rig.runUntil(5000);
-            int still = rig.firstAfter("eyes STILL", 1300);
+            int still = rig.firstAfter("eyes EYES_ONLY", 1300);
             int idleAgain = rig.firstAfter("eyes IDLE", 1700);
             int hopAgain = rig.firstAfter("hop", 1700);
             // Readings back at 3000, 3100, 3200: available at 3200, then a full pause.
@@ -583,7 +583,7 @@ public final class ExploreBrainHarness {
             int idle = rig.firstAfter("eyes IDLE", 3000);
             int next = rig.firstMotionAfter(3001);
             check(n, rig.timeOf(back) == 2000 && rig.timeOf(stop) == 2100 && lost == ExploreBrain.State.EYES_ONLY
-                            && rig.firstAfter("eyes STILL", 2100) >= 0 && rig.motions(2101, 4000) == 0
+                            && rig.firstAfter("eyes EYES_ONLY", 2100) >= 0 && rig.motions(2101, 4000) == 0
                             && rig.timeOf(idle) == 3000 && rig.what(next).equals("hop")
                             && rig.timeOf(next) == 4000 && rig.violations.isEmpty(),
                     "back@" + rig.timeOf(back) + " stop@" + rig.timeOf(stop) + " lost=" + lost
@@ -673,7 +673,7 @@ public final class ExploreBrainHarness {
         scenario("uncalibrated_brain_never_moves", n -> {
             Rig rig = new Rig(tuning().calibration(null).build(), CLEAR).started();
             rig.runUntil(10000);
-            check(n, rig.motions(0, 10001) == 0 && rig.count("eyes STILL") >= 1
+            check(n, rig.motions(0, 10001) == 0 && rig.count("eyes EYES_ONLY") >= 1
                             && rig.brain.state() == ExploreBrain.State.EYES_ONLY,
                     "state=" + rig.brain.state() + " " + rig.tail());
         });
@@ -692,7 +692,7 @@ public final class ExploreBrainHarness {
             Rig rig = new Rig(tuning().build(), CLEAR);
             rig.brain.start();
             rig.runUntil(10000);
-            check(n, rig.motions(0, 10001) == 0 && rig.count("eyes STILL") >= 1
+            check(n, rig.motions(0, 10001) == 0 && rig.count("eyes EYES_ONLY") >= 1
                             && rig.brain.state() == ExploreBrain.State.EYES_ONLY,
                     "state=" + rig.brain.state() + " " + rig.tail());
         });
@@ -734,7 +734,7 @@ public final class ExploreBrainHarness {
             int stop = rig.first("stop", hop);
             check(n, rig.count("hop") == 1 && rig.timeOf(stop) == rig.timeOf(hop)
                             && rig.brain.state() == ExploreBrain.State.EYES_ONLY && !rig.moving
-                            && rig.firstAfter("eyes STILL", 1300) >= 0,
+                            && rig.firstAfter("eyes EYES_ONLY", 1300) >= 0,
                     "state=" + rig.brain.state() + " " + rig.tail());
         });
         scenario("shutdown_stops_and_goes_inert", n -> {
