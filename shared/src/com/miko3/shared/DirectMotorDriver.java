@@ -204,6 +204,35 @@ public final class DirectMotorDriver {
      * condition a write-only FileOutputStream had no way to ever detect at all. */
     private static final String ERROR_UART = "ERROR_UART";
 
+    /** Debug-only capture of every raw MCU reply, off unless enabled with
+     * `setprop log.tag.MikoDmdRaw DEBUG` (scripts/qa-explore-sensors.py does this).
+     * Exists to document the reply format (docs/hardware/tof-sensor.md). */
+    private static final String RAW_TAG = "MikoDmdRaw";
+
+    /** One logcat line per reply: the sent frame's tag (e.g. POWER, VEL1=) and the
+     * reply with its trailing 'X' padding trimmed, non-printables as '.'. */
+    private static void logRawReply(byte[] frame, byte[] reply) {
+        int tagEnd = 0;
+        while (tagEnd < frame.length && tagEnd < 5 && frame[tagEnd] >= 'A' && frame[tagEnd] <= 'Z') {
+            tagEnd++;
+        }
+        String sent = new String(frame, 0, tagEnd, StandardCharsets.US_ASCII);
+        if (reply == null) {
+            Log.d(RAW_TAG, "sent=" + sent + " reply=null");
+            return;
+        }
+        int end = reply.length;
+        while (end > 0 && reply[end - 1] == 'X') {
+            end--;
+        }
+        StringBuilder text = new StringBuilder(end);
+        for (int i = 0; i < end; i++) {
+            byte b = reply[i];
+            text.append(b >= 0x20 && b < 0x7f ? (char) b : '.');
+        }
+        Log.d(RAW_TAG, "sent=" + sent + " len=" + reply.length + " reply=" + text);
+    }
+
     /** Every write to the UART is immediately followed by a synchronous read of the
      * MCU's reply, matching SocialInteraction_SpeechChat.SendData()'s own contract
      * exactly (confirmed via decompiled source AND live strace) — callers must hold
@@ -220,6 +249,9 @@ public final class DirectMotorDriver {
             throw new IOException("SensorModule.write() failed");
         }
         byte[] reply = sensorModule.read();
+        if (Log.isLoggable(RAW_TAG, Log.DEBUG)) {
+            logRawReply(frame, reply);
+        }
         if (reply != null && reply.length == ERROR_UART.length()
                 && new String(reply, StandardCharsets.US_ASCII).equals(ERROR_UART)) {
             Log.w(TAG, "ERROR_UART reply -- resetting UART");
