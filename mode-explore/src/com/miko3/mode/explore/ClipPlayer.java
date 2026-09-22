@@ -34,7 +34,7 @@ import java.util.Random;
 final class ClipPlayer {
     private static final String TAG = "ClipPlayer";
     private static final String[] STARTLE_CLIPS = {"startle-1.wav", "startle-2.wav", "startle-3.wav"};
-    private static final String[] SONG_CLIPS = {"song-1.wav", "song-2.wav", "song-3.wav"};
+    private static final String[] SONG_CLIPS = {"song-1.wav", "song-2.wav", "song-3.wav", "song-4.wav"};
     /** Still for this long before the first phrase. */
     private static final long FIRST_SONG_DELAY_MS = 3000;
     /** Quiet gap between phrases, drawn from this range. */
