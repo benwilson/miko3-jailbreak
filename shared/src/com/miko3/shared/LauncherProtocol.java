@@ -23,6 +23,7 @@ public final class LauncherProtocol {
      * parameter and the "mode" field of each mode's presence answer. See ModeRegistry. */
     public static final String MODE_REMOTE_CONTROL = "remote-control";
     public static final String MODE_VOICE = "voice";
+    public static final String MODE_EXPLORE = "explore";
 
     /** Launcher route that exits whichever mode is running and launches the one
      * named by LAUNCH_MODE_PARAM (remote-control when absent, for old links). */
