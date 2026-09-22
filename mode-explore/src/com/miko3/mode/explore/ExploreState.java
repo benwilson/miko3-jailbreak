@@ -26,6 +26,18 @@ final class ExploreState {
     /** Idle glancing, the other modes' look (R6). The state before the brain first reports. */
     static final String IDLE = "idle";
 
+    /** Eyes held on the direction he is about to move (lookX/lookY), set before a turn (R7). */
+    static final String LOOK = "look";
+    /** The startle: a quick squint as he stops at an edge or obstacle (R11). */
+    static final String FLINCH = "flinch";
+    /** No usable sensor readings, so he will not drive: visibly "not moving", not frozen (R10). */
+    static final String EYES_ONLY = "eyes-only";
+    /** The cornered cool-down (KTD8): drowsy, distinct from the no-sensors look. */
+    static final String RESTING = "resting";
+
+    /** Every state the brain publishes, for the page tests. */
+    static final String[] ALL_STATES = {IDLE, LOOK, FLINCH, EYES_ONLY, RESTING};
+
     static final ExploreState IDLE_STATE = new ExploreState(IDLE, 0, 0);
 
     /** Page poll interval while the mode is up (KTD10: about 150 ms, so a "look"
@@ -98,8 +110,22 @@ final class ExploreState {
     }
 
     // Per-state looks, as overrides on the shared eyes keyed by a class on #rig.
-    // Empty in U4: idle is the other modes' look unchanged. U6 fills this in.
-    private static final String STATE_CSS = "";
+    // idle is the other modes' look unchanged (R6). The animations go on
+    // .glow-core, never .glow: .glow's transform carries the gaze, and a keyframe
+    // transform on the same element would override it.
+    private static final String STATE_CSS =
+            // Look: a slightly brighter core while he eyes the way ahead.
+            "#rig.s-look .glow-core{filter:brightness(1.15)}"
+            // Flinch: one quick squint that springs back.
+            + "@keyframes flinch{0%{transform:scale(1,1)}25%{transform:scale(1.18,.3)}"
+            + "60%{transform:scale(.95,1.08)}100%{transform:scale(1,1)}}"
+            + "#rig.s-flinch .glow-core{animation:flinch .55s cubic-bezier(.3,1.4,.5,1) 1}"
+            // Eyes-only (no sensors, not driving): half-closed and dimmed. The
+            // glances continue (see GAZE_JS), so it reads as awake but staying put.
+            + "#rig.s-eyes-only .glow-core{transform:scale(1,.45);opacity:.7;transition:transform .6s,opacity .6s}"
+            // Resting (cornered cool-down): drowsy, slowly breathing lids.
+            + "@keyframes drowse{from{transform:scale(1,.6);opacity:.85}to{transform:scale(1,.3);opacity:.55}}"
+            + "#rig.s-resting .glow-core{animation:drowse 2.4s ease-in-out infinite alternate}";
 
     // The poll. setTimeout chained off each answer (not setInterval) and
     // XMLHttpRequest with a timeout, as in the voice mode, so a hung request
@@ -127,9 +153,31 @@ final class ExploreState {
             + "showExploreState({state:'" + IDLE + "',lookX:0,lookY:0});"
             + "pollExploreState();";
 
-    // Runs after the eyes define gazeTo. Empty in U4; U6 wraps gazeTo here to
-    // hold the eyes on exploreState.lookX/lookY during a look (R7).
-    private static final String GAZE_JS = "";
+    // Runs after the eyes define gazeTo: every glance goes through it.
+    // - look: every glance goes to the published direction, so the eyes stay on
+    //   where he is about to move (R7). lookX/lookY in [-1, 1] map to the glance's
+    //   own range (x about +-10vmin, y about +-9vmin).
+    // - flinch: eyes snap to centre.
+    // - eyes-only / resting: glances are damped, not stopped, so the eyes never
+    //   look frozen (R10).
+    // showExploreState is wrapped too, so a look moves the eyes the moment it
+    // arrives rather than at the next glance, which can be seconds away; the
+    // brain only waits ~500ms before turning (KTD10).
+    private static final String GAZE_JS =
+            "var eyesGazeTo=gazeTo;"
+            + "gazeTo=function(x,y,speedMs){"
+            + "if(exploreState.state==='look'){x=exploreState.lookX*10;y=exploreState.lookY*9;}"
+            + "else if(exploreState.state==='flinch'){x=0;y=0;}"
+            + "else if(exploreState.state==='eyes-only'||exploreState.state==='resting'){x*=0.35;y*=0.35;}"
+            + "eyesGazeTo(x,y,speedMs);"
+            + "};"
+            + "var showExploreStateBase=showExploreState;"
+            + "showExploreState=function(s){"
+            + "var was=exploreState;"
+            + "showExploreStateBase(s);"
+            + "if(s.state==='look'&&(was.state!=='look'||was.lookX!==s.lookX||was.lookY!==s.lookY))gazeTo(0,0,260);"
+            + "else if(s.state==='flinch'&&was.state!=='flinch')gazeTo(0,0,90);"
+            + "};";
 
     /** GET /device-view (and /): the shared eyes plus the state hook. */
     static final String DEVICE_VIEW_HTML = EyesPage.build(
