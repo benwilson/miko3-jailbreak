@@ -13,8 +13,11 @@ package com.miko3.mode.explore;
  * so a fresh install runs eyes-only and never drives on guessed thresholds (KTD9).
  */
 final class ExploreTuning {
-    /** Forward ticks per hop; each tick is one driveContinuous(+2,0) resend. */
+    /** Forward ticks per leg of driving, at least; each tick is one driveContinuous(+2,0)
+     * resend, so consecutive ticks keep the robot rolling without stopping. */
     final int hopTicks;
+    /** Forward ticks per leg, at most: each leg drives a random length in between. */
+    final int hopTicksMax;
     /** Gap between hop ticks: the forward recipe must be resent every 250 ms. */
     final long hopTickMs;
     /** Reverse ticks per hazard back-off (R4: short and fixed). */
@@ -55,6 +58,7 @@ final class ExploreTuning {
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
+        hopTicksMax = Math.max(b.hopTicks, b.hopTicksMax);
         hopTickMs = b.hopTickMs;
         backTicks = b.backTicks;
         backTickMs = b.backTickMs;
@@ -119,13 +123,17 @@ final class ExploreTuning {
 
     /** Starts from the shipped defaults; every setter returns the builder. */
     static final class Builder {
-        private int hopTicks = 2;
+        // Continuous legs rather than hops: 4-10 s of driving (16-40 ticks of 250 ms),
+        // then a short pause and usually a new heading. Fewer starts and stops also means
+        // fewer nose bobs pushing the ToF out of the controller's band.
+        private int hopTicks = 16;
+        private int hopTicksMax = 40;
         private long hopTickMs = 250;
         private int backTicks = 1;
         private long backTickMs = 250;
-        private long pauseMinMs = 1500;
-        private long pauseMaxMs = 4000;
-        private double turnChance = 0.4;
+        private long pauseMinMs = 300;
+        private long pauseMaxMs = 700;
+        private double turnChance = 0.7;
         private long turnMinMs = 300;
         private long turnMaxMs = 900;
         private long escapeTurnMs = 1200;
@@ -144,7 +152,10 @@ final class ExploreTuning {
         private boolean ir1IsLeft = true;
         private Calibration calibration;
 
-        Builder hopTicks(int v) { hopTicks = v; return this; }
+        /** A fixed leg length. */
+        Builder hopTicks(int v) { hopTicks = v; hopTicksMax = v; return this; }
+        /** A random leg length between min and max ticks. */
+        Builder hopTicks(int min, int max) { hopTicks = min; hopTicksMax = max; return this; }
         Builder hopTickMs(long v) { hopTickMs = v; return this; }
         Builder backTicks(int v) { backTicks = v; return this; }
         Builder backTickMs(long v) { backTickMs = v; return this; }
