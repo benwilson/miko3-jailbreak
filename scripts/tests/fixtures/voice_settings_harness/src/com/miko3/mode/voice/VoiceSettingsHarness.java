@@ -391,25 +391,59 @@ public final class VoiceSettingsHarness {
             public void run(String n) throws Exception {
                 VoiceSettings s = new VoiceSettings(new MemStore());
                 check(n, "".equals(s.relayAddress()) && !s.turnTaking()
-                                && s.prebufferChunks() == 1 && s.uplinkChunkMs() == 80,
+                                && s.prebufferChunks() == 6 && s.speakerBufferMs() == 1000
+                                && s.playerQueueChunks() == 38 && s.uplinkChunkMs() == 80
+                                && s.wakeTrimMs() == 200,
                         "relay=" + s.relayAddress() + " turn=" + s.turnTaking() + " prebuffer="
-                                + s.prebufferChunks() + " uplink=" + s.uplinkChunkMs());
+                                + s.prebufferChunks() + " speakerBuffer=" + s.speakerBufferMs()
+                                + " queue=" + s.playerQueueChunks() + " uplink=" + s.uplinkChunkMs()
+                                + " wakeTrim=" + s.wakeTrimMs());
             }
         });
         scenario("tuning_keys_read_from_store", new Scenario() {
             public void run(String n) throws Exception {
                 MemStore store = new MemStore();
                 store.values.put(VoiceSettings.KEY_PREBUFFER_CHUNKS, 3);
+                store.values.put(VoiceSettings.KEY_SPEAKER_BUFFER_MS, 1500);
+                store.values.put(VoiceSettings.KEY_PLAYER_QUEUE_CHUNKS, 40);
                 store.values.put(VoiceSettings.KEY_UPLINK_CHUNK_MS, 40);
+                store.values.put(VoiceSettings.KEY_WAKE_TRIM_MS, 320);
                 VoiceSettings s = new VoiceSettings(store);
                 MemStore bad = new MemStore();
                 bad.values.put(VoiceSettings.KEY_PREBUFFER_CHUNKS, -2);
+                bad.values.put(VoiceSettings.KEY_SPEAKER_BUFFER_MS, 0);
+                bad.values.put(VoiceSettings.KEY_PLAYER_QUEUE_CHUNKS, -9);
                 bad.values.put(VoiceSettings.KEY_UPLINK_CHUNK_MS, 0);
+                bad.values.put(VoiceSettings.KEY_WAKE_TRIM_MS, -1);
                 VoiceSettings b = new VoiceSettings(bad);
-                check(n, s.prebufferChunks() == 3 && s.uplinkChunkMs() == 40
-                                && b.prebufferChunks() == 1 && b.uplinkChunkMs() == 80,
-                        "s=" + s.prebufferChunks() + "/" + s.uplinkChunkMs() + " b=" + b.prebufferChunks()
-                                + "/" + b.uplinkChunkMs());
+                check(n, s.prebufferChunks() == 3 && s.speakerBufferMs() == 1500
+                                && s.playerQueueChunks() == 40
+                                && s.uplinkChunkMs() == 40 && s.wakeTrimMs() == 320
+                                && b.prebufferChunks() == 6 && b.speakerBufferMs() == 1000
+                                && b.playerQueueChunks() == 38
+                                && b.uplinkChunkMs() == 80 && b.wakeTrimMs() == 200,
+                        "s=" + s.prebufferChunks() + "/" + s.speakerBufferMs() + "/" + s.playerQueueChunks()
+                                + "/" + s.uplinkChunkMs() + "/" + s.wakeTrimMs()
+                                + " b=" + b.prebufferChunks() + "/" + b.speakerBufferMs() + "/"
+                                + b.playerQueueChunks() + "/" + b.uplinkChunkMs() + "/" + b.wakeTrimMs());
+            }
+        });
+        scenario("wake_trim_zero_is_kept_and_nonsense_is_not", new Scenario() {
+            public void run(String n) throws Exception {
+                // Zero is a meaningful trim (forward everything from the detection),
+                // so it must survive; a typo that would swallow the question does not.
+                MemStore zero = new MemStore();
+                zero.values.put(VoiceSettings.KEY_WAKE_TRIM_MS, 0);
+                MemStore huge = new MemStore();
+                huge.values.put(VoiceSettings.KEY_WAKE_TRIM_MS, VoiceSettings.MAX_WAKE_TRIM_MS + 1);
+                MemStore wrongType = new MemStore();
+                wrongType.values.put(VoiceSettings.KEY_WAKE_TRIM_MS, "200");
+                check(n, new VoiceSettings(zero).wakeTrimMs() == 0
+                                && new VoiceSettings(huge).wakeTrimMs() == 200
+                                && new VoiceSettings(wrongType).wakeTrimMs() == 200,
+                        "zero=" + new VoiceSettings(zero).wakeTrimMs()
+                                + " huge=" + new VoiceSettings(huge).wakeTrimMs()
+                                + " wrongType=" + new VoiceSettings(wrongType).wakeTrimMs());
             }
         });
         scenario("address_parser_accepts_private_and_link_local", new Scenario() {

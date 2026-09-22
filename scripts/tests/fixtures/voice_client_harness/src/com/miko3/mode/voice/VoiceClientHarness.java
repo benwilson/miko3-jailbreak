@@ -15,7 +15,8 @@ import java.util.Map;
  * VoiceSettings store.
  *
  * Args (key=value, all optional): address=host:port, strict=true|false,
- * ready_ms, backoff_base_ms, backoff_cap_ms, welcome_ms, connect_ms.
+ * ready_ms, backoff_base_ms, backoff_cap_ms, welcome_ms, connect_ms, trim
+ * (wake_trim_ms, default 0 here so mic sequence numbers stay frame-aligned).
  *
  * Commands on stdin, one per line:
  *   wake              the spotter heard "Hey Miko" (prints WAKE mic_seq=<next chunk's seq>)
@@ -54,6 +55,11 @@ public final class VoiceClientHarness {
         final Map<String, Object> prefs = new HashMap<String, Object>();
         prefs.put(VoiceSettings.KEY_RELAY_ADDRESS, opt(opts, "address", ""));
         prefs.put(VoiceSettings.KEY_TURN_TAKING, Boolean.valueOf(opt(opts, "strict", "false")));
+        // Each mic chunk carries its sequence number in its first four bytes, which a
+        // trim that is not a whole number of chunks would shift out of a frame's head.
+        // The default here is therefore 0, not the product's wake_trim_ms default; the
+        // trim tests pass a multiple of the 80 ms chunk.
+        prefs.put(VoiceSettings.KEY_WAKE_TRIM_MS, Integer.valueOf(opt(opts, "trim", "0")));
         final VoiceSettings settings = new VoiceSettings(new VoiceSettings.Store() {
             @Override
             public synchronized String getString(String key, String def) {

@@ -13,11 +13,26 @@ import java.util.ArrayDeque;
  * One conversation's speaker track and its "voice-player" thread. The track
  * is paused whenever it has nothing to play (idle), so the per-turn
  * underrun count covers only the time a reply was actually playing.
+ *
+ * SpeakerSizing owns every size here and explains the trade; this class only
+ * makes the AudioTrack calls. The one piece of choreography worth repeating:
+ * the track's buffer is its start threshold on this platform, so it is opened
+ * to the prebuffer while starting and raised to the full cushion as soon as
+ * the playback head moves (openCushion), and kickStart() pads with silence in
+ * the corner where even the prebuffer never fills, so a short reply can never
+ * sit in a track that refuses to start.
  */
 final class VoicePlayer implements Runnable {
+    /** Nothing has played this long after the track was started: force it out. */
+    private static final long START_KICK_MS = 400;
+    /** Not even the kick got a frame out: give the conversation its turn back. */
+    private static final long STALL_GIVEUP_MS = 3000;
+    private static final byte[] SILENCE = new byte[SpeakerSizing.CHUNK_BYTES];
+
     private final VoiceEngine engine;
     private final AudioTrack track;
-    private final int prebufferChunks;
+    private final SpeakerSizing sizing;
+    private final int capacityFrames;
     private final Thread thread;
     private volatile boolean running = true;
 
@@ -25,7 +40,9 @@ final class VoicePlayer implements Runnable {
     private final ArrayDeque<byte[]> queue = new ArrayDeque<byte[]>();
     private boolean flushRequested;
     private long firstChunkAtMs = -1; // arrival of the first chunk since idle
+    private long lastChunkAtMs = -1; // arrival of the newest chunk since idle
     private int overruns; // chunks dropped on a full queue this turn
+    private int peakQueued; // deepest the queue got this turn
     private String replyId;
 
     // Player thread only (pending() reads the volatiles).
@@ -35,16 +52,21 @@ final class VoicePlayer implements Runnable {
     private int currentOff;
     private long framesWritten; // since creation or the last flush
     private long headAtStart;
+    private long startedAtMs;
     private boolean playing;
+    private boolean cushionOpen; // buffer raised from the prebuffer to the cushion
+    private boolean kicked; // silence already used to force this start
+    private int trackBufferFrames; // what the track last reported for its buffer
     private int underrunsAtStart;
 
-    static VoicePlayer create(VoiceEngine engine, int prebufferChunks) {
+    static VoicePlayer create(VoiceEngine engine, VoiceSettings settings) {
         int minBuf = AudioTrack.getMinBufferSize(ConversationClient.SPEAKER_RATE, AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) {
             Log.e(VoiceEngine.TAG, "unsupported speaker configuration (" + minBuf + "); replies will not play");
             return null;
         }
+        SpeakerSizing sizing = SpeakerSizing.of(settings, minBuf / 2);
         AudioTrack track;
         try {
             track = new AudioTrack.Builder()
@@ -58,7 +80,9 @@ final class VoicePlayer implements Runnable {
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                             .build())
                     .setTransferMode(AudioTrack.MODE_STREAM)
-                    .setBufferSizeInBytes(Math.max(minBuf, VoiceEngine.SPEAKER_CHUNK_BYTES * (prebufferChunks + 1)))
+                    // The ceiling, not the working size: the track starts on the
+                    // prebuffer and is raised towards this once it is playing.
+                    .setBufferSizeInBytes(Math.max(minBuf, sizing.capacityBytes()))
                     .build();
         } catch (RuntimeException e) {
             Log.e(VoiceEngine.TAG, "speaker track creation failed; replies will not play", e);
@@ -69,21 +93,27 @@ final class VoicePlayer implements Runnable {
             track.release();
             return null;
         }
-        // Cap what the track itself holds to about the prebuffer, so a flush
-        // discards little and the head position tracks what is audible.
-        int asked = VoiceEngine.SPEAKER_CHUNK_FRAMES * prebufferChunks;
-        int effective = track.setBufferSizeInFrames(asked);
+        // U12 replaced "hold about the prebuffer, so a flush discards little"
+        // with a cushion: barge-in was measured to be impossible on this
+        // hardware (the platform echo canceller ducks the microphone to RMS 41
+        // while the speaker plays), so a cheap flush buys nothing and smooth
+        // playback buys everything. Each start still opens at startFrames().
+        int effective = track.setBufferSizeInFrames(sizing.startFrames());
         Log.i(VoiceEngine.TAG, "speaker track ready: " + ConversationClient.SPEAKER_RATE
                 + " Hz voice-communication, capacity " + track.getBufferCapacityInFrames()
-                + " frames, effective buffer " + effective + " frames (asked " + asked + "), prebuffer "
-                + prebufferChunks + " chunks");
-        return new VoicePlayer(engine, track, prebufferChunks);
+                + " frames, start buffer " + effective + " frames (asked " + sizing.startFrames()
+                + "), cushion " + sizing.trackFrames() + " frames (" + sizing.trackMs() + " ms), prebuffer "
+                + sizing.prebufferChunks() + " chunks (" + sizing.prebufferMs() + " ms), queue "
+                + sizing.queueChunks() + " chunks (" + sizing.queueMs() + " ms)");
+        return new VoicePlayer(engine, track, sizing, effective);
     }
 
-    private VoicePlayer(VoiceEngine engine, AudioTrack track, int prebufferChunks) {
+    private VoicePlayer(VoiceEngine engine, AudioTrack track, SpeakerSizing sizing, int bufferFrames) {
         this.engine = engine;
         this.track = track;
-        this.prebufferChunks = prebufferChunks;
+        this.sizing = sizing;
+        this.capacityFrames = track.getBufferCapacityInFrames();
+        this.trackBufferFrames = bufferFrames;
         this.thread = new Thread(this, "voice-player");
         thread.start();
     }
@@ -93,17 +123,25 @@ final class VoicePlayer implements Runnable {
     }
 
     synchronized void enqueue(byte[] chunk) {
-        if (queue.size() >= VoiceEngine.PLAYER_QUEUE_CHUNKS) {
+        // The queue now holds the relay's whole burst, so this is a backstop
+        // against a wedged track rather than routine trimming (U12).
+        if (queue.size() >= sizing.queueChunks()) {
             overruns++;
             if (overruns == 1 || overruns % 25 == 0) {
-                Log.w(VoiceEngine.TAG, "speaker queue full: dropped " + overruns + " chunks of reply " + replyId);
+                Log.w(VoiceEngine.TAG, "speaker queue full at " + queue.size() + " chunks: dropped "
+                        + overruns + " chunks of reply " + replyId);
             }
             return;
         }
+        long now = SystemClock.elapsedRealtime();
         if (!started && firstChunkAtMs < 0) {
-            firstChunkAtMs = SystemClock.elapsedRealtime();
+            firstChunkAtMs = now;
         }
+        lastChunkAtMs = now;
         queue.add(chunk);
+        if (queue.size() > peakQueued) {
+            peakQueued = queue.size();
+        }
         notifyAll();
     }
 
@@ -171,11 +209,13 @@ final class VoicePlayer implements Runnable {
             long now = SystemClock.elapsedRealtime();
             if (!started && current != null) {
                 long first;
+                long last;
                 synchronized (this) {
                     first = firstChunkAtMs;
+                    last = lastChunkAtMs;
                 }
-                if (queued >= prebufferChunks || (first >= 0 && now - first >= VoiceEngine.PREBUFFER_HOLD_MS)) {
-                    startTrack();
+                if (sizing.shouldStart(queued, first >= 0 ? now - first : -1, last >= 0 ? now - last : -1)) {
+                    startTrack(now);
                 }
             }
             boolean wrote = false;
@@ -227,10 +267,67 @@ final class VoicePlayer implements Runnable {
         }
     }
 
-    private void startTrack() {
+    private void startTrack(long now) {
         started = true;
         needPlay = true;
+        cushionOpen = false;
+        kicked = false;
+        startedAtMs = now;
         headAtStart = head();
+        // Back down to the start threshold: the track is drained and paused
+        // here, so this only decides how little has to be written before the
+        // first frame is emitted. openCushion() raises it again once it is.
+        setTrackBuffer(sizing.startFrames());
+    }
+
+    /** setBufferSizeInFrames, remembering what the track actually gave us. */
+    private void setTrackBuffer(int frames) {
+        try {
+            int got = track.setBufferSizeInFrames(frames);
+            if (got > 0) {
+                trackBufferFrames = got;
+            }
+        } catch (IllegalStateException e) {
+            Log.w(VoiceEngine.TAG, "speaker buffer resize to " + frames + " failed: " + e);
+        }
+    }
+
+    /** Frames are audible: open the buffer from the start threshold to the full
+     * cushion, so the rest of the reply survives a late player-thread wakeup. */
+    private void openCushion() {
+        cushionOpen = true;
+        int before = trackBufferFrames;
+        setTrackBuffer(sizing.trackFrames());
+        if (trackBufferFrames != before) {
+            Log.i(VoiceEngine.TAG, "speaker cushion open: buffer " + before + " -> " + trackBufferFrames
+                    + " frames of " + capacityFrames);
+        }
+    }
+
+    /**
+     * The track was started but nothing has come out: less than a start
+     * threshold of audio exists (a reply shorter than the prebuffer) and the
+     * platform is holding it. Open the buffer all the way and top it up with
+     * silence until it refuses more, which crosses the threshold whether the
+     * platform measures it against the buffer size or the capacity. The padding
+     * lands after the words, so it costs a beat before the mic reopens and is
+     * logged -- if this line ever shows up on hardware, the start threshold is
+     * real and the prebuffer is the thing to tune.
+     */
+    private void kickStart() {
+        kicked = true;
+        setTrackBuffer(capacityFrames);
+        int padded = 0;
+        for (int i = 0; i < capacityFrames / SpeakerSizing.CHUNK_FRAMES + 2; i++) {
+            int n = track.write(SILENCE, 0, SILENCE.length, AudioTrack.WRITE_NON_BLOCKING);
+            if (n <= 0) {
+                break;
+            }
+            padded += n / 2;
+            framesWritten += n / 2;
+        }
+        Log.w(VoiceEngine.TAG, "speaker start kick: reply " + replyId + " had not played after "
+                + START_KICK_MS + " ms; padded " + SpeakerSizing.framesToMs(padded) + " ms of silence");
     }
 
     private long head() {
@@ -249,9 +346,25 @@ final class VoicePlayer implements Runnable {
             }
             report(true, head, toPlay);
         }
+        if (playing && !cushionOpen) {
+            openCushion();
+        }
         boolean empty;
         synchronized (this) {
             empty = queue.isEmpty() && current == null;
+        }
+        if (!playing && !kicked && !needPlay && empty && now - startedAtMs >= START_KICK_MS) {
+            kickStart();
+            return;
+        }
+        if (!playing && now - startedAtMs >= STALL_GIVEUP_MS) {
+            // The head never moved. Whatever is wrong with the track, holding
+            // the turn forever is worse: pending() would stay true and the
+            // conversation would never listen again without a restart.
+            Log.e(VoiceEngine.TAG, "speaker stalled: no frame played " + (now - startedAtMs)
+                    + " ms after start (reply " + replyId + "); dropping what is buffered");
+            doFlush();
+            return;
         }
         if (empty && head >= framesWritten) {
             goIdle(head);
@@ -267,16 +380,30 @@ final class VoicePlayer implements Runnable {
         needPlay = false;
         int underruns = track.getUnderrunCount() - underrunsAtStart;
         int dropped;
+        int peak;
+        int queued;
         String id;
         synchronized (this) {
             dropped = overruns;
+            peak = peakQueued;
+            queued = queue.size();
             overruns = 0;
+            peakQueued = 0;
             firstChunkAtMs = -1;
+            lastChunkAtMs = -1;
             id = replyId;
         }
+        cushionOpen = false;
         if (playing) {
             playing = false;
-            Log.i(VoiceEngine.TAG, "reply " + id + " played: underruns=" + underruns + " dropped=" + dropped);
+            // queue/track numbers for the next tuning pass: peak says whether the
+            // queue is anywhere near its bound, buffer is what the track really
+            // gave us (an ask is advisory) against the capacity it was built with.
+            Log.i(VoiceEngine.TAG, "reply " + id + " played: underruns=" + underruns + " dropped=" + dropped
+                    + " queue=" + queued + " peakQueue=" + peak + "/" + sizing.queueChunks()
+                    + " buffer=" + track.getBufferSizeInFrames() + "/" + capacityFrames + " frames ("
+                    + SpeakerSizing.framesToMs(track.getBufferSizeInFrames()) + " ms)"
+                    + (kicked ? " kicked=1" : ""));
             report(false, head, -1);
         }
     }
@@ -305,7 +432,7 @@ final class VoicePlayer implements Runnable {
         synchronized (this) {
             queued = queue.size();
         }
-        long bufferedFrames = Math.max(0, framesWritten - head) + (long) queued * VoiceEngine.SPEAKER_CHUNK_FRAMES;
+        long bufferedFrames = Math.max(0, framesWritten - head) + (long) queued * SpeakerSizing.CHUNK_FRAMES;
         c.onPlayback(nowPlaying, (int) (bufferedFrames * 1000 / ConversationClient.SPEAKER_RATE),
                 firstChunkToPlayMs);
     }

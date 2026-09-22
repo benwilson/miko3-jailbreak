@@ -4,7 +4,6 @@ import com.miko3.shared.WebSocketClient;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -33,9 +32,12 @@ import java.util.concurrent.TimeUnit;
  *   CLOSING      conv.close(sleep_word / farewell_timeout) with reply audio still
  *                to play: plays out, then LISTENING on playback idle
  *
- * Audio leaves the robot only in CONVERSING (R1): sendUplink() drops every
- * chunk in any other state, whatever the capture side hands it. Every path
- * into LISTENING calls Audio.listen(), which resumes the spotter (KTD6).
+ * Audio leaves the robot only in CONVERSING (R1): sendUplink() hands every
+ * chunk to UplinkGate, which drops them all in any other state, whatever the
+ * capture side offers. The gate also drops the wake trim (wake_trim_ms) after
+ * each wake, so the model hears the question and never "Hey Miko" (U11), and
+ * holds the pre-ready buffer. Every path into LISTENING calls Audio.listen(),
+ * which resumes the spotter (KTD6).
  *
  * Threads: every protocol event, timer and state change runs on one
  * "voice-client" thread, so the state machine needs no locks. Frames go out
@@ -126,8 +128,6 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
 
     enum Phase { UNREACHABLE, LISTENING, CONNECTING, CONVERSING, CLOSING, STOPPED }
 
-    private enum Uplink { DROP, BUFFER, SEND }
-
     private final VoiceSettings settings;
     private final Audio audio;
     private final StateListener states;
@@ -161,13 +161,8 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
 
     // ---- uplink, shared with the capture and spotter threads ------------------
     private final Object uplinkLock = new Object();
-    private Uplink uplink = Uplink.DROP;
-    private final ArrayDeque<byte[]> preReady = new ArrayDeque<byte[]>();
-    private int preReadyMax;
-    private int preReadyDropped;
-    private byte[] partial;
-    private int partialLen;
-    private WebSocketClient uplinkLink;
+    /** Decides what of the wake is kept and what is dropped; guarded by uplinkLock. */
+    private final UplinkGate gate = new UplinkGate(MIC_RATE);
 
     ConversationClient(VoiceSettings settings, Audio audio, StateListener states, Logger log, Config cfg) {
         this.settings = settings;
@@ -245,10 +240,11 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
     // ---- calls from the audio side ---------------------------------------------
 
     /** The spotter heard the wake word. Buffering starts here, on the caller's
-     * thread, so the words said right after the wake word are kept. */
+     * thread, so the words said right after the wake word are kept -- minus the
+     * gate's wake trim, which swallows the tail of the wake word itself. */
     void onWake() {
         synchronized (uplinkLock) {
-            if (phase == Phase.LISTENING && uplink == Uplink.DROP) {
+            if (phase == Phase.LISTENING && gate.dropping()) {
                 beginBufferLocked();
             }
         }
@@ -260,38 +256,16 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         });
     }
 
-    /** Mic audio, 16-bit LE 16 kHz mono, any whole number of samples. Sent only
-     * while a conversation is open (R1); never blocks. */
+    /** Mic audio, 16-bit LE 16 kHz mono, any whole number of samples, captured
+     * after the wake callback. Kept only while a conversation is open or opening
+     * (R1), and only past the wake trim; never blocks. */
     void sendUplink(byte[] pcm) {
         sendUplink(pcm, 0, pcm.length);
     }
 
     void sendUplink(byte[] pcm, int off, int len) {
         synchronized (uplinkLock) {
-            if (uplink == Uplink.DROP) {
-                return;
-            }
-            while (len > 0) {
-                int n = Math.min(len, partial.length - partialLen);
-                System.arraycopy(pcm, off, partial, partialLen, n);
-                partialLen += n;
-                off += n;
-                len -= n;
-                if (partialLen == partial.length) {
-                    byte[] frame = partial;
-                    partial = new byte[frame.length];
-                    partialLen = 0;
-                    if (uplink == Uplink.BUFFER) {
-                        if (preReady.size() >= preReadyMax) {
-                            preReady.poll();
-                            preReadyDropped++;
-                        }
-                        preReady.add(frame);
-                    } else {
-                        tx.binary(uplinkLink, frame);
-                    }
-                }
-            }
+            gate.offer(pcm, off, len);
         }
     }
 
@@ -330,7 +304,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         if (phase != Phase.LISTENING || link == null || !welcomed) {
             log.info("wake ignored: " + phase.name().toLowerCase() + (detail != null ? " (" + detail + ")" : ""));
             if (phase == Phase.LISTENING || phase == Phase.UNREACHABLE) {
-                setUplink(Uplink.DROP);
+                dropUplink();
                 audio.listen();
             }
             return;
@@ -339,7 +313,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         conv = id;
         boolean strict = settings.turnTaking();
         synchronized (uplinkLock) {
-            if (uplink == Uplink.DROP) {
+            if (gate.dropping()) {
                 beginBufferLocked();
             }
         }
@@ -373,19 +347,23 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         dropping = false;
         speaking = false;
         audio.openPlayer();
+        final WebSocketClient sending = link;
         int sent;
         int dropped;
+        String wake;
         synchronized (uplinkLock) {
-            sent = preReady.size();
-            dropped = preReadyDropped;
-            for (byte[] frame : preReady) {
-                tx.binary(link, frame);
-            }
-            preReady.clear();
-            uplinkLink = link;
-            uplink = Uplink.SEND;
+            dropped = gate.oldestDropped();
+            wake = gate.summary();
+            sent = gate.ready(new UplinkGate.Sink() {
+                @Override
+                public void frame(byte[] frame) {
+                    tx.binary(sending, frame);
+                }
+            });
         }
-        log.info("pre-ready buffer: " + sent + " chunks sent" + (dropped > 0 ? " (" + dropped + " oldest dropped)" : ""));
+        log.info("pre-ready buffer: " + sent + " chunks sent"
+                + (dropped > 0 ? " (" + dropped + " oldest dropped)" : ""));
+        log.info("wake audio at conv.ready: " + wake);
         setPhase(Phase.CONVERSING, null);
     }
 
@@ -399,7 +377,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
             enterUnreachable("the conversation failed to open (" + reason + ")");
         } else if (phase == Phase.CONVERSING) {
             if (("sleep_word".equals(reason) || "farewell_timeout".equals(reason)) && audio.hasPendingAudio()) {
-                setUplink(Uplink.DROP);
+                dropUplink();
                 setPhase(Phase.CLOSING, null);
                 closingTimer = schedule(new Runnable() {
                     @Override
@@ -498,13 +476,13 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         cancel(closingTimer);
         stopped = true;
         phase = Phase.STOPPED;
-        setUplink(Uplink.DROP);
+        dropUplink();
     }
 
     private void endConversation() {
         cancel(readyTimer);
         cancel(closingTimer);
-        setUplink(Uplink.DROP);
+        dropUplink();
         audio.closePlayer();
         endDropping();
         conv = null;
@@ -521,14 +499,14 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
     }
 
     private void enterListening() {
-        setUplink(Uplink.DROP);
+        dropUplink();
         audio.listen();
         setPhase(Phase.LISTENING, null);
     }
 
     private void enterUnreachable(String why) {
         Phase from = phase;
-        setUplink(Uplink.DROP);
+        dropUplink();
         if (from != Phase.LISTENING && from != Phase.UNREACHABLE) {
             audio.listen();
         }
@@ -862,28 +840,24 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         tx.text(link, text);
     }
 
-    private void setUplink(Uplink mode) {
+    /** Stops keeping mic audio, logging what this wake had kept. */
+    private void dropUplink() {
+        String wake = null;
         synchronized (uplinkLock) {
-            uplink = mode;
-            if (mode != Uplink.SEND) {
-                uplinkLink = null;
+            if (!gate.dropping()) {
+                wake = gate.summary();
             }
-            if (mode == Uplink.DROP) {
-                preReady.clear();
-                partialLen = 0;
-            }
+            gate.drop();
+        }
+        if (wake != null) {
+            log.info("wake audio this conversation: " + wake);
         }
     }
 
-    /** Caller holds uplinkLock. Reads the uplink chunk size at each wake. */
+    /** Caller holds uplinkLock. Reads the uplink chunk size and the wake trim at each wake. */
     private void beginBufferLocked() {
         int chunkMs = Math.max(10, Math.min(1000, settings.uplinkChunkMs()));
-        partial = new byte[chunkMs * MIC_RATE / 1000 * 2];
-        partialLen = 0;
-        preReady.clear();
-        preReadyMax = Math.max(1, cfg.preReadyMs / chunkMs);
-        preReadyDropped = 0;
-        uplink = Uplink.BUFFER;
+        gate.wake(chunkMs, cfg.preReadyMs, settings.wakeTrimMs());
     }
 
     // ---- loop plumbing ------------------------------------------------------------

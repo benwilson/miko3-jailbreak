@@ -58,7 +58,9 @@ TONE_BYTES_PER_SECOND = 22050 * 2
 
 # Short timings so the suite runs in about a minute; the defaults are the plan's
 # (2 s / 30 s backoff, 3.5 s ready timeout).
-FAST = {"backoff_base_ms": "250", "backoff_cap_ms": "1000", "connect_ms": "2000"}
+# trim=0 keeps the mic sequence markers at the head of every uplink frame; the
+# wake-trim test overrides it with a whole number of 80 ms chunks.
+FAST = {"backoff_base_ms": "250", "backoff_cap_ms": "1000", "connect_ms": "2000", "trim": "0"}
 
 
 class Harness:
@@ -446,6 +448,42 @@ class FullRelayTest(ClientTestCase):
         self.assertEqual(states, ["playing", "idle", "playing", "idle"])
 
         self.wake_until_conversing(h)  # the spotter was resumed: the next wake works
+
+    def test_wake_trim_keeps_the_wake_word_out_of_what_the_model_hears(self):
+        """U11: with wake_trim_ms set, the model's first audio starts that far past
+        the wake, and the speech after the trim still arrives whole and in order."""
+        model, relay = self.full_relay("chat")
+        # 160 ms is two whole 80 ms mic chunks, so the sequence markers stay at the
+        # head of each uplink frame and the drop is countable.
+        h = self.harness(f"127.0.0.1:{relay.port}", trim="160")
+        h.expect(r"^STATE listening", timeout=10)
+        model.send("delay 0.8")
+        model.expect(r"^DELAY")
+        time.sleep(0.3)
+        h.send("wake")
+        wake_seq = int(h.expect(r"^WAKE mic_seq=(\d+)").group(1))
+        h.expect(r'^LOG I tx \{"type":"conv\.open"')
+        trimmed = h.expect(r"^LOG I wake audio at conv\.ready: dropped (\d+) ms as wake-word pre-roll "
+                           r"\(wake_trim_ms=(\d+)\), forwarded (\d+) ms", timeout=5)
+        h.expect(r"^STATE conversing")
+        self.assertEqual((trimmed.group(1), trimmed.group(2)), ("160", "160"))
+        self.assertGreater(int(trimmed.group(3)), 0, "the trim swallowed the question too")
+        model.send("delay 0")
+        h.expect(r"^AUDIO playing")
+        h.expect(r"^AUDIO idle played=\d+", timeout=5)
+        h.expect(r"^AUDIO playing", timeout=5)
+        h.expect(r"^AUDIO idle played=\d+", timeout=5)
+        h.expect(r"^STATE listening", timeout=10)
+
+        session = model.expect(r"^SESSION 1 .*seqs=([\d,]*)", timeout=5).group(1)
+        seqs = [int(x) for x in session.split(",") if x]
+        self.assertEqual(seqs[0] - wake_seq, 2,
+                         f"first uplink seq {seqs[0]}, wake at {wake_seq}: the 160 ms trim should "
+                         "have dropped exactly the two chunks after the detection")
+        self.assertEqual(seqs, list(range(seqs[0], seqs[0] + len(seqs))),
+                         "the speech after the trim reached the model out of order or with gaps")
+        self.assertTrue(h.seen(r"^LOG I wake audio this conversation: dropped 160 ms as wake-word pre-roll"),
+                        "the per-wake totals were never logged for tuning")
 
     def test_ready_timeout_closes_then_forced_status_and_next_wake(self):
         model, relay = self.full_relay("quiet")

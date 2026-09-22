@@ -33,8 +33,11 @@ import recognizer.WakeWord;
  *   - listening: to the "voice-spotter" thread through a one-deep drop-oldest
  *     slot, so capture never waits on inference;
  *   - from a "Hey Miko" hit until listen() is called again: to
- *     ConversationClient.sendUplink(), which buffers it until conv.ready (the
- *     pre-ready buffer), then sends it, and drops it in every other state.
+ *     ConversationClient.sendUplink() and so to UplinkGate, which drops the
+ *     first wake_trim_ms as the tail of the wake word, buffers the rest until
+ *     conv.ready (the pre-ready buffer), then sends it, and drops everything in
+ *     every other state. Nothing captured before the detection callback is
+ *     forwarded at all (onHit).
  * The spotter is therefore paused for the whole conversation and reset and
  * resumed by listen(), which the client calls on every path back to
  * listening. A busy or failing microphone is logged ("microphone busy"),
@@ -52,11 +55,11 @@ import recognizer.WakeWord;
  * Playback: an AudioTrack tagged USAGE_VOICE_COMMUNICATION /
  * CONTENT_TYPE_SPEECH, 22,050 Hz mono 16-bit, MODE_STREAM, created at
  * conv.ready (openPlayer) and released when the conversation ends. An
- * urgent-audio "voice-player" thread drains a queue bounded at about one
- * second (overflow drops the chunk, logged) with non-blocking writes, starts
- * the track once the prebuffer (preference, default one chunk) is queued,
+ * urgent-audio "voice-player" thread drains a queue bounded at about three
+ * seconds (overflow drops the chunk, logged) with non-blocking writes, starts
+ * the track once the prebuffer (preference, default six chunks) is queued,
  * and derives playing and idle from the playback head position, never from
- * the queue emptying. flushReply() pauses and flushes the track at once; the
+ * the queue emptying. Every size is SpeakerSizing's, from preferences. flushReply() pauses and flushes the track at once; the
  * next reply's audio plays it again. Underruns (getUnderrunCount) and
  * dropped chunks are logged per turn.
  *
@@ -81,13 +84,6 @@ final class VoiceEngine implements ConversationClient.Audio {
     private static final long MIC_RETRY_CAP_MS = 30000;
     /** A capture that ran this long resets the retry backoff. */
     private static final long MIC_HEALTHY_MS = 10000;
-
-    static final int SPEAKER_CHUNK_FRAMES = ConversationClient.SPEAKER_RATE * 80 / 1000; // 1,764
-    static final int SPEAKER_CHUNK_BYTES = SPEAKER_CHUNK_FRAMES * 2; // 3,528
-    /** About one second of reply audio (KTD6). */
-    static final int PLAYER_QUEUE_CHUNKS = 13;
-    /** A reply shorter than the prebuffer still starts after this long. */
-    static final long PREBUFFER_HOLD_MS = 200;
 
     /** Short text for the settings page's state line, or null when all is well. */
     interface DetailListener {
@@ -207,7 +203,7 @@ final class VoiceEngine implements ConversationClient.Audio {
     @Override
     public void openPlayer() {
         VoicePlayer old;
-        VoicePlayer created = VoicePlayer.create(this, settings.prebufferChunks());
+        VoicePlayer created = VoicePlayer.create(this, settings);
         synchronized (playerLock) {
             old = player;
             player = created;
@@ -640,8 +636,13 @@ final class VoiceEngine implements ConversationClient.Audio {
         return String.format(Locale.US, "scores=%s inference=%.1fms", formatScores(scores), us / 1000f);
     }
 
-    /** Capture now goes to the client (which starts its pre-ready buffer in onWake)
-     * until listen(); the chunk already waiting in the slot goes with it. */
+    /** Capture now goes to the client (which starts its pre-ready buffer in onWake,
+     * past the wake trim) until listen(). Nothing captured before this callback is
+     * forwarded: the chunk the detector fired on was consumed by the spotter, and
+     * the chunk left waiting in the slot -- captured while inference ran, so still
+     * inside the wake word as far as we can tell -- is discarded here rather than
+     * sent (U11). The first audio the model can hear is the next chunk route()
+     * hands over, minus wake_trim_ms of it. */
     private void onHit() {
         synchronized (slotLock) {
             if (toClient) {
@@ -653,11 +654,7 @@ final class VoiceEngine implements ConversationClient.Audio {
             }
             c.onWake();
             toClient = true;
-            byte[] waiting = slot;
             slot = null;
-            if (waiting != null) {
-                c.sendUplink(waiting);
-            }
         }
     }
 

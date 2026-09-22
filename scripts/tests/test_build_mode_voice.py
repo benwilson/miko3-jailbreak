@@ -281,6 +281,7 @@ class SettingsHarnessTest(unittest.TestCase):
         "exit_with_stale_token_refused",
         "defaults",
         "tuning_keys_read_from_store",
+        "wake_trim_zero_is_kept_and_nonsense_is_not",
         "address_parser_accepts_private_and_link_local",
         "address_parser_refuses_bad_input",
         "address_parser_fields",
