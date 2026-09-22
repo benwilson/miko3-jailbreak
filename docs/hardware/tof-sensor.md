@@ -1,6 +1,6 @@
 # ToF / edge sensor readings
 
-How the front ToF sensor's readings reach a mode app, from live captures on 2026-09-22 (firmware as shipped on this unit, ServiceExam disabled). Captured with `scripts/qa-explore-sensors.py`; sample records live in `scripts/tests/fixtures/explore_sensor_records/`.
+How the front ToF sensor's readings reach a mode app, from live captures on 2026-09-22 (firmware as shipped on this unit, ServiceExam disabled). The sensor looks **down** at the surface about 20 cm ahead of the robot: it is a cliff sensor, not a forward rangefinder. What that means for driving is in `docs/solutions/best-practices/miko3-tof-is-a-downward-cliff-sensor-inside-mcu-safe-band.md`. Captured with `scripts/qa-explore-sensors.py`; sample records live in `scripts/tests/fixtures/explore_sensor_records/`.
 
 ## Where the readings come from
 
@@ -21,9 +21,9 @@ POWER=0,0,07884,-0234,07887,-0234,076,14,15,23FLBTN=0,0,0,0,00000,00000IMUAC=...
 - `TOFIR=` carries four comma-separated fields:
   - `tof`: a five-digit ToF reading.
   - A field that was all `X`, meaning absent, in every capture. This is where decompiled code expected `ir1`.
-  - A single digit, always `0` in the baseline. This is `ir2` in the decompiled parser, and a likely digital edge/obstacle flag, **unconfirmed**.
+  - A single digit (`ir2` in the decompiled parser): the motor controller's own hazard flag. It is `0` on clear desk and `1` for **both** a near object and an edge, so it cannot tell them apart.
   - A trailing `X`-padding run.
-- The POWER reply carries **no `CPL=` field**. The motion-refusal ack (`CPL=2`) must come in the reply to the drive frame (`VEL1`), which the owner-attended capture confirms (below).
+- `CPL=` (the motion ack) is absent from POWER replies while the robot is still, and **appears in them while it is moving**: `CPL=1` while driving, `CPL=2` when the controller refuses forward motion because the reading is outside its safe band (see Calibrated behavior).
 
 ## Baseline behavior
 
@@ -44,14 +44,20 @@ About 20 minutes after the baseline, with no code change to the parsing, every r
 
 Either way the mode fails safe: without the flag rule calibrated, a constant 16383 means "no sensors", and the robot stays still with its eyes-only look.
 
-## Still to capture (owner-attended, U8)
+## Calibrated behavior (owner-attended session, later on 2026-09-22)
 
-These steps need someone to move the robot or block the sensor, so they happen in the U8 calibration session:
+| Situation | tof | `ir2` |
+|---|---|---|
+| Clear flat desk | 203–219 in the calibration capture; about 190–260 across headings | 0 |
+| Hand about 5 cm in front | 38–50 | 1 |
+| Front held past the desk edge | 16383 | 1 |
 
-- `tof` with a hand about 3 cm in front, and with the front held just past a table edge. This shows whether an edge reads high (the floor is far away) or maps to the digit field.
-- What the single-digit field does at an edge and at an obstacle.
-- Which reply carries `CPL=2` after a refused forward command.
-- The units of `tof`. Millimetres is plausible from the baseline distance, but unconfirmed.
+- The edge signature is `16383` with `ir2=1`, which confirms the first reading of the "16383 with the flag digit set" section above: an edge, or open space.
+- The controller's own safe band is roughly **170–280**. Outside it, the controller sets `ir2=1` and refuses forward motion (`CPL=2`). Refusals were seen at 166 (too close) and 289 (too far).
+- Because the sensor looks down, the robot's nose bobbing as a hop starts, stops or turns swings the reading by 40–60 counts. That can briefly leave the band on open desk, and it settles within about 250 ms once the robot is still.
+- The calibration `scripts/qa-explore-mode.py` wrote from these captures is `obstacleTofBelow=157`, with the edge detected by `ir2 > 0`.
+
+## Still open
+
+- The units of `tof`. Millimetres is plausible, but unconfirmed.
 - Stopping distance: how far the robot travels after `stop()` from a forward hop.
-
-Run `python3 scripts/qa-explore-sensors.py` (without `--non-interactive`) for the guided steps.
