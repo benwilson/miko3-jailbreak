@@ -66,6 +66,10 @@ Android's per-package flag, recorded in the per-user package-restrictions file, 
 
 A purpose-built robot capability — remote control, telepresence, autonomous operation, and others planned — that ships as its own installed app rather than a feature bolted onto the custom launcher. The launcher starts a mode and regains the home screen when the operator exits it; only one mode's control logic drives the robot at a time. A shared module gives every mode the same robot-control and UI plumbing instead of each one reimplementing it.
 
+## Startle
+
+An autonomous mode's full reaction to an edge, obstacle, or other hazard that appears while the robot is moving. It stops at once, plays a short startled sound, flinches its eyes, backs up briefly for a fixed short time, then looks toward a new heading and turns away. It differs from the quiet turn-away used when a hazard is already in view before a move starts: that turn has no sound and no back-off. The back-off is blind, because nothing senses behind the robot, so it is kept deliberately short. Too many hazard reactions (startles or quiet turn-aways) within a short window make the robot rest instead of backing off and turning.
+
 ## Conversation
 
 The window of a voice session that opens when the on-device wake-word spotter hears "Hey Miko" and closes when the relay matches "Goodbye Miko" in the transcript or the silence timeout passes. Only inside a conversation does microphone audio leave the robot; between conversations the mode is listening locally and streams nothing.
