@@ -10,6 +10,7 @@ import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.ModeRegistry;
 import com.miko3.shared.RoutingHttpServer;
 
+import java.io.File;
 import java.io.IOException;
 
 /**
@@ -47,6 +48,14 @@ public class ModeApp extends Application {
     // The wander (U5), running between startExplore() and stopExplore().
     private final Object exploreLock = new Object();
     private boolean exploring;
+    private ExploreDrive drive;
+    private ExploreLoop loop;
+    private ClipPlayer clips;
+
+    /** How often the brain loop runs; well under a hop tick (ExploreBrain.onTick). */
+    private static final long BRAIN_TICK_MS = 20;
+    /** The stop timer's window (KTD6): no brain tick for this long stops the wheels. */
+    private static final long STOP_TIMER_MS = 600;
 
     // Same stale-instance guard as the voice mode's ModeApp: with
     // launchMode="singleTop", an old MainActivity's teardown can run after a newer
@@ -121,8 +130,9 @@ public class ModeApp extends Application {
      * MainActivity; idempotent, so a newer instance activating over an older
      * one keeps the running wander.
      *
-     * U4 scaffold: eyes only. U5 starts the drive adapter (lease holder, stop
-     * timer) and the brain thread here.
+     * Connects the driver (whose keepalive replies carry the readings), asks for
+     * the drive lease, and starts the brain loop. With no calibration file the
+     * brain stays in eyes-only (KTD9): the same loop runs, it just never drives.
      */
     void startExplore() {
         synchronized (exploreLock) {
@@ -130,8 +140,19 @@ public class ModeApp extends Application {
                 return;
             }
             exploring = true;
-            setExploreState(ExploreState.IDLE_STATE);
-            Log.i(TAG, "explore started (eyes only)");
+            setExploreState(ExploreState.of(ExploreState.EYES_ONLY));
+            ExploreTuning.Calibration calibration =
+                    ExploreCalibration.read(new File(getFilesDir(), ExploreCalibration.FILE_NAME));
+            Log.i(TAG, calibration == null
+                    ? "no sensor calibration -- eyes only until scripts/qa-explore-mode.py calibrates"
+                    : "sensor calibration: " + calibration);
+            clips = new ClipPlayer(this);
+            drive = new ExploreDrive(this);
+            drive.start();
+            loop = new ExploreLoop(ExploreTuning.defaults(calibration), ExploreDrive.CLOCK,
+                    drive, drive, drive, eyes, sound, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
+            loop.start();
+            Log.i(TAG, "explore started");
         }
     }
 
@@ -140,8 +161,8 @@ public class ModeApp extends Application {
      * stopped (R5). Only the current generation's exit calls this
      * (MainActivity), so a stale instance can't stop a newer one's wander.
      *
-     * U5 joins the brain thread here, then sends stop() and releases the lease
-     * (KTD7), all before this returns.
+     * Ends the brain thread and waits for it (which leaves the wheels stopped),
+     * then releases the lease and disconnects (KTD7), all before returning.
      */
     void stopExplore() {
         synchronized (exploreLock) {
@@ -149,10 +170,60 @@ public class ModeApp extends Application {
                 return;
             }
             exploring = false;
+            loop.stop();
+            drive.release();
+            clips.release();
+            loop = null;
+            drive = null;
+            clips = null;
             setExploreState(ExploreState.IDLE_STATE);
             Log.i(TAG, "explore stopped");
         }
     }
+
+    // What the brain drives on the page (U6): its eye states mapped to the page's.
+    // LEFT is the robot's own left, which a viewer facing the screen sees as the
+    // eyes moving to their right, so it maps to +x.
+    private final ExploreBrain.Eyes eyes = new ExploreBrain.Eyes() {
+        @Override
+        public void show(ExploreBrain.EyeState state, ExploreBrain.Direction gaze) {
+            switch (state) {
+                case LOOK:
+                    setExploreState(ExploreState.look(ExploreState.LOOK,
+                            gaze == ExploreBrain.Direction.LEFT ? 1 : gaze == ExploreBrain.Direction.RIGHT ? -1 : 0, 0));
+                    break;
+                case FLINCH:
+                    setExploreState(ExploreState.of(ExploreState.FLINCH));
+                    break;
+                case RESTING:
+                    setExploreState(ExploreState.of(ExploreState.RESTING));
+                    break;
+                case STILL:
+                    setExploreState(ExploreState.of(ExploreState.EYES_ONLY));
+                    break;
+                default:
+                    setExploreState(ExploreState.IDLE_STATE);
+                    break;
+            }
+        }
+    };
+
+    private final ExploreBrain.Sound sound = new ExploreBrain.Sound() {
+        @Override
+        public void playStartle() {
+            ClipPlayer c = clips;
+            if (c != null) {
+                c.playStartle();
+            }
+        }
+    };
+
+    private final ExploreBrain.Trace trace = new ExploreBrain.Trace() {
+        @Override
+        public void note(String message) {
+            Log.i("ExploreBrain", message);
+        }
+    };
 
     /** Called when a MainActivity instance (re)establishes itself as the active
      * one: bumps and returns the new generation and marks the mode present. */

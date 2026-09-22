@@ -120,6 +120,12 @@ public final class DirectMotorDriver {
      */
     private static final byte[] STOP_FRAME = buildTaggedFrame("MTSTP", POWER_FRAME_SIZE);
 
+    /** "TOFEN" + 0x58 padding to 500 bytes: switches the front ToF sensor on, exactly as
+     * SocialInteraction_SpeechChat.startTof() does (generate500ByteData("TOFEN", 500)).
+     * ServiceExam sends the matching TOFDS on some boot and login paths, which would
+     * leave the ToF reporting a stuck value; enableTof() undoes that. */
+    private static final byte[] TOF_ENABLE_FRAME = buildTaggedFrame("TOFEN", POWER_FRAME_SIZE);
+
     private SensorModule sensorModule;
     private Thread keepaliveThread;
     private volatile boolean keepaliveRunning;
@@ -230,6 +236,11 @@ public final class DirectMotorDriver {
             sensorModule.connectUart(DEVICE_PATH);
             return true;
         }
+    }
+
+    /** Switches the front ToF sensor on (see TOF_ENABLE_FRAME). Safe to repeat. */
+    public synchronized void enableTof() throws IOException {
+        sendFrame(TOF_ENABLE_FRAME);
     }
 
     /** The newest front-sensor reading, or null before the first POWER reply. Callers
