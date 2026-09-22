@@ -1,5 +1,6 @@
 package com.miko3.shared;
 
+import android.os.SystemClock;
 import android.util.Log;
 
 import emotix.com.drivers.SensorModule;
@@ -63,13 +64,14 @@ import java.nio.charset.StandardCharsets;
  * this project's existing DriveLeaseService model for the AIDL path), not
  * left open continuously alongside otherwise-normal robot operation.
  *
- * WRITE-ONLY BY DESIGN: this class never reads from the device. ServiceExam
- * continuously receives MCU telemetry (~10Hz "PI3 callback" strings —
- * POWER=/IMUAC=/IMUGY=/GLPOS=/TOFIR=/Left=/Right=) over this same line; a
- * second reader steals bytes ServiceExam needs, with no way to give them
- * back (confirmed live). Motor commands are fire-and-forget from this
- * class's side, same contract as the existing AIDL-based
- * RobotControlClient, which also never inspects the MCU's ack.
+ * SINGLE READER: every write here is followed by a synchronous read of the
+ * MCU's reply (see sendFrame()), and this class is the only reader of the device
+ * node — a second reader steals replies this one is waiting for (confirmed live
+ * against ServiceExam, which is now disabled). The replies to the POWER poll carry
+ * the front ToF sensor's readings, which sendFrame() parses and publishes as
+ * latestSensors() (docs/hardware/tof-sensor.md); anything that needs sensor data
+ * reads it from here instead of opening the device again. Motor commands stay
+ * fire-and-forget: callers get no per-command ack.
  *
  * REQUIRED KEEPALIVE — the actual missing piece, found via strace: a bare
  * VEL1 write alone does NOT move the wheels if ServiceExam has never
@@ -118,9 +120,24 @@ public final class DirectMotorDriver {
      */
     private static final byte[] STOP_FRAME = buildTaggedFrame("MTSTP", POWER_FRAME_SIZE);
 
+    /** "TOFEN" + 0x58 padding to 500 bytes: switches the front ToF sensor on, exactly as
+     * SocialInteraction_SpeechChat.startTof() does (generate500ByteData("TOFEN", 500)).
+     * ServiceExam sends the matching TOFDS on some boot and login paths, which would
+     * leave the ToF reporting a stuck value; enableTof() undoes that. */
+    private static final byte[] TOF_ENABLE_FRAME = buildTaggedFrame("TOFEN", POWER_FRAME_SIZE);
+
     private SensorModule sensorModule;
     private Thread keepaliveThread;
     private volatile boolean keepaliveRunning;
+
+    /** The newest TOFIR reading from a POWER-poll reply, or null before the first one. */
+    private volatile SensorSnapshot latestSensors;
+    /** When a reply last carried CPL=2 (the MCU refusing forward motion), or 0 if never. */
+    private volatile long lastRefusalMs;
+
+    /** How long the keepalive waits before retrying after a failed write, doubling to the cap. */
+    private static final int RECONNECT_BACKOFF_MS = 200;
+    private static final int RECONNECT_BACKOFF_CAP_MS = 2000;
 
     /**
      * Opens the UART via SensorModule (JNI into the same system-installed
@@ -170,6 +187,7 @@ public final class DirectMotorDriver {
         keepaliveThread = new Thread(new Runnable() {
             @Override
             public void run() {
+                int failures = 0;
                 while (keepaliveRunning) {
                     try {
                         synchronized (DirectMotorDriver.this) {
@@ -178,12 +196,20 @@ public final class DirectMotorDriver {
                             }
                             sendFrame(POWER_FRAME);
                         }
+                        failures = 0;
                     } catch (IOException e) {
-                        Log.w(TAG, "keepalive write failed", e);
-                        break;
+                        // A dead keepalive would leave isConnected() true with no sensor
+                        // data and no motion honored, so reopen the port and keep going.
+                        // Readers see the gap as a stale latestSensors() timestamp.
+                        Log.w(TAG, "keepalive write failed -- reopening the UART", e);
+                        if (!reopenUart()) {
+                            break;
+                        }
+                        failures++;
                     }
                     try {
-                        Thread.sleep(KEEPALIVE_INTERVAL_MS);
+                        Thread.sleep(failures == 0 ? KEEPALIVE_INTERVAL_MS
+                                : Math.min(RECONNECT_BACKOFF_CAP_MS, RECONNECT_BACKOFF_MS << Math.min(failures - 1, 4)));
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         break;
@@ -199,10 +225,69 @@ public final class DirectMotorDriver {
         return sensorModule != null;
     }
 
+    /** Close and reopen the device after a failed keepalive write; false once
+     * disconnect() has torn the driver down, which ends the keepalive loop. */
+    private boolean reopenUart() {
+        synchronized (this) {
+            if (sensorModule == null || !keepaliveRunning) {
+                return false;
+            }
+            sensorModule.close();
+            sensorModule.connectUart(DEVICE_PATH);
+            return true;
+        }
+    }
+
+    /** Switches the front ToF sensor on (see TOF_ENABLE_FRAME). Safe to repeat. */
+    public synchronized void enableTof() throws IOException {
+        sendFrame(TOF_ENABLE_FRAME);
+    }
+
+    /** The newest front-sensor reading, or null before the first POWER reply. Callers
+     * judge freshness from its timestampMs (SystemClock.elapsedRealtime()). */
+    public SensorSnapshot latestSensors() {
+        return latestSensors;
+    }
+
+    /** SystemClock.elapsedRealtime() of the last reply carrying CPL=2 (the MCU refused
+     * forward motion for an edge/obstacle), or 0 if none has. */
+    public long lastRefusalMs() {
+        return lastRefusalMs;
+    }
+
     /** The literal 10-byte reply SocialInteraction_SpeechChat.SendData() checks for
      * (confirmed from source) that signals the UART itself needs resetting — a
      * condition a write-only FileOutputStream had no way to ever detect at all. */
     private static final String ERROR_UART = "ERROR_UART";
+
+    /** Debug-only capture of every raw MCU reply, off unless enabled with
+     * `setprop log.tag.MikoDmdRaw DEBUG` (scripts/qa-explore-sensors.py does this).
+     * Exists to document the reply format (docs/hardware/tof-sensor.md). */
+    private static final String RAW_TAG = "MikoDmdRaw";
+
+    /** One logcat line per reply: the sent frame's tag (e.g. POWER, VEL1=) and the
+     * reply with its trailing 'X' padding trimmed, non-printables as '.'. */
+    private static void logRawReply(byte[] frame, byte[] reply) {
+        int tagEnd = 0;
+        while (tagEnd < frame.length && tagEnd < 5 && frame[tagEnd] >= 'A' && frame[tagEnd] <= 'Z') {
+            tagEnd++;
+        }
+        String sent = new String(frame, 0, tagEnd, StandardCharsets.US_ASCII);
+        if (reply == null) {
+            Log.d(RAW_TAG, "sent=" + sent + " reply=null");
+            return;
+        }
+        int end = reply.length;
+        while (end > 0 && reply[end - 1] == 'X') {
+            end--;
+        }
+        StringBuilder text = new StringBuilder(end);
+        for (int i = 0; i < end; i++) {
+            byte b = reply[i];
+            text.append(b >= 0x20 && b < 0x7f ? (char) b : '.');
+        }
+        Log.d(RAW_TAG, "sent=" + sent + " len=" + reply.length + " reply=" + text);
+    }
 
     /** Every write to the UART is immediately followed by a synchronous read of the
      * MCU's reply, matching SocialInteraction_SpeechChat.SendData()'s own contract
@@ -220,6 +305,22 @@ public final class DirectMotorDriver {
             throw new IOException("SensorModule.write() failed");
         }
         byte[] reply = sensorModule.read();
+        if (Log.isLoggable(RAW_TAG, Log.DEBUG)) {
+            logRawReply(frame, reply);
+        }
+        if (reply != null) {
+            long now = SystemClock.elapsedRealtime();
+            String text = SensorReply.text(reply);
+            if (frame == POWER_FRAME) {
+                SensorSnapshot reading = SensorReply.parse(text, now);
+                if (reading != null) {
+                    latestSensors = reading;
+                }
+            }
+            if (SensorReply.parseCpl(text) == 2) {
+                lastRefusalMs = now;
+            }
+        }
         if (reply != null && reply.length == ERROR_UART.length()
                 && new String(reply, StandardCharsets.US_ASCII).equals(ERROR_UART)) {
             Log.w(TAG, "ERROR_UART reply -- resetting UART");
@@ -231,9 +332,9 @@ public final class DirectMotorDriver {
     /**
      * Fire-and-forget from the CALLER's perspective (matches RobotControlClient.
      * drive()'s own contract, and this project's own established convention — see
-     * class javadoc's WRITE-ONLY note) even though sendFrame() now reads a reply
-     * internally: that read is for UART-level health (ERROR_UART detection), not a
-     * per-command application-level ack, so callers still don't get one.
+     * class javadoc's SINGLE READER note) even though sendFrame() reads a reply
+     * internally: that read serves UART health (ERROR_UART) and the published sensor
+     * readings, not a per-command application-level ack, so callers still don't get one.
      */
     public synchronized void drive(int linear, int angular, int timeCentiseconds) throws IOException {
         sendFrame(buildFrame(linear, angular, timeCentiseconds));

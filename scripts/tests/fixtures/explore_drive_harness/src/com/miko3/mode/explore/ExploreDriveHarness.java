@@ -1,0 +1,266 @@
+package com.miko3.mode.explore;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Host-JVM checks for the explore mode's drive wiring (U5): the stop timer, the
+ * lease-gated motor adapter, and the brain loop's threads and exit order.
+ * Driven by scripts/tests/test_explore_drive.py.
+ *
+ * The loop scenarios run the real threads against fakes for a few hundred
+ * milliseconds, so they check order and outcome, never exact timing.
+ *
+ * Prints one "PASS <name>" or "FAIL <name>: <detail>" line per scenario.
+ */
+public final class ExploreDriveHarness {
+    private static void check(String name, boolean ok, String detail) {
+        System.out.println(ok ? "PASS " + name : "FAIL " + name + ": " + detail);
+    }
+
+    /** Records every wheel command, and every call made by anyone, in order. */
+    static final class FakeWheels implements ExploreLoop.Wheels {
+        final List<String> calls = Collections.synchronizedList(new ArrayList<String>());
+        volatile boolean failNext;
+
+        private void record(String c) throws IOException {
+            calls.add(c);
+            if (failNext && !c.equals("stop")) {
+                failNext = false;
+                throw new IOException("injected");
+            }
+        }
+
+        @Override public void forwardTick() throws IOException { record("forward"); }
+        @Override public void turn(ExploreBrain.Direction d) throws IOException { record("turn-" + d); }
+        @Override public void backTick() throws IOException { record("back"); }
+        @Override public void stop() throws IOException { calls.add("stop"); }
+
+        int count(String c) {
+            synchronized (calls) {
+                int n = 0;
+                for (String s : calls) {
+                    if (s.equals(c)) {
+                        n++;
+                    }
+                }
+                return n;
+            }
+        }
+
+        int motion() {
+            return count("forward") + count("back") + count("turn-LEFT") + count("turn-RIGHT");
+        }
+    }
+
+    static final class FakeLease implements ExploreLoop.Lease {
+        volatile boolean held;
+        @Override public boolean held() { return held; }
+    }
+
+    /** A fresh, clear reading every call, timestamped now. */
+    static final class ClearSensors implements ExploreLoop.Sensors {
+        final ExploreBrain.Clock clock;
+        ClearSensors(ExploreBrain.Clock clock) { this.clock = clock; }
+        @Override public SensorReading latest() {
+            return new SensorReading(clock.nowMs(), 250, SensorSnapshotAbsent.ABSENT, 0, null, false);
+        }
+    }
+
+    /** SensorReading's "absent field" value, without pulling in the shared parser. */
+    static final class SensorSnapshotAbsent {
+        static final int ABSENT = -1;
+    }
+
+    static final class Hooks implements ExploreLoop.Hooks {
+        volatile boolean stale;
+        volatile boolean frozen;
+        @Override public boolean staleSensors() { return stale; }
+        @Override public boolean freezeBrain() { return frozen; }
+    }
+
+    static final ExploreBrain.Clock REAL = new ExploreBrain.Clock() {
+        @Override public long nowMs() { return System.nanoTime() / 1000000L; }
+    };
+
+    static final ExploreBrain.Eyes NO_EYES = new ExploreBrain.Eyes() {
+        @Override public void show(ExploreBrain.EyeState state, ExploreBrain.Direction gaze) { }
+    };
+
+    static final ExploreBrain.Sound NO_SOUND = new ExploreBrain.Sound() {
+        @Override public void playStartle() { }
+    };
+
+    /** Short pauses so a loop run moves within a few hundred milliseconds. */
+    static ExploreTuning quickTuning() {
+        return new ExploreTuning.Builder()
+                .calibration(new ExploreTuning.Calibration(60, -1, 5, true))
+                .pauseMs(20, 40).lookLeadMs(20).turnMs(20, 40)
+                .hopTickMs(30).recoveryStreak(2)
+                // ClearSensors reports a constant tof; keep the frozen rule out of these short runs.
+                .frozenTofWindowMs(60000)
+                .build();
+    }
+
+    static ExploreLoop loop(FakeWheels wheels, FakeLease lease, Hooks hooks, long deadmanMs) {
+        return new ExploreLoop(quickTuning(), REAL, wheels, new ClearSensors(REAL), lease,
+                NO_EYES, NO_SOUND, hooks, null, 10, deadmanMs);
+    }
+
+    static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static void writeText(File f, String text) throws IOException {
+        FileWriter w = new FileWriter(f);
+        try {
+            w.write(text);
+        } finally {
+            w.close();
+        }
+    }
+
+    public static void main(String[] args) {
+        // ---- stop timer ----
+        StopTimer t = new StopTimer(600);
+        check("stop_timer_idle_until_first_feed", !t.expired(10000), "fired with nothing to stop");
+        t.feed(1000);
+        boolean before = t.expired(1599);
+        boolean at = t.expired(1600);
+        boolean again = t.expired(5000);
+        check("stop_timer_fires_once_after_silence", !before && at && !again,
+                "before=" + before + " at=" + at + " again=" + again);
+
+        StopTimer fed = new StopTimer(600);
+        boolean everFired = false;
+        for (long now = 0; now < 10000; now += 100) {
+            fed.feed(now);
+            everFired |= fed.expired(now + 50);
+        }
+        check("stop_timer_never_fires_while_fed", !everFired, "fired despite regular feeds");
+
+        StopTimer rearm = new StopTimer(600);
+        rearm.feed(0);
+        rearm.expired(700);
+        rearm.feed(800);
+        check("stop_timer_rearms_after_a_feed", rearm.expired(1400), "did not fire after re-arming");
+
+        // ---- lease-gated motor ----
+        FakeWheels w = new FakeWheels();
+        FakeLease lease = new FakeLease();
+        DriveGate gate = new DriveGate(w, lease, null);
+        gate.hopTick();
+        gate.turn(ExploreBrain.Direction.LEFT);
+        gate.backTick();
+        check("gate_drops_motion_without_lease", w.motion() == 0, "sent " + w.calls);
+        gate.stop();
+        check("gate_stop_goes_out_without_lease", w.count("stop") == 1, "sent " + w.calls);
+
+        lease.held = true;
+        gate.hopTick();
+        gate.turn(ExploreBrain.Direction.RIGHT);
+        gate.backTick();
+        check("gate_passes_motion_under_lease",
+                w.calls.contains("forward") && w.calls.contains("turn-RIGHT") && w.calls.contains("back"),
+                "sent " + w.calls);
+
+        FakeWheels failing = new FakeWheels();
+        FakeLease held = new FakeLease();
+        held.held = true;
+        DriveGate failGate = new DriveGate(failing, held, null);
+        failing.failNext = true;
+        failGate.hopTick();
+        check("gate_write_failure_stops_best_effort",
+                failing.calls.size() == 2 && failing.calls.get(1).equals("stop"), "sent " + failing.calls);
+
+        // ---- calibration file ----
+        try {
+            File dir = java.nio.file.Files.createTempDirectory("explore_cal").toFile();
+            File f = new File(dir, ExploreCalibration.FILE_NAME);
+            check("calibration_missing_file_is_uncalibrated", ExploreCalibration.read(f) == null, "expected null");
+
+            ExploreCalibration.write(f, new ExploreTuning.Calibration(60, 420, -1, true));
+            ExploreTuning.Calibration back = ExploreCalibration.read(f);
+            check("calibration_round_trips",
+                    back != null && back.obstacleTofBelow == 60 && back.edgeTofAbove == 420
+                            && back.edgeIr == -1 && back.edgeIrAbove,
+                    "got " + back);
+
+            writeText(f, "obstacleTofBelow=sixty\nedgeTofAbove=420\n");
+            check("calibration_corrupt_file_is_uncalibrated", ExploreCalibration.read(f) == null, "expected null");
+
+            writeText(f, "obstacleTofBelow=60\n");
+            check("calibration_without_an_edge_rule_is_uncalibrated", ExploreCalibration.read(f) == null,
+                    "an obstacle rule alone must not be enough to drive");
+
+            writeText(f, "obstacleTofBelow=60\nedgeTofAbove=420\nedgeIrAbove=maybe\n");
+            check("calibration_bad_boolean_is_uncalibrated", ExploreCalibration.read(f) == null, "expected null");
+        } catch (IOException e) {
+            check("calibration_round_trips", false, e.toString());
+        }
+
+        // ---- loop ----
+        FakeWheels lw = new FakeWheels();
+        FakeLease ll = new FakeLease();
+        Hooks hooks = new Hooks();
+        ExploreLoop noLease = loop(lw, ll, hooks, 600);
+        noLease.start();
+        sleep(400);
+        int motionWithoutLease = lw.motion();
+        ll.held = true;
+        sleep(600);
+        int motionWithLease = lw.motion();
+        noLease.stop();
+        check("loop_moves_only_once_the_lease_is_held", motionWithoutLease == 0 && motionWithLease > 0,
+                "without=" + motionWithoutLease + " with=" + motionWithLease);
+
+        FakeWheels sw = new FakeWheels();
+        FakeLease sl = new FakeLease();
+        sl.held = true;
+        Hooks staleHooks = new Hooks();
+        staleHooks.stale = true;
+        ExploreLoop stale = loop(sw, sl, staleHooks, 600);
+        stale.start();
+        sleep(500);
+        stale.stop();
+        check("loop_stale_hook_keeps_the_robot_still", sw.motion() == 0, "moved: " + sw.calls);
+
+        FakeWheels ew = new FakeWheels();
+        FakeLease el = new FakeLease();
+        el.held = true;
+        ExploreLoop exiting = loop(ew, el, new Hooks(), 600);
+        exiting.start();
+        sleep(300);
+        exiting.stop();
+        int callsAtStop = ew.calls.size();
+        String last = callsAtStop == 0 ? "" : ew.calls.get(callsAtStop - 1);
+        sleep(200);
+        check("loop_exit_ends_in_stop_and_goes_quiet",
+                last.equals("stop") && ew.calls.size() == callsAtStop && !exiting.isRunning(),
+                "last=" + last + " after=" + ew.calls.subList(callsAtStop, ew.calls.size()));
+
+        FakeWheels fw = new FakeWheels();
+        FakeLease fl = new FakeLease();
+        fl.held = true;
+        Hooks freeze = new Hooks();
+        ExploreLoop frozen = loop(fw, fl, freeze, 200);
+        frozen.start();
+        sleep(300);
+        int stopsBefore = fw.count("stop");
+        freeze.frozen = true;
+        sleep(500);
+        int stopsAfter = fw.count("stop");
+        freeze.frozen = false;
+        frozen.stop();
+        check("loop_stop_timer_stops_a_frozen_brain", stopsAfter > stopsBefore,
+                "stops before=" + stopsBefore + " after=" + stopsAfter);
+    }
+}

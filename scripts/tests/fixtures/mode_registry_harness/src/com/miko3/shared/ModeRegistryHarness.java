@@ -49,8 +49,9 @@ public final class ModeRegistryHarness {
 
     private static void registryScenarios() {
         List<ModeRegistry.Mode> all = ModeRegistry.all();
-        check("registry_order_and_ids", all.size() == 2
-                        && "remote-control".equals(all.get(0).id) && "voice".equals(all.get(1).id),
+        check("registry_order_and_ids", all.size() == 3
+                        && "remote-control".equals(all.get(0).id) && "voice".equals(all.get(1).id)
+                        && "explore".equals(all.get(2).id),
                 "got " + ids(all));
 
         ModeRegistry.Mode rc = ModeRegistry.byId("remote-control");
@@ -69,10 +70,22 @@ public final class ModeRegistryHarness {
                         && voice.displayName.length() > 0,
                 describe(voice));
 
+        // The next port pair after voice's (U4, KTD12); must match the explore
+        // mode's own ModeApp.PORT/HTTPS_PORT.
+        ModeRegistry.Mode explore = ModeRegistry.byId("explore");
+        check("explore_entry", explore != null
+                        && "com.miko3.mode.explore".equals(explore.packageName)
+                        && "com.miko3.mode.explore.MainActivity".equals(explore.activityClassName)
+                        && explore.httpPort == 8083 && explore.httpsPort == 8446
+                        && explore.displayName.length() > 0,
+                describe(explore));
+
         check("ids_match_protocol_constants",
                 LauncherProtocol.MODE_REMOTE_CONTROL.equals(rc == null ? null : rc.id)
-                        && LauncherProtocol.MODE_VOICE.equals(voice == null ? null : voice.id),
-                "protocol ids " + LauncherProtocol.MODE_REMOTE_CONTROL + "/" + LauncherProtocol.MODE_VOICE);
+                        && LauncherProtocol.MODE_VOICE.equals(voice == null ? null : voice.id)
+                        && LauncherProtocol.MODE_EXPLORE.equals(explore == null ? null : explore.id),
+                "protocol ids " + LauncherProtocol.MODE_REMOTE_CONTROL + "/" + LauncherProtocol.MODE_VOICE
+                        + "/" + LauncherProtocol.MODE_EXPLORE);
 
         check("by_id_unknown_is_null", ModeRegistry.byId("autonomous") == null
                 && ModeRegistry.byId(null) == null && ModeRegistry.byId("") == null, "expected null");
@@ -85,6 +98,7 @@ public final class ModeRegistryHarness {
                 "old no-param /launch-mode link must keep launching remote-control");
         check("launch_target_by_id",
                 ModeRegistry.resolveLaunchTarget("voice") == ModeRegistry.VOICE
+                        && ModeRegistry.resolveLaunchTarget("explore") == ModeRegistry.EXPLORE
                         && ModeRegistry.resolveLaunchTarget("remote-control") == ModeRegistry.REMOTE_CONTROL,
                 "ids did not resolve");
         check("launch_target_unknown_is_null", ModeRegistry.resolveLaunchTarget("nope") == null,
@@ -144,6 +158,12 @@ public final class ModeRegistryHarness {
         Map<String, ModeRegistry.Presence> voiceOn = presence(ModeRegistry.Presence.INACTIVE, ModeRegistry.Presence.ACTIVE);
         check("voice_active_is_exited", "[voice]".equals(ids(ModeRegistry.activeModes(all, voiceOn))),
                 ids(ModeRegistry.activeModes(all, voiceOn)));
+
+        Map<String, ModeRegistry.Presence> exploreOn = presence(ModeRegistry.Presence.INACTIVE,
+                ModeRegistry.Presence.INACTIVE);
+        exploreOn.put("explore", ModeRegistry.Presence.ACTIVE);
+        check("explore_active_is_exited", "[explore]".equals(ids(ModeRegistry.activeModes(all, exploreOn))),
+                ids(ModeRegistry.activeModes(all, exploreOn)));
 
         Map<String, ModeRegistry.Presence> failed = presence(ModeRegistry.Presence.UNKNOWN, ModeRegistry.Presence.UNKNOWN);
         check("probe_failures_exit_nothing", ModeRegistry.activeModes(all, failed).isEmpty(),

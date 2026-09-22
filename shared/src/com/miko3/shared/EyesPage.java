@@ -36,8 +36,12 @@ package com.miko3.shared;
  * .housing > .glass > .glow > .glow-core. A caller restyles them by class on
  * #rig from its own CSS (the voice mode does this per conversation state), and
  * its after-eyes script may wrap the global gazeTo(x,y,speedMs) that every
- * glance goes through. Pure string building, no android.* — the host-JVM tests
- * compile it directly.
+ * glance goes through. The script sets the blink as an INLINE style on each
+ * .glow-core (and gazeTo sets .glow's transform inline), so a caller rule that
+ * changes .glow-core's animation, transform or opacity must be !important or
+ * it silently loses (docs/solutions/ui-bugs/
+ * per-mode-eye-css-overridden-by-inline-blink-animation.md). Pure string
+ * building, no android.* — the host-JVM tests compile it directly.
  */
 public final class EyesPage {
     private EyesPage() {

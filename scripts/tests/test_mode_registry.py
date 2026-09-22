@@ -44,6 +44,8 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "shared" / "ModeRegistryHarness.java"
 SERVER_P12 = REPO / "shared" / "assets" / "server.p12"
 RC_SRC = REPO / "mode-remote-control" / "src" / "com" / "miko3" / "mode" / "remotecontrol"
 VOICE_SRC = REPO / "mode-voice" / "src" / "com" / "miko3" / "mode" / "voice"
+EXPLORE_SRC = REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore"
+REGISTRY_SRC = SHARED_SRC / "com" / "miko3" / "shared" / "ModeRegistry.java"
 LAUNCHER_SRC = REPO / "launcher" / "src" / "com" / "miko3" / "launcher"
 
 
@@ -55,6 +57,7 @@ class ModeRegistryHarnessTest(unittest.TestCase):
         "registry_order_and_ids",
         "remote_control_entry",
         "voice_entry",
+        "explore_entry",
         "ids_match_protocol_constants",
         "by_id_unknown_is_null",
         "registry_is_unmodifiable",
@@ -74,6 +77,7 @@ class ModeRegistryHarnessTest(unittest.TestCase):
         "none_active_exits_nothing",
         "remote_control_active_is_exited",
         "voice_active_is_exited",
+        "explore_active_is_exited",
         "probe_failures_exit_nothing",
         "failure_plus_active_exits_only_active",
         "both_active_exits_both_in_registry_order",
@@ -193,6 +197,37 @@ class SourceWiringTest(unittest.TestCase):
         # Stale-instance guard: only the current generation stops the engine.
         self.assertIn("app.isCurrent(myGeneration)", body)
         self.assertLess(body.index("app.isCurrent(myGeneration)"), body.index("app.stopVoice()"))
+
+    def test_explore_serves_presence_from_explicit_flag(self):
+        app = (EXPLORE_SRC / "ModeApp.java").read_text()
+        self.assertIn("server.route(LauncherProtocol.PRESENCE_PATH", app)
+        self.assertIn("ModeRegistry.presenceJson(LauncherProtocol.MODE_EXPLORE", app)
+        self.assertRegex(app, r"private volatile boolean active;")
+
+    def test_explore_ports_match_the_registry(self):
+        """The mode keeps its own port literals; they must equal ModeRegistry.EXPLORE's."""
+        app = (EXPLORE_SRC / "ModeApp.java").read_text()
+        self.assertRegex(app, r"static final int PORT = 8083;")
+        self.assertRegex(app, r"static final int HTTPS_PORT = 8446;")
+        self.assertRegex(REGISTRY_SRC.read_text(), r"com\.miko3\.mode\.explore\.MainActivity\",\s*8083, 8446,")
+
+    def test_explore_teardown_stops_wander_before_presence(self):
+        activity = (EXPLORE_SRC / "MainActivity.java").read_text()
+        for signature in ("private void exitMode()", "protected void onDestroy()"):
+            with self.subTest(path=signature):
+                self.assertIn("releaseIfCurrent()", _method_body(activity, signature))
+        body = _method_body(activity, "private boolean releaseIfCurrent()")
+        # The robot is stopped (and the lease released, U5) before the launcher
+        # can see presence go inactive and start another mode (R5).
+        self.assertIn("app.stopExplore()", body)
+        self.assertIn("app.deactivate(myGeneration)", body)
+        self.assertLess(body.index("app.stopExplore()"), body.index("app.deactivate(myGeneration)"))
+        # Stale-instance guard: only the current generation stops the wander.
+        self.assertIn("app.isCurrent(myGeneration)", body)
+        self.assertLess(body.index("app.isCurrent(myGeneration)"), body.index("app.stopExplore()"))
+        # Force-exit is honored on a fresh instance and on the running one.
+        self.assertIn("LauncherProtocol.EXTRA_FORCE_EXIT", activity)
+        self.assertIn("exitMode()", _method_body(activity, "protected void onNewIntent(Intent intent)"))
 
     def test_launcher_has_no_hard_coded_mode(self):
         app = (LAUNCHER_SRC / "LauncherApp.java").read_text()

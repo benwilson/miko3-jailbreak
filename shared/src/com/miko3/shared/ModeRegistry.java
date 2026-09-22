@@ -73,8 +73,12 @@ public final class ModeRegistry {
             "com.miko3.mode.voice", "com.miko3.mode.voice.MainActivity",
             8082, 8445, "Voice Conversation");
 
+    public static final Mode EXPLORE = new Mode(LauncherProtocol.MODE_EXPLORE,
+            "com.miko3.mode.explore", "com.miko3.mode.explore.MainActivity",
+            8083, 8446, "Explore");
+
     private static final List<Mode> ALL =
-            Collections.unmodifiableList(Arrays.asList(REMOTE_CONTROL, VOICE));
+            Collections.unmodifiableList(Arrays.asList(REMOTE_CONTROL, VOICE, EXPLORE));
 
     /** Every registered mode, in launcher-page order. */
     public static List<Mode> all() {
