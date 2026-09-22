@@ -466,6 +466,32 @@ public final class ExploreBrainHarness {
                             && cpl1 == HazardClassifier.Status.CLEAR,
                     "cpl2=" + s + " hazard=" + (h == null ? null : h.kind) + " cpl1=" + cpl1);
         });
+        scenario("classifier_absent_ir_is_never_an_edge", n -> {
+            // Live records carry ir1 as all-'X' padding (absent, -1); with a "below"
+            // IR rule that must not read as an edge on every reading.
+            HazardClassifier c = new HazardClassifier(new ExploreTuning.Builder()
+                    .calibration(new ExploreTuning.Calibration(100, -1, 1, false)).recoveryStreak(1).build());
+            c.offer(new SensorReading(100, 300, -1, 1, null, false));
+            HazardClassifier.Status s = c.status(100);
+            check(n, s == HazardClassifier.Status.CLEAR, "status=" + s + " hazard=" + c.hazard());
+        });
+        scenario("classifier_fault_tof_with_ir_edge_flag_is_an_edge", n -> {
+            // Over an edge the ToF may read its out-of-range value; when the IR edge flag
+            // agrees, that is an edge to back away from, not a dead sensor to freeze on.
+            HazardClassifier c = new HazardClassifier(new ExploreTuning.Builder()
+                    .calibration(new ExploreTuning.Calibration(100, -1, 0, true)).recoveryStreak(1).build());
+            c.offer(new SensorReading(100, 300, -1, 0, null, false));
+            HazardClassifier.Status before = c.status(100);
+            c.offer(new SensorReading(200, 16383, -1, 1, null, false));
+            HazardClassifier.Status edge = c.status(200);
+            HazardClassifier.Hazard h = c.hazard();
+            c.offer(new SensorReading(300, 16383, -1, 0, null, false));
+            HazardClassifier.Status noFlag = c.status(300);
+            check(n, before == HazardClassifier.Status.CLEAR && edge == HazardClassifier.Status.HAZARD
+                            && h != null && h.kind == HazardClassifier.Kind.EDGE
+                            && noFlag == HazardClassifier.Status.UNAVAILABLE,
+                    "before=" + before + " edge=" + edge + " hazard=" + h + " noFlag=" + noFlag);
+        });
     }
 
     // ---- ExploreBrain: acceptance examples ----

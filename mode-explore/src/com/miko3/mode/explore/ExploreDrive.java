@@ -229,7 +229,10 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         }
         long refusal = driver.lastRefusalMs();
         Integer cpl = refusal != 0 && refusal >= s.timestampMs - REFUSAL_WINDOW_MS ? Integer.valueOf(2) : null;
-        return new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, s.fault);
+        // fault stays false: SensorSnapshot.fault only means tof read 16383, which the
+        // classifier judges itself (it can be an edge when the IR flag agrees). A dead
+        // keepalive shows up as the readings going stale.
+        return new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false);
     }
 
     // ---- ExploreLoop.Hooks ----

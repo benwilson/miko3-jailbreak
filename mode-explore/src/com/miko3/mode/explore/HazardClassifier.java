@@ -150,8 +150,16 @@ final class HazardClassifier {
         return latest;
     }
 
+    /** An absent IR field (all-'X' padding, -1) is never an edge, whichever way the rule points. */
     private boolean irEdge(int ir) {
+        if (ir < 0) {
+            return false;
+        }
         return cal.edgeIrAbove ? ir > cal.edgeIr : ir < cal.edgeIr;
+    }
+
+    private boolean irEdgeFlagged(SensorReading r) {
+        return cal != null && cal.edgeIr >= 0 && (irEdge(r.ir1) || irEdge(r.ir2));
     }
 
     /** Why this reading cannot be trusted, or null if it can. */
@@ -159,7 +167,9 @@ final class HazardClassifier {
         if (r.fault) {
             return "fault reply";
         }
-        if (r.tof == tuning.tofFault) {
+        // Over an edge the ToF can read its out-of-range value; when a calibrated IR
+        // edge flag agrees, the reading is an edge to back away from, not a dead sensor.
+        if (r.tof == tuning.tofFault && !irEdgeFlagged(r)) {
             return "tof at fault value " + tuning.tofFault;
         }
         if (tuning.frozenTofWindowMs > 0 && r.timestampMs - tofSinceMs >= tuning.frozenTofWindowMs) {
