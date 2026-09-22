@@ -58,6 +58,17 @@ class ExploreStatePageTest(unittest.TestCase):
         for s in self.states[:-1]:
             self.assertEqual((s["lookX"], s["lookY"]), (0.0, 0.0), s["state"])
 
+    def test_animated_looks_override_the_inline_blink(self):
+        # The shared eyes start their blink as an inline style on each .glow-core
+        # (cores[g].style.animation), and an inline animation beats any stylesheet
+        # rule that is not !important, so without it these looks never show on the
+        # robot (found by browser test: eyes-only rendered fully open).
+        self.assertIn("cores[g].style.animation=", self.page)
+        for state in ("flinch", "eyes-only", "resting"):
+            rule = re.search(r"#rig\.s-" + re.escape(state) + r" \.glow-core\{([^}]*)\}", self.page)
+            self.assertIsNotNone(rule, state)
+            self.assertRegex(rule.group(1), r"animation:[^;]*!important", state)
+
     def test_gaze_wrap_holds_the_look_direction(self):
         # R7: while looking, every glance goes to the published direction.
         self.assertIn("var eyesGazeTo=gazeTo;", self.page)

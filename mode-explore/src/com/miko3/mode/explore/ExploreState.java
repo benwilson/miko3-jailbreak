@@ -13,10 +13,8 @@ import com.miko3.shared.EyesPage;
  * (R7). Immutable, so publishing one is a single volatile write and the
  * /state route never takes a lock the brain holds.
  *
- * U4 scaffold: only IDLE is published, and the page applies the class
- * without per-state rules. U6 adds the per-state CSS (STATE_CSS) and the
- * gaze wrap (GAZE_JS) that holds the eyes on the look direction; the brain
- * (U3/U5) adds its own state names through {@link #of}/{@link #look}.
+ * STATE_CSS and GAZE_JS restyle the shared eyes per state and hold the gaze
+ * on the look direction; the shared EyesPage itself is unchanged.
  *
  * Polling rather than pushing into the WebView so the same page works in a
  * LAN browser, as the voice mode's does. No android.* here: host-JVM tests
@@ -112,20 +110,24 @@ final class ExploreState {
     // Per-state looks, as overrides on the shared eyes keyed by a class on #rig.
     // idle is the other modes' look unchanged (R6). The animations go on
     // .glow-core, never .glow: .glow's transform carries the gaze, and a keyframe
-    // transform on the same element would override it.
+    // transform on the same element would override it. The shared eyes start
+    // their blink as an inline style on each .glow-core, and an inline animation
+    // beats any stylesheet rule, so every look that replaces the blink says so
+    // with !important (an !important declaration also outranks the animation).
     private static final String STATE_CSS =
             // Look: a slightly brighter core while he eyes the way ahead.
-            "#rig.s-look .glow-core{filter:brightness(1.15)}"
+            "#rig.s-" + LOOK + " .glow-core{filter:brightness(1.15)}"
             // Flinch: one quick squint that springs back.
             + "@keyframes flinch{0%{transform:scale(1,1)}25%{transform:scale(1.18,.3)}"
             + "60%{transform:scale(.95,1.08)}100%{transform:scale(1,1)}}"
-            + "#rig.s-flinch .glow-core{animation:flinch .55s cubic-bezier(.3,1.4,.5,1) 1}"
+            + "#rig.s-" + FLINCH + " .glow-core{animation:flinch .55s cubic-bezier(.3,1.4,.5,1) 1!important}"
             // Eyes-only (no sensors, not driving): half-closed and dimmed. The
             // glances continue (see GAZE_JS), so it reads as awake but staying put.
-            + "#rig.s-eyes-only .glow-core{transform:scale(1,.45);opacity:.7;transition:transform .6s,opacity .6s}"
+            + "#rig.s-" + EYES_ONLY + " .glow-core{animation:none!important;transform:scale(1,.45);opacity:.7;"
+            + "transition:transform .6s,opacity .6s}"
             // Resting (cornered cool-down): drowsy, slowly breathing lids.
             + "@keyframes drowse{from{transform:scale(1,.6);opacity:.85}to{transform:scale(1,.3);opacity:.55}}"
-            + "#rig.s-resting .glow-core{animation:drowse 2.4s ease-in-out infinite alternate}";
+            + "#rig.s-" + RESTING + " .glow-core{animation:drowse 2.4s ease-in-out infinite alternate!important}";
 
     // The poll. setTimeout chained off each answer (not setInterval) and
     // XMLHttpRequest with a timeout, as in the voice mode, so a hung request
@@ -166,17 +168,17 @@ final class ExploreState {
     private static final String GAZE_JS =
             "var eyesGazeTo=gazeTo;"
             + "gazeTo=function(x,y,speedMs){"
-            + "if(exploreState.state==='look'){x=exploreState.lookX*10;y=exploreState.lookY*9;}"
-            + "else if(exploreState.state==='flinch'){x=0;y=0;}"
-            + "else if(exploreState.state==='eyes-only'||exploreState.state==='resting'){x*=0.35;y*=0.35;}"
+            + "if(exploreState.state==='" + LOOK + "'){x=exploreState.lookX*10;y=exploreState.lookY*9;}"
+            + "else if(exploreState.state==='" + FLINCH + "'){x=0;y=0;}"
+            + "else if(exploreState.state==='" + EYES_ONLY + "'||exploreState.state==='" + RESTING + "'){x*=0.35;y*=0.35;}"
             + "eyesGazeTo(x,y,speedMs);"
             + "};"
             + "var showExploreStateBase=showExploreState;"
             + "showExploreState=function(s){"
             + "var was=exploreState;"
             + "showExploreStateBase(s);"
-            + "if(s.state==='look'&&(was.state!=='look'||was.lookX!==s.lookX||was.lookY!==s.lookY))gazeTo(0,0,260);"
-            + "else if(s.state==='flinch'&&was.state!=='flinch')gazeTo(0,0,90);"
+            + "if(s.state==='" + LOOK + "'&&(was.state!=='" + LOOK + "'||was.lookX!==s.lookX||was.lookY!==s.lookY))gazeTo(0,0,260);"
+            + "else if(s.state==='" + FLINCH + "'&&was.state!=='" + FLINCH + "')gazeTo(0,0,90);"
             + "};";
 
     /** GET /device-view (and /): the shared eyes plus the state hook. */
