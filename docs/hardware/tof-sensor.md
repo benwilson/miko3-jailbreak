@@ -30,10 +30,19 @@ POWER=0,0,07884,-0234,07887,-0234,076,14,15,23FLBTN=0,0,0,0,00000,00000IMUAC=...
 The robot sat still on the desk with nothing close in front:
 
 - `tof` ranged 234–263 across 20 s, a spread of about 20–30. The value is live: it changes on every read. ToF is therefore enabled by default with ServiceExam disabled, and no `TOFEN` is needed.
-- The frozen-`tof` rule (KTD3 in the explore plan) is viable. A still robot still jitters by tens of counts, so identical values over about 2 s (roughly 16 replies) mean a stuck sensor. The rule applies to `tof` only.
+- The frozen-`tof` rule (KTD3 in the explore plan) is viable. A still robot still jitters by tens of counts, so identical values for the brain's 3 s window mean a stuck sensor. The rule applies to `tof` only.
 - `16383` (`0x3FFF`) is the known dead-sensor value (bent-pin fault, `docs/hardware/motors-wheels.md`).
 
 Logcat kept 74 of the roughly 160 replies in a 20 s window, most likely because of logcat's own rate limiting. The mode reads replies directly, not through logcat, so this doesn't affect it.
+
+## 16383 with the flag digit set
+
+About 20 minutes after the baseline, with no code change to the parsing, every reply read `TOFIR=16383,…,1` (40+ consecutive replies). Sending `TOFEN` did not change it, so the ToF had not been switched off. Two readings fit:
+
+- **Out of range, or an edge.** The robot was moved, lifted, or is facing open space, and the flag digit marks "no surface / edge". If the U8 edge capture shows this signature, `scripts/qa-explore-mode.py` calibrates the edge on that flag. The classifier then treats `16383` plus the flag as an edge to back away from, rather than a dead sensor.
+- **The old hardware fault.** The bent connector pin also produced a constant 16383 (`docs/hardware/motors-wheels.md`). If the sensor reads 16383 while the robot sits on the desk facing an object, reseat the connector before calibrating.
+
+Either way the mode fails safe: without the flag rule calibrated, a constant 16383 means "no sensors", and the robot stays still with its eyes-only look.
 
 ## Still to capture (owner-attended, U8)
 
