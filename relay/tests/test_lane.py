@@ -20,6 +20,7 @@ if str(RELAY_ROOT) not in sys.path:
     sys.path.insert(0, str(RELAY_ROOT))
 
 from relay.lane import (  # noqa: E402
+    BURST_SECONDS,
     CLOSE_BAD_HELLO,
     CLOSE_PROTO,
     CLOSE_REPLACED,
@@ -405,7 +406,34 @@ class PacingTests(LaneTestCase):
 class RealTimePacingTests(LaneTestCase):
     pacing = Pacing()
 
-    async def test_default_pacing_is_80ms(self):
+    def test_the_default_burst_cap_is_two_seconds(self):
+        """Pinned, because it is the size of the cushion the robot is allowed to hold.
+        Measured live, the model generates reply audio at 0.88-0.97x realtime, so the
+        robot's speaker drains mid-reply unless it is holding seconds, not milliseconds."""
+        self.assertEqual(BURST_SECONDS, 2.0)
+        self.assertEqual(Pacing().burst_seconds, 2.0)
+        self.assertEqual(Pacing().chunk_seconds, 0.080)
+
+    async def test_default_pacing_is_80ms_after_a_two_second_burst(self):
+        robot, link, _ = await self.conversing()
+        reply_id = link.begin_reply()
+        link.send_reply_audio(reply_id, reply_audio(28))
+        link.end_reply(reply_id)
+        await robot.wait_for(lambda: len(robot.binaries()) == 28, timeout=3)
+        chunks = robot.binaries()
+        t0 = chunks[0].t
+        self.assertLess(chunks[24].t - t0, 0.05)  # 25-chunk burst: 2.0 s of audio at once
+        self.assertAlmostEqual(chunks[25].t - t0, 26 * 0.080 - 2.0, delta=0.020)
+        self.assertAlmostEqual(chunks[27].t - chunks[25].t, 2 * 0.080, delta=0.020)
+
+
+class SmallBurstPacingTests(LaneTestCase):
+    """The cap this relay shipped with before the cushion was raised. It is still
+    reachable by configuration (--burst-seconds 0.5), and it must still behave exactly as
+    it did: a six-chunk burst, then one chunk per chunk period."""
+    pacing = Pacing(burst_seconds=0.5)
+
+    async def test_a_configured_small_cap_reproduces_the_old_burst(self):
         robot, link, _ = await self.conversing()
         reply_id = link.begin_reply()
         link.send_reply_audio(reply_id, reply_audio(9))
@@ -416,6 +444,61 @@ class RealTimePacingTests(LaneTestCase):
         self.assertLess(chunks[5].t - t0, 0.02)  # 6-chunk burst
         self.assertAlmostEqual(chunks[6].t - t0, 7 * 0.080 - 0.5, delta=0.012)
         self.assertAlmostEqual(chunks[8].t - chunks[6].t, 2 * 0.080, delta=0.012)
+
+
+class LargeBurstPacingTests(LaneTestCase):
+    """The raised cap at 4x time scale: 0.5 s of cap over 20 ms chunks is the same
+    25-chunk burst the 2.0 s default gives over 80 ms ones."""
+    pacing = Pacing(chunk_seconds=0.02, burst_seconds=0.5)
+
+    async def test_burst_fills_to_the_cap_then_settles_into_the_steady_cadence(self):
+        robot, link, _ = await self.conversing()
+        chunk_s = self.pacing.chunk_seconds
+        total = 35
+        reply_id = link.begin_reply()
+        link.send_reply_audio(reply_id, reply_audio(total))
+        link.end_reply(reply_id)
+        await robot.wait_for(lambda: len(robot.binaries()) == total, timeout=3)
+        chunks = robot.binaries()
+        t0 = chunks[0].t
+        burst = [c for c in chunks if c.t - t0 < chunk_s / 2]
+        self.assertEqual(len(burst), 25)  # 500 ms of audio, the most under the cap
+        for i, c in enumerate(chunks):  # never more than the cap ahead of the estimate
+            ahead = (i + 1) * chunk_s - (c.t - t0)
+            self.assertLessEqual(ahead, self.pacing.burst_seconds + 0.005, f"chunk {i}")
+        steady = chunks[25:]
+        span = steady[-1].t - steady[0].t
+        self.assertAlmostEqual(span / (len(steady) - 1), chunk_s, delta=0.004)
+        first_due = 26 * chunk_s - self.pacing.burst_seconds
+        self.assertAlmostEqual(steady[0].t - t0, first_due, delta=0.008)
+
+    async def test_flush_during_a_large_burst_discards_the_whole_remainder(self):
+        """A bigger cap means a bigger queue behind it, so a flush throws away more. It
+        must still throw away ALL of it, report the count, and get audio.flush to the
+        robot ahead of anything else."""
+        robot, link, _ = await self.conversing()
+        first = link.begin_reply()
+        link.send_reply_audio(first, reply_audio(60))
+        await robot.wait_for(lambda: len(robot.binaries()) >= 25, timeout=3)
+        discarded = link.flush_reply(first)
+        link.send_reply_audio(first, reply_audio(4))  # late audio for the flushed reply
+        self.assertGreaterEqual(discarded, 30)
+        # everything that had not gone out, however much the bigger cap left queued
+        self.assertEqual(link.pacer.chunks_sent + discarded, 60)
+        flush = await robot.wait_text("audio.flush")
+        self.assertEqual(flush.data["reply"], first)
+        await asyncio.sleep(0.2)  # ten chunk periods
+        flush_index = robot.frames.index(flush)
+        self.assertEqual([f for f in robot.frames[flush_index:] if f.kind == "binary"], [])
+        before = len(robot.binaries())
+        second = link.begin_reply()
+        link.send_reply_audio(second, reply_audio(3))
+        link.end_reply(second)
+        await robot.wait_for(lambda: len(robot.binaries()) == before + 3, timeout=2)
+        mark = robot.texts("reply")[-1]
+        self.assertEqual(mark.data["id"], second)
+        after = [f for f in robot.frames[flush_index:] if f.kind == "binary"]
+        self.assertGreater(robot.frames.index(after[0]), robot.frames.index(mark))
 
 
 class CommandLaneTests(LaneTestCase):

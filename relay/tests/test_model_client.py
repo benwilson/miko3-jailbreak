@@ -1,7 +1,8 @@
 """Tests for relay/relay/model_client.py against the scripted fake model server.
 
-Covers plan U4's scenarios: `reset` then `system` before any audio, the 80 ms zero-frame
-watchdog, bursts and the open-time backlog forwarded unpaced, ordered reply events with the
+Covers plan U4's scenarios: `reset` then `system` before any audio, the frame clock that
+paces the uplink at realtime (one frame per frame period, zero-filled when nothing is
+queued -- bursts and the open-time backlog included), ordered reply events with the
 audio bytes intact, the running user transcript, error and takeover closes, persona
 validation, and the health probe KTD4 uses. Also the verified server contract: events keyed
 by `kind`, assistant text in `delta`, and the `system` ack that gates a ready session.
@@ -18,6 +19,7 @@ if str(RELAY_ROOT) not in sys.path:
 
 from relay.model_client import (  # noqa: E402
     DEFAULT_PATH,
+    FRAME_SECONDS,
     ZERO_FRAME,
     AgentEnd,
     AgentStart,
@@ -123,8 +125,12 @@ class ModelClientTests(ClientTestCase):
             gaps = [b.t - a.t for a, b in zip(frames, frames[1:])]
             self.assertTrue(all(0.06 <= g <= 0.12 for g in gaps), gaps)
 
-    async def test_no_zero_frames_while_chunks_arrive_faster_than_80ms(self):
-        # Uplink frames may be any whole number of samples: 50 ms here, 800 samples.
+    async def test_chunks_of_any_size_are_forwarded_intact_and_in_order(self):
+        # Uplink frames may be any whole number of samples: 50 ms here, 800 samples. The
+        # frame clock advances by the audio duration of the frame it just sent, not by a
+        # flat 80 ms, so a robot handing over 50 ms of audio every 50 ms is keeping up
+        # exactly and nothing of it is dropped. A slot its chunk has not reached yet still
+        # gets a zero frame (round 9: one frame per slot, never two).
         async with FakeModelServer() as server:
             client = await self.open_client(server)
             sent = []
@@ -134,11 +140,14 @@ class ModelClientTests(ClientTestCase):
                 client.send_audio(chunk)
                 await asyncio.sleep(0.05)
             session = server.last_session
-            await server.wait_until(lambda: len(session.binaries()) >= 8)
-            self.assertEqual([f.data for f in session.binaries()], sent)
-            self.assertEqual(client.zero_frames_sent, 0)
+            real = lambda: [f.data for f in session.binaries() if f.data != ZERO_FRAME]  # noqa: E731
+            await server.wait_until(lambda: len(real()) >= 8, timeout=3.0)
+            self.assertEqual(real(), sent)
+            self.assertEqual(client.uplink_dropped, 0)
 
-    async def test_burst_of_five_chunks_forwarded_at_once(self):
+    async def test_burst_of_five_chunks_is_released_in_order_at_the_frame_rate(self):
+        # Round 9: a burst is queued and released one frame per FRAME_SECONDS. It used to
+        # go out at once, which is how the model's input backlog outran realtime.
         async with FakeModelServer() as server:
             client = await self.open_client(server)
             await asyncio.sleep(0.02)
@@ -151,17 +160,18 @@ class ModelClientTests(ClientTestCase):
             await server.wait_until(lambda: sum(f.data != ZERO_FRAME for f in session.binaries()) >= 5)
             arrived = [f for f in session.binaries() if f.data != ZERO_FRAME]
             self.assertEqual([f.data for f in arrived], burst)
-            self.assertLess(arrived[-1].t - t_sent, 0.05)
+            self.assertGreater(arrived[-1].t - t_sent, 4 * FRAME_SECONDS * 0.8)
 
-    async def test_backlog_at_open_forwarded_without_pacing(self):
+    async def test_backlog_at_open_is_released_at_the_frame_rate(self):
         backlog = [pcm(1280, 200 + i) for i in range(10)]  # 800 ms of buffered speech
         async with FakeModelServer() as server:
             await self.open_client(server, backlog=backlog)
             session = server.last_session
-            await server.wait_until(lambda: len(session.binaries()) >= 10)
+            await server.wait_until(lambda: len(session.binaries()) >= 10, timeout=4.0)
             frames = session.binaries()[:10]
             self.assertEqual([f.data for f in frames], backlog)
-            self.assertLess(frames[-1].t - frames[0].t, 0.05)
+            # 800 ms of recorded audio takes 800 ms to hand over, not 800 ms of instant lag.
+            self.assertGreater(frames[-1].t - frames[0].t, 9 * FRAME_SECONDS * 0.8)
 
     async def test_reply_events_in_order_with_audio_bytes_intact(self):
         script = Script(turns=[Turn(user_end_at=0.05, reply_delay=0.05, reply_seconds=0.24)], pace=0.1)
@@ -376,6 +386,160 @@ class EventKeyTests(ClientTestCase):
             events = await collect_until(client, lambda e: isinstance(e, UserEnd))
             deltas = [e for e in events if isinstance(e, AssistantTextDelta)]
             self.assertEqual([d.text for d in deltas], ["hello"])
+
+
+class UplinkFrameClockTests(ClientTestCase):
+    """Round 9. Measured live against the real server, `stats.input_backlog_frames` climbed
+    3 -> 7 -> 14 -> 20 -> 22 -> 28 while the server itself was FASTER than realtime (rtf
+    0.70-0.76). The only way that happens is that the relay handed it more than one 80 ms
+    frame per 80 ms of wall clock: chunks were forwarded the instant they arrived AND the
+    watchdog filled the slot a jittery late chunk had not arrived for, so a late chunk cost
+    two frames for one slot. These pin the frame clock that replaced that."""
+
+    async def rate(self, session, seconds):
+        """Frames the model received per frame period over `seconds` of wall clock."""
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        before = len(session.binaries())
+        await asyncio.sleep(seconds)
+        elapsed = loop.time() - t0
+        return (len(session.binaries()) - before) / (elapsed / FRAME_SECONDS)
+
+    async def test_twenty_chunks_fed_instantly_arrive_spread_at_the_frame_rate(self):
+        async with FakeModelServer() as server:
+            client = await self.open_client(server)
+            await asyncio.sleep(0.02)
+            burst = [pcm(1280, 300 + i) for i in range(20)]
+            for chunk in burst:
+                client.send_audio(chunk)
+            session = server.last_session
+            await server.wait_until(
+                lambda: sum(f.data != ZERO_FRAME for f in session.binaries()) >= 20,
+                timeout=6.0)
+            arrived = [f for f in session.binaries() if f.data != ZERO_FRAME]
+            self.assertEqual([f.data for f in arrived], burst)  # in order, none dropped
+            span = arrived[-1].t - arrived[0].t
+            # 20 frames is 1.6 s of audio and must take about 1.6 s of wall clock to hand
+            # over, not the ~0 s the unpaced uplink took.
+            self.assertGreater(span, 19 * FRAME_SECONDS * 0.8)
+            self.assertLess(span, 19 * FRAME_SECONDS * 1.6)
+            gaps = [b.t - a.t for a, b in zip(arrived, arrived[1:])]
+            self.assertLess(max(gaps), 3 * FRAME_SECONDS, gaps)
+
+    async def test_one_zero_frame_per_frame_period_with_no_input(self):
+        async with FakeModelServer() as server:
+            client = await self.open_client(server)
+            session = server.last_session
+            rate = await self.rate(session, 0.6)
+            self.assertTrue(all(f.data == ZERO_FRAME for f in session.binaries()))
+            self.assertTrue(0.8 <= rate <= 1.2, rate)
+            self.assertEqual(client.chunks_sent, 0)
+
+    async def test_jitter_never_buys_a_second_frame_for_one_slot(self):
+        # The live failure, driven explicitly: chunks arrive early, late and in pairs. The
+        # model must still receive exactly one frame per frame period.
+        jitter = [0.02, 0.14, 0.0, 0.11, 0.05, 0.16, 0.03, 0.09, 0.13, 0.02, 0.15, 0.06]
+        async with FakeModelServer() as server:
+            client = await self.open_client(server)
+            session = server.last_session
+            await asyncio.sleep(0.02)
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            before = len(session.binaries())
+            for i, gap in enumerate(jitter):
+                await asyncio.sleep(gap)
+                client.send_audio(pcm(1280, 400 + i))
+            elapsed = loop.time() - t0
+            got = len(session.binaries()) - before
+            expected = elapsed / FRAME_SECONDS
+            rate = got / expected
+            self.assertTrue(0.85 <= rate <= 1.15, f"{got} frames in {expected:.1f} slots")
+            self.assertTrue(0.85 <= client.send_rate <= 1.15, client.send_rate)
+
+    async def test_release_queue_bound_drops_the_oldest_and_counts_it(self):
+        async with FakeModelServer() as server:
+            client = self.new_client(server, uplink_queue=4)
+            await client.open()
+            session = server.last_session
+            for i in range(10):  # 4 fit, the first 6 are pushed off the front
+                client.send_audio(pcm(1280, 500 + i))
+            self.assertEqual(client.uplink_dropped, 6)
+            await server.wait_until(
+                lambda: sum(f.data != ZERO_FRAME for f in session.binaries()) >= 4, timeout=3.0)
+            kept = [f.data for f in session.binaries() if f.data != ZERO_FRAME]
+            self.assertEqual(kept[:4], [pcm(1280, 506 + i) for i in range(4)])  # newest kept
+            stats = client.uplink_stats()
+            self.assertEqual(stats["dropped"], 6)
+            self.assertEqual(stats["queued"], 10)
+            self.assertEqual(stats["sent"], 4)
+
+    async def test_the_pre_ready_backlog_is_paced_like_everything_else(self):
+        # DECISION: the robot's pre-`conv.ready` buffer is released through the same frame
+        # clock. Dumping it would put the model that many frames behind for the rest of the
+        # conversation, which is the failure this round exists to end.
+        backlog = [pcm(1280, 600 + i) for i in range(6)]
+        async with FakeModelServer() as server:
+            client = self.new_client(server)
+            await client.open(quiet=True)
+            session = server.last_session
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            client.start_uplink(backlog=backlog)
+            await server.wait_until(
+                lambda: sum(f.data != ZERO_FRAME for f in session.binaries()) >= 6, timeout=3.0)
+            arrived = [f for f in session.binaries() if f.data != ZERO_FRAME]
+            self.assertEqual([f.data for f in arrived], backlog)
+            self.assertGreater(arrived[-1].t - t0, 5 * FRAME_SECONDS * 0.8)
+
+    async def test_uplink_stats_report_the_real_send_rate(self):
+        async with FakeModelServer() as server:
+            client = await self.open_client(server)
+            for i in range(6):
+                client.send_audio(pcm(1280, 700 + i))
+                await asyncio.sleep(0.05)  # the robot running ahead of the clock
+            await asyncio.sleep(0.3)
+            stats = client.uplink_stats()
+            self.assertEqual(stats["sent"] + stats["zero"], client.frames_sent)
+            self.assertTrue(0.85 <= stats["rate"] <= 1.15, stats)
+            self.assertGreaterEqual(stats["queue_peak"], 1)
+
+
+class QuietSessionTests(ClientTestCase):
+    """A session opened `quiet` (the relay's warm one) is silent until it is adopted. The
+    zero-frame watchdog exists so the model's VAD hears the person stop talking; before a
+    conversation there is nobody to hear, and this server runs slower than realtime
+    (measured rtf 1.8-3.3), so every zero frame only lengthens its input backlog."""
+
+    async def test_a_quiet_session_sends_nothing_until_the_uplink_starts(self):
+        async with FakeModelServer() as server:
+            client = self.new_client(server)
+            await client.open(quiet=True)
+            session = server.last_session
+            self.assertTrue(client.system_acked)  # the persona is in: adoption is instant
+            self.assertFalse(client.ready)
+            client.send_audio(pcm(1280, 5))  # held, not forwarded
+            await asyncio.sleep(0.3)  # several 80 ms watchdog intervals
+            self.assertEqual(session.binaries(), [])
+            self.assertEqual(client.zero_frames_sent, 0)
+            self.assertEqual(client.chunks_sent, 0)
+            client.start_uplink()
+            self.assertTrue(client.ready)
+            await server.wait_until(lambda: len(session.binaries()) >= 3)
+            frames = [f.data for f in session.binaries()]
+            self.assertEqual(frames[0], pcm(1280, 5))  # what was held, first and in order
+            self.assertEqual(frames[1:], [ZERO_FRAME] * (len(frames) - 1))  # then watchdog
+            self.assertGreaterEqual(client.zero_frames_sent, 2)
+
+    async def test_starting_the_uplink_forwards_a_backlog_before_later_audio(self):
+        async with FakeModelServer() as server:
+            client = self.new_client(server)
+            await client.open(quiet=True)
+            session = server.last_session
+            client.start_uplink(backlog=[pcm(1280, 1), pcm(1280, 2)])
+            client.send_audio(pcm(1280, 3))
+            await server.wait_until(lambda: len(session.binaries()) >= 3)
+            self.assertEqual([f.data for f in session.binaries()][:3],
+                             [pcm(1280, 1), pcm(1280, 2), pcm(1280, 3)])
 
 
 class SystemAckTests(ClientTestCase):

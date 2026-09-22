@@ -12,12 +12,14 @@ latency fields and the log never blocking.
 import asyncio
 import contextlib
 import json
+import os
 import re
 import signal
 import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -25,15 +27,23 @@ RELAY_ROOT = Path(__file__).resolve().parents[1]
 if str(RELAY_ROOT) not in sys.path:
     sys.path.insert(0, str(RELAY_ROOT))
 
-from relay.conversation import Config, ConversationEngine, UplinkGate  # noqa: E402
-from relay.lane import LaneServer  # noqa: E402
+from relay.conversation import (  # noqa: E402
+    Config,
+    ConversationEngine,
+    LoopGuard,
+    UplinkGate,
+)
+from relay.lane import LaneServer, Pacing  # noqa: E402
 from relay.logging import ConversationLogs  # noqa: E402
+from relay import main  # noqa: E402
 from tests.fake_model_server import (  # noqa: E402
+    Burst,
     FakeModelServer,
     Script,
     Turn,
     idle_chunk,
     reply_chunks,
+    speech_chunks,
 )
 from tests.fake_robot import FakeRobot  # noqa: E402
 
@@ -74,7 +84,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         await self.stack.aclose()
 
     async def start(self, script=None, *, model=None, lane_ping=2.0, logs_writer=None,
-                    turn_taking="interruptible", **overrides):
+                    turn_taking="interruptible", pacing=None, **overrides):
         """Fake model server, logs, engine, lane and a connected fake robot."""
         self.model = model or FakeModelServer(script or Script())
         if model is None:
@@ -88,12 +98,18 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
                         ready_timeout=0.5, silence_timeout=5.0, drain_cap=2.0,
                         farewell_start_timeout=0.3, cooldown=0.05, probe_interval=0.1,
                         probe_timeout=0.3, sleep_settle=0.1, strict_idle_grace=1.0,
-                        reply_silence_ms=250)
+                        reply_silence_ms=250,
+                        # Default off here so every test in this file exercises the
+                        # connect-per-conversation path unchanged; tests/test_prewarm.py
+                        # covers the warm session, and MainTests below runs the real
+                        # default (on) end to end.
+                        prewarm=False)
         settings.update(overrides)
         self.engine = ConversationEngine(Config(**settings), self.logs)
         await self.engine.start()
         self.stack.push_async_callback(self.engine.stop)
-        self.lane = LaneServer(self.engine, "127.0.0.1", 0, ping_interval=lane_ping)
+        self.lane = LaneServer(self.engine, "127.0.0.1", 0, ping_interval=lane_ping,
+                               pacing=pacing or Pacing())
         await self.lane.start()
         self.stack.push_async_callback(self.lane.stop)
         robot = FakeRobot(self.lane.port, turn_taking=turn_taking)
@@ -542,6 +558,68 @@ class DerivedReplyBoundaryTests(EngineTestCase):
         self.assertLess(robot.texts("conv.close")[0].t - ready.t, 1.6)
         self.assertEqual(robot.binaries(), [])
 
+    async def test_a_reply_that_starts_speaking_after_the_start_grace_is_forwarded_in_full(self):
+        """The start grace ends a reply the model has not spoken in yet. That must cost
+        nothing but a reply id: every loud chunk that arrives afterwards still reaches the
+        robot, attributed to a new reply. Losing it is what left a person hearing silence."""
+        script = self.real_script(reply_silence_before=1.2)
+        robot = await self.start(script, reply_start_grace_ms=400, silence_timeout=10.0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await asyncio.sleep(0.8)  # the grace has expired; not a word has been spoken
+        await robot.wait_for(lambda: len(robot.binaries()) >= 3, timeout=3.0)
+        got = [f.data for f in robot.binaries()]
+        for chunk in reply_chunks(script, 0):
+            self.assertIn(chunk, got)  # every loud chunk, after the grace gave up on it
+        await asyncio.sleep(0.5)  # past the hangover
+        await robot.close_conv()
+        records = await self.records(conv)
+        self.assertEqual([r["why"] for r in self.of(records, "reply.end")],
+                         ["no-speech", "silence"])
+        loud = sum(t["loud_chunks"] for t in self.of(records, "turn"))
+        self.assertEqual(loud, len(reply_chunks(script, 0)))
+        close = self.of(records, "close")[0]
+        # Only silence is ever counted out of reply, so the byte count divides evenly.
+        self.assertEqual(close["out_of_reply"]["bytes"],
+                         close["out_of_reply"]["chunks"] * 3528)
+
+    async def test_a_farewell_that_starts_speaking_late_still_plays_before_the_close(self):
+        """The incident: the model's text reached the farewell phrase while no reply was
+        open (the start grace had already given up on the one agent_start opened), and the
+        drain closed on its farewell-start timer 0.3 s later -- before the child's TTS had
+        produced a sound. The person heard nothing of the goodbye (R2). The drain must wait
+        for the speech the model still owes it, bounded by the drain cap."""
+        script = self.real_script(reply_silence_before=1.6, reply_seconds=0.24)
+        script.events = [(0.9, {"kind": "assistant_text_delta",
+                                "delta": "Sure. Talk to you later."})]
+        robot = await self.start(script, reply_start_grace_ms=400, drain_cap=6.0,
+                                 farewell_start_timeout=0.3)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(robot.binaries()) >= 3, timeout=4.0)
+        got = [f.data for f in robot.binaries()]
+        for chunk in reply_chunks(script, 0):
+            self.assertIn(chunk, got)  # the late farewell was spoken to the person
+        self.assertEqual(robot.texts("conv.close"), [])  # still playing it out
+        await asyncio.sleep(0.5)  # past the hangover: the reply that carried it has ended
+        await robot.playback("idle")
+        self.assertEqual((await self.wait_close(robot))["reason"], "sleep_word")
+        records = await self.records(conv)
+        self.assertTrue(any(t["loud_chunks"] for t in self.of(records, "turn")))
+
+    async def test_out_of_reply_counts_only_silence(self):
+        """Out-of-reply audio is dropped only because it is silence the robot's speaker
+        would choke on. Loud audio is never out of reply: it opens one."""
+        script = Script(idle_audio_every=0.08, idle_audio_sample=6000)
+        robot = await self.start(script, silence_timeout=10.0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(robot.binaries()) >= 3, timeout=3.0)
+        self.assertIn(idle_chunk(script), [f.data for f in robot.binaries()])
+        await robot.close_conv()
+        close = self.of(await self.records(conv), "close")[0]
+        self.assertEqual(close["out_of_reply"], {"chunks": 0, "bytes": 0})
+
     async def test_agent_end_still_ends_the_reply_at_once(self):
         script = Script(turns=[Turn(user_end_at=0.05, reply_delay=0.05, reply_seconds=0.24)],
                         idle_audio_every=0.08)
@@ -556,6 +634,243 @@ class DerivedReplyBoundaryTests(EngineTestCase):
         self.assertEqual(ends[0]["why"], "agent_end")
         self.assertLess(ends[0]["duration_ms"], 1000)  # nowhere near the 2 s hangover
         await robot.close_conv()
+
+
+class SlowServerBurstTests(EngineTestCase):
+    """A model server slower than realtime does not stream its reply evenly: the audio
+    arrives in BURSTS -- a loud stretch, a gap of silence while it computes, another loud
+    stretch -- and the gaps measured live run past 800 ms. The hangover alone treated each
+    gap as the end of the reply, so one spoken sentence became a dozen replies and the
+    robot's player restarted a dozen times: the stuttering the person heard. So while the
+    model is evidently still talking -- its `assistant_text_delta` still arriving, or its
+    `stats.speech_queue` still non-zero -- the hangover does not end the reply."""
+
+    def bursty_script(self, bursts, **turn_fields):
+        """One reply sent in bursts, the way the slow server sends it: no agent_end, and
+        the reply channel still streaming silence between replies."""
+        fields = dict(user_end_at=0.05, reply_delay=0.05, agent_end=False,
+                      reply_bursts=bursts)
+        fields.update(turn_fields)
+        return Script(turns=[Turn(**fields)], idle_audio_every=0.08)
+
+    @staticmethod
+    def loud(robot):
+        return [f.data for f in robot.binaries() if any(f.data)]
+
+    async def test_a_bursty_reply_is_one_reply_not_a_dozen(self):
+        """The live failure: gaps of 800-900 ms inside one spoken turn. The text deltas
+        that keep arriving through them are what says the model is still talking."""
+        script = self.bursty_script([
+            Burst(speech=0.16),
+            Burst(silence=0.56, speech=0.16, text=["I am ", "still ", "talking "]),
+            Burst(silence=0.64, speech=0.16, text=["and ", "still ", "talking."]),
+        ])
+        robot = await self.start(script, reply_silence_ms=400)  # under both gaps
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(self.loud(robot)) >= 6, timeout=4.0)
+        await asyncio.sleep(0.5)  # past the hangover, with the reply now genuinely over
+        self.assertEqual(len(robot.texts("reply")), 1)  # ONE reply, not one per burst
+        self.assertEqual(self.loud(robot), speech_chunks(script, 0))  # all of it, in order
+        await robot.close_conv()
+        records = await self.records(conv)
+        ends = self.of(records, "reply.end")
+        self.assertEqual(len(ends), 1, ends)
+        self.assertEqual(ends[0]["why"], "silence")
+        self.assertGreater(ends[0]["duration_ms"], 1300)  # it spanned both gaps
+        turn = self.of(records, "turn")[0]
+        self.assertEqual(turn["loud_chunks"], 6)
+
+    async def test_text_deltas_with_no_audio_hold_the_reply_open(self):
+        """Text alone keeps a reply that has spoken alive past the hangover; once both the
+        text and the audio have been quiet for it, the reply ends normally."""
+        script = self.bursty_script([
+            Burst(speech=0.16),
+            Burst(silence=1.2, text=["one ", "two ", "three ", "four"]),
+        ])
+        robot = await self.start(script, reply_silence_ms=400)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(self.loud(robot)) >= 2, timeout=3.0)
+        await asyncio.sleep(1.8)
+        self.assertEqual(len(robot.texts("reply")), 1)
+        await robot.close_conv()
+        records = await self.records(conv)
+        ends = self.of(records, "reply.end")
+        self.assertEqual(len(ends), 1, ends)
+        self.assertEqual(ends[0]["why"], "silence")  # it does end, once the text stops
+        self.assertGreater(ends[0]["duration_ms"], 1200)  # long past the 400 ms hangover
+        self.assertEqual(self.of(records, "turn")[0]["loud_chunks"], 2)
+
+    async def test_a_non_zero_speech_queue_holds_the_reply_open(self):
+        """`stats.speech_queue` is TTS still queued for playback: more speech is coming,
+        whatever the reply channel sounds like right now. Samples arrive every few
+        seconds, so the newest one is used and a missing one blocks nothing."""
+        script = Script(turns=[Turn(user_end_at=0.05, reply_delay=0.05, reply_seconds=0.16,
+                                    agent_end=False)],
+                        idle_audio_every=0.08,
+                        events=[(t, {"kind": "stats", "input_backlog_frames": 0,
+                                     "speech_queue": queue})
+                                for t, queue in [(0.2, 6), (0.5, 4), (0.8, 2), (1.1, 0)]])
+        robot = await self.start(script)  # hangover 250 ms
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(self.loud(robot)) >= 2, timeout=3.0)
+        await asyncio.sleep(1.6)
+        self.assertEqual(len(robot.texts("reply")), 1)
+        await robot.close_conv()
+        records = await self.records(conv)
+        ends = self.of(records, "reply.end")
+        self.assertEqual(len(ends), 1, ends)
+        self.assertEqual(ends[0]["why"], "silence")
+        self.assertGreater(ends[0]["duration_ms"], 900)  # held while the queue was draining
+        self.assertLess(ends[0]["duration_ms"], 2000)  # and released once it hit zero
+
+    async def test_a_zero_speech_queue_does_not_delay_the_end(self):
+        """The mirror of the test above, and of the no-stats case the other tests in this
+        file run: a queue of zero leaves the hangover in charge."""
+        script = Script(turns=[Turn(user_end_at=0.05, reply_delay=0.05, reply_seconds=0.16,
+                                    agent_end=False)],
+                        idle_audio_every=0.08,
+                        events=[(t, {"kind": "stats", "input_backlog_frames": 0,
+                                     "speech_queue": 0}) for t in (0.2, 0.5, 0.8)])
+        robot = await self.start(script)  # hangover 250 ms
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(self.loud(robot)) >= 2, timeout=3.0)
+        await asyncio.sleep(0.6)
+        await robot.close_conv()
+        records = await self.records(conv)
+        ends = self.of(records, "reply.end")
+        self.assertEqual(len(ends), 1, ends)
+        self.assertEqual(ends[0]["why"], "silence")
+        self.assertLess(ends[0]["duration_ms"], 700)  # the hangover, not a held reply
+
+    async def test_a_bursty_farewell_still_drains_and_closes_on_sleep_word(self):
+        """The whole point of holding the reply open is that the person hears one
+        continuous goodbye; the drain must still close on it once it has played."""
+        script = self.bursty_script([
+            Burst(speech=0.16),
+            Burst(silence=0.4, speech=0.16, text=["Sure. ", "Talk ", "to you later."]),
+        ])
+        robot = await self.start(script, drain_cap=3.0)
+        ready = await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(self.loud(robot)) >= 4, timeout=4.0)
+        await asyncio.sleep(0.5)
+        self.assertEqual(len(robot.texts("reply")), 1)
+        self.assertEqual(self.loud(robot), speech_chunks(script, 0))
+        self.assertEqual(robot.texts("conv.close"), [])  # not before the goodbye played
+        await robot.playback("idle")
+        closed = await self.wait_close(robot)
+        self.assertEqual(closed["reason"], "sleep_word")  # not farewell_timeout
+        self.assertLess(robot.texts("conv.close")[0].t - ready.t, 3.0)
+        records = await self.records(conv)
+        self.assertEqual(len(self.of(records, "reply.end")), 1)
+        self.assertEqual(self.of(records, "underrun"), [])
+
+
+class ReplyCushionTests(EngineTestCase):
+    """What the robot is holding while a reply plays (round 10).
+
+    Measured live: the model's speech generation is capped at about 1.0x realtime by its
+    duplex timeline (one 80 ms audio frame per 80 ms step) and comes out at 0.88-0.97x, so
+    reply audio arrives slightly SLOWER than the robot plays it and the speaker drains --
+    `reply N played: underruns=2..3` on every reply, heard as stuttering. The cure is a
+    cushion, and ReplyPacer's burst cap is what decides how big a cushion the robot is
+    ALLOWED to hold: raising the robot's own prebuffer did nothing while the relay refused
+    to send more than half a second ahead of its estimate of the speaker.
+    """
+
+    HEAD = 18  # chunks already in the server's TTS queue, flushed in a lump: 1.44 s
+    TAIL = 25  # chunks it then generates, at 0.95x realtime: 2.0 s of audio in 2.1 s
+
+    def cushioned_script(self):
+        chunk = 0.080
+        return Script(turns=[Turn(user_end_at=0.05, reply_delay=0.05, agent_end=False,
+                                  reply_bursts=[Burst(speech=self.HEAD * chunk, pace=0.0),
+                                                Burst(speech=self.TAIL * chunk,
+                                                      pace=1 / 0.95)])])
+
+    @staticmethod
+    def cushion(robot):
+        """Seconds of reply audio the robot is holding as each chunk lands, taking it to
+        start playing at the first chunk and to play on without a gap at 1.0x. Below zero
+        is an underrun: the speaker wanted a sample that had not arrived."""
+        chunks = [f for f in robot.binaries() if any(f.data)]
+        t0 = chunks[0].t
+        return [(i + 1) * 0.080 - (f.t - t0) for i, f in enumerate(chunks)]
+
+    async def played(self, robot, timeout):
+        await robot.wait_for(lambda: len([f for f in robot.binaries() if any(f.data)])
+                             == self.HEAD + self.TAIL, timeout=timeout)
+        return self.cushion(robot)
+
+    async def test_the_default_cap_leaves_the_robot_a_seconds_long_cushion(self):
+        robot = await self.start(self.cushioned_script())
+        await self.open_ready(robot)
+        cushion = await self.played(robot, 8)
+        self.assertGreater(max(cushion), 1.2)  # the head start is banked, not clipped
+        # and it is still there at the end: the 0.95x tail eats it at 50 ms per second
+        self.assertGreater(min(cushion[self.HEAD - 1:]), 1.0)
+        self.assertGreater(cushion[-1], 1.1)
+        self.assertLess(max(cushion) - cushion[-1], 0.5)  # steady, not runaway
+        self.assertGreater(min(cushion), 0.0)  # never starved
+
+    async def test_the_old_half_second_cap_pins_the_cushion_at_the_cap(self):
+        """The same reply through the cap this relay used to ship: the robot cannot hold
+        more than the cap however early the audio arrived. This is why raising the robot's
+        prebuffer changed nothing."""
+        robot = await self.start(self.cushioned_script(), pacing=Pacing(burst_seconds=0.5))
+        await self.open_ready(robot)
+        cushion = await self.played(robot, 10)
+        self.assertLess(max(cushion), 0.6)  # the cap, not the audio, is the constraint
+        self.assertGreater(max(cushion), 0.4)
+
+
+class BurstSecondsOptionTests(unittest.TestCase):
+    """--burst-seconds / RELAY_BURST_SECONDS, and that it reaches the lane's pacer."""
+
+    def test_default_flag_and_environment(self):
+        self.assertEqual(main.parse_args([]).burst_seconds, 2.0)
+        self.assertEqual(main.parse_args(["--burst-seconds", "0.5"]).burst_seconds, 0.5)
+        with unittest.mock.patch.dict(os.environ, {"RELAY_BURST_SECONDS": "1.25"}):
+            self.assertEqual(main.parse_args([]).burst_seconds, 1.25)
+            self.assertEqual(main.parse_args(["--burst-seconds", "3"]).burst_seconds, 3.0)
+
+    def test_it_reaches_the_lane_servers_pacing(self):
+        recorded = {}
+
+        class RecordingLaneServer:
+            def __init__(self, handler, host, port, **kwargs):
+                recorded.update(kwargs)
+                self.host, self.port = host, port
+
+            async def start(self):
+                raise KeyboardInterrupt  # nothing past the lane needs to run
+
+            async def stop(self):
+                pass
+
+        log_dir = Path(tempfile.mkdtemp(prefix="relay-burst-"))
+        persona = log_dir / "persona.txt"
+        persona.write_text(PERSONA + "\n")
+        args = main.parse_args(["--lane-host", "127.0.0.1", "--lane-port", "0",
+                                "--no-prewarm", "--burst-seconds", "1.5",
+                                "--persona", str(persona), "--log-dir", str(log_dir)])
+        with unittest.mock.patch.object(main, "LaneServer", RecordingLaneServer):
+            with contextlib.suppress(KeyboardInterrupt):
+                asyncio.run(main.run(args))
+        self.assertEqual(recorded["pacing"], Pacing(burst_seconds=1.5))
+
+
+class SlowServerDefaultsTests(unittest.TestCase):
+    """Defaults measured against the slow server: the bursts' gaps ran past 800 ms, and a
+    farewell it is still speaking can outlive an 8 s drain cap."""
+
+    def test_the_hangover_outlasts_a_bursts_gap_and_the_drain_cap_a_slow_farewell(self):
+        self.assertEqual(Config().reply_silence_ms, 1500.0)
+        self.assertEqual(Config().drain_cap, 12.0)
 
 
 class FarewellPhraseTests(EngineTestCase):
@@ -1143,6 +1458,328 @@ class UplinkNoiseGateEngineTests(EngineTestCase):
         self.assertEqual(uplink["zeroed"], 4)
         self.assertEqual(uplink["gated"], 0)
 
+
+# The live failure this guards, one conversation, 42 replies: the person asked about zebras
+# and the quantized model answered "They are used for decoration... used in fashion... used
+# in art... used in music... used in sports... used in religion... used in education..."
+# and then looped back to fashion/art/music/education and kept going. The machine was not
+# the constraint (rtf 0.64-0.70, input backlog 1-2 frames) -- the model simply would not
+# stop. Each phrase differs from the last by ONE word, which is why the unit the detector
+# counts is a sliding four-word window and not a sentence.
+ZEBRA_LOOP = ["Zebras are used for a lot of things. ", "They are used for decoration. ",
+              "They are used in fashion. ", "They are used in art. ",
+              "They are used in music. ", "They are used in sports. ",
+              "They are used in religion. ", "They are used in education. ",
+              "They are used in fashion. ", "They are used in art. ",
+              "They are used in music. ", "They are used in education. ",
+              "They are used in fashion. ", "They are used in art. ",
+              "They are used in music. ", "They are used in education. ",
+              "They are used in fashion. "]
+# The negative case, deliberately LONGER than the loop above (103 words against 88): a real
+# answer to the same question that rambles without ever repeating itself. If the detector
+# fires on this it is unusable, because this is what a good model sounds like.
+ZEBRA_ANSWER = ["Zebras are wild horses that live in Africa. ",
+                "Every one of them has a stripe pattern nobody else shares, ",
+                "a bit like a fingerprint, and a foal learns to follow its mother by it. ",
+                "The stripes probably keep biting flies away, ",
+                "because flies land far less often on striped surfaces than on plain ones. ",
+                "They also help a herd look like one big shape to a lion at dusk. ",
+                "Plains zebras migrate hundreds of miles between water holes, ",
+                "and they sleep standing up, taking turns to watch for danger. ",
+                "Nobody has ever tamed one properly, which is why you do not ride them. "]
+
+
+class LoopGuardTests(unittest.TestCase):
+    """The repetition detector on its own: normalized four-word windows, counted as they
+    arrive, tripping on the third occurrence of any one of them."""
+
+    def guard(self, **kw):
+        return LoopGuard(**kw)
+
+    @staticmethod
+    def feed_all(guard, phrases):
+        for phrase in phrases:
+            hit = guard.feed(phrase)
+            if hit is not None:
+                return hit
+        return None
+
+    def test_the_zebra_loop_trips_and_names_the_repeated_window(self):
+        self.assertEqual(self.feed_all(self.guard(), ZEBRA_LOOP), "they are used in")
+
+    def test_a_longer_varied_answer_never_trips(self):
+        self.assertIsNone(self.feed_all(self.guard(), ZEBRA_ANSWER))
+
+    def test_it_trips_early_not_only_on_the_verbatim_loop_back(self):
+        """The first pass alone -- every sentence different by one word -- is enough."""
+        self.assertIsNotNone(self.feed_all(self.guard(), ZEBRA_LOOP[:5]))
+
+    def test_ordinary_repeated_words_do_not_trip(self):
+        text = ["The dog and the cat and the bird were in the garden. ",
+                "You are right, that is the one I meant. ",
+                "The weather was warm and the sky was clear, so the walk was nice."]
+        self.assertIsNone(self.feed_all(self.guard(), text))
+
+    def test_a_word_split_across_deltas_is_still_one_word(self):
+        """The server streams text in deltas that cut words in half."""
+        guard = self.guard()
+        hit = self.feed_all(guard, ["they are us", "ed in fash", "ion they are used in art ",
+                                    "they are used in mus", "ic"])
+        self.assertEqual(hit, "they are used in")
+
+    def test_punctuation_and_case_are_ignored(self):
+        guard = self.guard()
+        self.assertIsNone(guard.feed("Round and round we go! "))
+        self.assertIsNone(guard.feed("round, and round we go... "))
+        self.assertEqual(guard.feed("ROUND AND ROUND WE GO"), "round and round we")
+
+    def test_a_stutter_of_one_word_trips(self):
+        self.assertIsNotNone(self.guard().feed("no no no no no no no"))
+
+    def test_the_threshold_is_configurable(self):
+        self.assertIsNone(self.feed_all(self.guard(repeats=9), ZEBRA_LOOP[:5]))
+        self.assertIsNotNone(self.feed_all(self.guard(repeats=2), ZEBRA_LOOP[:4]))
+
+    def test_the_window_is_configurable(self):
+        # A five-word window misses the zebra loop's first pass entirely: each sentence
+        # differs from the last by its final word. That is why the default is four.
+        self.assertIsNone(self.feed_all(self.guard(window=5), ZEBRA_LOOP[:8]))
+
+    def test_reset_forgets_everything(self):
+        guard = self.guard()
+        self.feed_all(guard, ZEBRA_LOOP[:4])
+        guard.reset()
+        self.assertIsNone(self.feed_all(guard, ZEBRA_LOOP[:3]))
+
+    def test_a_disabled_guard_never_trips(self):
+        self.assertIsNone(self.feed_all(self.guard(repeats=0), ZEBRA_LOOP))
+
+
+class ReplyCutTests(EngineTestCase):
+    """Two independent cut-offs on a reply in flight, for a model that will not stop
+    talking (see ZEBRA_LOOP). Either one flushes the robot's buffer, ends the reply with
+    its own `why`, and MUTES the rest of the model's turn -- the model keeps generating for
+    a while and its continuing audio must not open a fresh reply."""
+
+    def cut_script(self, *, phrases=None, seconds=6.0, turns=None, **turn_fields):
+        """One long reply, streamed as fast as the socket takes it and with no agent_end --
+        which is what the real server does when a reply simply finishes."""
+        fields = dict(user_end_at=0.05, reply_delay=0.05, agent_end=False,
+                      reply_seconds=seconds, reply_phrases=phrases)
+        fields.update(turn_fields)
+        return Script(turns=turns or [Turn(**fields)], pace=0, idle_audio_every=0.08)
+
+    @staticmethod
+    def loud(robot):
+        return [f for f in robot.binaries() if any(f.data)]
+
+    async def cut(self, robot, why, timeout=4.0):
+        """Wait for the robot's audio.flush and return the cut's log record."""
+        flush = await robot.wait_text("audio.flush", timeout=timeout)
+        await robot.wait_for(lambda: True)
+        return flush
+
+    async def test_a_reply_past_the_cap_is_cut_and_nothing_more_is_forwarded(self):
+        robot = await self.start(self.cut_script(), reply_max_seconds=1.0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await self.cut(robot, "too-long")
+        mark = len(robot.frames)
+        await asyncio.sleep(0.6)  # the rest of a 6 s reply is still arriving from the model
+        self.assertEqual([f for f in robot.frames[mark:] if f.kind == "binary"], [])
+        self.assertEqual(len(robot.texts("reply")), 1)  # and it opened no new reply
+        await robot.close_conv()
+        records = await self.records(conv)
+        end = self.of(records, "reply.end")[0]
+        self.assertEqual(end["why"], "too-long")
+        # Measured on the audio forwarded, not on the clock: the fake sent all 6 s at once.
+        self.assertGreaterEqual(end["audio_ms"], 1000)
+        self.assertLess(end["audio_ms"], 1200)
+        cut = self.of(records, "reply.cut")[0]
+        self.assertEqual(cut["why"], "too-long")
+        self.assertGreater(self.of(records, "close")[0]["cut"]["muted_chunks"], 0)
+
+    async def test_a_looping_reply_is_cut_by_the_repetition_guard(self):
+        robot = await self.start(self.cut_script(phrases=ZEBRA_LOOP),
+                                 reply_max_seconds=0)  # only the loop guard can fire
+        await self.open_ready(robot)
+        conv = robot.conv
+        await self.cut(robot, "looping")
+        await robot.close_conv()
+        records = await self.records(conv)
+        self.assertEqual(self.of(records, "reply.end")[0]["why"], "looping")
+        cut = self.of(records, "reply.cut")[0]
+        self.assertEqual(cut["why"], "looping")
+        self.assertEqual(cut["phrase"], "they are used in")
+        self.assertIn("used in", cut["text"])  # the offending text, trimmed
+
+    async def test_a_long_varied_answer_of_the_same_shape_is_not_cut(self):
+        """The negative case that matters: a real, rambling, non-repetitive answer -- one
+        word LONGER than the loop above -- has to survive both guards untouched."""
+        robot = await self.start(self.cut_script(phrases=ZEBRA_ANSWER, seconds=6.0),
+                                 reply_max_seconds=0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(self.loud(robot)) >= 20, timeout=5.0)
+        await asyncio.sleep(0.6)
+        self.assertEqual(robot.texts("audio.flush"), [])
+        self.assertEqual(len(robot.texts("reply")), 1)
+        await robot.close_conv()
+        records = await self.records(conv)
+        self.assertEqual(self.of(records, "reply.cut"), [])
+        self.assertEqual(self.of(records, "reply.end")[0]["why"], "silence")
+
+    async def test_the_muted_tail_opens_no_new_reply_and_its_drops_are_counted(self):
+        robot = await self.start(self.cut_script(phrases=ZEBRA_LOOP), reply_max_seconds=0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await self.cut(robot, "looping")
+        await asyncio.sleep(0.8)  # the model talks on, and the idle channel keeps streaming
+        self.assertEqual(len(robot.texts("reply")), 1)
+        await robot.close_conv()
+        cut = self.of(await self.records(conv), "close")[0]["cut"]
+        self.assertEqual(cut["looping"], 1)
+        self.assertEqual(cut["mutes"], 1)
+        self.assertGreater(cut["muted_chunks"], 0)
+
+    async def test_the_next_turn_is_completely_normal_after_a_cut(self):
+        """The conversation stays open: the person speaks again, the model's next reply
+        plays in full, and its farewell phrase still closes the conversation."""
+        script = self.cut_script(turns=[
+            Turn(user_end_at=0.05, reply_delay=0.05, agent_end=False, reply_seconds=6.0,
+                 reply_phrases=ZEBRA_LOOP),
+            Turn(user_end_at=2.0, reply_delay=0.1, agent_end=False, reply_seconds=0.24,
+                 reply_text=["Sure. Talk to you later."]),
+        ])
+        robot = await self.start(script, reply_max_seconds=0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await self.cut(robot, "looping")
+        await robot.wait_for(lambda: len(robot.texts("reply")) == 2, timeout=5.0)
+        mark = len(robot.frames)
+        await robot.wait_for(lambda: [f for f in robot.frames[mark:] if f.kind == "binary"],
+                             timeout=3.0)
+        await asyncio.sleep(0.4)
+        await robot.playback("idle")
+        self.assertEqual((await self.wait_close(robot, timeout=3.0))["reason"], "sleep_word")
+        records = await self.records(conv)
+        ends = self.of(records, "reply.end")
+        self.assertEqual([e["why"] for e in ends], ["looping", "silence"])
+        self.assertEqual(self.of(records, "reply.unmute")[0]["why"], "user_start")
+        self.assertEqual(len(self.of(records, "drain")), 1)
+
+    async def test_the_silence_timer_still_closes_the_conversation_after_a_cut(self):
+        robot = await self.start(self.cut_script(phrases=ZEBRA_LOOP), reply_max_seconds=0,
+                                 silence_timeout=0.8)
+        await self.open_ready(robot)
+        await self.cut(robot, "looping")
+        self.assertEqual((await self.wait_close(robot, timeout=4.0))["reason"], "silence")
+
+    async def test_reply_max_seconds_zero_disables_the_length_cap(self):
+        robot = await self.start(self.cut_script(seconds=3.0), reply_max_seconds=0,
+                                 loop_guard=False)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(self.loud(robot)) >= 20, timeout=5.0)
+        await asyncio.sleep(0.6)
+        self.assertEqual(robot.texts("audio.flush"), [])
+        await robot.close_conv()
+        self.assertEqual(self.of(await self.records(conv), "reply.cut"), [])
+
+    async def test_no_loop_guard_disables_the_repetition_guard(self):
+        robot = await self.start(self.cut_script(phrases=ZEBRA_LOOP), reply_max_seconds=0,
+                                 loop_guard=False)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await robot.wait_for(lambda: len(self.loud(robot)) >= 20, timeout=5.0)
+        await asyncio.sleep(0.6)
+        self.assertEqual(robot.texts("audio.flush"), [])
+        await robot.close_conv()
+        self.assertEqual(self.of(await self.records(conv), "reply.cut"), [])
+
+    async def test_the_length_cap_alone_still_cuts_a_loop_with_the_guard_off(self):
+        robot = await self.start(self.cut_script(phrases=ZEBRA_LOOP), reply_max_seconds=1.0,
+                                 loop_guard=False)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await self.cut(robot, "too-long")
+        await robot.close_conv()
+        self.assertEqual(self.of(await self.records(conv), "reply.end")[0]["why"], "too-long")
+
+
+class BacklogAlarmTests(EngineTestCase):
+    """Round 9. Measured live, `stats.input_backlog_frames` climbed 3 -> 7 -> 14 -> 20 -> 22
+    -> 28 while the server was faster than realtime, and nothing in the relay said so. The
+    alarm cannot fix it -- the frame clock in ModelClient does that -- but it must never let
+    the same failure be invisible again."""
+
+    async def alarms(self, conv):
+        return self.of(await self.records(conv), "uplink.backlog")
+
+    async def test_the_alarm_fires_once_when_the_model_falls_behind(self):
+        script = Script(stats_every=0.04, stats_backlog_frames=40.0, stats_rtf=0.72)
+        robot = await self.start(script, backlog_alarm_frames=25.0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await asyncio.sleep(0.5)  # a dozen stats frames, every one of them over the limit
+        alarms = await self.alarms(conv)
+        self.assertEqual(len(alarms), 1, alarms)
+        self.assertEqual(alarms[0]["frames"], 40.0)
+        self.assertEqual(alarms[0]["limit"], 25.0)
+        self.assertEqual(alarms[0]["rtf"], 0.72)
+        # It names the measured send rate, which is the number that proves whose fault it is.
+        self.assertIn("rate", alarms[0]["uplink"])
+        self.assertIn("sent", alarms[0]["uplink"])
+
+    async def test_a_backlog_under_the_threshold_never_alarms(self):
+        script = Script(stats_every=0.04, stats_backlog_frames=3.0)
+        robot = await self.start(script, backlog_alarm_frames=25.0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await asyncio.sleep(0.4)
+        self.assertEqual(await self.alarms(conv), [])
+
+    async def test_the_alarm_re_arms_only_after_the_backlog_recovers(self):
+        script = Script(stats_every=0.04, stats_backlog_frames=40.0)
+        robot = await self.start(script, backlog_alarm_frames=25.0)
+        await self.open_ready(robot)
+        conv = robot.conv
+        await asyncio.sleep(0.3)
+        self.assertEqual(len(await self.alarms(conv)), 1)
+        script.stats_backlog_frames = 2.0  # the model caught up
+        await asyncio.sleep(0.2)
+        self.assertEqual(len(await self.alarms(conv)), 1)
+        script.stats_backlog_frames = 60.0  # and fell behind again: a new excursion
+        await asyncio.sleep(0.3)
+        alarms = await self.alarms(conv)
+        self.assertEqual(len(alarms), 2, alarms)
+        self.assertEqual(alarms[1]["frames"], 60.0)
+
+    async def test_the_close_record_carries_what_the_model_was_actually_sent(self):
+        robot = await self.start(Script())
+        await self.open_ready(robot)
+        conv = robot.conv
+        for _ in range(4):
+            await robot.send_audio(SPEECH)
+            await asyncio.sleep(0.08)
+        await robot.close_conv()
+        close = self.of(await self.records(conv), "close")[0]
+        model = close["uplink"]["model"]
+        self.assertEqual(model["sent"] + model["zero"], model["frames"])
+        self.assertTrue(0.7 <= model["rate"] <= 1.3, model)
+
+
+class BacklogAlarmDefaultsTests(unittest.TestCase):
+    def test_the_alarm_threshold_is_two_seconds_of_frames_by_default(self):
+        self.assertEqual(Config().backlog_alarm_frames, 25.0)
+
+
+class ReplyCutDefaultsTests(unittest.TestCase):
+    def test_the_guards_are_on_by_default_at_the_documented_settings(self):
+        self.assertEqual(Config().reply_max_seconds, 30.0)
+        self.assertIs(Config().loop_guard, True)
+        self.assertEqual(Config().loop_guard_repeats, 3)
+        self.assertEqual(Config().loop_guard_window, 4)
 
 if __name__ == "__main__":
     unittest.main()

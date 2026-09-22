@@ -3,13 +3,16 @@
 Per robot link the engine is `idle` (listening) or has one conversation, which moves
 connecting -> conversing -> [draining] -> closed:
 
-- connecting: conv.open arrived. Any health probe in flight is cancelled and its result
-  discarded (the model server is single-client, so a probe would evict the conversation),
-  then one ModelClient connects and sends `reset` and `system` (the persona): every
-  conversation is a fresh session (R9). Uplink that arrives meanwhile is kept and goes to
-  the model back to back once connected and the persona has been acknowledged (the model
-  reads it in at roughly 80 ms a word). No ready session within ready_timeout (12 s) ends
-  it with conv.close{model_error}.
+- connecting: conv.open arrived. With prewarm on this is usually instant: a warm session
+  is waiting, already reset and carrying the persona, and the conversation takes it over
+  and sends conv.ready in the same turn of the event loop. Otherwise (prewarm off, or no
+  warm session ready) any health probe in flight is cancelled and its result discarded
+  (the model server is single-client, so a probe would evict the conversation), then one
+  ModelClient connects and sends `reset` and `system` (the persona) -- and this wake pays
+  that persona read, measured at 1.5-2.8 s idle and 10.9 s on a busy server. Either way
+  the session is fresh (R9). Uplink that arrives meanwhile is kept and goes to the model
+  back to back once the persona has been acknowledged. No ready session within
+  ready_timeout (12 s) ends it with conv.close{model_error}.
 - conversing: conv.ready sent. Uplink goes straight to the model; model events and the
   reply audio drive the reply (reply / audio / audio.flush on the lane), the silence timer
   and the farewell matcher. The silence timer is armed at conv.ready, re-armed at user_end
@@ -22,9 +25,11 @@ connecting -> conversing -> [draining] -> closed:
   derived end and a robot playback{idle} after it, then conv.close{sleep_word}. The match
   runs seconds ahead of the audio (text deltas outrun the TTS), so a reply that carried no
   speech does not count as the farewell: the drain waits for one that did, since the point
-  of it is that the person hears the goodbye (R2). If a match ever arrives between replies,
-  no agent_start within farewell_start_timeout (1.5 s) closes at once; drain_cap (8 s)
-  closes with farewell_timeout either way.
+  of it is that the person hears the goodbye (R2). If a match arrives between replies with
+  no speech outstanding, no agent_start within farewell_start_timeout (1.5 s) closes at
+  once; if the model still owes speech it opened a reply for, only drain_cap (8 s) bounds
+  the wait, because that is the goodbye still on its way. drain_cap closes with
+  farewell_timeout either way.
 - closed: conv.close sent (unless the robot or the lane ended it) and the model
   connection closed. A model error, a fatal warning or the model connection closing ends
   it with model_error; the robot link stays up.
@@ -34,22 +39,26 @@ continuously, and between replies it is exact digital silence. `agent_end` is me
 never to arrive when a reply simply finishes -- the child emits it only when the person
 takes the floor back -- so the reply's boundaries are derived from the audio itself:
 
-- a reply BEGINS at the first non-silent chunk, or at agent_start if that comes first;
+- a LOUD chunk is ALWAYS forwarded, in every state. If no reply is open it opens one first
+  -- including while the conversation is DRAINING, because a farewell that starts speaking
+  late must still be heard. Loud audio is never dropped and never counted out of reply;
+- a SILENT chunk is forwarded only inside a reply that has already spoken, which is what
+  keeps the pause between two sentences from splitting one reply. Otherwise it is dropped
+  and counted as `out_of_reply`, so that counter only ever counts silence;
+- a reply BEGINS at its first loud chunk, or at agent_start if that comes first;
 - one opened by agent_start then waits `reply_start_grace_ms` for its first sound, because
   the child's TTS lags its own agent_start by a variable amount (~240 ms in one probe, over
-  640 ms in a run that lost a farewell). The grace expiring ends it as an empty reply
-  (`why: "no-speech"`); the silence it waited through is dropped, not forwarded;
-- from its first loud chunk it ENDS `reply_silence_ms` after its last non-silent chunk, or
-  at agent_end or flush if one of those arrives first. Silence BETWEEN two loud chunks is
-  forwarded, not dropped: that hangover is exactly what keeps a pause between two sentences
-  from splitting a reply. Running the hangover before the reply has any speech is what
-  ended a reply empty and left its farewell to arrive out of reply and be dropped.
+  640 ms in a run that lost a farewell, and past 3 s in the run that lost a whole reply).
+  The grace expiring ends that reply `no-speech` and costs nothing but a reply id: audio
+  that arrives afterwards opens its own reply and plays in full. It also records that the
+  model still owes this conversation speech, which is what the drain below waits for;
+- from its first loud chunk it ENDS `reply_silence_ms` after its last loud chunk, or at
+  agent_end or flush if one of those arrives first.
 
-Only a reply's audio reaches the robot; silence outside one, and the TTS lag at the head of
-one, are dropped and counted in the close record as `out_of_reply`. Without that the robot's speaker never drains, its
-playback{idle} never arrives, and both the farewell drain and the strict gate fall back to
-their timers. Every reply logs a `reply.end` record with its duration and which signal
-ended it, so the field data shows whether silence, agent_end or flush is doing the work.
+Dropping the silence keeps the robot's speaker draining, so its playback{idle} arrives and
+neither the farewell drain nor the strict gate has to fall back to its timer. Every reply
+logs a `reply.end` record with its duration and which signal ended it, so the field data
+shows whether silence, agent_end or flush is doing the work.
 
 Turn-taking (KTD5): in "interruptible" conversations the model's `flush` stops the reply
 at once (the paced queue is discarded and audio.flush{reply} sent). In "strict" ones the
@@ -58,19 +67,42 @@ reports playback idle, plus the cooldown; an idle before the derived end is an u
 logged, and the gate stays closed. The dormant transcript matcher is not fed while the
 gate is closed; the farewell matcher reads the model's own text and is unaffected.
 
-Health (KTD4): while a robot is listening the engine probes the model server every
-probe_interval and pushes status{model_ok} when it changes. After a conversation that
-failed to open or ended with model_error, or that the robot closed while connecting, it
-probes at once and pushes the result even if unchanged. Probes run only while no
-conversation connection is open or opening.
+The warm session (prewarm, on by default): one is opened when a robot links and after
+every conversation closes, and it is handed to a conversation exactly once -- a session
+that has carried a conversation has heard it, so it can never be warm again (R9). It costs
+the model server's one client slot for as long as a robot is linked, which is why
+--no-prewarm exists and why the owner's browser page cannot be open at the same time.
+
+Health (KTD4): while a robot is listening the engine pushes status{model_ok} when it
+changes, and after a conversation that failed to open or ended with model_error, or that
+the robot closed while connecting, it pushes the result even if unchanged. Where that
+answer comes from depends on prewarm, because the server takes one client and the two
+sources must never race:
+
+A warm session waits SILENTLY: it sends `reset` and the persona and then nothing at all
+until a conversation adopts it, when its uplink (and the zero-frame watchdog the model's VAD
+needs between the person's words) starts. The model server is slower than realtime, so idle
+frames only build its input backlog. Its liveness is still watched: the connection closing,
+not traffic on it, is what says the model went away.
+
+- prewarm ON: the warm session IS the health signal. Opening one is a stronger check than
+  `status` (it proves the persona can be read in, not just that the port answers), and its
+  connection dying is what says the model went away. A failed or lost warm session is
+  retried every probe_interval, which is also what re-reports model_ok when it comes back.
+- prewarm OFF: the probe path, unchanged -- probe() every probe_interval while the robot is
+  listening, never while a conversation connection is open or opening.
+
+engine.start() probes once in both modes: no robot is linked yet, so nothing is warm.
 
 Every conversation writes one JSONL log (relay.logging) with the model events, lane
 frames (never audio bytes), matcher decisions (`sleepword`, whichever matcher made them)
 and a per-turn latency record.
 """
 import asyncio
+import collections
 import logging
 import math
+import re
 from array import array
 from dataclasses import dataclass, field
 
@@ -79,6 +111,7 @@ from relay.logging import new_conversation_id
 from relay.model_client import (
     DEFAULT_PATH,
     DEFAULT_PORT,
+    FRAME_SECONDS,
     INPUT_RATE,
     OUTPUT_RATE,
     AgentEnd,
@@ -123,6 +156,13 @@ INTERRUPTIBLE = "interruptible"
 FATAL_WARNING_CODES = frozenset({"fatal"})
 BACKLOG_MAX_CHUNKS = 128  # about 10 s of 80 ms uplink frames buffered while connecting
 UPLINK_GATE_FRAME_MS = 20  # the uplink gate decides per 20 ms of the robot's 80 ms chunk
+TOO_LONG = "too-long"
+LOOPING = "looping"
+# Ending a reply for one of these discards what the robot has already buffered
+# (audio.flush) instead of letting the lane's pacer play it out.
+FLUSH_REASONS = frozenset({"flush", TOO_LONG, LOOPING})
+CUT_SNIPPET_CHARS = 240  # how much of the offending text is logged
+_NOT_WORD = re.compile(r"[^a-z0-9]+")
 
 
 def chunk_rms(pcm):
@@ -143,6 +183,75 @@ def is_silent(pcm, threshold):
     if not any(pcm):
         return True
     return threshold > 0 and chunk_rms(pcm) < threshold
+
+
+class LoopGuard:
+    """Trip when the reply in flight starts repeating itself.
+
+    THE EVIDENCE (one live conversation, 42 replies): asked a simple question about zebras,
+    the quantized model answered "They are used for decoration... used in fashion... used in
+    art... used in music... used in sports... used in religion... used in education..." and
+    then looped back to fashion/art/music/education and kept going. The machine was not the
+    constraint -- rtf 0.64-0.70, input backlog 1-2 frames -- the model simply would not stop.
+
+    THE RULE, chosen from exactly that: normalize (lowercase, every run of non-alphanumeric
+    characters becomes one space), then count each sliding WINDOW of `window` consecutive
+    words as it arrives. Trip on the `repeats`-th occurrence of any one window, and report
+    it. Defaults: a four-word window, three occurrences.
+
+    Why a four-word window and not sentences: every sentence in that answer differs from the
+    last by ONE word, so counting whole sentences catches nothing until the model loops back
+    verbatim, which took it another six sentences. The window "they are used in" recurs in
+    every one of them and trips on the third -- four sentences in. It is also why the window
+    is not longer: at five words, "they are used in fashion" and "they are used in art" are
+    different units and the first pass is invisible (the test asserts this).
+
+    Why not shorter, and why three: ordinary English repeats three-word runs innocently
+    ("one of the", "a lot of", "the rest of"), and any phrase said once or twice is normal
+    speech -- "you are right" is an answer, "you are right" three times is a stuck model. A
+    window is counted at every position, so a one-word stutter ("no no no no no no") also
+    trips, which is the other shape this failure takes.
+
+    Text arrives as deltas that cut words in half ("they are us" / "ed in fash" / "ion"), so
+    the trailing partial word is held back until a separator arrives for it.
+
+    `repeats=0` disables the guard entirely."""
+
+    def __init__(self, repeats=3, window=4):
+        self.repeats = repeats
+        self.window = max(1, window)
+        self.reset()
+
+    @property
+    def enabled(self):
+        return self.repeats > 0
+
+    def reset(self):
+        self._buf = ""
+        self._recent = collections.deque(maxlen=self.window)
+        self._counts = {}
+        self._tripped = False
+
+    def feed(self, text):
+        """Add the next assistant-text delta; returns the repeated phrase, or None."""
+        if not self.enabled or self._tripped or not text:
+            return None
+        self._buf += text
+        norm = _NOT_WORD.sub(" ", self._buf.lower())
+        words = norm.split()
+        # A trailing character that is not a separator means the last word may still be
+        # half-written, so carry it into the next delta rather than counting a fragment.
+        self._buf = words.pop() if (words and not norm.endswith(" ")) else ""
+        for word in words:
+            self._recent.append(word)
+            if len(self._recent) < self.window:
+                continue
+            phrase = " ".join(self._recent)
+            seen = self._counts[phrase] = self._counts.get(phrase, 0) + 1
+            if seen >= self.repeats:
+                self._tripped = True
+                return phrase
+        return None
 
 
 class UplinkGate:
@@ -211,17 +320,37 @@ class Config:
     # relay waits for that ack; the robot's own limit (15 s) stays above this one.
     ready_timeout: float = 12.0
     silence_timeout: float = 90.0
-    drain_cap: float = 8.0
+    # Backstop on the farewell, not a normal path: the drain closes on the robot's
+    # playback{idle} as soon as the goodbye has been spoken. A server slower than realtime
+    # takes longer than 8 s to speak one, and cutting it off there is exactly what the
+    # drain exists to prevent, so the cap sits well above a slow farewell.
+    drain_cap: float = 12.0
     farewell_start_timeout: float = 1.5  # match to agent_start, else close at once
     # A reply ends this long (milliseconds) after its last non-silent audio chunk. It has
     # to outlast the pauses the model leaves between sentences and fall well inside the
     # drain cap; `agent_end` would end a reply sooner, but the real server never sends one.
-    reply_silence_ms: float = 600.0
+    # Measured on a server slower than realtime: the reply arrives in bursts whose gaps run
+    # past 800 ms, and at 600 ms each gap ended the reply -- one sentence became a dozen
+    # 80 ms replies, which is the stuttering the person heard. Continued `assistant_text_delta`
+    # and a non-zero `stats.speech_queue` hold a reply open past this as well.
+    reply_silence_ms: float = 1500.0
     # A reply opened by `agent_start` waits this long (milliseconds) for its first sound
     # before it ends as an empty one (`why: "no-speech"`). The child's TTS lags its own
     # agent_start -- about 240 ms in one probe, over 640 ms in a run that lost a farewell --
     # so the end-of-speech hangover above must not start until the reply has any speech.
     reply_start_grace_ms: float = 3000.0
+    # The newest `stats` sample counts as current for this long. The server sends stats
+    # only every few seconds, so a reply held open by a non-zero `speech_queue` must not be
+    # held open for good by a sample that stopped being refreshed (a stalled server, or one
+    # that went quiet); past this the hangover decides on the audio alone.
+    stats_max_age: float = 10.0
+    # SAFETY NET on the failure round 9 fixed (see ModelClient's frame clock). The model
+    # reports how far behind its input is in `stats.input_backlog_frames`; past this many
+    # frames -- 25 is 2 s, well beyond the 1-2 frames a healthy session sits at -- the relay
+    # logs one loud warning naming its own measured send rate, so a relay feeding the model
+    # faster than realtime can never again be invisible in the field. Logging only: the
+    # frame clock is the fix, and dropping audio on an alarm would hide it again. 0 disables.
+    backlog_alarm_frames: float = 25.0
     # Below this RMS a reply-channel chunk counts as silence. The real server sends exact
     # digital silence (RMS 0.0) between replies; the margin is for a noisier build.
     reply_silence_rms: float = 50.0
@@ -234,15 +363,55 @@ class Config:
     # Uplink frames stay unmuted this long (milliseconds) after the last loud one, so the
     # decaying tail of a word is not clipped; 0 mutes on the first quiet frame.
     uplink_gate_hang_ms: float = 200.0
+    # HARD LENGTH CAP on one reply, in seconds of the audio actually forwarded to the
+    # robot -- not wall clock, so a server slower than realtime is not cut off early for
+    # being slow. 0 disables it. The quantized model does not stop talking on its own (see
+    # LoopGuard), and 30 s is already far past anything this persona is asked for.
+    reply_max_seconds: float = 30.0
+    # Watch the reply's own text and cut it when the model starts repeating itself.
+    loop_guard: bool = True
+    loop_guard_repeats: int = 3  # occurrences of one window that trip it
+    loop_guard_window: int = 4  # words per counted window; see LoopGuard for why four
+    # Either guard MUTES the rest of the model's turn: it keeps generating for a while
+    # after the cut, and that audio must not open a fresh reply. The mute ends at the
+    # turn's real end (agent_end, a flush, the next agent_start, or the person speaking
+    # again); this is only the backstop if none of those ever arrives.
+    cut_mute_cap: float = 20.0
     cooldown: float = 0.3  # strict gate stays shut this long after the robot goes idle
     strict_idle_grace: float = 2.0  # strict gate opens anyway if no idle comes after a reply
-    probe_interval: float = 5.0
+    # Keep one model session open, already reset and carrying the persona, so that a wake
+    # does not pay the persona read (measured live: 1.5-2.8 s idle, 10.9 s on a busy
+    # server, against the robot's 15 s ready timeout). The model server takes ONE client,
+    # so with this on the relay holds it for as long as a robot is linked and the owner's
+    # browser page cannot use the model at the same time. Off, the relay connects per
+    # conversation and the persona read is back on the critical path.
+    prewarm: bool = True
+    probe_interval: float = 5.0  # also the re-warm retry interval when a warm session fails
     probe_timeout: float = 2.0
     sleep_settle: float = 0.5  # running transcript age before the matcher decides on it
     # The farewell phrase the persona is told to end its goodbye with, and the only way a
     # conversation ends by itself today. Must match the persona file; "" disables it.
     farewell_phrase: str = DEFAULT_FAREWELL_PHRASE
     fatal_warning_codes: frozenset = field(default=FATAL_WARNING_CODES)
+
+
+class _Warm:
+    """A model session that has already sent `reset` and the persona and is waiting for a
+    conversation to take it over, so that conv.open only has to start streaming.
+
+    Handed out exactly once (ConversationEngine._take_warm) and never handed out again: a
+    session that has carried a conversation has heard that conversation, and R9 says every
+    conversation starts fresh with nothing remembered. A new one is opened after each
+    conversation closes."""
+
+    def __init__(self, client, opened_at, system_ms):
+        self.client = client
+        self.opened_at = opened_at
+        self.system_ms = system_ms  # what reading the persona in cost, off the wake path
+        self.watcher = None  # drains its events and notices it dying
+
+    def age_ms(self, now):
+        return round((now - self.opened_at) * 1000, 1)
 
 
 class _Robot:
@@ -295,9 +464,22 @@ class Conversation:
         self.gate_open_at = 0.0  # strict: end of the cooldown
         self.farewell_started = False
         self.farewell_ended = False
+        # The model opened a reply (agent_start) and the start grace expired before its TTS
+        # produced a sound: it still owes this conversation that speech. Cleared by the
+        # first loud chunk of any reply. The drain reads it, because a farewell matched
+        # while this is set is a farewell that has been written but not yet spoken.
+        self.speech_pending = False
         self.turn = None  # the latency record of the current reply
         self.turns = 0
+        self.warm = False  # took over a warm session instead of opening its own
+        self.warm_age_ms = None  # how long that session had been waiting
+        self.warm_system_ms = None  # what it had already paid to read the persona in
+        self.system_ms = 0.0  # what THIS conversation paid for the persona, on its own path
         self.last_stats = None
+        self.last_stats_at = None  # loop time of that sample, so a stale one cannot hold a reply
+        # The backlog alarm has fired for the excursion the model is in now; it re-arms when
+        # the backlog comes back under the threshold, so one bad stretch logs one warning.
+        self.backlog_alarm = False
         # `zeroed`: chunks the strict/draining gate replaced wholesale. `gated`: chunks the
         # uplink noise gate muted part or all of (backlog ones included, so it can exceed
         # `frames`); `gated_frames`: the 20 ms sub-frames inside them.
@@ -307,6 +489,17 @@ class Conversation:
                                       engine.config.uplink_gate_hang_ms)
         # Reply-channel audio the model streamed outside any reply, dropped by the gate.
         self.out_of_reply = {"chunks": 0, "bytes": 0}
+        # The reply guards (see LoopGuard and Config.reply_max_seconds). `muted` is the
+        # rest of a cut turn: every reply-channel chunk is dropped and no reply may open
+        # until the turn really ends.
+        self.loop_guard = LoopGuard(
+            engine.config.loop_guard_repeats if engine.config.loop_guard else 0,
+            engine.config.loop_guard_window)
+        self.reply_text = ""  # assistant text of the reply in flight, for the cut snippet
+        self.muted = False
+        self.muted_drops = {"chunks": 0, "bytes": 0}  # this mute's, reset when one starts
+        self.cut = {"too_long": 0, "looping": 0, "mutes": 0, "muted_chunks": 0,
+                    "muted_bytes": 0}
         self._timers = {}
 
     def log(self, ev, **fields):
@@ -360,6 +553,9 @@ class ConversationEngine:
         self.logs = logs if logs is not None else _NullLogs()
         self.robots = {}  # Link -> _Robot
         self.model_ok_last = True  # the latest probe result, for `welcome`
+        self.warm = None  # the _Warm session waiting for a conversation, if any
+        self._warm_task = None  # the one opening it
+        self._warm_retry = None  # the backoff timer after a failed or lost warm session
         self._tasks = set()
 
     async def start(self):
@@ -368,6 +564,7 @@ class ConversationEngine:
                  "reachable" if self.model_ok_last else "NOT reachable")
 
     async def stop(self):
+        self._drop_warm("relay stopping")
         for robot in list(self.robots.values()):
             if robot.conversation is not None:
                 self._end(robot.conversation, "link_lost", notify=False, detail="relay stopping")
@@ -388,7 +585,12 @@ class ConversationEngine:
     def on_link(self, link):
         robot = _Robot(link, self.model_ok_last)
         self.robots[link] = robot
-        robot.prober = self._spawn(self._prober(robot), f"probe-{link.robot_id}")
+        if self.config.prewarm:
+            # The warm session is the health signal too: opening one is a stronger probe
+            # than `status`, and a probe beside it would evict it (one client only).
+            self._want_warm()
+        else:
+            robot.prober = self._spawn(self._prober(robot), f"probe-{link.robot_id}")
 
     def on_link_closed(self, link, why):
         robot = self.robots.get(link)
@@ -415,7 +617,13 @@ class ConversationEngine:
               msg=msg)
         log.info("%s conv %s open (%s, log %s)", link.robot_id, conv, turn_taking, c.id)
         c.set_timer("ready", cfg.ready_timeout, self._ready_expired)
-        c.opener = self._spawn(self._open(c), f"model-open-{c.id}")
+        warm = self._take_warm() if cfg.prewarm else None
+        if warm is not None:
+            # Nothing to wait for: the session is reset, carries the persona and has been
+            # acknowledged. conv.ready goes out in this same turn of the event loop.
+            self._adopt(c, warm)
+        else:
+            c.opener = self._spawn(self._open(c), f"model-open-{c.id}")
 
     def on_uplink(self, link, conv, pcm):
         c = self._current(link, conv)
@@ -486,13 +694,29 @@ class ConversationEngine:
 
     async def _open(self, c):
         robot = c.robot
+        cfg = self.config
+        if cfg.prewarm and self._warm_task is not None and not self._warm_task.done():
+            # A warm session is already being opened. Wait for that one rather than
+            # connect beside it: the model server takes a single client, and this
+            # conversation would have to pay the same persona read anyway. The `ready`
+            # timer bounds the wait.
+            await asyncio.wait({self._warm_task})
+            if c.state != CONNECTING:
+                return
         waits = [t for t in (robot.probe_task, robot.model_closing)
                  if t is not None and not t.done()]
         if waits:
             await asyncio.wait(waits)
         if c.state != CONNECTING:
             return
-        cfg = self.config
+        warm = self._take_warm() if cfg.prewarm else None
+        if warm is not None:
+            self._adopt(c, warm)
+            return
+        why = "prewarm is off" if not cfg.prewarm else "no warm session was ready"
+        c.log("warm.miss", why=why)
+        log.info("%s conv %s is opening its own model session (%s): the persona read is on "
+                 "the critical path of this wake", c.link.robot_id, c.conv, why)
         try:
             c.client = ModelClient(cfg.model_host, cfg.model_port, persona=cfg.persona,
                                    path=cfg.model_path, open_timeout=cfg.ready_timeout)
@@ -510,12 +734,40 @@ class ConversationEngine:
             return
         if c.state != CONNECTING:
             return
+        c.system_ms = c.client.system_ms  # what reading the persona in cost this wake
+        c.backlog = None  # open() already sent it, as it iterated it
+        self._ready(c)
+
+    def _adopt(self, c, warm):
+        """Take over a warm session: this conversation pays no persona read at all. The
+        session has been silent until now (see _open_warm); its uplink, and with it the
+        zero-frame watchdog the model's VAD needs, starts here."""
+        now = asyncio.get_running_loop().time()
+        c.client = warm.client
+        c.client.start_uplink()
+        c.warm = True
+        c.warm_age_ms = warm.age_ms(now)
+        c.warm_system_ms = warm.system_ms
+        c.log("warm.adopt", age_ms=c.warm_age_ms, system_ms=warm.system_ms)
+        log.info("%s conv %s adopted the warm model session (%s ms old, its persona read "
+                 "cost %s ms, off this wake's critical path)", c.link.robot_id, c.conv,
+                 c.warm_age_ms, warm.system_ms)
+        self._ready(c)
+
+    def _ready(self, c):
+        """The model session is usable: hand over anything held and tell the robot. No
+        await between the backlog and CONVERSING, so uplink cannot overtake it."""
+        if c.state != CONNECTING:
+            return
+        for chunk in c.backlog or ():  # only on the adopted path; open() sends its own
+            c.client.send_audio(chunk)
         c.backlog = None
         c.state = CONVERSING
         c.cancel_timer("ready")
         c.link.send_conv_ready(c.conv)
         c.log("relay", msg={"type": "conv.ready"}, backlog_chunks=c.uplink["backlog"],
-              system_ms=c.client.system_ms)  # what reading the persona in cost this wake
+              system_ms=c.system_ms, warm=c.warm, warm_age_ms=c.warm_age_ms,
+              warm_system_ms=c.warm_system_ms)
         self._arm_silence(c)
         c.pump = self._spawn(self._pump(c), f"model-events-{c.id}")
 
@@ -536,8 +788,9 @@ class ConversationEngine:
             c.link.close_conv(reason, c.conv)
         c.log("close", reason=reason, state=previous, detail=detail,
               duration_ms=round((asyncio.get_running_loop().time() - c.t0) * 1000, 1),
-              system_ms=c.client.system_ms if c.client else None,
-              turns=c.turns, uplink=c.uplink, out_of_reply=c.out_of_reply,
+              system_ms=c.client.system_ms if c.client else None, warm=c.warm,
+              turns=c.turns, uplink=self._uplink_record(c), out_of_reply=c.out_of_reply,
+              cut=c.cut,
               model_chunks_sent=c.client.chunks_sent if c.client else 0,
               model_zero_frames=c.client.zero_frames_sent if c.client else 0)
         log.info("%s conv %s closed: %s%s (%d out-of-reply audio chunks dropped)",
@@ -550,6 +803,16 @@ class ConversationEngine:
         # way out of its unreachable state keys off that status frame (KTD3, KTD4).
         force = reason == "model_error" or previous == CONNECTING
         robot.model_closing = self._spawn(self._shutdown(c, force), f"model-close-{c.id}")
+
+    @staticmethod
+    def _uplink_record(c):
+        """The conversation's uplink counters, plus what the model was actually handed:
+        frames sent, frames zero-filled for an empty slot, chunks queued behind the frame
+        clock and chunks dropped at its bound, and the measured send rate in audio seconds
+        per wall second. `rate` is the number the live failure needed and did not have."""
+        record = dict(c.uplink)
+        record["model"] = c.client.uplink_stats() if c.client is not None else {}
+        return record
 
     async def _shutdown(self, c, force):
         me = asyncio.current_task()
@@ -567,12 +830,19 @@ class ConversationEngine:
             robot.force_probe = robot.force_probe or force
             robot.listening.set()
             robot.kick.set()
+            # The session just closed has heard a conversation, so it can never be warm
+            # again (R9). Open a new one for the next wake.
+            self._want_warm()
 
     def _forget(self, robot):
         self.robots.pop(robot.link, None)
         for task in (robot.prober, robot.probe_task):
             if task is not None:
                 task.cancel()
+        if not self.robots:
+            # Nothing to be ready for: give the model server's single client slot back, so
+            # the owner's browser page works again while no robot is linked.
+            self._drop_warm("no robot is linked")
 
     # --- model events ---
 
@@ -598,6 +868,7 @@ class ConversationEngine:
             return
         c.log("model", msg=ev.data)
         if isinstance(ev, UserStart):
+            self._unmute(c, "user_start")  # the person has the floor: the turn is over
             c.user_speaking = True
             c.cancel_timer("silence")
         elif isinstance(ev, UserTextDelta):
@@ -624,12 +895,15 @@ class ConversationEngine:
         elif isinstance(ev, AgentEnd):
             self._on_agent_end(c, now)
         elif isinstance(ev, Flush):
+            self._unmute(c, "flush")
             if c.reply_id is not None:
                 self._end_reply(c, now, "flush")
             else:
                 c.dropping = True
         elif isinstance(ev, Stats):
             c.last_stats = ev.data
+            c.last_stats_at = now
+            self._check_backlog(c, ev.data)
         elif isinstance(ev, ModelError):
             self._end(c, "model_error", detail=f"model error {ev.code!r}: {ev.message}")
         elif isinstance(ev, ModelWarning):
@@ -639,15 +913,30 @@ class ConversationEngine:
                 log.warning("%s conv %s: model warning %r: %s", c.link.robot_id, c.conv,
                             ev.code, ev.message)
         elif isinstance(ev, AssistantTextDelta):
+            if c.muted:
+                # The tail of a cut turn. It is not going to be spoken, so it is not
+                # matched against the farewell either: the goodbye has to be heard (R2).
+                return
+            # Text still arriving for this reply says the model is still producing the turn,
+            # so it holds the reply open exactly as a loud chunk does (see _keep_speaking).
+            self._keep_speaking(c)
             # The model's own text is the only text on the channel, and its farewell phrase
             # is how a conversation ends here. The person's words are never matched against
             # it: there is no transcript of them at all (KTD2 stays dormant).
             if c.state == CONVERSING:
                 self._decide(c, c.farewell.feed(ev.text))
+            if c.reply_id is not None:
+                # The repetition guard reads the reply in flight. Only a reply that is
+                # actually open can be cut, so text between replies is not accumulated.
+                c.reply_text += ev.text
+                phrase = c.loop_guard.feed(ev.text)
+                if phrase is not None:
+                    self._cut_reply(c, now, LOOPING, phrase)
 
     def _on_agent_start(self, c, now):
         """agent_start does arrive (measured); it is only agent_end that never does. If the
         audio beat it to the reply by a chunk or two, that reply is this one."""
+        self._unmute(c, "agent_start")  # a new reply is a new turn
         if c.reply_id is not None:
             if c.turn is not None and c.turn["begun_by"] == "audio":
                 c.turn["begun_by"] = "audio+agent_start"
@@ -657,6 +946,7 @@ class ConversationEngine:
         self._begin_reply(c, now, "agent_start")
 
     def _on_agent_end(self, c, now):
+        self._unmute(c, "agent_end")
         if c.reply_id is not None:
             self._end_reply(c, now, "agent_end")
             return
@@ -683,11 +973,14 @@ class ConversationEngine:
         c.cancel_timer("silence")
         c.reply_id = c.link.begin_reply()
         c.dropping = False
+        c.loop_guard.reset()  # each reply is judged on its own text
+        c.reply_text = ""
         c.turns += 1
         c.turn = {"n": c.turns, "reply": c.reply_id, "begun_by": why, "end_reason": None,
                   "reply_ms": None, "user_end_to_first_chunk_ms": None,
                   "robot_first_chunk_to_play_ms": None, "reply_chunks": 0, "reply_bytes": 0,
                   "loud_chunks": 0, "silent_chunks": 0, "dropped_chunks": 0, "flushed": False,
+                  "text_deltas": 0, "queue_holds": 0,
                   "underruns": 0, "_start": now, "_user_end": c.last_user_end,
                   "_first_chunk": None, "_first_loud": None}
         c.last_user_end = None
@@ -724,7 +1017,13 @@ class ConversationEngine:
         if reply_id is None:
             return
         turn = c.turn
-        if why == "flush":
+        if why == "no-speech":
+            # agent_start with nothing behind it yet: the child's TTS is still lagging, so
+            # the speech is owed, not lost. Audio that arrives later opens its own reply.
+            c.speech_pending = True
+        if why in FLUSH_REASONS:
+            # Stop playing this reply AT ONCE: the robot drops what it has buffered and
+            # goes quiet, rather than talking on for as long as the pacer's queue lasts.
             c.link.flush_reply(reply_id)
             c.log("relay", msg={"type": "audio.flush", "reply": reply_id})
             c.dropping = True
@@ -771,10 +1070,146 @@ class ConversationEngine:
                 c.farewell_started = False
                 c.log("drain.empty", reply=reply_id, why=why)
 
+    def _cut_reply(self, c, now, why, detail):
+        """A guard tripped on the reply in flight (see Config.reply_max_seconds and
+        LoopGuard). Stop forwarding it, flush what the robot has buffered so it goes quiet
+        and the person can speak again, end the reply with its own `why`, and mute the rest
+        of the model's turn. The conversation itself stays open."""
+        reply_id = c.reply_id
+        if reply_id is None:
+            return
+        snippet = c.reply_text[-CUT_SNIPPET_CHARS:]
+        audio_ms = round(c.turn["reply_bytes"] / 2 / OUTPUT_RATE * 1000, 1) if c.turn else None
+        c.cut["too_long" if why == TOO_LONG else "looping"] += 1
+        c.log("reply.cut", reply=reply_id, why=why, detail=detail, audio_ms=audio_ms,
+              phrase=detail if why == LOOPING else None,
+              text=("..." + snippet) if len(c.reply_text) > len(snippet) else snippet)
+        log.info("%s conv %s: CUTTING reply %s (%s: %s) after %s ms of audio -- the rest of "
+                 "this turn is muted. Text: %r", c.link.robot_id, c.conv, reply_id, why,
+                 detail, audio_ms, snippet)
+        self._end_reply(c, now, why)  # flushes, because why is in FLUSH_REASONS
+        self._mute_turn(c)
+
+    def _mute_turn(self, c):
+        """Drop the rest of the model's turn. The model keeps generating for a while after
+        a cut -- that is the whole reason it had to be cut -- and every chunk of it would
+        otherwise open a fresh reply and start the robot talking again. `dropping` is not
+        enough: it clears on the first silent chunk, and the server streams silence between
+        its own bursts. The mute ends only when the turn really does (see _unmute)."""
+        c.muted = True
+        c.muted_drops = {"chunks": 0, "bytes": 0}
+        c.cut["mutes"] += 1
+        c.set_timer("mute_cap", self.config.cut_mute_cap, self._mute_cap_expired)
+
+    def _unmute(self, c, why):
+        """The model's turn ended: back to normal. Counts what the mute dropped."""
+        if not c.muted:
+            return
+        c.muted = False
+        c.dropping = False  # the stale tail is already gone; do not drop the next reply
+        c.cancel_timer("mute_cap")
+        c.log("reply.unmute", why=why, **c.muted_drops)
+        log.info("%s conv %s: muted turn ended (%s); %d chunks (%d bytes) dropped",
+                 c.link.robot_id, c.conv, why, c.muted_drops["chunks"],
+                 c.muted_drops["bytes"])
+
+    def _mute_cap_expired(self, c):
+        if c.state != CLOSED:
+            self._unmute(c, "timeout")
+
+    def _over_length(self, c):
+        """True once this reply has forwarded more than reply_max_seconds of audio. Measured
+        on the audio itself, so a server slower than realtime is never cut short for being
+        slow -- only a reply that is genuinely too long to sit through is."""
+        cap = self.config.reply_max_seconds
+        if cap <= 0 or c.turn is None:
+            return False
+        return c.turn["reply_bytes"] / 2 / OUTPUT_RATE > cap
+
+    def _arm_hangover(self, c):
+        """(Re-)start the end-of-speech hangover. Anything that says the model is still
+        producing this reply comes through here: its loud audio, its text, its speech
+        queue."""
+        c.set_timer("reply_silence", self.config.reply_silence_ms / 1000,
+                    self._reply_silence_expired)
+
+    def _keep_speaking(self, c):
+        """`assistant_text_delta` for the reply in flight: the model is still producing this
+        turn, so the gap in its audio is the server being slow, not the reply ending.
+        Measured live, that is exactly what a slower-than-realtime server does -- speech,
+        800-900 ms of silence while it computes, more speech -- and ending the reply at each
+        gap restarted the robot's player a dozen times inside one sentence.
+
+        Only once the reply has spoken, because until then the START GRACE governs and the
+        text means the opposite: it runs seconds ahead of the TTS, so text before any sound
+        is the lag the grace exists to bound, not evidence of speech."""
+        if c.reply_id is None or c.turn is None or c.turn["_first_loud"] is None:
+            return
+        c.turn["text_deltas"] += 1
+        self._arm_hangover(c)
+
+    def _check_backlog(self, c, data):
+        """Watch how far behind the model's input is (`stats.input_backlog_frames`) and log
+        ONE loud warning per excursion past Config.backlog_alarm_frames.
+
+        Round 9, measured live: the backlog climbed 3 -> 7 -> 14 -> 20 -> 22 -> 28 while the
+        server itself was faster than realtime (rtf 0.70-0.76), and nothing said so -- the
+        only sign was the conversation degenerating. A server with headroom can only fall
+        behind if it is being fed faster than realtime, so the warning names the relay's own
+        measured send rate: >= 1.0 and the relay is the cause, well under 1.0 and the server
+        is. No corrective action: the frame clock in ModelClient is the fix, and dropping
+        audio here would only hide a regression in it."""
+        limit = self.config.backlog_alarm_frames
+        if not limit or not isinstance(data, dict):
+            return
+        try:
+            frames = float(data.get("input_backlog_frames") or 0)
+        except (TypeError, ValueError):
+            return
+        if frames <= limit:
+            c.backlog_alarm = False  # recovered: the next excursion gets its own warning
+            return
+        if c.backlog_alarm:
+            return
+        c.backlog_alarm = True
+        stats = c.client.uplink_stats() if c.client is not None else {}
+        c.log("uplink.backlog", frames=frames, limit=limit, rtf=data.get("rtf"), uplink=stats)
+        log.warning(
+            "%s conv %s: the model is %g frames (%.1f s) behind on its input, past the %g "
+            "frame alarm -- this relay has sent it %s s of audio in %s frames at %s x "
+            "realtime (server rtf %s). At or above 1.0 the relay is overfeeding it; well "
+            "below 1.0 the server itself cannot keep up.",
+            c.link.robot_id, c.conv, frames, frames * FRAME_SECONDS, limit,
+            stats.get("seconds"), stats.get("frames"), stats.get("rate"), data.get("rtf"))
+
+    def _speech_queued(self, c, now):
+        """Whether the model's newest `stats` says it still has TTS queued for playback
+        (`speech_queue`, in frames). A sample is optional and arrives only every few
+        seconds, so a missing -- or stale, see Config.stats_max_age -- one blocks nothing:
+        this answers False and the audio alone decides."""
+        data = c.last_stats
+        if not isinstance(data, dict) or c.last_stats_at is None:
+            return False
+        if now - c.last_stats_at > self.config.stats_max_age:
+            return False
+        try:
+            return float(data.get("speech_queue") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
     def _reply_silence_expired(self, c):
-        """No non-silent audio for reply_silence_ms (the hangover): the reply is over."""
-        if c.state != CLOSED and c.reply_id is not None:
-            self._end_reply(c, asyncio.get_running_loop().time(), "silence")
+        """No non-silent audio for reply_silence_ms (the hangover): the reply is over --
+        unless the model still has speech queued for playback, which says more of this
+        reply is on its way and only the server's pace is in the way of hearing it."""
+        if c.state == CLOSED or c.reply_id is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if self._speech_queued(c, now):
+            if c.turn is not None:
+                c.turn["queue_holds"] += 1
+            self._arm_hangover(c)
+            return
+        self._end_reply(c, now, "silence")
 
     def _reply_start_grace_expired(self, c):
         """An agent_start the model has still not spoken after reply_start_grace_ms: end the
@@ -783,36 +1218,59 @@ class ConversationEngine:
         if c.state != CLOSED and c.reply_id is not None:
             self._end_reply(c, asyncio.get_running_loop().time(), "no-speech")
 
-    def _on_reply_audio(self, c, pcm, now):
-        """Forward the model's audio to the robot only while a reply is open, and derive
-        that reply's own start and end from the audio.
+    def _drop_silence(self, c, pcm):
+        """Count one silent chunk the robot is not given. Only silence ever comes here:
+        `out_of_reply` is a silence counter, and a non-zero one is not a lost reply."""
+        c.out_of_reply["chunks"] += 1
+        c.out_of_reply["bytes"] += len(pcm)
 
-        The model streams reply-channel audio continuously, whether or not it is speaking
+    def _on_reply_audio(self, c, pcm, now):
+        """Forward the model's reply-channel audio to the robot, and derive each reply's
+        own start and end from that audio.
+
+        ONE RULE, because breaking it once cost a person a whole spoken goodbye: a LOUD
+        chunk is always forwarded, whatever the state, and opens a reply if none is open --
+        DRAINING included, since a farewell whose TTS starts late must still be heard. Only
+        SILENCE is ever dropped, and only outside a reply that has already spoken.
+
+        The model streams the reply channel continuously, whether or not it is speaking
         (docs/model-server-protocol.md: 228 frames over one 20 s run, no gap above 0.4 s),
-        and what it streams outside a reply is exact digital silence. Forwarding all of it
+        and what it streams outside a reply is exact digital silence. Forwarding that too
         would keep the robot's speaker permanently busy, so its playback{idle} would never
         arrive, the farewell drain would always run to its cap and the strict gate would
         only ever reopen on its backstop. agent_start still says "I am speaking", but the
         matching agent_end is measured never to come, so sound starting and sound stopping
         are what open and close a reply.
 
-        agent_start runs ahead of the sound: the child's TTS lags it. While a reply that
-        agent_start opened is still waiting for its first loud chunk, the silence it is
-        waiting through is dropped like any other out-of-reply silence, and reply_start_grace
-        rather than the hangover bounds the wait."""
+        agent_start runs ahead of the sound: the child's TTS lags it, by over 3 s in the
+        run that lost a reply. While a reply agent_start opened is still waiting for its
+        first loud chunk, the silence it waits through is dropped like any other, and
+        reply_start_grace rather than the hangover bounds the wait -- but the grace giving
+        up never puts later audio at risk: that audio is loud, so it opens its own reply."""
+        if c.muted:
+            # A guard cut this turn's reply; everything the model produces until the turn
+            # ends goes nowhere. Counted, so the field data shows how much that is.
+            c.muted_drops["chunks"] += 1
+            c.muted_drops["bytes"] += len(pcm)
+            c.cut["muted_chunks"] += 1
+            c.cut["muted_bytes"] += len(pcm)
+            return
         silent = is_silent(pcm, self.config.reply_silence_rms)
         if c.reply_id is None:
             if c.dropping:
-                # Flushed mid-reply: the tail the model had already produced is discarded
-                # until its stream goes quiet again (or agent_start opens the next reply).
+                # The one place loud audio is deliberately not forwarded, and it is not a
+                # drop of anything the person should hear: the conversation is interruptible
+                # and the person barged in, so the tail the model had already produced is
+                # stale and must not play over them. Counted apart, as `dropped_chunks`, and
+                # only until the model's stream goes quiet (or agent_start opens the next
+                # reply). Nothing here is counted out of reply.
                 if not silent:
                     if c.turn is not None:
                         c.turn["dropped_chunks"] += 1
                     return
                 c.dropping = False
             if silent:
-                c.out_of_reply["chunks"] += 1
-                c.out_of_reply["bytes"] += len(pcm)
+                self._drop_silence(c, pcm)
                 return
             self._begin_reply(c, now, "audio")
         turn = c.turn
@@ -820,8 +1278,7 @@ class ConversationEngine:
             # The reply is open (agent_start) but has not started speaking yet: this is the
             # TTS lag. Drop it like any other out-of-reply silence, so the robot is not given
             # a lag to play before the reply's first word and an empty reply forwards nothing.
-            c.out_of_reply["chunks"] += 1
-            c.out_of_reply["bytes"] += len(pcm)
+            self._drop_silence(c, pcm)
             return
         if not c.link.send_reply_audio(c.reply_id, pcm):
             return
@@ -831,15 +1288,20 @@ class ConversationEngine:
         turn["reply_bytes"] += len(pcm)
         if silent:
             turn["silent_chunks"] += 1
-            return  # the hangover armed by the last non-silent chunk keeps running
-        turn["loud_chunks"] += 1
-        if turn["_first_loud"] is None:
-            turn["_first_loud"] = now
-            c.cancel_timer("reply_start_grace")  # the hangover governs from here
-            if turn["_user_end"] is not None:
-                turn["user_end_to_first_chunk_ms"] = round((now - turn["_user_end"]) * 1000, 1)
-        c.set_timer("reply_silence", self.config.reply_silence_ms / 1000,
-                    self._reply_silence_expired)
+            # the hangover armed by the last non-silent chunk keeps running
+        else:
+            turn["loud_chunks"] += 1
+            if turn["_first_loud"] is None:
+                turn["_first_loud"] = now
+                c.speech_pending = False  # the model caught up with itself
+                c.cancel_timer("reply_start_grace")  # the hangover governs from here
+                if turn["_user_end"] is not None:
+                    turn["user_end_to_first_chunk_ms"] = round((now - turn["_user_end"]) * 1000,
+                                                               1)
+            self._arm_hangover(c)
+        if self._over_length(c):
+            self._cut_reply(c, now, TOO_LONG,
+                            f"{self.config.reply_max_seconds} s of reply audio")
 
     def _finish_turn(self, c):
         """Write the latency record of the reply just finished (at the next reply or the
@@ -891,8 +1353,12 @@ class ConversationEngine:
         c.cancel_timer("silence")
         c.cancel_timer("match_poll")
         # The farewell phrase is matched while the farewell is already being spoken, so
-        # the reply in flight IS the farewell and no further agent_start is coming.
-        c.farewell_started = c.agent_speaking
+        # the reply in flight IS the farewell and no further agent_start is coming. It is
+        # also the farewell when the model has opened a reply and not yet spoken in it
+        # (`speech_pending`): the text runs seconds ahead of the TTS, and closing on the
+        # farewell-start timer before a sound arrives is exactly how a person is left
+        # hearing nothing of the goodbye (R2). The drain cap is the bound in that case.
+        c.farewell_started = c.agent_speaking or c.speech_pending
         c.farewell_ended = False
         c.log("drain", agent_speaking=c.agent_speaking)
         cfg = self.config
@@ -918,6 +1384,125 @@ class ConversationEngine:
     def _silence_expired(self, c):
         if c.state == CONVERSING and not c.agent_speaking:
             self._end(c, "silence")
+
+    # --- the warm session ---
+
+    def _want_warm(self):
+        """Open a warm session if prewarm is on, a robot is linked and listening, and none
+        is open or opening. Cheap and idempotent: call it wherever that might have become
+        true."""
+        if not self.config.prewarm or self.warm is not None or self._warm_task is not None:
+            return
+        if not self.robots or any(r.conversation is not None for r in self.robots.values()):
+            return  # a conversation owns the model server's one client slot
+        if all(r.link.closed for r in self.robots.values()):
+            return
+        self._warm_task = self._spawn(self._open_warm(), "model-warm")
+
+    async def _open_warm(self):
+        """Connect, `reset`, send the persona and wait for its ack -- all of it before any
+        wake, so that conv.open only has to start streaming. Failing is also the health
+        answer: it is a stronger check than `status`, and running both would mean two
+        connections to a server that takes one."""
+        me = asyncio.current_task()
+        cfg = self.config
+        closing = [r.model_closing for r in self.robots.values()
+                   if r.model_closing is not None and not r.model_closing.done()]
+        if closing:
+            await asyncio.wait(closing)  # never connect on top of a closing conversation
+        client = ModelClient(cfg.model_host, cfg.model_port, persona=cfg.persona,
+                             path=cfg.model_path, open_timeout=cfg.probe_timeout)
+        try:
+            # Quiet: a warm session must not stream anything at the model while it waits.
+            # ModelClient's watchdog would fill the wait with 80 ms zero frames, and this
+            # server runs slower than realtime (measured rtf 1.8-3.3), so they queue up as
+            # input backlog -- live, a conversation started with the model ~18 s behind and
+            # climbing, and hours of it degenerated the model into a repetition loop. The
+            # uplink (watchdog included) starts at adoption, where the VAD needs it.
+            await client.open(quiet=True)
+        except asyncio.CancelledError:
+            self._spawn(self._close_client(client), "model-warm-drop")
+            raise
+        except Exception as exc:  # noqa: BLE001 - OSError, TimeoutError, InvalidHandshake...
+            if self._warm_task is me:
+                self._warm_task = None
+            log.info("no warm model session: %r", exc)
+            self._spawn(self._close_client(client), "model-warm-drop")
+            self._report_all(False)
+            self._retry_warm()
+            return
+        now = asyncio.get_running_loop().time()
+        if self._warm_task is me:
+            self._warm_task = None
+        if not self.robots or not self.config.prewarm:  # nobody is waiting for it any more
+            self._spawn(self._close_client(client), "model-warm-drop")
+            return
+        warm = _Warm(client, now, client.system_ms)
+        self.warm = warm  # no await since the check above: nothing can have taken it
+        warm.watcher = self._spawn(self._watch_warm(warm), "model-warm-watch")
+        log.info("warm model session ready (persona read in %s ms, off the wake path); the "
+                 "relay now holds the model server's single client slot",
+                 client.system_ms)
+        self._report_all(True)
+
+    async def _watch_warm(self, warm):
+        """Hold the session open and discard everything the model says on it: no
+        conversation has started, so none of it belongs to one. Ends when the connection
+        does -- which, while a warm session is held, is the model-not-reachable signal."""
+        async for _event in warm.client.events():
+            pass
+        if self.warm is not warm:
+            return  # already adopted or released; whoever took it owns the close
+        self.warm = None
+        log.warning("warm model session lost: the model server evicted it (its browser page "
+                    "opened?) or went away; model not reachable until it is back")
+        self._report_all(False)
+        self._retry_warm()
+
+    def _take_warm(self):
+        """The warm session, handed out once and then gone. A session that has carried a
+        conversation is never warm again (R9), so there is no way back into this."""
+        warm, self.warm = self.warm, None
+        if warm is None:
+            return None
+        if warm.watcher is not None:
+            warm.watcher.cancel()  # its events belong to the conversation from here
+        if warm.client.closed:  # died between the watcher noticing and now
+            self._spawn(self._close_client(warm.client), "model-warm-drop")
+            return None
+        return warm
+
+    def _drop_warm(self, why):
+        """Release the warm session and stop trying to keep one."""
+        if self._warm_task is not None:
+            self._warm_task.cancel()
+            self._warm_task = None
+        if self._warm_retry is not None:
+            self._warm_retry.cancel()
+            self._warm_retry = None
+        warm = self._take_warm()
+        if warm is not None:
+            log.info("warm model session released (%s)", why)
+            self._spawn(self._close_client(warm.client), "model-warm-drop")
+
+    def _retry_warm(self):
+        """Try again after one probe interval. One timer at a time, so a model server that
+        is down is retried at the prober's own pace and never hammered."""
+        if self._warm_retry is not None or not self.config.prewarm:
+            return
+        loop = asyncio.get_running_loop()
+        self._warm_retry = loop.call_later(self.config.probe_interval, self._guard,
+                                           self._warm_retry_due)
+
+    def _warm_retry_due(self):
+        self._warm_retry = None
+        self._want_warm()
+
+    async def _close_client(self, client):
+        try:
+            await client.close()
+        except Exception:  # noqa: BLE001 - closing a broken socket must not raise
+            log.exception("closing a model connection failed")
 
     # --- health probe ---
 
@@ -962,6 +1547,16 @@ class ConversationEngine:
                 await asyncio.wait_for(robot.kick.wait(), self.config.probe_interval)
             except TimeoutError:
                 pass
+
+    def _report_all(self, ok):
+        """Push model_ok to every linked robot, by the same rules a probe result follows:
+        on a change, or when a failed conversation asked for a fresh status either way."""
+        self.model_ok_last = ok
+        for robot in list(self.robots.values()):
+            if robot.link.closed:
+                continue
+            force, robot.force_probe = robot.force_probe, False
+            self._report_model_ok(robot, ok, force)
 
     def _report_model_ok(self, robot, ok, force):
         changed = ok != robot.model_ok

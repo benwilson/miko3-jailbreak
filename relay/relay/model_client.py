@@ -12,11 +12,27 @@ handed over before the ack is kept and forwarded in order once it arrives, so a 
 forgetful session every time (R9) never costs the first words. After that it keeps the
 model's input stream continuous, because silence is how the model hears the person stop:
 
-- every uplink chunk is forwarded the moment it is handed over, never re-paced, so Wi-Fi
-  jitter cannot build into permanent input lag;
-- a watchdog sends one zero-filled 80 ms frame only when a full 80 ms passes with nothing
-  forwarded, whatever size the uplink frames are;
-- a backlog handed to open() (the robot's pre-`conv.ready` buffer) goes out back to back.
+- the uplink runs on a FRAME CLOCK: exactly one frame leaves per frame period of wall
+  clock, on a deadline that advances by the audio duration of the frame just sent, so it
+  can neither drift nor bunch. Whatever is queued at the deadline goes; if nothing is,
+  a zero-filled 80 ms frame goes instead, because silence is how the model's VAD hears the
+  person stop. Chunks arriving faster than the clock (Wi-Fi jitter catching up, or a
+  pre-ready buffer) are queued and released at that rate, never dumped; past
+  UPLINK_QUEUE_CHUNKS the oldest is dropped and counted, because a robot persistently
+  ahead of realtime is a bug and silently growing lag is worse than a drop;
+- this is only once the uplink has started: a session opened `quiet` (the relay's warm
+  one) sends nothing at all until start_uplink(), because idle frames only build the
+  model's input backlog;
+- a backlog handed to open() (the robot's pre-`conv.ready` buffer) is queued like the rest
+  and released at the frame rate -- see open().
+
+Round 9, measured live: `stats.input_backlog_frames` climbed 3 -> 7 -> 14 -> 20 -> 22 -> 28
+while the server itself was FASTER than realtime (rtf 0.70-0.76), and earlier in the same
+session compounded until the model was ~39 s behind and degenerated. A server with headroom
+can only fall behind if it is fed faster than realtime: chunks were forwarded the instant
+they arrived AND the watchdog filled the slot a late chunk had not arrived for, so one
+jittery chunk cost two frames for one 80 ms slot. uplink_stats()["rate"] is that number,
+measured, so the failure can be seen rather than inferred.
 
 Server frames come back as a typed event stream (events()), ending with exactly one Closed.
 A server `error` closes the connection and the stream, with the error's code on Closed.
@@ -41,7 +57,10 @@ OUTPUT_RATE = 22050  # reply PCM: 16-bit LE mono
 FRAME_SECONDS = 0.080
 ZERO_FRAME = bytes(int(INPUT_RATE * FRAME_SECONDS) * 2)  # 1,280 samples, 2,560 bytes
 SYSTEM_TEXT_FIELD = "text"  # assumption: field carrying the persona on `system` (see protocol doc)
-UPLINK_QUEUE_CHUNKS = 64  # about 5 s of 80 ms chunks; beyond that the oldest is dropped
+# The release queue in front of the frame clock. Bounding it bounds the latency a robot
+# running ahead of realtime can build: 64 chunks is about 5 s of 80 ms audio, and past that
+# the OLDEST is dropped, so what survives is what the person just said.
+UPLINK_QUEUE_CHUNKS = 64
 EVENT_QUEUE_EVENTS = 1024
 PREREADY_CHUNKS = 512  # about 40 s of 80 ms chunks held while the persona is read in
 SYSTEM_TIMEOUT = 20.0  # generous: a long persona is read in at roughly 80 ms a word
@@ -164,6 +183,11 @@ class Closed(ModelEvent):
     error: bool = False
 
 
+def frame_seconds(frame):
+    """Seconds of audio in one uplink frame (16-bit LE mono at INPUT_RATE)."""
+    return len(frame) / 2 / INPUT_RATE
+
+
 def check_persona(persona):
     """ValueError naming the first non-ASCII character, which the model server rejects."""
     try:
@@ -201,7 +225,8 @@ class ModelClient:
     """
 
     def __init__(self, host, port=DEFAULT_PORT, persona="", *, path=DEFAULT_PATH,
-                 open_timeout=3.0, system_timeout=SYSTEM_TIMEOUT):
+                 open_timeout=3.0, system_timeout=SYSTEM_TIMEOUT,
+                 uplink_queue=UPLINK_QUEUE_CHUNKS):
         check_persona(persona)
         self.host = host
         self.port = port
@@ -210,14 +235,26 @@ class ModelClient:
         self.open_timeout = open_timeout
         self.system_timeout = system_timeout
         self.transcript = ""  # the person's running transcript for the current turn
-        self.chunks_sent = 0
-        self.zero_frames_sent = 0
-        self.dropped_chunks = 0
+        self.chunks_sent = 0  # real uplink frames forwarded
+        self.zero_frames_sent = 0  # frame slots nothing had arrived for
+        self.dropped_chunks = 0  # total dropped: the pre-ready hold plus the release queue
+        self.dropped_preready = 0  # dropped while held before the ack / while quiet
+        self.uplink_dropped = 0  # dropped oldest at the release queue's bound
+        self.chunks_queued = 0  # chunks ever put on the release queue
+        self.queue_peak = 0  # deepest the release queue ever got: how far ahead the robot ran
+        self.audio_seconds_sent = 0.0  # audio duration handed to the model, zero frames included
         self.system_acked = False  # the `system` ack arrived: the session is usable
+        self.quiet = False  # opened quiet (a warm session): hold everything, send nothing
         self.system_ms = None  # how long the child took to read the persona in
         self.ready = False  # open() finished: the ack is in and everything held is away
         self._ws = None
-        self._uplink = asyncio.Queue(UPLINK_QUEUE_CHUNKS)
+        self._uplink = asyncio.Queue(uplink_queue)
+        # The frame clock's own measurement: first send, last send, and the audio covered
+        # by every frame but the one in flight. Over exactly [first send, last send] those
+        # two are the same interval, so send_rate is unbiased even a few frames in.
+        self._first_send_at = None
+        self._last_send_at = None
+        self._audio_before_last = 0.0
         self._preready = []  # audio handed over before the ack, kept in order
         self._events = asyncio.Queue(EVENT_QUEUE_EVENTS)
         self._acked = asyncio.Event()
@@ -234,9 +271,31 @@ class ModelClient:
     def closed(self):
         return self._closed_event is not None
 
-    async def open(self, backlog=()):
+    async def open(self, backlog=(), *, quiet=False):
         """Connect, reset the session, send the persona, wait for the child's `system` ack,
-        then forward `backlog` and anything handed to send_audio meanwhile, back to back.
+        then start the frame clock on `backlog` and anything handed to send_audio meanwhile,
+        oldest first.
+
+        THE PRE-READY BACKLOG IS PACED LIKE EVERYTHING ELSE (round 9). It used to go out
+        back to back, to catch up faster. That is the one thing the model's input stream
+        cannot absorb: its input is a timeline, so N frames dumped in put it N frames
+        behind, and it stays there. Measured, the server had 30% of headroom at best (rtf
+        0.70), which drains one frame of backlog for every three it plays -- so a 10 s
+        buffer costs over 30 s of lag -- and at the rtf 1.8-3.3 also measured it never
+        drains at all. Paced, the model hears the buffer at the rate the person spoke it:
+        first response comes later by however long the robot was buffering, which is
+        near zero on the warm path (adoption is same-tick) and the persona read on the cold
+        one, and the model is never left behind. The release queue's bound caps even that,
+        dropping the oldest of an over-long buffer rather than the newest.
+
+        `quiet=True` stops there and sends NOTHING more until start_uplink(): no audio, and
+        no watchdog zero frames. That is the relay's warm session, waiting to be adopted.
+        The watchdog exists so the model's VAD hears the person stop talking; before a
+        conversation nobody is talking, and this server runs slower than realtime (measured
+        rtf 1.8-3.3), so every frame sent into it only lengthens its input backlog -- live,
+        a conversation opened with the model already ~18 s behind and it went on climbing.
+        The session stays live and instantly usable: the persona is already in, and the
+        connection itself (its WebSocket keepalive included) is the liveness signal.
 
         Raises OSError, TimeoutError or websockets' InvalidHandshake if the server is not
         there, and SystemAckTimeout if the persona is never acknowledged: without that ack
@@ -254,15 +313,37 @@ class ModelClient:
             raise
         self.system_ms = round((asyncio.get_running_loop().time() - started) * 1000, 1)
         self.system_acked = True
-        # The ack is in: everything held goes out in order, oldest first, before the
-        # watchdog starts filling silence.
+        if quiet:
+            self.quiet = True
+            self._preready = list(backlog) + self._preready
+            log.info("model session quiet %s (persona read in %s ms; silent until the "
+                     "uplink starts)", self.uri, self.system_ms)
+            return
+        # The ack is in: everything held joins the release queue in order, oldest first,
+        # and the frame clock hands it over at the rate the model can actually hear it.
         held, self._preready = self._preready, []
         for chunk in list(backlog) + held:
-            await self._send_chunk(chunk)
+            self._enqueue(chunk)
+        self._start_uplink_loop()
+
+    def start_uplink(self, backlog=()):
+        """Start forwarding uplink on a session opened `quiet`: `backlog` first, then
+        everything held while it was quiet, then live audio and the watchdog's zero frames.
+        Synchronous, so adoption can go straight on to conv.ready with nothing between."""
+        for chunk in backlog:
+            self.send_audio(chunk)  # while quiet these are held, in order
+        self.quiet = False
+        held, self._preready = self._preready, []
+        for chunk in held:
+            self._enqueue(chunk)
+        self._start_uplink_loop()
+
+    def _start_uplink_loop(self):
         self.ready = True
-        log.info("model session ready %s (persona read in %s ms, %d chunks held)",
-                 self.uri, self.system_ms, self.chunks_sent)
-        self._sender = asyncio.create_task(self._send_loop(), name="model-uplink")
+        log.info("model session ready %s (persona read in %s ms, %d chunks queued)",
+                 self.uri, self.system_ms, self._uplink.qsize())
+        if self._sender is None and not self.closed:
+            self._sender = asyncio.create_task(self._send_loop(), name="model-uplink")
 
     async def _await_system_ack(self):
         """Wait for the `system` ack, tolerating the `system_start` and `progress` frames
@@ -286,24 +367,65 @@ class ModelClient:
 
     def send_audio(self, chunk):
         """Queue one uplink chunk (16-bit LE 16 kHz mono, any whole number of samples) for
-        immediate forwarding. Never blocks; a no-op once closed. Before the `system` ack it
-        is held instead, and goes out in order as soon as the session is ready."""
+        immediate forwarding. Never blocks; a no-op once closed. Before the `system` ack --
+        and on a quiet session, until start_uplink() -- it is held instead, and goes out in
+        order as soon as the session is ready."""
         if len(chunk) % 2:
             raise ValueError(f"uplink chunk of {len(chunk)} bytes is not whole 16-bit samples")
         if self.closed:
             return
-        if not self.system_acked:
+        if not self.system_acked or self.quiet:
             if len(self._preready) >= PREREADY_CHUNKS:
                 self._preready.pop(0)
                 self.dropped_chunks += 1
+                self.dropped_preready += 1
             self._preready.append(chunk)
             return
+        self._enqueue(chunk)
+
+    def _enqueue(self, chunk):
+        """Put one chunk on the release queue the frame clock drains. Past the bound the
+        OLDEST goes: a robot that is persistently ahead of realtime is a bug, and the newest
+        audio is the audio the person is speaking now."""
+        self.chunks_queued += 1
         if self._uplink.full():
             self._uplink.get_nowait()
             self.dropped_chunks += 1
-            if self.dropped_chunks == 1 or self.dropped_chunks % 50 == 0:
-                log.warning("model uplink stalled: %d chunks dropped", self.dropped_chunks)
+            self.uplink_dropped += 1
+            if self.uplink_dropped == 1 or self.uplink_dropped % 50 == 0:
+                log.warning("model uplink is ahead of realtime: %d chunks dropped from the "
+                            "front of a %d-chunk release queue (send rate %.2f x realtime)",
+                            self.uplink_dropped, self._uplink.maxsize, self.send_rate)
         self._uplink.put_nowait(chunk)
+        self.queue_peak = max(self.queue_peak, self._uplink.qsize())
+
+    @property
+    def frames_sent(self):
+        """Every frame the model was handed: real chunks plus the clock's zero frames."""
+        return self.chunks_sent + self.zero_frames_sent
+
+    @property
+    def send_rate(self):
+        """Audio seconds handed to the model per second of wall clock -- THE number this
+        round is about. The frame clock holds it at 1.00; the unpaced uplink it replaced
+        measured 1.15-1.5, and every percent over 1.0 is input backlog the model never gets
+        back. 0.0 until two frames have gone out."""
+        if self._first_send_at is None or self._last_send_at is None:
+            return 0.0
+        elapsed = self._last_send_at - self._first_send_at
+        if elapsed <= 0:
+            return 0.0
+        return self._audio_before_last / elapsed
+
+    def uplink_stats(self):
+        """What the model was actually sent, for the conversation's own uplink stats."""
+        return {"frames": self.frames_sent, "sent": self.chunks_sent,
+                "zero": self.zero_frames_sent, "queued": self.chunks_queued,
+                "queue_depth": self._uplink.qsize(), "queue_peak": self.queue_peak,
+                "dropped": self.dropped_chunks, "dropped_queue": self.uplink_dropped,
+                "dropped_preready": self.dropped_preready,
+                "seconds": round(self.audio_seconds_sent, 3),
+                "rate": round(self.send_rate, 3)}
 
     async def events(self):
         """Server events in arrival order; the stream ends after its single Closed."""
@@ -331,31 +453,53 @@ class ModelClient:
         self._emit_closed(Closed(code=self._ws.close_code if self._ws else None,
                                  reason="closed by relay"))
 
-    async def _send_chunk(self, chunk):
-        await self._ws.send(chunk)
-        self.chunks_sent += 1
+    async def _send_frame(self, frame, now, *, zero):
+        await self._ws.send(frame)
+        if zero:
+            self.zero_frames_sent += 1
+        else:
+            self.chunks_sent += 1
+        if self._first_send_at is None:
+            self._first_send_at = now
+        self._last_send_at = now
+        self._audio_before_last = self.audio_seconds_sent
+        self.audio_seconds_sent += frame_seconds(frame)
 
     async def _send_loop(self):
+        """The frame clock. One frame leaves per frame period of wall clock and no more,
+        ever: that is the whole fix. The deadline advances by the audio duration of the
+        frame just sent -- one FRAME_SECONDS for the robot's 80 ms chunks and for every zero
+        frame -- rather than being reset to "now", so scheduling jitter can neither make the
+        clock drift late nor let it bunch frames to catch up.
+
+        Advancing by the frame's own duration rather than a flat FRAME_SECONDS matters
+        because the uplink contract allows any whole number of samples per chunk: the
+        invariant that has to hold is audio seconds sent <= wall seconds elapsed, not frames
+        sent <= slots elapsed. For 80 ms chunks the two are the same thing.
+
+        Whatever is queued at the deadline goes; when nothing is, the zero frame goes, so
+        the model's VAD still hears silence and the person's turn still ends. What it will
+        NOT do any more is send both for one slot, which is how a late chunk over Wi-Fi used
+        to buy the model an extra 80 ms of permanent input backlog."""
         loop = asyncio.get_running_loop()
-        last = loop.time()
+        deadline = loop.time()
         try:
             while True:
+                wait = deadline - loop.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
                 try:
-                    chunk = self._uplink.get_nowait()
+                    chunk, zero = self._uplink.get_nowait(), False
                 except asyncio.QueueEmpty:
-                    wait = last + FRAME_SECONDS - loop.time()
-                    try:
-                        chunk = await asyncio.wait_for(self._uplink.get(), max(wait, 0.0))
-                    except asyncio.TimeoutError:
-                        await self._ws.send(ZERO_FRAME)
-                        self.zero_frames_sent += 1
-                        # Keep an even 80 ms cadence, but never burst zeros to catch up after
-                        # the loop itself stalled: that would be the lag this avoids.
-                        now = loop.time()
-                        last = last + FRAME_SECONDS if now - last < 2 * FRAME_SECONDS else now
-                        continue
-                await self._send_chunk(chunk)
-                last = loop.time()
+                    chunk, zero = ZERO_FRAME, True
+                now = loop.time()
+                await self._send_frame(chunk, now, zero=zero)
+                deadline += frame_seconds(chunk)
+                # If the event loop itself stalled for longer than a frame, resync instead
+                # of firing off the frames the stall owes: catching up is exactly the lag
+                # this clock exists to prevent.
+                if deadline < now - FRAME_SECONDS:
+                    deadline = now
         except ConnectionClosed:
             pass  # the receive loop reports the close
         except asyncio.CancelledError:

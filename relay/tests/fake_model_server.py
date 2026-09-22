@@ -13,7 +13,13 @@ relay tests are deterministic:
     async with FakeModelServer(script) as server:
         client = ModelClient("127.0.0.1", server.port, persona="...")
 
-A turn can also script the real child's TTS lag: `reply_silence_before` seconds of digital
+A turn can stream `assistant_text_delta` through its own reply audio (`reply_phrases`),
+the way the real server keeps producing text while it speaks -- a long reply whose phrases
+repeat scripts the quantized model's degenerate loop.
+
+A turn can script a slower-than-realtime server's BURSTY reply (`reply_bursts=[Burst(...)]`):
+stretches of speech separated by gaps of digital silence, with `assistant_text_delta` still
+arriving through the gaps. A turn can also script the real child's TTS lag: `reply_silence_before` seconds of digital
 silence on the reply channel between `agent_start` (with its `reply_text` deltas) and the
 first speech chunk, and `agent_end=False` for the real server's missing `agent_end`.
 
@@ -36,6 +42,25 @@ from websockets.exceptions import ConnectionClosed
 OUTPUT_RATE = 22050  # the real server's reply PCM: 16-bit mono 22.05 kHz
 TAKEOVER_CLOSE_CODE = 1000  # assumption: the real server's close code on takeover is unknown
 TAKEOVER_CLOSE_REASON = "replaced by a new client"
+
+
+@dataclass
+class Burst:
+    """One stretch of a bursty reply, the way a slower-than-realtime server sends one:
+    `silence` seconds of digital silence while the server computes, then `speech` seconds
+    of audio. Its `text` deltas are spread evenly through the silence (the model's text
+    runs ahead of its TTS, so it keeps talking in text while the audio has not caught up);
+    with no silence they go out at the head of the burst."""
+    silence: float = 0.0
+    speech: float = 0.0
+    text: list[str] = field(default_factory=list)
+    # Wall-clock delivery rate for THIS burst's chunks, overriding Script.pace (0 = as
+    # fast as the socket takes them). The real server's speech generation is capped at
+    # about 1.0x realtime by its duplex timeline, but what it has already generated sits
+    # in its TTS queue (`stats.speech_queue`) and goes out in a lump when it flushes. So
+    # one reply is a fast head followed by a sub-realtime tail, and how much of that head
+    # the robot is allowed to bank is exactly what the relay's burst cap decides.
+    pace: float | None = None
 
 
 @dataclass
@@ -64,6 +89,17 @@ class Turn:
     # reply_text deltas, which go out with agent_start) before the first speech chunk.
     # `reply_seconds=0` scripts an agent_start the model never speaks after at all.
     reply_silence_before: float = 0.0
+    # Measured on a server slower than realtime: the reply audio arrives in BURSTS -- a
+    # loud stretch, then a gap of silence while the server computes, then another -- with
+    # `assistant_text_delta` still flowing through the gaps. Set to a list of Burst to
+    # script that; it replaces reply_seconds / reply_gap_* for this turn's reply body.
+    reply_bursts: list[Burst] | None = None
+    # `assistant_text_delta` spread evenly THROUGH the reply's own audio, rather than all
+    # at agent_start the way `reply_text` goes out. That is what the real server does -- it
+    # keeps producing text while it speaks -- and it is what a guard watching the reply in
+    # flight has to see. A long `reply_seconds` with a repeating phrase list scripts the
+    # quantized model's degenerate loop; with a varied one, an ordinary long answer.
+    reply_phrases: list[str] | None = None
 
 
 @dataclass
@@ -74,6 +110,11 @@ class Script:
     flush_rms: float | None = None  # uplink RMS that interrupts an active reply (None = never)
     stats_every: float | None = None  # seconds between stats frames (None = none)
     stats_backlog: float = 0.0  # input backlog reported in stats, seconds
+    # `input_backlog_frames`: how many 80 ms frames of uplink the child has not consumed
+    # yet. This is the field the real server sends and the relay's backlog alarm watches;
+    # a test may change it while the session runs to drive an excursion and a recovery.
+    stats_backlog_frames: float = 0.0
+    stats_rtf: float | None = None  # `rtf`; < 1 means the server is faster than realtime
     stats_speech_queue: int = 0
     # Seconds between out-of-reply reply-channel audio chunks (None = none). The real
     # server streams reply audio continuously, whether or not it is replying -- see
@@ -92,40 +133,80 @@ class Script:
     system_ack_delay: float = 0.01  # how long the persona takes to read in
 
 
+def chunk_count(script, seconds):
+    """How many chunks the fake sends for a stretch of `seconds`."""
+    return max(0, round(seconds * 1000 / script.chunk_ms))
+
+
+def speech_chunk(script, turn_index, i):
+    """The i-th loud chunk of a turn's reply: distinct bytes per turn and per chunk, so a
+    test can assert exactly which chunks reached the robot and in which order."""
+    samples = OUTPUT_RATE * script.chunk_ms // 1000
+    base = (turn_index * 7919 + i * 131) % 20000
+    return array("h", ((base + k) % 20000 - 10000 for k in range(samples))).tobytes()
+
+
+def silence_chunk(script):
+    """One chunk of the exact digital silence the real server sends when it is not
+    speaking -- between replies, and inside one while it is still computing."""
+    return bytes(OUTPUT_RATE * script.chunk_ms // 1000 * 2)
+
+
 def speech_chunks(script, turn_index):
     """The loud chunks of a turn's reply, without any scripted in-reply silence."""
     turn = script.turns[turn_index]
-    samples = OUTPUT_RATE * script.chunk_ms // 1000
+    if turn.reply_bursts is not None:
+        return [pcm for pcm, loud in burst_frames(script, turn_index) if loud]
     if turn.reply_seconds <= 0:
         return []  # an agent_start with no speech behind it
     count = max(1, round(turn.reply_seconds * 1000 / script.chunk_ms))
-    chunks = []
-    for i in range(count):
-        base = (turn_index * 7919 + i * 131) % 20000
-        pcm = array("h", ((base + k) % 20000 - 10000 for k in range(samples)))
-        chunks.append(pcm.tobytes())
-    return chunks
+    return [speech_chunk(script, turn_index, i) for i in range(count)]
+
+
+def burst_frames(script, turn_index):
+    """Every reply chunk of a bursty turn in order, as (pcm, is_speech) pairs."""
+    turn = script.turns[turn_index]
+    frames, i = [], 0
+    for burst in turn.reply_bursts or []:
+        frames += [(silence_chunk(script), False)] * chunk_count(script, burst.silence)
+        for _ in range(chunk_count(script, burst.speech)):
+            frames.append((speech_chunk(script, turn_index, i), True))
+            i += 1
+    return frames
 
 
 def reply_chunks(script, turn_index):
     """The exact reply PCM chunks the fake sends for a turn, so tests can check bytes:
-    its speech, with any scripted gap of digital silence spliced in."""
+    its speech, with any scripted gap of digital silence spliced in (or, for a bursty
+    turn, the whole burst timeline)."""
     turn = script.turns[turn_index]
+    if turn.reply_bursts is not None:
+        return [pcm for pcm, _loud in burst_frames(script, turn_index)]
     chunks = speech_chunks(script, turn_index)
     if turn.reply_gap_after is None or turn.reply_gap_seconds <= 0:
         return chunks
     at = max(1, round(turn.reply_gap_after * 1000 / script.chunk_ms))
     gap = max(1, round(turn.reply_gap_seconds * 1000 / script.chunk_ms))
-    silence = bytes(OUTPUT_RATE * script.chunk_ms // 1000 * 2)
-    return chunks[:at] + [silence] * gap + chunks[at:]
+    return chunks[:at] + [silence_chunk(script)] * gap + chunks[at:]
 
 
 def lead_silence_chunks(script, turn_index):
     """The digital silence a turn sends between its `agent_start` and its first speech
     chunk: the real server's TTS lag (see Turn.reply_silence_before)."""
     turn = script.turns[turn_index]
-    count = round(turn.reply_silence_before * 1000 / script.chunk_ms)
-    return [bytes(OUTPUT_RATE * script.chunk_ms // 1000 * 2)] * max(0, count)
+    return [silence_chunk(script)] * chunk_count(script, turn.reply_silence_before)
+
+
+def phrase_schedule(phrases, chunks):
+    """Which `reply_phrases` deltas go out just before which reply chunk, spread evenly
+    over the reply's audio; {} when there is nothing to spread."""
+    due = {}
+    phrases = list(phrases or ())
+    if not phrases or chunks <= 0:
+        return due
+    for j, text in enumerate(phrases):
+        due.setdefault(min(chunks - 1, j * chunks // len(phrases)), []).append(text)
+    return due
 
 
 def idle_chunk(script):
@@ -133,7 +214,7 @@ def idle_chunk(script):
     sends between replies; `idle_audio_sample` makes it audible instead."""
     samples = OUTPUT_RATE * script.chunk_ms // 1000
     if not script.idle_audio_sample:
-        return bytes(samples * 2)
+        return silence_chunk(script)
     return array("h", [script.idle_audio_sample] * samples).tobytes()
 
 
@@ -297,12 +378,52 @@ class Session:
             await self.ws.send(chunk)
             self.lead_silence_bytes_sent += len(chunk)
             await asyncio.sleep(spacing)
-        for chunk in reply_chunks(self.script, index):
-            await self.ws.send(chunk)
-            self.reply_bytes_sent += len(chunk)
-            await asyncio.sleep(spacing)
+        if turn.reply_bursts is not None:
+            await self._bursts(index, turn, spacing)
+        else:
+            chunks = reply_chunks(self.script, index)
+            due = phrase_schedule(turn.reply_phrases, len(chunks))
+            if turn.reply_phrases and not due:  # a reply with no audio to spread them over
+                due = {None: list(turn.reply_phrases)}
+                for text in due[None]:
+                    await self._send_json({"kind": "assistant_text_delta", "delta": text})
+            for k, chunk in enumerate(chunks):
+                for text in due.get(k, ()):
+                    await self._send_json({"kind": "assistant_text_delta", "delta": text})
+                await self.ws.send(chunk)
+                self.reply_bytes_sent += len(chunk)
+                await asyncio.sleep(spacing)
         if turn.agent_end:
             await self._send_json({"kind": "agent_end"})
+
+    async def _bursts(self, index, turn, spacing):
+        """A slow server's bursty reply: speech, then a gap of digital silence while the
+        server computes -- with the turn's text deltas still arriving through the gap,
+        spread evenly through it, because the model's text runs ahead of its TTS."""
+        i = 0
+        for burst in turn.reply_bursts:
+            step = spacing if burst.pace is None else self.script.chunk_ms / 1000 * burst.pace
+            gap = chunk_count(self.script, burst.silence)
+            deltas = list(burst.text)
+            due = {}
+            for j, text in enumerate(deltas):
+                due.setdefault(round((j + 1) * gap / (len(deltas) + 1)), []).append(text)
+            for k in range(gap):
+                for text in due.get(k, []):
+                    await self._send_json({"kind": "assistant_text_delta", "delta": text})
+                chunk = silence_chunk(self.script)
+                await self.ws.send(chunk)
+                self.reply_bytes_sent += len(chunk)
+                await asyncio.sleep(step)
+            if not gap:
+                for text in deltas:
+                    await self._send_json({"kind": "assistant_text_delta", "delta": text})
+            for _ in range(chunk_count(self.script, burst.speech)):
+                chunk = speech_chunk(self.script, index, i)
+                i += 1
+                await self.ws.send(chunk)
+                self.reply_bytes_sent += len(chunk)
+                await asyncio.sleep(step)
 
     async def _idle_audio(self):
         """Reply-channel audio outside any reply, the way the real server streams it."""
@@ -320,8 +441,12 @@ class Session:
     async def _stats(self):
         while True:
             await asyncio.sleep(self.script.stats_every)
-            await self._send_json({"kind": "stats", "input_backlog": self.script.stats_backlog,
-                                   "speech_queue": self.script.stats_speech_queue})
+            frame = {"kind": "stats", "input_backlog": self.script.stats_backlog,
+                     "input_backlog_frames": self.script.stats_backlog_frames,
+                     "speech_queue": self.script.stats_speech_queue}
+            if self.script.stats_rtf is not None:
+                frame["rtf"] = self.script.stats_rtf
+            await self._send_json(frame)
 
 
 class FakeModelServer:
@@ -333,6 +458,13 @@ class FakeModelServer:
         self.sessions: list[Session] = []
         self.bind_port = port
         self.port = None
+        # The real server takes one client and the newest connection evicts the previous
+        # one, so a client that means to keep a session must never open a second beside it.
+        # `evictions` counts the times a new connection landed on a live one; `max_open`
+        # is the high-water mark of connections open at once.
+        self.evictions = 0
+        self.open_now = 0
+        self.max_open = 0
         self._server = None
         self._active: Session | None = None
         self._changed = asyncio.Event()
@@ -355,18 +487,24 @@ class FakeModelServer:
         await self._server.wait_closed()
 
     async def _handle(self, ws):
-        previous = self._active
-        if previous is not None:
-            await previous.ws.close(TAKEOVER_CLOSE_CODE, TAKEOVER_CLOSE_REASON)
-        session = Session(self, ws, self.script)
-        self.sessions.append(session)
-        self._active = session
-        self._notify()
+        self.open_now += 1
+        self.max_open = max(self.max_open, self.open_now)
         try:
-            await session.run()
+            previous = self._active
+            if previous is not None:
+                self.evictions += 1
+                await previous.ws.close(TAKEOVER_CLOSE_CODE, TAKEOVER_CLOSE_REASON)
+            session = Session(self, ws, self.script)
+            self.sessions.append(session)
+            self._active = session
+            self._notify()
+            try:
+                await session.run()
+            finally:
+                if self._active is session:
+                    self._active = None
         finally:
-            if self._active is session:
-                self._active = None
+            self.open_now -= 1
 
     def _notify(self):
         self._changed.set()

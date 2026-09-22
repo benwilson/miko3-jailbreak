@@ -46,9 +46,12 @@ events are keyed by **`kind`**. Only the client's commands use `type`.
 Raw PCM, 16-bit signed little-endian, 16 kHz, mono, no header. The client sends continuously,
 **including silence**: the child's VAD detects the end of the person's turn from the silence,
 so the stream must never stall. The browser page sends 80 ms chunks (1,280 samples, 2,560
-bytes). Any whole number of samples per frame works; the relay forwards robot chunks as they
-arrive and fills gaps of 80 ms or more with zero-filled 80 ms frames. Audio sent while the
-model is not `ready` is dropped by the server (`Model.audio`).
+bytes). Any whole number of samples per frame works. The relay paces this stream on a frame
+clock — exactly one frame per frame period of wall clock, the queued chunk if there is one
+and a zero-filled 80 ms frame if there is not — because **the server's input is a timeline
+and it is fed in realtime or not at all**; see "An input stream faster than realtime is
+permanent lag" below. Audio sent while the model is not `ready` is dropped by the server
+(`Model.audio`).
 
 #### The server's turn detection is a bare energy VAD, and a noise floor latches it
 
@@ -131,19 +134,84 @@ timers, never both at once**:
 - a reply begun by `agent_start` then has `--reply-start-grace-ms` (default 3000 ms) to
   produce its first sound — the **start grace**. If it does, the hangover below takes over;
   if the grace expires first, the reply ends empty, logged as `why: "no-speech"`;
-- from its first loud chunk it **ends** `--reply-silence-ms` (default 600 ms) after its last
+- from its first loud chunk it **ends** `--reply-silence-ms` (default 1500 ms) after its last
   non-silent chunk — the **end-of-speech hangover** — or at `agent_end` or `flush` if one of
-  those arrives first.
+  those arrives first. While the model is evidently still talking the hangover does not end
+  it: see the bursty-output section below.
 
 Silence *between* two loud chunks of a reply is forwarded like any other audio — the
 hangover is exactly what stops a pause between two sentences from splitting one reply into
 two. Silence *outside* a reply, and the TTS lag at the head of one (below), are dropped and
 counted in the conversation's `close` record as `out_of_reply`.
 Forwarding all of it keeps the robot's speaker permanently busy: its `playback{state:"idle"}`
-never arrives, so the farewell drain always runs to its 8 s cap and the strict turn-taking
+never arrives, so the farewell drain always runs to its cap and the strict turn-taking
 gate only ever reopens on its backstop. Each reply logs a `reply.end` record with its
 duration and `why` (`silence`, `no-speech`, `agent_end`, `flush` or `agent_start`), so the
 field data shows which signal is actually doing the work.
+
+#### A slow server sends its reply in BURSTS, and the gaps are not the end of it
+
+**Measured live, on a loaded server:** the reply audio does not arrive evenly. It comes in
+bursts — a loud chunk or two, then **800–900 ms of silence while the server computes**, then
+more speech — because the model runs **slower than realtime** (`stats.rtf` 1.8–3.3 under
+load). With a 600 ms hangover every gap looked like the end of the reply: one spoken sentence
+became **a dozen back-to-back replies of ~80 ms each** in a single conversation, logged as
+repeated `reply.end {"why": "silence"}` against `turn {"reply_bytes": 7056,
+"loud_chunks": 1}`. Each one made the robot's player begin and end a reply, which is what the
+person heard as badly stuttering audio.
+
+Two signals say the model is still producing the turn even while its audio is quiet, and both
+now hold the reply open:
+
+- **`assistant_text_delta` keeps arriving.** The model's text runs ahead of its TTS, so it
+  keeps writing right through a gap. A delta for the reply in flight refreshes the hangover
+  exactly as a loud chunk does — but only **after** the reply has spoken, because before that
+  the same text is the TTS lag the start grace exists to bound, not evidence of speech;
+- **`stats.speech_queue` is non-zero**, i.e. frames of TTS still queued for playback: more of
+  this reply is coming and only the server's pace is in the way. The newest sample is used;
+  `stats` arrives only every few seconds, so a missing one blocks nothing, and a sample older
+  than `Config.stats_max_age` (10 s) is ignored so a stalled server cannot hold a reply open
+  for good.
+
+The default hangover is **1500 ms**, comfortably above the measured gaps, and `--drain-cap`
+is **12 s**, because a farewell a slow server is still speaking can legitimately outlast 8 s;
+the cap is a backstop, not the normal path (the drain closes on `playback{idle}`). Every
+other end condition is unchanged: `agent_end`, `flush`, the next `agent_start`, and the start
+grace for a reply that never speaks. In-reply silence is still forwarded, so the robot's
+speaker stays fed across a gap and its player runs continuously through the whole burst. The
+`turn` record carries `text_deltas` and `queue_holds` so the field data shows which signal
+did the holding.
+
+#### An idle connection is not free: it builds the model's input backlog
+
+**Measured live:** the relay's warm session (prewarm) held a connection open and, because
+`ModelClient`'s watchdog sends an 80 ms zero frame whenever nothing else has gone out, it
+streamed continuous silence at a server that cannot keep up with realtime. A conversation
+opened with the model already **221 frames (~18 s) behind** (`stats.input_backlog_frames`),
+climbing to **489**, and after a couple of hours the model degenerated into a repetition loop
+("you are right. I am Miko.") that reproduced in the plain browser page with no relay
+involved. So a warm session now stays **silent until it is adopted**: `reset`, the persona,
+the ack, then nothing at all. The watchdog exists so the model's VAD hears the person stop
+talking; before a conversation there is nobody to hear. Liveness is still watched through the
+connection itself (its close, and the WebSocket keepalive), not through traffic on it.
+
+#### An input stream faster than realtime is permanent lag
+
+**Measured live:** in a conversation whose server had headroom — `rtf` 0.70–0.76, i.e.
+*faster* than realtime — `stats.input_backlog_frames` still climbed 3 → 7 → 14 → 20 → 22 →
+28, and earlier in the same session compounded to ~39 s behind, at which point the model
+degenerated. The server was not the problem. The relay was sending it more than one 80 ms
+frame per 80 ms of wall clock: chunks went out the moment they arrived *and* a watchdog
+filled the slot a jittery late chunk had not arrived for, so one late chunk bought two
+frames for one slot — roughly 15–20% over realtime.
+
+The server consumes this stream at realtime; it has no way to skip. So every frame over
+realtime is backlog it keeps, and it only drains at whatever headroom `rtf` leaves (at
+`rtf` 0.70, one frame recovered per three played; at `rtf` > 1, never). The relay therefore
+paces the uplink on a frame clock whose deadline advances by the duration of the frame just
+sent, and paces the robot's pre-`conv.ready` buffer the same way rather than bursting it.
+`stats.input_backlog_frames` past `--backlog-alarm-frames` (default 25) logs one warning
+naming the relay's own measured send rate, so the same failure cannot recur unseen.
 
 #### The TTS lags `agent_start`, so the hangover cannot start at the reply
 
@@ -269,7 +337,7 @@ the conversation closes with reason `sleep_word` once the farewell's **derived e
 audio going quiet for `--reply-silence-ms`) and the robot's `playback{idle}` have both
 arrived, or on the drain cap if the audio never goes quiet or the robot never reports idle.
 Keying this off `agent_end` was what made every farewell close with `farewell_timeout` at
-the 8 s cap instead.
+the drain cap instead.
 
 The phrase is `--farewell-phrase` (default `talk to you later`). **It must match the persona
 file**, which is what tells the model to say it; changing one means changing the other.
@@ -292,9 +360,10 @@ server: {"kind":"user_end","t":78}
 server: {"kind":"agent_start","t":79,"turn":1}          the relay opens a reply here
 server: {"kind":"assistant_text_delta","delta":"It's sunny"}
 server: <PCM 22.05 kHz> <PCM> ...                       loud: forwarded to the robot
-server: <PCM zeros> <PCM zeros> ...                     no agent_end ever comes; 600 ms
-                                                        of these end the reply, and the
-                                                        rest is dropped again
+server: <PCM zeros> <PCM zeros> ...                     no agent_end ever comes; 1500 ms
+                                                        of these, with no text delta and
+                                                        no queued speech, end the reply,
+                                                        and the rest is dropped again
 ```
 
 And the last turn of one, which is how the conversation ends:
@@ -304,7 +373,7 @@ server: {"kind":"agent_start","t":310,"turn":7}
 server: {"kind":"assistant_text_delta","delta":"Talk to "}
 server: {"kind":"assistant_text_delta","delta":"you later."}   the farewell phrase matches
 server: <PCM 22.05 kHz> <PCM> ...                              the farewell, forwarded
-server: <PCM zeros> <PCM zeros> ...                            600 ms of silence: the
+server: <PCM zeros> <PCM zeros> ...                            1500 ms of silence: the
                                                                reply's derived end, and
                                                                end_reply() on the lane
 robot:  {"type":"playback","state":"idle"}                     the speaker has run dry

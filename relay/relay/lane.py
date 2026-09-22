@@ -49,7 +49,7 @@ PROTO_VERSION = 1
 RELAY_VERSION = "0.1.0"
 DEFAULT_PORT = 8790
 REPLY_CHUNK_BYTES = int(OUTPUT_RATE * FRAME_SECONDS) * 2  # 1,764 samples, 3,528 bytes
-BURST_SECONDS = 0.5
+BURST_SECONDS = 2.0  # see ReplyPacer: the cushion the robot is allowed to bank
 PING_INTERVAL = 2.0
 PING_MISSES = 3
 HELLO_TIMEOUT = 5.0
@@ -80,7 +80,8 @@ def lan_address():
 @dataclass(frozen=True)
 class Pacing:
     """Reply pacing (KTD5). chunk_seconds is the playback time of one REPLY_CHUNK_BYTES
-    chunk; tests shrink it to run the same schedule faster."""
+    chunk; tests shrink it to run the same schedule faster. burst_seconds is the cushion
+    cap -- see ReplyPacer -- and --burst-seconds sets it."""
     chunk_seconds: float = FRAME_SECONDS
     burst_seconds: float = BURST_SECONDS
 
@@ -127,6 +128,21 @@ class ReplyPacer:
     for another chunk under the burst cap, chunks go out back to back; after that one
     goes out each time the estimate drops by a chunk, which is one per chunk period, on a
     schedule computed from the estimate so it does not drift.
+
+    burst_seconds is therefore the largest cushion the robot can ever hold, and it is set
+    to seconds rather than the half second it started at. The model's speech generation is
+    capped at about 1.0x realtime by its duplex timeline -- one 80 ms audio frame per 80 ms
+    step -- and measures 0.88-0.97x, so reply audio arrives slightly SLOWER than the robot
+    plays it and the speaker drains mid-reply (`underruns=2..3` on every reply, heard as
+    stuttering). Raising the robot's own prebuffer could not fix that while this cap stood:
+    whatever the robot was willing to hold, the relay would not send it.
+
+    The small cap existed so that a flush (barge-in) threw away little audio. Barge-in has
+    since been measured not to work on this hardware at all: the platform echo canceller
+    ducks the robot's microphone to RMS 41 while its speaker plays, against 399 in a quiet
+    room, so the person cannot be heard mid-reply and the flush path is nearly dead weight.
+    A cushion against a sub-realtime producer is worth far more than cheap flushes, so the
+    trade is taken the other way round now -- a flush discards more, and that is fine.
     """
 
     def __init__(self, emit_mark, emit_chunk, pacing=Pacing()):
