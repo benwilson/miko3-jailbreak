@@ -441,6 +441,52 @@ desugaring) — the only missing piece is the join-token issuance, which is a
 server-side concern (`wsUrl`/`token` are fetched from Miko's backend, not
 computed on-device).
 
+## 10. Explore's object detector on the robot — MEASURED (2026-09-23)
+
+Camera curiosity (`docs/plans/2026-09-23-1037-feat-explore-camera-curiosity-plan.md`,
+U1) measured two detectors on one floor frame, with the robot on the floor facing
+two potted plants about 3–4 ft away (640x480, captured through remote-control's
+stream).
+
+**The frame.** The single camera points forward and slightly up: from the floor it
+sees objects 3–4 ft ahead well, with the floor itself only in the bottom few rows,
+so things right in front of the nose drop out of view as he gets close. The test
+frame was badly overexposed because remote-control sets a manual exposure; explore
+should leave auto-exposure on.
+
+**Vendor Yolo-Fastest (80 COCO classes, `com.miko.objectDetection.YOLOv4`).** Loads
+in explore's process with its native bundle (`libobjectDetection.so`,
+`libc++_shared.so`, `yolo-fastest-opt.{param,bin}`) and runs 46–76 ms per frame, but
+called both pots "vase" and missed the plants entirely. With only 80 COCO labels it
+also cannot name most things on a floor or desk. Not used.
+
+**YOLOE-26n with explore's own vocabulary on ONNX Runtime (used).** An
+open-vocabulary detector exported with `mode-explore/assets/vocabulary.txt` (341
+names) by `scripts/export-explore-detector.py`, run by ONNX Runtime Android 1.30.0 on
+the CPU (`OnnxRecognizer`). Same detections on the robot as on a Mac: vase 0.87, the
+two plants as "succulent" 0.43 and 0.34, cup 0.27, and a false "table" 0.38 along the
+bottom edge. Timings on the MT8168:
+
+| | ms |
+|---|---|
+| session create (11 MB model) | ~750 |
+| first frame | 1,300–1,500 |
+| steady state, 2 intra-op threads | ~1,100 |
+| steady state, 4 threads | 1,600–1,900 (slower: competes with the brain and UI) |
+| same model on an Apple-silicon Mac | 25 |
+
+About a second per look is fine for curiosity stops, where he is parked while he
+looks; it is too slow for tracking while driving, so approaches re-check between
+legs. A smaller export (e.g. 320x416) would be ~2.5x faster at the cost of small
+or distant things.
+
+**Packaging.** ONNX Runtime adds `libonnxruntime.so` (33 MB, 12 MB compressed in the
+APK) and a 112 KB JNI library; the model is 11 MB (10 MB compressed); explore's APK is
+about 28 MB. The runtime AAR is fetched once from Maven Central into the gitignored
+`tools/third_party/` and checked against a pinned SHA-256 (`scripts/build-mode-explore.py`).
+The spoken names ship as Opus in WebM, which this robot's `MediaPlayer` plays (Opus in
+Ogg needs Android 10).
+
 ## Open questions
 
 - Where/how are `assets/*.tflite` copied out to `/sdcard/klug/vision/` on

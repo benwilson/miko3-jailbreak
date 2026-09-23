@@ -60,6 +60,56 @@ final class ExploreTuning {
      */
     final int approachBandLower;
     final int approachBandUpper;
+    /**
+     * Recognition thresholds (KTD6), tuned on the robot in U8: a detection at or
+     * above confidenceFloor is a thing; the best between unsureFloor and it makes
+     * a look unsure (R13). A box at least fillHeight of the frame's height or
+     * fillArea of its area has arrived by the camera (R6).
+     */
+    final float confidenceFloor;
+    final float unsureFloor;
+    final float fillHeight;
+    final float fillArea;
+    /**
+     * Camera curiosity (KTD5). A curiosity stop comes curiosityMin..MaxMs of
+     * wandering after the last one. A scan takes up to scanLooks looks with a
+     * scanTurnMs step turn between them. A look counts only if its frame was
+     * captured lookSettleMs after he stopped moving; no such look within
+     * firstLookTimeoutMs of opening the camera (lookTimeoutMs later) is a camera
+     * failure, which turns curiosity off for cameraBackoffMs (KTD8).
+     */
+    final long curiosityMinMs;
+    final long curiosityMaxMs;
+    final int scanLooks;
+    final long scanTurnMs;
+    final long lookSettleMs;
+    final long firstLookTimeoutMs;
+    final long lookTimeoutMs;
+    final long cameraBackoffMs;
+    /**
+     * Facing and approaching (R5, R6). A target within centreTolerance of the
+     * frame's centre (box centre, -1..1) is ahead; otherwise he turns toward it
+     * for turnMsPerUnit x its offset, at most faceTurnsMax times. Each approach
+     * leg is approachTicks forward ticks, at most approachLegsMax legs; sensor
+     * arrival is ignored for the first approachGraceMs of a leg (KTD4). The
+     * target missing from lostLooksMax looks in a row ends the approach (R7).
+     */
+    final float centreTolerance;
+    final long turnMsPerUnit;
+    final int faceTurnsMax;
+    final int approachTicks;
+    final int approachLegsMax;
+    final long approachGraceMs;
+    final int lostLooksMax;
+    /** How long each reaction clip is given before the next (U6's clips run 0.7-1.4 s, names up to 2.5 s). */
+    final long curiousMs;
+    final long thinkingMs;
+    final long nameMs;
+    final long delightedMs;
+    final long disappointedMs;
+    final long puzzledMs;
+    /** After greeting a person or pet, people and pets are ignored this long (R12). */
+    final long peopleCooldownMs;
     /** Edge and obstacle thresholds from the device, or null when uncalibrated (KTD9). */
     final Calibration calibration;
 
@@ -88,6 +138,32 @@ final class ExploreTuning {
         ir1IsLeft = b.ir1IsLeft;
         approachBandLower = b.approachBandLower;
         approachBandUpper = Math.max(b.approachBandLower, b.approachBandUpper);
+        confidenceFloor = b.confidenceFloor;
+        unsureFloor = Math.min(b.unsureFloor, b.confidenceFloor);
+        fillHeight = b.fillHeight;
+        fillArea = b.fillArea;
+        curiosityMinMs = b.curiosityMinMs;
+        curiosityMaxMs = Math.max(b.curiosityMinMs, b.curiosityMaxMs);
+        scanLooks = Math.max(1, b.scanLooks);
+        scanTurnMs = b.scanTurnMs;
+        lookSettleMs = b.lookSettleMs;
+        firstLookTimeoutMs = b.firstLookTimeoutMs;
+        lookTimeoutMs = b.lookTimeoutMs;
+        cameraBackoffMs = b.cameraBackoffMs;
+        centreTolerance = b.centreTolerance;
+        turnMsPerUnit = b.turnMsPerUnit;
+        faceTurnsMax = b.faceTurnsMax;
+        approachTicks = Math.max(1, b.approachTicks);
+        approachLegsMax = Math.max(1, b.approachLegsMax);
+        approachGraceMs = b.approachGraceMs;
+        lostLooksMax = Math.max(1, b.lostLooksMax);
+        curiousMs = b.curiousMs;
+        thinkingMs = b.thinkingMs;
+        nameMs = b.nameMs;
+        delightedMs = b.delightedMs;
+        disappointedMs = b.disappointedMs;
+        puzzledMs = b.puzzledMs;
+        peopleCooldownMs = b.peopleCooldownMs;
         calibration = b.calibration;
     }
 
@@ -162,6 +238,35 @@ final class ExploreTuning {
         // docs/solutions/best-practices/miko3-tof-is-a-downward-cliff-sensor-inside-mcu-safe-band.md
         private int approachBandLower = 170;
         private int approachBandUpper = 280;
+        // U1's plant frame: the pots scored 0.87 (as "vase"), the plants 0.34-0.43,
+        // and a false "table" along the bottom edge 0.38.
+        private float confidenceFloor = 0.35f;
+        private float unsureFloor = 0.2f;
+        private float fillHeight = 0.7f;
+        private float fillArea = 0.4f;
+        private long curiosityMinMs = 20000;
+        private long curiosityMaxMs = 40000;
+        private int scanLooks = 3;
+        private long scanTurnMs = 700;
+        private long lookSettleMs = 400;
+        // Camera start plus the recognizer's first run (~0.75 s load, ~1.4 s first frame, U1).
+        private long firstLookTimeoutMs = 8000;
+        private long lookTimeoutMs = 5000;
+        private long cameraBackoffMs = 120000;
+        private float centreTolerance = 0.25f;
+        private long turnMsPerUnit = 900;
+        private int faceTurnsMax = 3;
+        private int approachTicks = 3;
+        private int approachLegsMax = 8;
+        private long approachGraceMs = 500;
+        private int lostLooksMax = 2;
+        private long curiousMs = 1100;
+        private long thinkingMs = 1500;
+        private long nameMs = 2500;
+        private long delightedMs = 1600;
+        private long disappointedMs = 1400;
+        private long puzzledMs = 1100;
+        private long peopleCooldownMs = 120000;
         private Calibration calibration;
 
         /** A fixed leg length. */
@@ -193,6 +298,49 @@ final class ExploreTuning {
             approachBandUpper = upper;
             return this;
         }
+        Builder recognition(float confidence, float unsure) {
+            confidenceFloor = confidence;
+            unsureFloor = unsure;
+            return this;
+        }
+        Builder fill(float height, float area) {
+            fillHeight = height;
+            fillArea = area;
+            return this;
+        }
+        Builder curiosityMs(long min, long max) { curiosityMinMs = min; curiosityMaxMs = max; return this; }
+        Builder scan(int looks, long turnMs) { scanLooks = looks; scanTurnMs = turnMs; return this; }
+        Builder lookTiming(long settle, long firstTimeout, long timeout) {
+            lookSettleMs = settle;
+            firstLookTimeoutMs = firstTimeout;
+            lookTimeoutMs = timeout;
+            return this;
+        }
+        Builder cameraBackoffMs(long v) { cameraBackoffMs = v; return this; }
+        Builder facing(float tolerance, long msPerUnit, int turnsMax) {
+            centreTolerance = tolerance;
+            turnMsPerUnit = msPerUnit;
+            faceTurnsMax = turnsMax;
+            return this;
+        }
+        Builder approach(int ticks, int legsMax, long graceMs, int lostMax) {
+            approachTicks = ticks;
+            approachLegsMax = legsMax;
+            approachGraceMs = graceMs;
+            lostLooksMax = lostMax;
+            return this;
+        }
+        /** One length for every reaction clip, for scripted timelines. */
+        Builder reactionMs(long v) {
+            curiousMs = v;
+            thinkingMs = v;
+            nameMs = v;
+            delightedMs = v;
+            disappointedMs = v;
+            puzzledMs = v;
+            return this;
+        }
+        Builder peopleCooldownMs(long v) { peopleCooldownMs = v; return this; }
         Builder calibration(Calibration v) { calibration = v; return this; }
 
         ExploreTuning build() {

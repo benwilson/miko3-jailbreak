@@ -13,11 +13,11 @@ execution: code
 ## Goal Capsule
 
 - **Objective:** while wandering, the robot notices things with its camera, rolls up to investigate them, and reacts like a curious little creature: excited and naming new things, disappointed by things it has already seen, and delighted to try to talk to people and pets. This is the camera-curiosity part of explore mode; the wander, eyes, and startle base (`docs/plans/2026-09-22-1438-feat-explore-mode-plan.md`) already shipped.
-- **Means:** the vendor's unused on-device object detector behind a recognizer boundary (KTD1, KTD2), a camera opened only for curiosity stops and approaches (KTD3), new curiosity states in the plain-Java brain (KTD5), and pre-rendered WALL-E-style voice clips (KTD7).
+- **Means:** an open-vocabulary on-device object detector (YOLOE with explore's own few-hundred-name vocabulary, on ONNX Runtime) behind a recognizer boundary (KTD1, KTD2), a camera opened only for curiosity stops and approaches (KTD3), new curiosity states in the plain-Java brain (KTD5), and pre-rendered WALL-E-style voice clips (KTD7).
 - **Product authority:** repo owner, sole decision-maker. The Product Contract governs; the Planning Contract serves it.
 - **Execution profile:** brain, classifier and recognition post-processing are proven with the repo's host-JVM harnesses under `scripts/tests/`; camera, detector and sound are verified on the robot over Wi-Fi adb (default `192.168.19.74:5555`). Aiming and sound tuning need the owner watching.
 - **Stop conditions:**
-  - If U1 shows the vendor detector cannot load in explore's process (with its full native bundle, KTD2), or takes longer than about 2 s per frame on the robot, stop after U1, before U2's VendorRecognizer and U3, and report; the plain-Java boundary of KTD1 may still be written, and it is where an alternative recognizer would go.
+  - If U1 shows the detector cannot load in explore's process (with its full native bundle, KTD2), or takes longer than about 2 s per frame on the robot, stop after U1, before U2's on-device recognizer and U3, and report; the plain-Java boundary of KTD1 may still be written, and it is where an alternative recognizer would go.
   - If U1's floor test frame shows the camera cannot see floor-level objects at all, stop and report before building approach behavior.
 - **Open blockers:** none. Desk use stays off until the separate blind-turn edge fix lands (see How This Work Fits Together); the floor is the working surface until then.
 
@@ -126,7 +126,7 @@ This plan covers camera curiosity. The broader breakdown below is the current un
 
 ### Dependencies / Assumptions
 
-- **On-device detector.** The vendor firmware bundles an 80-category common-object detector it never calls (`docs/hardware/person-tracking.md`; labels in `tools/serviceexam_jadx/sources/com/miko/objectDetection/Box.java`), which covers people, cats, dogs, plants, cups, bottles, chairs, books, phones and more. Assumed to run acceptably on the robot's CPU; unmeasured.
+- **On-device detector.** The vendor firmware bundles an 80-category COCO detector it never calls (`docs/hardware/person-tracking.md`). U1 measured it on the robot: fast, but it named the potted plants "vase" and missed the plants, and 80 labels cannot name most floor and desk things. At the owner's direction ("isn't there something better that can recognize more than 80 things that'll run on this device?") it is replaced by YOLOE-26n exported with a ~340-name vocabulary and run on ONNX Runtime; measured ~1.1 s per frame on the robot (`docs/hardware/camera-vision.md` §10).
 - **Camera.** One camera, opened as the first id; where it points and how wide it sees are undocumented, so what he can see from the floor is unknown. Known driver constraints: a fixed frame rate only, a fragile first open after a cold boot, and most of a CPU core used while open (`CameraCapture.java` in mode-remote-control; memory note on the camera HAL bug). Explore mode has no camera permission today.
 - **Speech.** No mode speaks today; the spoken names are new sounds.
 
@@ -156,7 +156,7 @@ This plan covers camera curiosity. The broader breakdown below is the current un
 ### Key Technical Decisions
 
 - KTD1. **Recognition behind a `Recognizer` boundary returning plain detections.** A detection is a label, a score and a box as fractions of the frame. The brain and all post-processing see only this shape, so a relay-backed recognizer can replace or supplement the on-device one later (R17). Post-processing (most prominent, frame fill, unsure, person/pet) is plain Java and host-tested.
-- KTD2. **The on-device recognizer is the vendor's unused 80-class detector, reused as-is.** `com.miko.objectDetection.YOLOv4` (`detect(Bitmap, conf, nms)`, `init(AssetManager, 2)`) with `Box`, kept in that exact package because the JNI symbols are compiled against it; the `Box` shim inlines the "clock" and "mouse" labels (the decompiled file imports unrelated classes for them) and keeps the `Box(float,float,float,float,int,float)` constructor and `x0/y0/x1/y1` fields the native code constructs, plus `libobjectDetection.so`, its C++ runtime `libc++_shared.so` (a declared dependency; ncnn is linked in statically) and `assets/yolo-fastest-opt.{param,bin}`, all staged at build time from the gitignored `tools/serviceexam_jadx/resources/` the way `libmiko_drivers.so` already is, with a build error naming any missing file (the model `.bin` is gitignored, so it is never committed) (recipe: `docs/hardware/person-tracking.md`, "Implementation"). Its COCO labels (`tools/serviceexam_jadx/sources/com/miko/objectDetection/Box.java`) are the vocabulary (R3). The person/pet set is "person", "cat", "dog" and "bird" (R11); everything else, "teddy bear" included, is an object.
+- KTD2. **The on-device recognizer is YOLOE-26n exported with explore's own vocabulary, run on ONNX Runtime.** (user-directed change during U1, 2026-09-23: the owner chose "YOLOE, ~300-500 names" after U1 showed the vendor's 80-class Yolo-Fastest misnamed the plants; research in the run's `detector-research.md`.) `mode-explore/assets/vocabulary.txt` lists the names in model order (people and pets first, then plants, furniture, room, clothes, toys, desk, kitchen, bathroom, tools, vehicles); `scripts/export-explore-detector.py` (in its own Ultralytics environment, `tools/detector-export/`, gitignored) bakes their text embeddings into the head and exports `mode-explore/assets/detector.onnx` at 480x640. Output0 is [4 + names + 32, anchors]: box centre/size in pixels, already-sigmoided scores, and mask coefficients that are ignored; the model is not NMS-free with this head, so `YoloeDecoder` does per-name NMS in plain Java. `OnnxRecognizer` runs it on 2 intra-op threads (4 measured slower). ONNX Runtime Android 1.30.0 comes from Maven Central, pinned by SHA-256, cached in the gitignored `tools/third_party/`, and its classes.jar is compiled and dexed in through a new `jars` input of `scripts/build_common.py` (no NDK is installed, so a custom ncnn JNI build was not an option). The person/pet set is the vocabulary's first section (person, baby, cat, dog, puppy, kitten, bird, parrot, hamster, rabbit, guinea pig, fish, turtle, lizard) (R11); everything else, "teddy bear" and "stuffed animal" included, is an object. YOLOE is AGPL-3.0: fine for this personal build; publish the source if the APK is ever distributed.
 - KTD3. **Camera on demand, adapted from remote-control's `CameraCapture`.** A copy in mode-explore (not a shared refactor, for the same reason KTD7 of the base plan copied the lease code) that keeps its fixed frame-rate selection, backoff and "up only after a real frame" rules, delivers 640x480 JPEG, and is opened only when the brain enters a curiosity stop or approach and closed when it leaves (R2). Frames are decoded and run through the detector on a camera-side worker thread; the brain polls the newest result with its frame timestamp, as it polls sensor readings, so the brain thread never blocks on the camera. Explore gains the CAMERA permission, granted by the install script as voice grants its microphone.
 - KTD4. **During an approach, the direction of the ToF excursion separates "arrived" from "edge".** The controller's `ir2` flag and its `CPL=2` refusal fire both for something close (tof falls below its safe band, about 170) and for a drop-off (tof rises above it, about 280, well before reaching 16383) (`docs/solutions/best-practices/miko3-tof-is-a-downward-cliff-sensor-inside-mcu-safe-band.md`). While approaching: tof below the calibrated `obstacleTofBelow`, or a flag/refusal with tof below the band's lower bound, is CLOSE (arrival, R6); a flag/refusal with tof above the band's upper bound, above a calibrated `edgeTofAbove`, or at 16383 is EDGE (R7); a flag/refusal inside the band is treated as EDGE, the safe reading. The band bounds are tuning values (default 170 and 280). For the first ~500 ms of each forward leg, when the nose bob can fake it, `ir2`/low-tof arrival is ignored; a `CPL=2` in that window still stops the leg at once and returns to a look, counting as neither arrival nor edge, so forward is never resent against a refusal (R15). Outside approaches the classifier is unchanged.
 - KTD5. **New brain states for curiosity, still one state machine on one thread.** SCAN (step turns, one look per step; the first look that sees something recognizable ends the scan and decides), REACT_HERE (seen-before or unsure reaction from where he is), FACE (eyes lead, turn to center the target), APPROACH (short forward legs with a look between legs to re-center; arrive on KTD4 or frame fill), INSPECT (react, speak), plus a curiosity-stop timer in PAUSE. Every motion stays sensor-gated and lease-gated; the stop timer and startle logic are untouched (R15). A session "seen" set of labels (R9, R10) and a person/pet cool-down live in the brain.
@@ -186,7 +186,7 @@ Loss of fresh readings or the lease from any state goes to EYES_ONLY, as today.
 
 ### Assumptions
 
-- The detector runs in well under 2 s per 640x480 frame on the MT8168 (U1 measures it).
+- The detector runs in under 2 s per 640x480 frame on the MT8168 (U1 measured ~1.1 s steady for YOLOE on 2 threads).
 - The single camera faces forward at a height that sees floor objects ahead (U1 checks with a test frame).
 - The person/pet cool-down defaults to 2 minutes; curiosity stops come every 20-40 s of wandering; both tunable.
 
@@ -211,10 +211,9 @@ U1 first (it gates U2 and U3). U2 and U4 can be written in parallel. U3 and U5 f
 **Dependencies:** none.
 
 **Files:**
-- `scripts/qa-explore-camera.py` (new)
 - `docs/hardware/camera-vision.md` (append findings)
 
-**Approach:** using the same native bundle as KTD2 (so a load failure is real, not a packaging gap), push a small throwaway test build of explore (or a debug HTTP route, removed before commit) that opens the camera, saves one frame, and times `YOLOv4.detect` over a few frames; the QA script pulls the frame and the timings over adb and prints the detections. Record camera height/aim, useful range for floor objects, and ms per frame.
+**Approach:** using the same native bundle as KTD2 (so a load failure is real, not a packaging gap), push a throwaway debug HTTP route in explore (removed before commit) that runs the detector on a frame pushed into the app's files dir and times a few runs. Record camera aim, useful range for floor objects, and ms per frame. (As run: the frame came from remote-control's stream, and no QA script was kept, since the route it would call is removed; U8's floor QA covers the live camera path.)
 
 **Execution note:** device spike; the debug route is removed before commit.
 
@@ -224,7 +223,7 @@ U1 first (it gates U2 and U3). U2 and U4 can be written in parallel. U3 and U5 f
 
 ### U2. Recognizer boundary and on-device detector
 
-**Goal:** a plain-Java recognition boundary and the vendor detector behind it (KTD1, KTD2, KTD6).
+**Goal:** a plain-Java recognition boundary and the YOLOE detector behind it (KTD1, KTD2, KTD6).
 
 **Requirements:** R3, R4, R6, R13, R17.
 
@@ -234,12 +233,13 @@ U1 first (it gates U2 and U3). U2 and U4 can be written in parallel. U3 and U5 f
 - `mode-explore/src/com/miko3/mode/explore/Detection.java` (new, plain Java)
 - `mode-explore/src/com/miko3/mode/explore/Sighting.java` (new, plain Java: post-processing -- prominent, frame fill, unsure, person/pet)
 - `mode-explore/src/com/miko3/mode/explore/Recognizer.java` (new interface)
-- `mode-explore/src/com/miko3/mode/explore/VendorRecognizer.java` (new, Android)
-- `mode-explore/src/com/miko/objectDetection/YOLOv4.java`, `Box.java` (vendor JNI shims, exact package)
-- `scripts/build-mode-explore.py` (stage `libobjectDetection.so`, `libc++_shared.so` and `yolo-fastest-opt.{param,bin}` from `tools/serviceexam_jadx/resources/`, erroring on any missing file)
-- `scripts/tests/fixtures/explore_sighting_harness/...`, `scripts/tests/test_explore_sighting.py` (new)
+- `mode-explore/src/com/miko3/mode/explore/YoloeDecoder.java` (new, plain Java: output tensor → detections, per-name NMS)
+- `mode-explore/src/com/miko3/mode/explore/OnnxRecognizer.java` (new, Android: ONNX Runtime session, bitmap → CHW floats)
+- `mode-explore/assets/vocabulary.txt`, `mode-explore/assets/detector.onnx` (new; the model is generated by `scripts/export-explore-detector.py`, new)
+- `scripts/build-mode-explore.py` (fetch and verify the pinned ONNX Runtime AAR, bundle its arm64 libraries, pass its jar), `scripts/build_common.py` (optional `jars` for javac and d8)
+- `scripts/tests/fixtures/explore_detector_harness/...`, `scripts/tests/test_explore_detector.py` (new), `scripts/tests/fixtures/explore_sighting_harness/...`, `scripts/tests/test_explore_sighting.py` (new), `scripts/tests/test_build_mode_explore.py`
 
-**Approach:** `VendorRecognizer` converts `Box` pixel coordinates to frame fractions and labels to plain strings. `Sighting` picks the most prominent detection above the confidence floor, reports unsure when only low-scoring boxes exist, and says whether a box fills the frame.
+**Approach:** `YoloeDecoder` converts the model's pixel boxes to frame fractions and class indices to vocabulary names; `OnnxRecognizer` implements `Recognizer`. `Sighting` picks the most prominent detection above the confidence floor, reports unsure when only low-scoring boxes exist, and says whether a box fills the frame.
 
 **Patterns to follow:** plain-Java-with-harness style of `HazardClassifier` and `scripts/tests/test_explore_brain.py`; native lib bundling in `scripts/build-mode-explore.py` (`libmiko_drivers.so`).
 
@@ -247,10 +247,12 @@ U1 first (it gates U2 and U3). U2 and U4 can be written in parallel. U3 and U5 f
 - Largest box above the confidence floor wins; a tie goes to the more centred box.
 - Only low-scoring boxes: reported unsure; no boxes: nothing.
 - A box 75% of frame height counts as filling the frame; a small central box does not.
-- "person", "cat", "dog" and "bird" are people/pets; "teddy bear" and "potted plant" are not.
-- Build test: the APK contains `libobjectDetection.so`, `libc++_shared.so` and both model assets; a missing vendor file fails the build with a message naming it.
+- The vocabulary's people-and-pets names are people/pets; "teddy bear", "stuffed animal" and "plant" are not.
+- Decoder: best name per anchor, score floor, same-name overlaps merged and different names kept, highest first with a cap, mask rows never read as scores, short output rejected.
+- Vocabulary: no duplicates, "person" first; the exporter, the voice generator and the app parse it alike.
+- Build test: the APK carries the ONNX Runtime libraries, its classes, `detector.onnx` and `vocabulary.txt`; a missing runtime package without fetching, or a checksum mismatch, fails the build with a message naming it.
 
-**Verification:** host tests pass; on the robot `VendorRecognizer` returns labelled detections for a live frame.
+**Verification:** host tests pass; on the robot `OnnxRecognizer` returns labelled detections for a live frame.
 
 ### U3. On-demand camera for explore
 
@@ -343,14 +345,14 @@ U1 first (it gates U2 and U3). U2 and U4 can be written in parallel. U3 and U5 f
 **Files:**
 - `scripts/gen-explore-sounds.py` (curious, thinking, disappointed, delighted, puzzled)
 - `scripts/gen-explore-voice.py` (new: spoken names)
-- `mode-explore/assets/react-*.wav`, `mode-explore/assets/name-*.wav` (generated)
+- `mode-explore/assets/react-*.wav`, `mode-explore/assets/name-*.webm` (generated)
 - `mode-explore/src/com/miko3/mode/explore/ClipPlayer.java`
 - `scripts/tests/test_gen_explore_sounds.py`, `scripts/tests/test_gen_explore_voice.py` (new)
 
-**Approach:** names use the COCO labels (with friendlier wording where needed, e.g. "potted plant" → "plant"), each rendered as a short phrase ("ooh, a plant"). ClipPlayer plays a named clip or a random clip from a group, on its existing thread.
+**Approach:** names are the vocabulary file's (KTD2), each rendered as a short phrase with the right article ("ooh, a plant", "ooh, socks", "ooh, a TV"), encoded as Opus in WebM (~4 KB each; a few hundred WAVs would add ~17 MB, and the robot's MediaPlayer plays WebM Opus). The clip slug rule is shared by `Detection.nameClip` and the generator. ClipPlayer plays a named clip or a random clip from a group, on its existing thread.
 
 **Test scenarios:**
-- Every vocabulary label has a name clip, mono 16-bit at the generator's rate, under 2.5 s, not silent.
+- Every vocabulary name has a WebM Opus name clip under 2.5 s and not silent; no stray clips; the app and the generator agree on every clip's file name.
 - Each reaction group has at least two variants, deterministic, in the deeper register (dominant frequency below the startle chirps').
 
 **Verification:** tests pass; the owner hears the names clearly on the robot (U8).

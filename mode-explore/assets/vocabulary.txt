@@ -1,0 +1,369 @@
+# Explore mode's vocabulary: every thing he can recognize and name.
+# One name per line, written the way he says it ("ooh, a plant").
+# The detector is exported with exactly this list (scripts/export-explore-detector.py) and ships in the APK,
+# and scripts/gen-explore-voice.py renders one name clip per line.
+# Lines starting with '#' and blank lines are ignored.
+# Section headers are for people; the order of names is the model's class order.
+
+# people and pets (always delighted; see PEOPLE_AND_PETS in Sighting)
+person
+baby
+cat
+dog
+puppy
+kitten
+bird
+parrot
+hamster
+rabbit
+guinea pig
+fish
+turtle
+lizard
+
+# plants and nature
+plant
+flower
+flowers
+cactus
+succulent
+tree
+leaf
+flower pot
+vase
+rock
+pinecone
+
+# furniture
+chair
+office chair
+stool
+couch
+armchair
+bed
+table
+desk
+coffee table
+nightstand
+bookshelf
+shelf
+cabinet
+dresser
+drawer
+wardrobe
+bench
+ottoman
+bean bag
+crib
+rocking chair
+bunk bed
+
+# around the room
+door
+window
+curtain
+blinds
+rug
+carpet
+mat
+doormat
+pillow
+cushion
+blanket
+lamp
+floor lamp
+ceiling fan
+fan
+heater
+air purifier
+humidifier
+radiator
+fireplace
+mirror
+picture frame
+painting
+poster
+clock
+wall clock
+calendar
+candle
+basket
+laundry basket
+box
+cardboard box
+storage bin
+trash can
+recycling bin
+bucket
+vacuum cleaner
+broom
+mop
+dustpan
+ladder
+stairs
+light switch
+power outlet
+power strip
+extension cord
+radiator vent
+fire extinguisher
+smoke detector
+umbrella
+coat rack
+hanger
+shoe rack
+
+# clothes and things people wear
+shoe
+shoes
+sneaker
+boot
+slipper
+sandal
+sock
+socks
+hat
+cap
+scarf
+glove
+jacket
+coat
+sweater
+hoodie
+shirt
+t-shirt
+pants
+jeans
+shorts
+dress
+skirt
+pajamas
+belt
+tie
+backpack
+handbag
+purse
+wallet
+suitcase
+glasses
+sunglasses
+watch
+necklace
+ring
+bracelet
+earrings
+keys
+key chain
+towel
+hair brush
+comb
+hair tie
+
+# toys and games
+toy
+teddy bear
+stuffed animal
+doll
+action figure
+toy car
+toy truck
+toy train
+toy robot
+toy dinosaur
+lego
+building blocks
+puzzle
+board game
+playing cards
+dice
+ball
+soccer ball
+basketball
+football
+tennis ball
+baseball
+balloon
+kite
+yo-yo
+rubber duck
+toy gun
+slinky
+rubik's cube
+drum
+guitar
+ukulele
+piano
+keyboard instrument
+xylophone
+crayon
+marker
+play dough
+jump rope
+skateboard
+scooter
+bicycle
+tricycle
+frisbee
+cat toy
+dog toy
+chew toy
+dog bed
+cat tree
+pet bowl
+leash
+bird cage
+fish tank
+
+# desk and office
+computer
+laptop
+monitor
+keyboard
+mouse
+mouse pad
+speaker
+headphones
+earbuds
+microphone
+webcam
+printer
+tablet
+phone
+cell phone
+charger
+cable
+usb stick
+hard drive
+router
+remote
+game controller
+game console
+tv
+camera
+calculator
+book
+notebook
+paper
+envelope
+folder
+binder
+pen
+pencil
+pencil case
+eraser
+ruler
+scissors
+stapler
+tape
+glue
+sticky notes
+paper clip
+rubber band
+highlighter
+desk lamp
+desk organizer
+mug
+coffee mug
+water bottle
+thermos
+headset
+smart speaker
+light bulb
+battery
+flashlight
+robot
+
+# kitchen and food
+cup
+glass
+bottle
+wine glass
+bowl
+plate
+fork
+knife
+spoon
+chopsticks
+pan
+pot
+kettle
+toaster
+microwave
+oven
+refrigerator
+sink
+blender
+coffee maker
+cutting board
+lunch box
+food container
+jar
+can
+cereal box
+bag
+plastic bag
+paper bag
+snack
+cookie
+cake
+donut
+pizza
+sandwich
+hot dog
+apple
+banana
+orange
+grapes
+strawberry
+lemon
+carrot
+broccoli
+bread
+egg
+cheese
+candy
+chocolate
+ice cream
+popcorn
+juice box
+milk carton
+
+# bathroom and cleaning
+toilet
+toothbrush
+toothpaste
+soap
+shampoo bottle
+tissue box
+toilet paper
+paper towel
+spray bottle
+sponge
+hair dryer
+bathtub
+scale
+
+# tools and things around the house
+hammer
+screwdriver
+wrench
+pliers
+drill
+tape measure
+tool box
+paint brush
+plunger
+watering can
+hose
+bicycle helmet
+sports bag
+
+# vehicles and outdoors (seen through doors and windows, or as toys)
+car
+truck
+bus
+motorcycle
+airplane
+boat
+train
+traffic cone

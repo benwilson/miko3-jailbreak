@@ -7,9 +7,12 @@ work, since DirectMotorDriver's SensorModule cannot load without it), asset
 staging (the app's own assets/ when present, the shared certificate, never the
 remote-control song or the settings stylesheet), and, when the Android
 toolchain is installed, a real build whose APK must carry the driver library
-under lib/arm64-v8a/, a manifest with INTERNET but no CAMERA or RECORD_AUDIO,
-the network security config, and the mode's classes in the dex.
+under lib/arm64-v8a/, a manifest with INTERNET and CAMERA but no RECORD_AUDIO,
+the network security config, and the mode's classes in the dex. The pinned
+ONNX Runtime package (camera curiosity, KTD2) must fail loudly when missing or
+tampered with, and its library, the detector and its vocabulary must ship.
 """
+import hashlib
 import importlib.util
 import subprocess
 import tempfile
@@ -33,6 +36,43 @@ def load_build_module():
 
 
 build = load_build_module()
+
+
+class OnnxRuntimeTest(unittest.TestCase):
+    def _fake_aar(self, cache):
+        cache.mkdir(parents=True, exist_ok=True)
+        aar = cache / build.ORT_AAR
+        with zipfile.ZipFile(aar, "w") as z:
+            z.writestr("classes.jar", b"jar")
+            for name in build.ORT_LIBS:
+                z.writestr(f"jni/{build.VENDOR_ABI}/{name}", b"so")
+            z.writestr("jni/x86_64/libonnxruntime.so", b"other abi")
+        return aar
+
+    def test_missing_package_without_fetch_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(build.BuildError) as ctx:
+                build.onnxruntime(Path(td), fetch=False)
+        self.assertIn(build.ORT_AAR, str(ctx.exception))
+
+    def test_checksum_mismatch_fails_and_extracts_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._fake_aar(Path(td))
+            with self.assertRaises(build.BuildError) as ctx:
+                build.onnxruntime(Path(td), fetch=False)
+            self.assertIn("checksum", str(ctx.exception))
+            self.assertFalse((Path(td) / f"onnxruntime-android-{build.ORT_VERSION}").exists())
+
+    def test_verified_package_yields_jar_and_arm64_libs_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            aar = self._fake_aar(Path(td))
+            digest = hashlib.sha256(aar.read_bytes()).hexdigest()
+            with mock.patch.object(build, "ORT_SHA256", digest):
+                jar, libs = build.onnxruntime(Path(td), fetch=False)
+            self.assertEqual(jar.read_bytes(), b"jar")
+            self.assertEqual([abi for abi, _ in libs], [build.VENDOR_ABI] * len(build.ORT_LIBS))
+            self.assertEqual(sorted(p.name for _, p in libs), sorted(build.ORT_LIBS))
+            self.assertTrue(all(p.is_file() for _, p in libs))
 
 
 class LayoutTest(unittest.TestCase):
@@ -146,10 +186,19 @@ class ApkContentsTest(unittest.TestCase):
     def test_apk_carries_motor_driver_lib(self):
         self.assertIn("lib/arm64-v8a/libmiko_drivers.so", self.names)
 
-    def test_manifest_requests_internet_only(self):
+    def test_apk_carries_detector_and_its_runtime(self):
+        for name in build.ORT_LIBS:
+            self.assertIn(f"lib/arm64-v8a/{name}", self.names)
+        self.assertIn("assets/detector.onnx", self.names)
+        self.assertIn("assets/vocabulary.txt", self.names)
+        with zipfile.ZipFile(self.apk) as z:
+            dex = z.read("classes.dex")
+        self.assertTrue(b"Lai/onnxruntime/OrtSession;" in dex, "ONNX Runtime classes missing from classes.dex")
+
+    def test_manifest_requests_internet_and_camera_only(self):
         tree = self._manifest_tree()
         self.assertIn("android.permission.INTERNET", tree)
-        self.assertNotIn("CAMERA", tree)
+        self.assertIn("android.permission.CAMERA", tree)
         self.assertNotIn("RECORD_AUDIO", tree)
 
     def test_manifest_declares_mode_app_and_main_activity(self):

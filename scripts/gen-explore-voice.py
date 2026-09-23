@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """gen-explore-voice.py — render the spoken names explore says when it inspects
-something ("ooh, a plant") into mode-explore/assets/name-<slug>.wav (camera
+something ("ooh, a plant") into mode-explore/assets/name-<slug>.webm (camera
 curiosity plan U6, KTD7, R8, R14).
 
-The vocabulary is the vendor detector's 80 COCO labels (Box.java in the gitignored
-tools/serviceexam_jadx sources; copied here so this script runs without them). Each
-label gets a short phrase with friendlier wording where the COCO name is stilted
-("potted plant" -> "a plant"). The phrase is spoken by a built-in macOS `say` voice,
+The vocabulary is mode-explore/assets/vocabulary.txt, the same list the detector is
+exported with (scripts/export-explore-detector.py). Each name gets a short phrase
+with the right article, or none for plural and mass nouns ("ooh, socks"), and
+fixed capitals where a name needs them ("a TV"). The phrase is spoken by a built-in macOS `say` voice,
 then ffmpeg turns it into a small robot voice to match the idle songs' WALL-E-style
 babble in the deeper register: pitched down a little, a light warble (vibrato) and
 a light ring-modulated buzz. Finally the clip is trimmed, faded and normalized here
-and written mono 16-bit at gen-explore-sounds.py's RATE. Every name is original
-speech; nothing comes from the film.
+and encoded as Opus in WebM: a few hundred names as WAV would add ~17 MB to the
+APK (assets are stored uncompressed), as Opus ~1.5 MB. The robot's MediaPlayer
+plays Opus in WebM (checked on the device; Opus in Ogg needs Android 10). Every
+name is original speech; nothing comes from the film.
 
 `say` output differs between macOS versions and machines, so the committed clips are
 checked for presence and format only (scripts/tests/test_gen_explore_voice.py).
-Requires macOS `say` and ffmpeg.
+Requires macOS `say` and ffmpeg with libopus.
 
   python3 scripts/gen-explore-voice.py                  # write mode-explore/assets/
   python3 scripts/gen-explore-voice.py OUT_DIR          # write somewhere else
@@ -28,7 +30,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import wave
 from pathlib import Path
 
 RATE = 22050  # same as scripts/gen-explore-sounds.py; the tests check they agree
@@ -38,54 +39,74 @@ MAX_SECONDS = 2.3    # keep every clip under the 2.5 s the brain budgets for a n
 PEAK = 0.62          # of full scale, like the startle chirps
 PITCH = 0.84         # pitch factor (tempo is restored), a little deeper than the voice
 
-# The vendor detector's labels, in its class-index order (Box.java). The decompiled file
-# references library constants for "mouse" and "clock"; these are their literal values.
-VOCABULARY = (
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
-    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
-    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
-    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
-    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
-    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-    "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
-    "toothbrush",
-)
+VOCABULARY_FILE = Path(__file__).resolve().parents[1] / "mode-explore" / "assets" / "vocabulary.txt"
+OPUS_BITRATE = "24k"  # speech; transparent enough on the robot's small speaker
 
-# What he calls a thing when the COCO name is stilted or not how people say it.
+
+def read_vocabulary(path=VOCABULARY_FILE):
+    """The names in model order: non-blank lines that are not '#' comments (the
+    same rule as export-explore-detector.py and OnnxRecognizer)."""
+    names = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            names.append(line)
+    return tuple(names)
+
+
+VOCABULARY = read_vocabulary()
+
+# How a name is written for the voice, where the vocabulary's lowercase spelling
+# would be read wrong ("tv" as "tuh-vee") or a synonym is how people say it.
 FRIENDLY = {
-    "potted plant": "plant",
-    "cell phone": "phone",
-    "dining table": "table",
     "tv": "TV",
-    "sports ball": "ball",
-    "hair drier": "hair dryer",
-    "refrigerator": "fridge",
-    "motorcycle": "motorbike",
+    "cell phone": "phone",
+    "t-shirt": "T-shirt",
+    "usb stick": "USB stick",
+    "lego": "Lego",
+    "rubik's cube": "Rubik's cube",
 }
 
 # Plural and mass nouns: "ooh, scissors", not "ooh, a scissors".
-NO_ARTICLE = {"skis", "scissors", "broccoli"}
+NO_ARTICLE = {
+    "flowers", "blinds", "stairs", "shoes", "socks", "pants", "jeans", "shorts", "pajamas",
+    "glasses", "sunglasses", "earrings", "keys", "headphones", "earbuds", "scissors",
+    "building blocks", "playing cards", "dice", "lego", "play dough", "sticky notes",
+    "grapes", "broccoli", "bread", "cheese", "candy", "chocolate", "ice cream", "popcorn",
+    "toothpaste", "soap", "toilet paper", "paper towel", "paper", "tape", "glue", "pliers",
+}
+
+# Words starting with a vowel letter but a consonant sound, and the reverse.
+A_NOT_AN = {"ukulele", "usb stick"}
 
 
 def slug(label):
-    """COCO label -> asset slug: spaces become dashes ("potted plant" -> "potted-plant")."""
-    return label.replace(" ", "-")
+    """Vocabulary name -> asset slug: lowercase, every run of other characters
+    becomes one dash ("guinea pig" -> "guinea-pig", "rubik's cube" -> "rubik-s-cube").
+    Must match Detection.nameClip on the robot."""
+    out, dash = [], False
+    for ch in label.lower():
+        if ch.isascii() and ch.isalnum():
+            if dash and out:
+                out.append("-")
+            out.append(ch)
+            dash = False
+        else:
+            dash = True
+    return "".join(out)
 
 
 def clip_name(label):
-    return f"name-{slug(label)}.wav"
+    return f"name-{slug(label)}.webm"
 
 
 def phrase(label):
-    """The words he says for a label, with the right article: "ooh, an apple"."""
+    """The words he says for a name, with the right article: "ooh, an apple"."""
     word = FRIENDLY.get(label, label)
     if label in NO_ARTICLE:
         return f"ooh, {word}"
-    article = "an" if word[0].lower() in "aeiou" else "a"
-    return f"ooh, {article} {word}"
+    vowel = word[0].lower() in "aeiou" and label not in A_NOT_AN
+    return f"ooh, {'an' if vowel else 'a'} {word}"
 
 
 # ffmpeg chain, after `say` writes 16-bit mono at RATE:
@@ -141,12 +162,29 @@ def finish(samples):
     return out
 
 
-def write_wav(path, samples):
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(RATE)
-        w.writeframes(samples.tobytes())
+def write_clip(path, samples):
+    """Encode finished samples as Opus in WebM at path."""
+    pcm = samples.tobytes() if sys.byteorder == "little" else _swapped(samples)
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", "-",
+         "-c:a", "libopus", "-b:a", OPUS_BITRATE, "-application", "voip",
+         "-map_metadata", "-1", "-fflags", "+bitexact", "-f", "webm", str(path)],
+        input=pcm, check=True)
+
+
+def _swapped(samples):
+    copy = array.array("h", samples)
+    copy.byteswap()
+    return copy.tobytes()
+
+
+def clip_seconds(path):
+    """A clip's length from ffprobe, or None when ffprobe is not installed."""
+    if shutil.which("ffprobe") is None:
+        return None
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                          "-of", "csv=p=0", str(path)], check=True, capture_output=True, text=True)
+    return float(out.stdout.strip())
 
 
 def render(label, voice, workdir):
@@ -169,7 +207,7 @@ def generate(out_dir, voice=VOICE):
     with tempfile.TemporaryDirectory(prefix="explore_voice_") as workdir:
         for label in VOCABULARY:
             path = out_dir / clip_name(label)
-            write_wav(path, render(label, voice, workdir))
+            write_clip(path, render(label, voice, workdir))
             paths.append(path)
     return paths
 
@@ -181,10 +219,10 @@ def main():
     parser.add_argument("--voice", default=os.environ.get("EXPLORE_VOICE", VOICE),
                         help=f"built-in macOS voice (default {VOICE})")
     args = parser.parse_args()
+    for stale in args.out.glob("name-*.wav"):  # the earlier WAV clips
+        stale.unlink()
     for path in generate(args.out, args.voice):
-        with wave.open(str(path)) as w:
-            seconds = w.getnframes() / w.getframerate()
-        print(f"wrote {path.name} ({seconds:.2f}s)")
+        print(f"wrote {path.name} ({clip_seconds(path) or 0:.2f}s, {path.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":

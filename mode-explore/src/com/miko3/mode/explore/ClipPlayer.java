@@ -33,10 +33,10 @@ import java.util.Random;
  * once up front; playStartle() only posts a seek-and-start to a private
  * thread, so a startle never delays the stop() the brain issues just before
  * it. Clips must be stored uncompressed in the APK for openFd, which aapt
- * does for .wav by default.
+ * does for .wav and .webm by default.
  *
- * Curiosity clips (camera curiosity plan U6): playName() says a detector label
- * (assets/name-<label with spaces as dashes>.wav, from scripts/gen-explore-voice.py)
+ * Curiosity clips (camera curiosity plan U6): playName() says a vocabulary name
+ * (assets/name-<slug>.webm, see Detection.nameClip; from scripts/gen-explore-voice.py)
  * and playReaction() plays a random variant of a reaction group
  * (assets/react-<group>-<n>.wav, from scripts/gen-explore-sounds.py). There are
  * too many names to hold a prepared player for each, so these are prepared on the
@@ -125,10 +125,10 @@ final class ClipPlayer {
         });
     }
 
-    /** Say a detector label's name ("ooh, a plant"), e.g. playName("potted plant").
-     * Returns at once; a label with no clip is logged and skipped. */
-    void playName(String cocoLabel) {
-        final String asset = "name-" + cocoLabel.replace(' ', '-') + ".wav";
+    /** Say a vocabulary name ("ooh, a plant"), e.g. playName("guinea pig").
+     * Returns at once; a name with no clip is logged and skipped. */
+    void playName(String label) {
+        final String asset = Detection.nameClip(label);
         handler.post(new Runnable() {
             @Override
             public void run() {
