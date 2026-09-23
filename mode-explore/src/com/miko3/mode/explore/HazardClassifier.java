@@ -174,7 +174,12 @@ final class HazardClassifier {
         if (r.tof == tuning.tofFault && !irEdgeFlagged(r)) {
             return "tof at fault value " + tuning.tofFault;
         }
-        if (tuning.frozenTofWindowMs > 0 && r.timestampMs - tofSinceMs >= tuning.frozenTofWindowMs) {
+        // The out-of-range value is naturally constant while he faces past an edge; with
+        // the IR edge flag agreeing it is an edge (a hazard he turns away from), not a
+        // stuck sensor. Treating it as frozen left him in eyes-only at the edge for good.
+        boolean edgeReading = r.tof == tuning.tofFault && irEdgeFlagged(r);
+        if (!edgeReading && tuning.frozenTofWindowMs > 0
+                && r.timestampMs - tofSinceMs >= tuning.frozenTofWindowMs) {
             return "tof frozen at " + r.tof + " for " + (r.timestampMs - tofSinceMs) + " ms";
         }
         return null;

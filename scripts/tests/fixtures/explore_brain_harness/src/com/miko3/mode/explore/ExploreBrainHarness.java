@@ -482,6 +482,19 @@ public final class ExploreBrainHarness {
             HazardClassifier.Status s = c.status(100);
             check(n, s == HazardClassifier.Status.CLEAR, "status=" + s + " hazard=" + c.hazard());
         });
+        scenario("classifier_edge_held_past_frozen_window_stays_a_hazard", n -> {
+            // Facing past an edge, tof sits at its out-of-range value with the IR flag on
+            // and never changes. That is an edge, not a stuck sensor; calling it frozen put
+            // the robot in eyes-only at the edge, where it never turned away (seen on device).
+            HazardClassifier c = new HazardClassifier(new ExploreTuning.Builder()
+                    .calibration(new ExploreTuning.Calibration(100, -1, 0, true)).recoveryStreak(1)
+                    .frozenTofWindowMs(3000).build());
+            for (long t = 100; t <= 6000; t += 100) {
+                c.offer(new SensorReading(t, 16383, -1, 1, null, false));
+            }
+            HazardClassifier.Status st = c.status(6000);
+            check(n, st == HazardClassifier.Status.HAZARD, "status=" + st + " reason=" + c.reason());
+        });
         scenario("classifier_one_ir_channel_gives_no_side", n -> {
             // ir1 is always absent on this robot; with only ir2 flagging there is nothing
             // to tell left from right, so the edge must not be pinned to a side.

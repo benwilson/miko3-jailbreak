@@ -67,6 +67,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "classifier_cpl2_is_a_hazard",
         "classifier_absent_ir_is_never_an_edge",
         "classifier_one_ir_channel_gives_no_side",
+        "classifier_edge_held_past_frozen_window_stays_a_hazard",
         "classifier_fault_tof_with_ir_edge_flag_is_an_edge",
         # ExploreBrain: acceptance examples
         "ae1_edge_mid_hop_startles_backs_off_and_turns_away",
