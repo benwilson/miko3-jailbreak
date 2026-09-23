@@ -23,11 +23,11 @@ final class Sighting {
 
     /**
      * Surfaces he stands on or sees past, never a thing to investigate: from the
-     * floor a rug or mat fills the bottom of nearly every frame, and he cannot
-     * drive up to a window.
+     * floor a rug or mat fills the bottom of nearly every frame, he cannot drive
+     * up to a window, and parked by a door he stared at it at every stop.
      */
     static final Set<String> BACKGROUND = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
-            "rug", "carpet", "mat", "doormat", "stairs", "window", "curtain", "blinds")));
+            "rug", "carpet", "mat", "doormat", "stairs", "window", "curtain", "blinds", "door")));
 
     static final Sighting NOTHING = new Sighting(Kind.NOTHING, null);
 

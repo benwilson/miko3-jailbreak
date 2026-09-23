@@ -120,6 +120,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "hazard_at_curiosity_turn_start_refuses",
         "close_but_off_centre_arrives_instead_of_turning",
         "curiosity_requested_now_starts_at_the_next_pause_end",
+        "stale_looks_end_the_stop_without_turning_curiosity_off",
         "lease_loss_mid_approach_stops_and_closes_the_camera",
         "camera_without_looks_turns_curiosity_off",
     )

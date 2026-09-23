@@ -140,6 +140,8 @@ public final class ExploreBrainHarness {
         boolean cameraOpen;
         long openedAt;
         ExploreBrain.Look latestLook;
+        /** Every look was captured before the camera opened: arriving, never new enough. */
+        boolean staleLooks;
 
         Rig(ExploreTuning tuning, Feed feed) {
             this(tuning, feed, null, false);
@@ -176,7 +178,7 @@ public final class ExploreBrainHarness {
                 if (cameraOpen && vision != null && now % 500 == 0 && now - openedAt >= 500) {
                     List<Detection> seen = vision.see(this, now - 200);
                     if (seen != null) {
-                        latestLook = new ExploreBrain.Look(now - 200, seen);
+                        latestLook = new ExploreBrain.Look(staleLooks ? openedAt - 1000 : now - 200, seen);
                     }
                 }
                 if (now % 100 == 0) {
@@ -1183,6 +1185,17 @@ public final class ExploreBrainHarness {
             check(n, rig.count("react curious") == 1 && rig.countPrefix("turn", 0, 5001) == 0
                             && rig.count("startle") == 0 && rig.violations.isEmpty(),
                     rig.tail());
+        });
+        scenario("stale_looks_end_the_stop_without_turning_curiosity_off", n -> {
+            // Looks keep arriving but all were captured before the stop settled: a slow
+            // detector, not a dead camera. The stop ends, and the next one still comes.
+            Rig rig = new Rig(curious().build(), CLEAR, (r, t) -> list(), true);
+            rig.staleLooks = true;
+            rig.started();
+            rig.runUntil(9000);
+            int close = rig.first("camera close", 0);
+            check(n, rig.timeOf(close) == 4300 && rig.count("camera open") >= 2 && rig.violations.isEmpty(),
+                    "close@" + rig.timeOf(close) + " " + rig.tail());
         });
         scenario("curiosity_requested_now_starts_at_the_next_pause_end", n -> {
             Rig rig = new Rig(curious().curiosityMs(100000, 100000).build(), CLEAR, PLANT, true).started();
