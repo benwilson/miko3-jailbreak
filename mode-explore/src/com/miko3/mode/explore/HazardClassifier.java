@@ -122,7 +122,9 @@ final class HazardClassifier {
             boolean e2 = irEdge(r.ir2);
             if (e1 || e2) {
                 ExploreBrain.Direction side = null;
-                if (e1 != e2) {
+                // A side only when both channels report; with one absent there is
+                // nothing to compare, and guessing pins every escape to one direction.
+                if (e1 != e2 && r.ir1 >= 0 && r.ir2 >= 0) {
                     boolean left = e1 == tuning.ir1IsLeft;
                     side = left ? ExploreBrain.Direction.LEFT : ExploreBrain.Direction.RIGHT;
                 }
