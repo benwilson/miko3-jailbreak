@@ -20,11 +20,28 @@ package com.miko3.mode.explore;
  *
  * Once available, a hazard is a calibrated threshold crossed or CPL=2 (the
  * controller refused a forward command, R9) in the latest reading.
+ *
+ * During an approach the brain asks approach() instead (KTD4): the same ir flag
+ * and CPL=2 refusal fire both for something close and for a drop-off, and the
+ * direction tof left the controller's safe band tells them apart.
  */
 final class HazardClassifier {
     enum Status { UNAVAILABLE, HAZARD, CLEAR }
 
     enum Kind { EDGE, OBSTACLE, CPL }
+
+    /**
+     * The verdict while approaching something (KTD4). CLOSE and CLOSE_REFUSED are
+     * both arrival; CLOSE_REFUSED means the controller refused forward (CPL=2), which
+     * the brain must honour even where it ignores ir/low-tof arrival (leg start).
+     */
+    enum ApproachVerdict {
+        UNAVAILABLE, CLEAR, CLOSE, CLOSE_REFUSED, EDGE;
+
+        boolean isClose() {
+            return this == CLOSE || this == CLOSE_REFUSED;
+        }
+    }
 
     /** What is ahead, and on which side when the sensor says (null = dead ahead or unknown). */
     static final class Hazard {
@@ -141,6 +158,43 @@ final class HazardClassifier {
             return new Hazard(Kind.CPL, null);
         }
         return null;
+    }
+
+    /**
+     * The approach-mode verdict at nowMs (KTD4). Unavailable exactly when status()
+     * is. Otherwise, from the latest reading:
+     *  - tof at its fault value, or above a calibrated edgeTofAbove: EDGE;
+     *  - tof below the calibrated obstacleTofBelow: CLOSE;
+     *  - an ir edge flag or CPL=2 with tof below the band's lower bound: CLOSE;
+     *    above its upper bound: EDGE; inside the band: EDGE, the safe reading;
+     *  - otherwise CLEAR.
+     * A CLOSE with CPL=2 present is reported as CLOSE_REFUSED.
+     */
+    ApproachVerdict approach(long nowMs) {
+        if (status(nowMs) == Status.UNAVAILABLE) {
+            return ApproachVerdict.UNAVAILABLE;
+        }
+        SensorReading r = latest;
+        boolean refused = r.cpl != null && r.cpl == 2;
+        ApproachVerdict close = refused ? ApproachVerdict.CLOSE_REFUSED : ApproachVerdict.CLOSE;
+        if (r.tof == tuning.tofFault) {
+            return ApproachVerdict.EDGE;
+        }
+        if (cal.edgeTofAbove >= 0 && r.tof > cal.edgeTofAbove) {
+            return ApproachVerdict.EDGE;
+        }
+        if (cal.obstacleTofBelow >= 0 && r.tof < cal.obstacleTofBelow) {
+            return close;
+        }
+        if (irEdgeFlagged(r) || refused) {
+            if (r.tof < tuning.approachBandLower) {
+                return close;
+            }
+            // Above the band it went toward a drop-off; inside it the flag says
+            // nothing about which way tof went, so it is treated as the safe EDGE too.
+            return ApproachVerdict.EDGE;
+        }
+        return ApproachVerdict.CLEAR;
     }
 
     /** Why the sensors are unavailable, for the log. */

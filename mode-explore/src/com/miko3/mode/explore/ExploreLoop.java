@@ -44,6 +44,9 @@ final class ExploreLoop {
 
         /** Stop ticking the brain, as if its thread hung, to prove the stop timer. */
         boolean freezeBrain();
+
+        /** Make a curiosity stop due now instead of after 20-40 s of wandering (camera curiosity U8). */
+        boolean curiousNow();
     }
 
     static final Hooks NO_HOOKS = new Hooks() {
@@ -54,6 +57,11 @@ final class ExploreLoop {
 
         @Override
         public boolean freezeBrain() {
+            return false;
+        }
+
+        @Override
+        public boolean curiousNow() {
             return false;
         }
     };
@@ -75,6 +83,13 @@ final class ExploreLoop {
     ExploreLoop(ExploreTuning tuning, ExploreBrain.Clock clock, Wheels wheels, Sensors sensors, Lease lease,
                 ExploreBrain.Eyes eyes, ExploreBrain.Sound sound, Hooks hooks, ExploreBrain.Trace trace,
                 long tickMs, long stopTimerMs) {
+        this(tuning, clock, wheels, sensors, lease, eyes, sound, ExploreBrain.NO_CAMERA, hooks, trace,
+                tickMs, stopTimerMs);
+    }
+
+    ExploreLoop(ExploreTuning tuning, ExploreBrain.Clock clock, Wheels wheels, Sensors sensors, Lease lease,
+                ExploreBrain.Eyes eyes, ExploreBrain.Sound sound, ExploreBrain.Camera camera, Hooks hooks,
+                ExploreBrain.Trace trace, long tickMs, long stopTimerMs) {
         this.clock = clock;
         this.wheels = wheels;
         this.sensors = sensors;
@@ -82,7 +97,8 @@ final class ExploreLoop {
         this.hooks = hooks == null ? NO_HOOKS : hooks;
         this.trace = trace;
         this.tickMs = tickMs;
-        this.brain = new ExploreBrain(tuning, clock, new DriveGate(wheels, lease, trace), eyes, sound, new Random());
+        this.brain = new ExploreBrain(tuning, clock, new DriveGate(wheels, lease, trace), eyes, sound, camera,
+                new Random());
         if (trace != null) {
             brain.setTrace(trace);
         }
@@ -151,6 +167,9 @@ final class ExploreLoop {
                 if (reading != null && reading.timestampMs > lastReadingMs) {
                     lastReadingMs = reading.timestampMs;
                     brain.onReading(reading);
+                }
+                if (hooks.curiousNow()) {
+                    brain.requestCuriosity();
                 }
                 brain.onTick();
                 stopTimer.feed(clock.nowMs());

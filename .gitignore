@@ -70,3 +70,5 @@ hooks/sd-free/miko3-test/
 
 # autonomous-recovery.py's own runtime cache of staged Route A files
 scripts/route-a-cache/
+tools/third_party/
+tools/detector-export/

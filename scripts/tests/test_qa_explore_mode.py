@@ -86,5 +86,32 @@ class ParseOnlyTest(unittest.TestCase):
             qa.parse_only("ae9")
 
 
+class CuriositySummaryTest(unittest.TestCase):
+    LOG = "\n".join([
+        "09-23 11:43:20.535 I/ExploreBrain(14459): curiosity stop: scanning",
+        "09-23 11:43:21.000 I/ExploreCamera(14459): look in 1295 ms: [cup 0.60 [0.1,0.1,0.2,0.2]]",
+        "09-23 11:43:22.911 I/ExploreBrain(14459): saw THING speaker 0.59 [0.47,0.37,1.00,1.00]",
+        "09-23 11:43:23.000 I/ExploreBrain(14459): approaching the speaker",
+        "09-23 11:43:30.000 I/ExploreBrain(14459): arrived: the speaker fills the frame",
+        "09-23 11:43:31.000 I/ExploreBrain(14459): hop tick",
+    ])
+
+    def test_keeps_the_brains_curiosity_decisions_in_order(self):
+        events, looked = qa.curiosity_summary(self.LOG)
+        self.assertEqual(events, ["curiosity stop: scanning", "saw THING speaker 0.59 [0.47,0.37,1.00,1.00]",
+                                  "approaching the speaker", "arrived: the speaker fills the frame"])
+        self.assertTrue(looked)
+
+    def test_a_stop_that_never_got_a_look_is_reported(self):
+        events, looked = qa.curiosity_summary(
+            "09-23 I/ExploreBrain( 1): curiosity stop: scanning\n"
+            "09-23 I/ExploreBrain( 1): camera gave no look in time; curiosity off for 120000 ms")
+        self.assertEqual(len(events), 2)
+        self.assertFalse(looked)
+
+    def test_curiosity_step_is_selectable(self):
+        self.assertEqual(qa.parse_only("curiosity"), ["curiosity"])
+
+
 if __name__ == "__main__":
     unittest.main()

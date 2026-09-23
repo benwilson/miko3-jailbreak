@@ -67,10 +67,11 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(inst.APK, REPO / "mode-explore" / "miko3-mode-explore.apk")
         self.assertEqual(inst.BUILD_PY, REPO / "scripts" / "build-mode-explore.py")
 
-    def test_install_then_launch_no_grant(self):
+    def test_install_grant_camera_then_launch(self):
         cmds = inst.install_commands(SERIAL, Path("/x/explore.apk"))
         self.assertEqual(cmds, [
             ["adb", "-s", SERIAL, "install", "-r", "-t", "/x/explore.apk"],
+            ["adb", "-s", SERIAL, "shell", "pm", "grant", "com.miko3.mode.explore", "android.permission.CAMERA"],
             ["adb", "-s", SERIAL, "shell", "am", "start", "-n", "com.miko3.mode.explore/.MainActivity"],
         ])
 
@@ -144,22 +145,33 @@ class MainTest(unittest.TestCase):
                 mock.patch.object(inst.Path, "exists", return_value=apk_exists):
             return inst.main(argv)
 
-    def test_happy_path_installs_then_launches(self):
+    GRANTED = done("    android.permission.CAMERA: granted=true\n")
+
+    def test_happy_path_installs_grants_then_launches(self):
         fake = FakeAdb({
             "get-state": done("device\n"),
             "install": done("Success\n"),
+            "dumpsys": self.GRANTED,
             "am start": done("Starting: Intent { cmp=com.miko3.mode.explore/.MainActivity }\n"),
         })
         self.assertEqual(self._run_main(fake, ["--no-build"]), 0)
         joined = [" ".join(c) for c in fake.calls]
         install = next(i for i, c in enumerate(joined) if " install " in c)
+        grant = next(i for i, c in enumerate(joined) if "pm grant" in c)
         start = next(i for i, c in enumerate(joined) if "am start" in c)
-        self.assertLess(install, start)
-        self.assertFalse(any("pm grant" in c for c in joined), "the explore mode needs no runtime permission")
+        self.assertLess(install, grant)
+        self.assertLess(grant, start)
         self.assertFalse(any("build-mode-explore.py" in c for c in joined), "--no-build must not rebuild")
 
+    def test_ungranted_camera_fails_before_launch(self):
+        fake = FakeAdb({"get-state": done("device\n"), "dumpsys": done("no permissions\n")})
+        with self.assertRaises(inst.InstallError) as ctx:
+            self._run_main(fake, ["--no-build"])
+        self.assertIn("CAMERA", str(ctx.exception))
+        self.assertFalse(any("am" in c and "start" in c for c in fake.calls))
+
     def test_builds_first_by_default(self):
-        fake = FakeAdb({"get-state": done("device\n")})
+        fake = FakeAdb({"get-state": done("device\n"), "dumpsys": self.GRANTED})
         self.assertEqual(self._run_main(fake, []), 0)
         self.assertIn("build-mode-explore.py", " ".join(fake.calls[0]))
 
@@ -188,6 +200,7 @@ class MainTest(unittest.TestCase):
     def test_launch_error_fails(self):
         fake = FakeAdb({
             "get-state": done("device\n"),
+            "dumpsys": self.GRANTED,
             "am start": done("Error: Activity class {com.miko3.mode.explore/.MainActivity} does not exist.\n"),
         })
         with self.assertRaises(inst.InstallError):

@@ -23,6 +23,9 @@ Usage:
 
 Dependencies: python3, Homebrew (for bootstrap), a JDK (javac/keytool).
 """
+import zipfile
+import urllib.request
+import hashlib
 import argparse
 import sys
 from pathlib import Path
@@ -52,6 +55,16 @@ KEYSTORE_CN = "Miko3 Explore Mode"
 VENDOR_ABI = "arm64-v8a"
 VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / VENDOR_ABI
 DRIVER_LIB = "libmiko_drivers.so"
+# ONNX Runtime for the YOLOE detector (mode-explore/assets/detector.onnx): the
+# prebuilt Android package from Maven Central, pinned and checksummed, cached in
+# the gitignored tools/third_party/ (too large for git: ~33 MB of arm64 .so).
+ORT_VERSION = "1.30.0"
+ORT_AAR = f"onnxruntime-android-{ORT_VERSION}.aar"
+ORT_URL = ("https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/"
+           f"{ORT_VERSION}/{ORT_AAR}")
+ORT_SHA256 = "e7fb945e402205f6db858d65bb78d2bdb0812317b383976c9e3bceb4862c73f1"
+ORT_CACHE = REPO / "tools" / "third_party"
+ORT_LIBS = ("libonnxruntime.so", "libonnxruntime4j_jni.so")
 
 # The remote-control mode's 3.6 MB song and the settings-page stylesheet have
 # no use in this APK (it serves no settings page). server.p12 is kept: it is
@@ -73,10 +86,38 @@ def vendor_native_libs(lib_dir=VENDOR_LIB_DIR):
     return [(VENDOR_ABI, lib)]
 
 
+def onnxruntime(cache=ORT_CACHE, fetch=True):
+    """Return (classes_jar, [(abi, so), ...]) from the pinned ONNX Runtime AAR,
+    downloading it into cache on first use and verifying its SHA-256."""
+    cache = Path(cache)
+    aar = cache / ORT_AAR
+    if not aar.is_file():
+        if not fetch:
+            raise BuildError(f"!! {aar} missing and fetching is off")
+        cache.mkdir(parents=True, exist_ok=True)
+        print(f"== fetching {ORT_URL} ==")
+        tmp = aar.with_suffix(".part")
+        urllib.request.urlretrieve(ORT_URL, tmp)
+        tmp.rename(aar)
+    digest = hashlib.sha256(aar.read_bytes()).hexdigest()
+    if digest != ORT_SHA256:
+        raise BuildError(f"!! {aar} checksum mismatch: {digest} (expected {ORT_SHA256}); "
+                         "delete it and rebuild")
+    out = cache / f"onnxruntime-android-{ORT_VERSION}"
+    if not (out / "classes.jar").is_file():
+        with zipfile.ZipFile(aar) as z:
+            z.extract("classes.jar", out)
+            for name in ORT_LIBS:
+                z.extract(f"jni/{VENDOR_ABI}/{name}", out)
+    return out / "classes.jar", [(VENDOR_ABI, out / "jni" / VENDOR_ABI / n) for n in ORT_LIBS]
+
+
 def build(sdk=None, bootstrap=True, apk_out=APK, build_dir=BUILD, keystore=KEYSTORE,
           lib_dir=VENDOR_LIB_DIR):
     """Check preconditions, then run the shared pipeline. Returns the APK path."""
     native_libs = vendor_native_libs(lib_dir)
+    ort_jar, ort_libs = onnxruntime()
+    native_libs = native_libs + ort_libs
     if not MANIFEST.exists():
         raise BuildError(f"!! {MANIFEST} not found — build mode-explore/ scaffold first")
 
@@ -96,6 +137,7 @@ def build(sdk=None, bootstrap=True, apk_out=APK, build_dir=BUILD, keystore=KEYST
         asset_exclude=SHARED_ASSETS_EXCLUDED,
         res_dir=RES,
         native_libs=native_libs,
+        jars=[ort_jar],
     )
     return Path(apk_out)
 

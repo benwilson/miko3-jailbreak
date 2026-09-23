@@ -9,6 +9,10 @@ import android.os.HandlerThread;
 import android.util.Log;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Random;
 
 /**
@@ -29,7 +33,15 @@ import java.util.Random;
  * once up front; playStartle() only posts a seek-and-start to a private
  * thread, so a startle never delays the stop() the brain issues just before
  * it. Clips must be stored uncompressed in the APK for openFd, which aapt
- * does for .wav by default.
+ * does for .wav and .webm by default.
+ *
+ * Curiosity clips (camera curiosity plan U6): playName() says a vocabulary name
+ * (assets/name-<slug>.webm, see Detection.nameClip; from scripts/gen-explore-voice.py)
+ * and playReaction() plays a random variant of a reaction group
+ * (assets/react-<group>-<n>.wav, from scripts/gen-explore-sounds.py). There are
+ * too many names to hold a prepared player for each, so these are prepared on the
+ * clip thread when asked and released when they finish. Only one plays at a time:
+ * a new one cuts off the one still playing.
  */
 final class ClipPlayer {
     private static final String TAG = "ClipPlayer";
@@ -41,6 +53,7 @@ final class ClipPlayer {
     private static final long SONG_GAP_MIN_MS = 6000;
     private static final long SONG_GAP_MAX_MS = 12000;
 
+    private final Context context;
     private final HandlerThread thread = new HandlerThread("explore-clips");
     private final Handler handler;
     private final MediaPlayer[] startles = new MediaPlayer[STARTLE_CLIPS.length];
@@ -48,9 +61,13 @@ final class ClipPlayer {
     /** Clip thread only: whether a singing session is on, and the phrase playing now. */
     private boolean singing;
     private MediaPlayer currentSong;
+    /** Clip thread only: reaction group -> its variant assets, and the one-shot playing now. */
+    private final Map<String, List<String>> reactions = new HashMap<>();
+    private MediaPlayer currentOneShot;
     private final Random random = new Random();
 
     ClipPlayer(final Context context) {
+        this.context = context;
         thread.start();
         handler = new Handler(thread.getLooper());
         handler.post(new Runnable() {
@@ -62,6 +79,7 @@ final class ClipPlayer {
                 for (int i = 0; i < SONG_CLIPS.length; i++) {
                     songs[i] = prepare(context, SONG_CLIPS[i]);
                 }
+                indexReactions();
             }
         });
     }
@@ -105,6 +123,108 @@ final class ClipPlayer {
                 }
             }
         });
+    }
+
+    /** Say a vocabulary name ("ooh, a plant"), e.g. playName("guinea pig").
+     * Returns at once; a name with no clip is logged and skipped. */
+    void playName(String label) {
+        final String asset = Detection.nameClip(label);
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                playOneShot(asset);
+            }
+        });
+    }
+
+    /** A random variant of a reaction group: "curious", "thinking", "disappointed",
+     * "delighted" or "puzzled". Returns at once; an unknown group is logged and skipped. */
+    void playReaction(final String group) {
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                List<String> variants = reactions.get(group);
+                if (variants == null || variants.isEmpty()) {
+                    Log.w(TAG, "no clips for reaction " + group + "; skipping");
+                    return;
+                }
+                playOneShot(variants.get(random.nextInt(variants.size())));
+            }
+        });
+    }
+
+    /** Clip thread: find the react-<group>-<n>.wav assets once, so the variant count lives
+     * only in the generator. */
+    private void indexReactions() {
+        try {
+            String[] names = context.getAssets().list("");
+            if (names == null) {
+                return;
+            }
+            for (String name : names) {
+                if (!name.startsWith("react-") || !name.endsWith(".wav")) {
+                    continue;
+                }
+                int dash = name.lastIndexOf('-');
+                if (dash <= "react-".length()) {
+                    continue;
+                }
+                String group = name.substring("react-".length(), dash);
+                List<String> variants = reactions.get(group);
+                if (variants == null) {
+                    variants = new ArrayList<>();
+                    reactions.put(group, variants);
+                }
+                variants.add(name);
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "cannot list reaction clips", e);
+        }
+    }
+
+    /** Clip thread: prepare an asset, play it once and release it when it ends (or
+     * fails), cutting off any one-shot still playing. */
+    private void playOneShot(String asset) {
+        stopOneShot();
+        final MediaPlayer p = prepare(context, asset);
+        if (p == null) {
+            return;
+        }
+        // Created on the clip thread, so these callbacks run on it too.
+        p.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+            @Override
+            public void onCompletion(MediaPlayer mp) {
+                releaseOneShot(mp);
+            }
+        });
+        p.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+            @Override
+            public boolean onError(MediaPlayer mp, int what, int extra) {
+                Log.w(TAG, "clip error " + what + "/" + extra);
+                releaseOneShot(mp);
+                return true;
+            }
+        });
+        currentOneShot = p;
+        try {
+            p.start();
+        } catch (IllegalStateException e) {
+            Log.w(TAG, asset + " playback failed", e);
+            releaseOneShot(p);
+        }
+    }
+
+    private void releaseOneShot(MediaPlayer p) {
+        if (currentOneShot == p) {
+            currentOneShot = null;
+        }
+        p.release();
+    }
+
+    private void stopOneShot() {
+        if (currentOneShot != null) {
+            releaseOneShot(currentOneShot);
+        }
     }
 
     /** Start humming now and then until stopSinging(). Idempotent; returns at once. */
@@ -173,6 +293,7 @@ final class ClipPlayer {
                 singing = false;
                 handler.removeCallbacks(singPhrase);
                 currentSong = null;
+                stopOneShot();
                 releaseAll(startles);
                 releaseAll(songs);
             }

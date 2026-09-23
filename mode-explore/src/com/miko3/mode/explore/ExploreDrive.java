@@ -50,6 +50,7 @@ import java.io.IOException;
  *   MikoExploreStale    hide every reading (AE3/AE4)
  *   MikoExploreFreeze   stop ticking the brain (proves the stop timer)
  *   MikoExploreNoRenew  stop renewing, so the launcher's lease TTL expires (AE5)
+ *   MikoExploreCurious  a curiosity stop is due at every pause (camera curiosity U8)
  */
 final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, ExploreLoop.Lease, ExploreLoop.Hooks {
     private static final String TAG = "ExploreDrive";
@@ -319,6 +320,11 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
     @Override
     public boolean freezeBrain() {
         return hook("MikoExploreFreeze");
+    }
+
+    @Override
+    public boolean curiousNow() {
+        return hook("MikoExploreCurious");
     }
 
     // ---- ExploreLoop.Wheels ----

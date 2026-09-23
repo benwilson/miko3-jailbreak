@@ -142,12 +142,15 @@ def java_home():
     return ""
 
 
-def compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir):
+def compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir, jars=()):
     """Compile every .java under each of src_dirs into one classes.dex.
 
     Per KTD2, src_dirs is normally [app_src, shared_src] — every APK dexes
     its own private copy of the shared module rather than sharing a
     library, since this build has no split-APK/Bundletool machinery.
+
+    jars: prebuilt Java libraries (e.g. an AAR's classes.jar) compiled against
+    and dexed into the same classes.dex.
     """
     print("== 1/4 javac + d8 ==")
     if build_dir.exists():
@@ -163,10 +166,12 @@ def compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir):
     if java_home_dir:
         env["JAVA_HOME"] = java_home_dir
     run([javac, "-source", "8", "-target", "8", "-encoding", "UTF-8",
-         "-bootclasspath", str(android_jar), "-classpath", str(android_jar),
+         "-bootclasspath", str(android_jar),
+         "-classpath", os.pathsep.join([str(android_jar)] + [str(j) for j in jars]),
          "-d", str(obj)] + sources, env=env)
     classes = [str(p) for p in sorted(obj.rglob("*.class"))]
-    run([bt / "d8", "--min-api", "28", "--output", str(build_dir)] + classes, env=env)
+    run([bt / "d8", "--min-api", "28", "--lib", str(android_jar), "--output", str(build_dir)]
+        + classes + [str(j) for j in jars], env=env)
     if not (build_dir / "classes.dex").exists():
         raise BuildError("!! d8 did not produce classes.dex")
 
@@ -280,9 +285,10 @@ def sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore
 
 def build_apk(src_dirs, manifest, android_jar, javac, bt, keytool, java_home_dir,
               build_dir, keystore, keystore_alias, keystore_pass, keystore_cn,
-              apk_out, asset_sources=None, res_dir=None, native_libs=None, asset_exclude=()):
+              apk_out, asset_sources=None, res_dir=None, native_libs=None, asset_exclude=(),
+              jars=()):
     """Full pipeline: compile_java -> stage_assets -> compile_resources -> link_and_pack -> sign."""
-    compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir)
+    compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir, jars)
     assets_dir = stage_assets(asset_sources, build_dir, asset_exclude) if asset_sources else None
     res_zip = compile_resources(bt, res_dir, build_dir) if res_dir else None
     withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip, native_libs)

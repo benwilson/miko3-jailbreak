@@ -51,6 +51,7 @@ public class ModeApp extends Application {
     private ExploreDrive drive;
     private ExploreLoop loop;
     private ClipPlayer clips;
+    private ExploreCamera camera;
 
     /** How often the brain loop runs; well under a hop tick (ExploreBrain.onTick). */
     private static final long BRAIN_TICK_MS = 20;
@@ -146,11 +147,20 @@ public class ModeApp extends Application {
             Log.i(TAG, calibration == null
                     ? "no sensor calibration -- eyes only until scripts/qa-explore-mode.py calibrates"
                     : "sensor calibration: " + calibration);
+            final ExploreTuning tuning = ExploreTuning.defaults(calibration);
             clips = new ClipPlayer(this);
+            // Opened only during curiosity stops (camera curiosity KTD3); the
+            // recognizer loads on the camera's detect thread on first use.
+            camera = new ExploreCamera(this, ExploreDrive.CLOCK, new ExploreCamera.RecognizerFactory() {
+                @Override
+                public Recognizer create() throws Exception {
+                    return new OnnxRecognizer(ModeApp.this, tuning.unsureFloor);
+                }
+            });
             drive = new ExploreDrive(this);
             drive.start();
-            loop = new ExploreLoop(ExploreTuning.defaults(calibration), ExploreDrive.CLOCK,
-                    drive, drive, drive, eyes, sound, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
+            loop = new ExploreLoop(tuning, ExploreDrive.CLOCK,
+                    drive, drive, drive, eyes, sound, camera, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
             loop.start();
             Log.i(TAG, "explore started");
         }
@@ -161,8 +171,9 @@ public class ModeApp extends Application {
      * stopped (R5). Only the current generation's exit calls this
      * (MainActivity), so a stale instance can't stop a newer one's wander.
      *
-     * Ends the brain thread and waits for it (which leaves the wheels stopped),
-     * then releases the lease and disconnects (KTD7), all before returning.
+     * Ends the brain thread and waits for it (which leaves the wheels stopped
+     * and the camera closed), releases the camera and recognizer, then the
+     * lease and the driver (KTD7), all before returning.
      */
     void stopExplore() {
         synchronized (exploreLock) {
@@ -171,9 +182,11 @@ public class ModeApp extends Application {
             }
             exploring = false;
             loop.stop();
+            camera.release();
             drive.release();
             clips.release();
             loop = null;
+            camera = null;
             drive = null;
             clips = null;
             setExploreState(ExploreState.IDLE_STATE);
@@ -207,6 +220,8 @@ public class ModeApp extends Application {
                 case RESTING:
                     setExploreState(ExploreState.of(ExploreState.RESTING));
                     break;
+                case STARE:
+                    break; // set by stare(), with where to look
                 case EYES_ONLY:
                     setExploreState(ExploreState.of(ExploreState.EYES_ONLY));
                     break;
@@ -214,6 +229,16 @@ public class ModeApp extends Application {
                     setExploreState(ExploreState.IDLE_STATE);
                     break;
             }
+        }
+
+        // The box's x is negative toward the robot's left, which the page shows as +x (see above).
+        @Override
+        public void stare(float x, float y) {
+            ClipPlayer c = clips;
+            if (c != null) {
+                c.stopSinging();
+            }
+            setExploreState(ExploreState.look(ExploreState.LOOK, -x, y));
         }
     };
 
@@ -223,6 +248,22 @@ public class ModeApp extends Application {
             ClipPlayer c = clips;
             if (c != null) {
                 c.playStartle();
+            }
+        }
+
+        @Override
+        public void playReaction(String group) {
+            ClipPlayer c = clips;
+            if (c != null) {
+                c.playReaction(group);
+            }
+        }
+
+        @Override
+        public void playName(String label) {
+            ClipPlayer c = clips;
+            if (c != null) {
+                c.playName(label);
             }
         }
     };

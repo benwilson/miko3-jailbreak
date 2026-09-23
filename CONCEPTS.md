@@ -70,6 +70,10 @@ A purpose-built robot capability — remote control, telepresence, autonomous op
 
 An autonomous mode's full reaction to an edge, obstacle, or other hazard that appears while the robot is moving. It stops at once, plays a short startled sound, flinches its eyes, backs up briefly for a fixed short time, then looks toward a new heading and turns away. It differs from the quiet turn-away used when a hazard is already in view before a move starts: that turn has no sound and no back-off. The back-off is blind, because nothing senses behind the robot, so it is kept deliberately short. Too many hazard reactions (startles or quiet turn-aways) within a short window make the robot rest instead of backing off and turning.
 
+## Curiosity stop
+
+An autonomous mode's periodic pause to look around with the camera, the only time the camera is on. It scans with a few short turns and picks the most prominent thing it recognizes. Something new this session, or any person or pet, it turns to face, rolls up to, and reacts to aloud, saying the thing's name; something already inspected gets a disappointed look from where it stands, and something it cannot make out a puzzled one. Arriving next to the thing is not a hazard, but an edge met on the way is still a startle. If the camera gives nothing, curiosity stops are switched off for a while and the robot carries on wandering.
+
 ## Forward refusal
 
 The motor controller's own refusal to drive the robot forward when its front sensor reading falls outside the band it considers safe: too close, meaning something is in front, or too far, meaning no surface, as past an edge. It happens in the controller's firmware, independent of any mode, and acknowledges the command as refused instead of moving, so it acts as a backstop beneath a mode's own hazard checks and is never overridden. It covers forward motion only; reversing and turning are not protected by it. Because the sensor looks down at the surface ahead, the robot rocking on its wheels can briefly push a reading out of the band and trigger a refusal on open ground.
