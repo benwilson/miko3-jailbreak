@@ -17,7 +17,8 @@ EXPLORE_SRC = REPO / "mode-explore" / "src"
 HARNESS = TESTS / "fixtures" / "explore_drive_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreDriveHarness.java"
 PLAIN_JAVA = [EXPLORE_SRC / "com" / "miko3" / "mode" / "explore" / n
-              for n in ("StopTimer.java", "DriveGate.java", "ExploreLoop.java", "ExploreCalibration.java")]
+              for n in ("StopTimer.java", "DriveGate.java", "ExploreLoop.java", "ExploreCalibration.java",
+                        "LeaseTrust.java")]
 
 
 class DriveWiringIsPlainJavaTest(unittest.TestCase):
@@ -35,6 +36,8 @@ class ExploreDriveHarnessTest(unittest.TestCase):
         "stop_timer_fires_once_after_silence",
         "stop_timer_never_fires_while_fed",
         "stop_timer_rearms_after_a_feed",
+        "stop_timer_rearm_fires_again_without_a_feed",
+        "lease_trust_expires_before_the_launcher_ttl",
         "gate_drops_motion_without_lease",
         "gate_stop_goes_out_without_lease",
         "gate_passes_motion_under_lease",
@@ -48,6 +51,7 @@ class ExploreDriveHarnessTest(unittest.TestCase):
         "loop_stale_hook_keeps_the_robot_still",
         "loop_exit_ends_in_stop_and_goes_quiet",
         "loop_stop_timer_stops_a_frozen_brain",
+        "loop_stop_timer_retries_a_failed_stop",
     )
 
     @classmethod

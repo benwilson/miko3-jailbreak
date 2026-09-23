@@ -26,6 +26,8 @@ public final class ExploreDriveHarness {
     static final class FakeWheels implements ExploreLoop.Wheels {
         final List<String> calls = Collections.synchronizedList(new ArrayList<String>());
         volatile boolean failNext;
+        /** How many upcoming stop() calls throw, to exercise the stop timer's retry. */
+        volatile int failStops;
 
         private void record(String c) throws IOException {
             calls.add(c);
@@ -38,7 +40,13 @@ public final class ExploreDriveHarness {
         @Override public void forwardTick() throws IOException { record("forward"); }
         @Override public void turn(ExploreBrain.Direction d) throws IOException { record("turn-" + d); }
         @Override public void backTick() throws IOException { record("back"); }
-        @Override public void stop() throws IOException { calls.add("stop"); }
+        @Override public void stop() throws IOException {
+            calls.add("stop");
+            if (failStops > 0) {
+                failStops--;
+                throw new IOException("injected stop failure");
+            }
+        }
 
         int count(String c) {
             synchronized (calls) {
@@ -153,6 +161,28 @@ public final class ExploreDriveHarness {
         rearm.feed(800);
         check("stop_timer_rearms_after_a_feed", rearm.expired(1400), "did not fire after re-arming");
 
+        StopTimer retry = new StopTimer(600);
+        retry.feed(0);
+        boolean rFirst = retry.expired(600);
+        retry.rearm();
+        boolean rAgain = retry.expired(620);
+        check("stop_timer_rearm_fires_again_without_a_feed", rFirst && rAgain, "first=" + rFirst + " again=" + rAgain);
+
+        // ---- lease trust ----
+        LeaseTrust trust = new LeaseTrust(1750);
+        boolean tBefore = trust.trusted(0);
+        trust.renewed(1000);
+        boolean tFresh = trust.trusted(2700);
+        boolean tStale = trust.trusted(2750);
+        trust.renewed(2800);
+        boolean tRenewed = trust.trusted(4000);
+        trust.lost();
+        boolean tAfterLoss = trust.trusted(4000);
+        check("lease_trust_expires_before_the_launcher_ttl",
+                !tBefore && tFresh && !tStale && tRenewed && !tAfterLoss,
+                "before=" + tBefore + " fresh=" + tFresh + " stale=" + tStale + " renewed=" + tRenewed
+                        + " afterLoss=" + tAfterLoss);
+
         // ---- lease-gated motor ----
         FakeWheels w = new FakeWheels();
         FakeLease lease = new FakeLease();
@@ -262,5 +292,23 @@ public final class ExploreDriveHarness {
         frozen.stop();
         check("loop_stop_timer_stops_a_frozen_brain", stopsAfter > stopsBefore,
                 "stops before=" + stopsBefore + " after=" + stopsAfter);
+
+        FakeWheels rw = new FakeWheels();
+        FakeLease rl = new FakeLease();
+        rl.held = true;
+        Hooks rfreeze = new Hooks();
+        ExploreLoop retrying = loop(rw, rl, rfreeze, 200);
+        retrying.start();
+        sleep(300);
+        rw.failStops = 2;
+        int stopsAtFreeze = rw.count("stop");
+        rfreeze.frozen = true;
+        sleep(700);
+        int attempts = rw.count("stop") - stopsAtFreeze;
+        boolean succeeded = rw.failStops == 0;
+        rfreeze.frozen = false;
+        retrying.stop();
+        check("loop_stop_timer_retries_a_failed_stop", attempts >= 3 && succeeded,
+                "stop attempts after freeze=" + attempts + " failuresLeft=" + rw.failStops);
     }
 }

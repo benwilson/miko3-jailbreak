@@ -170,8 +170,9 @@ final class ExploreLoop {
                     wheels.stop();
                 } catch (IOException e) {
                     if (trace != null) {
-                        trace.note("stop-timer stop failed: " + e.getMessage());
+                        trace.note("stop-timer stop failed, retrying: " + e.getMessage());
                     }
+                    stopTimer.rearm();
                 }
             }
             sleep(checkMs);

@@ -25,6 +25,12 @@ final class StopTimer {
         armed = true;
     }
 
+    /** Fire again on the next check, without a feed: the stop it triggered failed, and
+     * a stuck brain will not feed the timer, so nothing else would retry it. */
+    synchronized void rearm() {
+        armed = true;
+    }
+
     /** True exactly once when the window has passed since the last feed. */
     synchronized boolean expired(long nowMs) {
         if (armed && nowMs - lastFeedMs >= windowMs) {

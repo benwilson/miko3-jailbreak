@@ -122,7 +122,9 @@ final class HazardClassifier {
             boolean e2 = irEdge(r.ir2);
             if (e1 || e2) {
                 ExploreBrain.Direction side = null;
-                if (e1 != e2) {
+                // A side only when both channels report; with one absent there is
+                // nothing to compare, and guessing pins every escape to one direction.
+                if (e1 != e2 && r.ir1 >= 0 && r.ir2 >= 0) {
                     boolean left = e1 == tuning.ir1IsLeft;
                     side = left ? ExploreBrain.Direction.LEFT : ExploreBrain.Direction.RIGHT;
                 }
@@ -172,7 +174,12 @@ final class HazardClassifier {
         if (r.tof == tuning.tofFault && !irEdgeFlagged(r)) {
             return "tof at fault value " + tuning.tofFault;
         }
-        if (tuning.frozenTofWindowMs > 0 && r.timestampMs - tofSinceMs >= tuning.frozenTofWindowMs) {
+        // The out-of-range value is naturally constant while he faces past an edge; with
+        // the IR edge flag agreeing it is an edge (a hazard he turns away from), not a
+        // stuck sensor. Treating it as frozen left him in eyes-only at the edge for good.
+        boolean edgeReading = r.tof == tuning.tofFault && irEdgeFlagged(r);
+        if (!edgeReading && tuning.frozenTofWindowMs > 0
+                && r.timestampMs - tofSinceMs >= tuning.frozenTofWindowMs) {
             return "tof frozen at " + r.tof + " for " + (r.timestampMs - tofSinceMs) + " ms";
         }
         return null;
