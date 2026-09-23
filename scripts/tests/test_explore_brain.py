@@ -28,7 +28,8 @@ EXPLORE_SRC = REPO / "mode-explore" / "src"
 EXPLORE_PKG = EXPLORE_SRC / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "explore_brain_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHarness.java"
-PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java")
+PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
+              "Sighting.java", "Detection.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -100,6 +101,22 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "wander_cycle_hops_and_turns_only_on_fresh_clear_readings",
         "lease_loss_reported_inside_a_motor_call",
         "shutdown_stops_and_goes_inert",
+        # Camera curiosity (camera curiosity plan U5, AE1-AE6)
+        "ae1_new_thing_faced_approached_inspected_then_disappointed",
+        "ae2_frame_fill_arrives_without_the_sensor",
+        "ae3_edge_during_approach_stops_startles_and_abandons",
+        "ae4_person_greeted_then_ignored_during_cooldown",
+        "ae5_camera_unavailable_wanders_as_before",
+        "ae6_camera_open_only_while_curious",
+        "target_lost_during_approach_gives_up",
+        "renamed_target_is_kept_by_overlap",
+        "different_thing_elsewhere_is_not_the_target",
+        "unsure_sighting_is_puzzled_and_stays",
+        "sensor_arrival_ignored_in_leg_grace",
+        "sensor_arrival_after_grace_arrives",
+        "cpl2_in_leg_grace_stops_the_leg_and_looks_again",
+        "lease_loss_mid_approach_stops_and_closes_the_camera",
+        "camera_without_looks_turns_curiosity_off",
     )
 
     @classmethod

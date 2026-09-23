@@ -97,10 +97,13 @@ public final class ExploreDriveHarness {
 
     static final ExploreBrain.Eyes NO_EYES = new ExploreBrain.Eyes() {
         @Override public void show(ExploreBrain.EyeState state, ExploreBrain.Direction gaze) { }
+        @Override public void stare(float x, float y) { }
     };
 
     static final ExploreBrain.Sound NO_SOUND = new ExploreBrain.Sound() {
         @Override public void playStartle() { }
+        @Override public void playReaction(String group) { }
+        @Override public void playName(String label) { }
     };
 
     /** Short pauses so a loop run moves within a few hundred milliseconds. */

@@ -1,16 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Miko 3 explore mode: the robot wanders the desk on its own. Launched by
      the launcher via explicit Intent (not HOME) and returns control to it on
-     exit, matching the remote-control and voice modes' manifests. No CAMERA
-     or RECORD_AUDIO permission: the mode reads the controller's sensor replies
-     over the shared motor driver and never opens the camera or microphone.
-     See docs/plans/2026-09-22-1438-feat-explore-mode-plan.md. -->
+     exit, matching the remote-control and voice modes' manifests. It reads the
+     controller's sensor replies over the shared motor driver, and opens the
+     camera only during curiosity stops (CAMERA, granted by
+     scripts/install-mode-explore.py); never the microphone.
+     See docs/plans/2026-09-22-1438-feat-explore-mode-plan.md and
+     docs/plans/2026-09-23-1037-feat-explore-camera-curiosity-plan.md. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.miko3.mode.explore"
     android:versionCode="1"
     android:versionName="1.0">
 
     <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.CAMERA"/>
 
     <application
         android:label="Miko3 Explore"

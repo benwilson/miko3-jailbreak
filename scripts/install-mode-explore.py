@@ -4,8 +4,8 @@ install-mode-explore.py — build, install, and launch the explore mode
 (mode-explore/miko3-mode-explore.apk) over root adb, hands-off.
 
 Then starts the mode's Activity directly, the same explicit Intent the
-launcher sends. No runtime permission to grant: the mode uses neither the
-camera nor the microphone. The launcher only lists Explore once it is
+launcher sends. Grants CAMERA before the first launch (camera curiosity), so
+the mode never shows a permission dialog; it never uses the microphone. The launcher only lists Explore once it is
 rebuilt with the updated mode registry (scripts/install-custom-launcher.py).
 
 The robot is reached over TCP adb by default (root adbd on 5555, as the
@@ -30,6 +30,7 @@ BUILD_PY = REPO / "scripts" / "build-mode-explore.py"
 PKG = "com.miko3.mode.explore"
 COMPONENT = f"{PKG}/.MainActivity"
 DEFAULT_SERIAL = "192.168.19.74:5555"
+PERMISSION = "android.permission.CAMERA"
 
 # A device that stops answering must fail, not hang.
 ADB_TIMEOUT = 120
@@ -65,10 +66,15 @@ def run_step(cmd, check=True, timeout=ADB_TIMEOUT):
     return r
 
 
+def adb(serial, *args, check=True, timeout=ADB_TIMEOUT):
+    return run_step(adb_cmd(serial, *args), check=check, timeout=timeout)
+
+
 def install_commands(serial, apk):
-    """The two device steps, in order: install, launch."""
+    """The three device steps, in order: install, grant, launch."""
     return [
         adb_cmd(serial, "install", "-r", "-t", str(apk)),
+        adb_cmd(serial, "shell", "pm", "grant", PKG, PERMISSION),
         adb_cmd(serial, "shell", "am", "start", "-n", COMPONENT),
     ]
 
@@ -109,14 +115,20 @@ def main(argv=None):
     if not APK.exists():
         raise InstallError(f"!! {APK} not found — build it first or drop --no-build")
 
-    print(f"== 1/3 reaching the robot at {args.serial} ==", flush=True)
+    print(f"== 1/4 reaching the robot at {args.serial} ==", flush=True)
     ensure_reachable(args.serial)
 
-    install, start = install_commands(args.serial, APK)
-    print(f"== 2/3 installing {APK.name} ==", flush=True)
+    install, grant, start = install_commands(args.serial, APK)
+    print(f"== 2/4 installing {APK.name} ==", flush=True)
     run_step(install)
 
-    print(f"== 3/3 launching {COMPONENT} ==", flush=True)
+    print(f"== 3/4 granting {PERMISSION} (no dialog on first launch) ==", flush=True)
+    run_step(grant)
+    dump = adb(args.serial, "shell", "dumpsys", "package", PKG).stdout
+    if f"{PERMISSION}: granted=true" not in dump:
+        raise InstallError(f"!! {PERMISSION} does not show granted=true in dumpsys package {PKG}")
+
+    print(f"== 4/4 launching {COMPONENT} ==", flush=True)
     out = run_step(start).stdout
     if "Error" in out:
         raise InstallError(f"!! am start failed:\n{out.strip()}")
