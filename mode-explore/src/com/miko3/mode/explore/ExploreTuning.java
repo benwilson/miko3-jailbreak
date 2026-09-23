@@ -53,6 +53,13 @@ final class ExploreTuning {
     final long cooldownMs;
     /** Whether ir1 is the left-hand edge sensor. Unverified until U1/U8; only steers which way to turn away. */
     final boolean ir1IsLeft;
+    /**
+     * The controller's safe tof band, lower and upper bounds (KTD4). During an
+     * approach an ir flag or CPL=2 with tof below the lower bound means something
+     * close ahead (arrival); above the upper bound, a drop-off.
+     */
+    final int approachBandLower;
+    final int approachBandUpper;
     /** Edge and obstacle thresholds from the device, or null when uncalibrated (KTD9). */
     final Calibration calibration;
 
@@ -79,6 +86,8 @@ final class ExploreTuning {
         capWindowMs = b.capWindowMs;
         cooldownMs = b.cooldownMs;
         ir1IsLeft = b.ir1IsLeft;
+        approachBandLower = b.approachBandLower;
+        approachBandUpper = Math.max(b.approachBandLower, b.approachBandUpper);
         calibration = b.calibration;
     }
 
@@ -150,6 +159,9 @@ final class ExploreTuning {
         private long capWindowMs = 20000;
         private long cooldownMs = 30000;
         private boolean ir1IsLeft = true;
+        // docs/solutions/best-practices/miko3-tof-is-a-downward-cliff-sensor-inside-mcu-safe-band.md
+        private int approachBandLower = 170;
+        private int approachBandUpper = 280;
         private Calibration calibration;
 
         /** A fixed leg length. */
@@ -176,6 +188,11 @@ final class ExploreTuning {
             return this;
         }
         Builder ir1IsLeft(boolean v) { ir1IsLeft = v; return this; }
+        Builder approachBand(int lower, int upper) {
+            approachBandLower = lower;
+            approachBandUpper = upper;
+            return this;
+        }
         Builder calibration(Calibration v) { calibration = v; return this; }
 
         ExploreTuning build() {

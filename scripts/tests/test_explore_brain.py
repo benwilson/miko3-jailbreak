@@ -69,6 +69,16 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "classifier_one_ir_channel_gives_no_side",
         "classifier_edge_held_past_frozen_window_stays_a_hazard",
         "classifier_fault_tof_with_ir_edge_flag_is_an_edge",
+        # HazardClassifier: approach mode (U4, KTD4)
+        "approach_low_tof_with_ir2_is_close",
+        "approach_fault_tof_with_ir2_is_edge",
+        "approach_cpl2_below_band_is_close_by_refusal",
+        "approach_cpl2_with_ir2_above_band_is_edge",
+        "approach_ir2_inside_band_is_edge",
+        "approach_no_flag_inside_band_is_clear",
+        "approach_tof_above_edge_rule_is_edge",
+        "approach_unavailable_like_wander_mode",
+        "wander_low_tof_with_ir2_is_still_a_hazard",
         # ExploreBrain: acceptance examples
         "ae1_edge_mid_hop_startles_backs_off_and_turns_away",
         "ae2_eyes_lead_the_turn_then_idle_on_the_hop",

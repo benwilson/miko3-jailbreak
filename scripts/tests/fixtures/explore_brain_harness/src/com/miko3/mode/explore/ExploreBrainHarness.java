@@ -524,6 +524,80 @@ public final class ExploreBrainHarness {
                             && noFlag == HazardClassifier.Status.UNAVAILABLE,
                     "before=" + before + " edge=" + edge + " hazard=" + h + " noFlag=" + noFlag);
         });
+        approachScenarios();
+    }
+
+    // ---- HazardClassifier: approach mode (U4, KTD4) ----
+
+    /** The owner's real calibration: obstacle below 157, no tof edge rule, ir2 above 0 is an edge. */
+    private static HazardClassifier ownerClassifier() {
+        return new HazardClassifier(new ExploreTuning.Builder()
+                .calibration(new ExploreTuning.Calibration(157, -1, 0, true)).recoveryStreak(1).build());
+    }
+
+    private static HazardClassifier.ApproachVerdict approachAt(int tof, int ir2, Integer cpl) {
+        HazardClassifier c = ownerClassifier();
+        c.offer(new SensorReading(100, tof, -1, ir2, cpl, false));
+        return c.approach(100);
+    }
+
+    private static void approachScenarios() {
+        scenario("approach_low_tof_with_ir2_is_close", n -> {
+            // A hand in front: tof far below the band with ir2 set is arrival, not a hazard.
+            HazardClassifier.ApproachVerdict v = approachAt(45, 1, null);
+            check(n, v == HazardClassifier.ApproachVerdict.CLOSE, "verdict=" + v);
+        });
+        scenario("approach_fault_tof_with_ir2_is_edge", n -> {
+            HazardClassifier.ApproachVerdict v = approachAt(16383, 1, null);
+            check(n, v == HazardClassifier.ApproachVerdict.EDGE, "verdict=" + v);
+        });
+        scenario("approach_cpl2_below_band_is_close_by_refusal", n -> {
+            // tof 166 is above obstacleTofBelow (157) but below the band (170): the
+            // controller refused forward because something is close.
+            HazardClassifier.ApproachVerdict v = approachAt(166, 0, 2);
+            check(n, v == HazardClassifier.ApproachVerdict.CLOSE_REFUSED && v.isClose(), "verdict=" + v);
+        });
+        scenario("approach_cpl2_with_ir2_above_band_is_edge", n -> {
+            // Rolling toward a drop-off: tof rising past the band's top (280).
+            HazardClassifier.ApproachVerdict v = approachAt(289, 1, 2);
+            check(n, v == HazardClassifier.ApproachVerdict.EDGE, "verdict=" + v);
+        });
+        scenario("approach_ir2_inside_band_is_edge", n -> {
+            // A flag with tof inside the band says nothing about direction: take the safe reading.
+            HazardClassifier.ApproachVerdict v = approachAt(230, 1, null);
+            check(n, v == HazardClassifier.ApproachVerdict.EDGE, "verdict=" + v);
+        });
+        scenario("approach_no_flag_inside_band_is_clear", n -> {
+            HazardClassifier.ApproachVerdict v = approachAt(220, 0, null);
+            check(n, v == HazardClassifier.ApproachVerdict.CLEAR, "verdict=" + v);
+        });
+        scenario("approach_tof_above_edge_rule_is_edge", n -> {
+            // A calibrated tof edge rule applies with or without a flag.
+            HazardClassifier c = new HazardClassifier(new ExploreTuning.Builder()
+                    .calibration(new ExploreTuning.Calibration(157, 400, 0, true)).recoveryStreak(1).build());
+            c.offer(new SensorReading(100, 450, -1, 0, null, false));
+            HazardClassifier.ApproachVerdict v = c.approach(100);
+            check(n, v == HazardClassifier.ApproachVerdict.EDGE, "verdict=" + v);
+        });
+        scenario("approach_unavailable_like_wander_mode", n -> {
+            HazardClassifier unc = new HazardClassifier(tuning().calibration(null).build());
+            unc.offer(new SensorReading(100, 45, -1, 1, null, false));
+            HazardClassifier.ApproachVerdict uncalibrated = unc.approach(100);
+            HazardClassifier c = ownerClassifier();
+            c.offer(new SensorReading(100, 45, -1, 1, null, false));
+            HazardClassifier.ApproachVerdict stale = c.approach(400);
+            check(n, uncalibrated == HazardClassifier.ApproachVerdict.UNAVAILABLE
+                            && stale == HazardClassifier.ApproachVerdict.UNAVAILABLE,
+                    "uncalibrated=" + uncalibrated + " stale=" + stale);
+        });
+        scenario("wander_low_tof_with_ir2_is_still_a_hazard", n -> {
+            HazardClassifier c = ownerClassifier();
+            c.offer(new SensorReading(100, 45, -1, 1, null, false));
+            HazardClassifier.Status s = c.status(100);
+            HazardClassifier.Hazard h = c.hazard();
+            check(n, s == HazardClassifier.Status.HAZARD && h != null && h.kind == HazardClassifier.Kind.EDGE,
+                    "status=" + s + " hazard=" + h);
+        });
     }
 
     // ---- ExploreBrain: acceptance examples ----
