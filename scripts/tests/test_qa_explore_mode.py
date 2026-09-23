@@ -109,6 +109,16 @@ class CuriositySummaryTest(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertFalse(looked)
 
+    def test_in_place_reactions_and_turns_are_reported(self):
+        events, looked = qa.curiosity_summary(
+            "09-23 I/ExploreBrain( 1): saw THING tv 0.54 [0.71,0.41,0.94,0.66]\n"
+            "09-23 I/ExploreBrain( 1): seen the tv already: disappointed\n"
+            "09-23 I/ExploreBrain( 1): unsure what the cup is: puzzled\n"
+            "09-23 I/ExploreBrain( 1): turning RIGHT to face the plant\n"
+            "09-23 I/ExploreBrain( 1): no new look in time; ending this curiosity stop")
+        self.assertEqual(len(events), 5)
+        self.assertTrue(looked)
+
     def test_curiosity_step_is_selectable(self):
         self.assertEqual(qa.parse_only("curiosity"), ["curiosity"])
 

@@ -620,8 +620,10 @@ final class ExploreBrain {
             target = sighting.target;
             note("saw " + sighting);
             if (sighting.kind == Sighting.Kind.UNSURE) {
+                note("unsure what the " + target.label + " is: puzzled");
                 react(now, State.REACT_HERE, Cue.PUZZLED);
             } else if (!sighting.isPersonOrPet() && seen.contains(target.label)) {
+                note("seen the " + target.label + " already: disappointed");
                 react(now, State.REACT_HERE, Cue.DISAPPOINTED);
             } else {
                 state = State.FACE;
@@ -658,6 +660,7 @@ final class ExploreBrain {
             note("never got close to the " + target.label + "; giving up");
             endCuriosity(now);
         } else if (Math.abs(target.centerX()) > tuning.centreTolerance) {
+            note("re-centring " + sideOf(target) + " on the " + target.label);
             startCuriosityTurn(now, sideOf(target), turnMsFor(target), false);
         } else {
             step = Step.READY_LEG;
@@ -682,6 +685,7 @@ final class ExploreBrain {
             return;
         }
         faceTurns++;
+        note("turning " + sideOf(target) + " to face the " + target.label);
         // Eyes are already on it; they lead the turn by lookLeadMs (R5).
         startCuriosityTurn(now, sideOf(target), turnMsFor(target), true);
     }

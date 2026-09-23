@@ -40,8 +40,9 @@ ALL_STEPS = ("calibrate", "ae1", "ae2", "ae3", "ae4", "ae5", "ae6", "stoptimer",
 
 # What the brain logs at each curiosity decision (ExploreBrain.note), in the
 # order a stop goes: the scan, what it saw, and how it ended.
-CURIOSITY_EVENTS = ("curiosity stop", "saw ", "approaching", "arrived", "nothing interesting",
-                    "lost sight", "never got close", "camera gave no look", "hazard")
+CURIOSITY_EVENTS = ("curiosity stop", "saw ", "turning ", "re-centring", "approaching", "arrived",
+                    "seen the ", "unsure what", "nothing interesting", "lost sight", "never got close",
+                    "no new look", "camera gave no look", "hazard")
 
 _sensors = None
 
