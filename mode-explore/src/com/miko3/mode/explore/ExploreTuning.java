@@ -246,9 +246,12 @@ final class ExploreTuning {
         private int scanLooks = 3;
         private long scanTurnMs = 700;
         private long lookSettleMs = 400;
-        // Camera start plus the recognizer's first run (~0.75 s load, ~1.4 s first frame, U1).
-        private long firstLookTimeoutMs = 8000;
-        private long lookTimeoutMs = 5000;
+        // Up to ExploreCamera.REOPEN_GAP_MS (3 s) before the camera reopens, camera start,
+        // then the recognizer's first run (~0.75 s load, ~1.4 s first frame, U1).
+        private long firstLookTimeoutMs = 10000;
+        // A look needs a frame taken after he stopped, and live looks take up to ~2.5 s
+        // on the robot, so the first usable one can be ~5 s away.
+        private long lookTimeoutMs = 8000;
         private long cameraBackoffMs = 120000;
         private float centreTolerance = 0.25f;
         private long turnMsPerUnit = 900;

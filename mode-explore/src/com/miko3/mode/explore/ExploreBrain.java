@@ -560,8 +560,14 @@ final class ExploreBrain {
                         onLook(now, look);
                     }
                 } else if (now >= lookDeadline) {
-                    note("camera gave no look in time; curiosity off for " + tuning.cameraBackoffMs + " ms");
-                    curiosityOffUntil = now + tuning.cameraBackoffMs;
+                    if (look != null) {
+                        // Looks are coming, just not a new enough one: a slow detector,
+                        // not a broken camera, so only this stop ends.
+                        note("no new look in time; ending this curiosity stop");
+                    } else {
+                        note("camera gave no look in time; curiosity off for " + tuning.cameraBackoffMs + " ms");
+                        curiosityOffUntil = now + tuning.cameraBackoffMs;
+                    }
                     endCuriosity(now);
                 }
                 break;

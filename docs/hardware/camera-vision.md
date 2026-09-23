@@ -487,6 +487,16 @@ about 28 MB. The runtime AAR is fetched once from Maven Central into the gitigno
 The spoken names ship as Opus in WebM, which this robot's `MediaPlayer` plays (Opus in
 Ogg needs Android 10).
 
+**Reopening the camera too soon hangs the HAL.** Opening camera 0 again ~50 ms
+after the previous device finished disconnecting made `camerahalserver` hang in
+`configureStreams` for 10 s (`mtkcam-dev3 ... onConfigureStreamsLocked ... err:-110`),
+raise an AEE exception, and sometimes stay unusable for about a minute of retries.
+Note that `CameraDevice.close()` returns before the close completes: gate the next
+open on `onClosed()` plus a settle gap. `ExploreCamera` waits 3 s after `onClosed()`
+(`REOPEN_GAP_MS`); 23 back-to-back open/close cycles then ran with no HAL error.
+With the camera streaming, a look takes ~2.3-2.5 s, not the ~1.1 s measured on a
+still frame.
+
 ## Open questions
 
 - Where/how are `assets/*.tflite` copied out to `/sdcard/klug/vision/` on

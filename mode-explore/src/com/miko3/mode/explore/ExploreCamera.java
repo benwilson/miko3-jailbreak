@@ -16,6 +16,7 @@ import android.media.Image;
 import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.Range;
 import android.util.Size;
@@ -46,6 +47,13 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private static final String TAG = "ExploreCamera";
     private static final int WIDTH = 640;
     private static final int HEIGHT = 480;
+    /**
+     * How long the HAL gets after a close before the next open. Reopening ~50 ms
+     * after the previous device disconnected made this HAL hang configureStreams
+     * for 10 s (mtkcam-dev3 err -110) and report an AEE exception, so that stop got
+     * no look and curiosity went off (seen on the robot with back-to-back stops).
+     */
+    private static final long REOPEN_GAP_MS = 3000;
 
     /** Builds the recognizer on the detect thread, the first time a frame needs it. */
     interface RecognizerFactory {
@@ -69,6 +77,17 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private boolean wanted;
     /** An openCamera() whose callback has not come yet. */
     private boolean opening;
+    /** When the last device finished closing (elapsedRealtime), for REOPEN_GAP_MS. */
+    private long closedAtMs = Long.MIN_VALUE / 2;
+    /**
+     * When a device close was requested and onClosed() has not come yet, else
+     * NOT_CLOSING. device is nulled at the request, so without this an open
+     * arriving in between would go straight through (seen: 16 ms after).
+     */
+    private long closingSinceMs = NOT_CLOSING;
+    private static final long NOT_CLOSING = Long.MIN_VALUE;
+    /** Stop waiting for an onClosed() that never comes. */
+    private static final long CLOSE_WAIT_MAX_MS = 5000;
     /** Counted down once the device is really closed, for release(). */
     private volatile CountDownLatch closed;
 
@@ -112,12 +131,36 @@ final class ExploreCamera implements ExploreBrain.Camera {
             @Override
             public void run() {
                 wanted = true;
-                if (device == null) {
-                    openNow();
-                }
+                openIfWanted.run();
             }
         });
     }
+
+    /** Camera thread: open now, or once REOPEN_GAP_MS has passed since the last close. */
+    private final Runnable openIfWanted = new Runnable() {
+        @Override
+        public void run() {
+            if (!wanted || device != null || opening) {
+                return;
+            }
+            long now = SystemClock.elapsedRealtime();
+            if (closingSinceMs != NOT_CLOSING && now - closingSinceMs < CLOSE_WAIT_MAX_MS) {
+                // onClosed() runs this again; the timeout is only a backstop.
+                cameraHandler.removeCallbacks(this);
+                cameraHandler.postDelayed(this, closingSinceMs + CLOSE_WAIT_MAX_MS - now);
+                return;
+            }
+            // Normally from onClosed(); from the close request if that never came.
+            long settledSince = closingSinceMs == NOT_CLOSING ? closedAtMs : closingSinceMs;
+            long wait = settledSince + REOPEN_GAP_MS - now;
+            if (wait > 0) {
+                cameraHandler.removeCallbacks(this);
+                cameraHandler.postDelayed(this, wait);
+                return;
+            }
+            openNow();
+        }
+    };
 
     @Override
     public void close() {
@@ -212,7 +255,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 public void onOpened(CameraDevice camera) {
                     opening = false;
                     if (!wanted) {
-                        camera.close();
+                        closeDevice(camera);
                         return;
                     }
                     device = camera;
@@ -223,7 +266,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 public void onDisconnected(CameraDevice camera) {
                     Log.w(TAG, "camera disconnected");
                     opening = false;
-                    camera.close();
+                    closeDevice(camera);
                     device = null;
                 }
 
@@ -232,12 +275,16 @@ final class ExploreCamera implements ExploreBrain.Camera {
                     // The brain notices no looks arriving and backs curiosity off (KTD8).
                     Log.e(TAG, "camera error " + error);
                     opening = false;
-                    camera.close();
+                    closeDevice(camera);
                     device = null;
                 }
 
                 @Override
                 public void onClosed(CameraDevice camera) {
+                    closedAtMs = SystemClock.elapsedRealtime();
+                    closingSinceMs = NOT_CLOSING;
+                    cameraHandler.removeCallbacks(openIfWanted);
+                    openIfWanted.run();
                     CountDownLatch latch = closed;
                     if (latch != null) {
                         latch.countDown();
@@ -285,7 +332,14 @@ final class ExploreCamera implements ExploreBrain.Camera {
         }
     }
 
+    /** Every device close goes through here, so the reopen waits for onClosed(). */
+    private void closeDevice(CameraDevice camera) {
+        closingSinceMs = SystemClock.elapsedRealtime();
+        camera.close();
+    }
+
     private void closeNow() {
+        cameraHandler.removeCallbacks(openIfWanted);
         if (session != null) {
             try {
                 session.close();
@@ -295,7 +349,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
             session = null;
         }
         if (device != null) {
-            device.close();
+            closeDevice(device);
             device = null;
         }
         if (reader != null) {
