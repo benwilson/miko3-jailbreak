@@ -1,6 +1,7 @@
 """Tests for scripts/gen-explore-sounds.py: the explore mode's startle chirps are
 generated, not recorded, so these pin what makes them usable on the robot —
-valid short WAVs, audible, and byte-identical across runs (explore plan U7)."""
+valid short WAVs, audible, and byte-identical across runs (explore plan U7), plus the
+curiosity reactions (camera curiosity plan U6)."""
 import array
 import importlib.util
 import tempfile
@@ -42,6 +43,10 @@ class GeneratedClipsTest(unittest.TestCase):
     def songs(self):
         return [p for p in self.paths if p.name.startswith("song-")]
 
+    def reacts(self, group=None):
+        prefix = "react-" if group is None else f"react-{group}-"
+        return [p for p in self.paths if p.name.startswith(prefix)]
+
     def test_writes_several_startle_variants(self):
         self.assertGreaterEqual(len(self.startles()), 2)
         for p in self.startles():
@@ -51,7 +56,7 @@ class GeneratedClipsTest(unittest.TestCase):
         # WALL-E-style babble while he sits still (resting or eyes-only); four, picked at
         # random, so it isn't always the same one.
         self.assertEqual(len(self.songs()), 4)
-        self.assertEqual(len(self.paths), len(self.startles()) + len(self.songs()))
+        self.assertEqual(len(self.paths), len(self.startles()) + len(self.songs()) + len(self.reacts()))
 
     def test_each_song_is_a_short_phrase(self):
         for p in self.songs():
@@ -79,6 +84,48 @@ class GeneratedClipsTest(unittest.TestCase):
     def test_songs_are_distinct(self):
         bodies = [p.read_bytes() for p in self.songs()]
         self.assertEqual(len(set(bodies)), len(bodies))
+
+    def test_writes_every_reaction_group_with_variants(self):
+        # Curiosity reactions (camera plan U6): each group has a few variants so repeats vary.
+        for group in ("curious", "thinking", "disappointed", "delighted", "puzzled"):
+            clips = self.reacts(group)
+            self.assertGreaterEqual(len(clips), 2, group)
+            self.assertLessEqual(len(clips), 3, group)
+            for i, p in enumerate(sorted(clips), start=1):
+                self.assertEqual(p.name, f"react-{group}-{i}.wav")
+        self.assertEqual({group for group, _ in gen.REACTIONS}, {"curious", "thinking", "disappointed", "delighted", "puzzled"})
+
+    def test_each_reaction_is_short_mono_16bit_at_the_expected_rate(self):
+        for p in self.reacts():
+            with wave.open(str(p)) as w:
+                self.assertEqual((w.getnchannels(), w.getsampwidth(), w.getframerate()), (1, 2, gen.RATE))
+                seconds = w.getnframes() / w.getframerate()
+            self.assertTrue(0.3 <= seconds < 3.0, f"{p.name}: {seconds:.2f}s")
+
+    def test_reactions_are_distinct(self):
+        bodies = [p.read_bytes() for p in self.reacts()]
+        self.assertEqual(len(set(bodies)), len(bodies))
+
+    def test_reactions_sit_in_the_deeper_register(self):
+        # Same voice as the songs, deeper than the startle chirps (camera plan U6): the median
+        # voiced window of every reaction crosses zero less often than any startle window.
+        def rates(p):
+            with wave.open(str(p)) as w:
+                samples = array.array("h", w.readframes(w.getnframes()))
+            win = gen.RATE // 20
+            out = []
+            for start in range(0, len(samples) - win, win):
+                chunk = samples[start:start + win]
+                if max(abs(x) for x in chunk) < 3000:
+                    continue
+                out.append(sum(1 for a, b in zip(chunk, chunk[1:]) if (a < 0) != (b < 0)))
+            return out
+        startle_floor = min(min(rates(p)) for p in self.startles())
+        for p in self.reacts():
+            r = sorted(rates(p))
+            self.assertTrue(r, f"{p.name} has no voiced window")
+            median = r[len(r) // 2]
+            self.assertLess(median, startle_floor, p.name)
 
     def test_each_startle_is_short_mono_16bit_at_the_expected_rate(self):
         for p in self.startles():

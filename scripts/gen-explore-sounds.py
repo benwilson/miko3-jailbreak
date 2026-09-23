@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""gen-explore-sounds.py — render the explore mode's startle chirps and idle songs
-into mode-explore/assets/ (explore plan U7, KTD11).
+"""gen-explore-sounds.py — render the explore mode's startle chirps, idle songs and
+curiosity reactions into mode-explore/assets/ (explore plan U7, KTD11; camera
+curiosity plan U6, KTD7).
 
 The sounds are synthesized rather than recorded so there is nothing to license
 and their character can be retuned here and regenerated. Each clip is a short
@@ -8,7 +9,8 @@ and their character can be retuned here and regenerated. Each clip is a short
 reads as a voice rather than a beep. The idle songs are short original runs of
 voiced syllables (pitch glides, vowel tones, warble and rasp) that he babbles while
 sitting still, in the style of WALL-E's processed-voice babble; they copy none of
-his lines or tunes. Output is deterministic, so the committed
+his lines or tunes. The curiosity reactions (curious, thinking, disappointed,
+delighted, puzzled) are the same babble voice, lower. Output is deterministic, so the committed
 WAVs can be checked against this script (scripts/tests/test_gen_explore_sounds.py).
 
   python3 scripts/gen-explore-sounds.py            # write mode-explore/assets/
@@ -82,6 +84,70 @@ SONGS = (
         ("oo", 0.40, 294, 247, "down", 0.018, 0.0, 0.0),
     ]),
 )
+
+# Curiosity reactions (camera curiosity plan U6, R8, R10, R11, R13, R14): same syllable
+# voice as the songs, kept low (fundamentals roughly 130-400 Hz) so they sit in the
+# deeper register, well under the startle chirps. Each group has a few variants, written
+# as react-<group>-<n>.wav, so a repeated reaction doesn't sound canned. All original.
+REACTIONS = (
+    ("curious", (  # "ooh..." rising, as he notices something new
+        [("oh", 0.12, 175, 196, "glide", 0.01, 0.0, 0.03),
+         ("oo", 0.65, 185, 294, "up", 0.015, 0.0, 0.0)],
+        [("oo", 0.85, 147, 262, "up", 0.02, 0.05, 0.0)],
+        [("oh", 0.22, 196, 220, "glide", 0.01, 0.0, 0.05),
+         ("oo", 0.60, 196, 311, "up", 0.018, 0.0, 0.0)],
+    )),
+    ("thinking", (  # short musing babble to himself
+        [("mm", 0.22, 196, 208, "glide", 0.01, 0.1, 0.03),
+         ("mm", 0.18, 220, 220, "glide", 0.01, 0.1, 0.03),
+         ("ah", 0.14, 247, 220, "down", 0.01, 0.05, 0.05),
+         ("mm", 0.35, 208, 185, "down", 0.015, 0.1, 0.0)],
+        [("oh", 0.12, 220, 220, "glide", 0.0, 0.1, 0.03),
+         ("oh", 0.12, 247, 247, "glide", 0.0, 0.1, 0.06),
+         ("mm", 0.30, 220, 196, "down", 0.012, 0.1, 0.05),
+         ("ah", 0.12, 262, 294, "up", 0.0, 0.05, 0.04),
+         ("mm", 0.35, 247, 208, "down", 0.015, 0.1, 0.0)],
+        [("mm", 0.40, 185, 233, "arc", 0.012, 0.1, 0.05),
+         ("ah", 0.12, 220, 220, "glide", 0.0, 0.1, 0.04),
+         ("oo", 0.35, 233, 196, "down", 0.015, 0.0, 0.0)],
+    )),
+    ("disappointed", (  # "oh, that again": a falling, sigh-ish droop
+        [("oh", 0.28, 262, 247, "glide", 0.01, 0.0, 0.06),
+         ("ah", 0.20, 233, 220, "glide", 0.01, 0.1, 0.03),
+         ("ah", 0.60, 220, 147, "down", 0.02, 0.15, 0.0)],
+        [("oh", 0.70, 247, 139, "down", 0.02, 0.1, 0.04),
+         ("mm", 0.30, 147, 131, "down", 0.015, 0.1, 0.0)],
+        [("oo", 0.20, 220, 220, "glide", 0.01, 0.0, 0.05),
+         ("oh", 0.60, 208, 139, "down", 0.02, 0.12, 0.0)],
+    )),
+    ("delighted", (  # excited, sociable babble aimed at a person or pet
+        [("ee", 0.08, 294, 349, "up", 0.0, 0.1, 0.04),
+         ("ee", 0.08, 330, 392, "up", 0.0, 0.1, 0.05),
+         ("ah", 0.30, 262, 392, "arc", 0.015, 0.15, 0.08),
+         ("oh", 0.12, 330, 330, "glide", 0.0, 0.1, 0.03),
+         ("oh", 0.12, 370, 370, "glide", 0.0, 0.1, 0.05),
+         ("ah", 0.40, 262, 392, "up", 0.02, 0.2, 0.0)],
+        [("ah", 0.10, 294, 294, "glide", 0.0, 0.15, 0.04),
+         ("ah", 0.10, 330, 330, "glide", 0.0, 0.15, 0.04),
+         ("ah", 0.10, 294, 294, "glide", 0.0, 0.15, 0.08),
+         ("oo", 0.50, 247, 370, "up", 0.02, 0.05, 0.05),
+         ("ee", 0.10, 330, 392, "up", 0.0, 0.1, 0.0)],
+        [("oh", 0.25, 220, 330, "up", 0.012, 0.05, 0.05),
+         ("ah", 0.10, 330, 330, "glide", 0.0, 0.15, 0.03),
+         ("ah", 0.10, 294, 294, "glide", 0.0, 0.15, 0.03),
+         ("ah", 0.10, 330, 330, "glide", 0.0, 0.15, 0.06),
+         ("oh", 0.45, 247, 392, "arc", 0.02, 0.15, 0.0)],
+    )),
+    ("puzzled", (  # a questioning "hm?"
+        [("mm", 0.18, 196, 185, "glide", 0.01, 0.1, 0.05),
+         ("mm", 0.45, 175, 294, "up", 0.012, 0.1, 0.0)],
+        [("ah", 0.12, 220, 220, "glide", 0.0, 0.05, 0.05),
+         ("oo", 0.50, 185, 311, "up", 0.015, 0.0, 0.0)],
+        [("mm", 0.30, 196, 165, "down", 0.012, 0.1, 0.05),
+         ("mm", 0.35, 175, 277, "up", 0.012, 0.1, 0.0)],
+    )),
+)
+REACTION_SEED = 100  # seeds for reactions start here, clear of the songs' seeds
 
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "mode-explore" / "assets"
 
@@ -169,7 +235,8 @@ def write_wav(path, samples):
 
 
 def generate(out_dir):
-    """Write every startle then every song into out_dir; returns their paths in that order."""
+    """Write every startle, then every song, then every reaction into out_dir; returns
+    their paths in that order."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for name, seconds, start, top, end in VARIANTS:
@@ -180,6 +247,13 @@ def generate(out_dir):
         path = out_dir / f"{name}.wav"
         write_wav(path, render_song(syllables, seed))
         paths.append(path)
+    seed = REACTION_SEED
+    for group, variants in REACTIONS:
+        for n, syllables in enumerate(variants, start=1):
+            path = out_dir / f"react-{group}-{n}.wav"
+            write_wav(path, render_song(syllables, seed))
+            paths.append(path)
+            seed += 1
     return paths
 
 
