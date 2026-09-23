@@ -23,6 +23,8 @@ import android.util.Size;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Explore's camera, open only during curiosity (camera curiosity KTD3, R2),
@@ -65,6 +67,10 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private CameraCaptureSession session;
     private ImageReader reader;
     private boolean wanted;
+    /** An openCamera() whose callback has not come yet. */
+    private boolean opening;
+    /** Counted down once the device is really closed, for release(). */
+    private volatile CountDownLatch closed;
 
     // Detect-thread state.
     private Recognizer recognizer;
@@ -131,9 +137,31 @@ final class ExploreCamera implements ExploreBrain.Camera {
         return latest;
     }
 
-    /** Exit: close the camera, then release the recognizer and both threads. */
+    /**
+     * Exit: close the camera and wait (bounded) until Camera2 confirms it, then
+     * release the recognizer and both threads. As remote-control's CameraCapture:
+     * onClosed() arrives on the camera thread, so it must outlive the close, and
+     * a device still owned when the mode relaunches makes the next open fail.
+     */
     void release() {
-        close();
+        generation++;
+        latest = null;
+        final CountDownLatch done = new CountDownLatch(1);
+        closed = done;
+        cameraHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                wanted = false;
+                boolean pending = device != null || opening;
+                closeNow();
+                if (!pending) {
+                    done.countDown();
+                }
+                // Otherwise onClosed() counts it down, including for an open still
+                // in flight, which onOpened() closes because wanted is false.
+            }
+        });
+        await(done);
         cameraThread.quitSafely();
         detectHandler.post(new Runnable() {
             @Override
@@ -145,6 +173,22 @@ final class ExploreCamera implements ExploreBrain.Camera {
             }
         });
         detectThread.quitSafely();
+        try {
+            // An in-flight look takes up to ~2 s; don't start a second session over it.
+            detectThread.join(3000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            if (!latch.await(2, TimeUnit.SECONDS)) {
+                Log.w(TAG, "camera close not confirmed within 2 s; releasing anyway");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     // ---- camera thread ----
@@ -162,9 +206,11 @@ final class ExploreCamera implements ExploreBrain.Camera {
             Size size = jpegSize(c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP));
             reader = ImageReader.newInstance(size.getWidth(), size.getHeight(), android.graphics.ImageFormat.JPEG, 2);
             reader.setOnImageAvailableListener(onImage, cameraHandler);
+            opening = true;
             manager.openCamera(ids[0], new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(CameraDevice camera) {
+                    opening = false;
                     if (!wanted) {
                         camera.close();
                         return;
@@ -176,6 +222,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 @Override
                 public void onDisconnected(CameraDevice camera) {
                     Log.w(TAG, "camera disconnected");
+                    opening = false;
                     camera.close();
                     device = null;
                 }
@@ -184,12 +231,22 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 public void onError(CameraDevice camera, int error) {
                     // The brain notices no looks arriving and backs curiosity off (KTD8).
                     Log.e(TAG, "camera error " + error);
+                    opening = false;
                     camera.close();
                     device = null;
+                }
+
+                @Override
+                public void onClosed(CameraDevice camera) {
+                    CountDownLatch latch = closed;
+                    if (latch != null) {
+                        latch.countDown();
+                    }
                 }
             }, cameraHandler);
         } catch (CameraAccessException | SecurityException | IllegalArgumentException e) {
             Log.e(TAG, "camera open failed", e);
+            opening = false;
             closeNow();
         }
     }
@@ -281,7 +338,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
                         try {
                             recognizer = factory.create();
                             Log.i(TAG, "recognizer ready in " + (clock.nowMs() - t0) + " ms");
-                        } catch (Exception e) {
+                        } catch (Throwable e) {
+                            // Throwable: a native library that fails to load throws an Error.
                             Log.e(TAG, "recognizer failed to load; curiosity is off", e);
                             recognizerFailed = true;
                         }
@@ -300,7 +358,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                         latest = new ExploreBrain.Look(frameMs, found);
                         Log.i(TAG, "look in " + (clock.nowMs() - t0) + " ms: " + found);
                     }
-                } catch (Exception e) {
+                } catch (Exception | OutOfMemoryError | LinkageError e) {
                     Log.e(TAG, "recognition failed", e);
                 } finally {
                     busy = false;

@@ -316,6 +316,14 @@ final class ExploreBrain {
         note("shutdown");
     }
 
+    /** A curiosity stop is due now (the U8 debug hook); it still waits for the pause to end. */
+    void requestCuriosity() {
+        long now = clock.nowMs();
+        if (curiosityAt > now) {
+            curiosityAt = now;
+        }
+    }
+
     /** Names inspected this session, for tests and logs. */
     Set<String> seen() {
         return seen;
@@ -634,6 +642,11 @@ final class ExploreBrain {
             face(now);
         } else if (Sighting.fillsFrame(target, tuning)) {
             note("arrived: the " + target.label + " fills the frame");
+            arrive(now);
+        } else if (classifier.approach(now).isClose()) {
+            // Touching it but off-centre (after a refused leg, say): a turn would see
+            // the ir flag as a hazard and escape from the very thing he came to see.
+            note("arrived: close to the " + target.label);
             arrive(now);
         } else if (legs >= tuning.approachLegsMax) {
             note("never got close to the " + target.label + "; giving up");

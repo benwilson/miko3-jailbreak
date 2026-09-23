@@ -1131,10 +1131,64 @@ public final class ExploreBrainHarness {
                     "state=" + rig.brain.state() + " " + rig.tail());
         });
         scenario("sensor_arrival_after_grace_arrives", n -> {
+            // A 3-tick leg (2000-2750) outlasts the 500 ms grace: the close reading at 2500
+            // arrives mid-leg, before the leg would have ended on its own.
             Vision ahead = (rig, t) -> list(box("cup", 0.8f, 0.5f, 0.6f, 0.2f, 0.3f));
-            Rig rig = new Rig(curious().build(), t -> t >= 2500 ? closeLowTof(t) : clear(t), ahead, true).started();
-            rig.runUntil(9000);
-            check(n, rig.count("name cup") == 1 && rig.count("startle") == 0 && rig.count("back") == 0,
+            Rig rig = new Rig(curious().approach(3, 4, 500, 2).build(), t -> t >= 2500 ? closeLowTof(t) : clear(t),
+                    ahead, true).started();
+            rig.runUntil(4000);
+            int stop = rig.firstAfter("stop", 2001);
+            int react = rig.first("react curious", 0);
+            check(n, rig.timeOf(stop) == 2500 && rig.timeOf(react) == 2500 && rig.countPrefix("hop", 2500, 4001) == 0
+                            && rig.count("startle") == 0 && rig.count("back") == 0,
+                    "stop@" + rig.timeOf(stop) + " react@" + rig.timeOf(react) + " " + rig.tail());
+        });
+        scenario("edge_at_leg_start_refuses_without_driving", n -> {
+            Vision ahead = (rig, t) -> list(box("cup", 0.8f, 0.5f, 0.6f, 0.2f, 0.3f));
+            Rig rig = new Rig(curious().build(), t -> t >= 1900 && t <= 2000 ? edgeAhead(t) : clear(t),
+                    ahead, true).started();
+            rig.runUntil(3200);
+            int turn = rig.first("turn", 0);
+            check(n, rig.countPrefix("hop", 0, 3201) == 0 && turn >= 0 && rig.countPrefix("react", 0, 3201) == 0
+                            && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("close_at_leg_start_arrives_without_driving", n -> {
+            Vision ahead = (rig, t) -> list(box("cup", 0.8f, 0.5f, 0.6f, 0.2f, 0.3f));
+            Rig rig = new Rig(curious().build(), t -> t >= 1900 && t <= 2100 ? closeLowTof(t) : clear(t),
+                    ahead, true).started();
+            rig.runUntil(3000);
+            check(n, rig.countPrefix("hop", 0, 3001) == 0 && rig.timeOf(rig.first("react curious", 0)) == 2000
+                            && rig.count("startle") == 0 && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("hazard_at_curiosity_turn_start_refuses", n -> {
+            // The plant is off to the right: eyes lead from 2000, the turn is due at 2500,
+            // but an obstacle is ahead then, so he turns away (after a new look lead) instead.
+            Rig rig = new Rig(curious().build(), t -> t >= 2400 && t <= 2500 ? obstacle(t) : clear(t),
+                    PLANT, true).started();
+            rig.runUntil(3200);
+            int turn = rig.first("turn", 0);
+            int look = rig.firstAfter("eyes LOOK", 2500);
+            check(n, rig.timeOf(turn) >= 3000 && look >= 0 && rig.timeOf(look) == 2500
+                            && rig.countPrefix("react", 0, 3201) == 0 && rig.violations.isEmpty(),
+                    "turn@" + rig.timeOf(turn) + " " + rig.tail());
+        });
+        scenario("close_but_off_centre_arrives_instead_of_turning", n -> {
+            // After the first leg the cup has drifted right and he is touching it: arrive,
+            // rather than turn toward it and read the ir flag as a hazard.
+            Vision drift = (rig, t) -> list(box("cup", 0.8f, rig.count("hop") > 0 ? 0.9f : 0.5f, 0.6f, 0.2f, 0.3f));
+            Rig rig = new Rig(curious().build(), t -> t >= 2600 ? closeLowTof(t) : clear(t), drift, true).started();
+            rig.runUntil(5000);
+            check(n, rig.count("react curious") == 1 && rig.countPrefix("turn", 0, 5001) == 0
+                            && rig.count("startle") == 0 && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("curiosity_requested_now_starts_at_the_next_pause_end", n -> {
+            Rig rig = new Rig(curious().curiosityMs(100000, 100000).build(), CLEAR, PLANT, true).started();
+            rig.at(1200, () -> rig.brain.requestCuriosity());
+            rig.runUntil(1400);
+            check(n, rig.timeOf(rig.first("camera open", 0)) == 1300 && rig.count("hop") == 0,
                     rig.tail());
         });
         scenario("cpl2_in_leg_grace_stops_the_leg_and_looks_again", n -> {

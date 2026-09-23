@@ -54,12 +54,11 @@ final class ExploreTuning {
     /** Whether ir1 is the left-hand edge sensor. Unverified until U1/U8; only steers which way to turn away. */
     final boolean ir1IsLeft;
     /**
-     * The controller's safe tof band, lower and upper bounds (KTD4). During an
-     * approach an ir flag or CPL=2 with tof below the lower bound means something
-     * close ahead (arrival); above the upper bound, a drop-off.
+     * The lower bound of the controller's safe tof band (KTD4; its upper bound is
+     * about 280). During an approach an ir flag or CPL=2 with tof below it means
+     * something close ahead (arrival); at or above it, a drop-off is assumed.
      */
     final int approachBandLower;
-    final int approachBandUpper;
     /**
      * Recognition thresholds (KTD6), tuned on the robot in U8: a detection at or
      * above confidenceFloor is a thing; the best between unsureFloor and it makes
@@ -137,7 +136,6 @@ final class ExploreTuning {
         cooldownMs = b.cooldownMs;
         ir1IsLeft = b.ir1IsLeft;
         approachBandLower = b.approachBandLower;
-        approachBandUpper = Math.max(b.approachBandLower, b.approachBandUpper);
         confidenceFloor = b.confidenceFloor;
         unsureFloor = Math.min(b.unsureFloor, b.confidenceFloor);
         fillHeight = b.fillHeight;
@@ -237,7 +235,6 @@ final class ExploreTuning {
         private boolean ir1IsLeft = true;
         // docs/solutions/best-practices/miko3-tof-is-a-downward-cliff-sensor-inside-mcu-safe-band.md
         private int approachBandLower = 170;
-        private int approachBandUpper = 280;
         // U1's plant frame: the pots scored 0.87 (as "vase"), the plants 0.34-0.43,
         // and a false "table" along the bottom edge 0.38.
         private float confidenceFloor = 0.35f;
@@ -293,11 +290,7 @@ final class ExploreTuning {
             return this;
         }
         Builder ir1IsLeft(boolean v) { ir1IsLeft = v; return this; }
-        Builder approachBand(int lower, int upper) {
-            approachBandLower = lower;
-            approachBandUpper = upper;
-            return this;
-        }
+        Builder approachBandLower(int v) { approachBandLower = v; return this; }
         Builder recognition(float confidence, float unsure) {
             confidenceFloor = confidence;
             unsureFloor = unsure;

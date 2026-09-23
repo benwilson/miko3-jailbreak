@@ -115,6 +115,11 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "sensor_arrival_ignored_in_leg_grace",
         "sensor_arrival_after_grace_arrives",
         "cpl2_in_leg_grace_stops_the_leg_and_looks_again",
+        "edge_at_leg_start_refuses_without_driving",
+        "close_at_leg_start_arrives_without_driving",
+        "hazard_at_curiosity_turn_start_refuses",
+        "close_but_off_centre_arrives_instead_of_turning",
+        "curiosity_requested_now_starts_at_the_next_pause_end",
         "lease_loss_mid_approach_stops_and_closes_the_camera",
         "camera_without_looks_turns_curiosity_off",
     )

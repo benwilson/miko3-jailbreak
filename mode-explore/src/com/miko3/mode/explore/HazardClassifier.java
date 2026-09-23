@@ -190,10 +190,8 @@ final class HazardClassifier {
             if (r.tof < tuning.approachBandLower) {
                 return close;
             }
-            if (r.tof > tuning.approachBandUpper) {
-                return ApproachVerdict.EDGE;
-            }
-            // Inside the band the flag says nothing about which way tof went.
+            // Above the band it went toward a drop-off; inside it the flag says
+            // nothing about which way tof went, so it is treated as the safe EDGE too.
             return ApproachVerdict.EDGE;
         }
         return ApproachVerdict.CLEAR;

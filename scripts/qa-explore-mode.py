@@ -12,9 +12,15 @@ writes the file into the app over root adb, and restarts the mode.
   python3 scripts/qa-explore-mode.py --only calibrate   # just the calibration
   python3 scripts/qa-explore-mode.py --only ae3,ae5     # just those checks
 
-Steps: calibrate, ae1..ae6, stoptimer, wander. AE3/AE4/AE5 and the stop timer are
-staged with the mode's debug hooks (setprop log.tag.MikoExplore* DEBUG) and
-checked in logcat; the rest need the owner's eyes and a y/n answer.
+Steps: calibrate, ae1..ae6, stoptimer, wander, curiosity. AE3/AE4/AE5 and the stop
+timer are staged with the mode's debug hooks (setprop log.tag.MikoExplore* DEBUG)
+and checked in logcat; the rest need the owner's eyes and a y/n answer.
+
+The curiosity step (camera curiosity plan U8) turns on MikoExploreCurious, so a
+curiosity stop comes at every pause instead of every 20-40 s, and reports what he
+saw and chose at each stop; the owner then answers for what they saw and heard.
+
+  python3 scripts/qa-explore-mode.py --only curiosity --curious-seconds 90
 """
 import argparse
 import importlib.util
@@ -30,7 +36,12 @@ PACKAGE = "com.miko3.mode.explore"
 ACTIVITY = f"{PACKAGE}/.MainActivity"
 CAL_NAME = "explore-calibration.properties"
 TOF_FAULT = 16383
-ALL_STEPS = ("calibrate", "ae1", "ae2", "ae3", "ae4", "ae5", "ae6", "stoptimer", "wander")
+ALL_STEPS = ("calibrate", "ae1", "ae2", "ae3", "ae4", "ae5", "ae6", "stoptimer", "wander", "curiosity")
+
+# What the brain logs at each curiosity decision (ExploreBrain.note), in the
+# order a stop goes: the scan, what it saw, and how it ended.
+CURIOSITY_EVENTS = ("curiosity stop", "saw ", "approaching", "arrived", "nothing interesting",
+                    "lost sight", "never got close", "camera gave no look", "hazard")
 
 _sensors = None
 
@@ -126,7 +137,9 @@ class Robot:
         self.serial = serial
 
     def adb(self, *args, check=True):
-        r = subprocess.run(["adb", "-s", self.serial] + list(args), capture_output=True, text=True, timeout=60)
+        # stdin=DEVNULL: adb would otherwise read the owner's y/n answers.
+        r = subprocess.run(["adb", "-s", self.serial] + list(args), capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
         if check and r.returncode != 0:
             raise RuntimeError(f"adb {' '.join(args)}: {r.stderr.strip() or r.stdout.strip()}")
         return r.stdout
@@ -188,6 +201,21 @@ class Robot:
         self.adb("shell", "rm", f"/data/local/tmp/{CAL_NAME}", check=False)
 
 
+def curiosity_summary(log):
+    """The brain's curiosity decisions from a logcat dump, one line each, and
+    whether at least one stop got as far as a look (a sighting or nothing)."""
+    lines = []
+    for line in log.splitlines():
+        _, sep, msg = line.partition("ExploreBrain")
+        if not sep:
+            continue
+        msg = msg.split(":", 1)[-1].strip()
+        if msg.startswith(CURIOSITY_EVENTS):
+            lines.append(msg)
+    looked = any(m.startswith(("saw ", "nothing interesting")) for m in lines)
+    return lines, looked
+
+
 def ask(question):
     return input(f"   {question} [y/n] ").strip().lower().startswith("y")
 
@@ -230,7 +258,7 @@ def hook_check(robot, tag, want, seconds=4):
     return ok
 
 
-def run_step(robot, name, seconds):
+def run_step(robot, name, seconds, curious_seconds=60.0):
     print(f"\n== {name} ==")
     if name == "calibrate":
         return step_calibrate(robot, seconds)
@@ -265,6 +293,22 @@ def run_step(robot, name, seconds):
         return hook_check(robot, "MikoExploreFreeze", "stop timer fired")
     if name == "wander":
         return ask("Watch him for several minutes: no edge falls, no pushing into things, and slow and curious?")
+    if name == "curiosity":
+        print(f"   Curiosity: a stop at every pause for {curious_seconds:.0f} s. Put something new, a person or a"
+              " pet in front of him; leave something he already inspected in view too.")
+        robot.hook("MikoExploreCurious", True)
+        try:
+            log = robot.logcat_after(curious_seconds, ["ExploreBrain", "ExploreCamera"])
+        finally:
+            robot.hook("MikoExploreCurious", False)
+        events, looked = curiosity_summary(log)
+        for e in events:
+            print(f"     {e}")
+        if not looked:
+            print("   no curiosity stop got as far as a look (camera or recognizer?)")
+            return False
+        return ask("did he face and roll up to new things and say their names, greet people/pets, "
+                   "sigh at things seen before, and never go off an edge?")
     raise ValueError(name)
 
 
@@ -273,6 +317,7 @@ def main():
     ap.add_argument("--serial", default=sensors_module().DEFAULT_SERIAL)
     ap.add_argument("--only", help="comma-separated steps: " + ",".join(ALL_STEPS))
     ap.add_argument("--seconds", type=float, default=5.0, help="length of each calibration capture")
+    ap.add_argument("--curious-seconds", type=float, default=60.0, help="length of the curiosity step")
     args = ap.parse_args()
     try:
         steps = parse_only(args.only)
@@ -281,7 +326,7 @@ def main():
     if ":" in args.serial:
         subprocess.run(["adb", "connect", args.serial], capture_output=True, timeout=30)
     robot = Robot(args.serial)
-    results = [(s, run_step(robot, s, args.seconds)) for s in steps]
+    results = [(s, run_step(robot, s, args.seconds, args.curious_seconds)) for s in steps]
     print("\n== report ==")
     for s, ok in results:
         print(f"   {'PASS' if ok else 'FAIL'} {s}")

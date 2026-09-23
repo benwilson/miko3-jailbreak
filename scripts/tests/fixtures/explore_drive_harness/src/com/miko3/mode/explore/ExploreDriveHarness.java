@@ -89,6 +89,7 @@ public final class ExploreDriveHarness {
         volatile boolean frozen;
         @Override public boolean staleSensors() { return stale; }
         @Override public boolean freezeBrain() { return frozen; }
+        @Override public boolean curiousNow() { return false; }
     }
 
     static final ExploreBrain.Clock REAL = new ExploreBrain.Clock() {
