@@ -64,6 +64,20 @@ final class Detection {
         return out.append(".webm").toString();
     }
 
+    /** Vertical centre, -1 (top) to 1 (bottom). */
+    float centerY() {
+        return (y0 + y1) - 1f;
+    }
+
+    /** Intersection over union with another box, 0 when they do not overlap. */
+    float iou(Detection other) {
+        float w = Math.max(0f, Math.min(x1, other.x1) - Math.max(x0, other.x0));
+        float h = Math.max(0f, Math.min(y1, other.y1) - Math.max(y0, other.y0));
+        float inter = w * h;
+        float union = area() + other.area() - inter;
+        return union <= 0 ? 0f : inter / union;
+    }
+
     private static float clamp(float v) {
         return Float.isNaN(v) ? 0f : Math.max(0f, Math.min(1f, v));
     }

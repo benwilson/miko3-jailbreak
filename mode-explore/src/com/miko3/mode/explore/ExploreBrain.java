@@ -240,9 +240,10 @@ final class ExploreBrain {
     private int legs;
     private long legStartedAt;
     private int lostLooks;
-    /** Clips still to play in INSPECT or REACT_HERE: a reaction group, or NAME ("") for the target's name. */
-    private final ArrayDeque<String> cues = new ArrayDeque<String>();
-    private static final String NAME = "";
+    /** What INSPECT and REACT_HERE play, in order: a reaction clip group, or the target's name. */
+    private enum Cue { CURIOUS, THINKING, DELIGHTED, DISAPPOINTED, PUZZLED, NAME }
+
+    private final ArrayDeque<Cue> cues = new ArrayDeque<Cue>();
     /** Names inspected this session (R9), and when the person/pet cool-down ends (R12). */
     private final Set<String> seen = new HashSet<String>();
     private long peopleIgnoredUntil;
@@ -605,9 +606,9 @@ final class ExploreBrain {
             target = sighting.target;
             note("saw " + sighting);
             if (sighting.kind == Sighting.Kind.UNSURE) {
-                react(now, State.REACT_HERE, "puzzled");
+                react(now, State.REACT_HERE, Cue.PUZZLED);
             } else if (!sighting.isPersonOrPet() && seen.contains(target.label)) {
-                react(now, State.REACT_HERE, "disappointed");
+                react(now, State.REACT_HERE, Cue.DISAPPOINTED);
             } else {
                 state = State.FACE;
                 faceTurns = 0;
@@ -740,26 +741,26 @@ final class ExploreBrain {
         stopMotors();
         hazardTimes.clear();
         if (Sighting.isPersonOrPet(target.label)) {
-            react(now, State.INSPECT, "delighted", NAME, "delighted");
+            react(now, State.INSPECT, Cue.DELIGHTED, Cue.NAME, Cue.DELIGHTED);
         } else {
-            react(now, State.INSPECT, "curious", "thinking", NAME);
+            react(now, State.INSPECT, Cue.CURIOUS, Cue.THINKING, Cue.NAME);
         }
     }
 
     /** Stand still, eyes on the target, and play the cues in order. */
-    private void react(long now, State s, String... sequence) {
+    private void react(long now, State s, Cue... sequence) {
         stopMotors();
         state = s;
         stare(target);
         cues.clear();
-        for (String c : sequence) {
+        for (Cue c : sequence) {
             cues.addLast(c);
         }
         nextCue(now);
     }
 
     private void nextCue(long now) {
-        String cue = cues.pollFirst();
+        Cue cue = cues.pollFirst();
         if (cue == null) {
             if (state == State.INSPECT) {
                 if (Sighting.isPersonOrPet(target.label)) {
@@ -771,26 +772,30 @@ final class ExploreBrain {
             endCuriosity(now);
             return;
         }
-        if (cue.isEmpty()) {
+        if (cue == Cue.NAME) {
             sound.playName(target.label);
-            phaseUntil = now + tuning.nameMs;
         } else {
-            sound.playReaction(cue);
-            phaseUntil = now + cueMs(cue);
+            // The clip group is the cue's name: "curious", "thinking", ...
+            sound.playReaction(cue.name().toLowerCase(java.util.Locale.US));
         }
+        phaseUntil = now + cueMs(cue);
     }
 
-    private long cueMs(String group) {
-        if (group.equals("curious")) {
-            return tuning.curiousMs;
-        } else if (group.equals("thinking")) {
-            return tuning.thinkingMs;
-        } else if (group.equals("delighted")) {
-            return tuning.delightedMs;
-        } else if (group.equals("disappointed")) {
-            return tuning.disappointedMs;
+    private long cueMs(Cue cue) {
+        switch (cue) {
+            case CURIOUS:
+                return tuning.curiousMs;
+            case THINKING:
+                return tuning.thinkingMs;
+            case DELIGHTED:
+                return tuning.delightedMs;
+            case DISAPPOINTED:
+                return tuning.disappointedMs;
+            case PUZZLED:
+                return tuning.puzzledMs;
+            default:
+                return tuning.nameMs;
         }
-        return tuning.puzzledMs;
     }
 
     /** Back to wandering; the camera closes as the state leaves curiosity. */
@@ -833,7 +838,7 @@ final class ExploreBrain {
         }
         float bestIou = MATCH_IOU;
         for (Detection d : detections) {
-            float iou = iou(d, last);
+            float iou = d.iou(last);
             if (iou >= bestIou) {
                 bestIou = iou;
                 best = d;
@@ -843,14 +848,6 @@ final class ExploreBrain {
     }
 
     private static final float MATCH_IOU = 0.3f;
-
-    private static float iou(Detection a, Detection b) {
-        float w = Math.max(0f, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0));
-        float h = Math.max(0f, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
-        float inter = w * h;
-        float union = a.area() + b.area() - inter;
-        return union <= 0 ? 0f : inter / union;
-    }
 
     /** The image's left is the robot's left: the camera faces forward. */
     private static Direction sideOf(Detection d) {
@@ -956,7 +953,7 @@ final class ExploreBrain {
 
     private void stare(Detection d) {
         float x = d.centerX();
-        float y = (d.y0 + d.y1) - 1f;
+        float y = d.centerY();
         if (shownState == EyeState.STARE && x == shownX && y == shownY) {
             return;
         }
