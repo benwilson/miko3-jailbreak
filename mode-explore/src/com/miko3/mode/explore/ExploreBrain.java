@@ -20,7 +20,8 @@ import java.util.Random;
  *   PAUSE      standing, eyes glancing (R2); ends on a fresh reading
  *   LOOK       eyes on the new heading for lookLeadMs before the turn (R7)
  *   TURN       turning in place for a fixed duration (R3)
- *   HOP        hopTicks forward ticks, hopTickMs apart, then stop (R1)
+ *   HOP        one leg of continuous driving: a random hopTicks..hopTicksMax forward ticks,
+ *              hopTickMs apart (each resend keeps it rolling), then stop (R1)
  *   STARTLE    stopped, startle clip and flinch (R11)
  *   BACK_OFF   the only reversing: backTicks, time-bounded and blind (R4, R12)
  *   CORNERED   too many hazards too fast: resting eyes, no motion (KTD8)
@@ -407,9 +408,12 @@ final class ExploreBrain {
         hopNext = false;
         show(EyeState.IDLE, null);
         state = State.HOP;
-        ticksLeft = tuning.hopTicks - 1;
+        int ticks = tuning.hopTicksMax > tuning.hopTicks
+                ? tuning.hopTicks + random.nextInt(tuning.hopTicksMax - tuning.hopTicks + 1)
+                : tuning.hopTicks;
+        ticksLeft = ticks - 1;
         nextTickAt = now + tuning.hopTickMs;
-        phaseUntil = now + tuning.hopTicks * tuning.hopTickMs;
+        phaseUntil = now + ticks * tuning.hopTickMs;
         moving = true;
         motor.hopTick();
     }

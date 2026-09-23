@@ -122,6 +122,9 @@ public final class ExploreBrainHarness {
         boolean moving;
         int hopTicksThisHop;
         int maxHopTicks;
+        int minHopTicks = Integer.MAX_VALUE;
+        /** Distinct leg lengths seen (ticks per completed-or-current leg). */
+        final java.util.Set<Integer> legLengths = new java.util.TreeSet<Integer>();
         /** Set by a scenario: the next hopTick reports the lease lost from inside the call. */
         boolean loseLeaseInsideHop;
 
@@ -180,6 +183,10 @@ public final class ExploreBrainHarness {
         public void hopTick() {
             if (!moving) {
                 checkStart("hop", true);
+                if (hopTicksThisHop > 0) {
+                    legLengths.add(hopTicksThisHop);
+                    minHopTicks = Math.min(minHopTicks, hopTicksThisHop);
+                }
                 hopTicksThisHop = 0;
             }
             moving = true;
@@ -701,6 +708,17 @@ public final class ExploreBrainHarness {
     // ---- ExploreBrain: happy path and integration ----
 
     private static void integrationScenarios() {
+        scenario("continuous_legs_vary_in_length_within_range", n -> {
+            // Legs of continuous driving: every tick of a leg is resent without a stop in
+            // between, and each leg's length is drawn from hopTicks..hopTicksMax.
+            Rig rig = new Rig(tuning().hopTicks(4, 12).turnChance(0.7).pauseMs(300, 700).build(), CLEAR)
+                    .started();
+            rig.runUntil(180000);
+            check(n, rig.legLengths.size() >= 3 && rig.minHopTicks >= 4 && rig.maxHopTicks <= 12
+                            && rig.count("startle") == 0 && rig.violations.isEmpty(),
+                    "legs=" + rig.legLengths + " min=" + rig.minHopTicks + " max=" + rig.maxHopTicks
+                            + " " + rig.tail());
+        });
         scenario("wander_cycle_hops_and_turns_only_on_fresh_clear_readings", n -> {
             Rig rig = new Rig(tuning().turnChance(0.4).pauseMs(800, 2500).turnMs(300, 900).build(), CLEAR)
                     .started();

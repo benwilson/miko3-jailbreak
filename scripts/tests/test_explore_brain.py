@@ -84,6 +84,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "frozen_tof_mid_run_stops_the_hop",
         "no_lease_never_moves",
         # ExploreBrain: happy path and integration with the drive adapter
+        "continuous_legs_vary_in_length_within_range",
         "wander_cycle_hops_and_turns_only_on_fresh_clear_readings",
         "lease_loss_reported_inside_a_motor_call",
         "shutdown_stops_and_goes_inert",

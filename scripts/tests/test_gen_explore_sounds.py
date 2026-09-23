@@ -36,13 +36,52 @@ class GeneratedClipsTest(unittest.TestCase):
     def tearDownClass(cls):
         cls._td.cleanup()
 
-    def test_writes_several_startle_variants(self):
-        self.assertGreaterEqual(len(self.paths), 2)
-        for p in self.paths:
-            self.assertTrue(p.name.startswith("startle-") and p.suffix == ".wav", p.name)
+    def startles(self):
+        return [p for p in self.paths if p.name.startswith("startle-")]
 
-    def test_each_clip_is_short_mono_16bit_at_the_expected_rate(self):
-        for p in self.paths:
+    def songs(self):
+        return [p for p in self.paths if p.name.startswith("song-")]
+
+    def test_writes_several_startle_variants(self):
+        self.assertGreaterEqual(len(self.startles()), 2)
+        for p in self.startles():
+            self.assertEqual(p.suffix, ".wav", p.name)
+
+    def test_writes_several_idle_songs(self):
+        # WALL-E-style babble while he sits still (resting or eyes-only); four, picked at
+        # random, so it isn't always the same one.
+        self.assertEqual(len(self.songs()), 4)
+        self.assertEqual(len(self.paths), len(self.startles()) + len(self.songs()))
+
+    def test_each_song_is_a_short_phrase(self):
+        for p in self.songs():
+            with wave.open(str(p)) as w:
+                self.assertEqual((w.getnchannels(), w.getsampwidth(), w.getframerate()), (1, 2, gen.RATE))
+                seconds = w.getnframes() / w.getframerate()
+            self.assertTrue(2.0 <= seconds <= 6.0, f"{p.name}: {seconds:.2f}s")
+
+    def test_each_song_moves_in_pitch(self):
+        # Syllables glide and jump (a voice, not a held tone): the dominant frequency across
+        # the clip must cover a wide range, measured by zero crossings in short windows.
+        for p in self.songs():
+            with wave.open(str(p)) as w:
+                samples = array.array("h", w.readframes(w.getnframes()))
+            win = gen.RATE // 20
+            rates = []
+            for start in range(0, len(samples) - win, win):
+                chunk = samples[start:start + win]
+                if max(abs(x) for x in chunk) < 3000:
+                    continue
+                crossings = sum(1 for a, b in zip(chunk, chunk[1:]) if (a < 0) != (b < 0))
+                rates.append(crossings)
+            self.assertGreaterEqual(max(rates) / max(1, min(rates)), 1.8, p.name)
+
+    def test_songs_are_distinct(self):
+        bodies = [p.read_bytes() for p in self.songs()]
+        self.assertEqual(len(set(bodies)), len(bodies))
+
+    def test_each_startle_is_short_mono_16bit_at_the_expected_rate(self):
+        for p in self.startles():
             with wave.open(str(p)) as w:
                 self.assertEqual(w.getnchannels(), 1)
                 self.assertEqual(w.getsampwidth(), 2)
