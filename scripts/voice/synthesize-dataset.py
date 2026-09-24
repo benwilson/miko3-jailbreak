@@ -285,9 +285,10 @@ class F5Backend:
         return np.array(wave), self.RATE
 
 
-def make_backend(name, reference):
+def make_backend(name, reference, exaggeration=0.5, cfg_weight=0.5):
     if name == "chatterbox":
-        return ChatterboxBackend(reference)
+        # exaggeration: emotional intensity (0.5 neutral); lower cfg_weight: livelier pacing.
+        return ChatterboxBackend(reference, exaggeration=exaggeration, cfg_weight=cfg_weight)
     if name == "f5":
         return F5Backend(reference, reference_transcript())
     raise SystemExit(f"unknown backend {name}")
@@ -359,6 +360,10 @@ def main(argv=None):
     mode.add_argument("--dataset", action="store_true", help="(not built yet)")
     ap.add_argument("--backend", choices=["chatterbox", "f5"], default="chatterbox")
     ap.add_argument("--reference", type=Path, default=REFERENCE)
+    ap.add_argument("--exaggeration", type=float, default=0.5,
+                    help="Chatterbox emotional intensity (0.5 neutral, higher = more excitable)")
+    ap.add_argument("--cfg-weight", type=float, default=0.5,
+                    help="Chatterbox pacing guidance (lower = faster, livelier delivery)")
     ap.add_argument("--out", type=Path, default=SAMPLES_DIR)
     ap.add_argument("--limit", type=int, default=None, help="render only the first N lines")
     ap.add_argument("--transcribe", action="store_true",
@@ -370,7 +375,7 @@ def main(argv=None):
     if not args.reference.exists():
         raise SystemExit(f"missing reference {args.reference}; run prepare-clips.py (U2)")
     t0 = time.perf_counter()
-    backend = make_backend(args.backend, args.reference)
+    backend = make_backend(args.backend, args.reference, args.exaggeration, args.cfg_weight)
     print(f"{backend.name} loaded on {backend.device} in {time.perf_counter() - t0:.1f} s",
           flush=True)
     lines = SAMPLE_LINES[: args.limit] if args.limit else SAMPLE_LINES
