@@ -62,6 +62,7 @@ public class LauncherApp extends Application {
     private WifiHttpHandler wifi;
     private ClaudeSettings claudeSettings;
     private SpeechEngine speech;
+    private ListenEngine listen;
     private PeopleStore people;
     // The Settings page's tokens (KTD6). Four, so the robot's own WebView sitting
     // on the page doesn't expire a LAN browser's form, or the other way round.
@@ -155,6 +156,10 @@ public class LauncherApp extends Application {
         // SpeechService is ready by the time a mode asks it to speak.
         speech = new SpeechEngine(this);
         speech.start();
+        // The robot's ears (explore-on-claude plan U3): the recognizer loads on
+        // the listen thread; each listen waits for the speech queue to go idle.
+        listen = new ListenEngine(this, speech.queue());
+        listen.start();
         wifi = new WifiHttpHandler(this);
         startServer();
 
@@ -181,6 +186,11 @@ public class LauncherApp extends Application {
     /** The robot's voice and its queue of lines, for SpeechService. */
     SpeechEngine speech() {
         return speech;
+    }
+
+    /** The robot's ears, for ListenService. */
+    ListenEngine listen() {
+        return listen;
     }
 
     /**

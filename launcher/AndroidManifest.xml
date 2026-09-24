@@ -19,6 +19,10 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <!-- ListenService hears the reply to "what's your name?" (explore-on-claude
+         plan U3, KTD1). Granted at install with pm grant (no dialog to show it
+         from): scripts/install-custom-launcher.py. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
 
     <application
         android:label="Miko3 Launcher"
@@ -69,6 +73,16 @@
         <service android:name=".PeopleService" android:exported="true">
             <intent-filter>
                 <action android:name="com.miko3.launcher.ROBOT_PEOPLE"/>
+            </intent-filter>
+        </service>
+
+        <!-- Listening for modes (explore-on-claude plan U3, KTD1): once the robot
+             has finished speaking, hear one short reply and return its
+             transcript. Exported with no permission for the same reason as
+             RobotSettingsService; the service checks each caller. -->
+        <service android:name=".ListenService" android:exported="true">
+            <intent-filter>
+                <action android:name="com.miko3.launcher.ROBOT_LISTEN"/>
             </intent-filter>
         </service>
     </application>
