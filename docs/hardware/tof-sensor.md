@@ -24,6 +24,7 @@ POWER=0,0,07884,-0234,07887,-0234,076,14,15,23FLBTN=0,0,0,0,00000,00000IMUAC=...
   - A single digit (`ir2` in the decompiled parser): the motor controller's own hazard flag. It is `0` on clear desk and `1` for **both** a near object and an edge, so it cannot tell them apart.
   - A trailing `X`-padding run.
 - `CPL=` (the motion ack) is absent from POWER replies while the robot is still, and **appears in them while it is moving**: `CPL=1` while driving, `CPL=2` when the controller refuses forward motion because the reading is outside its safe band (see Calibrated behavior).
+- `Left=`/`Right=` are the wheel encoder counts (10 digits, each followed by a comma). They climb while the wheels turn: about 650–880 counts a second per wheel driving forward on the floor, ~50 per 125 ms reply turning in place (2026-09-24). **They stand still while the wheels are stalled.** Pushed against something too low for the ToF to see (tof reading clear floor, ~200), the controller kept acknowledging forward (`CPL=1`) for 8 s while both counts didn't move. Explore mode's stall rule reads this (fewer than 10 counts in a second of a forward leg). An earlier session saw these counts never change, but at that time the robot wasn't actually driving.
 
 ## Baseline behavior
 

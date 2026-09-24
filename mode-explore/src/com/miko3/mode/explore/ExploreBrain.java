@@ -219,6 +219,15 @@ final class ExploreBrain {
     /** When the current escape turn started, and since when the way ahead has read clear (-1: not clear). */
     private long turnStartedAt;
     private long clearSince = -1;
+    /** Wheel progress this leg (trackWheels): when it started, the last reading with
+     * encoder counts, when those began, and (time, counts moved) per reading. */
+    private long hopStartedAt;
+    private SensorReading lastWheels;
+    private long wheelsSince;
+    private final ArrayDeque<long[]> wheelMoves = new ArrayDeque<long[]>();
+    /** Stalls since the last cleanly finished leg, and whether the current startle is one. */
+    private int stallStreak;
+    private boolean stalledNow;
     /** Times of recent failed escapes (a full sweep with no clear way), for the cornered rest. */
     private final ArrayDeque<Long> escapeFailures = new ArrayDeque<Long>();
     /** Side of the last hazard, so the next discretionary turn steers away from it. */
@@ -294,6 +303,7 @@ final class ExploreBrain {
             return;
         }
         classifier.offer(reading);
+        trackWheels(reading);
         step(true);
     }
 
@@ -420,10 +430,18 @@ final class ExploreBrain {
             case HOP:
                 if (hazard) {
                     hazardInMotion(now);
+                } else if (wheelsStalled(now)) {
+                    // Pushing against something too low for the front sensor to see.
+                    // The sensor can't say when he is past it, so each stall in a row
+                    // backs off further and turns a set, growing amount (escapeTurn()).
+                    stallStreak++;
+                    note("wheels stalled while driving: blocked by something low (" + stallStreak + " in a row)");
+                    hazardInMotion(now, null);
                 } else if (now >= phaseUntil) {
                     stopMotors();
                     // Driven away cleanly: whatever cornered him is behind him.
                     hazardTimes.clear();
+                    stallStreak = 0;
                     escapeFailures.clear();
                     escapeSide = null;
                     enterPause(now, pauseMs(), false);
@@ -446,7 +464,7 @@ final class ExploreBrain {
                 // Blind (nothing watches behind him): bounded by time only, hazards ignored.
                 if (now >= phaseUntil) {
                     stopMotors();
-                    enterLook(now, escapeDir, true, tuning.escapeTurnMs);
+                    enterLook(now, escapeDir, true, escapeTurnMs());
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
                     nextTickAt += tuning.backTickMs;
@@ -515,14 +533,23 @@ final class ExploreBrain {
 
     /** A hazard while moving: stop in this same event, then startle (R11). */
     private void hazardInMotion(long now) {
-        stopMotors();
         HazardClassifier.Hazard h = classifier.hazard();
         note("hazard while " + state + ": " + h);
+        hazardInMotion(now, h);
+    }
+
+    /** As above, for a hazard the classifier did not see (h null: side unknown). */
+    private void hazardInMotion(long now, HazardClassifier.Hazard h) {
+        stopMotors();
+        stalledNow = h == null && state == State.HOP && stallStreak > 0;
         hopNext = false;
         lastHazardSide = h == null ? null : h.side;
         escapeDir = escapeSide(h);
         corneredAfterStartle = recordHazard(now);
-        sound.playStartle();
+        // One "whoa" per stall streak: repeat stalls flinch quietly.
+        if (!stalledNow || stallStreak == 1) {
+            sound.playStartle();
+        }
         show(EyeState.FLINCH, null);
         state = State.STARTLE;
         phaseUntil = now + tuning.startleMs;
@@ -571,6 +598,45 @@ final class ExploreBrain {
             escapeSide = heading.opposite();
             enterLook(now, escapeSide, true, tuning.escapeTurnMs);
         }
+    }
+
+    /**
+     * Wheel progress during a leg, from the encoder counts in each reading. Only
+     * while hopping: turns and back-offs move the wheels differently.
+     */
+    private void trackWheels(SensorReading r) {
+        if (state != State.HOP || !r.hasWheels()) {
+            return;
+        }
+        if (lastWheels != null) {
+            wheelMoves.addLast(new long[]{r.timestampMs,
+                    Math.abs(r.wheelLeft - lastWheels.wheelLeft) + Math.abs(r.wheelRight - lastWheels.wheelRight)});
+        } else {
+            wheelsSince = r.timestampMs;
+        }
+        lastWheels = r;
+        while (!wheelMoves.isEmpty() && r.timestampMs - wheelMoves.peekFirst()[0] > tuning.stallWindowMs) {
+            wheelMoves.pollFirst();
+        }
+    }
+
+    /**
+     * The controller keeps taking forward ticks but the wheels have barely turned
+     * for stallWindowMs (past the leg's first stallGraceMs): he is stuck against
+     * something low (owner report 2026-09-24; on the robot the encoders stood still
+     * for 8 s of acknowledged forward while tof read clear floor). Off without
+     * encoder data.
+     */
+    private boolean wheelsStalled(long now) {
+        if (lastWheels == null || now - hopStartedAt < tuning.stallGraceMs
+                || now - wheelsSince < tuning.stallWindowMs) {
+            return false;
+        }
+        long moved = 0;
+        for (long[] m : wheelMoves) {
+            moved += m[1];
+        }
+        return moved < tuning.stallMinCounts;
     }
 
     /** Records one hazard reaction; true when that trips the cornered cap (KTD8). */
@@ -992,19 +1058,31 @@ final class ExploreBrain {
         ticksLeft = ticks - 1;
         nextTickAt = now + tuning.hopTickMs;
         phaseUntil = now + ticks * tuning.hopTickMs;
+        hopStartedAt = now;
+        lastWheels = null;
+        wheelMoves.clear();
         moving = true;
         motor.hopTick();
     }
 
+    /** The escape turn's minimum: longer for each stall in a row (see HOP). */
+    private long escapeTurnMs() {
+        if (!stalledNow) {
+            return tuning.escapeTurnMs;
+        }
+        return Math.min(tuning.escapeSweepMaxMs, tuning.stallTurnMs + (stallStreak - 1) * tuning.stallTurnStepMs);
+    }
+
     private void startBackOff(long now) {
-        if (tuning.backTicks <= 0) {
-            enterLook(now, escapeDir, true, tuning.escapeTurnMs);
+        int ticks = stalledNow ? Math.max(tuning.backTicks, tuning.stallBackTicks) : tuning.backTicks;
+        if (ticks <= 0) {
+            enterLook(now, escapeDir, true, escapeTurnMs());
             return;
         }
         state = State.BACK_OFF;
-        ticksLeft = tuning.backTicks - 1;
+        ticksLeft = ticks - 1;
         nextTickAt = now + tuning.backTickMs;
-        phaseUntil = now + tuning.backTicks * tuning.backTickMs;
+        phaseUntil = now + ticks * tuning.backTickMs;
         moving = true;
         motor.backTick();
     }

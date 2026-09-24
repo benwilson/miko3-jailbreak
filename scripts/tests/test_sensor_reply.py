@@ -44,6 +44,8 @@ class SensorReplyHarnessTest(unittest.TestCase):
         "cpl_two_is_read_from_a_drive_reply",
         "missing_cpl_is_unknown_not_zero",
         "malformed_cpl_is_unknown",
+        "wheel_counts_are_read",
+        "missing_or_cut_off_wheel_counts_are_absent",
     )
 
     @classmethod

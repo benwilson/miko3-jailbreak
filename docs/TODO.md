@@ -4,6 +4,7 @@ The running list of what is left to do on the robot's modes. Add to it when some
 
 ## Explore mode
 
+- [ ] **Low obstacles: camera check if wheels ever spin in place.** Stalls against something too low for the front sensor are now caught by the wheel encoders (PR for stall detection, 2026-09-24): on the robot the wheels stopped dead. If he's ever seen pushing with wheels *spinning* (encoders counting, robot not moving), add the owner's camera idea: compare frames during a leg, and treat "the view hasn't changed" as blocked.
 - [ ] **Floor tuning session with the owner** (camera curiosity plan U8): `python3 scripts/qa-explore-mode.py --only curiosity --curious-seconds 90`.
   - Confirm he turns *toward* an off-centre target. Steering assumes the camera frame isn't mirrored; this hasn't been checked on the robot.
   - Trim near-synonyms in `mode-explore/assets/vocabulary.txt` (tv/monitor/computer, plant/succulent, the chair/laptop pair seen on one box), so one thing isn't inspected twice under two names. Re-export the model and regenerate the name clips afterwards.

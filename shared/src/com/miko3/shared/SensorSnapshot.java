@@ -20,18 +20,28 @@ public final class SensorSnapshot {
     public final int ir2;
     /** True when tof is DEAD_TOF: the sensor is reporting, but nothing it says is usable. */
     public final boolean fault;
+    /** The wheel encoder counts from the record's Left=/Right= fields, or ABSENT. They
+     * climb while a wheel turns and stand still while it is stalled. */
+    public final long wheelLeft;
+    public final long wheelRight;
 
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2) {
+        this(timestampMs, tof, ir1, ir2, ABSENT, ABSENT);
+    }
+
+    public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, long wheelLeft, long wheelRight) {
         this.timestampMs = timestampMs;
         this.tof = tof;
         this.ir1 = ir1;
         this.ir2 = ir2;
         this.fault = tof == DEAD_TOF;
+        this.wheelLeft = wheelLeft;
+        this.wheelRight = wheelRight;
     }
 
     @Override
     public String toString() {
         return "SensorSnapshot{t=" + timestampMs + " tof=" + tof + " ir1=" + ir1 + " ir2=" + ir2
-                + (fault ? " FAULT" : "") + "}";
+                + " wheels=" + wheelLeft + "/" + wheelRight + (fault ? " FAULT" : "") + "}";
     }
 }

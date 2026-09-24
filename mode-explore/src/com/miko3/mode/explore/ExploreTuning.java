@@ -57,6 +57,23 @@ final class ExploreTuning {
     final long escapeSweepMaxMs;
     final int escapeFailuresMax;
     final long escapeFailWindowMs;
+    /**
+     * Stall (blocked by something too low for the front sensor): during a leg,
+     * after stallGraceMs, fewer than stallMinCounts encoder counts (both wheels)
+     * in the last stallWindowMs. On the robot a blocked leg moved 0 counts; a
+     * short free burst moved ~10 counts per 125 ms reply.
+     */
+    final long stallGraceMs;
+    final long stallWindowMs;
+    final long stallMinCounts;
+    /**
+     * After a stall: back off stallBackTicks, then turn at least stallTurnMs, and
+     * stallTurnStepMs longer for each further stall before a clean leg. The front
+     * sensor can't see what stalled him, so these set how far he gets from it.
+     */
+    final int stallBackTicks;
+    final long stallTurnMs;
+    final long stallTurnStepMs;
     /** Cornered backstop: capHazards reactions within capWindowMs, no successful hop between, rest for cooldownMs (KTD8). */
     final int capHazards;
     final long capWindowMs;
@@ -135,6 +152,12 @@ final class ExploreTuning {
         turnMaxMs = Math.max(b.turnMinMs, b.turnMaxMs);
         escapeTurnMs = b.escapeTurnMs;
         corneredTurnMs = b.corneredTurnMs;
+        stallGraceMs = b.stallGraceMs;
+        stallWindowMs = b.stallWindowMs;
+        stallMinCounts = b.stallMinCounts;
+        stallBackTicks = b.stallBackTicks;
+        stallTurnMs = b.stallTurnMs;
+        stallTurnStepMs = b.stallTurnStepMs;
         escapeClearMs = b.escapeClearMs;
         escapeSweepMaxMs = Math.max(b.escapeTurnMs, b.escapeSweepMaxMs);
         escapeFailuresMax = Math.max(1, b.escapeFailuresMax);
@@ -235,6 +258,12 @@ final class ExploreTuning {
         private long turnMaxMs = 900;
         private long escapeTurnMs = 1200;
         private long corneredTurnMs = 2400;
+        private long stallGraceMs = 1000;
+        private long stallWindowMs = 1000;
+        private long stallMinCounts = 10;
+        private int stallBackTicks = 3;
+        private long stallTurnMs = 2000;
+        private long stallTurnStepMs = 1000;
         private long escapeClearMs = 300;
         // No heading feedback: 6 s of turning is assumed to be about a full circle.
         private long escapeSweepMaxMs = 6000;
@@ -302,6 +331,18 @@ final class ExploreTuning {
         Builder turnMs(long min, long max) { turnMinMs = min; turnMaxMs = max; return this; }
         Builder escapeTurnMs(long v) { escapeTurnMs = v; return this; }
         Builder corneredTurnMs(long v) { corneredTurnMs = v; return this; }
+        Builder stall(long graceMs, long windowMs, long minCounts) {
+            stallGraceMs = graceMs;
+            stallWindowMs = windowMs;
+            stallMinCounts = minCounts;
+            return this;
+        }
+        Builder stallEscape(int backTicks, long turnMs, long turnStepMs) {
+            stallBackTicks = backTicks;
+            stallTurnMs = turnMs;
+            stallTurnStepMs = turnStepMs;
+            return this;
+        }
         Builder escape(long clearMs, long sweepMaxMs, int failuresMax, long failWindowMs) {
             escapeClearMs = clearMs;
             escapeSweepMaxMs = sweepMaxMs;
