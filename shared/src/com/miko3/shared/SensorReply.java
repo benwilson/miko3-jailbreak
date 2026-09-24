@@ -19,6 +19,8 @@ import java.nio.charset.StandardCharsets;
 public final class SensorReply {
     private static final String TOFIR = "TOFIR=";
     private static final String CPL = "CPL=";
+    private static final String LEFT = "Left=";
+    private static final String RIGHT = "Right=";
 
     private SensorReply() {
     }
@@ -49,7 +51,27 @@ public final class SensorReply {
             return null;
         }
         return new SensorSnapshot(timestampMs, tof, number(fields[1]),
-                fields.length > 2 ? number(fields[2]) : SensorSnapshot.ABSENT);
+                fields.length > 2 ? number(fields[2]) : SensorSnapshot.ABSENT,
+                count(text, LEFT), count(text, RIGHT));
+    }
+
+    /** The wheel encoder count after {@code key} ("Left=0000068312,"): 1-10 digits ended
+     * by a comma (both counts always have one), else ABSENT. A count cut off mid-field
+     * is ABSENT, never a smaller number. */
+    private static long count(String text, String key) {
+        int start = text.indexOf(key);
+        if (start < 0) {
+            return SensorSnapshot.ABSENT;
+        }
+        int i = start + key.length();
+        int end = i;
+        while (end < text.length() && Character.isDigit(text.charAt(end))) {
+            end++;
+        }
+        if (end == i || end - i > 10 || end >= text.length() || text.charAt(end) != ',') {
+            return SensorSnapshot.ABSENT;
+        }
+        return Long.parseLong(text.substring(i, end));
     }
 
     /** The CPL motion-ack value in {@code reply} (2 = the MCU refused forward motion for an

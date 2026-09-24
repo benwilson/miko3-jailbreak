@@ -91,6 +91,19 @@ public final class SensorReplyHarness {
         check("missing_cpl_is_unknown_not_zero",
                 SensorReply.parseCpl(padded(captured)) == SensorSnapshot.ABSENT, "expected ABSENT");
 
+        SensorSnapshot w = SensorReply.parse(bytes(
+                "POWER=0,0TOFIR=00209,XXXX,0,XXXXHEADTM=0Left=0000068312,Right=0000059810,00,00,00000,0,0"), T);
+        check("wheel_counts_are_read",
+                w != null && w.wheelLeft == 68312 && w.wheelRight == 59810, "got " + w);
+
+        check("missing_or_cut_off_wheel_counts_are_absent",
+                SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXX"), T).wheelLeft == SensorSnapshot.ABSENT
+                        && SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=00000683"), T).wheelLeft
+                        == SensorSnapshot.ABSENT
+                        && SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=XXXX,Right=1,"), T).wheelLeft
+                        == SensorSnapshot.ABSENT,
+                "expected ABSENT");
+
         check("malformed_cpl_is_unknown",
                 SensorReply.parseCpl(bytes("CPL=X,")) == SensorSnapshot.ABSENT
                         && SensorReply.parseCpl((byte[]) null) == SensorSnapshot.ABSENT, "expected ABSENT");

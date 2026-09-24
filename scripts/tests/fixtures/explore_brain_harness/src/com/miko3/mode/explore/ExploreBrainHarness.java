@@ -75,6 +75,12 @@ public final class ExploreBrainHarness {
         return new SensorReading(t, 50 + jitter(t), 100, 100, null, false);
     }
 
+    /** Clear floor with wheel counts that track movedUntil (10 counts per 100 ms per wheel). */
+    static SensorReading wheels(long t, long movedUntil) {
+        long counts = movedUntil / 10;
+        return new SensorReading(t, 300 + jitter(t), 100, 100, null, false, 50000 + counts, 40000 + counts);
+    }
+
     static SensorReading cpl2(long t) {
         return new SensorReading(t, 300 + jitter(t), 100, 100, 2, false);
     }
@@ -870,6 +876,50 @@ public final class ExploreBrainHarness {
             check(n, rig.count("startle") == 2 && turns.size() >= 2
                             && turns.get(0).equals("turn LEFT") && turns.get(1).equals("turn LEFT"),
                     "turns=" + turns + " " + rig.tail());
+        });
+        scenario("stalled_wheels_mid_hop_stop_startle_and_escape", n -> {
+            // A 5 s leg from 1300; the wheels turn until 2000, then stand still though
+            // forward keeps going out: after a second with no progress he stops.
+            Rig rig = new Rig(tuning().hopTicks(20).build(), t -> wheels(t, Math.min(t, 2000))).started();
+            rig.runUntil(5500);
+            int stop = rig.firstAfter("stop", 1301);
+            check(n, rig.timeOf(stop) >= 2900 && rig.timeOf(stop) <= 3100 && rig.count("startle") == 1
+                            && rig.count("back") == 3 && rig.firstAfter("turn", rig.timeOf(stop)) >= 0,
+                    "stop@" + rig.timeOf(stop) + " " + rig.tail());
+        });
+        scenario("repeated_stalls_back_off_further_and_turn_more_each_time", n -> {
+            // The wheels never turn: every leg stalls. Each stall backs off 3 ticks and
+            // turns longer than the last (2 s, 3 s, 4 s here), one way, one "whoa".
+            Rig rig = new Rig(tuning().hopTicks(20).stallEscape(3, 2000, 1000).cap(8, 20000, 30000)
+                    .escape(300, 6000, 3, 60000).build(),
+                    t -> wheels(t, 0)).started();
+            rig.runUntil(30000);
+            List<Long> turnMs = new ArrayList<Long>();
+            List<String> dirs = new ArrayList<String>();
+            for (int i = 0; i < rig.log.size(); i++) {
+                if (rig.log.get(i).what.startsWith("turn")) {
+                    dirs.add(rig.log.get(i).what);
+                    turnMs.add(rig.timeOf(rig.first("stop", i)) - rig.log.get(i).t);
+                }
+            }
+            check(n, turnMs.size() >= 3 && turnMs.get(0) >= 2000 && turnMs.get(1) >= 3000 && turnMs.get(2) >= 4000
+                            && turnMs.get(1) > turnMs.get(0) && turnMs.get(2) > turnMs.get(1)
+                            && dirs.get(0).equals(dirs.get(1)) && dirs.get(1).equals(dirs.get(2))
+                            && rig.count("startle") == 1 && rig.count("back") >= 9,
+                    "turnMs=" + turnMs + " dirs=" + dirs + " startles=" + rig.count("startle")
+                            + " backs=" + rig.count("back") + " " + rig.tail());
+        });
+        scenario("turning_wheels_never_read_as_stalled", n -> {
+            Rig rig = new Rig(tuning().hopTicks(20).build(), t -> wheels(t, t)).started();
+            rig.runUntil(6500);
+            check(n, rig.count("startle") == 0 && rig.countPrefix("hop", 1300, 6300) == 20
+                            && rig.timeOf(rig.firstAfter("stop", 1301)) == 6300,
+                    rig.tail());
+        });
+        scenario("no_wheel_data_never_reads_as_stalled", n -> {
+            Rig rig = new Rig(tuning().hopTicks(20).build(), CLEAR).started();
+            rig.runUntil(6500);
+            check(n, rig.count("startle") == 0 && rig.timeOf(rig.firstAfter("stop", 1301)) == 6300, rig.tail());
         });
         scenario("flapping_readings_do_not_resume_driving", n -> {
             // Solid until 500, then two readings every 500 ms (never three in a row), solid from 10000.

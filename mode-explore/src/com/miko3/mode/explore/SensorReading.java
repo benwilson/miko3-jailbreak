@@ -26,19 +26,35 @@ final class SensorReading {
     /** Nothing in this reading can be trusted. The device side currently never sets it
      * (a dead keepalive shows up as staleness instead); it stays for a future producer. */
     final boolean fault;
+    /** Wheel encoder counts, or -1 when the reply carried none. They stand still while
+     * the wheels are stalled, e.g. against something too low for the front sensor. */
+    final long wheelLeft;
+    final long wheelRight;
 
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault) {
+        this(timestampMs, tof, ir1, ir2, cpl, fault, -1, -1);
+    }
+
+    SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault,
+                  long wheelLeft, long wheelRight) {
         this.timestampMs = timestampMs;
         this.tof = tof;
         this.ir1 = ir1;
         this.ir2 = ir2;
         this.cpl = cpl;
         this.fault = fault;
+        this.wheelLeft = wheelLeft;
+        this.wheelRight = wheelRight;
+    }
+
+    boolean hasWheels() {
+        return wheelLeft >= 0 && wheelRight >= 0;
     }
 
     @Override
     public String toString() {
         return "t=" + timestampMs + " tof=" + tof + " ir1=" + ir1 + " ir2=" + ir2
-                + " cpl=" + cpl + (fault ? " FAULT" : "");
+                + " cpl=" + cpl + (hasWheels() ? " wheels=" + wheelLeft + "/" + wheelRight : "")
+                + (fault ? " FAULT" : "");
     }
 }
