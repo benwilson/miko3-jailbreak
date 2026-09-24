@@ -5,6 +5,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
 import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.Log;
@@ -55,6 +56,7 @@ public class LauncherApp extends Application {
 
     private RoutingHttpServer server;
     private WifiHttpHandler wifi;
+    private ClaudeSettings claudeSettings;
     private volatile byte[] cssBytes;
 
     // Held only to create and keep alive DriveLeaseService, the modes' motor
@@ -74,6 +76,15 @@ public class LauncherApp extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        // Before the server starts, so no request can see it unset.
+        claudeSettings = new ClaudeSettings(
+                new PrefsStore(getSharedPreferences(ClaudeSettings.PREFS_NAME, MODE_PRIVATE)),
+                new ClaudeSettings.Clock() {
+                    @Override
+                    public long nowMillis() {
+                        return System.currentTimeMillis();
+                    }
+                });
         wifi = new WifiHttpHandler(this);
         startServer();
 
@@ -84,6 +95,12 @@ public class LauncherApp extends Application {
         // is in background" depending on device idle state at launch), but a bound
         // service has no such restriction.
         bindService(new Intent(this, DriveLeaseService.class), leaseConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    /** The robot's Claude API settings (settings plan U2), for the settings
+     * page and the settings service. */
+    ClaudeSettings claudeSettings() {
+        return claudeSettings;
     }
 
     /**
@@ -339,6 +356,39 @@ public class LauncherApp extends Application {
             return java.net.URLEncoder.encode(s, "UTF-8");
         } catch (Exception e) {
             return s;
+        }
+    }
+
+    /** ClaudeSettings.Store over the launcher's SharedPreferences. One commit()
+     * per call, not apply(), so a save is on disk before the POST's redirect is
+     * sent, and survives a reboot or reinstall right after (R15). */
+    private static final class PrefsStore implements ClaudeSettings.Store {
+        private final SharedPreferences prefs;
+
+        PrefsStore(SharedPreferences prefs) {
+            this.prefs = prefs;
+        }
+
+        @Override
+        public String getString(String key, String def) {
+            try {
+                return prefs.getString(key, def);
+            } catch (ClassCastException e) {
+                // A hand-written non-string value (the file is reachable over root adb).
+                Log.w(TAG, "preference " + key + " is not a string; using the default");
+                return def;
+            }
+        }
+
+        @Override
+        public void putStrings(Map<String, String> entries) {
+            SharedPreferences.Editor editor = prefs.edit();
+            for (Map.Entry<String, String> e : entries.entrySet()) {
+                editor.putString(e.getKey(), e.getValue());
+            }
+            if (!editor.commit()) {
+                Log.w(TAG, "Claude settings commit failed");
+            }
         }
     }
 }
