@@ -31,3 +31,7 @@ The running list of what is left to do on the robot's modes. Add to it when some
 ## Spike drive test
 
 - [ ] Fix `spike-drive-test/build.py`: it fails on committed code because its shared-class list is missing `SensorSnapshot` and `SensorReply`.
+
+## Robot voice
+
+- [ ] **Speech under Explore's load (measured 2026-09-24, `scripts/voice/speed-check.py`).** Idle, the stock lessac voices meet the 2 s target at 4 threads: low 0.84 s to first sound (RTF 0.41), medium 1.10 s (RTF 0.52). With Explore frozen mid-scan (camera and detector busy), medium at 4 threads fell to 4.89 s and RTF 2.96, too slow to stream. The owner chose to train medium anyway (lessac medium checkpoint `en/en_US/lessac/medium/epoch=2164-step=1355540.ckpt`, 22050 Hz). The speech service has to make it work under load: speak only after a look finishes (the detector is idle while he talks), and measure 2 threads under load, which the check didn't cover.
