@@ -14,8 +14,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
+try:
+    import numpy as np
+    import soundfile as sf
+except ImportError:  # the host python has neither; run these in voice-work/.venv-clone
+    raise unittest.SkipTest("numpy/soundfile not installed; run with voice-work/.venv-clone/bin/python")
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "voice" / "synthesize-dataset.py"
