@@ -21,6 +21,10 @@ public final class LauncherProtocol {
      * (voice plan U5). Modes go through RobotSpeechClient, not this directly. */
     public static final String ROBOT_SPEECH_ACTION = "com.miko3.launcher.ROBOT_SPEECH";
 
+    /** Intent action a mode app binds to reach the launcher's PeopleService
+     * (explore-on-claude plan U2). Modes go through RobotPeopleClient, not this directly. */
+    public static final String ROBOT_PEOPLE_ACTION = "com.miko3.launcher.ROBOT_PEOPLE";
+
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 
     /** Boolean extra on a launch Intent the launcher sends a mode's Activity, asking
@@ -55,6 +59,13 @@ public final class LauncherProtocol {
     public static final String SETTINGS_CLAUDE_FORGET_PATH = "/settings/claude/forget";
     /** Voice: the robot says the typed line through the launcher's speech queue. */
     public static final String SETTINGS_VOICE_SAY_PATH = "/settings/voice/say";
+    /** People (explore-on-claude plan U2): rename or forget one person, by id. */
+    public static final String SETTINGS_PEOPLE_RENAME_PATH = "/settings/people/rename";
+    public static final String SETTINGS_PEOPLE_FORGET_PATH = "/settings/people/forget";
+    /** GET ?id=<person id> answers that person's face JPEG. Under SETTINGS_PATH,
+     * so it is TLS-only like the rest (isTlsOnlyPath): a face never crosses the
+     * network in cleartext. */
+    public static final String SETTINGS_PEOPLE_FACE_PATH = "/settings/people/face";
 
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;

@@ -21,6 +21,7 @@ import com.miko3.shared.ModeRegistry;
 import com.miko3.shared.PageToken;
 import com.miko3.shared.RoutingHttpServer;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
@@ -61,6 +62,7 @@ public class LauncherApp extends Application {
     private WifiHttpHandler wifi;
     private ClaudeSettings claudeSettings;
     private SpeechEngine speech;
+    private PeopleStore people;
     // The Settings page's tokens (KTD6). Four, so the robot's own WebView sitting
     // on the page doesn't expire a LAN browser's form, or the other way round.
     private final PageToken settingsToken = new PageToken(4);
@@ -140,6 +142,15 @@ public class LauncherApp extends Application {
                         return System.currentTimeMillis();
                     }
                 });
+        // The people the robot remembers (explore-on-claude plan U2): faces and
+        // an index in launcher-private files, for PeopleService and the People
+        // section. Loaded before the server starts, like the settings.
+        people = new PeopleStore(new File(getFilesDir(), "people"), new PeopleStore.Clock() {
+            @Override
+            public long nowMillis() {
+                return System.currentTimeMillis();
+            }
+        });
         // The robot's voice (voice plan U5): loaded once, on its own thread, so
         // SpeechService is ready by the time a mode asks it to speak.
         speech = new SpeechEngine(this);
@@ -160,6 +171,11 @@ public class LauncherApp extends Application {
      * page and the settings service. */
     ClaudeSettings claudeSettings() {
         return claudeSettings;
+    }
+
+    /** The people the robot remembers, for PeopleService and the Settings page. */
+    PeopleStore people() {
+        return people;
     }
 
     /** The robot's voice and its queue of lines, for SpeechService. */
@@ -266,7 +282,8 @@ public class LauncherApp extends Application {
         RoutingHttpServer.RouteHandler settingsHandler = new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                SettingsPage.handle(req, res, settingsToken, claudeSettings, claudeApi, settingsSpeaker);
+                SettingsPage.handle(req, res, settingsToken, claudeSettings, claudeApi, settingsSpeaker,
+                        people);
             }
         };
         server.route(LauncherProtocol.SETTINGS_PATH, settingsHandler);
@@ -275,6 +292,9 @@ public class LauncherApp extends Application {
         server.route(LauncherProtocol.SETTINGS_CLAUDE_TEST_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_CLAUDE_FORGET_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_VOICE_SAY_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH, settingsHandler);
         server.route(LauncherProtocol.LAUNCH_MODE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {

@@ -61,5 +61,15 @@
                 <action android:name="com.miko3.launcher.ROBOT_SPEECH"/>
             </intent-filter>
         </service>
+
+        <!-- The people the robot remembers, for modes (explore-on-claude plan U2,
+             KTD1): recent faces, add, touch, name. Exported with no permission
+             for the same reason as RobotSettingsService; the service checks
+             each caller. -->
+        <service android:name=".PeopleService" android:exported="true">
+            <intent-filter>
+                <action android:name="com.miko3.launcher.ROBOT_PEOPLE"/>
+            </intent-filter>
+        </service>
     </application>
 </manifest>
