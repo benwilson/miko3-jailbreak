@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -27,6 +28,11 @@ import javax.net.ssl.SSLException;
  * a log line or a Reason. Reason text is fixed; nothing from a response body
  * is ever copied into it, since an endpoint may echo the key back.
  *
+ * messages() (explore plan U1, KTD2/KTD3/KTD6) is the one deliberate
+ * exception: it returns the JSON object Claude wrote, because that is the
+ * point of the call. Its failures are still fixed Reasons, and nothing (the
+ * reply, the images, the key) is logged.
+ *
  * Plain Java (no android.*) so scripts/tests can exercise it on the host JVM
  * with a fake Transport; ClaudeHttpsTransport is the real one.
  */
@@ -36,6 +42,8 @@ public final class ClaudeApi {
     private static final int PAGE_LIMIT = 1000;
     /** A proxy that keeps answering has_more would otherwise page forever. */
     private static final int MAX_PAGES = 20;
+    /** Room for a JSON reply of a few short lines; the structured replies are far smaller. */
+    private static final int MESSAGES_MAX_TOKENS = 1024;
 
     /** Why a call failed. The text is fixed and safe to show anywhere. */
     public enum Reason {
@@ -53,7 +61,11 @@ public final class ClaudeApi {
         OVERLOADED("The endpoint is overloaded; try again shortly."),
         ENDPOINT_ERROR("The endpoint is overloaded or erroring."),
         UNREACHABLE("The endpoint can't be reached (DNS, connection or timeout)."),
-        TLS_FAILED("TLS failed; check the robot's clock and the endpoint's certificate.");
+        TLS_FAILED("TLS failed; check the robot's clock and the endpoint's certificate."),
+        /** messages(): Claude answered in words with no JSON, or stopped with stop_reason "refusal". */
+        REFUSED("Claude declined to answer this request."),
+        /** messages(): Claude's reply held JSON that isn't one valid object. */
+        BAD_REPLY("Claude's reply wasn't the JSON object that was asked for.");
 
         public final String text;
 
@@ -115,12 +127,19 @@ public final class ClaudeApi {
         public final Map<String, String> headers;
         /** The JSON body, or null for a GET. */
         public final String body;
+        /** This call's read timeout in ms, or 0 for the transport's default. */
+        public final int readTimeoutMs;
 
         Request(String method, String url, Map<String, String> headers, String body) {
+            this(method, url, headers, body, 0);
+        }
+
+        Request(String method, String url, Map<String, String> headers, String body, int readTimeoutMs) {
             this.method = method;
             this.url = url;
             this.headers = Collections.unmodifiableMap(headers);
             this.body = body;
+            this.readTimeoutMs = Math.max(0, readTimeoutMs);
         }
     }
 
@@ -135,10 +154,68 @@ public final class ClaudeApi {
         }
     }
 
+    /** messages()' outcome: the JSON object Claude replied with, or one Reason. */
+    public static final class MessageResult {
+        public final Reason reason;
+        /** The HTTP status behind a failure, or 0 when there was no response. */
+        public final int httpStatus;
+        /** The parsed reply; empty unless ok(). */
+        public final Map<String, Object> json;
+
+        private MessageResult(Reason reason, int httpStatus, Map<String, Object> json) {
+            this.reason = reason;
+            this.httpStatus = httpStatus;
+            this.json = Collections.unmodifiableMap(json);
+        }
+
+        static MessageResult failure(Reason reason, int httpStatus) {
+            return new MessageResult(reason, httpStatus, new LinkedHashMap<String, Object>());
+        }
+
+        public boolean ok() {
+            return reason == null;
+        }
+
+        /** The reason plus the status, as Result.describe(); never the reply itself. */
+        public String describe() {
+            if (ok()) {
+                return "OK";
+            }
+            return httpStatus > 0 ? reason.text + " (HTTP " + httpStatus + ")" : reason.text;
+        }
+
+        @Override
+        public String toString() {
+            return describe();
+        }
+    }
+
     private final Transport transport;
+    /** Set once the endpoint has rejected output_config; later calls put the schema in the prompt. */
+    private volatile boolean schemaInPrompt;
 
     public ClaudeApi(Transport transport) {
         this.transport = transport;
+    }
+
+    /** A text content block for messages(). */
+    public static Map<String, Object> textBlock(String text) {
+        Map<String, Object> b = new LinkedHashMap<String, Object>();
+        b.put("type", "text");
+        b.put("text", text);
+        return b;
+    }
+
+    /** An image content block for messages(): the JPEG bytes as base64 with no line breaks. */
+    public static Map<String, Object> jpegBlock(byte[] jpeg) {
+        Map<String, Object> source = new LinkedHashMap<String, Object>();
+        source.put("type", "base64");
+        source.put("media_type", "image/jpeg");
+        source.put("data", Base64.getEncoder().encodeToString(jpeg));
+        Map<String, Object> b = new LinkedHashMap<String, Object>();
+        b.put("type", "image");
+        b.put("source", source);
+        return b;
     }
 
     /**
@@ -281,6 +358,142 @@ public final class ClaudeApi {
         return Result.failure(forStatus(resp, false), resp.status);
     }
 
+    /**
+     * One user turn of content blocks (textBlock/jpegBlock, sent in the given
+     * order) and the JSON object Claude replies with. Blocking: call it off
+     * the main thread.
+     *
+     * With a schema, it is sent as output_config.format (json_schema). If the
+     * endpoint answers 400 naming output_config, the call is retried once
+     * with the schema in the system prompt instead, and every later call on
+     * this ClaudeApi does the same. Without a schema the prompt must ask for
+     * JSON itself.
+     *
+     * timeoutMs is this call's read timeout (0 or less: the transport's
+     * default); a timeout is UNREACHABLE. A reply in words with no JSON, or
+     * stop_reason "refusal", is REFUSED; JSON that isn't one object is
+     * BAD_REPLY; a response body that isn't a Messages reply is ENDPOINT_ERROR.
+     *
+     * @param system the system prompt, or null for none
+     * @param schema a JSON schema as nested Maps/Lists, or null
+     */
+    public MessageResult messages(ClaudeAccess access, String system, List<Map<String, Object>> content,
+            Map<String, ?> schema, int timeoutMs) {
+        if (access == null || !access.isSetUp()) {
+            return MessageResult.failure(Reason.NOT_SET_UP, 0);
+        }
+        String base = normalizeBaseUrl(access.baseUrl);
+        Result bad = checkSetup(base, access.apiKey);
+        if (bad != null) {
+            return MessageResult.failure(bad.reason, 0);
+        }
+        for (int k = 0; k < access.model.length(); k++) {
+            if (Character.isISOControl(access.model.charAt(k))) {
+                return MessageResult.failure(Reason.BAD_MODEL_NAME, 0);
+            }
+        }
+        boolean useOutputConfig = schema != null && !schemaInPrompt;
+        Request request = messagesRequest(base, access, system, content, schema, useOutputConfig, timeoutMs);
+        Response resp;
+        try {
+            resp = transport.send(request);
+            if (useOutputConfig && rejectsOutputConfig(resp)) {
+                schemaInPrompt = true;
+                resp = transport.send(messagesRequest(base, access, system, content, schema, false, timeoutMs));
+            }
+        } catch (IOException e) {
+            return MessageResult.failure(forException(e), 0);
+        }
+        if (resp.status < 200 || resp.status > 299) {
+            return MessageResult.failure(forStatus(resp, false), resp.status);
+        }
+        return readReply(resp);
+    }
+
+    private static Request messagesRequest(String base, ClaudeAccess access, String system,
+            List<Map<String, Object>> content, Map<String, ?> schema, boolean useOutputConfig, int timeoutMs) {
+        Map<String, Object> message = new LinkedHashMap<String, Object>();
+        message.put("role", "user");
+        message.put("content", content == null ? new ArrayList<Object>() : content);
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("model", access.model);
+        body.put("max_tokens", MESSAGES_MAX_TOKENS);
+        String sys = system;
+        if (schema != null && !useOutputConfig) {
+            String ask = "Reply with only a JSON object that matches this JSON schema, and no other text: "
+                    + Json.write(schema);
+            sys = sys == null || sys.isEmpty() ? ask : sys + "\n\n" + ask;
+        }
+        if (sys != null && !sys.isEmpty()) {
+            body.put("system", sys);
+        }
+        body.put("messages", Collections.singletonList(message));
+        if (useOutputConfig) {
+            Map<String, Object> format = new LinkedHashMap<String, Object>();
+            format.put("type", "json_schema");
+            format.put("schema", schema);
+            body.put("output_config", Collections.singletonMap("format", format));
+        }
+        return new Request("POST", base + "/v1/messages", headers(access.apiKey, true), Json.write(body),
+                Math.max(0, timeoutMs));
+    }
+
+    /** A 400 whose error message names output_config: the endpoint (or a proxy) doesn't take it. */
+    private static boolean rejectsOutputConfig(Response resp) {
+        if (resp.status != 400) {
+            return false;
+        }
+        Map<?, ?> body = parseObject(resp.body);
+        Object error = body == null ? null : body.get("error");
+        Object message = error instanceof Map ? ((Map<?, ?>) error).get("message") : null;
+        return message instanceof String && ((String) message).contains("output_config");
+    }
+
+    /** The JSON object in a 2xx Messages reply, or why there isn't one. */
+    private static MessageResult readReply(Response resp) {
+        Map<?, ?> body = parseObject(resp.body);
+        if (body == null) {
+            return MessageResult.failure(Reason.ENDPOINT_ERROR, resp.status);
+        }
+        if ("refusal".equals(body.get("stop_reason"))) {
+            return MessageResult.failure(Reason.REFUSED, resp.status);
+        }
+        if (!(body.get("content") instanceof List)) {
+            return MessageResult.failure(Reason.ENDPOINT_ERROR, resp.status);
+        }
+        StringBuilder text = new StringBuilder();
+        boolean anyText = false;
+        for (Object block : (List<?>) body.get("content")) {
+            if (block instanceof Map && "text".equals(((Map<?, ?>) block).get("type"))
+                    && ((Map<?, ?>) block).get("text") instanceof String) {
+                text.append((String) ((Map<?, ?>) block).get("text"));
+                anyText = true;
+            }
+        }
+        if (!anyText) {
+            return MessageResult.failure(Reason.ENDPOINT_ERROR, resp.status);
+        }
+        String t = text.toString().trim();
+        Object parsed = parseAny(t);
+        if (parsed == null) {
+            // Prompt-only JSON may come wrapped in prose or a ```json fence.
+            int open = t.indexOf('{');
+            if (open < 0) {
+                return MessageResult.failure(t.indexOf('[') >= 0 ? Reason.BAD_REPLY : Reason.REFUSED, resp.status);
+            }
+            int close = t.lastIndexOf('}');
+            parsed = close > open ? parseAny(t.substring(open, close + 1)) : null;
+        }
+        if (!(parsed instanceof Map)) {
+            return MessageResult.failure(Reason.BAD_REPLY, resp.status);
+        }
+        Map<String, Object> json = new LinkedHashMap<String, Object>();
+        for (Map.Entry<?, ?> e : ((Map<?, ?>) parsed).entrySet()) {
+            json.put(String.valueOf(e.getKey()), e.getValue());
+        }
+        return new MessageResult(null, 0, json);
+    }
+
     /** NOT_SET_UP, BAD_BASE_URL or BAD_KEY_FORMAT before any request is made; null if fine.
      * base is the already-normalized base URL (null if it wasn't usable). */
     private static Result checkSetup(String base, String key) {
@@ -377,6 +590,15 @@ public final class ClaudeApi {
             return Reason.OVERLOADED;
         }
         return null;
+    }
+
+    /** Any JSON value, or null if the text isn't JSON. */
+    private static Object parseAny(String text) {
+        try {
+            return Json.parse(text);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /** The body as a JSON object, or null if it is anything else. */
