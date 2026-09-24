@@ -5,7 +5,7 @@ vocabulary (camera curiosity, KTD2).
 YOLOE-26n is an open-vocabulary detector: given a list of names, it bakes their
 text embeddings into its classification head, and the exported model is then a
 plain detector for exactly those names, in that order. This exports it to ONNX
-for ONNX Runtime on the robot, at the camera's 480x640 frame size.
+for ONNX Runtime on the robot, at 320x416 (--imgsz to change it).
 
 Runs in its own environment, since Ultralytics pulls in PyTorch:
 
@@ -29,7 +29,10 @@ REPO = Path(__file__).resolve().parents[1]
 VOCABULARY = REPO / "mode-explore" / "assets" / "vocabulary.txt"
 OUT = REPO / "mode-explore" / "assets" / "detector.onnx"
 WEIGHTS = "yoloe-26n-seg.pt"
-IMGSZ = (480, 640)  # the camera's frame, height x width
+# Height x width, multiples of 32. The camera delivers 640x480; the app scales
+# frames down to this. 320x416 runs ~0.6 s a look on the robot vs ~1.4 s at
+# 480x640, and still found the plants on the test frame (camera-vision.md §10).
+IMGSZ = (320, 416)
 
 
 def read_vocabulary(path=VOCABULARY):
@@ -49,6 +52,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--check", metavar="IMAGE", help="run the detector on this image before exporting")
     ap.add_argument("--out", default=str(OUT))
+    ap.add_argument("--imgsz", type=int, nargs=2, metavar=("H", "W"), default=IMGSZ,
+                    help=f"input size, multiples of 32 (default {IMGSZ[0]} {IMGSZ[1]})")
     args = ap.parse_args()
 
     from ultralytics import YOLOE  # only in the export environment
@@ -57,11 +62,11 @@ def main():
     model = YOLOE(WEIGHTS)
     model.set_classes(names)
     if args.check:
-        result = model.predict(args.check, conf=0.25, verbose=False)[0]
+        result = model.predict(args.check, conf=0.25, imgsz=tuple(args.imgsz), verbose=False)[0]
         for box in result.boxes:
             print(f"  {names[int(box.cls)]:<20} {float(box.conf):.2f} "
                   f"{[int(v) for v in box.xyxy[0].tolist()]}")
-    exported = Path(model.export(format="onnx", imgsz=IMGSZ, simplify=True, dynamic=False))
+    exported = Path(model.export(format="onnx", imgsz=tuple(args.imgsz), simplify=True, dynamic=False))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(exported), args.out)
     print(f"wrote {args.out} ({Path(args.out).stat().st_size // 1024} KB, {len(names)} names)")
