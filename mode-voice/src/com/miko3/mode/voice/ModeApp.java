@@ -12,6 +12,7 @@ import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.HttpUtil;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.ModeRegistry;
+import com.miko3.shared.PageToken;
 import com.miko3.shared.RoutingHttpServer;
 
 import java.io.IOException;
@@ -51,7 +52,7 @@ public class ModeApp extends Application {
 
     private RoutingHttpServer server;
     private VoiceSettings settings;
-    private final PageToken pageToken = new PageToken();
+    private final PageToken pageToken = new PageToken(1);
     private volatile Runnable exitRunnable;
     // What the eyes show (U7, KTD9). U8's engine sets it; /voice-state reads it
     // without taking any lock. stateText is optional detail the engine adds to

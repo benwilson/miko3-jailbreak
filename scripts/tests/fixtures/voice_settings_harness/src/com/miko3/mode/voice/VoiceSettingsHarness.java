@@ -2,6 +2,7 @@ package com.miko3.mode.voice;
 
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
+import com.miko3.shared.PageToken;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -77,7 +78,7 @@ public final class VoiceSettingsHarness {
     static final class Fixture {
         final MemStore store = new MemStore();
         final VoiceSettings settings;
-        final PageToken token = new PageToken();
+        final PageToken token = new PageToken(1);
         final Recorder listener = new Recorder();
 
         Fixture() {

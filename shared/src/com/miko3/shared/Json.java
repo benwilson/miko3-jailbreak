@@ -1,4 +1,4 @@
-package com.miko3.mode.voice;
+package com.miko3.shared;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -6,21 +6,22 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Just enough JSON for the lane's envelopes: objects, arrays, strings,
- * numbers (integers as Long, others as Double), booleans, null. org.json is
- * Android-only and ConversationClient has to run on the host JVM.
+ * Just enough JSON for our wire formats (voice's lane envelopes, the Claude
+ * API): objects, arrays, strings, numbers (integers as Long, others as
+ * Double), booleans, null. org.json is Android-only and the callers have to
+ * run on the host JVM.
  */
-final class LaneJson {
+public final class Json {
     private final String s;
     private int i;
 
-    private LaneJson(String s) {
+    private Json(String s) {
         this.s = s;
     }
 
     /** Throws IllegalArgumentException on anything malformed. */
-    static Object parse(String text) {
-        LaneJson p = new LaneJson(text);
+    public static Object parse(String text) {
+        Json p = new Json(text);
         p.ws();
         Object v = p.value();
         p.ws();
@@ -30,7 +31,7 @@ final class LaneJson {
         return v;
     }
 
-    static String write(Object v) {
+    public static String write(Object v) {
         StringBuilder sb = new StringBuilder();
         write(sb, v);
         return sb.toString();

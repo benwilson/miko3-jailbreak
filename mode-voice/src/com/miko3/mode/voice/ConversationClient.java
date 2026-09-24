@@ -1,5 +1,6 @@
 package com.miko3.mode.voice;
 
+import com.miko3.shared.Json;
 import com.miko3.shared.WebSocketClient;
 
 import java.io.IOException;
@@ -690,7 +691,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         log.info("rx " + text);
         Map<String, Object> msg;
         try {
-            Object parsed = LaneJson.parse(text);
+            Object parsed = Json.parse(text);
             if (!(parsed instanceof Map)) {
                 log.warn("relay sent a JSON value that is not an object; ignored");
                 return;
@@ -835,7 +836,7 @@ final class ConversationClient implements VoiceSettings.RelayAddressListener {
         for (int i = 0; i + 1 < fields.length; i += 2) {
             m.put((String) fields[i], fields[i + 1]);
         }
-        String text = LaneJson.write(m);
+        String text = Json.write(m);
         log.info("tx " + text);
         tx.text(link, text);
     }
