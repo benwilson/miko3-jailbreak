@@ -8,12 +8,14 @@ Modes:
   --samples   render about 10 sample lines for the owner's listening gate
               (R6) and time the cloner. Writes voice-work/samples/NN-<slug>.wav
               (22050 Hz, mono, 16-bit) and voice-work/samples/report.json.
-  --dataset   NOT BUILT YET. Will read scripts/voice/script-lines.txt, render
-              every line, re-transcribe each clip with mlx-whisper, drop clips
-              whose transcript drifts from the prompt (KTD2), and write an
-              LJSpeech-style voice-work/dataset/metadata.csv (`wav|text`).
-              render_line(), resample(), audio_problems(), write_wav() and
-              word_match() are the pieces it will reuse.
+  --dataset   read scripts/voice/script-lines.txt, render every line, and
+              re-transcribe each clip with mlx-whisper. A clip is dropped when
+              it is silent, clipped, implausibly long or short for its text,
+              or its transcript's word error rate is over 0.15 after both
+              sides are normalized (KTD2); a dropped line is retried twice
+              with new seeds. Writes voice-work/dataset/wavs/NNNN.wav,
+              metadata.csv (LJSpeech `id|text`), summary.json and
+              progress.log. Resumable: lines already finished are skipped.
 
 Backends (KTD1):
   chatterbox  Chatterbox (MIT), the primary. Needs no reference transcript.
@@ -27,6 +29,7 @@ Every output is checked to stay inside the gitignored voice-work/ directory.
 The owner's clips are read in place and never copied elsewhere.
 
   voice-work/.venv-clone/bin/python scripts/voice/synthesize-dataset.py --samples
+  voice-work/.venv-clone/bin/python scripts/voice/synthesize-dataset.py --dataset
   voice-work/.venv-f5/bin/python scripts/voice/synthesize-dataset.py --samples \\
       --backend f5 --out voice-work/samples-f5 --limit 3
 """
@@ -48,6 +51,20 @@ WORK_ROOT = REPO / "voice-work"
 REFERENCE = WORK_ROOT / "reference" / "reference.wav"
 MANIFEST = WORK_ROOT / "clips" / "manifest.json"
 SAMPLES_DIR = WORK_ROOT / "samples"
+DATASET_DIR = WORK_ROOT / "dataset"
+SCRIPT_LINES = REPO / "scripts" / "voice" / "script-lines.txt"
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+
+# Owner's pick at listening gate 1 (KTD1): the "excited" delivery.
+EXAGGERATION = 0.9
+CFG_WEIGHT = 0.3
+
+MIN_WORDS, MAX_WORDS, MAX_CHARS = 3, 25, 180
+MAX_WER = 0.15
+MAX_RETRIES = 2              # a dropped line is rendered at most 1 + 2 times
+MAX_WORDS_PER_SECOND = 6.5   # faster than this is truncated or garbled
+MIN_WORDS_PER_SECOND = 1.0   # slower (after 1 s of slack) is babbling or stalling
+SLACK_SECONDS = 1.0
 
 OUT_RATE = 22050             # Piper medium tier (KTD8)
 MIN_SECONDS = 0.3
@@ -188,6 +205,160 @@ def check_wav(path):
     return info.frames / info.samplerate
 
 
+# ---------------------------------------------------------- script lines
+
+def line_key(text):
+    """What makes two lines duplicates: the same words, ignoring case and punctuation."""
+    return " ".join(re.findall(r"[a-z0-9']+", text.lower().replace("\u2019", "'")))
+
+
+def dedupe(lines):
+    seen, out = set(), []
+    for line in lines:
+        k = line_key(line)
+        if k not in seen:
+            seen.add(k)
+            out.append(line)
+    return out
+
+
+def line_problems(text):
+    problems = []
+    n = len(text.split())
+    if not MIN_WORDS <= n <= MAX_WORDS:
+        problems.append(f"{n} words (want {MIN_WORDS}-{MAX_WORDS})")
+    if len(text) >= MAX_CHARS:
+        problems.append(f"{len(text)} characters (want under {MAX_CHARS})")
+    if "|" in text:
+        problems.append("pipe character")
+    return problems
+
+
+def _text_lines(path):
+    return [l.strip() for l in Path(path).read_text().splitlines()
+            if l.strip() and not l.lstrip().startswith("#")]
+
+
+def load_script_lines(path=SCRIPT_LINES):
+    """Script lines in order, de-duplicated; a malformed line is an error."""
+    lines = dedupe(_text_lines(path))
+    bad = [(l, line_problems(l)) for l in lines if line_problems(l)]
+    if bad:
+        raise ValueError(f"{path}: bad lines: {bad[:5]}")
+    return lines
+
+
+def vocabulary_names(path):
+    return _text_lines(path)
+
+
+def missing_names(names, lines):
+    """Names that no line uses as whole words (case-insensitive)."""
+    text = "\n".join(lines).lower()
+    return [n for n in names
+            if not re.search(r"(?<![a-z0-9'-])" + re.escape(n.lower()) + r"(?![a-z0-9-])", text)]
+
+
+# ------------------------------------------------------- round-trip filter
+
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve thirteen "
+         "fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+_SCALES = [(10 ** 12, "trillion"), (10 ** 9, "billion"), (10 ** 6, "million"), (1000, "thousand")]
+_ORDINAL = {"one": "first", "two": "second", "three": "third", "five": "fifth",
+            "eight": "eighth", "nine": "ninth", "twelve": "twelfth"}
+
+
+def number_words(n):
+    """Cardinal words for a non-negative integer, without 'and' (1250 -> one thousand two hundred fifty)."""
+    if n < 20:
+        return [_ONES[n]]
+    if n < 100:
+        return [_TENS[n // 10]] + ([_ONES[n % 10]] if n % 10 else [])
+    if n < 1000:
+        return [_ONES[n // 100], "hundred"] + (number_words(n % 100) if n % 100 else [])
+    for value, name in _SCALES:
+        if n >= value:
+            return number_words(n // value) + [name] + (number_words(n % value) if n % value else [])
+    raise AssertionError(n)
+
+
+def year_words(n):
+    """How a year is read aloud: 1999 -> nineteen ninety nine, 2024 -> twenty twenty four."""
+    hi, lo = divmod(n, 100)
+    if lo == 0:
+        return number_words(hi) + ["hundred"]
+    return number_words(hi) + (["oh"] + number_words(lo) if lo < 10 else number_words(lo))
+
+
+def ordinal_words(n):
+    words = number_words(n)
+    last = words[-1]
+    if last in _ORDINAL:
+        words[-1] = _ORDINAL[last]
+    elif last.endswith("y"):
+        words[-1] = last[:-1] + "ieth"
+    else:
+        words[-1] = last + "th"
+    return words
+
+
+def _is_year(n):
+    return 1100 <= n <= 1999 or 2010 <= n <= 2099
+
+
+def normalize_words(text):
+    """Lower-case words with punctuation gone and numbers written out, for comparing
+    a prompt with its transcript ("1, 2, 3" and "One, two, three." agree)."""
+    t = text.lower().replace("\u2019", "'").replace("\u2018", "'")
+
+    def say(m):
+        money, num, frac, suffix = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+        grouped = "," in num                              # 1,250 is never a year
+        n = int(num.replace(",", ""))
+        if suffix in ("st", "nd", "rd", "th"):
+            words = ordinal_words(n)
+        elif frac is None and not money and not grouped and len(num) == 4 and _is_year(n):
+            words = year_words(n)
+        else:
+            words = number_words(n)
+            if frac is not None:
+                words += ["point"] + [_ONES[int(d)] for d in frac]
+        if suffix == "%":
+            words.append("percent")
+        if money:
+            words.append("dollars" if n != 1 or frac else "dollar")
+        return " " + " ".join(words) + " "
+
+    t = re.sub(r"\b(\d{1,2}):(\d{2})\b",
+               lambda m: " " + " ".join(number_words(int(m.group(1))) + (
+                   [] if m.group(2) == "00" else
+                   ["oh"] + number_words(int(m.group(2))) if m.group(2)[0] == "0" else
+                   number_words(int(m.group(2))))) + " ", t)
+    t = re.sub(r"(\$)?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?(st|nd|rd|th|%)?", say, t)
+    return re.findall(r"[a-z]+", t.replace("'", ""))
+
+
+def word_error_rate(prompt, transcript):
+    """Word edit distance over the prompt's word count, after normalize_words()."""
+    ref, hyp = normalize_words(prompt), normalize_words(transcript)
+    if not ref:
+        return 0.0 if not hyp else 1.0
+    prev = list(range(len(hyp) + 1))
+    for i, r in enumerate(ref, 1):
+        cur = [i] + [0] * len(hyp)
+        for j, h in enumerate(hyp, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (r != h))
+        prev = cur
+    return prev[-1] / len(ref)
+
+
+def duration_plausible(text, seconds):
+    """Is this clip length believable for this many spoken words?"""
+    n = max(1, len(normalize_words(text)))
+    return n / MAX_WORDS_PER_SECOND <= seconds <= n / MIN_WORDS_PER_SECOND + SLACK_SECONDS
+
+
 def word_match(prompt, transcript):
     """Word-level similarity (0-1) of a prompt and its re-transcription."""
     def words(s):
@@ -214,7 +385,7 @@ def projected_hours(rtf, audio_hours, keep_rate=1.0):
 class ChatterboxBackend:
     name = "chatterbox"
 
-    def __init__(self, reference, device=None, exaggeration=0.5, cfg_weight=0.5):
+    def __init__(self, reference, device=None, exaggeration=EXAGGERATION, cfg_weight=CFG_WEIGHT):
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         import torch
         from chatterbox.tts import ChatterboxTTS
@@ -226,7 +397,10 @@ class ChatterboxBackend:
         self.exaggeration = exaggeration
         self.cfg_weight = cfg_weight
 
-    def generate(self, text):
+    def generate(self, text, seed=None):
+        if seed is not None:
+            import torch
+            torch.manual_seed(seed)
         wav = self.model.generate(text, exaggeration=self.exaggeration,
                                   cfg_weight=self.cfg_weight)
         return wav.detach().cpu().numpy(), self.model.sr
@@ -285,7 +459,7 @@ class F5Backend:
         return np.array(wave), self.RATE
 
 
-def make_backend(name, reference, exaggeration=0.5, cfg_weight=0.5):
+def make_backend(name, reference, exaggeration=EXAGGERATION, cfg_weight=CFG_WEIGHT):
     if name == "chatterbox":
         # exaggeration: emotional intensity (0.5 neutral); lower cfg_weight: livelier pacing.
         return ChatterboxBackend(reference, exaggeration=exaggeration, cfg_weight=cfg_weight)
@@ -333,45 +507,223 @@ def render_samples(backend, lines, out_dir, work_root=None):
     return report
 
 
+def transcribe_file(path, prompt=None):
+    """What mlx-whisper hears in a clip (the prompt is unused; it keeps whisper unbiased)."""
+    import mlx_whisper
+    r = mlx_whisper.transcribe(str(path), path_or_hf_repo=WHISPER_MODEL, language="en")
+    return r["text"].strip()
+
+
 def transcribe_samples(report, out_dir, work_root=None):
     """Re-transcribe each sample with mlx-whisper and note how well it matches."""
-    import mlx_whisper
     for s in report["samples"]:
-        r = mlx_whisper.transcribe(s["file"], path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
-                                   language="en")
-        s["transcript"] = r["text"].strip()
+        s["transcript"] = transcribe_file(s["file"])
         s["word_match"] = round(word_match(s["text"], s["transcript"]), 3)
         print(f"{Path(s['file']).name}: {s['word_match']:.2f}  {s['transcript']}", flush=True)
     path = guard_output(Path(out_dir) / "report.json", work_root)
     path.write_text(json.dumps(report, indent=1) + "\n")
 
 
+# -------------------------------------------------------------------- dataset
+
+def clip_id(index):
+    return f"{index + 1:04d}"
+
+
+def classify_clip(text, raw, raw_rate, audio):
+    """Drop reason for a rendered clip before transcription, or None if it may pass.
+    Clipping is judged on the cloner's own output, before the peak ceiling hides it."""
+    x = np.asarray(raw, dtype=np.float32).reshape(-1)
+    if len(x) == 0 or not np.all(np.isfinite(x)):
+        return "bad-audio"
+    if float(np.max(np.abs(x))) < SILENT_PEAK:
+        return "silent"
+    if float(np.mean(np.abs(x) >= CLIP_LEVEL)) > MAX_CLIPPED_FRACTION:
+        return "clipped"
+    if not duration_plausible(text, len(audio) / OUT_RATE):
+        return "duration"
+    problems = audio_problems(audio, OUT_RATE)
+    if any("silent" in p for p in problems):
+        return "silent"
+    if problems:
+        return "gap" if any("gap" in p for p in problems) else "bad-audio"
+    return None
+
+
+def write_metadata(out_dir, rows, work_root=None, wav_dir=None):
+    """LJSpeech metadata.csv (`id|text`), listing only rows whose WAV exists."""
+    out = guard_output(out_dir, work_root)
+    wav_dir = Path(wav_dir) if wav_dir else out / "wavs"
+    path = guard_output(out / "metadata.csv", work_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keep = [f"{i}|{t}\n" for i, t in rows if "|" not in t and (wav_dir / f"{i}.wav").exists()]
+    tmp = path.with_suffix(".csv.tmp")
+    tmp.write_text("".join(keep))
+    tmp.replace(path)
+    return len(keep)
+
+
+def _load_results(path):
+    results = {}
+    if path.exists():
+        for raw in path.read_text().splitlines():
+            try:
+                r = json.loads(raw)
+            except ValueError:
+                continue  # a line cut short by a crash
+            results[r["id"]] = r
+    return results
+
+
+def build_dataset(backend, transcribe, lines, out_dir, work_root=None,
+                  max_retries=MAX_RETRIES, max_wer=MAX_WER, log=print):
+    """Render, round-trip filter and write the dataset; resumable. Returns the summary."""
+    out = guard_output(out_dir, work_root)
+    wavs = guard_output(out / "wavs", work_root)
+    tmp_dir = guard_output(out / "tmp", work_root)
+    results_path = guard_output(out / "results.jsonl", work_root)
+    log_path = guard_output(out / "progress.log", work_root)
+    for d in (wavs, tmp_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    results = _load_results(results_path)
+    logf = open(log_path, "a")
+
+    def note(msg):
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+        logf.write(line + "\n")
+        logf.flush()
+        if log:
+            log(line)
+
+    def done(i, text):
+        r = results.get(clip_id(i))
+        if not r or r["text"] != text:
+            return False
+        return r["status"] == "dropped" or (wavs / f"{clip_id(i)}.wav").exists()
+
+    todo = [i for i, t in enumerate(lines) if not done(i, t)]
+    note(f"start: {len(lines)} lines, {len(lines) - len(todo)} already finished, {len(todo)} to render")
+    t_start = time.perf_counter()
+    audio_done = 0.0
+    with open(results_path, "a") as resf:
+        for n_done, i in enumerate(todo, 1):
+            text, cid = lines[i], clip_id(i)
+            final = wav_path = None
+            attempts = []
+            for attempt in range(max_retries + 1):
+                seed = (i + 1) * 1000 + attempt
+                t0 = time.perf_counter()
+                raw, rate = backend.generate(text, seed=seed)
+                audio = limit_peak(resample(raw, rate, OUT_RATE))
+                took = time.perf_counter() - t0
+                seconds = len(audio) / OUT_RATE
+                rec = {"attempt": attempt, "seed": seed, "seconds": round(seconds, 2),
+                       "gen_seconds": round(took, 2)}
+                reason = classify_clip(text, raw, rate, audio)
+                if reason is None:
+                    tmp = write_wav(tmp_dir / f"{cid}.wav", audio, OUT_RATE, work_root)
+                    heard = transcribe(tmp, text)
+                    wer = word_error_rate(text, heard)
+                    rec.update(transcript=heard, wer=round(wer, 3))
+                    if wer > max_wer:
+                        reason = "transcript"
+                        tmp.unlink()
+                    else:
+                        wav_path = wavs / f"{cid}.wav"
+                        tmp.replace(wav_path)
+                rec["reason"] = reason
+                attempts.append(rec)
+                audio_done += seconds
+                note(f"{cid} try {attempt + 1}: {'kept' if reason is None else 'drop ' + reason}"
+                     f" {seconds:.1f}s gen {took:.1f}s"
+                     + (f" wer {rec['wer']:.2f} heard {rec['transcript']!r}" if "wer" in rec else "")
+                     + f" | {text}")
+                if reason is None:
+                    break
+            final = {"id": cid, "text": text, "status": "kept" if wav_path else "dropped",
+                     "reason": attempts[-1]["reason"], "seconds": attempts[-1]["seconds"],
+                     "attempts": attempts}
+            results[cid] = final
+            resf.write(json.dumps(final) + "\n")
+            resf.flush()
+            if n_done % 10 == 0 or n_done == len(todo):
+                elapsed = time.perf_counter() - t_start
+                kept = sum(r["status"] == "kept" for r in results.values())
+                eta = elapsed / n_done * (len(todo) - n_done)
+                note(f"progress {n_done}/{len(todo)} this run; kept {kept} total; "
+                     f"elapsed {elapsed / 60:.1f} min; eta {eta / 60:.1f} min")
+                write_metadata(out, _kept_rows(lines, results), work_root)
+    summary = summarize(lines, results, out, work_root)
+    note(f"done: {json.dumps(summary)}")
+    logf.close()
+    return summary
+
+
+def _kept_rows(lines, results):
+    rows = []
+    for i, text in enumerate(lines):
+        r = results.get(clip_id(i))
+        if r and r["text"] == text and r["status"] == "kept":
+            rows.append((clip_id(i), text))
+    return rows
+
+
+def summarize(lines, results, out, work_root=None):
+    current = [results[clip_id(i)] for i, t in enumerate(lines)
+               if clip_id(i) in results and results[clip_id(i)]["text"] == t]
+    kept = [r for r in current if r["status"] == "kept"]
+    dropped = {}
+    for r in current:
+        if r["status"] == "dropped":
+            dropped[r["reason"]] = dropped.get(r["reason"], 0) + 1
+    n_rows = write_metadata(out, _kept_rows(lines, results), work_root)
+    summary = {"lines": len(lines), "finished": len(current), "kept": n_rows,
+               "dropped": dropped,
+               "retries": sum(len(r["attempts"]) - 1 for r in current),
+               "hours": round(sum(r["seconds"] for r in kept) / 3600, 3),
+               "sample_rate": OUT_RATE, "max_wer": MAX_WER,
+               "exaggeration": EXAGGERATION, "cfg_weight": CFG_WEIGHT}
+    guard_output(Path(out) / "summary.json", work_root).write_text(json.dumps(summary, indent=1) + "\n")
+    return summary
+
+
 def run_dataset(args):
-    # TODO(U3 second half): script-lines.txt -> render_line -> write_wav ->
-    # mlx-whisper round trip (word_match threshold, drop and count) ->
-    # voice-work/dataset/wavs/*.wav + metadata.csv (`id|text`, no pipes in text).
-    raise SystemExit("--dataset is not built yet (plan U3, second half)")
+    out = guard_output(args.out or DATASET_DIR)
+    lines = load_script_lines(args.lines)
+    if args.limit:
+        lines = lines[: args.limit]
+    if not args.reference.exists():
+        raise SystemExit(f"missing reference {args.reference}; run prepare-clips.py (U2)")
+    t0 = time.perf_counter()
+    backend = make_backend(args.backend, args.reference, args.exaggeration, args.cfg_weight)
+    print(f"{backend.name} loaded on {backend.device} in {time.perf_counter() - t0:.1f} s "
+          f"(exaggeration {args.exaggeration}, cfg_weight {args.cfg_weight})", flush=True)
+    summary = build_dataset(backend, transcribe_file, lines, out)
+    print(json.dumps(summary, indent=1))
+    return 0
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--samples", action="store_true", help="render the sample lines")
-    mode.add_argument("--dataset", action="store_true", help="(not built yet)")
+    mode.add_argument("--dataset", action="store_true", help="build voice-work/dataset (resumable)")
     ap.add_argument("--backend", choices=["chatterbox", "f5"], default="chatterbox")
     ap.add_argument("--reference", type=Path, default=REFERENCE)
-    ap.add_argument("--exaggeration", type=float, default=0.5,
+    ap.add_argument("--exaggeration", type=float, default=EXAGGERATION,
                     help="Chatterbox emotional intensity (0.5 neutral, higher = more excitable)")
-    ap.add_argument("--cfg-weight", type=float, default=0.5,
+    ap.add_argument("--cfg-weight", type=float, default=CFG_WEIGHT,
                     help="Chatterbox pacing guidance (lower = faster, livelier delivery)")
-    ap.add_argument("--out", type=Path, default=SAMPLES_DIR)
+    ap.add_argument("--out", type=Path, default=None,
+                    help="output directory (default voice-work/samples or voice-work/dataset)")
+    ap.add_argument("--lines", type=Path, default=SCRIPT_LINES, help="script lines for --dataset")
     ap.add_argument("--limit", type=int, default=None, help="render only the first N lines")
     ap.add_argument("--transcribe", action="store_true",
                     help="re-transcribe the samples with mlx-whisper afterwards")
     args = ap.parse_args(argv)
     if args.dataset:
-        run_dataset(args)
-    out = guard_output(args.out)
+        return run_dataset(args)
+    out = guard_output(args.out or SAMPLES_DIR)
     if not args.reference.exists():
         raise SystemExit(f"missing reference {args.reference}; run prepare-clips.py (U2)")
     t0 = time.perf_counter()
