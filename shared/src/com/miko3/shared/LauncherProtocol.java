@@ -13,6 +13,10 @@ public final class LauncherProtocol {
     /** Intent action a mode app binds to reach the launcher's DriveLeaseService. */
     public static final String DRIVE_LEASE_ACTION = "com.miko3.launcher.DRIVE_LEASE";
 
+    /** Intent action a mode app binds to reach the launcher's RobotSettingsService
+     * (settings plan U5). Modes go through RobotSettingsClient, not this directly. */
+    public static final String ROBOT_SETTINGS_ACTION = "com.miko3.launcher.ROBOT_SETTINGS";
+
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 
     /** Boolean extra on a launch Intent the launcher sends a mode's Activity, asking

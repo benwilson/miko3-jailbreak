@@ -43,5 +43,14 @@
                 <action android:name="com.miko3.launcher.DRIVE_LEASE"/>
             </intent-filter>
         </service>
+
+        <!-- Claude API settings for modes (settings plan U5, KTD1). Exported with
+             no permission because every APK has its own signing key; the service
+             itself checks each caller's package and pinned certificate. -->
+        <service android:name=".RobotSettingsService" android:exported="true">
+            <intent-filter>
+                <action android:name="com.miko3.launcher.ROBOT_SETTINGS"/>
+            </intent-filter>
+        </service>
     </application>
 </manifest>
