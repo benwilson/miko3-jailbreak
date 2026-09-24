@@ -50,7 +50,7 @@ public class LauncherApp extends Application {
     // ModeApp.PORT/HTTPS_PORT). No handoff logic needed anymore — this server
     // just runs for the launcher process's whole lifetime.
     static final int PORT = 8080;
-    static final int HTTPS_PORT = 8443;
+    static final int HTTPS_PORT = LauncherProtocol.LAUNCHER_HTTPS_PORT;
 
     // Bound for each loopback presence probe (connect and read each). A live
     // mode answers in a few ms; a dead one refuses at once. Only a wedged
@@ -192,7 +192,8 @@ public class LauncherApp extends Application {
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 int battery = DeviceInfo.batteryPercent(LauncherApp.this);
                 String batteryStr = battery < 0 ? "unknown" : (battery + "%");
-                res.sendText(200, "OK", "text/plain; charset=utf-8", batteryStr + "|" + DeviceInfo.uptime());
+                res.sendText(200, "OK", "text/plain; charset=utf-8",
+                        batteryStr + "|" + DeviceInfo.uptime() + "|" + DeviceInfo.wifiIp(LauncherApp.this));
             }
         });
         server.route("/wifi/status", new RoutingHttpServer.RouteHandler() {

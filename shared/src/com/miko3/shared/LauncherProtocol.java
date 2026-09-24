@@ -49,4 +49,36 @@ public final class LauncherProtocol {
     public static final String SETTINGS_CLAUDE_MODELS_PATH = "/settings/claude/models";
     public static final String SETTINGS_CLAUDE_TEST_PATH = "/settings/claude/test";
     public static final String SETTINGS_CLAUDE_FORGET_PATH = "/settings/claude/forget";
+
+    /** The launcher's fixed HTTPS port, where the Settings page lives. */
+    public static final int LAUNCHER_HTTPS_PORT = 8443;
+
+    /**
+     * True for SETTINGS_PATH and everything under it. These carry the API key,
+     * so RoutingHttpServer serves them over TLS only: on the plain listener a
+     * GET is redirected once HTTPS is up, and anything else gets a 503 without
+     * its body being read (a redirected POST would already have sent the key
+     * in cleartext, and would lose its body anyway).
+     */
+    public static boolean isTlsOnlyPath(String path) {
+        return path != null && (path.equals(SETTINGS_PATH) || path.startsWith(SETTINGS_PATH + "/"));
+    }
+
+    /**
+     * The plain-listener refusal for a TLS-only path. Fixed text apart from the
+     * host, which comes from the request's Host header and is used only when
+     * it is a plain host name or IPv4 address.
+     */
+    public static String settingsNeedHttpsMessage(String hostHeader) {
+        String host = hostHeader == null ? "" : hostHeader;
+        int colon = host.indexOf(':');
+        if (colon >= 0) {
+            host = host.substring(0, colon);
+        }
+        if (!host.matches("[A-Za-z0-9.-]{1,253}")) {
+            host = "<robot address>";
+        }
+        return "The settings page needs HTTPS. Retry at https://" + host + ":" + LAUNCHER_HTTPS_PORT
+                + SETTINGS_PATH + "\n";
+    }
 }

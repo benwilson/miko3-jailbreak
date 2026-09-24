@@ -12,14 +12,23 @@ import java.util.Map;
  * run on the host JVM.
  */
 public final class Json {
+    /** Deepest object/array nesting parse() accepts. The parser recurses once
+     * per level, so without a cap a hostile body (an endpoint answering with
+     * thousands of '[') overflows the stack, and a StackOverflowError is an
+     * Error: it escapes callers' RuntimeException handling and kills the
+     * thread. None of our wire formats come near this. */
+    static final int MAX_DEPTH = 64;
+
     private final String s;
     private int i;
+    private int depth;
 
     private Json(String s) {
         this.s = s;
     }
 
-    /** Throws IllegalArgumentException on anything malformed. */
+    /** Throws IllegalArgumentException on anything malformed or nested more
+     * than MAX_DEPTH deep. */
     public static Object parse(String text) {
         Json p = new Json(text);
         p.ws();
@@ -122,10 +131,13 @@ public final class Json {
             throw error("unexpected end");
         }
         char c = s.charAt(i);
-        if (c == '{') {
-            return object();
-        } else if (c == '[') {
-            return array();
+        if (c == '{' || c == '[') {
+            if (++depth > MAX_DEPTH) {
+                throw error("nested too deeply");
+            }
+            Object v = c == '{' ? object() : array();
+            depth--;
+            return v;
         } else if (c == '"') {
             return string();
         } else if (s.startsWith("true", i)) {

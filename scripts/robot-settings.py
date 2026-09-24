@@ -86,6 +86,17 @@ def validate_base_url(url):
         raise SettingsError(f"!! base URL must start with https:// and name a host, got: {url}\n"
                             "   The robot never stores a non-https URL (R7). Fix --base-url or "
                             "ANTHROPIC_BASE_URL and re-run.")
+    # Userinfo could carry a password, so this message never echoes the URL.
+    if parts.username is not None or parts.password is not None:
+        raise SettingsError("!! base URL must not contain a user name or password (user@host).\n"
+                            "   The robot rejects it too. Fix --base-url or ANTHROPIC_BASE_URL and re-run.")
+    try:
+        bad_port = parts.port == 0 or parts.netloc.endswith(":")
+    except ValueError:  # non-numeric or out of range
+        bad_port = True
+    if bad_port:
+        raise SettingsError(f"!! base URL port must be a number from 1 to 65535, got: {url}\n"
+                            "   Fix --base-url or ANTHROPIC_BASE_URL and re-run.")
 
 
 def resolve_push_inputs(args):

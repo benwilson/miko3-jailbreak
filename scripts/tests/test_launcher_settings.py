@@ -30,6 +30,7 @@ HOME_PAGE = LAUNCHER / "LauncherPage.java"
 ACTIVITY = LAUNCHER / "MainActivity.java"
 PROTOCOL = SHARED_SRC / "com" / "miko3" / "shared" / "LauncherProtocol.java"
 REGISTRY = SHARED_SRC / "com" / "miko3" / "shared" / "ModeRegistry.java"
+ROUTER = SHARED_SRC / "com" / "miko3" / "shared" / "RoutingHttpServer.java"
 SETTINGS_PATHS = (
     "SETTINGS_PATH",
     "SETTINGS_CLAUDE_PATH",
@@ -96,6 +97,8 @@ class ClaudeSettingsHarnessTest(unittest.TestCase):
         "url_change_with_blank_key_rejected",
         "url_change_with_blank_key_rejected_even_without_stored_key",
         "url_change_with_new_key_succeeds",
+        "model_containing_the_new_key_rejected",
+        "model_containing_the_stored_key_rejected",
         "url_spellings_count_as_the_same_url",
         "stored_url_is_normalized",
         "http_url_rejected",
@@ -240,6 +243,39 @@ class SettingsPageSourceTest(unittest.TestCase):
         self.assertLess(body.index("isHomePageUrl"), body.index("webView.reload()"))
 
 
+class SettingsTlsOnlyWiringTest(unittest.TestCase):
+    """RoutingHttpServer needs Android, so its plain-listener refusal of settings
+    paths is checked at the source: it runs before the request body is wrapped
+    or any route is looked up, and a non-GET is never redirected."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _strip_comments(ROUTER.read_text())
+        cls.handle = cls.src[cls.src.index("private void handle(Socket client, boolean isTls)"):]
+
+    def test_plain_listener_refuses_settings_paths_before_the_body(self):
+        m = re.search(r"if\s*\(\s*!isTls\s*&&\s*LauncherProtocol\.isTlsOnlyPath\(\s*path\s*\)\s*\)\s*\{"
+                      r"[^}]*sendText\(\s*503\s*,[^}]*LauncherProtocol\.settingsNeedHttpsMessage\([^}]*"
+                      r"client\.close\(\);\s*return;", self.handle)
+        self.assertIsNotNone(m, "no 503 branch for plain-listener settings paths")
+        for later in ("bodyStream(", "new HttpRequest(", "wsRoutes.get(", "routes.get("):
+            self.assertLess(m.start(), self.handle.index(later), later)
+
+    def test_redirect_skips_non_get_settings_requests(self):
+        redirect = self.handle.index("res.redirect(")
+        guard = self.handle.rindex("if (!isTls && httpsPort > 0", 0, redirect)
+        cond = self.handle[guard:redirect]
+        self.assertIn("LauncherProtocol.PRESENCE_PATH", cond)
+        self.assertRegex(cond, r"isTlsOnlyPath\(\s*path\s*\)")
+        self.assertRegex(cond, r'"GET"\.equals\(\s*method\s*\)')
+        # The redirect comes first so a GET still reaches HTTPS once it is up.
+        self.assertLess(redirect, self.handle.index("sendText(503"))
+
+    def test_launcher_https_port_comes_from_the_protocol(self):
+        self.assertRegex(_strip_comments(APP.read_text()),
+                         r"HTTPS_PORT\s*=\s*LauncherProtocol\.LAUNCHER_HTTPS_PORT\s*;")
+
+
 class SettingsPageHarnessTest(unittest.TestCase):
     SCENARIOS = (
         "page_has_home_link_and_claude_section",
@@ -269,6 +305,8 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "status_line_is_escaped",
         "fresh_robot_flow",
         "home_page_url_check",
+        "settings_paths_are_tls_only",
+        "plain_http_settings_refusal_is_fixed_text",
     )
 
     @classmethod

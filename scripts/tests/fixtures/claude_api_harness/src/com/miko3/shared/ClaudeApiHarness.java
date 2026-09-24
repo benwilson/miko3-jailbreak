@@ -122,6 +122,16 @@ public final class ClaudeApiHarness {
                 ClaudeApi.normalizeBaseUrl("https://h.test/?a=1") == null
                         && ClaudeApi.normalizeBaseUrl("https://h.test#x") == null,
                 "a URL with a query or fragment was accepted");
+        check("normalize_rejects_userinfo_and_bad_ports",
+                ClaudeApi.normalizeBaseUrl("https://h.test@evil.test") == null
+                        && ClaudeApi.normalizeBaseUrl("https://user:pw@h.test") == null
+                        && ClaudeApi.normalizeBaseUrl("https://h.test:abc") == null
+                        && ClaudeApi.normalizeBaseUrl("https://h.test:123456") == null
+                        && ClaudeApi.normalizeBaseUrl("https://h.test:65536") == null
+                        && ClaudeApi.normalizeBaseUrl("https://h.test:0") == null
+                        && "https://h.test:8443".equals(ClaudeApi.normalizeBaseUrl("https://h.test:8443")),
+                "userinfo or a bad port was accepted, or a good port rejected: "
+                        + ClaudeApi.normalizeBaseUrl("https://h.test:8443"));
     }
 
     private static void listing() {
@@ -163,6 +173,25 @@ public final class ClaudeApiHarness {
         r = new ClaudeApi(html).listModels(BASE, KEY);
         check("list_200_not_json_is_endpoint_error",
                 !r.ok() && r.reason == ClaudeApi.Reason.ENDPOINT_ERROR, describe(r));
+
+        FakeTransport echo = new FakeTransport().reply(200, "{\"data\":[{\"id\":\"m-a\"},{\"id\":\"" + KEY
+                + "\"},{\"id\":\"x-" + KEY + "-y\"},{\"id\":\"m-b\"}],\"has_more\":false}");
+        r = new ClaudeApi(echo).listModels(BASE, KEY);
+        check("list_drops_ids_that_echo_the_key",
+                r.ok() && r.models.equals(Arrays.asList("m-a", "m-b")), describe(r).replace(KEY, "<KEY>"));
+
+        StringBuilder deep = new StringBuilder("{\"data\":");
+        for (int k = 0; k < 10000; k++) {
+            deep.append('[');
+        }
+        FakeTransport nested = new FakeTransport().reply(200, deep.toString());
+        try {
+            r = new ClaudeApi(nested).listModels(BASE, KEY);
+            check("list_deeply_nested_json_is_endpoint_error",
+                    !r.ok() && r.reason == ClaudeApi.Reason.ENDPOINT_ERROR, describe(r));
+        } catch (Throwable t) {
+            check("list_deeply_nested_json_is_endpoint_error", false, "threw " + t.getClass().getName());
+        }
 
         FakeTransport none = new FakeTransport();
         r = new ClaudeApi(none).listModels(BASE, "");

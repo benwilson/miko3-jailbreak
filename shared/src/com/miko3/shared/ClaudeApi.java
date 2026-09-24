@@ -143,9 +143,9 @@ public final class ClaudeApi {
 
     /**
      * The canonical form of a base URL, or null if it isn't usable: it must be
-     * https:// with a host, and have no whitespace, query or fragment. A
-     * trailing "/" or "/v1" (or "/v1/") is dropped, so all of those spellings
-     * compare equal (R6). Callers trim form input before calling.
+     * https:// with a host (no userinfo, any port 1-65535), and have no
+     * whitespace, query or fragment. A trailing "/" or "/v1" (or "/v1/") is
+     * dropped, so all of those spellings compare equal (R6). Callers trim form input before calling.
      */
     public static String normalizeBaseUrl(String raw) {
         if (raw == null || !raw.regionMatches(true, 0, "https://", 0, 8)) {
@@ -168,8 +168,11 @@ public final class ClaudeApi {
         if (host.isEmpty() || host.indexOf('@') >= 0) {
             return null;
         }
-        if (colon >= 0 && !authority.substring(colon + 1).matches("[0-9]{1,5}")) {
-            return null;
+        if (colon >= 0) {
+            String port = authority.substring(colon + 1);
+            if (!port.matches("[0-9]{1,5}") || Integer.parseInt(port) < 1 || Integer.parseInt(port) > 65535) {
+                return null;
+            }
         }
         return "https://" + rest;
     }
@@ -222,9 +225,12 @@ public final class ClaudeApi {
                 return Result.failure(Reason.ENDPOINT_ERROR, resp.status);
             }
             // Only data[].id is relied on; a proxy may leave out the other fields.
+            // An id that echoes the key is dropped: ids are stored, shown in the
+            // settings page and printed by scripts, and the key must never be.
             for (Object entry : (List<?>) body.get("data")) {
-                if (entry instanceof Map && ((Map<?, ?>) entry).get("id") instanceof String) {
-                    ids.add((String) ((Map<?, ?>) entry).get("id"));
+                Object id = entry instanceof Map ? ((Map<?, ?>) entry).get("id") : null;
+                if (id instanceof String && !((String) id).contains(key)) {
+                    ids.add((String) id);
                 }
             }
             Object next = body.get("last_id");

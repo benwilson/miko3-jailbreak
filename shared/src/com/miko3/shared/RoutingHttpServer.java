@@ -269,7 +269,11 @@ public final class RoutingHttpServer implements Runnable {
             // ever see this 302; it's a tiny JSON status no page loads, so it gains
             // nothing from the secure context. Keyed off the shared constant so no
             // mode needs code of its own for this.
-            if (!isTls && httpsPort > 0 && !LauncherProtocol.PRESENCE_PATH.equals(path)) {
+            //
+            // Settings paths (TLS-only, they carry the API key) redirect a GET
+            // only; any other method falls through to the 503 below.
+            if (!isTls && httpsPort > 0 && !LauncherProtocol.PRESENCE_PATH.equals(path)
+                    && (!LauncherProtocol.isTlsOnlyPath(path) || "GET".equals(method))) {
                 String host = headers.get("host");
                 if (host != null) {
                     int colon = host.indexOf(':');
@@ -278,6 +282,16 @@ public final class RoutingHttpServer implements Runnable {
                     client.close();
                     return;
                 }
+            }
+
+            // A TLS-only path that wasn't redirected above is refused outright on
+            // the plain listener, before HTTPS binds or if its certificate failed
+            // to load: its body (which may hold the key) is never read or dispatched.
+            if (!isTls && LauncherProtocol.isTlsOnlyPath(path)) {
+                res.sendText(503, "Service Unavailable", "text/plain; charset=utf-8",
+                        LauncherProtocol.settingsNeedHttpsMessage(headers.get("host")));
+                client.close();
+                return;
             }
 
             InputStream body = bodyStream(rawIn, headers);

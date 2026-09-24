@@ -138,7 +138,8 @@ final class ClaudeSettings {
     /**
      * Applies the save rules to one form submission, in order: the URL must be
      * https:// (R7), a blank key keeps the stored one (R5), and a changed URL
-     * needs a new key (R6). An empty model is allowed (R7). Nothing is stored
+     * needs a new key (R6). An empty model is allowed (R7), but never one
+     * containing the new or the stored key. Nothing is stored
      * unless every rule passes; a changed URL also drops the model list, which
      * belonged to the old endpoint.
      */
@@ -153,6 +154,13 @@ final class ClaudeSettings {
             checkKey(key);
         }
         String modelId = checkModel(model);
+        String stored = storedKey();
+        if (!modelId.isEmpty() && ((!key.isEmpty() && modelId.contains(key))
+                || (!stored.isEmpty() && modelId.contains(stored)))) {
+            // Fixed text: the model is stored, shown on the page and printed by scripts.
+            throw new InvalidException("The model name can't contain the API key. Pick a model from the list "
+                    + "or type its name, for example claude-sonnet-4-5.");
+        }
         boolean urlChanged = !url.equals(ClaudeApi.normalizeBaseUrl(storedBaseUrl()));
         if (urlChanged && key.isEmpty()) {
             throw new InvalidException("Changing the base URL needs the API key entered again in the same save.");

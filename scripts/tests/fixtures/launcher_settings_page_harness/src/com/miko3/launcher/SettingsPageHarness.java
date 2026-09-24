@@ -3,6 +3,7 @@ package com.miko3.launcher;
 import com.miko3.shared.ClaudeApi;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.PageToken;
 
 import java.io.ByteArrayInputStream;
@@ -536,6 +537,44 @@ public final class SettingsPageHarness {
                         && !SettingsPage.isHomePageUrl(null)
                         && !SettingsPage.isHomePageUrl("not a url %%");
                 check(n, ok, "");
+            }
+        });
+
+        // The API key travels in settings POSTs, so RoutingHttpServer serves every
+        // settings path over TLS only and refuses it on the plain listener.
+        scenario("settings_paths_are_tls_only", new Scenario() {
+            public void run(String n) {
+                List<String> wrong = new ArrayList<String>();
+                for (String p : Arrays.asList(LauncherProtocol.SETTINGS_PATH, LauncherProtocol.SETTINGS_CLAUDE_PATH,
+                        LauncherProtocol.SETTINGS_CLAUDE_MODELS_PATH, LauncherProtocol.SETTINGS_CLAUDE_TEST_PATH,
+                        LauncherProtocol.SETTINGS_CLAUDE_FORGET_PATH, "/settings/", "/settings/anything/else")) {
+                    if (!LauncherProtocol.isTlsOnlyPath(p)) {
+                        wrong.add("plain:" + p);
+                    }
+                }
+                for (String p : Arrays.asList(LauncherProtocol.PRESENCE_PATH, "/", LauncherProtocol.LAUNCH_MODE_PATH,
+                        "/settingsx", "/drive-ws", "", null)) {
+                    if (LauncherProtocol.isTlsOnlyPath(p)) {
+                        wrong.add("tls:" + p);
+                    }
+                }
+                check(n, wrong.isEmpty(), wrong.toString());
+            }
+        });
+
+        scenario("plain_http_settings_refusal_is_fixed_text", new Scenario() {
+            public void run(String n) {
+                String named = LauncherProtocol.settingsNeedHttpsMessage("192.168.1.50:8080");
+                String bare = LauncherProtocol.settingsNeedHttpsMessage("robot.local");
+                String hostile = LauncherProtocol.settingsNeedHttpsMessage("<script>x</script>");
+                String none = LauncherProtocol.settingsNeedHttpsMessage(null);
+                boolean ok = named.contains("https://192.168.1.50:" + LauncherProtocol.LAUNCHER_HTTPS_PORT + "/settings")
+                        && LauncherProtocol.LAUNCHER_HTTPS_PORT == 8443
+                        && named.toLowerCase().contains("https")
+                        && bare.contains("https://robot.local:8443/settings")
+                        && !hostile.contains("script") && hostile.contains("https://<robot address>:")
+                        && hostile.contains(":8443/settings") && none.contains(":8443/settings");
+                check(n, ok, named + " | " + hostile + " | " + none);
             }
         });
 

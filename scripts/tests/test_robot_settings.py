@@ -235,6 +235,19 @@ class PushTest(SecrecyMixin, unittest.TestCase):
         self.assertNotEqual(run.code, 0)
         self.assertEqual(run.adb.calls, [])
 
+    def test_userinfo_or_bad_port_base_url_fails_before_any_adb_command(self):
+        for bad in ("https://h.test@evil.test", "https://user:pw@h.test", "https://h.test:abc",
+                    "https://h.test:123456", "https://h.test:65536", "https://h.test:0"):
+            with self.subTest(url=bad):
+                run = Run(["--base-url", bad], ALL_ENV)
+                self.assertNotEqual(run.code, 0)
+                self.assertEqual(run.adb.calls, [])
+                self.assertNotIn("pw", run.stderr)
+                self.assertKeyNeverLeaked(run)
+
+    def test_explicit_valid_port_is_accepted(self):
+        rs.validate_base_url("https://h.test:8443")
+
     def test_key_without_base_url_exits_readably_before_any_adb_command(self):
         run = Run([], {"ANTHROPIC_API_KEY": KEY, "ANTHROPIC_MODEL": MODEL})
         self.assertNotEqual(run.code, 0)

@@ -191,6 +191,33 @@ public final class ClaudeSettingsHarness {
             }
         });
 
+        // A model field holding the key would be stored, rendered and printed.
+        scenario("model_containing_the_new_key_rejected", new Scenario() {
+            public void run(String n) {
+                Fixture f = new Fixture();
+                String exact = refusal(f.settings, ClaudeSettings.DEFAULT_BASE_URL, KEY_A, KEY_A);
+                String within = refusal(f.settings, ClaudeSettings.DEFAULT_BASE_URL, KEY_A, "x/" + KEY_A + "-y");
+                check(n, exact != null && within != null && !exact.contains(KEY_A) && !within.contains(KEY_A)
+                                && !exact.contains("wxyz") && f.store.commits == 0,
+                        "refusals=" + (exact == null ? "null" : "set") + "," + (within == null ? "null" : "set")
+                                + " commits=" + f.store.commits);
+            }
+        });
+
+        scenario("model_containing_the_stored_key_rejected", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = withKey();
+                int commits = f.store.commits;
+                String why = refusal(f.settings, ClaudeSettings.DEFAULT_BASE_URL, "", KEY_A);
+                String whyNewKey = refusal(f.settings, ClaudeSettings.DEFAULT_BASE_URL, KEY_B, "m-" + KEY_A);
+                ClaudeSettings.Credentials c = f.settings.credentialsForRequests();
+                check(n, why != null && whyNewKey != null && !why.contains(KEY_A) && !whyNewKey.contains(KEY_A)
+                                && "m1".equals(c.model) && KEY_A.equals(c.apiKey) && f.store.commits == commits,
+                        "refusals=" + (why == null ? "null" : "set") + "," + (whyNewKey == null ? "null" : "set")
+                                + " model=" + (c.model.contains(KEY_A) ? "<KEY>" : c.model));
+            }
+        });
+
         // AE2: https://host, https://host/ and https://host/v1/ are one URL.
         scenario("url_spellings_count_as_the_same_url", new Scenario() {
             public void run(String n) throws Exception {
