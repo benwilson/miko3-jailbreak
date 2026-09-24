@@ -32,6 +32,7 @@ public final class ExploreBrainHarness {
                 .turnMs(500, 500)
                 .escapeTurnMs(800)
                 .corneredTurnMs(2400)
+                .escape(300, 3000, 3, 60000)
                 .lookLeadMs(500)
                 .startleMs(400)
                 .staleMs(300)
@@ -678,7 +679,8 @@ public final class ExploreBrainHarness {
 
     private static void acceptanceScenarios() {
         scenario("ae1_edge_mid_hop_startles_backs_off_and_turns_away", n -> {
-            Rig rig = new Rig(tuning().build(), t -> t < 1600 ? clear(t) : edgeAhead(t)).started();
+            // The edge is in view until the escape turn has begun (turning away clears it).
+            Rig rig = new Rig(tuning().build(), t -> t < 1600 || t >= 2600 ? clear(t) : edgeAhead(t)).started();
             rig.runUntil(3700);
             int hop = rig.first("hop", 0);
             int stop = rig.first("stop", hop);
@@ -811,22 +813,63 @@ public final class ExploreBrainHarness {
                             && rig.what(turn).equals("turn LEFT") && rig.violations.isEmpty(),
                     rig.tail());
         });
-        scenario("cornered_cap_rests_without_motion_then_turns_wider", n -> {
-            // Edge dead ahead from 1600 forever: hazard 1 mid-hop at 1600, then refusals
-            // at the ends of the next two pauses (4600, 6900) trip the cap at 6900.
+        scenario("cornered_only_after_three_failed_escapes", n -> {
+            // Edge in view from 1600 whichever way he turns: one startle, then escape
+            // sweeps (3 s each here) that never find a clear way, alternating direction;
+            // the third failure makes him rest, with no motion, then try a wider turn.
             Rig rig = new Rig(tuning().build(), t -> t < 1600 ? clear(t) : edgeAhead(t)).started();
-            rig.runUntil(7000);
+            rig.runUntil(20000);
             ExploreBrain.State resting = rig.brain.state();
             int rest = rig.first("eyes RESTING", 0);
-            rig.runUntil(40000);
-            int wider = rig.firstAfter("turn", 36900);
-            int widerStop = rig.first("stop", wider);
-            long widerMs = rig.timeOf(widerStop) - rig.timeOf(wider);
-            check(n, resting == ExploreBrain.State.CORNERED && rig.timeOf(rest) == 6900
-                            && rig.motions(6901, 36900) == 0 && rig.count("back") == 1
-                            && wider >= 0 && widerMs >= 2400 && widerMs < 2500,
-                    "state=" + resting + " rest@" + rig.timeOf(rest) + " motionsDuringRest="
-                            + rig.motions(6901, 36900) + " widerMs=" + widerMs + " " + rig.tail());
+            List<String> turns = new ArrayList<String>();
+            for (Event e : rig.log) {
+                if (e.what.startsWith("turn") && e.t < rig.timeOf(rest)) {
+                    turns.add(e.what);
+                }
+            }
+            long restAt = rig.timeOf(rest);
+            rig.runUntil(restAt + 30000 + 2000);
+            int wider = rig.firstAfter("turn", restAt + 30000);
+            check(n, resting == ExploreBrain.State.CORNERED && turns.size() == 3
+                            && !turns.get(0).equals(turns.get(1)) && !turns.get(1).equals(turns.get(2))
+                            && rig.count("startle") == 1 && rig.count("back") == 1
+                            && rig.motions(restAt + 1, restAt + 30000) == 0 && wider >= 0,
+                    "state=" + resting + " turns=" + turns + " rest@" + restAt + " " + rig.tail());
+        });
+        scenario("wall_clearing_mid_escape_ends_it_without_resting", n -> {
+            // An obstacle ahead until the escape turn has swept a while: he keeps turning
+            // (no second startle) until it reads clear, then pauses and drives on.
+            Rig rig = new Rig(tuning().build(), t -> t < 1600 || t >= 4000 ? clear(t) : obstacle(t)).started();
+            rig.runUntil(8000);
+            int turn = rig.firstAfter("turn", 1600);
+            int stop = rig.first("stop", turn);
+            check(n, rig.count("startle") == 1 && rig.timeOf(stop) >= 4300 && rig.timeOf(stop) < 4500
+                            && rig.firstAfter("hop", rig.timeOf(stop)) >= 0 && rig.count("eyes RESTING") == 0
+                            && rig.violations.isEmpty(),
+                    "turn@" + rig.timeOf(turn) + " stop@" + rig.timeOf(stop) + " " + rig.tail());
+        });
+        scenario("escapes_keep_one_direction_until_he_drives_off", n -> {
+            // Edge on the right (escape LEFT); then, before a leg completes, an edge on the
+            // left, which alone would say turn RIGHT: he keeps escaping LEFT.
+            Rig rig = new Rig(tuning().build(), t -> {
+                if (t >= 1600 && t < 2600) {
+                    return edgeRight(t);
+                }
+                if (t >= 4800 && t < 5800) {
+                    return edgeLeft(t);
+                }
+                return clear(t);
+            }).started();
+            rig.runUntil(8000);
+            List<String> turns = new ArrayList<String>();
+            for (Event e : rig.log) {
+                if (e.what.startsWith("turn")) {
+                    turns.add(e.what);
+                }
+            }
+            check(n, rig.count("startle") == 2 && turns.size() >= 2
+                            && turns.get(0).equals("turn LEFT") && turns.get(1).equals("turn LEFT"),
+                    "turns=" + turns + " " + rig.tail());
         });
         scenario("flapping_readings_do_not_resume_driving", n -> {
             // Solid until 500, then two readings every 500 ms (never three in a row), solid from 10000.

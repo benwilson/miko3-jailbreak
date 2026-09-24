@@ -214,6 +214,13 @@ final class ExploreBrain {
     /** Which way the post-startle turn goes, and whether the startle tripped the cap. */
     private Direction escapeDir;
     private boolean corneredAfterStartle;
+    /** The way escapes turn until he next drives off cleanly (escapeSide()); null when not escaping. */
+    private Direction escapeSide;
+    /** When the current escape turn started, and since when the way ahead has read clear (-1: not clear). */
+    private long turnStartedAt;
+    private long clearSince = -1;
+    /** Times of recent failed escapes (a full sweep with no clear way), for the cornered rest. */
+    private final ArrayDeque<Long> escapeFailures = new ArrayDeque<Long>();
     /** Side of the last hazard, so the next discretionary turn steers away from it. */
     private Direction lastHazardSide;
 
@@ -392,8 +399,12 @@ final class ExploreBrain {
                 }
                 break;
             case TURN:
+                if (escape) {
+                    escapeStep(now, hazard);
+                    break;
+                }
                 sawClearDuringTurn |= !hazard;
-                if (hazard && (!escape || sawClearDuringTurn)) {
+                if (hazard) {
                     hazardInMotion(now);
                 } else if (now >= phaseUntil) {
                     stopMotors();
@@ -411,7 +422,10 @@ final class ExploreBrain {
                     hazardInMotion(now);
                 } else if (now >= phaseUntil) {
                     stopMotors();
+                    // Driven away cleanly: whatever cornered him is behind him.
                     hazardTimes.clear();
+                    escapeFailures.clear();
+                    escapeSide = null;
                     enterPause(now, pauseMs(), false);
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
@@ -455,6 +469,7 @@ final class ExploreBrain {
                     hazardTimes.clear();
                     Direction d = lastHazardSide != null ? lastHazardSide.opposite() : randomDirection();
                     note("cool-down over, trying a wider turn " + d);
+                    escapeSide = d;
                     enterLook(now, d, true, tuning.corneredTurnMs);
                 }
                 break;
@@ -495,7 +510,7 @@ final class ExploreBrain {
             enterCornered(now);
             return;
         }
-        enterLook(now, away(h), true, tuning.escapeTurnMs);
+        enterLook(now, escapeSide(h), true, tuning.escapeTurnMs);
     }
 
     /** A hazard while moving: stop in this same event, then startle (R11). */
@@ -505,12 +520,57 @@ final class ExploreBrain {
         note("hazard while " + state + ": " + h);
         hopNext = false;
         lastHazardSide = h == null ? null : h.side;
-        escapeDir = away(h);
+        escapeDir = escapeSide(h);
         corneredAfterStartle = recordHazard(now);
         sound.playStartle();
         show(EyeState.FLINCH, null);
         state = State.STARTLE;
         phaseUntil = now + tuning.startleMs;
+    }
+
+    /**
+     * Which way to escape: away from this hazard's side for the first hazard, then
+     * the same way for every hazard until he drives off cleanly, so he doesn't
+     * swing back and forth into the same wall (owner request, docs/TODO.md).
+     */
+    private Direction escapeSide(HazardClassifier.Hazard h) {
+        if (escapeSide == null) {
+            escapeSide = away(h);
+        }
+        return escapeSide;
+    }
+
+    /**
+     * An escape turn: keep turning the same way until the way ahead has read clear
+     * for escapeClearMs (and at least the turn's own length has passed). A hazard
+     * seen again mid-turn just means "not clear yet": turning in place is how he
+     * gets out, so it doesn't startle. No clear way within escapeSweepMaxMs is a
+     * failed escape; he tries the other way, and rests only after
+     * escapeFailuresMax failures within escapeFailWindowMs.
+     */
+    private void escapeStep(long now, boolean hazard) {
+        if (hazard) {
+            clearSince = -1;
+        } else if (clearSince < 0) {
+            clearSince = now;
+        }
+        if (clearSince >= 0 && now - clearSince >= tuning.escapeClearMs && now >= phaseUntil) {
+            stopMotors();
+            enterPause(now, pauseMs(), false);
+        } else if (now - turnStartedAt >= tuning.escapeSweepMaxMs) {
+            stopMotors();
+            escapeFailures.addLast(now);
+            while (!escapeFailures.isEmpty() && now - escapeFailures.peekFirst() > tuning.escapeFailWindowMs) {
+                escapeFailures.pollFirst();
+            }
+            note("no clear way turning " + heading + " (" + escapeFailures.size() + " failed escapes)");
+            if (escapeFailures.size() >= tuning.escapeFailuresMax) {
+                enterCornered(now);
+                return;
+            }
+            escapeSide = heading.opposite();
+            enterLook(now, escapeSide, true, tuning.escapeTurnMs);
+        }
     }
 
     /** Records one hazard reaction; true when that trips the cornered cap (KTD8). */
@@ -915,6 +975,8 @@ final class ExploreBrain {
     private void startTurn(long now, boolean hazardInView) {
         state = State.TURN;
         sawClearDuringTurn = !hazardInView;
+        clearSince = hazardInView ? -1 : now;
+        turnStartedAt = now;
         phaseUntil = now + turnMs;
         moving = true;
         motor.turn(heading);
@@ -949,8 +1011,10 @@ final class ExploreBrain {
 
     private void enterCornered(long now) {
         stopMotors();
-        note("cornered: " + hazardTimes.size() + " hazards in " + tuning.capWindowMs + " ms, resting");
+        note("cornered: " + escapeFailures.size() + " failed escapes, " + hazardTimes.size()
+                + " hazards; resting");
         hazardTimes.clear();
+        escapeFailures.clear();
         state = State.CORNERED;
         phaseUntil = now + tuning.cooldownMs;
         show(EyeState.RESTING, null);

@@ -47,7 +47,17 @@ final class ExploreTuning {
     final long frozenTofWindowMs;
     /** Good readings in a row needed to go from unavailable back to available (KTD3). */
     final int recoveryStreak;
-    /** Cornered cap: capHazards reactions within capWindowMs, no successful hop between, rest for cooldownMs (KTD8). */
+    /**
+     * Escaping (owner request 2026-09-24, docs/TODO.md): an escape turn keeps going
+     * until the way ahead reads clear for escapeClearMs; no clear way within
+     * escapeSweepMaxMs (about a full circle) is a failed escape, and
+     * escapeFailuresMax failures within escapeFailWindowMs make him rest.
+     */
+    final long escapeClearMs;
+    final long escapeSweepMaxMs;
+    final int escapeFailuresMax;
+    final long escapeFailWindowMs;
+    /** Cornered backstop: capHazards reactions within capWindowMs, no successful hop between, rest for cooldownMs (KTD8). */
     final int capHazards;
     final long capWindowMs;
     final long cooldownMs;
@@ -125,6 +135,10 @@ final class ExploreTuning {
         turnMaxMs = Math.max(b.turnMinMs, b.turnMaxMs);
         escapeTurnMs = b.escapeTurnMs;
         corneredTurnMs = b.corneredTurnMs;
+        escapeClearMs = b.escapeClearMs;
+        escapeSweepMaxMs = Math.max(b.escapeTurnMs, b.escapeSweepMaxMs);
+        escapeFailuresMax = Math.max(1, b.escapeFailuresMax);
+        escapeFailWindowMs = b.escapeFailWindowMs;
         lookLeadMs = b.lookLeadMs;
         startleMs = b.startleMs;
         staleMs = b.staleMs;
@@ -221,6 +235,11 @@ final class ExploreTuning {
         private long turnMaxMs = 900;
         private long escapeTurnMs = 1200;
         private long corneredTurnMs = 2400;
+        private long escapeClearMs = 300;
+        // No heading feedback: 6 s of turning is assumed to be about a full circle.
+        private long escapeSweepMaxMs = 6000;
+        private int escapeFailuresMax = 3;
+        private long escapeFailWindowMs = 60000;
         private long lookLeadMs = 500;
         private long startleMs = 400;
         private long staleMs = 300;
@@ -229,7 +248,9 @@ final class ExploreTuning {
         // long mean a stuck sensor (docs/hardware/tof-sensor.md).
         private long frozenTofWindowMs = 3000;
         private int recoveryStreak = 3;
-        private int capHazards = 3;
+        // A backstop now that failed escapes decide cornering: hazards met right after
+        // clean escapes (a cluttered corner) still end in a rest eventually.
+        private int capHazards = 8;
         private long capWindowMs = 20000;
         private long cooldownMs = 30000;
         private boolean ir1IsLeft = true;
@@ -281,6 +302,13 @@ final class ExploreTuning {
         Builder turnMs(long min, long max) { turnMinMs = min; turnMaxMs = max; return this; }
         Builder escapeTurnMs(long v) { escapeTurnMs = v; return this; }
         Builder corneredTurnMs(long v) { corneredTurnMs = v; return this; }
+        Builder escape(long clearMs, long sweepMaxMs, int failuresMax, long failWindowMs) {
+            escapeClearMs = clearMs;
+            escapeSweepMaxMs = sweepMaxMs;
+            escapeFailuresMax = failuresMax;
+            escapeFailWindowMs = failWindowMs;
+            return this;
+        }
         Builder lookLeadMs(long v) { lookLeadMs = v; return this; }
         Builder startleMs(long v) { startleMs = v; return this; }
         Builder staleMs(long v) { staleMs = v; return this; }
