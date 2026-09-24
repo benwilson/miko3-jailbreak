@@ -132,6 +132,30 @@ public final class ExploreBrainHarness {
         CuriosityPort.Answer answer(Rig rig, CuriosityPort.LookRequest request, int nth);
     }
 
+    interface MatchScript {
+        CuriosityPort.MatchAnswer answer(Rig rig, int nth);
+    }
+
+    interface NameScript {
+        CuriosityPort.Named find(String transcript);
+    }
+
+    /** What the fake launcher and Claude answer in the meet flow; a null answer never comes. */
+    static final class People {
+        MatchScript match = (rig, nth) -> CuriosityPort.MatchAnswer.FAILED;
+        CuriosityPort.MatchAnswer lines = CuriosityPort.MatchAnswer.FAILED;
+        CuriosityPort.Heard heard = CuriosityPort.Heard.NOTHING;
+        long replyMs = 2000;
+        /** Like the adapter: the robot's patterns first ("my name is X", "I'm X"), then Claude. */
+        NameScript name = t -> {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(?i)^(?:my name is|i'm|i am|call me) (\\w+)$").matcher(t.trim());
+            return m.matches() ? CuriosityPort.Named.of(m.group(1)) : CuriosityPort.Named.NONE;
+        };
+        boolean nameAsksClaude;
+        CuriosityPort.Answer remembered = CuriosityPort.Answer.line("Nice to meet you! I'll remember you!");
+    }
+
     static final class Rig implements ExploreBrain.Clock, ExploreBrain.Motor, ExploreBrain.Eyes, ExploreBrain.Sound,
             ExploreBrain.Camera, CuriosityPort {
         final List<Event> log = new ArrayList<Event>();
@@ -174,6 +198,23 @@ public final class ExploreBrainHarness {
         long speechMs = 1500;
         boolean sayNeverFinishes;
         long sayingUntil = Long.MIN_VALUE;
+        /** The fake people flow (U5): scripted answers, each after claudeDelayMs (a reply after replyMs). */
+        final People people = new People();
+        final List<String> meets = new ArrayList<String>();
+        final List<Long> matchTimeouts = new ArrayList<Long>();
+        final List<String> stored = new ArrayList<String>();
+        int touches;
+        long listenMaxMs;
+        CuriosityPort.MatchAnswer pendingMatch;
+        long pendingMatchAt;
+        CuriosityPort.MatchAnswer pendingLines;
+        long pendingLinesAt;
+        CuriosityPort.Heard pendingHeard;
+        long pendingHeardAt;
+        CuriosityPort.Named pendingName;
+        long pendingNameAt;
+        CuriosityPort.Answer pendingRemembered;
+        long pendingRememberedAt;
         /** Every brain state seen, and every state seen with the camera open. */
         final java.util.Set<ExploreBrain.State> statesSeen = new java.util.TreeSet<ExploreBrain.State>();
         final java.util.Set<ExploreBrain.State> openStates = new java.util.TreeSet<ExploreBrain.State>();
@@ -396,32 +437,104 @@ public final class ExploreBrainHarness {
 
         @Override
         public void match(byte[] frameJpeg, Detection personBox, long timeoutMs) {
+            meets.add(new String(frameJpeg, java.nio.charset.StandardCharsets.US_ASCII) + " " + personBox.label);
+            matchTimeouts.add(timeoutMs);
+            pendingMatch = people.match == null ? null : people.match.answer(this, meets.size());
+            pendingMatchAt = now + claudeDelayMs;
             log.add(new Event(now, "match"));
         }
 
         @Override
         public CuriosityPort.MatchAnswer matchAnswer() {
-            return CuriosityPort.MatchAnswer.FAILED;
+            if (pendingMatch == null || now < pendingMatchAt) {
+                return null;
+            }
+            CuriosityPort.MatchAnswer a = pendingMatch;
+            pendingMatch = null;
+            log.add(new Event(now, "match " + a.status));
+            return a;
+        }
+
+        @Override
+        public void lines(long timeoutMs) {
+            pendingLines = people.lines;
+            pendingLinesAt = now + claudeDelayMs;
+            log.add(new Event(now, "lines"));
+        }
+
+        @Override
+        public CuriosityPort.MatchAnswer linesAnswer() {
+            if (pendingLines == null || now < pendingLinesAt) {
+                return null;
+            }
+            CuriosityPort.MatchAnswer a = pendingLines;
+            pendingLines = null;
+            log.add(new Event(now, "lines " + a.status));
+            return a;
         }
 
         @Override
         public void listen(long maxMs) {
+            if (!sayFinished()) {
+                violations.add(now + ":listen while still speaking");
+            }
+            listenMaxMs = maxMs;
+            pendingHeard = people.heard;
+            pendingHeardAt = now + people.replyMs;
             log.add(new Event(now, "listen"));
         }
 
         @Override
         public CuriosityPort.Heard heard() {
-            return CuriosityPort.Heard.NOTHING;
+            if (pendingHeard == null || now < pendingHeardAt) {
+                return null;
+            }
+            CuriosityPort.Heard h = pendingHeard;
+            pendingHeard = null;
+            log.add(new Event(now, "heard " + h.status));
+            return h;
+        }
+
+        @Override
+        public void findName(String transcript, long timeoutMs) {
+            pendingName = people.name == null ? null : people.name.find(transcript);
+            pendingNameAt = now + (people.nameAsksClaude ? claudeDelayMs : 0);
+            log.add(new Event(now, "find name"));
+        }
+
+        @Override
+        public CuriosityPort.Named foundName() {
+            if (pendingName == null || now < pendingNameAt) {
+                return null;
+            }
+            CuriosityPort.Named n = pendingName;
+            pendingName = null;
+            return n;
         }
 
         @Override
         public void remember(String name, long timeoutMs) {
-            log.add(new Event(now, "remember " + name));
+            stored.add(name == null ? "(unnamed)" : name);
+            pendingRemembered = people.remembered;
+            pendingRememberedAt = now + claudeDelayMs;
+            log.add(new Event(now, "remember " + (name == null ? "(unnamed)" : name)));
         }
 
         @Override
         public CuriosityPort.Answer remembered() {
-            return CuriosityPort.Answer.failed();
+            if (pendingRemembered == null || now < pendingRememberedAt) {
+                return null;
+            }
+            CuriosityPort.Answer a = pendingRemembered;
+            pendingRemembered = null;
+            log.add(new Event(now, "remembered " + a.status));
+            return a;
+        }
+
+        @Override
+        public void touch() {
+            touches++;
+            log.add(new Event(now, "touch"));
         }
 
         // ---- log queries ----
@@ -547,6 +660,8 @@ public final class ExploreBrainHarness {
         integrationScenarios();
         curiosityScenarios();
         claudeScenarios();
+        meetScenarios();
+        faceCropScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -1461,6 +1576,7 @@ public final class ExploreBrainHarness {
         return curious()
                 .scan(3, 500)
                 .ask(2, 4000)
+                .meet(4000, 6000, 2000)
                 .sayTimeoutMs(6000);
     }
 
@@ -1590,8 +1706,11 @@ public final class ExploreBrainHarness {
         });
         scenario("claude_look_request_carries_recent_picks_and_the_people_cool_down_holds", n -> {
             Rig rig = new Rig(claudeTuning().build(), CLEAR, (r, t) -> list(), true,
-                    (r, req, nth) -> pick(2, "person", CuriosityPort.Kind.PERSON, "Hi there, friend!",
-                            0.5f, 0.5f, 0.4f, 0.8f)).started();
+                    (r, req, nth) -> pick(2, "person", CuriosityPort.Kind.PERSON, "Hi!",
+                            0.5f, 0.5f, 0.4f, 0.8f));
+            // U5: a person is greeted through the match; here he knows them but has no name for them.
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known(null, "Hi {name}!", "Hi there, friend!");
+            rig.started();
             rig.runUntil(16000);
             int say = rig.first("say Hi there, friend!", 0);
             CuriosityPort.LookRequest first = rig.asks.get(0);
@@ -1659,6 +1778,337 @@ public final class ExploreBrainHarness {
             check(n, open > ask && hop > open && rig.timeOf(hop) >= rig.timeOf(ask) + 3000 && say > hop
                             && rig.violations.isEmpty(),
                     "open=" + rig.timeOf(open) + " hop=" + rig.timeOf(hop) + " " + rig.tail());
+        });
+    }
+
+    // ---- ExploreBrain: meeting and remembering people (explore on Claude plan U5, AE2, AE3, AE5) ----
+    //
+    // Claude picks a person straight ahead in look 3, so there is no orient turn:
+    // MEET starts at 5000 with the match request, which answers at 6000. A line
+    // takes speechMs (1500) to say, and a reply comes replyMs (2000) after listen().
+
+    private static final Claude PERSON_AHEAD = (rig, req, nth) ->
+            pick(2, "person", CuriosityPort.Kind.PERSON, "LOOK-LINE", 0.5f, 0.5f, 0.4f, 0.8f);
+
+    private static final CuriosityPort.MatchAnswer STRANGER =
+            CuriosityPort.MatchAnswer.stranger("Hello! What's your name?", "No worries, shy friend!");
+
+    private static Rig meetRig() {
+        return meetRig(claudeTuning());
+    }
+
+    private static Rig meetRig(ExploreTuning.Builder b) {
+        return new Rig(b.build(), CLEAR, (r, t) -> list(), true, PERSON_AHEAD);
+    }
+
+    /** Back to wandering after the stop: eyes idle at t, and not stuck in any meet state. */
+    private static boolean resumedBy(Rig rig, long from, long by) {
+        int idle = rig.firstAfter("eyes IDLE", from);
+        return idle >= 0 && rig.timeOf(idle) <= by;
+    }
+
+    private static void meetScenarios() {
+        scenario("meet_ae3_known_person_is_greeted_by_name_and_touched", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah", "Sarah! Great to see you, {name}!",
+                    "Hello again, friend!");
+            rig.started();
+            rig.runUntil(12000);
+            int match = rig.first("match", 0);
+            int say = rig.first("say ", match);
+            check(n, match >= 0 && rig.what(say).equals("say Sarah! Great to see you, Sarah!")
+                            && rig.touches == 1 && rig.countPrefix("say", 0, 12001) == 1
+                            && rig.count("listen") == 0 && rig.stored.isEmpty()
+                            && resumedBy(rig, rig.timeOf(say), rig.timeOf(say) + 1500)
+                            && rig.violations.isEmpty(),
+                    "say=" + rig.what(say) + " touches=" + rig.touches + " " + rig.tail());
+        });
+        scenario("meet_ae2_new_person_who_gives_a_name_is_stored_and_remembered", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Sarah");
+            rig.people.remembered = CuriosityPort.Answer.line("Sarah, what a lovely smile! I'll remember you!");
+            rig.started();
+            rig.runUntil(16000);
+            int ask = rig.first("say Hello! What's your name?", 0);
+            int listen = rig.first("listen", ask);
+            int remember = rig.first("remember Sarah", listen);
+            int say = rig.first("say Sarah, what a lovely smile!", remember);
+            check(n, ask >= 0 && listen > ask && rig.timeOf(listen) == rig.timeOf(ask) + 1500
+                            && rig.listenMaxMs == 6000 && remember > listen && say > remember
+                            && rig.stored.equals(java.util.Arrays.asList("Sarah"))
+                            && rig.count("say LOOK-LINE") == 0 && rig.touches == 0
+                            && resumedBy(rig, rig.timeOf(say), rig.timeOf(say) + 1500)
+                            && rig.violations.isEmpty(),
+                    "ask=" + ask + " listen=" + listen + " remember=" + remember + " say=" + say + " " + rig.tail());
+        });
+        scenario("meet_ae5_no_reply_says_the_friendly_line_and_stores_nothing", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = CuriosityPort.Heard.NOTHING;
+            rig.started();
+            rig.runUntil(14000);
+            int listen = rig.first("listen", 0);
+            int say = rig.first("say No worries, shy friend!", listen);
+            check(n, listen >= 0 && say > listen && rig.stored.isEmpty() && rig.count("find name") == 0
+                            && resumedBy(rig, rig.timeOf(say), rig.timeOf(say) + 1500)
+                            && rig.violations.isEmpty(),
+                    "say=" + say + " stored=" + rig.stored + " " + rig.tail());
+        });
+        scenario("meet_ae5_reply_without_a_name_is_stored_unnamed", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "hmm what");
+            rig.people.remembered = CuriosityPort.Answer.line("Nice to meet you! I'll remember that smile!");
+            rig.started();
+            rig.runUntil(16000);
+            int remember = rig.first("remember", 0);
+            int say = rig.first("say Nice to meet you!", remember);
+            check(n, rig.stored.equals(java.util.Arrays.asList("(unnamed)")) && say > remember
+                            && rig.violations.isEmpty(),
+                    "stored=" + rig.stored + " " + rig.tail());
+        });
+        scenario("meet_reply_without_a_pattern_waits_for_claude_to_find_the_name", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "oh hi it is priya");
+            rig.people.name = t -> CuriosityPort.Named.of("Priya");
+            rig.people.nameAsksClaude = true;
+            rig.started();
+            rig.runUntil(16000);
+            int heard = rig.first("heard WORDS", 0);
+            int find = rig.first("find name", heard);
+            int remember = rig.first("remember Priya", find);
+            check(n, find > heard && rig.timeOf(remember) == rig.timeOf(find) + 1000
+                            && rig.stored.equals(java.util.Arrays.asList("Priya")) && rig.violations.isEmpty(),
+                    "find=" + find + " remember=" + remember + " " + rig.tail());
+        });
+        scenario("meet_unsure_match_runs_the_new_person_flow", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("match", "unsure");
+            json.put("named_line", "Hi {name}!");
+            json.put("unnamed_line", "Hi again!");
+            json.put("ask_line", "Hello! What's your name?");
+            json.put("no_reply_line", "No worries, shy friend!");
+            ClaudeReplies.Match m = ClaudeReplies.match(json, 3);
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> m.reference < 0
+                    ? CuriosityPort.MatchAnswer.stranger(m.askLine, m.noReplyLine)
+                    : CuriosityPort.MatchAnswer.known("X", m.namedLine, m.unnamedLine);
+            rig.started();
+            rig.runUntil(12000);
+            check(n, m.reference == -1 && rig.count("say Hello! What's your name?") == 1
+                            && rig.count("listen") == 1 && rig.touches == 0 && rig.violations.isEmpty(),
+                    "ref=" + m.reference + " " + rig.tail());
+        });
+        scenario("meet_refused_match_asks_text_only_lines_then_the_name", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.FAILED;
+            rig.people.lines = STRANGER;
+            rig.started();
+            rig.runUntil(14000);
+            int failed = rig.first("match FAILED", 0);
+            int lines = rig.first("lines", failed);
+            int ask = rig.first("say Hello! What's your name?", lines);
+            check(n, failed >= 0 && rig.timeOf(lines) == rig.timeOf(failed) && ask > lines
+                            && rig.count("lines") == 1 && rig.first("listen", ask) > ask
+                            && rig.countPrefix("name", 0, 14001) == 0 && rig.violations.isEmpty(),
+                    "lines=" + lines + " ask=" + ask + " " + rig.tail());
+        });
+        scenario("meet_refused_match_and_failed_lines_play_the_name_clip_without_asking", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.FAILED;
+            rig.people.lines = CuriosityPort.MatchAnswer.FAILED;
+            rig.started();
+            rig.runUntil(12000);
+            int linesFailed = rig.first("lines FAILED", 0);
+            int name = rig.first("name person", linesFailed);
+            check(n, linesFailed >= 0 && rig.timeOf(name) == rig.timeOf(linesFailed)
+                            && rig.countPrefix("say", 0, 12001) == 0 && rig.count("listen") == 0
+                            && rig.count("lines") == 1 && rig.stored.isEmpty()
+                            && resumedBy(rig, rig.timeOf(name), rig.timeOf(name) + 1000)
+                            && rig.violations.isEmpty(),
+                    "name=" + name + " " + rig.tail());
+        });
+        scenario("meet_known_person_without_a_name_is_greeted_with_the_unnamed_line", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known(null, "Hi {name}!", "Hey, I remember you!");
+            rig.started();
+            rig.runUntil(12000);
+            check(n, rig.count("say Hey, I remember you!") == 1 && rig.touches == 1 && rig.count("listen") == 0
+                            && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("meet_match_reference_beyond_the_gallery_is_a_new_person", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("match", "4");
+            json.put("named_line", "Hi {name}!");
+            json.put("unnamed_line", "Hi again!");
+            json.put("ask_line", "Hello! What's your name?");
+            json.put("no_reply_line", "No worries!");
+            ClaudeReplies.Match beyond = ClaudeReplies.match(json, 3);
+            json.put("match", 2L);
+            ClaudeReplies.Match second = ClaudeReplies.match(json, 3);
+            json.put("match", "0");
+            ClaudeReplies.Match zero = ClaudeReplies.match(json, 3);
+            json.put("match", "none");
+            json.remove("ask_line");
+            ClaudeReplies.Match noAsk = ClaudeReplies.match(json, 3);
+            check(n, beyond.reference == -1 && beyond.askLine != null && second.reference == 1
+                            && zero.reference == -1 && noAsk == null,
+                    "beyond=" + beyond.reference + " second=" + second.reference + " zero=" + zero.reference
+                            + " noAsk=" + noAsk);
+        });
+        scenario("meet_listen_failure_resumes_within_the_budget", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.FAILED, null);
+            rig.started();
+            rig.runUntil(14000);
+            int failed = rig.first("heard FAILED", 0);
+            check(n, failed >= 0 && rig.stored.isEmpty() && resumedBy(rig, rig.timeOf(failed), rig.timeOf(failed))
+                            && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("meet_listen_that_never_answers_ends_at_its_deadline", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = null;
+            rig.started();
+            rig.runUntil(20000);
+            int listen = rig.first("listen", 0);
+            // 6000 ms of listening plus the 2000 ms margin.
+            check(n, listen >= 0 && resumedBy(rig, rig.timeOf(listen), rig.timeOf(listen) + 8000)
+                            && !resumedBy(rig, rig.timeOf(listen), rig.timeOf(listen) + 7990)
+                            && rig.stored.isEmpty() && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("meet_remember_failure_resumes_within_the_budget", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            rig.people.remembered = null;
+            rig.started();
+            rig.runUntil(22000);
+            int remember = rig.first("remember Sam", 0);
+            check(n, remember >= 0 && resumedBy(rig, rig.timeOf(remember), rig.timeOf(remember) + 4000)
+                            && rig.countPrefix("say", rig.timeOf(remember), 22001) == 0
+                            && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("meet_match_that_never_answers_resumes_within_the_budget", n -> {
+            Rig rig = meetRig();
+            rig.people.match = null;
+            rig.people.lines = null;
+            rig.started();
+            rig.runUntil(20000);
+            int match = rig.first("match", 0);
+            int lines = rig.first("lines", match);
+            int name = rig.first("name person", lines);
+            check(n, match >= 0 && rig.matchTimeouts.get(0) == 4000
+                            && rig.timeOf(lines) == rig.timeOf(match) + 4000
+                            && rig.timeOf(name) == rig.timeOf(lines) + 4000
+                            && resumedBy(rig, rig.timeOf(name), rig.timeOf(name) + 1000)
+                            && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("meet_match_request_never_carries_names", n -> {
+            Rig rig = meetRig(claudeTuning().peopleCooldownMs(0));
+            final List<String> notes = new ArrayList<String>();
+            rig.brain.setTrace(notes::add);
+            rig.people.match = (r, k) -> k == 1 ? STRANGER
+                    : CuriosityPort.MatchAnswer.known("Sarah", "Welcome back, {name}!", "Hi again!");
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Sarah");
+            rig.started();
+            rig.runUntil(40000);
+            boolean clean = rig.meets.size() >= 2;
+            for (String m : rig.meets) {
+                clean &= m.startsWith("jpeg@") && m.endsWith(" person") && !m.contains("Sarah");
+            }
+            boolean quiet = true;
+            for (String note : notes) {
+                quiet &= !note.contains("Sarah") && !note.contains("What's your name") && !note.contains("Welcome")
+                        && !note.contains("LOOK-LINE");
+            }
+            check(n, clean && quiet && rig.count("say Welcome back, Sarah!") >= 1 && rig.violations.isEmpty(),
+                    "meets=" + rig.meets + " quiet=" + quiet + " " + rig.tail());
+        });
+        scenario("meet_camera_stays_closed_and_eyes_think_while_matching", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            rig.started();
+            rig.runUntil(16000);
+            int match = rig.first("match", 0);
+            // The eyes last shown when the match goes out, up to its answer, are the thinking eyes.
+            String eyes = "none";
+            for (int i = 0; i < rig.log.size() && rig.log.get(i).t <= rig.timeOf(match) + 990; i++) {
+                if (rig.log.get(i).what.startsWith("eyes")) {
+                    eyes = rig.log.get(i).what;
+                }
+            }
+            java.util.Set<ExploreBrain.State> allowed = java.util.EnumSet.of(
+                    ExploreBrain.State.SCAN, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH);
+            check(n, eyes.equals("eyes THINKING") && allowed.containsAll(rig.openStates)
+                            && rig.countPrefix("camera open", rig.timeOf(match), rig.timeOf(match) + 8000) == 0
+                            && rig.violations.isEmpty(),
+                    "open in " + rig.openStates + " " + rig.tail());
+        });
+    }
+
+    // ---- FaceCrop geometry (explore on Claude plan KTD5) ----
+
+    private static void faceCropScenarios() {
+        scenario("face_crop_expands_the_face_hit_1_6x", n -> {
+            // Eyes 40 px apart at (320, 200) in a 640x480 frame: a 100 px face, 160 px after 1.6x, 10 px lower.
+            int[] sq = FaceCrop.Square.aroundFace(320f, 200f, 40f, 640, 480);
+            int[] edge = FaceCrop.Square.aroundFace(10f, 10f, 40f, 640, 480);
+            check(n, sq[2] == 160 && sq[0] == 240 && sq[1] == 130 && edge[0] == 0 && edge[1] == 0 && edge[2] == 160,
+                    java.util.Arrays.toString(sq) + " " + java.util.Arrays.toString(edge));
+        });
+        scenario("face_crop_without_a_face_uses_the_top_quarter_of_the_person", n -> {
+            // A person box from (0.25, 0.1) to (0.75, 0.9): 384 px tall, so a 96 px square at its top centre.
+            int[] sq = FaceCrop.Square.topOfPerson(new Detection("person", 1f, 0.25f, 0.1f, 0.75f, 0.9f), 640, 480);
+            check(n, sq[2] == 96 && sq[0] == 272 && sq[1] == 48, java.util.Arrays.toString(sq));
+        });
+        scenario("replies_look_reads_the_frame_box_kind_and_line", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("interesting", Boolean.TRUE);
+            json.put("frame", 3L);
+            json.put("box", java.util.Arrays.<Object>asList(320L, 120L, 640L, 360L));
+            json.put("kind", "animal");
+            json.put("label", "cat");
+            json.put("line", "What a fluffy cat!");
+            int[] w = {640, 640, 640};
+            int[] h = {480, 480, 480};
+            CuriosityPort.Answer a = ClaudeReplies.look(json, w, h);
+            json.put("frame", 4L);
+            CuriosityPort.Answer bad = ClaudeReplies.look(json, w, h);
+            json.put("interesting", Boolean.FALSE);
+            CuriosityPort.Answer nothing = ClaudeReplies.look(json, w, h);
+            check(n, a.status == CuriosityPort.Answer.Status.PICK && a.frame == 2 && a.kind == CuriosityPort.Kind.ANIMAL
+                            && Math.abs(a.box.x0 - 0.5f) < 1e-4 && Math.abs(a.box.y1 - 0.75f) < 1e-4
+                            && a.line.equals("What a fluffy cat!")
+                            && bad.status == CuriosityPort.Answer.Status.FAILED
+                            && nothing.status == CuriosityPort.Answer.Status.NOTHING,
+                    a + " " + bad + " " + nothing);
+        });
+        scenario("replies_name_keeps_one_or_two_words_and_fills_the_placeholder", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("name", "Priya");
+            CuriosityPort.Named ok = ClaudeReplies.name(json);
+            json.put("name", "");
+            CuriosityPort.Named none = ClaudeReplies.name(json);
+            json.put("name", "the person said hello there");
+            CuriosityPort.Named sentence = ClaudeReplies.name(json);
+            json.remove("name");
+            CuriosityPort.Named missing = ClaudeReplies.name(json);
+            check(n, ok.status == CuriosityPort.Named.Status.NAME && ok.name.equals("Priya")
+                            && none.status == CuriosityPort.Named.Status.NO_NAME
+                            && sentence.status == CuriosityPort.Named.Status.NO_NAME
+                            && missing.status == CuriosityPort.Named.Status.FAILED
+                            && ClaudeReplies.fill("Hi {name}!", "Sam").equals("Hi Sam!"),
+                    "ok=" + ok.status + " none=" + none.status + " sentence=" + sentence.status);
         });
     }
 }

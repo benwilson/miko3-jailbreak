@@ -146,6 +146,14 @@ final class ExploreTuning {
     final long askTimeoutMs;
     final long sayTimeoutMs;
     final int recentPicksMax;
+    /**
+     * Meeting a person (explore on Claude U5, KTD3, KTD4): the match request and
+     * each later Claude request get meetTimeoutMs; he listens for up to listenMs
+     * and waits listenMarginMs more for the launcher's answer before giving up.
+     */
+    final long meetTimeoutMs;
+    final long listenMs;
+    final long listenMarginMs;
     /** Claude's box and a detector box are the same thing at this overlap (KTD7). */
     final float pickMatchIou;
     /**
@@ -221,6 +229,9 @@ final class ExploreTuning {
         askTimeoutMs = b.askTimeoutMs;
         sayTimeoutMs = b.sayTimeoutMs;
         recentPicksMax = Math.max(0, b.recentPicksMax);
+        meetTimeoutMs = b.meetTimeoutMs;
+        listenMs = b.listenMs;
+        listenMarginMs = b.listenMarginMs;
         pickMatchIou = b.pickMatchIou;
         reopenGapMs = b.reopenGapMs;
         calibration = b.calibration;
@@ -347,6 +358,11 @@ final class ExploreTuning {
         // A few seconds of speech (R5), plus the launcher's synthesis; only a backstop.
         private long sayTimeoutMs = 15000;
         private int recentPicksMax = 8;
+        // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
+        private long meetTimeoutMs = 12000;
+        // KTD4's 6 s cap, and room for the launcher to wait out the speech queue and decode.
+        private long listenMs = 6000;
+        private long listenMarginMs = 6000;
         private float pickMatchIou = 0.3f;
         private long reopenGapMs = 3000;
         private Calibration calibration;
@@ -441,6 +457,12 @@ final class ExploreTuning {
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
         Builder recentPicksMax(int v) { recentPicksMax = v; return this; }
+        Builder meet(long timeoutMs, long listenMs, long listenMarginMs) {
+            meetTimeoutMs = timeoutMs;
+            this.listenMs = listenMs;
+            this.listenMarginMs = listenMarginMs;
+            return this;
+        }
         Builder pickMatchIou(float v) { pickMatchIou = v; return this; }
         Builder reopenGapMs(long v) { reopenGapMs = v; return this; }
         Builder calibration(Calibration v) { calibration = v; return this; }

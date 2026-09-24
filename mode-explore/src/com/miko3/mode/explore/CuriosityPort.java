@@ -40,7 +40,7 @@ interface CuriosityPort {
     /** True once the last say() has finished, been cancelled or failed; false while it is queued or playing. */
     boolean sayFinished();
 
-    // ---- people (U5 builds the flow on these; U4 only defines them) ----
+    // ---- people (U5): match, then greet, or ask the name, listen and remember ----
 
     /** Compare the person in this frame's box with the stored faces (KTD3). Never carries names. */
     void match(byte[] frameJpeg, Detection personBox, long timeoutMs);
@@ -60,6 +60,21 @@ interface CuriosityPort {
 
     /** The line to say after remember(), or null while it is running. */
     Answer remembered();
+
+    /** Mark the person the last match() found as seen now (R10). Fire and forget. */
+    void touch();
+
+    /** A text-only request for ask_line and no_reply_line, when match() failed or was refused (KTD3). */
+    void lines(long timeoutMs);
+
+    /** NEW with the two lines, FAILED, or null while it is running. */
+    MatchAnswer linesAnswer();
+
+    /** The name in a heard reply: the robot's own patterns first, then a small text-only Claude request (KTD4). */
+    void findName(String transcript, long timeoutMs);
+
+    /** What findName() found, or null while it is running. */
+    Named foundName();
 
     /** No Claude: every stop takes the path it took before U4. */
     CuriosityPort NONE = new CuriosityPort() {
@@ -103,6 +118,23 @@ interface CuriosityPort {
 
         public Answer remembered() {
             return Answer.failed();
+        }
+
+        public void touch() {
+        }
+
+        public void lines(long timeoutMs) {
+        }
+
+        public MatchAnswer linesAnswer() {
+            return MatchAnswer.FAILED;
+        }
+
+        public void findName(String transcript, long timeoutMs) {
+        }
+
+        public Named foundName() {
+            return Named.FAILED;
         }
     };
 
@@ -239,6 +271,14 @@ interface CuriosityPort {
         final String askLine;
         final String noReplyLine;
 
+        static MatchAnswer known(String nameOrNull, String namedLine, String unnamedLine) {
+            return new MatchAnswer(Status.KNOWN, nameOrNull, namedLine, unnamedLine, null, null);
+        }
+
+        static MatchAnswer stranger(String askLine, String noReplyLine) {
+            return new MatchAnswer(Status.NEW, null, null, null, askLine, noReplyLine);
+        }
+
         MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
                     String noReplyLine) {
             this.status = status;
@@ -262,6 +302,26 @@ interface CuriosityPort {
         Heard(Status status, String text) {
             this.status = status;
             this.text = text;
+        }
+    }
+
+    /** What findName() found: a name, no clear name (the person is kept unnamed, R12), or a failure. */
+    final class Named {
+        enum Status { NAME, NO_NAME, FAILED }
+
+        static final Named NONE = new Named(Status.NO_NAME, null);
+        static final Named FAILED = new Named(Status.FAILED, null);
+
+        final Status status;
+        final String name;
+
+        Named(Status status, String name) {
+            this.status = status;
+            this.name = name;
+        }
+
+        static Named of(String nameOrNull) {
+            return nameOrNull == null || nameOrNull.trim().isEmpty() ? NONE : new Named(Status.NAME, nameOrNull.trim());
         }
     }
 }

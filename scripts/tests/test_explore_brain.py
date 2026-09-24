@@ -29,7 +29,8 @@ EXPLORE_PKG = EXPLORE_SRC / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "explore_brain_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHarness.java"
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
-              "Sighting.java", "Detection.java", "CuriosityPort.java")
+              "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
+              "ExplorePrompts.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -140,6 +141,28 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "claude_scan_keeps_every_look_even_after_a_sighting",
         "claude_failed_first_try_is_retried_then_spoken",
         "claude_reopen_gap_counts_in_the_first_look_budget",
+        # Meeting and remembering people (explore on Claude plan U5, AE2, AE3, AE5)
+        "meet_ae3_known_person_is_greeted_by_name_and_touched",
+        "meet_ae2_new_person_who_gives_a_name_is_stored_and_remembered",
+        "meet_ae5_no_reply_says_the_friendly_line_and_stores_nothing",
+        "meet_ae5_reply_without_a_name_is_stored_unnamed",
+        "meet_reply_without_a_pattern_waits_for_claude_to_find_the_name",
+        "meet_unsure_match_runs_the_new_person_flow",
+        "meet_refused_match_asks_text_only_lines_then_the_name",
+        "meet_refused_match_and_failed_lines_play_the_name_clip_without_asking",
+        "meet_known_person_without_a_name_is_greeted_with_the_unnamed_line",
+        "meet_match_reference_beyond_the_gallery_is_a_new_person",
+        "meet_listen_failure_resumes_within_the_budget",
+        "meet_listen_that_never_answers_ends_at_its_deadline",
+        "meet_remember_failure_resumes_within_the_budget",
+        "meet_match_that_never_answers_resumes_within_the_budget",
+        "meet_match_request_never_carries_names",
+        "meet_camera_stays_closed_and_eyes_think_while_matching",
+        # FaceCrop geometry (KTD5) and Claude's replies (U6)
+        "face_crop_expands_the_face_hit_1_6x",
+        "face_crop_without_a_face_uses_the_top_quarter_of_the_person",
+        "replies_look_reads_the_frame_box_kind_and_line",
+        "replies_name_keeps_one_or_two_words_and_fills_the_placeholder",
     )
 
     @classmethod

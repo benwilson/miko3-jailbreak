@@ -90,6 +90,14 @@ final class ExploreLoop {
     ExploreLoop(ExploreTuning tuning, ExploreBrain.Clock clock, Wheels wheels, Sensors sensors, Lease lease,
                 ExploreBrain.Eyes eyes, ExploreBrain.Sound sound, ExploreBrain.Camera camera, Hooks hooks,
                 ExploreBrain.Trace trace, long tickMs, long stopTimerMs) {
+        this(tuning, clock, wheels, sensors, lease, eyes, sound, camera, CuriosityPort.NONE, hooks, trace,
+                tickMs, stopTimerMs);
+    }
+
+    /** With Claude at curiosity stops (explore on Claude U6): port is ModeApp's ClaudeCuriosity. */
+    ExploreLoop(ExploreTuning tuning, ExploreBrain.Clock clock, Wheels wheels, Sensors sensors, Lease lease,
+                ExploreBrain.Eyes eyes, ExploreBrain.Sound sound, ExploreBrain.Camera camera, CuriosityPort port,
+                Hooks hooks, ExploreBrain.Trace trace, long tickMs, long stopTimerMs) {
         this.clock = clock;
         this.wheels = wheels;
         this.sensors = sensors;
@@ -98,7 +106,7 @@ final class ExploreLoop {
         this.trace = trace;
         this.tickMs = tickMs;
         this.brain = new ExploreBrain(tuning, clock, new DriveGate(wheels, lease, trace), eyes, sound, camera,
-                new Random());
+                port, new Random());
         if (trace != null) {
             brain.setTrace(trace);
         }
