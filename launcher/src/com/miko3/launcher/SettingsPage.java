@@ -124,8 +124,7 @@ final class SettingsPage {
             // R9: the stored model and the last list stay as they were.
             return "Models not refreshed: " + result.describe();
         }
-        settings.saveModels(result.models);
-        int found = settings.models().size();
+        int found = settings.saveModels(result.models);
         if (found == 0) {
             return "The endpoint listed no models; type a model name instead.";
         }

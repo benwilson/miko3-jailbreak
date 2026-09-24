@@ -49,8 +49,8 @@ final class ClaudeSettings {
     /** Model ids as Anthropic, Bedrock ("...-v1:0"), Vertex ("...@date") and
      * proxies ("vendor/model") spell them. Conservative on purpose: the id goes
      * into a JSON body, an HTML attribute and a status redirect. */
-    private static final Pattern MODEL_ID = Pattern.compile("[A-Za-z0-9._:@/-]{1,128}");
     private static final int MAX_MODEL_LENGTH = 128;
+    private static final Pattern MODEL_ID = Pattern.compile("[A-Za-z0-9._:@/-]{1," + MAX_MODEL_LENGTH + "}");
     /** Below this, four characters are too much of the key to show (R4). */
     private static final int MIN_KEY_LENGTH_FOR_SUFFIX = 12;
 
@@ -215,8 +215,9 @@ final class ClaudeSettings {
     }
 
     /** Stores a Refresh result, dropping duplicates and ids this class wouldn't
-     * accept as a model, so the list is safe to render and to save back. */
-    synchronized void saveModels(List<String> ids) {
+     * accept as a model, so the list is safe to render and to save back.
+     * Returns how many ids were kept. */
+    synchronized int saveModels(List<String> ids) {
         LinkedHashSet<String> kept = new LinkedHashSet<String>();
         for (String id : ids == null ? Collections.<String>emptyList() : ids) {
             if (isModelId(id)) {
@@ -231,6 +232,7 @@ final class ClaudeSettings {
             joined.append(id);
         }
         store.putStrings(Collections.singletonMap(KEY_MODELS, joined.toString()));
+        return kept.size();
     }
 
     /** The trimmed model id, or "" for none; throws with a readable reason otherwise. */
@@ -257,12 +259,9 @@ final class ClaudeSettings {
     /** Header values are printable ASCII with no spaces (the client checks the
      * same before sending); catching it here tells the owner at save time. */
     private static void checkKey(String key) throws InvalidException {
-        for (int k = 0; k < key.length(); k++) {
-            char c = key.charAt(k);
-            if (c <= 0x20 || c >= 0x7f) {
-                throw new InvalidException("The API key contains spaces or characters a key can't have; "
-                        + "paste it again.");
-            }
+        if (!ClaudeApi.isValidKeyFormat(key)) {
+            throw new InvalidException("The API key contains spaces or characters a key can't have; "
+                    + "paste it again.");
         }
     }
 

@@ -188,9 +188,12 @@ class ServiceWiringTest(unittest.TestCase):
     def test_not_set_up_answer_when_store_is_not_set_up(self):
         # The answer rule the harness exercises (AE7) is the one the service returns.
         self.assertIn("CallerCheck.accessFor(", self.src)
-        check = _read(CALLER_CHECK)
-        self.assertIn("isSetUp()", check)
-        self.assertIn("ClaudeAccess.notSetUp()", check)
+        # accessFor defers to ClaudeAccess.setUp, which answers "not set up"
+        # when the base URL, key or model is blank.
+        self.assertIn("ClaudeAccess.setUp(", _read(CALLER_CHECK))
+        access = _read(ACCESS)
+        self.assertRegex(access, r"isBlank\(baseUrl\)\s*\|\|\s*isBlank\(apiKey\)\s*\|\|\s*isBlank\(model\)")
+        self.assertIn("return NOT_SET_UP;", access)
 
     def test_no_log_call_touches_the_key(self):
         # R14: no Log line (or anything else printing) mentions the key.

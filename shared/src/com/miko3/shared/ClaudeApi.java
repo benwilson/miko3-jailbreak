@@ -157,15 +157,9 @@ public final class ClaudeApi {
                 return null;
             }
         }
-        String rest = raw.substring(8);
-        while (rest.endsWith("/")) {
-            rest = rest.substring(0, rest.length() - 1);
-        }
+        String rest = stripTrailingSlashes(raw.substring(8));
         if (rest.endsWith("/v1")) {
-            rest = rest.substring(0, rest.length() - 3);
-        }
-        while (rest.endsWith("/")) {
-            rest = rest.substring(0, rest.length() - 1);
+            rest = stripTrailingSlashes(rest.substring(0, rest.length() - 3));
         }
         int slash = rest.indexOf('/');
         String authority = slash < 0 ? rest : rest.substring(0, slash);
@@ -180,20 +174,43 @@ public final class ClaudeApi {
         return "https://" + rest;
     }
 
+    private static String stripTrailingSlashes(String s) {
+        while (s.endsWith("/")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        return s;
+    }
+
+    /** True when the key is printable ASCII with no spaces, as a header value
+     * must be; a CR/LF would also split the header. */
+    public static boolean isValidKeyFormat(String key) {
+        if (key == null) {
+            return false;
+        }
+        for (int k = 0; k < key.length(); k++) {
+            char c = key.charAt(k);
+            if (c <= 0x20 || c >= 0x7f) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** Every model id the endpoint lists, reading all pages (KTD5). */
     public Result listModels(String baseUrl, String key) {
-        Result bad = checkSetup(baseUrl, key);
+        String base = normalizeBaseUrl(baseUrl);
+        Result bad = checkSetup(base, key);
         if (bad != null) {
             return bad;
         }
-        String base = normalizeBaseUrl(baseUrl);
+        Map<String, String> headers = headers(key, false);
         List<String> ids = new ArrayList<String>();
         String after = null;
         for (int page = 0; page < MAX_PAGES; page++) {
             String url = base + "/v1/models?limit=" + PAGE_LIMIT + (after == null ? "" : "&after_id=" + encode(after));
             Response resp;
             try {
-                resp = transport.send(new Request("GET", url, headers(key, false), null));
+                resp = transport.send(new Request("GET", url, headers, null));
             } catch (IOException e) {
                 return Result.failure(forException(e), 0);
             }
@@ -225,7 +242,8 @@ public final class ClaudeApi {
      * URL, TLS, key, billing and model in one go for almost no cost.
      */
     public Result testConnection(String baseUrl, String key, String model) {
-        Result bad = checkSetup(baseUrl, key);
+        String base = normalizeBaseUrl(baseUrl);
+        Result bad = checkSetup(base, key);
         if (bad != null) {
             return bad;
         }
@@ -244,7 +262,7 @@ public final class ClaudeApi {
         body.put("model", model);
         body.put("max_tokens", 1);
         body.put("messages", Collections.singletonList(message));
-        String url = normalizeBaseUrl(baseUrl) + "/v1/messages";
+        String url = base + "/v1/messages";
         Response resp;
         try {
             resp = transport.send(new Request("POST", url, headers(key, true), Json.write(body)));
@@ -257,20 +275,17 @@ public final class ClaudeApi {
         return Result.failure(forStatus(resp, false), resp.status);
     }
 
-    /** NOT_SET_UP, BAD_BASE_URL or BAD_KEY_FORMAT before any request is made; null if fine. */
-    private static Result checkSetup(String baseUrl, String key) {
+    /** NOT_SET_UP, BAD_BASE_URL or BAD_KEY_FORMAT before any request is made; null if fine.
+     * base is the already-normalized base URL (null if it wasn't usable). */
+    private static Result checkSetup(String base, String key) {
         if (key == null || key.isEmpty()) {
             return Result.failure(Reason.NOT_SET_UP, 0);
         }
-        if (normalizeBaseUrl(baseUrl) == null) {
+        if (base == null) {
             return Result.failure(Reason.BAD_BASE_URL, 0);
         }
-        // Header values are printable ASCII; a CR/LF would also split the header.
-        for (int k = 0; k < key.length(); k++) {
-            char c = key.charAt(k);
-            if (c <= 0x20 || c >= 0x7f) {
-                return Result.failure(Reason.BAD_KEY_FORMAT, 0);
-            }
+        if (!isValidKeyFormat(key)) {
+            return Result.failure(Reason.BAD_KEY_FORMAT, 0);
         }
         return null;
     }

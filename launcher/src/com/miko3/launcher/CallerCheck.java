@@ -85,9 +85,6 @@ final class CallerCheck {
     /** The answer for an allowed caller: the stored values, or "not set up
      * yet" before setup and after Forget key (R7, R16). */
     static ClaudeAccess accessFor(ClaudeSettings.Credentials c) {
-        if (!c.isSetUp()) {
-            return ClaudeAccess.notSetUp();
-        }
         return ClaudeAccess.setUp(c.baseUrl, c.apiKey, c.model);
     }
 }
