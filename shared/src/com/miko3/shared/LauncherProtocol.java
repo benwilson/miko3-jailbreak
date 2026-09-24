@@ -13,6 +13,10 @@ public final class LauncherProtocol {
     /** Intent action a mode app binds to reach the launcher's DriveLeaseService. */
     public static final String DRIVE_LEASE_ACTION = "com.miko3.launcher.DRIVE_LEASE";
 
+    /** Intent action a mode app binds to reach the launcher's RobotSettingsService
+     * (settings plan U5). Modes go through RobotSettingsClient, not this directly. */
+    public static final String ROBOT_SETTINGS_ACTION = "com.miko3.launcher.ROBOT_SETTINGS";
+
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 
     /** Boolean extra on a launch Intent the launcher sends a mode's Activity, asking
@@ -35,4 +39,46 @@ public final class LauncherProtocol {
      * (KTD8). RoutingHttpServer serves this path on the plain listener even once
      * HTTPS is up, so the launcher's loopback probe never sees the HTTPS redirect. */
     public static final String PRESENCE_PATH = "/presence";
+
+    /** The launcher's Settings page (settings plan U4): GET renders it. */
+    public static final String SETTINGS_PATH = "/settings";
+
+    /** Settings actions. Each takes a POST carrying the page token in its body
+     * and redirects back to SETTINGS_PATH with a status line (KTD6). */
+    public static final String SETTINGS_CLAUDE_PATH = "/settings/claude";
+    public static final String SETTINGS_CLAUDE_MODELS_PATH = "/settings/claude/models";
+    public static final String SETTINGS_CLAUDE_TEST_PATH = "/settings/claude/test";
+    public static final String SETTINGS_CLAUDE_FORGET_PATH = "/settings/claude/forget";
+
+    /** The launcher's fixed HTTPS port, where the Settings page lives. */
+    public static final int LAUNCHER_HTTPS_PORT = 8443;
+
+    /**
+     * True for SETTINGS_PATH and everything under it. These carry the API key,
+     * so RoutingHttpServer serves them over TLS only: on the plain listener a
+     * GET is redirected once HTTPS is up, and anything else gets a 503 without
+     * its body being read (a redirected POST would already have sent the key
+     * in cleartext, and would lose its body anyway).
+     */
+    public static boolean isTlsOnlyPath(String path) {
+        return path != null && (path.equals(SETTINGS_PATH) || path.startsWith(SETTINGS_PATH + "/"));
+    }
+
+    /**
+     * The plain-listener refusal for a TLS-only path. Fixed text apart from the
+     * host, which comes from the request's Host header and is used only when
+     * it is a plain host name or IPv4 address.
+     */
+    public static String settingsNeedHttpsMessage(String hostHeader) {
+        String host = hostHeader == null ? "" : hostHeader;
+        int colon = host.indexOf(':');
+        if (colon >= 0) {
+            host = host.substring(0, colon);
+        }
+        if (!host.matches("[A-Za-z0-9.-]{1,253}")) {
+            host = "<robot address>";
+        }
+        return "The settings page needs HTTPS. Retry at https://" + host + ":" + LAUNCHER_HTTPS_PORT
+                + SETTINGS_PATH + "\n";
+    }
 }

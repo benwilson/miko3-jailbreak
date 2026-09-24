@@ -5,16 +5,20 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
 import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.Log;
 
+import com.miko3.shared.ClaudeApi;
+import com.miko3.shared.ClaudeHttpsTransport;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.HttpUtil;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.ModeRegistry;
+import com.miko3.shared.PageToken;
 import com.miko3.shared.RoutingHttpServer;
 
 import java.io.IOException;
@@ -46,7 +50,7 @@ public class LauncherApp extends Application {
     // ModeApp.PORT/HTTPS_PORT). No handoff logic needed anymore — this server
     // just runs for the launcher process's whole lifetime.
     static final int PORT = 8080;
-    static final int HTTPS_PORT = 8443;
+    static final int HTTPS_PORT = LauncherProtocol.LAUNCHER_HTTPS_PORT;
 
     // Bound for each loopback presence probe (connect and read each). A live
     // mode answers in a few ms; a dead one refuses at once. Only a wedged
@@ -55,6 +59,11 @@ public class LauncherApp extends Application {
 
     private RoutingHttpServer server;
     private WifiHttpHandler wifi;
+    private ClaudeSettings claudeSettings;
+    // The Settings page's tokens (KTD6). Four, so the robot's own WebView sitting
+    // on the page doesn't expire a LAN browser's form, or the other way round.
+    private final PageToken settingsToken = new PageToken(4);
+    private final ClaudeApi claudeApi = new ClaudeApi(new ClaudeHttpsTransport());
     private volatile byte[] cssBytes;
 
     // Held only to create and keep alive DriveLeaseService, the modes' motor
@@ -74,6 +83,15 @@ public class LauncherApp extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        // Before the server starts, so no request can see it unset.
+        claudeSettings = new ClaudeSettings(
+                new PrefsStore(getSharedPreferences(ClaudeSettings.PREFS_NAME, MODE_PRIVATE)),
+                new ClaudeSettings.Clock() {
+                    @Override
+                    public long nowMillis() {
+                        return System.currentTimeMillis();
+                    }
+                });
         wifi = new WifiHttpHandler(this);
         startServer();
 
@@ -84,6 +102,12 @@ public class LauncherApp extends Application {
         // is in background" depending on device idle state at launch), but a bound
         // service has no such restriction.
         bindService(new Intent(this, DriveLeaseService.class), leaseConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    /** The robot's Claude API settings (settings plan U2), for the settings
+     * page and the settings service. */
+    ClaudeSettings claudeSettings() {
+        return claudeSettings;
     }
 
     /**
@@ -168,7 +192,8 @@ public class LauncherApp extends Application {
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
                 int battery = DeviceInfo.batteryPercent(LauncherApp.this);
                 String batteryStr = battery < 0 ? "unknown" : (battery + "%");
-                res.sendText(200, "OK", "text/plain; charset=utf-8", batteryStr + "|" + DeviceInfo.uptime());
+                res.sendText(200, "OK", "text/plain; charset=utf-8",
+                        batteryStr + "|" + DeviceInfo.uptime() + "|" + DeviceInfo.wifiIp(LauncherApp.this));
             }
         });
         server.route("/wifi/status", new RoutingHttpServer.RouteHandler() {
@@ -177,6 +202,21 @@ public class LauncherApp extends Application {
                 res.sendText(200, "OK", "text/plain; charset=utf-8", wifi.connectionStatus());
             }
         });
+        // The Settings page and its actions (settings plan U4). One handler for
+        // all of them; SettingsPage dispatches on the path. Refresh and Test call
+        // the endpoint synchronously, which is fine on the server's thread per
+        // connection.
+        RoutingHttpServer.RouteHandler settingsHandler = new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                SettingsPage.handle(req, res, settingsToken, claudeSettings, claudeApi);
+            }
+        };
+        server.route(LauncherProtocol.SETTINGS_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CLAUDE_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CLAUDE_MODELS_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CLAUDE_TEST_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CLAUDE_FORGET_PATH, settingsHandler);
         server.route(LauncherProtocol.LAUNCH_MODE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
@@ -339,6 +379,39 @@ public class LauncherApp extends Application {
             return java.net.URLEncoder.encode(s, "UTF-8");
         } catch (Exception e) {
             return s;
+        }
+    }
+
+    /** ClaudeSettings.Store over the launcher's SharedPreferences. One commit()
+     * per call, not apply(), so a save is on disk before the POST's redirect is
+     * sent, and survives a reboot or reinstall right after (R15). */
+    private static final class PrefsStore implements ClaudeSettings.Store {
+        private final SharedPreferences prefs;
+
+        PrefsStore(SharedPreferences prefs) {
+            this.prefs = prefs;
+        }
+
+        @Override
+        public String getString(String key, String def) {
+            try {
+                return prefs.getString(key, def);
+            } catch (ClassCastException e) {
+                // A hand-written non-string value (the file is reachable over root adb).
+                Log.w(TAG, "preference " + key + " is not a string; using the default");
+                return def;
+            }
+        }
+
+        @Override
+        public void putStrings(Map<String, String> entries) {
+            SharedPreferences.Editor editor = prefs.edit();
+            for (Map.Entry<String, String> e : entries.entrySet()) {
+                editor.putString(e.getKey(), e.getValue());
+            }
+            if (!editor.commit()) {
+                Log.w(TAG, "Claude settings commit failed");
+            }
         }
     }
 }

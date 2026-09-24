@@ -35,7 +35,11 @@ public class MainActivity extends Activity {
     private final BroadcastReceiver wifiReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            webView.reload();
+            // Only the home page shows Wi-Fi state (KTD9). Reloading the Settings
+            // page would wipe a half-typed key and issue a fresh page token.
+            if (SettingsPage.isHomePageUrl(webView.getUrl())) {
+                webView.reload();
+            }
         }
     };
 

@@ -1,4 +1,4 @@
-package com.miko3.mode.voice;
+package com.miko3.shared;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -6,21 +6,31 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Just enough JSON for the lane's envelopes: objects, arrays, strings,
- * numbers (integers as Long, others as Double), booleans, null. org.json is
- * Android-only and ConversationClient has to run on the host JVM.
+ * Just enough JSON for our wire formats (voice's lane envelopes, the Claude
+ * API): objects, arrays, strings, numbers (integers as Long, others as
+ * Double), booleans, null. org.json is Android-only and the callers have to
+ * run on the host JVM.
  */
-final class LaneJson {
+public final class Json {
+    /** Deepest object/array nesting parse() accepts. The parser recurses once
+     * per level, so without a cap a hostile body (an endpoint answering with
+     * thousands of '[') overflows the stack, and a StackOverflowError is an
+     * Error: it escapes callers' RuntimeException handling and kills the
+     * thread. None of our wire formats come near this. */
+    static final int MAX_DEPTH = 64;
+
     private final String s;
     private int i;
+    private int depth;
 
-    private LaneJson(String s) {
+    private Json(String s) {
         this.s = s;
     }
 
-    /** Throws IllegalArgumentException on anything malformed. */
-    static Object parse(String text) {
-        LaneJson p = new LaneJson(text);
+    /** Throws IllegalArgumentException on anything malformed or nested more
+     * than MAX_DEPTH deep. */
+    public static Object parse(String text) {
+        Json p = new Json(text);
         p.ws();
         Object v = p.value();
         p.ws();
@@ -30,7 +40,7 @@ final class LaneJson {
         return v;
     }
 
-    static String write(Object v) {
+    public static String write(Object v) {
         StringBuilder sb = new StringBuilder();
         write(sb, v);
         return sb.toString();
@@ -121,10 +131,13 @@ final class LaneJson {
             throw error("unexpected end");
         }
         char c = s.charAt(i);
-        if (c == '{') {
-            return object();
-        } else if (c == '[') {
-            return array();
+        if (c == '{' || c == '[') {
+            if (++depth > MAX_DEPTH) {
+                throw error("nested too deeply");
+            }
+            Object v = c == '{' ? object() : array();
+            depth--;
+            return v;
         } else if (c == '"') {
             return string();
         } else if (s.startsWith("true", i)) {
