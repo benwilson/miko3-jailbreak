@@ -10,12 +10,15 @@ import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.Log;
 
+import com.miko3.shared.ClaudeApi;
+import com.miko3.shared.ClaudeHttpsTransport;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.HttpUtil;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.ModeRegistry;
+import com.miko3.shared.PageToken;
 import com.miko3.shared.RoutingHttpServer;
 
 import java.io.IOException;
@@ -57,6 +60,10 @@ public class LauncherApp extends Application {
     private RoutingHttpServer server;
     private WifiHttpHandler wifi;
     private ClaudeSettings claudeSettings;
+    // The Settings page's tokens (KTD6). Four, so the robot's own WebView sitting
+    // on the page doesn't expire a LAN browser's form, or the other way round.
+    private final PageToken settingsToken = new PageToken(4);
+    private final ClaudeApi claudeApi = new ClaudeApi(new ClaudeHttpsTransport());
     private volatile byte[] cssBytes;
 
     // Held only to create and keep alive DriveLeaseService, the modes' motor
@@ -194,6 +201,21 @@ public class LauncherApp extends Application {
                 res.sendText(200, "OK", "text/plain; charset=utf-8", wifi.connectionStatus());
             }
         });
+        // The Settings page and its actions (settings plan U4). One handler for
+        // all of them; SettingsPage dispatches on the path. Refresh and Test call
+        // the endpoint synchronously, which is fine on the server's thread per
+        // connection.
+        RoutingHttpServer.RouteHandler settingsHandler = new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                SettingsPage.handle(req, res, settingsToken, claudeSettings, claudeApi);
+            }
+        };
+        server.route(LauncherProtocol.SETTINGS_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CLAUDE_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CLAUDE_MODELS_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CLAUDE_TEST_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CLAUDE_FORGET_PATH, settingsHandler);
         server.route(LauncherProtocol.LAUNCH_MODE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {

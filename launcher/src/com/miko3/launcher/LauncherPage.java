@@ -80,6 +80,9 @@ final class LauncherPage {
                     .append(running ? " (running)" : "")
                     .append("</a> ");
         }
+        // Robot-wide settings, next to the modes but not one of them (settings plan U4).
+        html.append("<a href=\"").append(LauncherProtocol.SETTINGS_PATH)
+                .append("\" role=\"button\" class=\"secondary\" id=\"settings-link\">Settings</a>");
         html.append("</section>");
 
         if (connectStatusMessage != null) {

@@ -35,4 +35,14 @@ public final class LauncherProtocol {
      * (KTD8). RoutingHttpServer serves this path on the plain listener even once
      * HTTPS is up, so the launcher's loopback probe never sees the HTTPS redirect. */
     public static final String PRESENCE_PATH = "/presence";
+
+    /** The launcher's Settings page (settings plan U4): GET renders it. */
+    public static final String SETTINGS_PATH = "/settings";
+
+    /** Settings actions. Each takes a POST carrying the page token in its body
+     * and redirects back to SETTINGS_PATH with a status line (KTD6). */
+    public static final String SETTINGS_CLAUDE_PATH = "/settings/claude";
+    public static final String SETTINGS_CLAUDE_MODELS_PATH = "/settings/claude/models";
+    public static final String SETTINGS_CLAUDE_TEST_PATH = "/settings/claude/test";
+    public static final String SETTINGS_CLAUDE_FORGET_PATH = "/settings/claude/forget";
 }
