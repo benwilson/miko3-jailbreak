@@ -98,7 +98,7 @@ This plan covers Explore's curiosity stops and people memory. The breakdown belo
 - Claude reads several images in one request and can report roughly where something is in a frame.
 - The robot's microphone works in the launcher's process, which has never recorded audio (voice mode verified the path in its own process). U7 verifies it. The microphone is ducked while the robot speaks, so he listens only after he finishes speaking.
 - sherpa-onnx, already in the launcher, also runs small English speech-recognition models. Unusual names may be misheard; Rename (R16) is the correction path.
-- Consent basis (owner's statement): people who talk to the robot have consented to having their face remembered. Faces are stored only after a reply (R12).
+- Consent basis (owner's statement): the robot is only ever around people who have consented to it, including having their face checked and remembered. Recognition on sight (Key Decisions) relies on this. Faces are still stored only after a reply (R12).
 - Owner-accepted: the Settings page is reachable by anyone on the Wi-Fi without a login, so the People section is too.
 - A curiosity stop happens every 20–40 seconds, so the Claude cost is one image request per stop, and up to three for a new person.
 
