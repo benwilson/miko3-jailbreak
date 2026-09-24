@@ -47,6 +47,8 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
     static final String TAG = "SpeechEngine";
     private static final String VOICE_ASSETS = "voice";
     private static final String STAMP = "stamp.txt";
+    /** Which voice the build staged ("stock lessac medium" or "trained"). */
+    private static final String LABEL = "label.txt";
     /** Frames per blocking write; between slices the head is checked. */
     private static final int SLICE_FRAMES = 1024;
     /** Slack past a line's own length before it is given up on. */
@@ -69,6 +71,8 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
     private long written;
     private boolean heard;
     private short[] pcm = new short[0];
+    // Set once the voice has loaded and warmed up; read by the Settings page.
+    private volatile boolean ready;
 
     SpeechEngine(Context context) {
         this.context = context.getApplicationContext();
@@ -83,6 +87,21 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
 
     SpeechQueue queue() {
         return queue;
+    }
+
+    /** True once the voice has loaded and warmed up, so a line plays soon. */
+    boolean isReady() {
+        return ready;
+    }
+
+    /** The staged voice's label from assets/voice/label.txt, or "unknown". */
+    String voiceName() {
+        try {
+            String label = readAll(context.getAssets().open(VOICE_ASSETS + "/" + LABEL)).trim();
+            return label.isEmpty() ? "unknown" : label;
+        } catch (IOException e) {
+            return "unknown";
+        }
     }
 
     /** Starts the speech thread, which loads the voice and then plays lines.
@@ -113,6 +132,7 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
             Log.i(TAG, "voice ready in " + (SystemClock.elapsedRealtime() - t0) + " ms (files "
                     + (copied - t0) + " ms): " + rate + " Hz, " + tuning + ", start buffer " + startFrames
                     + " frames, capacity " + capacityFrames + " frames");
+            ready = true;
         } catch (Throwable t) {
             Log.e(TAG, "voice failed to load; the robot cannot speak", t);
             queue.shutdown();

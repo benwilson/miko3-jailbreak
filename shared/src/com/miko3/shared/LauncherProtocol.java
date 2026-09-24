@@ -53,6 +53,8 @@ public final class LauncherProtocol {
     public static final String SETTINGS_CLAUDE_MODELS_PATH = "/settings/claude/models";
     public static final String SETTINGS_CLAUDE_TEST_PATH = "/settings/claude/test";
     public static final String SETTINGS_CLAUDE_FORGET_PATH = "/settings/claude/forget";
+    /** Voice: the robot says the typed line through the launcher's speech queue. */
+    public static final String SETTINGS_VOICE_SAY_PATH = "/settings/voice/say";
 
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;

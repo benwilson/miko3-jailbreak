@@ -80,6 +80,7 @@ PLACEHOLDER_VOICE_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/downloa
                          f"{PLACEHOLDER_VOICE}.tar.bz2")
 PLACEHOLDER_VOICE_SHA256 = "9e3febfacf0abf4270172d2958bcec246032b7e88efc2720840cc80c93de334e"
 STAMP = "stamp.txt"
+LABEL = "label.txt"
 
 
 def verified(path, sha256):
@@ -208,6 +209,8 @@ def main():
         stamp_root = Path(td)
         (stamp_root / "voice").mkdir()
         (stamp_root / "voice" / STAMP).write_text(voice_stamp(voice_dir) + "\n")
+        # What the Settings page shows as the loaded voice (outside the stamp's hash).
+        (stamp_root / "voice" / LABEL).write_text(("stock lessac medium" if placeholder else "trained") + "\n")
         bc.build_apk(
             src_dirs=[SRC, SHARED_SRC],
             manifest=MANIFEST,

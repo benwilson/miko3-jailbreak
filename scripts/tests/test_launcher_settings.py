@@ -37,6 +37,7 @@ SETTINGS_PATHS = (
     "SETTINGS_CLAUDE_MODELS_PATH",
     "SETTINGS_CLAUDE_TEST_PATH",
     "SETTINGS_CLAUDE_FORGET_PATH",
+    "SETTINGS_VOICE_SAY_PATH",
 )
 
 
@@ -190,6 +191,7 @@ class SettingsPageSourceTest(unittest.TestCase):
             "SETTINGS_CLAUDE_MODELS_PATH": "/settings/claude/models",
             "SETTINGS_CLAUDE_TEST_PATH": "/settings/claude/test",
             "SETTINGS_CLAUDE_FORGET_PATH": "/settings/claude/forget",
+            "SETTINGS_VOICE_SAY_PATH": "/settings/voice/say",
         }
         for name, path in expected.items():
             self.assertRegex(src, rf'public static final String {name} = "{re.escape(path)}";')
@@ -198,6 +200,9 @@ class SettingsPageSourceTest(unittest.TestCase):
         for name in SETTINGS_PATHS:
             self.assertRegex(self.app, rf"server\.route\(\s*LauncherProtocol\.{name}\s*,")
         self.assertIn("SettingsPage.handle(", self.app)
+        # The page speaks in-process, through the engine's own queue.
+        self.assertRegex(self.app, r"implements\s+SettingsPage\.Speaker")
+        self.assertIn("speech.queue().speak(", self.app)
         self.assertRegex(self.app, r"new\s+PageToken\(\s*4\s*\)")
         self.assertRegex(self.app, r"new\s+ClaudeApi\(\s*new\s+ClaudeHttpsTransport\(\s*\)\s*\)")
 
@@ -307,6 +312,15 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "home_page_url_check",
         "settings_paths_are_tls_only",
         "plain_http_settings_refusal_is_fixed_text",
+        "voice_section_shows_say_form_and_voice_name",
+        "say_without_token_rejected",
+        "say_with_stale_token_rejected",
+        "say_empty_text_refused",
+        "say_too_long_text_refused",
+        "say_while_voice_loading_refused",
+        "say_speaks_and_redirects",
+        "say_status_never_echoes_text",
+        "get_on_say_path_refused",
     )
 
     @classmethod

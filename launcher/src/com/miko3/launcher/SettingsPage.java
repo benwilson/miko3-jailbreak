@@ -23,9 +23,11 @@ import java.util.Map;
 /**
  * The robot's Settings page at LauncherProtocol.SETTINGS_PATH (settings plan
  * U4, R1-R10, R16): a Home link, then one section per group of settings. v1
- * has only the Claude API section: a Save form (base URL, key, model) and
+ * has the Claude API section: a Save form (base URL, key, model) and
  * three token-only buttons (Refresh models, Test connection, Forget key)
- * that act on what is already saved. The same page serves the robot's own
+ * that act on what is already saved. Then the Voice section: type a line,
+ * press Say it, and the robot speaks it through the launcher's own speech
+ * queue (the request returns once it is queued, not once it has played). The same page serves the robot's own
  * WebView and a LAN browser.
  *
  * Follows voice mode's SettingsPage pattern: every action is a POST that
@@ -53,16 +55,37 @@ final class SettingsPage {
     // read into memory whole.
     static final int MAX_FORM_BYTES = 8192;
 
+    static final String SAY_EMPTY = "Nothing said: type something to say.";
+    static final String SAY_TOO_LONG = "Nothing said: that is longer than " + SpeechQueue.MAX_CHARS + " characters.";
+    static final String SAY_LOADING = "The voice is still loading; try again in a few seconds.";
+    static final String SAY_SPEAKING = "Speaking.";
+
+    /**
+     * The robot's voice, as the Voice section sees it. LauncherApp backs it
+     * with SpeechEngine's queue in-process; the host harness fakes it.
+     */
+    interface Speaker {
+        /** True once the voice has loaded and warmed up. */
+        boolean ready();
+
+        /** Which voice the build staged, e.g. "stock lessac medium" or "trained". */
+        String voiceName();
+
+        /** Queues text and returns at once, without waiting for playback.
+         * Throws IllegalArgumentException (SpeechQueue's fixed reasons) when refused. */
+        void say(String text);
+    }
+
     /** Every settings route. GET the page; POST an action with the page token. */
     static void handle(HttpRequest req, HttpResponse res, PageToken token, ClaudeSettings settings,
-                       ClaudeApi api) throws IOException {
+                       ClaudeApi api, Speaker speaker) throws IOException {
         if (LauncherProtocol.SETTINGS_PATH.equals(req.path)) {
             if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
                 res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
                 return;
             }
             res.sendText(200, "OK", "text/html; charset=utf-8", buildHtml(token.issue(), settings.status(),
-                    settings.models(), req.queryParam("status", null)));
+                    settings.models(), speaker.voiceName(), req.queryParam("status", null)));
             return;
         }
         // The action paths never act on a GET, so nothing in a URL (which the
@@ -71,13 +94,13 @@ final class SettingsPage {
             res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "POST only");
             return;
         }
-        String status = act(req.path, readForm(req), token, settings, api);
+        String status = act(req.path, readForm(req), token, settings, api, speaker);
         res.redirect(LauncherProtocol.SETTINGS_PATH + "?status=" + urlEncode(status));
     }
 
     /** Runs one action; returns the status line to show. */
     static String act(String path, Map<String, String> form, PageToken token, ClaudeSettings settings,
-                      ClaudeApi api) {
+                      ClaudeApi api, Speaker speaker) {
         if (form == null) {
             return "Nothing changed: the form was too large.";
         }
@@ -96,6 +119,9 @@ final class SettingsPage {
         if (LauncherProtocol.SETTINGS_CLAUDE_FORGET_PATH.equals(path)) {
             settings.forgetKey();
             return "Key forgotten. No key is set.";
+        }
+        if (LauncherProtocol.SETTINGS_VOICE_SAY_PATH.equals(path)) {
+            return say(form.get("text"), speaker);
         }
         return "Nothing changed: unknown action.";
     }
@@ -141,7 +167,29 @@ final class SettingsPage {
         return "Connection works: " + c.model + " answered.";
     }
 
-    static String buildHtml(String token, ClaudeSettings.Status st, List<String> models, String status) {
+    /** Queues the typed line. Every return is fixed text: never the line itself. */
+    private static String say(String text, Speaker speaker) {
+        if (text == null || text.trim().isEmpty()) {
+            return SAY_EMPTY;
+        }
+        if (text.length() > SpeechQueue.MAX_CHARS) {
+            return SAY_TOO_LONG;
+        }
+        if (!speaker.ready()) {
+            return SAY_LOADING;
+        }
+        try {
+            speaker.say(text);
+        } catch (IllegalArgumentException e) {
+            // The queue shut down (the voice failed to load) or refused the line.
+            return SpeechQueue.REFUSE_UNAVAILABLE.equals(e.getMessage())
+                    ? "Nothing said: the robot's voice is not available." : SAY_EMPTY;
+        }
+        return SAY_SPEAKING;
+    }
+
+    static String buildHtml(String token, ClaudeSettings.Status st, List<String> models, String voiceName,
+                            String status) {
         String t = escapeHtml(token);
         StringBuilder html = new StringBuilder();
         html.append("<!doctype html><html><head><meta charset=\"utf-8\">");
@@ -198,6 +246,19 @@ final class SettingsPage {
         tokenForm(html, t, LauncherProtocol.SETTINGS_CLAUDE_TEST_PATH, "Test connection", "secondary");
         tokenForm(html, t, LauncherProtocol.SETTINGS_CLAUDE_FORGET_PATH, "Forget key", "contrast");
         html.append("</div>");
+        html.append("</section>");
+
+        html.append("<section id=\"voice\"><h2>Voice</h2>");
+        html.append("<p id=\"voice-name\">Voice: ").append(escapeHtml(voiceName)).append("</p>");
+        html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_VOICE_SAY_PATH)
+                .append("\">");
+        html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+        html.append("<label for=\"say-text\">Something to say");
+        html.append("<input type=\"text\" id=\"say-text\" name=\"text\" maxlength=\"")
+                .append(SpeechQueue.MAX_CHARS).append("\" autocomplete=\"off\">");
+        html.append("<small>The robot says it out loud.</small></label>");
+        html.append("<button type=\"submit\">Say it</button>");
+        html.append("</form>");
         html.append("</section>");
 
         html.append("</main></body></html>");

@@ -67,6 +67,44 @@ public class LauncherApp extends Application {
     private final ClaudeApi claudeApi = new ClaudeApi(new ClaudeHttpsTransport());
     private volatile byte[] cssBytes;
 
+    // The Settings page's Voice section speaks in-process, straight into the
+    // engine's queue (no binding to our own SpeechService). Its lines are owned
+    // by this object, so a mode's cancel() never drops them.
+    private final SettingsPage.Speaker settingsSpeaker = new SettingsSpeaker();
+
+    private final class SettingsSpeaker implements SettingsPage.Speaker {
+        private volatile String voiceName;
+
+        @Override
+        public boolean ready() {
+            return speech.isReady();
+        }
+
+        @Override
+        public String voiceName() {
+            String name = voiceName;
+            if (name == null) {
+                name = speech.voiceName();
+                voiceName = name;
+            }
+            return name;
+        }
+
+        @Override
+        public void say(String text) {
+            long id = speech.queue().speak(this, text, new SpeechQueue.Listener() {
+                @Override
+                public void finished() {
+                }
+
+                @Override
+                public void cancelled() {
+                }
+            });
+            Log.i(TAG, "settings page queued line " + id);
+        }
+    }
+
     // Held only to create and keep alive DriveLeaseService, the modes' motor
     // arbiter (R3/KTD3). The launcher never queries the holder: which mode is
     // running comes from presence (KTD8), since the voice mode never takes the
@@ -219,7 +257,7 @@ public class LauncherApp extends Application {
         RoutingHttpServer.RouteHandler settingsHandler = new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                SettingsPage.handle(req, res, settingsToken, claudeSettings, claudeApi);
+                SettingsPage.handle(req, res, settingsToken, claudeSettings, claudeApi, settingsSpeaker);
             }
         };
         server.route(LauncherProtocol.SETTINGS_PATH, settingsHandler);
@@ -227,6 +265,7 @@ public class LauncherApp extends Application {
         server.route(LauncherProtocol.SETTINGS_CLAUDE_MODELS_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_CLAUDE_TEST_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_CLAUDE_FORGET_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_VOICE_SAY_PATH, settingsHandler);
         server.route(LauncherProtocol.LAUNCH_MODE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
