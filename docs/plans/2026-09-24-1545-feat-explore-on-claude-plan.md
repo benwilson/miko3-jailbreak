@@ -33,7 +33,7 @@ Explore's curiosity stops today recognize only 341 fixed object names with an on
 - **Claude picks the target and writes the words; the on-robot detector only steers.** (session-settled: user-directed — chosen over the detector picking the target with Claude only commenting, and over Claude steering every correction: Claude should do the choosing, and steering must stay fast.) Governs R1, R2, R3, R4.
 - **Every line he says is written by Claude; nothing he says in a curiosity reaction is canned.** (session-settled: user-directed — decided by the owner at scope confirmation.) Governs R5, R6, R11.
 - **A slow or failed Claude call is retried before falling back.** (session-settled: user-directed — the owner asked that he prompt Claude again rather than give up; the retry limit is this plan's choice.) Governs R7, R8.
-- **People are remembered across days by face, kept until the owner forgets them.** (session-settled: user-directed — chosen over session-only text memory, no people memory, and automatic expiry.) Governs R9, R10, R13, R14.
+- **People are remembered across days by face, kept until the owner forgets them, and only once they reply.** (session-settled: user-directed — chosen over session-only text memory, no people memory, and automatic expiry; and over storing faces of people who don't answer.) Governs R9, R10, R12, R13, R14.
 - **A new person is asked their name, heard with on-robot speech recognition.** (session-settled: user-directed — chosen over sending the reply to the Linux host and over asking without listening.) Governs R11, R12.
 - **Explore goes on Claude before Voice mode.** (session-settled: user-directed — chosen over Voice first.)
 
@@ -58,7 +58,7 @@ Explore's curiosity stops today recognize only 341 fixed object names with an on
 - R9. When the chosen thing is a person, he compares their face with the people he has already met and learns whether this is someone known, and their name if one is stored.
 - R10. A known person is greeted by name in a Claude-written line that shows he remembers them; an unnamed known person is greeted as someone he has seen before.
 - R11. A new person is asked their name in a Claude-written line. After he finishes speaking he listens for a few seconds, hears the reply with on-robot speech recognition, and stores the name. A second Claude request, given the name and the person's photo, writes a personal line about them that tells them he will remember them.
-- R12. If he hears no clear name, he still remembers the face as an unnamed person and says a Claude-written line that he will remember them.
+- R12. A face is stored only once the person answers (a name or any reply he can hear): talking to the robot is the consent to be remembered. If he hears no reply, he says a friendly Claude-written line and does not keep their face. If he hears a reply but no clear name, he keeps the face as an unnamed person, whom the owner can name on the Settings page.
 - R13. Face images stay on the robot and are kept until the owner forgets that person. They leave the robot only inside requests to the configured Claude endpoint.
 - R14. Each face comparison includes at most a fixed number of stored faces, most recently seen first, so requests stay bounded as he meets more people.
 
@@ -73,7 +73,7 @@ Explore's curiosity stops today recognize only 341 fixed object names with an on
 - AE2. **Covers R9, R11.** Given a person he has never seen, when he reacts, then he asks their name, listens after he finishes speaking, stores "Sarah" with her face, and says a Claude-written line using "Sarah" that tells her he'll remember her.
 - AE3. **Covers R10.** Given Sarah was stored yesterday, when he sees her today, then he greets her by name.
 - AE4. **Covers R7, R8.** Given the Claude endpoint is unreachable, when a curiosity stop happens, then he shows his thinking eyes, tries twice, and then reacts with the detector's pick and its name clip, all within about 20 seconds.
-- AE5. **Covers R12.** Given a new person who doesn't answer, when he listens, then he stores an unnamed face and says he'll remember them; the owner can name them later on the Settings page.
+- AE5. **Covers R12.** Given a new person who doesn't answer, when he listens, then he says something friendly and stores nothing; given a person who answers with something that isn't a clear name, he stores them as unnamed for the owner to name later.
 - AE6. **Covers R16.** Given Sarah is stored, when the owner presses Forget, then her face and name are deleted, and next time he treats her as someone new.
 
 ### Scope Boundaries
@@ -97,6 +97,7 @@ This plan covers Explore's curiosity stops and people memory. The breakdown belo
 - Claude reads several images in one request and can report roughly where something is in a frame.
 - The robot's microphone works in Explore's process; voice mode verified the audio path. The microphone is ducked while the robot speaks, so he listens only after he finishes speaking.
 - sherpa-onnx, already in the launcher, also runs small English speech-recognition models. Unusual names may be misheard; Rename (R16) is the correction path.
+- Consent basis (owner's statement): people who talk to the robot have consented to having their face remembered. Faces are stored only after a reply (R12).
 - Owner-accepted: the Settings page is reachable by anyone on the Wi-Fi without a login, so the People section is too.
 - A curiosity stop happens every 20–40 seconds, so the Claude cost is one or two image requests per stop.
 
