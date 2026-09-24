@@ -40,6 +40,7 @@ public final class ExploreBrainHarness {
                 .recoveryStreak(3)
                 .cap(3, 20000, 30000)
                 .ir1IsLeft(true)
+                .reopenGapMs(0)
                 .calibration(calibration());
     }
 
@@ -122,8 +123,17 @@ public final class ExploreBrainHarness {
         List<Detection> see(Rig rig, long t);
     }
 
+    /**
+     * The scripted Claude (explore on Claude U4), shaped like Vision: the answer to
+     * the rig's nth ask() (1-based, counted over the whole run), or null for a
+     * request that never answers (the brain's own deadline ends it).
+     */
+    interface Claude {
+        CuriosityPort.Answer answer(Rig rig, CuriosityPort.LookRequest request, int nth);
+    }
+
     static final class Rig implements ExploreBrain.Clock, ExploreBrain.Motor, ExploreBrain.Eyes, ExploreBrain.Sound,
-            ExploreBrain.Camera {
+            ExploreBrain.Camera, CuriosityPort {
         final List<Event> log = new ArrayList<Event>();
         final List<Action> actions = new ArrayList<Action>();
         final List<String> violations = new ArrayList<String>();
@@ -149,17 +159,42 @@ public final class ExploreBrainHarness {
         ExploreBrain.Look latestLook;
         /** Every look was captured before the camera opened: arriving, never new enough. */
         boolean staleLooks;
+        /** Like ExploreCamera: after a close, the camera yields nothing until this gap has passed. */
+        long reopenGapMs;
+        long closedAt = Long.MIN_VALUE / 4;
+        long looksFrom;
+
+        /** The fake Claude and speech: null claude means the port can't ask (today's behavior). */
+        final Claude claude;
+        long claudeDelayMs = 1000;
+        final List<CuriosityPort.LookRequest> asks = new ArrayList<CuriosityPort.LookRequest>();
+        final List<Long> askTimeouts = new ArrayList<Long>();
+        CuriosityPort.Answer pending;
+        long pendingAt;
+        long speechMs = 1500;
+        boolean sayNeverFinishes;
+        long sayingUntil = Long.MIN_VALUE;
+        /** Every brain state seen, and every state seen with the camera open. */
+        final java.util.Set<ExploreBrain.State> statesSeen = new java.util.TreeSet<ExploreBrain.State>();
+        final java.util.Set<ExploreBrain.State> openStates = new java.util.TreeSet<ExploreBrain.State>();
 
         Rig(ExploreTuning tuning, Feed feed) {
             this(tuning, feed, null, false);
         }
 
         Rig(ExploreTuning tuning, Feed feed, Vision vision, boolean cameraAvailable) {
+            this(tuning, feed, vision, cameraAvailable, null);
+        }
+
+        Rig(ExploreTuning tuning, Feed feed, Vision vision, boolean cameraAvailable, Claude claude) {
             this.tuning = tuning;
             this.feed = feed;
             this.vision = vision;
             this.cameraAvailable = cameraAvailable;
-            this.brain = new ExploreBrain(tuning, this, this, this, this, this, new Random(1));
+            this.claude = claude;
+            this.brain = claude == null
+                    ? new ExploreBrain(tuning, this, this, this, this, this, new Random(1))
+                    : new ExploreBrain(tuning, this, this, this, this, this, this, new Random(1));
         }
 
         /** The usual start: brain up, lease granted at once. */
@@ -182,10 +217,11 @@ public final class ExploreBrainHarness {
                         a.run.run();
                     }
                 }
-                if (cameraOpen && vision != null && now % 500 == 0 && now - openedAt >= 500) {
+                if (cameraOpen && vision != null && now % 500 == 0 && now >= looksFrom) {
                     List<Detection> seen = vision.see(this, now - 200);
                     if (seen != null) {
-                        latestLook = new ExploreBrain.Look(staleLooks ? openedAt - 1000 : now - 200, seen);
+                        latestLook = new ExploreBrain.Look(staleLooks ? openedAt - 1000 : now - 200, seen,
+                                ("jpeg@" + (now - 200)).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
                     }
                 }
                 if (now % 100 == 0) {
@@ -193,11 +229,16 @@ public final class ExploreBrainHarness {
                     if (r != null) {
                         lastFed = r;
                         brain.onReading(r);
+                        statesSeen.add(brain.state());
                     }
                 }
                 brain.onTick();
                 if (cameraOpen != brain.state().curious()) {
                     violations.add(now + ":camera " + (cameraOpen ? "open" : "closed") + " in " + brain.state());
+                }
+                statesSeen.add(brain.state());
+                if (cameraOpen) {
+                    openStates.add(brain.state());
                 }
             }
         }
@@ -211,6 +252,7 @@ public final class ExploreBrainHarness {
         public void open() {
             cameraOpen = true;
             openedAt = now;
+            looksFrom = Math.max(now, closedAt + reopenGapMs) + 500;
             latestLook = null;
             log.add(new Event(now, "camera open"));
         }
@@ -218,6 +260,7 @@ public final class ExploreBrainHarness {
         @Override
         public void close() {
             cameraOpen = false;
+            closedAt = now;
             log.add(new Event(now, "camera close"));
         }
 
@@ -305,6 +348,80 @@ public final class ExploreBrainHarness {
         @Override
         public void playName(String label) {
             log.add(new Event(now, "name " + label));
+        }
+
+        // ---- the curiosity port: scripted Claude and speech ----
+
+        @Override
+        public boolean canAsk() {
+            return claude != null;
+        }
+
+        @Override
+        public void ask(CuriosityPort.LookRequest request, long timeoutMs) {
+            asks.add(request);
+            askTimeouts.add(timeoutMs);
+            pending = claude.answer(this, request, asks.size());
+            pendingAt = now + claudeDelayMs;
+            log.add(new Event(now, "ask " + request.frames.size() + " frames"));
+        }
+
+        @Override
+        public CuriosityPort.Answer answer() {
+            if (pending == null || now < pendingAt) {
+                return null;
+            }
+            CuriosityPort.Answer a = pending;
+            pending = null;
+            log.add(new Event(now, "answer " + a.status));
+            return a;
+        }
+
+        @Override
+        public void cancelAsk() {
+            pending = null;
+            log.add(new Event(now, "cancel ask"));
+        }
+
+        @Override
+        public void say(String line) {
+            sayingUntil = sayNeverFinishes ? Long.MAX_VALUE : now + speechMs;
+            log.add(new Event(now, "say " + line));
+        }
+
+        @Override
+        public boolean sayFinished() {
+            return now >= sayingUntil;
+        }
+
+        @Override
+        public void match(byte[] frameJpeg, Detection personBox, long timeoutMs) {
+            log.add(new Event(now, "match"));
+        }
+
+        @Override
+        public CuriosityPort.MatchAnswer matchAnswer() {
+            return CuriosityPort.MatchAnswer.FAILED;
+        }
+
+        @Override
+        public void listen(long maxMs) {
+            log.add(new Event(now, "listen"));
+        }
+
+        @Override
+        public CuriosityPort.Heard heard() {
+            return CuriosityPort.Heard.NOTHING;
+        }
+
+        @Override
+        public void remember(String name, long timeoutMs) {
+            log.add(new Event(now, "remember " + name));
+        }
+
+        @Override
+        public CuriosityPort.Answer remembered() {
+            return CuriosityPort.Answer.failed();
         }
 
         // ---- log queries ----
@@ -429,6 +546,7 @@ public final class ExploreBrainHarness {
         edgeScenarios();
         integrationScenarios();
         curiosityScenarios();
+        claudeScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -1328,6 +1446,219 @@ public final class ExploreBrainHarness {
             check(n, rig.timeOf(close) == 4300 && rig.count("camera open") == 1 && rig.countPrefix("hop", 4300, 12001) >= 3
                             && rig.violations.isEmpty(),
                     rig.tail());
+        });
+    }
+
+    // ---- ExploreBrain: Claude picks and speaks (explore on Claude plan U4) ----
+    //
+    // Three scan looks: the camera opens at 1300, looks arrive at 2000, 3000 and
+    // 4000 (captured 1800, 2800, 3800) with a 500 ms scan turn after each of the
+    // first two, so the look request goes out at 4000 and the fake Claude answers
+    // claudeDelayMs later. The look a frame was captured in is the number of turns
+    // before its capture time.
+
+    private static ExploreTuning.Builder claudeTuning() {
+        return curious()
+                .scan(3, 500)
+                .ask(2, 4000)
+                .sayTimeoutMs(6000);
+    }
+
+    /** Which scan look a capture at t belongs to: 0, 1, 2 during the scan; 3+ once he turns after it. */
+    private static int lookAt(Rig rig, long t) {
+        return rig.countPrefix("turn", 0, t);
+    }
+
+    private static CuriosityPort.Answer pick(int frame, String label, CuriosityPort.Kind kind, String line,
+                                             float cx, float cy, float w, float h) {
+        return CuriosityPort.Answer.pick(frame, box(label, 1f, cx, cy, w, h), kind, line);
+    }
+
+    /** A cup straight ahead in the given look (and in every look after the scan), growing as he drives. */
+    private static Vision cupIn(int look) {
+        return (rig, t) -> {
+            int at = lookAt(rig, t);
+            if (at == look || at >= 3) {
+                return list(box("cup", 0.8f, 0.5f, 0.6f, 0.2f, Math.min(1f, 0.3f + 0.15f * rig.count("hop"))));
+            }
+            return list();
+        };
+    }
+
+    private static final Claude CAT_RIGHT_IN_FRAME_3 = (rig, req, nth) ->
+            pick(2, "cat", CuriosityPort.Kind.ANIMAL, "Hello kitty, what a fluffy tail!", 0.8f, 0.5f, 0.2f, 0.3f);
+
+    private static final Claude MUG_ON_THE_CUP = (rig, req, nth) ->
+            pick(2, "mug", CuriosityPort.Kind.OTHER, "Ooh, a mug! Is that hot chocolate?", 0.52f, 0.6f, 0.22f, 0.32f);
+
+    private static void claudeScenarios() {
+        scenario("claude_ae1_turns_to_the_picked_frame_and_offset_and_speaks_without_driving", n -> {
+            // A chair on the left in look 1; the detector sees nothing in look 3, where Claude sees a cat on the right.
+            Vision room = (rig, t) -> lookAt(rig, t) == 0 ? list(box("chair", 0.8f, 0.2f, 0.6f, 0.2f, 0.4f)) : list();
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, room, true, CAT_RIGHT_IN_FRAME_3).started();
+            rig.runUntil(9000);
+            int ask = rig.first("ask", 0);
+            int thinking = rig.first("eyes THINKING", 0);
+            int lead = rig.first("eyes LOOK RIGHT", ask);
+            int turn = rig.first("turn RIGHT", lead);
+            int stop = rig.first("stop", turn);
+            int say = rig.first("say Hello kitty", stop);
+            long turnMs = rig.timeOf(stop) - rig.timeOf(turn);
+            boolean ordered = ask >= 0 && thinking >= 0 && rig.timeOf(thinking) == rig.timeOf(ask)
+                    && lead > ask && turn > lead && stop > turn && say > stop;
+            check(n, ordered && rig.timeOf(ask) == 4000 && rig.asks.get(0).frames.size() == 3
+                            // Frame 3's own heading (no heading turn) plus 0.6 x 800 ms for the right offset.
+                            && turnMs >= 470 && turnMs <= 500
+                            && rig.countPrefix("hop", 0, rig.timeOf(say) + 3000) == 0
+                            && rig.countPrefix("camera open", rig.timeOf(ask), rig.timeOf(say) + 1) == 0
+                            && rig.countPrefix("name", 0, 9001) == 0 && rig.countPrefix("react", 0, 9001) == 0
+                            && rig.violations.isEmpty(),
+                    "ask=" + ask + " lead=" + lead + " turn=" + turn + " turnMs=" + turnMs + " say=" + say + " "
+                            + rig.tail());
+        });
+        scenario("claude_pick_on_a_detector_box_of_the_same_kind_is_approached_before_speaking", n -> {
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, cupIn(2), true, MUG_ON_THE_CUP).started();
+            rig.runUntil(12000);
+            int ask = rig.first("ask", 0);
+            int open = rig.first("camera open", ask);
+            int hop = rig.first("hop", open);
+            int say = rig.first("say Ooh, a mug", hop);
+            check(n, ask >= 0 && open > ask && hop > open && say > hop
+                            && rig.timeOf(rig.firstAfter("camera close", rig.timeOf(hop))) == rig.timeOf(say)
+                            && rig.countPrefix("hop", rig.timeOf(say), rig.timeOf(say) + 1500) == 0
+                            && rig.count("name cup") == 0 && rig.countPrefix("react", 0, 12001) == 0
+                            && rig.count("startle") == 0 && rig.violations.isEmpty(),
+                    "ask=" + ask + " open=" + open + " hop=" + hop + " say=" + say + " " + rig.tail());
+        });
+        scenario("claude_nothing_interesting_resumes_without_speaking", n -> {
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, cupIn(0), true,
+                    (r, req, nth) -> CuriosityPort.Answer.nothing()).started();
+            rig.runUntil(6000);
+            int answer = rig.first("answer NOTHING", 0);
+            int idle = rig.firstAfter("eyes IDLE", rig.timeOf(answer));
+            check(n, answer >= 0 && rig.timeOf(idle) == rig.timeOf(answer)
+                            && rig.brain.state() != ExploreBrain.State.ASK
+                            && rig.countPrefix("say", 0, 6001) == 0 && rig.countPrefix("name", 0, 6001) == 0
+                            && rig.countPrefix("react", 0, 6001) == 0
+                            // The next stop is due after the 1000 ms pause.
+                            && rig.countPrefix("camera open", rig.timeOf(answer), rig.timeOf(answer) + 1000) == 0
+                            && rig.motions(rig.timeOf(answer), rig.timeOf(answer) + 1000) == 0
+                            && rig.violations.isEmpty(),
+                    "answer=" + answer + " idle=" + idle + " " + rig.tail());
+        });
+        scenario("claude_ae4_unreachable_thinks_tries_twice_then_turns_back_to_the_detector_pick", n -> {
+            // The detector saw a cup in look 1; Claude never answers.
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, cupIn(0), true, (r, req, nth) -> null).started();
+            rig.runUntil(30000);
+            int ask = rig.first("ask", 0);
+            int thinking = rig.first("eyes THINKING", 0);
+            int ask2 = rig.first("ask", ask + 1);
+            int cancel = rig.first("cancel ask", ask);
+            int cancel2 = rig.first("cancel ask", cancel + 1);
+            int scanTurn = rig.first("turn", 0);
+            String scanDir = rig.what(scanTurn).substring(5);
+            String back = scanDir.equals("LEFT") ? "RIGHT" : "LEFT";
+            int lead = rig.first("eyes LOOK " + back, cancel2);
+            int turn = rig.first("turn " + back, lead);
+            int stop = rig.first("stop", turn);
+            int open = rig.first("camera open", stop);
+            int name = rig.first("name cup", open);
+            long askAt = rig.timeOf(ask);
+            check(n, ask >= 0 && rig.timeOf(thinking) == askAt && rig.countPrefix("ask", 0, askAt + 8001) == 2
+                            && rig.askTimeouts.get(0) == 4000 && rig.timeOf(ask2) == askAt + 4000
+                            && rig.timeOf(cancel) == askAt + 4000 && rig.timeOf(cancel2) == askAt + 8000
+                            // Back to look 1's heading: both scan turns undone.
+                            && rig.timeOf(lead) == askAt + 8000 && rig.timeOf(stop) - rig.timeOf(turn) == 1000
+                            && name > open && rig.timeOf(name) - askAt < 8000 + 6000
+                            && rig.countPrefix("say", 0, 30001) == 0 && rig.violations.isEmpty(),
+                    "ask=" + ask + " ask2=" + ask2 + " cancel2=" + cancel2 + " lead=" + lead + " turn=" + turn
+                            + " name=" + name + " " + rig.tail());
+        });
+        scenario("claude_camera_closed_while_asking_and_speaking_reopened_only_for_face_and_approach", n -> {
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, cupIn(2), true, MUG_ON_THE_CUP).started();
+            rig.runUntil(12000);
+            int ask = rig.first("ask", 0);
+            int say = rig.first("say", 0);
+            java.util.Set<ExploreBrain.State> allowed = java.util.EnumSet.of(
+                    ExploreBrain.State.SCAN, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH);
+            check(n, rig.timeOf(rig.firstAfter("camera close", 0)) == rig.timeOf(ask)
+                            && rig.timeOf(rig.firstAfter("camera close", rig.timeOf(ask) + 1)) == rig.timeOf(say)
+                            && rig.statesSeen.contains(ExploreBrain.State.ASK)
+                            && rig.statesSeen.contains(ExploreBrain.State.SPEAK)
+                            && allowed.containsAll(rig.openStates) && rig.violations.isEmpty(),
+                    "open in " + rig.openStates + " seen " + rig.statesSeen + " " + rig.tail());
+        });
+        scenario("claude_look_request_carries_recent_picks_and_the_people_cool_down_holds", n -> {
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, (r, t) -> list(), true,
+                    (r, req, nth) -> pick(2, "person", CuriosityPort.Kind.PERSON, "Hi there, friend!",
+                            0.5f, 0.5f, 0.4f, 0.8f)).started();
+            rig.runUntil(16000);
+            int say = rig.first("say Hi there, friend!", 0);
+            CuriosityPort.LookRequest first = rig.asks.get(0);
+            CuriosityPort.LookRequest second = rig.asks.size() > 1 ? rig.asks.get(1) : null;
+            boolean remembered = second != null && second.recent.size() == 1
+                    && second.recent.get(0).kind == CuriosityPort.Kind.PERSON
+                    && second.recent.get(0).label.equals("person") && second.livingCoolingDown;
+            check(n, say >= 0 && first.recent.isEmpty() && !first.livingCoolingDown && remembered
+                            && rig.count("say Hi there, friend!") == 1
+                            && rig.statesSeen.contains(ExploreBrain.State.MEET) && rig.violations.isEmpty(),
+                    "asks=" + rig.asks.size() + " say=" + say + " says=" + rig.count("say Hi there, friend!")
+                            + " seen=" + rig.statesSeen + (second == null ? "" : " recent=" + second.recent
+                            + " cooling=" + second.livingCoolingDown) + " " + rig.tail());
+        });
+        scenario("claude_say_that_never_finishes_ends_at_the_backstop", n -> {
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, (r, t) -> list(), true,
+                    (r, req, nth) -> pick(2, "lamp", CuriosityPort.Kind.OTHER, "What a shiny lamp!",
+                            0.5f, 0.5f, 0.2f, 0.3f));
+            rig.sayNeverFinishes = true;
+            rig.started();
+            rig.runUntil(14000);
+            int say = rig.first("say What a shiny lamp!", 0);
+            int idle = rig.firstAfter("eyes IDLE", rig.timeOf(say));
+            check(n, say >= 0 && rig.timeOf(idle) == rig.timeOf(say) + 6000
+                            && rig.brain.state() != ExploreBrain.State.SPEAK && rig.violations.isEmpty(),
+                    "say=" + rig.timeOf(say) + " idle=" + rig.timeOf(idle) + " " + rig.tail());
+        });
+        scenario("claude_scan_keeps_every_look_even_after_a_sighting", n -> {
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, cupIn(0), true,
+                    (r, req, nth) -> CuriosityPort.Answer.nothing()).started();
+            rig.runUntil(5000);
+            CuriosityPort.LookRequest req = rig.asks.isEmpty() ? null : rig.asks.get(0);
+            boolean frames = req != null && req.frames.size() == 3;
+            for (int i = 0; frames && i < 3; i++) {
+                frames = req.frames.get(i).look == i && req.frames.get(i).jpeg != null
+                        && new String(req.frames.get(i).jpeg, java.nio.charset.StandardCharsets.US_ASCII)
+                        .equals("jpeg@" + (1800 + 1000 * i));
+            }
+            check(n, frames && rig.countPrefix("turn", 0, 4001) == 2 && rig.violations.isEmpty(),
+                    "asks=" + rig.asks.size() + " " + rig.tail());
+        });
+        scenario("claude_failed_first_try_is_retried_then_spoken", n -> {
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, (r, t) -> list(), true,
+                    (r, req, nth) -> nth == 1 ? CuriosityPort.Answer.failed()
+                            : pick(2, "robot", CuriosityPort.Kind.TECHNOLOGY, "Another robot! Hello, cousin!",
+                            0.5f, 0.5f, 0.2f, 0.3f)).started();
+            rig.runUntil(9000);
+            int failed = rig.first("answer FAILED", 0);
+            int ask2 = rig.first("ask", failed);
+            int say = rig.first("say Another robot!", ask2);
+            check(n, failed >= 0 && rig.timeOf(ask2) == rig.timeOf(failed) && say > ask2
+                            && rig.countPrefix("name", 0, 9001) == 0 && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("claude_reopen_gap_counts_in_the_first_look_budget", n -> {
+            Rig rig = new Rig(claudeTuning().reopenGapMs(3000).build(), CLEAR, cupIn(2), true, MUG_ON_THE_CUP);
+            rig.reopenGapMs = 3000;
+            rig.claudeDelayMs = 100;
+            rig.started();
+            rig.runUntil(16000);
+            int ask = rig.first("ask", 0);
+            int open = rig.first("camera open", ask);
+            int hop = rig.first("hop", open);
+            int say = rig.first("say Ooh, a mug", hop);
+            check(n, open > ask && hop > open && rig.timeOf(hop) >= rig.timeOf(ask) + 3000 && say > hop
+                            && rig.violations.isEmpty(),
+                    "open=" + rig.timeOf(open) + " hop=" + rig.timeOf(hop) + " " + rig.tail());
         });
     }
 }

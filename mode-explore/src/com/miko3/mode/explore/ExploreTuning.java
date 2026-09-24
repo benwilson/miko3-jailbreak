@@ -136,6 +136,24 @@ final class ExploreTuning {
     final long puzzledMs;
     /** After greeting a person or pet, people and pets are ignored this long (R12). */
     final long peopleCooldownMs;
+    /**
+     * Asking Claude (explore on Claude KTD6): askAttempts tries of askTimeoutMs
+     * each before falling back to the detector (R7, R8). A spoken line is given
+     * up on after sayTimeoutMs if the finished callback never comes (KTD8). The
+     * look request carries the last recentPicksMax picks (KTD2).
+     */
+    final int askAttempts;
+    final long askTimeoutMs;
+    final long sayTimeoutMs;
+    final int recentPicksMax;
+    /** Claude's box and a detector box are the same thing at this overlap (KTD7). */
+    final float pickMatchIou;
+    /**
+     * The camera waits this long after closing before it opens again
+     * (ExploreCamera.REOPEN_GAP_MS). Reopening it mid-stop for FACE counts the
+     * rest of the gap toward the first look's deadline (KTD6).
+     */
+    final long reopenGapMs;
     /** Edge and obstacle thresholds from the device, or null when uncalibrated (KTD9). */
     final Calibration calibration;
 
@@ -199,6 +217,12 @@ final class ExploreTuning {
         disappointedMs = b.disappointedMs;
         puzzledMs = b.puzzledMs;
         peopleCooldownMs = b.peopleCooldownMs;
+        askAttempts = Math.max(1, b.askAttempts);
+        askTimeoutMs = b.askTimeoutMs;
+        sayTimeoutMs = b.sayTimeoutMs;
+        recentPicksMax = Math.max(0, b.recentPicksMax);
+        pickMatchIou = b.pickMatchIou;
+        reopenGapMs = b.reopenGapMs;
         calibration = b.calibration;
     }
 
@@ -317,6 +341,14 @@ final class ExploreTuning {
         private long disappointedMs = 1400;
         private long puzzledMs = 1100;
         private long peopleCooldownMs = 120000;
+        // Two tries of about 10 s (R7): a stop with Claude unreachable falls back within ~20 s (AE4).
+        private int askAttempts = 2;
+        private long askTimeoutMs = 10000;
+        // A few seconds of speech (R5), plus the launcher's synthesis; only a backstop.
+        private long sayTimeoutMs = 15000;
+        private int recentPicksMax = 8;
+        private float pickMatchIou = 0.3f;
+        private long reopenGapMs = 3000;
         private Calibration calibration;
 
         /** A fixed leg length. */
@@ -406,6 +438,11 @@ final class ExploreTuning {
             return this;
         }
         Builder peopleCooldownMs(long v) { peopleCooldownMs = v; return this; }
+        Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
+        Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
+        Builder recentPicksMax(int v) { recentPicksMax = v; return this; }
+        Builder pickMatchIou(float v) { pickMatchIou = v; return this; }
+        Builder reopenGapMs(long v) { reopenGapMs = v; return this; }
         Builder calibration(Calibration v) { calibration = v; return this; }
 
         ExploreTuning build() {

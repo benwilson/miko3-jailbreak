@@ -29,7 +29,7 @@ EXPLORE_PKG = EXPLORE_SRC / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "explore_brain_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHarness.java"
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
-              "Sighting.java", "Detection.java")
+              "Sighting.java", "Detection.java", "CuriosityPort.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -129,6 +129,17 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "stale_looks_end_the_stop_without_turning_curiosity_off",
         "lease_loss_mid_approach_stops_and_closes_the_camera",
         "camera_without_looks_turns_curiosity_off",
+        # Claude picks and speaks (explore on Claude plan U4, AE1, AE4)
+        "claude_ae1_turns_to_the_picked_frame_and_offset_and_speaks_without_driving",
+        "claude_pick_on_a_detector_box_of_the_same_kind_is_approached_before_speaking",
+        "claude_nothing_interesting_resumes_without_speaking",
+        "claude_ae4_unreachable_thinks_tries_twice_then_turns_back_to_the_detector_pick",
+        "claude_camera_closed_while_asking_and_speaking_reopened_only_for_face_and_approach",
+        "claude_look_request_carries_recent_picks_and_the_people_cool_down_holds",
+        "claude_say_that_never_finishes_ends_at_the_backstop",
+        "claude_scan_keeps_every_look_even_after_a_sighting",
+        "claude_failed_first_try_is_retried_then_spoken",
+        "claude_reopen_gap_counts_in_the_first_look_budget",
     )
 
     @classmethod

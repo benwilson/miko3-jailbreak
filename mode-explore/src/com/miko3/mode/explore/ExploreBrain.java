@@ -1,6 +1,7 @@
 package com.miko3.mode.explore;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -41,6 +42,29 @@ import java.util.Set;
  *   INSPECT    arrived: "ooh", thinking babble and its name, or a delighted
  *              greeting for a person or pet (R8, R11)
  *   REACT_HERE seen before (disappointed) or unsure (puzzled), from where he is
+ *
+ * Claude at curiosity stops (explore on Claude plan U4, KTD6, KTD7), when the
+ * CuriosityPort can ask. The scan then takes all its looks, keeping each
+ * look's JPEG and detections, and the camera is closed in these states:
+ *
+ *   ASK        thinking eyes; one look request with every scan frame, polled
+ *              each tick; askAttempts tries of askTimeoutMs, then the fallback
+ *   ORIENT     turn to the picked frame's scan heading plus the box's offset
+ *              (or, on the fallback, back to the look that held the detector's pick)
+ *   MEET       a person pick: the hand-off to the meet flow (U5); for now it
+ *              goes straight on to SPEAK
+ *   SPEAK      Claude's line through the port; waits for its finished flag,
+ *              with sayTimeoutMs as the backstop
+ *
+ *   SCAN -> ASK -> nothing interesting: PAUSE, silent
+ *              -> a pick the detector also boxed (same broad kind): ORIENT -> FACE
+ *                 (camera reopens) -> APPROACH -> SPEAK (or MEET -> SPEAK)
+ *              -> any other pick: ORIENT -> SPEAK (or MEET -> SPEAK), no driving
+ *              -> both tries failed: ORIENT back to the detector's look, then
+ *                 the pre-U4 path (FACE / REACT_HERE, name clip), or PAUSE if
+ *                 the detector saw nothing
+ *
+ * Without a port that can ask, a stop runs exactly as before U4.
  *
  * The rules that make it safe:
  *  - It decides on every reading and every tick, so the stop that follows a
@@ -122,14 +146,24 @@ final class ExploreBrain {
         Look latest();
     }
 
-    /** One recognized camera frame: when it was captured (brain clock), and what was in it. */
+    /**
+     * One recognized camera frame: when it was captured (brain clock), what was in
+     * it, and the frame's JPEG (null when the camera didn't keep it), which the
+     * look request sends to Claude (explore on Claude U4).
+     */
     static final class Look {
         final long frameMs;
         final List<Detection> detections;
+        final byte[] jpeg;
 
         Look(long frameMs, List<Detection> detections) {
+            this(frameMs, detections, null);
+        }
+
+        Look(long frameMs, List<Detection> detections, byte[] jpeg) {
             this.frameMs = frameMs;
             this.detections = detections;
+            this.jpeg = jpeg;
         }
     }
 
@@ -165,11 +199,13 @@ final class ExploreBrain {
 
     /** What the eyes show: glancing, leading a turn, startled, resting (cornered), not moving (R10). */
     /** ...and STARE: on something the camera sees (Eyes.stare). */
-    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE }
+    /** ...and THINKING: waiting for Claude's answer (explore on Claude R7). */
+    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING }
 
     enum State {
         EYES_ONLY, PAUSE, LOOK, TURN, HOP, STARTLE, BACK_OFF, CORNERED, STOPPED,
-        SCAN, FACE, APPROACH, INSPECT, REACT_HERE;
+        SCAN, FACE, APPROACH, INSPECT, REACT_HERE,
+        ASK, ORIENT, MEET, SPEAK;
 
         /** The camera is open in exactly these (R2, AE6). */
         boolean curious() {
@@ -187,6 +223,7 @@ final class ExploreBrain {
     private final Sound sound;
     private final Random random;
     private final Camera camera;
+    private final CuriosityPort port;
     private final HazardClassifier classifier;
     /** Times of the hazard reactions since the last successful hop, for the cornered cap. */
     private final ArrayDeque<Long> hazardTimes = new ArrayDeque<Long>();
@@ -264,13 +301,55 @@ final class ExploreBrain {
     private final Set<String> seen = new HashSet<String>();
     private long peopleIgnoredUntil;
 
+    // ---- asking Claude (explore on Claude U4) ----
+    /** This stop asks Claude: decided as the scan starts. */
+    private boolean claudeStop;
+    /** The scan's looks in order, and the first detector sighting among them (the fallback). */
+    private final List<Look> scanned = new ArrayList<Look>();
+    private Sighting detectorPick;
+    private int detectorPickLook = -1;
+    /** The frames sent (in request order), the tries made, and this try's deadline. */
+    private final List<CuriosityPort.Frame> askedFrames = new ArrayList<CuriosityPort.Frame>();
+    private int askTries;
+    private long askDeadline;
+    private boolean asking;
+    /** Claude's pick this stop; null on the fallback and on stops without Claude. */
+    private CuriosityPort.Answer pick;
+    private enum Then { SPEAK, FACE, SIGHTING }
+    private Then afterOrient;
+    /** When the backstop ends SPEAK. */
+    private long sayUntil;
+    /** When the camera last closed, for its reopen gap (tuning.reopenGapMs). */
+    private long cameraClosedAt = Long.MIN_VALUE / 4;
+
+    /** What he reacted to this session, oldest first, for the look request (KTD2). */
+    private static final class Picked {
+        final String label;
+        final CuriosityPort.Kind kind;
+        final long atMs;
+
+        Picked(String label, CuriosityPort.Kind kind, long atMs) {
+            this.label = label;
+            this.kind = kind;
+            this.atMs = atMs;
+        }
+    }
+
+    private final ArrayDeque<Picked> picked = new ArrayDeque<Picked>();
+
     ExploreBrain(ExploreTuning tuning, Clock clock, Motor motor, Eyes eyes, Sound sound, Random random) {
         this(tuning, clock, motor, eyes, sound, NO_CAMERA, random);
     }
 
     ExploreBrain(ExploreTuning tuning, Clock clock, Motor motor, Eyes eyes, Sound sound, Camera camera,
                  Random random) {
+        this(tuning, clock, motor, eyes, sound, camera, CuriosityPort.NONE, random);
+    }
+
+    ExploreBrain(ExploreTuning tuning, Clock clock, Motor motor, Eyes eyes, Sound sound, Camera camera,
+                 CuriosityPort port, Random random) {
         this.tuning = tuning;
+        this.port = port;
         this.clock = clock;
         this.motor = motor;
         this.eyes = eyes;
@@ -328,6 +407,7 @@ final class ExploreBrain {
         }
         moving = false;
         motor.stop();
+        cancelAsk();
         state = State.STOPPED;
         syncCamera();
         note("shutdown");
@@ -476,10 +556,28 @@ final class ExploreBrain {
             case APPROACH:
                 curiosityStep(now, fresh, hazard);
                 break;
+            case ORIENT:
+                curiosityStep(now, fresh, hazard);
+                break;
             case INSPECT:
             case REACT_HERE:
                 if (now >= phaseUntil) {
                     nextCue(now);
+                }
+                break;
+            // Standing still, like INSPECT: a hazard ahead matters only once he moves again.
+            case ASK:
+                askStep(now);
+                break;
+            case MEET:
+                meetStep(now);
+                break;
+            case SPEAK:
+                if (port.sayFinished()) {
+                    finishPick(now);
+                } else if (now >= sayUntil) {
+                    note("speech never reported finished; moving on");
+                    finishPick(now);
                 }
                 break;
             case CORNERED:
@@ -662,6 +760,11 @@ final class ExploreBrain {
         scanLooksLeft = tuning.scanLooks;
         scanDir = randomDirection();
         target = null;
+        claudeStop = port.canAsk();
+        scanned.clear();
+        detectorPick = null;
+        detectorPickLook = -1;
+        pick = null;
         firstLook = true;
         show(EyeState.IDLE, null);
         waitForLook(now);
@@ -671,7 +774,10 @@ final class ExploreBrain {
     private void waitForLook(long now) {
         step = Step.WAIT_LOOK;
         lookAfter = now + tuning.lookSettleMs;
-        lookDeadline = now + (firstLook ? tuning.firstLookTimeoutMs : tuning.lookTimeoutMs);
+        // A camera about to (re)open yields nothing until its reopen gap has passed
+        // (KTD6): the rest of the gap counts toward this look's deadline.
+        long ready = cameraOpen ? now : Math.max(now, cameraClosedAt + tuning.reopenGapMs);
+        lookDeadline = ready + (firstLook ? tuning.firstLookTimeoutMs : tuning.lookTimeoutMs);
         firstLook = false;
     }
 
@@ -694,7 +800,7 @@ final class ExploreBrain {
                         note("camera gave no look in time; curiosity off for " + tuning.cameraBackoffMs + " ms");
                         curiosityOffUntil = now + tuning.cameraBackoffMs;
                     }
-                    endCuriosity(now);
+                    giveUp(now);
                 }
                 break;
             }
@@ -711,6 +817,8 @@ final class ExploreBrain {
                     stopMotors();
                     if (state == State.APPROACH) {
                         step = Step.READY_LEG;
+                    } else if (state == State.ORIENT) {
+                        oriented(now);
                     } else {
                         waitForLook(now);
                     }
@@ -732,6 +840,10 @@ final class ExploreBrain {
     /** A new look arrived (on a fresh reading): decide what the state does with it. */
     private void onLook(long now, Look look) {
         boolean ignorePeople = now < peopleIgnoredUntil;
+        if (state == State.SCAN && claudeStop) {
+            scanLook(now, look, ignorePeople);
+            return;
+        }
         if (state == State.SCAN) {
             Sighting sighting = Sighting.choose(look.detections, tuning, ignorePeople);
             if (sighting.kind == Sighting.Kind.NOTHING) {
@@ -763,7 +875,7 @@ final class ExploreBrain {
         if (found == null) {
             if (++lostLooks >= tuning.lostLooksMax) {
                 note("lost sight of the " + target.label);
-                endCuriosity(now);
+                giveUp(now);
             } else {
                 waitForLook(now);
             }
@@ -784,7 +896,7 @@ final class ExploreBrain {
             arrive(now);
         } else if (legs >= tuning.approachLegsMax) {
             note("never got close to the " + target.label + "; giving up");
-            endCuriosity(now);
+            giveUp(now);
         } else if (Math.abs(target.centerX()) > tuning.centreTolerance) {
             note("re-centring " + sideOf(target) + " on the " + target.label);
             startCuriosityTurn(now, sideOf(target), turnMsFor(target), false);
@@ -889,7 +1001,9 @@ final class ExploreBrain {
     private void arrive(long now) {
         stopMotors();
         hazardTimes.clear();
-        if (Sighting.isPersonOrPet(target.label)) {
+        if (pick != null) {
+            speakPick(now);
+        } else if (Sighting.isPersonOrPet(target.label)) {
             react(now, State.INSPECT, Cue.DELIGHTED, Cue.NAME, Cue.DELIGHTED);
         } else {
             react(now, State.INSPECT, Cue.CURIOUS, Cue.THINKING, Cue.NAME);
@@ -917,6 +1031,7 @@ final class ExploreBrain {
                 } else {
                     seen.add(target.label);
                 }
+                remember(target.label, CuriosityPort.Kind.of(target.label), now);
             }
             endCuriosity(now);
             return;
@@ -950,7 +1065,12 @@ final class ExploreBrain {
     /** Back to wandering; the camera closes as the state leaves curiosity. */
     private void endCuriosity(long now) {
         stopMotors();
+        cancelAsk();
         target = null;
+        pick = null;
+        afterOrient = null;
+        scanned.clear();
+        askedFrames.clear();
         cues.clear();
         scheduleCuriosity(now);
         enterPause(now, pauseMs(), false);
@@ -965,8 +1085,287 @@ final class ExploreBrain {
                 camera.open();
             } else {
                 camera.close();
+                cameraClosedAt = clock.nowMs();
             }
         }
+    }
+
+    // ---- asking Claude (explore on Claude U4) ----
+
+    /** A Claude stop's scan look: keep it (and the detector's first sighting), and take them all (R1). */
+    private void scanLook(long now, Look look, boolean ignorePeople) {
+        scanned.add(look);
+        if (detectorPick == null) {
+            Sighting s = Sighting.choose(look.detections, tuning, ignorePeople);
+            if (s.kind != Sighting.Kind.NOTHING) {
+                detectorPick = s;
+                detectorPickLook = scanned.size() - 1;
+                note("detector saw " + s + " in look " + scanned.size());
+            }
+        }
+        if (--scanLooksLeft > 0) {
+            startCuriosityTurn(now, scanDir, tuning.scanTurnMs, false);
+        } else {
+            enterAsk(now);
+        }
+    }
+
+    /** Scan done: the camera closes and he thinks while Claude looks (R6, R7). */
+    private void enterAsk(long now) {
+        stopMotors();
+        state = State.ASK;
+        show(EyeState.THINKING, null);
+        askTries = 0;
+        askedFrames.clear();
+        for (int i = 0; i < scanned.size(); i++) {
+            if (scanned.get(i).jpeg != null) {
+                askedFrames.add(new CuriosityPort.Frame(i, scanned.get(i).jpeg));
+            }
+        }
+        if (askedFrames.isEmpty()) {
+            note("no frames kept to show Claude");
+            fallback(now);
+            return;
+        }
+        startAsk(now);
+    }
+
+    private void startAsk(long now) {
+        askTries++;
+        asking = true;
+        askDeadline = now + tuning.askTimeoutMs;
+        boolean cooling = now < peopleIgnoredUntil;
+        note("asking Claude (try " + askTries + " of " + tuning.askAttempts + ", " + askedFrames.size() + " frames)");
+        port.ask(new CuriosityPort.LookRequest(new ArrayList<CuriosityPort.Frame>(askedFrames), recent(now), cooling),
+                tuning.askTimeoutMs);
+    }
+
+    /** ASK, each tick: poll the answer; a failure or a missed deadline is another try, then the fallback (R7). */
+    private void askStep(long now) {
+        CuriosityPort.Answer a = port.answer();
+        if (a == null) {
+            if (now >= askDeadline) {
+                note("no answer from Claude in " + tuning.askTimeoutMs + " ms");
+                cancelAsk();
+                retryOrFallback(now);
+            }
+            return;
+        }
+        asking = false;
+        if (a.status == CuriosityPort.Answer.Status.NOTHING) {
+            note("Claude: nothing interesting here");
+            endCuriosity(now);
+        } else if (a.status == CuriosityPort.Answer.Status.PICK && validPick(a)) {
+            onPick(now, a);
+        } else {
+            note("Claude's answer failed or was unusable: " + a);
+            retryOrFallback(now);
+        }
+    }
+
+    private boolean validPick(CuriosityPort.Answer a) {
+        return a.frame >= 0 && a.frame < askedFrames.size() && a.box != null && a.kind != null
+                && a.line != null && !a.line.trim().isEmpty();
+    }
+
+    private void retryOrFallback(long now) {
+        if (askTries < tuning.askAttempts) {
+            startAsk(now);
+        } else {
+            fallback(now);
+        }
+    }
+
+    /** Claude picked something: face it, approaching only if the detector boxed it too (KTD7). */
+    private void onPick(long now, CuriosityPort.Answer a) {
+        int look = askedFrames.get(a.frame).look;
+        note("Claude picked " + a + " (look " + (look + 1) + ")");
+        if (a.kind.isLiving() && now < peopleIgnoredUntil) {
+            note("greeted people and animals recently; carrying on");
+            endCuriosity(now);
+            return;
+        }
+        pick = a;
+        remember(a.box.label, a.kind, now);
+        float cx = a.box.centerX();
+        long offset = Math.abs(cx) > tuning.centreTolerance
+                ? (cx < 0 ? -1 : 1) * Math.max(100, (long) (Math.abs(cx) * tuning.turnMsPerUnit)) : 0;
+        Detection agree = detectorAgrees(scanned.get(look).detections, a);
+        if (agree != null) {
+            note("the detector sees it too, as a " + agree.label + ": approaching");
+            target = agree;
+            orient(now, look, offset, Then.FACE);
+        } else {
+            target = null;
+            orient(now, look, offset, Then.SPEAK);
+        }
+    }
+
+    /** The detector's box in that look overlapping Claude's, of the same broad kind (KTD7), or null. */
+    private Detection detectorAgrees(List<Detection> detections, CuriosityPort.Answer a) {
+        Detection best = null;
+        float bestIou = -1f;
+        float px0 = Math.min(a.box.x0, a.box.x1);
+        float px1 = Math.max(a.box.x0, a.box.x1);
+        float py0 = Math.min(a.box.y0, a.box.y1);
+        float py1 = Math.max(a.box.y0, a.box.y1);
+        for (Detection d : detections) {
+            if (d.score < tuning.confidenceFloor || Sighting.BACKGROUND.contains(d.label)
+                    || !CuriosityPort.Kind.of(d.label).sameBroadKind(a.kind)) {
+                continue;
+            }
+            float iou = d.iou(a.box);
+            float dx = (d.x0 + d.x1) / 2;
+            float dy = (d.y0 + d.y1) / 2;
+            boolean inside = dx >= px0 && dx <= px1 && dy >= py0 && dy <= py1;
+            if ((iou >= tuning.pickMatchIou || inside) && iou > bestIou) {
+                best = d;
+                bestIou = iou;
+            }
+        }
+        return best;
+    }
+
+    /** Both tries failed (R8): back to the look that held the detector's pick, then the old path. */
+    private void fallback(long now) {
+        pick = null;
+        if (detectorPick == null) {
+            note("no answer from Claude and the detector saw nothing; carrying on");
+            endCuriosity(now);
+            return;
+        }
+        note("no answer from Claude; falling back to the detector's " + detectorPick);
+        orient(now, detectorPickLook, 0, Then.SIGHTING);
+    }
+
+    /**
+     * Turn from the last scan look's heading to the given look's, plus offsetMs
+     * (positive = right), then carry on with `then`. The scan stepped scanTurnMs
+     * toward scanDir between looks.
+     */
+    private void orient(long now, int look, long offsetMs, Then then) {
+        stopMotors();
+        state = State.ORIENT;
+        afterOrient = then;
+        long scanSign = scanDir == Direction.RIGHT ? 1 : -1;
+        long ms = (look - (scanned.size() - 1)) * tuning.scanTurnMs * scanSign + offsetMs;
+        if (Math.abs(ms) < MIN_ORIENT_MS) {
+            oriented(now);
+            return;
+        }
+        Direction d = ms > 0 ? Direction.RIGHT : Direction.LEFT;
+        note("turning " + d + " " + Math.abs(ms) + " ms toward it");
+        show(EyeState.LOOK, d);
+        startCuriosityTurn(now, d, Math.abs(ms), true);
+    }
+
+    private static final long MIN_ORIENT_MS = 50;
+
+    private void oriented(long now) {
+        Then then = afterOrient;
+        afterOrient = null;
+        if (then == Then.SPEAK) {
+            speakPick(now);
+        } else if (then == Then.FACE) {
+            enterFace(now);
+        } else {
+            sighted(now, detectorPick);
+        }
+    }
+
+    /** FACE with the camera reopening: wait for a look (its reopen gap counted, KTD6), then face as before. */
+    private void enterFace(long now) {
+        state = State.FACE;
+        faceTurns = 0;
+        lostLooks = 0;
+        firstLook = true;
+        waitForLook(now);
+    }
+
+    /** The pre-U4 reaction to the detector's sighting, from the fallback. */
+    private void sighted(long now, Sighting s) {
+        target = s.target;
+        if (s.kind == Sighting.Kind.UNSURE) {
+            note("unsure what the " + target.label + " is: puzzled");
+            react(now, State.REACT_HERE, Cue.PUZZLED);
+        } else if (!s.isPersonOrPet() && seen.contains(target.label)) {
+            note("seen the " + target.label + " already: disappointed");
+            react(now, State.REACT_HERE, Cue.DISAPPOINTED);
+        } else {
+            enterFace(now);
+        }
+    }
+
+    /** FACE or APPROACH ended without arriving: with Claude's pick he still says its line from here. */
+    private void giveUp(long now) {
+        if (pick != null) {
+            stopMotors();
+            speakPick(now);
+        } else {
+            endCuriosity(now);
+        }
+    }
+
+    private void speakPick(long now) {
+        if (pick.kind == CuriosityPort.Kind.PERSON) {
+            stopMotors();
+            state = State.MEET;
+            note("a person: meeting them");
+            return;
+        }
+        speak(now, pick.line);
+    }
+
+    /**
+     * MEET: the person hand-off. U5's flow (match, greet or ask the name, listen,
+     * remember) starts here; until then he says Claude's line like any other pick.
+     */
+    private void meetStep(long now) {
+        speak(now, pick.line);
+    }
+
+    /** SPEAK: the camera and detector are closed (R6); wait for the finished flag (KTD8). */
+    private void speak(long now, String line) {
+        stopMotors();
+        state = State.SPEAK;
+        if (target != null) {
+            stare(target);
+        } else {
+            stareAt(0f, pick.box.centerY());
+        }
+        sayUntil = now + tuning.sayTimeoutMs;
+        port.say(line);
+    }
+
+    private void finishPick(long now) {
+        if (pick.kind.isLiving()) {
+            peopleIgnoredUntil = now + tuning.peopleCooldownMs;
+        } else {
+            seen.add(pick.box.label);
+        }
+        endCuriosity(now);
+    }
+
+    private void cancelAsk() {
+        if (asking) {
+            asking = false;
+            port.cancelAsk();
+        }
+    }
+
+    private void remember(String label, CuriosityPort.Kind kind, long now) {
+        picked.addLast(new Picked(label, kind, now));
+        while (picked.size() > tuning.recentPicksMax) {
+            picked.pollFirst();
+        }
+    }
+
+    private List<CuriosityPort.Recent> recent(long now) {
+        List<CuriosityPort.Recent> out = new ArrayList<CuriosityPort.Recent>();
+        for (Picked p : picked) {
+            out.add(new CuriosityPort.Recent(p.label, p.kind, now - p.atMs));
+        }
+        return out;
     }
 
     /**
@@ -1011,8 +1410,11 @@ final class ExploreBrain {
 
     private void enterEyesOnly(String why) {
         stopMotors();
+        cancelAsk();
         hopNext = false;
         target = null;
+        pick = null;
+        afterOrient = null;
         cues.clear();
         if (state != State.EYES_ONLY || shownState == null) {
             note("eyes only: " + why);
@@ -1117,8 +1519,10 @@ final class ExploreBrain {
     }
 
     private void stare(Detection d) {
-        float x = d.centerX();
-        float y = d.centerY();
+        stareAt(d.centerX(), d.centerY());
+    }
+
+    private void stareAt(float x, float y) {
         if (shownState == EyeState.STARE && x == shownX && y == shownY) {
             return;
         }

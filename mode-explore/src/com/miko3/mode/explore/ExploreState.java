@@ -32,9 +32,11 @@ final class ExploreState {
     static final String EYES_ONLY = "eyes-only";
     /** The cornered cool-down (KTD8): drowsy, distinct from the no-sensors look. */
     static final String RESTING = "resting";
+    /** Waiting for Claude at a curiosity stop (explore on Claude R7): eyes up, a slow pulse. */
+    static final String THINKING = "thinking";
 
     /** Every state the brain publishes, for the page tests. */
-    static final String[] ALL_STATES = {IDLE, LOOK, FLINCH, EYES_ONLY, RESTING};
+    static final String[] ALL_STATES = {IDLE, LOOK, FLINCH, EYES_ONLY, RESTING, THINKING};
 
     static final ExploreState IDLE_STATE = new ExploreState(IDLE, 0, 0);
 
@@ -127,7 +129,10 @@ final class ExploreState {
             + "transition:transform .6s,opacity .6s}"
             // Resting (cornered cool-down): drowsy, slowly breathing lids.
             + "@keyframes drowse{from{transform:scale(1,.6);opacity:.85}to{transform:scale(1,.3);opacity:.55}}"
-            + "#rig.s-" + RESTING + " .glow-core{animation:drowse 2.4s ease-in-out infinite alternate!important}";
+            + "#rig.s-" + RESTING + " .glow-core{animation:drowse 2.4s ease-in-out infinite alternate!important}"
+            // Thinking (waiting for Claude): a slow bright-dim pulse; the gaze goes up (GAZE_JS).
+            + "@keyframes ponder{from{filter:brightness(.8)}to{filter:brightness(1.25)}}"
+            + "#rig.s-" + THINKING + " .glow-core{animation:ponder 1.2s ease-in-out infinite alternate!important}";
 
     // The poll. setTimeout chained off each answer (not setInterval) and
     // XMLHttpRequest with a timeout, as in the voice mode, so a hung request
@@ -162,6 +167,7 @@ final class ExploreState {
     // - flinch: eyes snap to centre.
     // - eyes-only / resting: glances are damped, not stopped, so the eyes never
     //   look frozen (R10).
+    // - thinking: glances drift up and narrow, the look of someone pondering.
     // showExploreState is wrapped too, so a look moves the eyes the moment it
     // arrives rather than at the next glance, which can be seconds away; the
     // brain only waits ~500ms before turning (KTD10).
@@ -171,6 +177,7 @@ final class ExploreState {
             + "if(exploreState.state==='" + LOOK + "'){x=exploreState.lookX*10;y=exploreState.lookY*9;}"
             + "else if(exploreState.state==='" + FLINCH + "'){x=0;y=0;}"
             + "else if(exploreState.state==='" + EYES_ONLY + "'||exploreState.state==='" + RESTING + "'){x*=0.35;y*=0.35;}"
+            + "else if(exploreState.state==='" + THINKING + "'){x*=0.4;y=-6;}"
             + "eyesGazeTo(x,y,speedMs);"
             + "};"
             + "var showExploreStateBase=showExploreState;"

@@ -409,7 +409,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
                     long t0 = clock.nowMs();
                     List<Detection> found = recognizer.detect(frame);
                     if (gen == generation) {
-                        latest = new ExploreBrain.Look(frameMs, found);
+                        // The JPEG rides along for Claude's look request (explore on Claude U4, R1).
+                        latest = new ExploreBrain.Look(frameMs, found, jpeg);
                         Log.i(TAG, "look in " + (clock.nowMs() - t0) + " ms: " + found);
                     }
                 } catch (Exception | OutOfMemoryError | LinkageError e) {
