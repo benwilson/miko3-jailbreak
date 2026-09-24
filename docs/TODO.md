@@ -23,3 +23,8 @@ The running list of what is left to do on the robot's modes. Add to it when some
 ## Remote-control mode
 
 - [ ] Confirm it still drives forward after the shared `DirectMotorDriver` change (needs someone watching the robot).
+
+## Launcher
+
+- [ ] Stop the Wi-Fi password reaching logcat. The Wi-Fi forms send it in a GET query (`/wifi/connect?...&password=`), and `RoutingHttpServer` logs every request line. Move those forms to POST, or redact the query in the log line.
+- [ ] Decide whether to replace the committed HTTPS certificate (`shared/assets/server.p12`, password in source). The repo is public, so someone actively attacking on the LAN could read an API key typed into the Settings page from a laptop browser. Pushing the key over adb and typing it on the robot's own screen are not affected.
