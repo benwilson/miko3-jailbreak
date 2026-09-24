@@ -89,3 +89,7 @@ The owner's own service, on the local network, that sits between a mode app and 
 ## Command lane
 
 The relay-to-robot direction of a mode's link to the relay, reserved for physical actions the model may later request. It sits beside the control lane, the small set of messages the link needs in every version (conversation open and close, playback state, flush, keepalive). In the talk-only version nothing travels on the command lane and the robot answers anything it does not recognize with an "unsupported" reply; it exists so adding actions is a server change, not a protocol redesign.
+
+## Settings page
+
+The launcher-served page that is the robot's single home for owner settings, organized in sections, opened either from a LAN browser or from the robot's own screen. Settings a mode needs live here rather than on the mode's own page; a mode reads them from the launcher at the time it uses them. Its first section is Claude API access, whose key the page never displays back and never lets a base-URL change carry forward without being re-entered.
