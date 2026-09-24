@@ -319,12 +319,14 @@ final class ClaudeCuriosity implements CuriosityPort {
         run(new Runnable() {
             @Override
             public void run() {
+                long t0 = System.currentTimeMillis();
                 List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
                 content.add(ClaudeApi.textBlock(ExplorePrompts.LINES_ASK));
                 ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM, content,
                         ExplorePrompts.LINES_SCHEMA, (int) timeoutMs);
                 MatchAnswer a = r.ok() ? ClaudeReplies.lines(r.json) : MatchAnswer.FAILED;
-                Log.i(TAG, "lines request: " + (r.ok() ? a.status.toString() : r.describe()));
+                Log.i(TAG, "lines request: " + (r.ok() ? a.status.toString() : r.describe()) + " in "
+                        + (System.currentTimeMillis() - t0) + " ms");
                 strangerLines.finish(g, a);
             }
         }, strangerLines, g, MatchAnswer.FAILED);
@@ -374,12 +376,14 @@ final class ClaudeCuriosity implements CuriosityPort {
                     names.finish(g, Named.of(local));
                     return;
                 }
+                long t0 = System.currentTimeMillis();
                 List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
                 content.add(ClaudeApi.textBlock(ExplorePrompts.nameAsk(transcript)));
                 ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM, content,
                         ExplorePrompts.NAME_SCHEMA, (int) timeoutMs);
                 Named found = r.ok() ? ClaudeReplies.name(r.json) : Named.FAILED;
-                Log.i(TAG, "name request: " + (r.ok() ? found.status.toString() : r.describe()));
+                Log.i(TAG, "name request: " + (r.ok() ? found.status.toString() : r.describe()) + " in "
+                        + (System.currentTimeMillis() - t0) + " ms");
                 names.finish(g, found);
             }
         }, names, g, Named.FAILED);
@@ -416,13 +420,15 @@ final class ClaudeCuriosity implements CuriosityPort {
             Log.w(TAG, "remember: the people store refused or is unavailable: " + e.getMessage());
             return Answer.failed();
         }
+        long t0 = System.currentTimeMillis();
         List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
         content.add(ClaudeApi.jpegBlock(face));
         content.add(ClaudeApi.textBlock(ExplorePrompts.rememberAsk(nameOrNull)));
         ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM, content,
                 ExplorePrompts.REMEMBER_SCHEMA, (int) timeoutMs);
         Answer a = r.ok() ? ClaudeReplies.remembered(r.json) : Answer.failed();
-        Log.i(TAG, "remember request: " + (r.ok() ? a.status.toString() : r.describe()));
+        Log.i(TAG, "remember request: " + (r.ok() ? a.status.toString() : r.describe()) + " in "
+                + (System.currentTimeMillis() - t0) + " ms");
         return a;
     }
 

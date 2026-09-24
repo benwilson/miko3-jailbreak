@@ -97,6 +97,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private final BitmapFactory.Options decode = new BitmapFactory.Options();
 
     private volatile boolean busy;
+    /** close() has run on the camera thread and open() has not been called since. */
+    private volatile boolean closedDone = true;
     private volatile ExploreBrain.Look latest;
     /** Bumped on every open and close; a result from an older generation is dropped. */
     private volatile int generation;
@@ -127,6 +129,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
     public void open() {
         generation++;
         latest = null;
+        closedDone = false;
         cameraHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -164,15 +167,25 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     @Override
     public void close() {
-        generation++;
+        final int gen = ++generation;
         latest = null;
+        closedDone = false;
         cameraHandler.post(new Runnable() {
             @Override
             public void run() {
                 wanted = false;
                 closeNow();
+                if (gen == generation) {
+                    closedDone = true;
+                }
             }
         });
+    }
+
+    /** Closed on the camera thread, and no detector run in flight (the brain speaks only then, R6). */
+    @Override
+    public boolean quiet() {
+        return closedDone && !busy;
     }
 
     @Override

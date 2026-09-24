@@ -163,6 +163,17 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "face_crop_without_a_face_uses_the_top_quarter_of_the_person",
         "replies_look_reads_the_frame_box_kind_and_line",
         "replies_name_keeps_one_or_two_words_and_fills_the_placeholder",
+        # The fixes from Explore on Claude's first live test
+        "tuning_defaults_roam_45_to_90_s_and_two_15_s_claude_tries",
+        "claude_other_pick_on_a_differently_named_detector_box_faces_without_driving",
+        "claude_other_pick_with_a_synonym_or_shared_word_is_approached",
+        "claude_pick_needs_iou_0_3_not_a_centre_inside_its_box",
+        "claude_repeat_of_a_recent_thing_is_nothing", "claude_living_pick_during_cool_down_is_nothing",
+        "prompt_cool_down_firmly_rules_out_people_and_animals", "prompt_recent_picks_are_ruled_out",
+        "claude_camera_closed_at_speak_entry_on_every_path",
+        "claude_speech_waits_for_an_in_flight_detector_run",
+        "claude_speech_goes_ahead_when_the_camera_never_goes_quiet",
+        "claude_stops_are_45_to_90_s_apart_and_he_roams_between",
     )
 
     @classmethod

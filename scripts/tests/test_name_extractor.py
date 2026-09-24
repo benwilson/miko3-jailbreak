@@ -28,6 +28,9 @@ class NameExtractorHarnessTest(unittest.TestCase):
         "this_is", "my_names", "name_then_trailer", "bare_full_name", "bare_name_please", "hyphenated",
         "im_fine_is_null", "im_not_telling_is_null", "sentence_is_null", "empty_is_null",
         "null_is_null", "blank_is_null", "hello_alone_is_null", "yes_is_null", "digits_is_null",
+        "clipped_s_tail", "clipped_s_no_apostrophe", "clipped_m_tail", "clipped_re_tail",
+        "names_ben", "its_ben", "im_ben", "stray_letter_before_name", "stray_letter_inside_name",
+        "lone_letter_is_null",
     )
 
     @classmethod

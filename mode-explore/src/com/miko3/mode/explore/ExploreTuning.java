@@ -98,7 +98,7 @@ final class ExploreTuning {
     final float fillArea;
     /**
      * Camera curiosity (KTD5). A curiosity stop comes curiosityMin..MaxMs of
-     * wandering after the last one. A scan takes up to scanLooks looks with a
+     * wandering after the last one ends, however it ends. A scan takes up to scanLooks looks with a
      * scanTurnMs step turn between them. A look counts only if its frame was
      * captured lookSettleMs after he stopped moving; no such look within
      * firstLookTimeoutMs of opening the camera (lookTimeoutMs later) is a camera
@@ -145,6 +145,8 @@ final class ExploreTuning {
     final int askAttempts;
     final long askTimeoutMs;
     final long sayTimeoutMs;
+    /** A line waits at most this long for the camera and detector to go quiet (R6; a detector run is ~1 s). */
+    final long quietWaitMs;
     final int recentPicksMax;
     /**
      * Meeting a person (explore on Claude U5, KTD3, KTD4): the match request and
@@ -228,6 +230,7 @@ final class ExploreTuning {
         askAttempts = Math.max(1, b.askAttempts);
         askTimeoutMs = b.askTimeoutMs;
         sayTimeoutMs = b.sayTimeoutMs;
+        quietWaitMs = Math.max(0, b.quietWaitMs);
         recentPicksMax = Math.max(0, b.recentPicksMax);
         meetTimeoutMs = b.meetTimeoutMs;
         listenMs = b.listenMs;
@@ -326,8 +329,9 @@ final class ExploreTuning {
         private float unsureFloor = 0.2f;
         private float fillHeight = 0.7f;
         private float fillArea = 0.4f;
-        private long curiosityMinMs = 20000;
-        private long curiosityMaxMs = 40000;
+        // 45-90 s of wandering between stops: the owner likes him driving around.
+        private long curiosityMinMs = 45000;
+        private long curiosityMaxMs = 90000;
         private int scanLooks = 3;
         private long scanTurnMs = 700;
         private long lookSettleMs = 400;
@@ -352,11 +356,13 @@ final class ExploreTuning {
         private long disappointedMs = 1400;
         private long puzzledMs = 1100;
         private long peopleCooldownMs = 120000;
-        // Two tries of about 10 s (R7): a stop with Claude unreachable falls back within ~20 s (AE4).
+        // Two tries of 15 s (R7): live, look requests took ~3 s but two in a row ran
+        // past 10 s. A stop with Claude unreachable falls back within ~30 s (AE4).
         private int askAttempts = 2;
-        private long askTimeoutMs = 10000;
+        private long askTimeoutMs = 15000;
         // A few seconds of speech (R5), plus the launcher's synthesis; only a backstop.
         private long sayTimeoutMs = 15000;
+        private long quietWaitMs = 1500;
         private int recentPicksMax = 8;
         // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
         private long meetTimeoutMs = 12000;
@@ -456,6 +462,7 @@ final class ExploreTuning {
         Builder peopleCooldownMs(long v) { peopleCooldownMs = v; return this; }
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
+        Builder quietWaitMs(long v) { quietWaitMs = v; return this; }
         Builder recentPicksMax(int v) { recentPicksMax = v; return this; }
         Builder meet(long timeoutMs, long listenMs, long listenMarginMs) {
             meetTimeoutMs = timeoutMs;

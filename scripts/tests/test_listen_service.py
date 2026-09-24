@@ -314,5 +314,29 @@ class BuildScriptTest(unittest.TestCase):
             self.assertIn(f"assets/listen/{f}", names)
 
 
+
+# Plan rule: never log names, transcripts, or spoken text; ids, timings,
+# lengths (x.length()), and outcomes are fine. A Log call's arguments, with string literals
+# dropped, must not name a variable that holds words.
+_WORDS_VAR = re.compile(r"\b(text|chunk|transcript|said|name|label|words)\b|\.text\b|\bline\b(?!\s*\.\s*id\b)")
+
+
+def _log_word_offenders(paths):
+    offenders = []
+    for path in paths:
+        for stmt in re.findall(r"Log\.\w\((.*?)\);", _read(path), flags=re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", stmt)
+            # A length or a null check says how much, not what: fine.
+            bare = re.sub(r"[\w.]+\.length\(\)|[\w.]+\s*==\s*null", "", bare)
+            if _WORDS_VAR.search(bare):
+                offenders.append(f"{path.name}: Log({' '.join(stmt.split())})")
+    return offenders
+
+
+class ListenPrivacyLogTest(unittest.TestCase):
+    def test_log_calls_never_carry_spoken_or_heard_words(self):
+        self.assertEqual(_log_word_offenders((SERVICE, ENGINE, SESSION, APP, LAUNCHER / "PeopleService.java", LAUNCHER / "PeopleStore.java")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

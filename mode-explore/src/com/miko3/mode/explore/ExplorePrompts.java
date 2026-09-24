@@ -56,11 +56,13 @@ final class ExplorePrompts {
                 sb.append(i == 0 ? "" : "; ").append(kindWord(r.kind)).append(' ').append(r.label)
                         .append(", ").append(Math.max(0, r.agoMs / 1000)).append(" s ago");
             }
-            sb.append(". Prefer something new over these.");
+            sb.append(". Do not pick anything on this list again, nor the same kind of thing under another"
+                    + " name, unless it is a person or an animal: pick something new, or answer interesting false.");
         }
         if (request.livingCoolingDown) {
-            sb.append(" He greeted a person or an animal a moment ago, so pick a thing this time"
-                    + " unless there is nothing else.");
+            sb.append(" He greeted a person or an animal a moment ago. Do not pick a person or an animal this"
+                    + " time, even if one is in view: pick the most interesting other thing, or answer"
+                    + " interesting false if there is none.");
         }
         sb.append(" Answer with interesting false if nothing is worth a reaction (an empty wall, a floor). "
                 + "Otherwise give the frame number it is in, its box in that frame's pixels as"

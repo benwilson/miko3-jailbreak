@@ -30,6 +30,17 @@ public final class NameExtractorHarness {
         {"bare_full_name", "sarah jones", "Sarah Jones"},
         {"bare_name_please", "Sarah, please", "Sarah"},
         {"hyphenated", "call me mary-kate", "Mary-Kate"},
+        // Contraction tails the recognizer clips off the front (live test: "'S BEN").
+        {"clipped_s_tail", "'S BEN", "Ben"},
+        {"clipped_s_no_apostrophe", "S BEN", "Ben"},
+        {"clipped_m_tail", "'M BEN", "Ben"},
+        {"clipped_re_tail", "'RE BEN", "Ben"},
+        {"names_ben", "name's Ben", "Ben"},
+        {"its_ben", "it's Ben", "Ben"},
+        {"im_ben", "I'm Ben", "Ben"},
+        {"stray_letter_before_name", "a ben", "Ben"},
+        {"stray_letter_inside_name", "ben s", "Ben"},
+        {"lone_letter_is_null", "S", null},
         // Replies that aren't a name.
         {"im_fine_is_null", "I'm fine", null},
         {"im_not_telling_is_null", "I'm not telling you", null},

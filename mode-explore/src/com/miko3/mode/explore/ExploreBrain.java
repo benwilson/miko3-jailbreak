@@ -162,6 +162,12 @@ final class ExploreBrain {
 
         /** The newest recognized frame since open(), or null. */
         Look latest();
+
+        /**
+         * Closed and idle: close() has taken effect and no detector run is in
+         * flight. close() is asynchronous, so speech waits for this (R6).
+         */
+        boolean quiet();
     }
 
     /**
@@ -200,6 +206,10 @@ final class ExploreBrain {
         public Look latest() {
             return null;
         }
+
+        public boolean quiet() {
+            return true;
+        }
     };
 
     /** Where transitions are narrated, for logcat. */
@@ -229,6 +239,12 @@ final class ExploreBrain {
         /** The camera is open in exactly these (R2, AE6). */
         boolean curious() {
             return this == SCAN || this == FACE || this == APPROACH || this == INSPECT || this == REACT_HERE;
+        }
+
+        /** Part of a curiosity stop, from the scan until he is back to wandering. */
+        boolean inStop() {
+            return curious() || this == ASK || this == ORIENT || this == MEET || this == SPEAK
+                    || this == ASK_NAME || this == LISTEN || this == NAME || this == REMEMBER || this == NAME_CLIP;
         }
     }
 
@@ -338,6 +354,9 @@ final class ExploreBrain {
     private Then afterOrient;
     /** When the backstop ends SPEAK. */
     private long sayUntil;
+    /** A line waiting for the camera and detector to go quiet, and how long it waits at most. */
+    private String pendingLine;
+    private long quietUntil;
     // ---- meeting a person (explore on Claude U5) ----
     /** MEET waits for the match request, then (if that failed) the lines-only request. */
     private boolean meetLines;
@@ -464,6 +483,7 @@ final class ExploreBrain {
             return;
         }
         stepping = true;
+        boolean wasInStop = state.inStop();
         try {
             boolean f = fresh;
             do {
@@ -472,6 +492,12 @@ final class ExploreBrain {
                 f = false;
             } while (again && state != State.STOPPED);
             syncCamera();
+            // However a stop ends (a line, NOTHING, a skip, the fallback, a
+            // failure, a hazard, the lease), the next one is a full gap of
+            // wandering away. Live, stops began ~0.5 s apart and he never roamed.
+            if (wasInStop && !state.inStop() && state != State.STOPPED) {
+                scheduleCuriosity(clock.nowMs());
+            }
         } finally {
             stepping = false;
         }
@@ -599,6 +625,9 @@ final class ExploreBrain {
                 meetStep(now);
                 break;
             case ASK_NAME:
+                if (!lineStarted(now)) {
+                    break;
+                }
                 if (port.sayFinished() || now >= sayUntil) {
                     startListening(now);
                 }
@@ -618,6 +647,9 @@ final class ExploreBrain {
                 }
                 break;
             case SPEAK:
+                if (!lineStarted(now)) {
+                    break;
+                }
                 if (port.sayFinished()) {
                     finishPick(now);
                 } else if (now >= sayUntil) {
@@ -1114,11 +1146,11 @@ final class ExploreBrain {
         target = null;
         pick = null;
         stranger = null;
+        pendingLine = null;
         afterOrient = null;
         scanned.clear();
         askedFrames.clear();
         cues.clear();
-        scheduleCuriosity(now);
         enterPause(now, pauseMs(), false);
     }
 
@@ -1199,8 +1231,7 @@ final class ExploreBrain {
         }
         asking = false;
         if (a.status == CuriosityPort.Answer.Status.NOTHING) {
-            note("Claude: nothing interesting here");
-            endCuriosity(now);
+            nothing(now, "Claude: nothing interesting here");
         } else if (a.status == CuriosityPort.Answer.Status.PICK && validPick(a)) {
             onPick(now, a);
         } else {
@@ -1228,9 +1259,13 @@ final class ExploreBrain {
         // A person's label is Claude's description of them: kept out of the trace.
         note("Claude picked " + (a.kind == CuriosityPort.Kind.PERSON ? "a person" : a.toString())
                 + " (look " + (look + 1) + ")");
+        // The prompt rules these out; a pick that ignores it wastes no more of the stop.
         if (a.kind.isLiving() && now < peopleIgnoredUntil) {
-            note("greeted people and animals recently; carrying on");
-            endCuriosity(now);
+            nothing(now, "greeted people and animals recently: as good as nothing, carrying on");
+            return;
+        }
+        if (!a.kind.isLiving() && seenLoosely(a.box.label)) {
+            nothing(now, "reacted to that already: as good as nothing, carrying on");
             return;
         }
         pick = a;
@@ -1249,29 +1284,118 @@ final class ExploreBrain {
         }
     }
 
-    /** The detector's box in that look overlapping Claude's, of the same broad kind (KTD7), or null. */
+    /**
+     * The detector's box in that look that is the same thing as Claude's (KTD7),
+     * or null: the same broad kind, overlapping by at least pickMatchIou, and for
+     * an OTHER pick, labels that agree loosely too. Live, a "potted plant" pick
+     * drove him at a "dresser" box when the broad kind was the only rule.
+     */
     private Detection detectorAgrees(List<Detection> detections, CuriosityPort.Answer a) {
         Detection best = null;
         float bestIou = -1f;
-        float px0 = Math.min(a.box.x0, a.box.x1);
-        float px1 = Math.max(a.box.x0, a.box.x1);
-        float py0 = Math.min(a.box.y0, a.box.y1);
-        float py1 = Math.max(a.box.y0, a.box.y1);
         for (Detection d : detections) {
             if (d.score < tuning.confidenceFloor || Sighting.BACKGROUND.contains(d.label)
                     || !CuriosityPort.Kind.of(d.label).sameBroadKind(a.kind)) {
                 continue;
             }
+            if (a.kind == CuriosityPort.Kind.OTHER && !labelsAgree(d.label, a.box.label)) {
+                continue;
+            }
             float iou = d.iou(a.box);
-            float dx = (d.x0 + d.x1) / 2;
-            float dy = (d.y0 + d.y1) / 2;
-            boolean inside = dx >= px0 && dx <= px1 && dy >= py0 && dy <= py1;
-            if ((iou >= tuning.pickMatchIou || inside) && iou > bestIou) {
+            if (iou >= tuning.pickMatchIou && iou > bestIou) {
                 best = d;
                 bestIou = iou;
             }
         }
         return best;
+    }
+
+    /** A stop that ends with nothing to react to: no line, back to wandering (R4). */
+    private void nothing(long now, String why) {
+        note(why);
+        endCuriosity(now);
+    }
+
+    /** Whether a thing he reacted to this session (seen) loosely matches this label. */
+    private boolean seenLoosely(String label) {
+        for (String s : seen) {
+            if (labelsAgree(s, label)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Words that describe rather than name a thing, so sharing one is no match. */
+    private static final Set<String> DESCRIBING = new HashSet<String>(java.util.Arrays.asList(
+            "a", "an", "the", "of", "and", "with", "on", "in", "some", "small", "big", "little", "large", "tiny",
+            "huge", "old", "new", "green", "red", "blue", "yellow", "white", "black", "brown", "grey", "gray",
+            "pink", "purple", "orange", "wooden", "wood", "metal", "plastic", "shiny", "round", "square", "tall",
+            "short", "pair", "cute", "fluffy", "colorful", "colourful", "empty", "full"));
+
+    /** Simple synonyms: one thing the detector and Claude may name differently. */
+    private static final String[][] SYNONYMS = {
+        {"plant", "potted plant", "pot plant", "houseplant", "succulent", "cactus", "fern", "flower", "bonsai"},
+        {"cup", "mug", "glass", "teacup"},
+        {"couch", "sofa", "settee"},
+        {"tv", "television", "monitor", "screen", "tv monitor"},
+        {"phone", "cell phone", "mobile phone", "smartphone", "cellphone"},
+        {"dresser", "chest of drawers", "drawers", "cabinet", "cupboard", "sideboard"},
+        {"table", "desk"},
+        {"teddy bear", "teddy", "stuffed animal", "plush", "plushie", "soft toy"},
+        {"lamp", "light"},
+        {"laptop", "computer"},
+    };
+
+    /**
+     * Whether two labels loosely name the same thing: a shared naming word
+     * (plurals folded), or both in one synonym group. So "succulent" matches
+     * "potted plant" and "green potted plant" matches "plant", but "potted plant"
+     * never matches "dresser".
+     */
+    static boolean labelsAgree(String a, String b) {
+        List<String> wa = labelWords(a);
+        List<String> wb = labelWords(b);
+        for (String w : wa) {
+            if (!DESCRIBING.contains(w) && wb.contains(w)) {
+                return true;
+            }
+        }
+        for (String[] group : SYNONYMS) {
+            if (mentions(wa, group) && mentions(wb, group)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean mentions(List<String> words, String[] group) {
+        for (String term : group) {
+            List<String> t = labelWords(term);
+            for (int i = 0; i + t.size() <= words.size(); i++) {
+                if (words.subList(i, i + t.size()).equals(t)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Lower-case words with a plural "s" folded ("plants" is "plant"). */
+    private static List<String> labelWords(String label) {
+        List<String> out = new ArrayList<String>();
+        if (label == null) {
+            return out;
+        }
+        for (String w : label.toLowerCase(java.util.Locale.ROOT).split("[^a-z]+")) {
+            if (w.length() > 3 && w.endsWith("s") && !w.endsWith("ss")) {
+                w = w.substring(0, w.length() - 1);
+            }
+            if (!w.isEmpty()) {
+                out.add(w);
+            }
+        }
+        return out;
     }
 
     /** Both tries failed (R8): back to the look that held the detector's pick, then the old path. */
@@ -1514,13 +1638,39 @@ final class ExploreBrain {
     private void say(long now, String line, State s) {
         stopMotors();
         state = s;
+        // Close the camera and detector before speech begins, not at the end of
+        // this step: synthesis competes with them for the CPU (R6, KTD6). Live,
+        // a line after APPROACH took 2.8 s to first audio.
+        syncCamera();
         if (target != null) {
             stare(target);
         } else {
             stareAt(0f, pick.box.centerY());
         }
+        pendingLine = line;
+        quietUntil = now + tuning.quietWaitMs;
+        lineStarted(now);
+    }
+
+    /**
+     * Hands the waiting line to the speech service once the camera and detector
+     * are quiet (or after quietWaitMs, as a backstop). True once it is speaking.
+     */
+    private boolean lineStarted(long now) {
+        if (pendingLine == null) {
+            return true;
+        }
+        if (!camera.quiet()) {
+            if (now < quietUntil) {
+                return false;
+            }
+            note("camera or detector still busy after " + tuning.quietWaitMs + " ms; speaking anyway");
+        }
         sayUntil = now + tuning.sayTimeoutMs;
+        String line = pendingLine;
+        pendingLine = null;
         port.say(line);
+        return false;
     }
 
     private void finishPick(long now) {

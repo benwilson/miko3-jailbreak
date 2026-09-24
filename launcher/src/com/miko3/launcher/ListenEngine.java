@@ -288,25 +288,25 @@ final class ListenEngine implements ListenSession.Ears {
 
     // ---- model files ----
 
-    /** assets/name/ copied into the files directory, unless the copy there
+    /** assets/model/ copied into the files directory, unless the copy there
      * already carries this build's stamp (written last, so an interrupted
      * copy is redone). Same scheme as SpeechEngine's voice. */
-    static File installAssets(Context context, String name) throws IOException {
+    static File installAssets(Context context, String model) throws IOException {
         AssetManager assets = context.getAssets();
-        String stamp = SpeechEngine.readAll(assets.open(name + "/" + STAMP)).trim();
-        File dir = new File(context.getFilesDir(), name);
+        String stamp = SpeechEngine.readAll(assets.open(model + "/" + STAMP)).trim();
+        File dir = new File(context.getFilesDir(), model);
         File stampFile = new File(dir, STAMP);
         if (stampFile.isFile() && stamp.equals(SpeechEngine.readAll(new FileInputStream(stampFile)).trim())) {
             return dir;
         }
-        Log.i(TAG, "copying " + name + " " + stamp + " out of the APK");
-        File tmp = new File(context.getFilesDir(), name + ".tmp");
+        Log.i(TAG, "copying " + model + " " + stamp + " out of the APK");
+        File tmp = new File(context.getFilesDir(), model + ".tmp");
         SpeechEngine.deleteTree(tmp);
-        SpeechEngine.copyAssets(assets, name, tmp);
+        SpeechEngine.copyAssets(assets, model, tmp);
         new File(tmp, STAMP).delete();
         SpeechEngine.deleteTree(dir);
         if (!tmp.renameTo(dir)) {
-            throw new IOException("could not move " + name + " into " + dir);
+            throw new IOException("could not move " + model + " into " + dir);
         }
         OutputStream out = new FileOutputStream(stampFile);
         try {

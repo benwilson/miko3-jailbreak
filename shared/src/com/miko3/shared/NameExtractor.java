@@ -16,7 +16,8 @@ import java.util.Set;
  * "my name's X", "I'm X", "I am X", "call me X", "it's X", "this is X", or the
  * name alone. X is one or two words ("i am sarah jones" gives "Sarah Jones"),
  * stopping at a word like "thanks" or "from". A greeting or filler before it
- * ("hi", "um") is skipped.
+ * ("hi", "um") is skipped, and so is a contraction tail the recognizer
+ * clipped from the front ("'S BEN" gives "Ben"). Stray single letters are dropped.
  *
  * Returns the name in title case, or null when the reply has no clear name
  * ("what?", "no", "I don't know", "I'm fine"). null is not "no reply": the
@@ -33,6 +34,10 @@ public final class NameExtractor {
         {"you", "can", "call", "me"}, {"call", "me"}, {"i", "am"}, {"i'm"}, {"im"},
         {"it's"}, {"its"}, {"it", "is"}, {"this", "is"}, {"name's"}, {"names"}, {"the", "name's"},
     };
+
+    /** Contraction tails left when the recognizer clips the front of a reply
+     * ("'S BEN" from "name's Ben"); skipped at the start like fillers. */
+    private static final Set<String> FRAGMENTS = set("s", "m", "re", "ll", "ve", "d", "t");
 
     /** Skipped at the start of a reply. */
     private static final Set<String> FILLERS = set(
@@ -68,7 +73,8 @@ public final class NameExtractor {
     public static String extract(String transcript) {
         List<String> words = words(transcript);
         int start = 0;
-        while (start < words.size() && FILLERS.contains(words.get(start))) {
+        while (start < words.size()
+                && (FILLERS.contains(words.get(start)) || FRAGMENTS.contains(words.get(start)))) {
             start++;
         }
         if (start >= words.size()) {
@@ -155,7 +161,9 @@ public final class NameExtractor {
         for (String w : sb.toString().trim().split("\\s+")) {
             // Strip quote marks and dashes used as punctuation around a word.
             w = w.replaceAll("^['-]+|['-]+$", "");
-            if (!w.isEmpty()) {
+            // A stray single letter ("a", a clipped "s") is never part of a
+            // name; "i" stays for "i am".
+            if (!w.isEmpty() && (w.length() > 1 || w.equals("i"))) {
                 out.add(w);
             }
         }

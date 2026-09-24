@@ -17,7 +17,8 @@ The robot's voice (voice plan U5, KTD3/KTD4): the launcher's SpeechService
 runs a Piper voice through sherpa-onnx. The build downloads sherpa-onnx's
 pinned, checksummed Android release into the gitignored tools/third_party/
 (its Java API jar, and its arm64 libsherpa-onnx-jni.so plus the
-libonnxruntime.so that library was built against) and bundles them. The voice
+libonnxruntime.so that library was built against) and bundles them, with the
+vendor's libmiko_drivers.so for the drive lease (VENDOR_LIB_DIR). The voice
 itself is staged into the APK's assets/voice/ as model.onnx, tokens.txt and
 espeak-ng-data/, plus a stamp.txt the launcher uses to know when to copy it
 out again: from launcher/assets/voice/ once the trained voice is committed
@@ -63,6 +64,15 @@ MANIFEST = APP_DIR / "AndroidManifest.xml"
 KEYSTORE = APP_DIR / "miko3-launcher.keystore"
 APK = APP_DIR / "miko3-launcher.apk"
 BUILD = APP_DIR / "build"
+
+# The vendor's libmiko_drivers.so, bundled as the launcher's own native
+# library: DriveLeaseService's DirectMotorDriver uses SensorModule, which
+# System.loadLibrary()s it, and the /system/lib64 copy is out of reach behind
+# linker namespace isolation (live test: NoClassDefFoundError SensorModule).
+# Same source as build-mode-explore.py and build-mode-remote-control.py.
+VENDOR_ABI = "arm64-v8a"
+VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / VENDOR_ABI
+DRIVER_LIB = "libmiko_drivers.so"
 
 KEYSTORE_ALIAS = "miko3launcher"
 KEYSTORE_PASS = "miko3launcher"
@@ -235,6 +245,20 @@ def voice_stamp(voice_dir):
     return h.hexdigest()[:16]
 
 
+def vendor_native_libs(lib_dir=None):
+    """[(abi, so_path)] for the motor-driver library, or BuildError naming the
+    missing file and the directory searched."""
+    lib = Path(lib_dir if lib_dir is not None else VENDOR_LIB_DIR) / DRIVER_LIB
+    if not lib.is_file():
+        raise BuildError(
+            f"!! vendor motor-driver library missing: {lib}\n"
+            "   it comes from ServiceExam's APK (lib/arm64-v8a/); re-extract it into "
+            "tools/serviceexam_jadx/resources/ (jadx) before building the launcher.\n"
+            "   Without it the drive lease's DirectMotorDriver cannot load SensorModule, "
+            "and the launcher crashes when a mode takes the lease.")
+    return [(VENDOR_ABI, lib)]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Build and sign the Miko 3 custom launcher APK.")
     ap.add_argument("--sdk", help="Android SDK root (default: auto-detect)")
@@ -242,10 +266,13 @@ def main():
                     help="fail if the toolchain is missing instead of installing it")
     args = ap.parse_args()
 
+    # Checked first, so a missing library never costs toolchain work.
+    vendor_native_libs()
     sdk = bc.find_sdk(args.sdk)
     sdk, bt, android_jar, javac, keytool = bc.ensure_toolchain(sdk, not args.no_bootstrap)
     jh = bc.java_home()
     sherpa_jar, sherpa_libs = sherpa_onnx()
+    native_libs = vendor_native_libs() + sherpa_libs
     placeholder = voice_root()
     voice_dir = (placeholder or LAUNCHER_ASSETS) / "voice"
     print(f"== voice: {voice_dir.relative_to(REPO)}"
@@ -274,7 +301,7 @@ def main():
             asset_sources=[LAUNCHER_ASSETS] + ([placeholder] if placeholder else [])
             + [listen_root, stamp_root, SHARED_ASSETS],
             res_dir=RES,
-            native_libs=sherpa_libs,
+            native_libs=native_libs,
             jars=[sherpa_jar],
         )
     print(f"\n== 4/4 BUILT: {APK.relative_to(REPO)} ({APK.stat().st_size} bytes) ==")

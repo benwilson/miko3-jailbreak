@@ -794,7 +794,16 @@ public final class SpeechServiceHarness {
                         return "";
                     }
                 });
-                check(n, t.threads == 4 && t.maxWords == 16, t.threads + "/" + t.maxWords);
+                check(n, t.threads == 4 && t.maxWords == 10, t.threads + "/" + t.maxWords);
+            }
+        });
+        scenario("default_splits_a_13_word_line_at_its_comma", new Scenario() {
+            public void run(String n) throws Exception {
+                // Live test: single 13-word lines took 2.2-2.8 s to first audio.
+                List<String> c = SpeechQueue.chunks(
+                        "Oh wow, look at that shiny green plant sitting by the window!",
+                        SpeechTuning.DEFAULT_MAX_WORDS);
+                check(n, c.size() == 2 && words(c.get(0)) <= 10, c.toString());
             }
         });
         scenario("tuning_overrides_and_clamps", new Scenario() {
@@ -806,14 +815,14 @@ public final class SpeechServiceHarness {
                     }
                 };
                 p.put(SpeechTuning.THREADS_PROP, "2");
-                p.put(SpeechTuning.MAX_WORDS_PROP, "10");
+                p.put(SpeechTuning.MAX_WORDS_PROP, "12");
                 SpeechTuning a = SpeechTuning.from(props);
                 p.put(SpeechTuning.THREADS_PROP, "64");
                 p.put(SpeechTuning.MAX_WORDS_PROP, "1");
                 SpeechTuning b = SpeechTuning.from(props);
                 p.put(SpeechTuning.THREADS_PROP, "lots");
                 SpeechTuning c = SpeechTuning.from(props);
-                check(n, a.threads == 2 && a.maxWords == 10 && b.threads == 4 && b.maxWords == 4
+                check(n, a.threads == 2 && a.maxWords == 12 && b.threads == 4 && b.maxWords == 4
                         && c.threads == 4, a.threads + "," + a.maxWords + " " + b.threads + "," + b.maxWords
                         + " " + c.threads);
             }

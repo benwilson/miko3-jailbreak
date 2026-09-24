@@ -47,8 +47,8 @@ public class ListenService extends Service {
             engine.listen(maxMs, new ListenEngine.Answer() {
                 @Override
                 public void answer(ListenSession.Result r) {
-                    Log.i(TAG, "uid " + uid + " listen " + r
-                            + (r.outcome == ListenSession.Outcome.HEARD ? ": \"" + r.text + "\"" : ""));
+                    Log.i(TAG, "uid " + uid + " listen " + r + (r.outcome == ListenSession.Outcome.HEARD
+                            ? ", " + (r.text == null ? 0 : r.text.length()) + " chars" : ""));
                     try {
                         switch (r.outcome) {
                             case HEARD:

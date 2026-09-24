@@ -113,5 +113,46 @@ class NothingPrivateIsLoggedTest(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class ClaudeLatencyIsLoggedTest(unittest.TestCase):
+    """Live test: two look tries timed out at 10 s while others took ~3 s. Every
+    Claude call logs how long it took in ms (no content), so slow calls show up."""
+
+    def test_every_claude_call_logs_its_latency(self):
+        body = code_only(src("ClaudeCuriosity.java"))
+        calls = body.split("claude.messages(")[1:]
+        self.assertEqual(len(calls), 5)
+        for i, after in enumerate(calls):
+            window = after[:900]
+            logs = re.findall(r"Log\.[diwe]\((.*?)\);", window, re.S)
+            self.assertTrue(logs, f"call {i + 1}: no Log after it")
+            self.assertRegex(logs[0], r'" ms"', f"call {i + 1}: its first Log has no latency: {logs[0]}")
+
+
+class BrainTraceIsPrivateTest(unittest.TestCase):
+    """The brain's notes go to logcat (ModeApp's trace), so they follow the same
+    rule: no spoken lines, transcripts, or names, and a person pick's label
+    (Claude's description of them) stays out. Detector class labels are fine."""
+
+    PRIVATE = re.compile(r"\b(\w*[lL]ine|text|transcript|name|named|heard)\b|\.text\b")
+
+    def test_notes_carry_no_lines_transcripts_or_names(self):
+        offenders = []
+        for call in re.findall(r"\bnote\((.*?)\);", code_only(src("ExploreBrain.java")), re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            bare = re.sub(r"[\w.]+\s*[!=]=\s*null", "", bare)
+            if self.PRIVATE.search(bare):
+                offenders.append(" ".join(call.split()))
+        self.assertEqual(offenders, [])
+
+    def test_a_person_picks_label_is_never_noted(self):
+        brain = code_only(src("ExploreBrain.java"))
+        for call in re.findall(r"\bnote\((.*?)\);", brain, re.S):
+            if "a.toString()" in call or "pick.toString()" in call:
+                self.assertIn("Kind.PERSON", call, f"a pick is noted without hiding a person: {call}")
+            self.assertNotRegex(call, r"\b(a|pick)\.box\.label\b")
+
+    def test_the_trace_is_what_reaches_logcat(self):
+        self.assertIn('Log.i("ExploreBrain", message)', src("ModeApp.java"))
+
 if __name__ == "__main__":
     unittest.main()
