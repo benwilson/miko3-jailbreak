@@ -17,6 +17,10 @@ public final class LauncherProtocol {
      * (settings plan U5). Modes go through RobotSettingsClient, not this directly. */
     public static final String ROBOT_SETTINGS_ACTION = "com.miko3.launcher.ROBOT_SETTINGS";
 
+    /** Intent action a mode app binds to reach the launcher's SpeechService
+     * (voice plan U5). Modes go through RobotSpeechClient, not this directly. */
+    public static final String ROBOT_SPEECH_ACTION = "com.miko3.launcher.ROBOT_SPEECH";
+
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 
     /** Boolean extra on a launch Intent the launcher sends a mode's Activity, asking

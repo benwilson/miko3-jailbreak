@@ -26,6 +26,7 @@ SHARED = SHARED_SRC / "com" / "miko3" / "shared"
 HARNESS = TESTS / "fixtures" / "robot_settings_service_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "launcher" / "RobotSettingsServiceHarness.java"
 CALLER_CHECK = LAUNCHER / "CallerCheck.java"
+CALLER_GATE = LAUNCHER / "CallerGate.java"
 SERVICE = LAUNCHER / "RobotSettingsService.java"
 INTERFACE = SHARED / "RobotSettings.java"
 ACCESS = SHARED / "ClaudeAccess.java"
@@ -180,10 +181,13 @@ class ServiceWiringTest(unittest.TestCase):
         self.assertNotRegex(self.src, r"private\s+(final\s+)?ClaudeSettings\.Credentials\s+\w+\s*;")
 
     def test_caller_identity_comes_from_binder_and_package_manager(self):
+        # The Android lookups live in CallerGate, shared with SpeechService.
+        self.assertIn("CallerGate.enforce(", self.src)
+        gate = _read(CALLER_GATE)
         for needle in ("Binder.getCallingUid()", "getPackagesForUid(", "GET_SIGNATURES",
                        'MessageDigest.getInstance("SHA-256")', "CallerCheck.allows(",
                        "throw new SecurityException("):
-            self.assertIn(needle, self.src)
+            self.assertIn(needle, gate)
 
     def test_not_set_up_answer_when_store_is_not_set_up(self):
         # The answer rule the harness exercises (AE7) is the one the service returns.
@@ -197,7 +201,7 @@ class ServiceWiringTest(unittest.TestCase):
 
     def test_no_log_call_touches_the_key(self):
         # R14: no Log line (or anything else printing) mentions the key.
-        for path in (SERVICE, INTERFACE, ACCESS, CLIENT, CALLER_CHECK):
+        for path in (SERVICE, INTERFACE, ACCESS, CLIENT, CALLER_CHECK, CALLER_GATE):
             src = _read(path)
             with self.subTest(file=path.name):
                 self.assertTrue(src, f"{path.name} missing")

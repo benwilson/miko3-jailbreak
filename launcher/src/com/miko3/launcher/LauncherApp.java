@@ -60,6 +60,7 @@ public class LauncherApp extends Application {
     private RoutingHttpServer server;
     private WifiHttpHandler wifi;
     private ClaudeSettings claudeSettings;
+    private SpeechEngine speech;
     // The Settings page's tokens (KTD6). Four, so the robot's own WebView sitting
     // on the page doesn't expire a LAN browser's form, or the other way round.
     private final PageToken settingsToken = new PageToken(4);
@@ -92,6 +93,10 @@ public class LauncherApp extends Application {
                         return System.currentTimeMillis();
                     }
                 });
+        // The robot's voice (voice plan U5): loaded once, on its own thread, so
+        // SpeechService is ready by the time a mode asks it to speak.
+        speech = new SpeechEngine(this);
+        speech.start();
         wifi = new WifiHttpHandler(this);
         startServer();
 
@@ -108,6 +113,11 @@ public class LauncherApp extends Application {
      * page and the settings service. */
     ClaudeSettings claudeSettings() {
         return claudeSettings;
+    }
+
+    /** The robot's voice and its queue of lines, for SpeechService. */
+    SpeechEngine speech() {
+        return speech;
     }
 
     /**
