@@ -35,6 +35,7 @@ Explore's curiosity stops today recognize only 341 fixed object names with an on
 - **A slow or failed Claude call is retried before falling back.** (session-settled: user-directed — the owner asked that he prompt Claude again rather than give up; the retry limit is this plan's choice.) Governs R7, R8.
 - **People are remembered across days by face, kept until the owner forgets them, and only once they reply.** (session-settled: user-directed — chosen over session-only text memory, no people memory, and automatic expiry; and over storing faces of people who don't answer.) Governs R9, R10, R12, R13, R14.
 - **A new person is asked their name, heard with on-robot speech recognition.** (session-settled: user-directed — chosen over sending the reply to the Linux host and over asking without listening.) Governs R11, R12.
+- **A person's face is checked against known people on sight, before they reply.** (session-settled: user-directed — chosen over talking first and checking only after a reply. Faster greetings for known people; the owner accepts that a stranger's face crop goes to the Claude endpoint for a match before they have spoken. Storing still waits for a reply, per R12.) Governs R9.
 - **Explore goes on Claude before Voice mode.** (session-settled: user-directed — chosen over Voice first.)
 
 ### Requirements
@@ -95,11 +96,11 @@ This plan covers Explore's curiosity stops and people memory. The breakdown belo
 ### Dependencies / Assumptions
 
 - Claude reads several images in one request and can report roughly where something is in a frame.
-- The robot's microphone works in Explore's process; voice mode verified the audio path. The microphone is ducked while the robot speaks, so he listens only after he finishes speaking.
+- The robot's microphone works in the launcher's process, which has never recorded audio (voice mode verified the path in its own process). U7 verifies it. The microphone is ducked while the robot speaks, so he listens only after he finishes speaking.
 - sherpa-onnx, already in the launcher, also runs small English speech-recognition models. Unusual names may be misheard; Rename (R16) is the correction path.
 - Consent basis (owner's statement): people who talk to the robot have consented to having their face remembered. Faces are stored only after a reply (R12).
 - Owner-accepted: the Settings page is reachable by anyone on the Wi-Fi without a login, so the People section is too.
-- A curiosity stop happens every 20–40 seconds, so the Claude cost is one or two image requests per stop.
+- A curiosity stop happens every 20–40 seconds, so the Claude cost is one image request per stop, and up to three for a new person.
 
 ### Sources / Research
 
@@ -118,11 +119,11 @@ Product Contract preservation: changed: R12 — after the brainstorm, the owner 
 ### Key Technical Decisions
 
 - KTD1. **Listening and the people store live in the launcher, next to speaking.** sherpa-onnx is already in the launcher, and adding it to Explore would clash with Explore's ONNX Runtime 1.30.0, the same reason the voice plan put speech there. The Settings page, also in the launcher, renders the People section from that store. Explore reaches both through caller-checked Binder services, built like `RobotSettingsService` and `SpeechService`. The launcher gains the RECORD_AUDIO permission. Implements R11, R13, R15, R16.
-- KTD2. **One "look" request per stop with structured output, and one extra request only for a person.** The look request sends the three 640x480 JPEG scan frames and asks for JSON: `{interesting: bool, frame, box:[x1,y1,x2,y2], kind: person|animal|technology|other, label, line}`. The format is enforced with `output_config.format`, falling back to prompt-only JSON if the proxy strips that field. The person request (KTD3) happens only when the look request picks a person. Implements R1, R2, R5, R9.
-- KTD3. **Face matching never sends names.** The person request sends the new face crop plus up to 10 stored faces (224 px JPEGs, most recently seen first), labelled "Reference 1..N", and states that they are consented photos from the household's own robot. It asks for `{match: N | "none" | "unsure", line}`. A known person's line uses a `{name}` placeholder, which the robot fills in on its side. "none", "unsure", or a refusal all count as a new person. Implements R9, R10, R14.
+- KTD2. **One "look" request per stop with structured output. A person adds a match request, and a new person adds a remember request plus an optional text-only name request, so a stop costs up to three image requests.** The look request sends the three 640x480 JPEG scan frames and asks for JSON: `{interesting: bool, frame, box:[x1,y1,x2,y2], kind: person|animal|technology|other, label, line}`. The request also carries a short list of this session's recent picks (label, kind, and when), so Claude can tell new from familiar (R2). Explore's existing `seen` set and people cool-down stay in force, so the same person isn't greeted every stop. The format is enforced with `output_config.format`, falling back to prompt-only JSON if the proxy strips that field. The person request (KTD3) happens only when the look request picks a person. Implements R1, R2, R5, R9.
+- KTD3. **Face matching never sends names.** The person request sends the new face crop plus up to 10 stored faces (224 px JPEGs, most recently seen first), labelled "Reference 1..N", and states that they are consented photos from the household's own robot. It asks for `{match: N | "none" | "unsure", named_line, unnamed_line, ask_line, no_reply_line}`. `named_line` uses a `{name}` placeholder, which the robot fills in on its side. `unnamed_line` greets a known person who has no stored name. `ask_line` asks a new person's name, and `no_reply_line` is the friendly line for when nobody answers. If the match request is refused, one text-only request is made for `ask_line` and `no_reply_line` (no image). If that also fails, he falls back to the detector's name clip without asking a name. "none", "unsure", or a refusal all count as a new person. Implements R9, R10, R14.
 - KTD4. **Names are heard with a streaming zipformer model and extracted on the robot first.** sherpa-onnx's streaming zipformer-en-20M (int8) runs in the launcher, with built-in endpointing (about 0.8 s of trailing silence) and a 6 s cap. The name is pulled out with patterns ("I'm X", "my name is X", "call me X", a lone word). If none match, a small text-only Claude request is the fallback. A second Claude request, given the name and the face, writes the "nice to meet you, I'll remember you" line. Implements R11, R12.
 - KTD5. **Faces are cropped with Android's built-in FaceDetector inside the chosen person box.** The hit is expanded 1.6x and saved as a 224x224 JPEG. When no face is found, the top 25% of the person box is used. No new model is added. Implements R9, R13.
-- KTD6. **Claude waits in a new brain state, polled like a look, with two tries of about 10 seconds.** The brain stays single-threaded and free of shared imports: a port starts the request and the brain polls it each tick. The HTTPS transport gets a per-call read timeout, because its fixed 30 s would break the 10 s tries. A new "thinking" eye state covers the wait. Implements R7, R8.
+- KTD6. **Claude waits in a new brain state, polled like a look, with two tries of about 10 seconds.** The brain stays single-threaded and free of shared imports: a port starts the request and the brain polls it each tick. The HTTPS transport gets a per-call read timeout, because its fixed 30 s would break the 10 s tries. A new "thinking" eye state covers the wait. The camera and detector are closed during ASK, SPEAK, LISTEN, and the person states, which stay outside the "curious" camera states. The camera is reopened only for FACE and APPROACH, and its 3 s reopen gap counts toward the stop's timing budget (R6). Implements R7, R8.
 - KTD7. **Direction comes from the scan turn plus the box's horizontal offset.** He turns to the chosen frame's scan heading, then by the box centre's offset from the frame centre. The detector's approach is used when one of its detections in that frame overlaps Claude's box with the same broad kind. Otherwise he faces the thing and doesn't drive. Implements R3.
 - KTD8. **Speaking waits for the finished callback, and listening starts only after it.** The launcher's microphone is ducked while it plays, so it listens only once the speech queue is idle. Explore speaks through `RobotSpeechClient` and polls a finished flag, with a timeout as a backstop. Implements R6, R11.
 
@@ -237,13 +238,15 @@ U1, U2, and U3 are independent building blocks. U4 needs U1. U5 needs U2, U3, an
   2. The ASK state shows the thinking eyes, starts the request through the port, and polls it, with two tries per KTD6.
   3. Turning and approaching follow KTD7.
   4. SPEAK hands the line to the port and waits for finished, with a backstop timeout.
-  5. On failure it drops to today's Sighting path. On "not interesting" it resumes exploring. A person pick hands off to U5's flow.
+  5. On failure it drops to today's Sighting path, first turning back to the heading of the look that held the detector's pick (KTD7), so the pick isn't lost. On "not interesting" it resumes exploring. A person pick hands off to U5's flow.
 - **Execution note:** Add the brain scenarios test-first, since the brain is heavily harnessed.
 - **Test scenarios:**
   - Covers AE1. The chair is on the left in frame 1 and the cat is on the right in frame 3. Claude picks frame 3's cat, he turns to frame 3's heading plus the right offset, speaks the cat line, and doesn't drive if the detector has no cat box.
   - Claude picks a box that overlaps a detector box of the same kind, so the existing approach runs before speaking.
   - Claude says nothing is interesting: no speech, and exploring resumes.
-  - Covers AE4. Both tries time out: thinking eyes, then the detector's pick and its name clip, all within the retry budget.
+  - Covers AE4. Both tries time out: thinking eyes, then he turns back to the look that held the detector's pick, then the pick and its name clip, all within the retry budget.
+  - The camera is closed during ASK and SPEAK and reopened only for FACE and APPROACH.
+  - The look request carries this session's recent picks. A person seen within the cool-down isn't greeted again.
   - A speech-finished callback that never arrives ends at the backstop timeout.
   - The scan keeps all three looks even when the first one sees something.
   - The brain still imports nothing from `com.miko3.shared` (the existing guard).
@@ -269,7 +272,9 @@ U1, U2, and U3 are independent building blocks. U4 needs U1. U5 needs U2, U3, an
   - Covers AE2. A new person replies "my name is Sarah", so `add(face, "Sarah")` is stored and the remember line is spoken.
   - Covers AE5. A new person gives no reply: nothing is stored and a friendly line is spoken.
   - Covers AE5. The reply "hmm what?" has no name, so the person is stored unnamed.
-  - The match says "unsure" or refuses, so the new-person flow runs.
+  - The match says "unsure", so the new-person flow runs with `ask_line`.
+  - The match is refused, so one text-only request supplies `ask_line` and `no_reply_line`. If that fails too, the detector's name clip plays and no name is asked.
+  - A known person with no stored name is greeted with `unnamed_line`.
   - A match reference number beyond the gallery counts as no match.
   - The listen or remember call fails: still no hang, and exploring resumes within the budget.
   - No names are ever included in the match request (checked on the fake port's captured request).
