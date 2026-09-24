@@ -26,6 +26,8 @@ final class LauncherPage {
         int battery = DeviceInfo.batteryPercent(ctx);
         String batteryStr = battery < 0 ? "unknown" : (battery + "%");
         String uptime = DeviceInfo.escapeHtml(DeviceInfo.uptime());
+        String ip = DeviceInfo.wifiIp(ctx);
+        String ipStr = ip.isEmpty() ? "not connected" : DeviceInfo.escapeHtml(ip);
 
         StringBuilder html = new StringBuilder();
         html.append("<!doctype html><html><head><meta charset=\"utf-8\">");
@@ -36,13 +38,16 @@ final class LauncherPage {
         html.append("<h1>Miko 3 &mdash; Custom Launcher</h1>");
 
         html.append("<section id=\"info\"><h2>Device</h2><table>");
+        // First row: the robot has no other way to show which address to
+        // open this page (or /settings) at from a laptop.
+        html.append("<tr><td>IP address</td><td id=\"ip\">").append(ipStr).append("</td></tr>");
         html.append("<tr><td>Model</td><td>").append(model).append("</td></tr>");
         html.append("<tr><td>Serial</td><td>").append(serial).append("</td></tr>");
         html.append("<tr><td>Battery</td><td id=\"battery\">").append(batteryStr).append("</td></tr>");
         html.append("<tr><td>Uptime</td><td id=\"uptime\">").append(uptime).append("</td></tr>");
         html.append("</table></section>");
 
-        // Battery/uptime go stale without some refresh, but a full page reload
+        // Battery/uptime/IP go stale without some refresh, but a full page reload
         // every few seconds (the original approach) re-fetches pico.min.css and
         // re-renders the whole Wi-Fi section (a WifiManager query) for two numbers
         // that change every second regardless. A lightweight poll-and-patch avoids
@@ -53,6 +58,7 @@ final class LauncherPage {
         html.append(".then(function(t){var parts=t.split('|');");
         html.append("document.getElementById('battery').textContent=parts[0];");
         html.append("document.getElementById('uptime').textContent=parts[1];");
+        html.append("document.getElementById('ip').textContent=parts[2]||'not connected';");
         html.append("});},5000);");
         html.append("</script>");
 
