@@ -494,8 +494,14 @@ raise an AEE exception, and sometimes stay unusable for about a minute of retrie
 Note that `CameraDevice.close()` returns before the close completes: gate the next
 open on `onClosed()` plus a settle gap. `ExploreCamera` waits 3 s after `onClosed()`
 (`REOPEN_GAP_MS`); 23 back-to-back open/close cycles then ran with no HAL error.
-With the camera streaming, a look takes ~2.3-2.5 s, not the ~1.1 s measured on a
-still frame.
+With the camera streaming, a 480x640 look took ~1.4-2.5 s, not the ~1.1 s measured
+on a still frame.
+
+**Smaller input (2026-09-24).** Exported at 320x416 (camera frames scaled down in the
+app), a live look takes ~0.6 s median (0.56-0.79 s) vs ~1.4 s for 480x640 in the same
+conditions. On the plant test frame it still found both pots and a plant (vase 0.74,
+succulent 0.47 and 0.27; the false "table" dropped out). 288x384 was barely faster and
+scored the plants lower. Small or distant things are what a smaller input loses.
 
 ## Open questions
 
