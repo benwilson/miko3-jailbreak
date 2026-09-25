@@ -17,7 +17,9 @@ import java.util.Locale;
  * the floor sensor, not the camera, stops him near his nose (KTD9);</li>
  * <li>a horizon test: floor never shows above the horizon, so whatever sits just
  * above it and carries on down into the lower frame is standing in the way,
- * and the further down it reaches the nearer it is.</li>
+ * and the further down it reaches the nearer it is. With the floor taught, a
+ * surface that comes well down with no floor between it and the floor run at
+ * the bottom stands where that run ends (a wall 2 ft off leaves a sliver).</li>
  * </ol>
  *
  * Teaching (R2, "floor sensor and camera together"): a frame captured while the
@@ -30,13 +32,20 @@ import java.util.Locale;
  * Plain Java (no Android or shared-driver imports) so it runs on the host JVM.
  * It never logs and keeps no pixels, only colour means (R15). Methods are
  * synchronized: ExploreCamera scores on its detect thread and forwards the
- * brain's teach and hazard calls. Thresholds are first guesses, checked on
- * real frames at U3's on-robot gate.
+ * brain's teach and hazard calls. Thresholds were tuned on U3's gate frames
+ * (this camera is dim and tilted up; see HORIZON and the luma constants), and
+ * colour distances are scaled for dim light (apart()).
  */
 final class Openness {
     static final int BINS = 16;
-    /** Where the horizon falls, as a fraction of frame height (top 0). */
-    static final float HORIZON = 0.45f;
+    /**
+     * Where the horizon falls, as a fraction of frame height (top 0). The camera
+     * sits ~10 cm up and tilts upward, so its horizon is well below the frame's
+     * middle: in the U3 gate frames the far floor through a doorway ends at ~0.85
+     * and a wall 2-3 ft away meets the floor at ~0.98, both putting it near 0.82.
+     * Floor never shows above it; everything standing on the floor crosses it.
+     */
+    static final float HORIZON = 0.8f;
     /** Floor colours kept; the least recently taught is forgotten first. */
     static final int MAX_PATCHES = 4;
     /** Samples awaiting the brain's word; the oldest is dropped first. */
@@ -44,8 +53,8 @@ final class Openness {
     /** What a colour the model never saw scores: unsure, not blocked. */
     static final float UNSURE = 0.5f;
 
-    /** A box whose bottom edge is at or below this (the bottom 20%) blocks its columns. */
-    private static final float NEAR_BOX_BOTTOM = 0.8f;
+    /** A box whose bottom edge is at or below this (the nearer half of the ground below the horizon) blocks its columns. */
+    private static final float NEAR_BOX_BOTTOM = 0.9f;
     /** What a box ending at or above the horizon (far away) takes off its columns. */
     private static final float FAR_BOX_PENALTY = 0.15f;
     /** A box counts for a bin when it covers at least this share of the bin's width. */
@@ -54,22 +63,47 @@ final class Openness {
     private static final float REFERENCE_ROWS = 0.04f;
     /** A reach this short (share of the lower frame) is a far wall's base, not in the way. */
     private static final float REACH_MARGIN = 0.1f;
-    /** Colour distance (RGB, 0..441) within which two pixels are one surface. */
+    /**
+     * A surface coming down this far (share of the lower frame) from the horizon
+     * is standing in front of him, not a far wall's base (those end within the
+     * ground band's top fifth or so, the true horizon sitting just below HORIZON).
+     */
+    private static final float STANDING_REACH = 0.25f;
+    /**
+     * Colour distance (RGB, 0..441, scaled for dim light by apart()) within which
+     * neighbouring pixels are one surface, and how far a surface may drift from
+     * its colour at the horizon (shading down a plain wall) and still count as it.
+     */
     private static final float SAME_SURFACE = 32f;
+    private static final float SURFACE_DRIFT = 64f;
+    /** The least step (same units) at which a surface coming down meets the floor. */
+    private static final float FLOOR_EDGE = 12f;
+    /**
+     * Shading and sensor noise scale with brightness, so below this luma colour
+     * distances are scaled up by LIGHT_REFERENCE / luma (this camera's frames are
+     * dim: luma 20-35 in office light), never by more than LIGHT_REFERENCE / MIN_LIGHT.
+     */
+    private static final float LIGHT_REFERENCE = 64f;
+    private static final float MIN_LIGHT = 16f;
     /** A floor patch matches within this distance plus twice its spread, up to MAX_FLOOR_TOLERANCE. */
     private static final float FLOOR_TOLERANCE = 30f;
     private static final float MAX_FLOOR_TOLERANCE = 60f;
     /** A bin's row is floor when at least this share of its pixels match a patch. */
     private static final float FLOOR_ROW_SHARE = 0.6f;
-    /** The teaching sample: the bottom rows, centre columns (what he drives onto next). */
-    private static final float SAMPLE_TOP = 0.85f;
+    /** The teaching sample: the bottom rows (the nearer half of the ground), centre columns (what he drives onto next). */
+    private static final float SAMPLE_TOP = 0.9f;
     private static final float SAMPLE_LEFT = 0.3f;
     private static final float SAMPLE_RIGHT = 0.7f;
     /** A sample more varied than this is not one floor (a toy, a seam, an edge). */
     private static final float MAX_SAMPLE_SPREAD = 18f;
-    /** Mean luma below DARK: no confidence; above DIM: full. Samples need DIM. */
-    private static final float DARK_LUMA = 20f;
-    private static final float DIM_LUMA = 60f;
+    /**
+     * Mean frame luma below DARK: no confidence; above DIM: full. This camera's
+     * office-light frames average luma ~30, so DIM sits there, not at a bright
+     * room's 60. A sample needs SAMPLE_LUMA: darker than that is sensor noise.
+     */
+    private static final float DARK_LUMA = 8f;
+    private static final float DIM_LUMA = 30f;
+    private static final float SAMPLE_LUMA = 12f;
     private static final float TAUGHT_CONFIDENCE = 0.9f;
     private static final float UNTAUGHT_CONFIDENCE = 0.3f;
     /** Merging stops weighting history beyond this many samples, so a patch follows the light. */
@@ -286,8 +320,10 @@ final class Openness {
             int x0 = (b * w + BINS - 1) / BINS;
             int x1 = Math.min(w, ((b + 1) * w + BINS - 1) / BINS);
             float colour = UNSURE;
+            int free = 0;
+            boolean floorBeyond = false;
             if (!patches.isEmpty() && x1 > x0) {
-                int free = 0;
+                boolean run = true;
                 for (int y = rows - 1; y >= 0; y--) {
                     int hits = 0;
                     for (int x = x0; x < x1; x++) {
@@ -295,14 +331,24 @@ final class Openness {
                             hits++;
                         }
                     }
-                    if (hits < FLOOR_ROW_SHARE * (x1 - x0)) {
-                        break;
+                    boolean isFloor = hits >= FLOOR_ROW_SHARE * (x1 - x0);
+                    run &= isFloor;
+                    if (run) {
+                        free++;
+                    } else if (isFloor) {
+                        floorBeyond = true;
                     }
-                    free++;
                 }
                 colour = UNSURE + (1f - UNSURE) * free / rows;
             }
             float reach = columns[b] == 0 ? 0f : reachSum[b] / columns[b];
+            if (!patches.isEmpty() && reach > STANDING_REACH && !floorBeyond) {
+                // A surface comes well down from the horizon and no taught floor shows
+                // between it and the floor run at the bottom (if any): it stands where
+                // that run ends, even where its colour broke first (a chair's seat
+                // above its base). Floor seen beyond a gap keeps the gap unsure (KTD9).
+                reach = Math.max(reach, 1f - (float) free / rows);
+            }
             float horizon = 1f - clamp01((reach - REACH_MARGIN) / (1f - REACH_MARGIN));
             bins[b] = clamp01(Math.min(boxes[b], Math.min(horizon, colour)));
         }
@@ -356,7 +402,13 @@ final class Openness {
         return ref;
     }
 
-    /** How far (share of the lower frame) the surface above the horizon carries on down this column. */
+    /**
+     * How far (share of the lower frame) the surface above the horizon carries on
+     * down this column: pixel to pixel, so the shading down a plain wall is
+     * followed, but never drifting far from its colour at the horizon. It ends at
+     * floor only across an edge (a wall's base, its shadow line): a dim wall can
+     * shade smoothly into a floor-like grey without ever reaching the floor.
+     */
     private static float reach(Frame lower, int first, int rows, boolean[] floor, int x, float[] ref) {
         float r = ref[x * 3];
         if (Float.isNaN(r)) {
@@ -364,12 +416,23 @@ final class Openness {
         }
         float g = ref[x * 3 + 1];
         float b = ref[x * 3 + 2];
+        float pr = r;
+        float pg = g;
+        float pb = b;
         int last = -1;
         for (int y = 0; y < rows; y++) {
             int p = lower.at(x, first + y);
-            if (floor[y * lower.width + x] || distance(p, r, g, b) > SAME_SURFACE) {
+            float cr = (p >> 16) & 0xff;
+            float cg = (p >> 8) & 0xff;
+            float cb = p & 0xff;
+            float step = apart(cr, cg, cb, pr, pg, pb);
+            if (step > SAME_SURFACE || apart(cr, cg, cb, r, g, b) > SURFACE_DRIFT
+                    || (floor[y * lower.width + x] && step > FLOOR_EDGE)) {
                 break;
             }
+            pr = cr;
+            pg = cg;
+            pb = cb;
             last = y;
         }
         if (last < 0) {
@@ -385,11 +448,7 @@ final class Openness {
     private boolean matchesFloor(float r, float g, float b) {
         for (int i = 0; i < patches.size(); i++) {
             Patch f = patches.get(i);
-            float dr = r - f.r;
-            float dg = g - f.g;
-            float db = b - f.b;
-            float t = f.tolerance();
-            if (dr * dr + dg * dg + db * db <= t * t) {
+            if (apart(r, g, b, f.r, f.g, f.b) <= f.tolerance()) {
                 return true;
             }
         }
@@ -424,7 +483,7 @@ final class Openness {
         float mr = (float) (r / n);
         float mg = (float) (g / n);
         float mb = (float) (b / n);
-        if (luma(mr, mg, mb) < DIM_LUMA) {
+        if (luma(mr, mg, mb) < SAMPLE_LUMA) {
             return;
         }
         double var = 0;
@@ -441,7 +500,8 @@ final class Openness {
         if (spread > MAX_SAMPLE_SPREAD) {
             return;
         }
-        pending.add(new Sample(frameMs, mr, mg, mb, spread));
+        // The patch's spread widens its tolerance, which is in apart()'s scaled units.
+        pending.add(new Sample(frameMs, mr, mg, mb, spread * dimScale(luma(mr, mg, mb))));
         while (pending.size() > MAX_PENDING) {
             pending.remove(0);
         }
@@ -451,7 +511,7 @@ final class Openness {
         Patch near = null;
         float best = Float.MAX_VALUE;
         for (Patch p : patches) {
-            float d = (float) Math.sqrt((s.r - p.r) * (s.r - p.r) + (s.g - p.g) * (s.g - p.g) + (s.b - p.b) * (s.b - p.b));
+            float d = apart(s.r, s.g, s.b, p.r, p.g, p.b);
             if (d <= p.tolerance() && d < best) {
                 best = d;
                 near = p;
@@ -499,6 +559,19 @@ final class Openness {
 
     private static float luma(float r, float g, float b) {
         return 0.299f * r + 0.587f * g + 0.114f * b;
+    }
+
+    /** Colour distance, scaled up in dim light where the same surface's pixels sit closer together. */
+    private static float apart(float r1, float g1, float b1, float r2, float g2, float b2) {
+        float dr = r1 - r2;
+        float dg = g1 - g2;
+        float db = b1 - b2;
+        float level = (luma(r1, g1, b1) + luma(r2, g2, b2)) / 2f;
+        return (float) Math.sqrt(dr * dr + dg * dg + db * db) * dimScale(level);
+    }
+
+    private static float dimScale(float luma) {
+        return LIGHT_REFERENCE / Math.max(MIN_LIGHT, Math.min(LIGHT_REFERENCE, luma));
     }
 
     private static float distance(int p, float r, float g, float b) {

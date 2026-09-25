@@ -19,6 +19,9 @@ public final class OpennessHarness {
     private static final int RUG = rgb(170, 40, 40);
     private static final int GREEN = rgb(40, 160, 60);
     private static final int DARK = rgb(4, 4, 6);
+    /** This camera's office light (the U3 gate frames): carpet near luma 21, the room behind near 35. */
+    private static final int DIM_FLOOR = rgb(21, 21, 23);
+    private static final int DIM_ROOM = rgb(36, 36, 40);
     private static final List<Detection> NONE = Collections.<Detection>emptyList();
 
     public static void main(String[] args) {
@@ -42,6 +45,10 @@ public final class OpennessHarness {
         check("malformed_input_never_throws", malformed());
         check("look_carries_the_profile_and_older_constructors_leave_it_null", lookCarriesProfile());
         check("no_camera_accepts_the_floor_calls", noCamera());
+        check("dim_carpet_sample_teaches_and_reads_open", dimCarpetTeaches());
+        check("wall_filling_the_frame_scores_blocked_once_floor_is_taught", wallFillsTheFrame());
+        check("untaught_floor_filling_the_ground_under_a_far_wall_stays_unsure", unknownFloorFillsTheGround());
+        check("standing_thing_stands_where_the_floor_run_ends", standsWhereTheRunEnds());
     }
 
     // ---- scenes ----
@@ -50,12 +57,26 @@ public final class OpennessHarness {
     private static final class Scene {
         private final List<float[]> rects = new ArrayList<>();
         private final List<Integer> colours = new ArrayList<>();
+        private final List<Integer> shadedTo = new ArrayList<>();
+        private final int farWall;
+        private final int floor;
         private boolean checker;
         private float[] checkerRect;
 
+        Scene(int farWall, int floor) {
+            this.farWall = farWall;
+            this.floor = floor;
+        }
+
         Scene paint(float x0, float y0, float x1, float y1, int colour) {
+            return shade(x0, y0, x1, y1, colour, colour);
+        }
+
+        /** A plain surface shading smoothly from top to bottom (light falling off down a wall). */
+        Scene shade(float x0, float y0, float x1, float y1, int top, int bottom) {
             rects.add(new float[] {x0, y0, x1, y1});
-            colours.add(colour);
+            colours.add(top);
+            shadedTo.add(bottom);
             return this;
         }
 
@@ -67,11 +88,11 @@ public final class OpennessHarness {
         }
 
         int at(float fx, float fy) {
-            int c = fy < Openness.HORIZON + 0.05f ? FAR_WALL : FLOOR;
+            int c = fy < ground(0.09f) ? farWall : floor;
             for (int i = 0; i < rects.size(); i++) {
                 float[] r = rects.get(i);
                 if (fx >= r[0] && fx < r[2] && fy >= r[1] && fy < r[3]) {
-                    c = colours.get(i);
+                    c = mix(colours.get(i), shadedTo.get(i), (fy - r[1]) / (r[3] - r[1]));
                 }
             }
             if (checker && fx >= checkerRect[0] && fx < checkerRect[2] && fy >= checkerRect[1] && fy < checkerRect[3]) {
@@ -106,7 +127,20 @@ public final class OpennessHarness {
     }
 
     private static Scene room() {
-        return new Scene();
+        return new Scene(FAR_WALL, FLOOR);
+    }
+
+    /** The room as this camera sees it in office light: dim, carpet near luma 21. */
+    private static Scene dimRoom() {
+        return new Scene(DIM_ROOM, DIM_FLOOR);
+    }
+
+    /**
+     * A height given as a share of the ground below the horizon (0 the horizon,
+     * 1 the frame bottom), so scenes keep their meaning wherever the horizon sits.
+     */
+    private static float ground(float f) {
+        return Openness.HORIZON + f * (1f - Openness.HORIZON);
     }
 
     private static Openness.Profile score(Openness o, Scene s, List<Detection> d, long ms, boolean teachable) {
@@ -129,7 +163,7 @@ public final class OpennessHarness {
 
     private static String wallOnTheLeft() {
         Openness o = taughtRoom();
-        Openness.Profile p = score(o, room().paint(0f, 0f, 0.35f, 0.85f, NEAR_WALL), NONE, 200, false);
+        Openness.Profile p = score(o, room().paint(0f, 0f, 0.35f, ground(0.73f), NEAR_WALL), NONE, 200, false);
         float left = max(p.bins, 0, 3);
         float right = min(p.bins, 8, 15);
         if (left >= 0.4f || right <= 0.8f) {
@@ -172,7 +206,7 @@ public final class OpennessHarness {
     private static String rugAndUntaught() {
         Openness o = taughtRoom();
         teach(o, room().paint(0.2f, 0.8f, 0.8f, 1f, RUG), 150);
-        Scene s = room().paint(0f, 0.6f, 0.5f, 1f, RUG).paint(0.5f, 0.6f, 1f, 1f, GREEN);
+        Scene s = room().paint(0f, ground(0.27f), 0.5f, 1f, RUG).paint(0.5f, ground(0.27f), 1f, 1f, GREEN);
         Openness.Profile p = score(o, s, NONE, 200, false);
         float rug = min(p.bins, 0, 6);
         float greenLo = min(p.bins, 9, 15);
@@ -267,7 +301,7 @@ public final class OpennessHarness {
         if (o.patches() != 1) {
             return "whole-frame sample not taught: patches " + o.patches();
         }
-        Openness.Profile p = o.score(room().paint(0f, 0f, 0.35f, 0.85f, NEAR_WALL).whole(), null, NONE, 200, false);
+        Openness.Profile p = o.score(room().paint(0f, 0f, 0.35f, ground(0.73f), NEAR_WALL).whole(), null, NONE, 200, false);
         float left = max(p.bins, 0, 3);
         float right = min(p.bins, 8, 15);
         return left < 0.4f && right > 0.8f ? null : "left " + left + " right " + right + " " + p;
@@ -399,7 +433,85 @@ public final class OpennessHarness {
         }
     }
 
+    /** Real failure 1: the carpet sample was below the old luma floor (60) and never taught. */
+    private static String dimCarpetTeaches() {
+        Openness o = new Openness();
+        score(o, dimRoom(), NONE, 100, true);
+        if (o.pending() != 1) {
+            return "a dim carpet sample was refused: pending " + o.pending();
+        }
+        o.floorDrivenOver(100);
+        if (o.patches() != 1) {
+            return "not taught: patches " + o.patches();
+        }
+        Openness.Profile p = score(o, dimRoom(), NONE, 200, false);
+        float lo = min(p.bins, 0, Openness.BINS - 1);
+        if (lo <= 0.8f || p.confidence < 0.6f) {
+            return "dim taught room reads " + p;
+        }
+        // Shading across the carpet (a lamp nearer one side) is still the carpet.
+        Openness.Profile q = score(o, dimRoom().paint(0.5f, Openness.HORIZON, 1f, 1f, rgb(27, 27, 30)), NONE, 300,
+                false);
+        float lit = min(q.bins, 0, Openness.BINS - 1);
+        return lit > 0.8f ? null : "a slightly brighter patch of the same carpet reads " + q;
+    }
+
+    /**
+     * Real failure 2: 2-3 ft from a plain wall, the wall fills the frame and shades
+     * darker downward; only a sliver of floor shows at the bottom, and at the dim,
+     * vignetted left edge the wall shades into a floor-like grey. Once the floor is
+     * taught every bin reads blocked, not unsure.
+     */
+    private static String wallFillsTheFrame() {
+        Openness o = new Openness();
+        teach(o, dimRoom(), 100);
+        float base = ground(0.9f);
+        Scene wall = dimRoom()
+                .shade(0f, 0f, 1f, base, rgb(110, 110, 114), rgb(48, 49, 52))
+                .shade(0f, 0f, 0.2f, base, rgb(52, 53, 57), rgb(25, 25, 27));
+        Openness.Profile p = score(o, wall, NONE, 200, false);
+        float hi = max(p.bins, 0, Openness.BINS - 1);
+        if (hi >= 0.3f) {
+            return "a wall filling the frame reads " + p;
+        }
+        Openness.Profile open = score(o, dimRoom(), NONE, 300, false);
+        return min(open.bins, 0, Openness.BINS - 1) > hi + 0.5f ? null : "open " + open + " wall " + p;
+    }
+
+    /** The wall rule must not turn a never-taught floor into a wall: its far wall ends at the horizon. */
+    private static String unknownFloorFillsTheGround() {
+        Openness o = taughtRoom();
+        Openness.Profile p = score(o, room().paint(0f, ground(0.09f), 1f, 1f, GREEN), NONE, 200, false);
+        float lo = min(p.bins, 0, Openness.BINS - 1);
+        float hi = max(p.bins, 0, Openness.BINS - 1);
+        return lo >= 0.35f && hi <= 0.65f ? null : "an untaught floor reads " + lo + ".." + hi + " " + p;
+    }
+
+    /**
+     * A chair: its seat crosses the horizon, then its base (another colour) goes on
+     * down to where the floor starts again. The seat's colour breaks before its
+     * base, but with no floor between them the whole thing stands where the floor
+     * run from the bottom ends, and reads near, not a far wall's base.
+     */
+    private static String standsWhereTheRunEnds() {
+        Openness o = taughtRoom();
+        Scene s = room().paint(0.25f, 0.3f, 0.5f, ground(0.5f), rgb(30, 30, 40))
+                .paint(0.25f, ground(0.5f), 0.5f, ground(0.8f), rgb(200, 200, 200));
+        Openness.Profile p = score(o, s, NONE, 200, false);
+        float chair = max(p.bins, 4, 7);
+        float clear = min(p.bins, 10, 15);
+        return chair < 0.35f && clear > 0.8f ? null : "chair " + chair + " clear " + clear + " " + p;
+    }
+
     // ---- helpers ----
+
+    private static int mix(int a, int b, float t) {
+        t = Math.max(0f, Math.min(1f, t));
+        int r = Math.round(((a >> 16) & 0xff) * (1f - t) + ((b >> 16) & 0xff) * t);
+        int g = Math.round(((a >> 8) & 0xff) * (1f - t) + ((b >> 8) & 0xff) * t);
+        int bl = Math.round((a & 0xff) * (1f - t) + (b & 0xff) * t);
+        return rgb(r, g, bl);
+    }
 
     private static int rgb(int r, int g, int b) {
         return (r << 16) | (g << 8) | b;

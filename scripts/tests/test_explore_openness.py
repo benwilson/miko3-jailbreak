@@ -28,6 +28,10 @@ EXPLORE_SRC = REPO / "mode-explore" / "src"
 PKG = EXPLORE_SRC / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "explore_openness_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "OpennessHarness.java"
+GATE_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "OpennessGate.java"
+# The owner's real frames for U3's gate: private, gitignored, often absent.
+NAV_FRAMES = REPO / "voice-work" / "nav-frames"
+GATE_FRAMES = (NAV_FRAMES / "open-floor-doorway.jpg", NAV_FRAMES / "wall-2ft.jpg")
 
 
 def src(name):
@@ -67,6 +71,11 @@ class OpennessHarnessTest(unittest.TestCase):
         # Integration with the brain's types
         "look_carries_the_profile_and_older_constructors_leave_it_null",
         "no_camera_accepts_the_floor_calls",
+        # The U3 gate's two real failures, as synthetic scenes (this camera: dim, up-tilted)
+        "dim_carpet_sample_teaches_and_reads_open",
+        "wall_filling_the_frame_scores_blocked_once_floor_is_taught",
+        "untaught_floor_filling_the_ground_under_a_far_wall_stays_unsure",
+        "standing_thing_stands_where_the_floor_run_ends",
     )
 
     @classmethod
@@ -99,6 +108,54 @@ class OpennessHarnessTest(unittest.TestCase):
 
 
 jvm_harness.add_scenario_tests(OpennessHarnessTest)
+
+
+class OpennessRealFrameGateTest(unittest.TestCase):
+    """U3's gate on the owner's two real robot frames (open floor with a doorway;
+    a plain wall 2-3 ft away), sampled as ExploreCamera samples them. Optional:
+    the frames are private and not in git, so this skips without them."""
+
+    SCENARIOS = (
+        "the_dim_carpet_teaches",
+        "the_open_frame_is_trusted_once_taught",
+        "the_wall_scores_clearly_below_the_doorway",
+        "the_plant_and_chair_stay_below_the_doorway",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        missing = [f.name for f in GATE_FRAMES if not f.is_file()]
+        if missing:
+            raise unittest.SkipTest(f"private gate frames absent: {', '.join(missing)}")
+        jdk = jvm_harness.find_jdk()
+        if jdk is None:
+            raise unittest.SkipTest("no JDK (javac + java) found")
+        cls.results = {}
+        cls.run_output = ""
+        with tempfile.TemporaryDirectory(prefix="explore_openness_gate_") as out:
+            c = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, [GATE_MAIN], [HARNESS, EXPLORE_SRC]),
+                               capture_output=True, text=True)
+            cls.compiled = c.returncode == 0
+            cls.compile_output = (c.stdout + c.stderr)[-3000:]
+            if cls.compiled:
+                r = subprocess.run([jdk[1], "-Djava.awt.headless=true", "-cp", out,
+                                    "com.miko3.mode.explore.OpennessGate"] + [str(f) for f in GATE_FRAMES],
+                                   capture_output=True, text=True, timeout=60)
+                cls.run_output = (r.stdout + r.stderr)[-6000:]
+                cls.results = jvm_harness.parse_verdicts(r.stdout)
+
+    def setUp(self):
+        self.assertTrue(self.compiled, f"gate failed to compile:\n{self.compile_output}")
+
+    def _assert_pass(self, name):
+        verdict, detail = self.results.get(name, ("MISSING", self.run_output))
+        self.assertEqual(verdict, "PASS", detail)
+
+    def test_gate_ran_exactly_the_listed_checks(self):
+        self.assertEqual(sorted(self.results), sorted(self.SCENARIOS), self.run_output)
+
+
+jvm_harness.add_scenario_tests(OpennessRealFrameGateTest)
 
 
 class OpennessIsPrivateTest(unittest.TestCase):

@@ -323,7 +323,7 @@ U1 (gyro in the sensor path) comes first. It unblocks U2 (heading tracker), and 
 - **Patterns to follow:** `Detection` (fractions 0..1, plain Java); `YuNetDecoder`'s plain-Java decode tested on the host.
 - **Test scenarios:**
   - A synthetic frame with uniform floor colour in the bottom rows and a wall block on the left scores the left bins low and the right bins high.
-  - A detector box reaching the bottom 20% of the frame marks its columns blocked even when their colour is floor-like.
+  - A detector box reaching the bottom 10% of the frame (the nearer half of the ground) marks its columns blocked even when their colour is floor-like.
   - A box high in the frame (far away) lowers its columns only slightly.
   - A rug patch taught as floor stays open, while a colour never taught reads unsure rather than blocked.
   - An all-dark frame returns low confidence.
