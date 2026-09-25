@@ -247,6 +247,13 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "pinned_runs_the_ladder_once_with_two_asks_then_rests",
         "pinned_after_the_rest_waits_longer_before_the_next_ladder",
         "pinned_backoff_resets_after_a_clean_drive_off",
+        # A blocked side: the retry and later turns go the other way (live 2026-09-25)
+        "blocked_side_backs_up_then_turns_the_other_way_and_drives_off",
+        "blocked_side_escape_turns_go_the_unblocked_way_even_the_long_way_round",
+        "blocked_turn_back_up_default_is_about_2_s",
+        # Signed wheel counters (live 2026-09-25: reverse counts down, from 0 at power-up)
+        "wheels_negative_counts_back_out_reports_the_real_distance",
+        "wheels_stall_is_detected_below_and_across_zero",
         # A blocked turn backs up a little first, then tries again once (live: pinned after a CPL stop)
         "blocked_turn_backs_up_a_little_then_the_retried_turn_succeeds",
         "blocked_turn_after_a_cpl_stop_still_backs_up_a_little_before_the_retry",
@@ -264,6 +271,20 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "doorway_ask_carries_one_roaming_frame_and_notes_carry_numbers_only",
         "roam_steer_doorway_weights_open_bands_and_turns_to_face_one_out_of_view",
         "replies_doorway_reads_x_and_rejects_bad_answers",
+        # People while roaming, with a per-person leave-alone (explore nav plan U7, R9, R10, AE4)
+        "people_roaming_person_is_approached_to_the_polite_distance_and_greeted_by_name",
+        "people_ae4_same_person_5_min_later_is_checked_and_left_alone",
+        "people_different_person_5_min_later_is_approached",
+        "people_check_timeout_or_offline_never_approaches",
+        "people_after_10_min_no_check_and_approached",
+        "people_a_then_b_then_a_check_covers_both_and_a_is_left_alone",
+        "people_curiosity_pick_of_the_owner_5_min_later_is_a_remark",
+        "people_owner_in_view_3_min_gets_at_most_3_checks",
+        "people_hazard_during_a_roaming_approach_drops_the_meeting",
+        "people_camera_closed_through_a_roaming_meetings_talking_states",
+        "people_trace_notes_never_carry_a_name",
+        "replies_recently_met_reads_same_none_unsure_and_rejects_bad_answers",
+        "people_tuning_defaults_10_min_leave_alone_one_check_a_minute",
     )
 
     @classmethod

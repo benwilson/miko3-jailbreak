@@ -118,6 +118,38 @@ final class ClaudeReplies {
     }
 
     /**
+     * The recently-met reply (explore nav plan U7) against people photos: "same_as"
+     * is a 1-based photo number (as a number, "2" or "Person 2"), "none" or
+     * "unsure". A number outside 1..people, or anything else, is a failure, which
+     * the brain treats like unsure: he leaves the person alone (KTD8).
+     */
+    static CuriosityPort.Recently recentlyMet(Map<String, Object> json, int people) {
+        Object v = json.get("same_as");
+        Long n = integer(v);
+        if (n == null && v instanceof String) {
+            String s = ((String) v).trim().toLowerCase(java.util.Locale.US);
+            if (s.equals("none")) {
+                return CuriosityPort.Recently.different();
+            }
+            if (s.equals("unsure")) {
+                return CuriosityPort.Recently.unsure();
+            }
+            if (s.startsWith("person ")) {
+                s = s.substring("person ".length()).trim();
+            }
+            try {
+                n = Long.parseLong(s);
+            } catch (NumberFormatException e) {
+                n = null;
+            }
+        }
+        if (n == null || n < 1 || n > people) {
+            return CuriosityPort.Recently.failed();
+        }
+        return CuriosityPort.Recently.same((int) (n - 1));
+    }
+
+    /**
      * The person reply against a gallery of galleryCount references. Returns
      * the 0-based reference matched, or -1 for "none", "unsure", a number
      * beyond the gallery, or anything else (all a new person, KTD3), plus the

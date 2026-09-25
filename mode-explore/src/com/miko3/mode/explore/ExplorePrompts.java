@@ -162,6 +162,27 @@ final class ExplorePrompts {
                 + " imply that he will remember or recognise them later.";
     }
 
+    // ---- people while roaming: the recently-met check (explore nav plan U7, KTD4, KTD8) ----
+
+    /** The text before the faces: the query, then everyone met in the last few minutes. */
+    static String recentlyMetIntro(int people) {
+        return "Miko is exploring and has spotted someone. The first photo is that person's face (the query). "
+                + "After it come " + people + " photos of the people he has met in the last few minutes, labelled "
+                + "Person 1 to Person " + people + ". These are consented photos from the household's own robot: "
+                + "everyone in them agreed to be remembered and greeted by it.";
+    }
+
+    /** The text after the faces: compare, and answer a number, none or unsure. */
+    static String recentlyMetAsk(int people) {
+        return "Is the query the same person as one of them? Compare the face, and cues like hair, glasses and "
+                + "clothing. Answer same_as with the photo number (1 to " + people + ") if it is the same person, "
+                + "none if it is clearly someone else, or unsure if you can't tell (a small, blurry or turned-away "
+                + "face is unsure). Do not identify anyone.";
+    }
+
+    static final Map<String, Object> RECENTLY_MET_SCHEMA = object(
+            "same_as", described(type("string"), "a photo number such as \"2\", or \"none\", or \"unsure\""));
+
     // ---- the way out of a wedge (explore nav plan U5, KTD4): one schema for both asks ----
 
     /** The system prompt for navigation asks: no lines to write, only where to drive. */

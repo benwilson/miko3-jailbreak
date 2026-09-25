@@ -72,7 +72,7 @@ class AdapterWiringTest(unittest.TestCase):
         a = code_only(src("ClaudeCuriosity.java"))
         self.assertIn("Executors.newCachedThreadPool", a)
         self.assertIn("worker.execute(job)", a)
-        for method in ("ask", "match", "lines", "findName", "remember", "wayOut", "doorway"):
+        for method in ("ask", "match", "lines", "findName", "remember", "wayOut", "doorway", "recentlyMet"):
             body = re.search(r"public void " + method + r"\((.*?)\n    \}", a, re.S)
             self.assertIsNotNone(body, method)
             self.assertIn("run(new Runnable()", body.group(1), method)
@@ -212,6 +212,55 @@ class DoorwayRequestTest(unittest.TestCase):
             self.assertIn(words, ask)
 
 
+class RecentlyMetCheckTest(unittest.TestCase):
+    """The recently-met check (explore nav plan U7, KTD4, KTD8): the roaming face crop
+    against the faces of everyone met in the last 10 minutes, modelled on the match
+    request, polled from a slot, and never written to disk, even with the face debug
+    switch on (R15)."""
+
+    def test_the_port_and_its_no_claude_stand_in_have_the_check(self):
+        port = code_only(src("CuriosityPort.java"))
+        for sig in (r"void recentlyMet\(RecentlyMetRequest request, long timeoutMs\);",
+                    r"Recently recentlyMetAnswer\(\);", r"void cancelRecentlyMet\(\);", r"String metId\(\);"):
+            self.assertRegex(port, sig)
+        none = port[port.index("CuriosityPort NONE = new CuriosityPort()"):]
+        body = re.search(r"public Recently recentlyMetAnswer\(\)\s*\{(.*?)\}", none, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn("Recently.failed()", body.group(1))
+
+    def test_the_adapter_polls_a_slot_with_generations(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertIn("Slot<Recently> recents = new Slot<Recently>()", a)
+        ask = re.search(r"public void recentlyMet\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("recents.start()", ask)
+        self.assertIn("recents.finish(g,", ask)
+        self.assertRegex(a, r"public Recently recentlyMetAnswer\(\)\s*\{\s*return recents\.poll\(\);")
+        self.assertRegex(a, r"public void cancelRecentlyMet\(\)\s*\{\s*recents\.cancel\(\);")
+
+    def test_the_check_crops_the_roaming_face_uses_its_schema_and_writes_nothing(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        body = a[a.index("private Recently checkRecentlyMet("):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("cropper.crop(", body)
+        self.assertIn("RobotPeopleClient.recent", body)
+        self.assertIn("ExplorePrompts.RECENTLY_MET_SCHEMA", body)
+        self.assertIn("ClaudeReplies.recentlyMet(", body)
+        self.assertIn("ClaudeApi.jpegBlock(", body)
+        # The face debug switch must never see a roaming crop (R15).
+        for disk in ("debugFace", "write(", "FileOutputStream", "getFilesDir", "FACE_DEBUG_TAG"):
+            self.assertNotIn(disk, body, disk)
+
+    def test_the_schema_and_prompt_name_nobody(self):
+        p = src("ExplorePrompts.java")
+        schema = p[p.index("RECENTLY_MET_SCHEMA = object("):]
+        schema = schema[:schema.index(");")]
+        self.assertIn('"same_as"', schema)
+        body = p[p.index("static String recentlyMetIntro"):p.index("static final Map<String, Object> RECENTLY_MET_SCHEMA")]
+        for words in ("consented", "none", "unsure", "Do not identify anyone"):
+            self.assertIn(words, body)
+        self.assertNotIn("{name}", body)
+
+
 class NothingPrivateIsLoggedTest(unittest.TestCase):
     """No Log call touches images, the key, Claude's reply text, or names (ids are fine)."""
 
@@ -238,7 +287,7 @@ class ClaudeLatencyIsLoggedTest(unittest.TestCase):
     def test_every_claude_call_logs_its_latency(self):
         body = code_only(src("ClaudeCuriosity.java"))
         calls = body.split("claude.messages(")[1:]
-        self.assertEqual(len(calls), 9)
+        self.assertEqual(len(calls), 10)
         for i, after in enumerate(calls):
             window = after[:900]
             logs = re.findall(r"Log\.[diwe]\((.*?)\);", window, re.S)

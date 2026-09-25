@@ -2,6 +2,7 @@ package com.miko3.mode.explore;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -173,6 +174,21 @@ import java.util.Set;
  * (doorwayExpireMs, doorwayExpireCounts), a look facing it reads blocked (closed
  * since), or he is wedged. Floor hazards, stalls and CPL stop him as always (AE3);
  * offline the ask fails quietly (AE7). Notes carry numbers only (R15).
+ *
+ * People while roaming (explore nav plan U7, R9, R10, KTD4, KTD8): a detector person
+ * box in a leg decision's look, with Claude set up, becomes a synthetic PERSON pick
+ * (the look is its frame 0): FACE, APPROACH until the box is politeHeight of the
+ * frame, then MEET_LOOK and the meeting exactly as at a curiosity stop. Everyone met
+ * is left alone for metLeaveAloneMs from the end of their meeting. While anyone is
+ * on that list, every PERSON pick, roaming or at a curiosity stop, first needs
+ * Claude's recently-met check (the person's face against theirs) to answer "none of
+ * them": at most one check per metCheckIntervalMs, and a pending, failed or unsure
+ * check, or none allowed yet, counts as just met. Roaming, he keeps roaming (a check
+ * runs in the background; a "none of them" clears a person seen within
+ * metClearedMs); at a curiosity stop, ASK waits for the check and a just-met pick
+ * ends as its remark, said without approaching. This replaces peopleCooldownMs for
+ * approaching people only; the look request's cooling-down flag still follows it.
+ * Notes carry counts only, never a name (R15).
  *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
@@ -597,6 +613,32 @@ final class ExploreBrain {
     /** The leg under way heads for the doorway with the way reading open: driven in full, he is through. */
     private boolean doorwayLeg;
 
+    // ---- people while roaming (explore nav plan U7) ----
+    /** Someone met: the port's handle for them (null: no face to compare) and when the meeting ended. */
+    private static final class Met {
+        final String id;
+        final long endedAt;
+
+        Met(String id, long endedAt) {
+            this.id = id;
+            this.endedAt = endedAt;
+        }
+    }
+
+    /** Everyone met in the last metLeaveAloneMs, oldest first. */
+    private final ArrayDeque<Met> met = new ArrayDeque<Met>();
+    /** This pick reached MEET: its end starts that person's leave-alone. */
+    private boolean meetingHeld;
+    /** This person pick ends as its remark: no approach and no meeting (KTD8). */
+    private boolean remarkOnly;
+    /** A recently-met check is out (sent at metCheckAt); gatedPick waits on it in ASK. */
+    private boolean metChecking;
+    private long metCheckAt;
+    private CuriosityPort.Answer gatedPick;
+    /** The next check may go at this time; a roaming person is cleared until metClearedUntil. */
+    private long metNextCheckAt = Long.MIN_VALUE / 4;
+    private long metClearedUntil = Long.MIN_VALUE / 4;
+
     /** The newest reading, where a drive's counts start from. */
     private SensorReading lastReading;
 
@@ -700,6 +742,7 @@ final class ExploreBrain {
         cancelAsk();
         cancelWayOut();
         cancelDoorway(clock.nowMs(), null);
+        cancelMetCheck();
         planner.reset();
         state = State.STOPPED;
         syncCamera();
@@ -777,6 +820,7 @@ final class ExploreBrain {
         boolean hazard = s == HazardClassifier.Status.HAZARD;
         watchLooks(now);
         doorwayStep(now);
+        metCheckStep(now);
         switch (state) {
             case PAUSE:
                 if (lookForLeg) {
@@ -948,7 +992,7 @@ final class ExploreBrain {
                 } else if (now >= phaseUntil) {
                     restEndedAt = now;
                     hazardTimes.clear();
-                    Direction d = lastHazardSide != null ? lastHazardSide.opposite() : randomDirection();
+                    Direction d = unblocked(lastHazardSide != null ? lastHazardSide.opposite() : randomDirection());
                     note("cool-down over, trying a wider turn " + d);
                     escapeSide = d;
                     enterLook(now, d, true, tuning.corneredTurnMs, tuning.corneredTurnDeg);
@@ -962,6 +1006,7 @@ final class ExploreBrain {
     /** A roaming leg ended without a hazard or stall (its time, or the camera saw the way blocked). */
     private void legDriven(long now) {
         stopMotors();
+        blockedSides.clear();
         // Driven away cleanly: whatever cornered him is behind him.
         compass.droveOffCleanly();
         hazardTimes.clear();
@@ -989,7 +1034,10 @@ final class ExploreBrain {
             legLookAfter = ready + tuning.lookSettleMs;
             legLookDeadline = ready + tuning.firstLookTimeoutMs;
         } else {
-            chooseLeg(now, cameraOpen ? roamLook(now) : null);
+            Look look = cameraOpen ? roamLook(now) : null;
+            if (!seePerson(now, look)) {
+                chooseLeg(now, look);
+            }
         }
     }
 
@@ -1017,7 +1065,7 @@ final class ExploreBrain {
         }
         if (hazard) {
             refuse(now);
-        } else {
+        } else if (!seePerson(now, arrived ? look : null)) {
             chooseLeg(now, arrived ? look : null);
         }
     }
@@ -1058,6 +1106,7 @@ final class ExploreBrain {
             } else {
                 d = randomDirection();
             }
+            d = unblocked(d);
             if (compass.usable(now)) {
                 double deg = tuning.turnMinDeg + random.nextDouble() * (tuning.turnMaxDeg - tuning.turnMinDeg);
                 enterLook(now, d, false, timedMs(deg), deg);
@@ -1163,6 +1212,7 @@ final class ExploreBrain {
         if (escapeSide == null) {
             escapeSide = away(h);
         }
+        escapeSide = unblocked(escapeSide);
         return escapeSide;
     }
 
@@ -1391,7 +1441,8 @@ final class ExploreBrain {
 
     /** A new look arrived (on a fresh reading): decide what the state does with it. */
     private void onLook(long now, Look look) {
-        boolean ignorePeople = now < peopleIgnoredUntil;
+        // Someone met in the last 10 minutes: the detector's fallback never approaches a person (KTD8).
+        boolean ignorePeople = now < peopleIgnoredUntil || anyoneMet(now);
         if (state == State.SCAN && claudeStop) {
             scanLook(now, look, ignorePeople);
             return;
@@ -1441,6 +1492,9 @@ final class ExploreBrain {
         } else if (Sighting.fillsFrame(target, tuning)) {
             note("arrived: the " + target.label + " fills the frame");
             arrive(now);
+        } else if (polite(target)) {
+            note("arrived: a polite distance from the person");
+            arrive(now);
         } else if (classifier.approach(now).isClose()) {
             // Touching it but off-centre (after a refused leg, say): a turn would see
             // the ir flag as a hazard and escape from the very thing he came to see.
@@ -1461,8 +1515,8 @@ final class ExploreBrain {
     /** FACE: turn toward the target until it is ahead (or enough tries), then approach. */
     private void face(long now) {
         stare(target);
-        if (Sighting.fillsFrame(target, tuning)) {
-            note("arrived: the " + target.label + " already fills the frame");
+        if (Sighting.fillsFrame(target, tuning) || polite(target)) {
+            note("arrived: the " + target.label + " already fills the frame or is a polite distance away");
             arrive(now);
             return;
         }
@@ -1628,6 +1682,10 @@ final class ExploreBrain {
     /** Forgets everything about the current stop (the camera closes as the state leaves curiosity). */
     private void clearStop() {
         cancelAsk();
+        // A check the stop was waiting on runs on; its answer then only clears a roaming person.
+        gatedPick = null;
+        remarkOnly = false;
+        meetingHeld = false;
         target = null;
         meetExpect = null;
         pick = null;
@@ -1834,6 +1892,10 @@ final class ExploreBrain {
 
     /** ASK, each tick: poll the answer; a failure or a missed deadline is another try, then the fallback (R7). */
     private void askStep(long now) {
+        if (gatedPick != null) {
+            // The pick is in; the recently-met check decides it (metCheckStep).
+            return;
+        }
         CuriosityPort.Answer a = port.answer();
         if (a == null) {
             if (now >= askDeadline) {
@@ -1873,8 +1935,19 @@ final class ExploreBrain {
         // A person's label is Claude's description of them: kept out of the trace.
         note("Claude picked " + (a.kind == CuriosityPort.Kind.PERSON ? "a person" : a.toString())
                 + " (look " + (look + 1) + ")");
+        // People: the recently-met gate before any approach (explore nav plan U7, KTD8).
+        if (a.kind == CuriosityPort.Kind.PERSON && anyoneMet(now)) {
+            if (startMetCheck(now, askedFrames.get(a.frame).jpeg, a.box)) {
+                gatedPick = a;
+                return;
+            }
+            note("no recently-met check can go now: just met, a remark only");
+            takePick(now, a, true);
+            return;
+        }
         // The prompt rules these out; a pick that ignores it wastes no more of the stop.
-        if (a.kind.isLiving() && now < peopleIgnoredUntil) {
+        // People are left alone per person instead (above), not by this cool-down.
+        if (a.kind == CuriosityPort.Kind.ANIMAL && now < peopleIgnoredUntil) {
             nothing(now, "greeted people and animals recently: as good as nothing, carrying on");
             return;
         }
@@ -1882,12 +1955,23 @@ final class ExploreBrain {
             nothing(now, "reacted to that already: as good as nothing, carrying on");
             return;
         }
+        takePick(now, a, false);
+    }
+
+    /**
+     * Go with Claude's pick: face it, approaching only if the detector boxed it too
+     * (KTD7); remark: a person just met, whose line is said without approaching or
+     * meeting them (KTD8).
+     */
+    private void takePick(long now, CuriosityPort.Answer a, boolean remark) {
+        int look = askedFrames.get(a.frame).look;
         pick = a;
         pickAt = now;
+        remarkOnly = remark;
         remember(a.box.label, a.kind, now);
         float cx = a.box.centerX();
         pickRecentred = Math.abs(cx) > tuning.centreTolerance;
-        Detection agree = detectorAgrees(scanned.get(look).detections, a);
+        Detection agree = remark ? null : detectorAgrees(scanned.get(look).detections, a);
         if (agree != null) {
             note("the detector sees it too, as a " + agree.label + ": approaching");
             target = agree;
@@ -2113,7 +2197,7 @@ final class ExploreBrain {
     }
 
     private void speakPick(long now) {
-        if (pick.kind == CuriosityPort.Kind.PERSON) {
+        if (pick.kind == CuriosityPort.Kind.PERSON && !remarkOnly) {
             enterMeetLook(now);
             return;
         }
@@ -2201,6 +2285,7 @@ final class ExploreBrain {
     private void enterMeet(long now, byte[] frameJpeg, Detection personBox) {
         stopMotors();
         state = State.MEET;
+        meetingHeld = true;
         stranger = null;
         meetLines = false;
         show(EyeState.THINKING, null);
@@ -2403,6 +2488,12 @@ final class ExploreBrain {
     private void finishPick(long now) {
         if (pick.kind.isLiving()) {
             peopleIgnoredUntil = now + tuning.peopleCooldownMs;
+            if (meetingHeld) {
+                // Their leave-alone starts now (R10): the port's handle, never a name.
+                met.addLast(new Met(port.metId(), now));
+                note("met someone: left alone for " + (tuning.metLeaveAloneMs / 1000) + " s ("
+                        + met.size() + " met recently)");
+            }
         } else {
             seen.add(pick.box.label);
         }
@@ -2493,11 +2584,14 @@ final class ExploreBrain {
         stopMotors();
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
                 + " deg in " + (now - turnStartedAt) + " ms");
+        blockedSides.add(heading);
         if (state == State.TURN && !turnRetrying && tuning.blockedTurnBackTicks > 0
                 && !planner.hasLegToBackAlong(compass.legs(), compass.degrees())) {
             // Live, pinned after a CPL stop with no leg to back out along (the ladder backs
             // out along one when there is): a little room behind him is often all a turn needs.
-            retryDir = heading;
+            // The retry goes the other way (live 2026-09-25: left blocked, right free); a
+            // roaming or escape turn's way doesn't matter, only its amount.
+            retryDir = heading.opposite();
             retryEscape = escape;
             retryMs = turnMs;
             retryDeg = turnDeg;
@@ -2511,7 +2605,7 @@ final class ExploreBrain {
 
     /** The short blind back-up before a blocked roaming turn is tried again (BACK_OFF, backForTurn). */
     private void startShortBack(long now) {
-        note("backing up a little, then trying the turn again");
+        note("backing up a little, then turning the other way");
         int ticks = tuning.blockedTurnBackTicks;
         state = State.BACK_OFF;
         backForTurn = true;
@@ -2585,7 +2679,7 @@ final class ExploreBrain {
         planner.begin(now, compass.degrees());
         escBackOutFirst = turnBlocked;
         escShortBack = false;
-        circleDir = escapeSide != null ? escapeSide : Direction.LEFT;
+        circleDir = unblocked(escapeSide != null ? escapeSide : Direction.LEFT);
         escapePhase(now);
     }
 
@@ -2876,6 +2970,7 @@ final class ExploreBrain {
             }
             if (escThen == EscThen.RETRY_TURN) {
                 escThen = escThenAfterRetry;
+                flipEscTurn(now);
                 esc = Esc.TURN_READY;
             } else if (escThen == EscThen.RETRACE_NEXT) {
                 escWait(now, EscThen.RETRACE_NEXT);
@@ -2937,10 +3032,19 @@ final class ExploreBrain {
             escAfterTurn(now);
             return;
         }
-        escTurnBy(delta > 0 ? Direction.LEFT : Direction.RIGHT, Math.abs(delta), then);
+        Direction d = delta > 0 ? Direction.LEFT : Direction.RIGHT;
+        double deg = Math.abs(delta);
+        if (unblocked(d) != d) {
+            note("the " + d + " side is blocked: turning the long way round");
+            d = d.opposite();
+            deg = 360 - deg;
+        }
+        escTurnBy(d, deg, then);
+        escTarget = target;
     }
 
     private void escTurnBy(Direction d, double deg, EscThen then) {
+        escTarget = Double.NaN;
         escDir = d;
         escTurnAmount = deg;
         escThen = then;
@@ -2960,7 +3064,8 @@ final class ExploreBrain {
     /** A turn in the escape that would not turn: back out once if the log allows, else the step failed. */
     private void escTurnBlocked(long now) {
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
-                + " deg in " + (now - turnStartedAt) + " ms");
+                + " deg in " + (now - turnStartedAt) + " ms (" + escDir + ")");
+        blockedSides.add(escDir);
         if (!escBackedOut) {
             escBackedOut = true;
             EscThen after = planner.phase() == EscapePlanner.Phase.RETRACE ? EscThen.RETRACE_NEXT : EscThen.RETRY_TURN;
@@ -2973,8 +3078,8 @@ final class ExploreBrain {
                 return;
             }
             if (tuning.blockedTurnBackTicks > 0) {
-                // No leg to back out along: a short blind back-up, then the same turn once more.
-                note("backing up a little, then trying the turn again");
+                // No leg to back out along: a short blind back-up, then the turn once more, the other way.
+                note("backing up a little, then trying the turn the other way");
                 escThenAfterRetry = keep;
                 escGoalAfterRetry = escGoal;
                 escGoal = 0;
@@ -3000,10 +3105,44 @@ final class ExploreBrain {
      */
     private boolean backForTurn;
     private boolean turnRetrying;
+    /**
+     * The ways a measured turn would not turn since he last drove off cleanly (live
+     * 2026-09-25: left was blocked while right and reversing were free, and every retry
+     * and ladder turn went left again). A blocked turn is retried the other way, and
+     * later turns go the unblocked way (unblocked()), even the long way round.
+     */
+    private final EnumSet<Direction> blockedSides = EnumSet.noneOf(Direction.class);
+    /** The escape turn's target heading (NaN: a circle step, whose way doesn't matter). */
+    private double escTarget = Double.NaN;
     private Direction retryDir;
     private boolean retryEscape;
     private long retryMs;
     private double retryDeg;
+
+    /** d, unless only d has been blocked since the last clean drive-off: then the other way. */
+    private Direction unblocked(Direction d) {
+        return d != null && blockedSides.contains(d) && !blockedSides.contains(d.opposite()) ? d.opposite() : d;
+    }
+
+    /**
+     * The escape turn to retry after its back-up, the other way round from the one
+     * that was blocked: to the same target the long way (or the short way, if the
+     * blocked turn was the long one), or, for a circle step, the same step the other
+     * way, and the rest of the circle turns that way too.
+     */
+    private void flipEscTurn(long now) {
+        Direction d = escDir.opposite();
+        if (!Double.isNaN(escTarget)) {
+            double delta = Heading.delta(compass.degrees(), escTarget);
+            Direction shortWay = delta > 0 ? Direction.LEFT : Direction.RIGHT;
+            escTurnAmount = d == shortWay ? Math.abs(delta) : 360 - Math.abs(delta);
+        } else if (planner.phase() == EscapePlanner.Phase.CIRCLE) {
+            circleDir = d;
+        }
+        escDir = d;
+        note("trying the turn the other way: " + d + " " + Math.round(escTurnAmount) + " deg");
+        show(EyeState.LOOK, d);
+    }
 
     private void escFailed(long now, String why) {
         stopMotors();
@@ -3127,6 +3266,7 @@ final class ExploreBrain {
     private void escapeFreed(long now, String how) {
         stopMotors();
         note("free after " + (now - planner.startedAt()) + " ms: " + how);
+        blockedSides.clear();
         planner.reset();
         esc = null;
         compass.droveOffCleanly();
@@ -3242,6 +3382,156 @@ final class ExploreBrain {
         doorwayLeg = false;
     }
 
+    // ---- people while roaming (explore nav plan U7, R9, R10, KTD4, KTD8) ----
+
+    /**
+     * A person in the leg decision's look (Claude set up, so he can meet them): true
+     * if he goes over to meet them. While someone met in the last metLeaveAloneMs is
+     * on the list, the person counts as just met unless a recently-met check cleared
+     * a person within metClearedMs; a check goes out in the background when one is
+     * allowed, and he keeps roaming meanwhile.
+     */
+    private boolean seePerson(long now, Look look) {
+        if (look == null || look.jpeg == null) {
+            return false;
+        }
+        Detection p = personBox(look.detections);
+        if (p == null || !port.canAsk()) {
+            return false;
+        }
+        if (anyoneMet(now) && now >= metClearedUntil) {
+            startMetCheck(now, look.jpeg, p);
+            return false;
+        }
+        metClearedUntil = Long.MIN_VALUE / 4;
+        approachPerson(now, look, p);
+        return true;
+    }
+
+    /** The largest person box at or above the confidence floor, else null. */
+    private Detection personBox(List<Detection> found) {
+        Detection best = null;
+        for (Detection d : found) {
+            if (d.score >= tuning.confidenceFloor && CuriosityPort.Kind.of(d.label) == CuriosityPort.Kind.PERSON
+                    && (best == null || d.area() > best.area())) {
+                best = d;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * A synthetic PERSON pick (KTD8): the roaming look is its frame 0 and the box its
+     * pick, so FACE, APPROACH (to the polite distance), MEET_LOOK and the meeting run
+     * as for Claude's person pick at a stop. Started on a fresh reading (decide).
+     */
+    private void approachPerson(long now, Look look, Detection p) {
+        note("a person while roaming: going over to meet them");
+        lookForLeg = false;
+        hopNext = false;
+        plannedTicks = -1;
+        doorwayLeg = false;
+        claudeStop = true;
+        heldPick = null;
+        scanned.clear();
+        scanHeadings.clear();
+        askedFrames.clear();
+        scanned.add(look);
+        scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
+        askedFrames.add(new CuriosityPort.Frame(0, look.jpeg));
+        pick = CuriosityPort.Answer.pick(0, p, CuriosityPort.Kind.PERSON, null);
+        pickAt = now;
+        pickRecentred = false;
+        remarkOnly = false;
+        remember(p.label, CuriosityPort.Kind.PERSON, now);
+        target = p;
+        state = State.FACE;
+        faceTurns = 0;
+        lostLooks = 0;
+        firstLook = false;
+        face(now);
+    }
+
+    /** A person box close enough to meet them: politeHeight of the frame's height (R9). */
+    private boolean polite(Detection d) {
+        return CuriosityPort.Kind.of(d.label) == CuriosityPort.Kind.PERSON && d.height() >= tuning.politeHeight;
+    }
+
+    /** Whether anyone was met in the last metLeaveAloneMs (older meetings are dropped here). */
+    private boolean anyoneMet(long now) {
+        while (!met.isEmpty() && now - met.peekFirst().endedAt >= tuning.metLeaveAloneMs) {
+            met.pollFirst();
+        }
+        return !met.isEmpty();
+    }
+
+    /**
+     * Send a recently-met check for this person, if one may go now: none out, the
+     * interval since the last one passed, and everyone on the list has a face to
+     * compare against. False: none went, so the person counts as just met.
+     */
+    private boolean startMetCheck(long now, byte[] jpeg, Detection box) {
+        if (metChecking || now < metNextCheckAt || jpeg == null || box == null || !port.canAsk()) {
+            return false;
+        }
+        List<String> ids = new ArrayList<String>();
+        for (Met m : met) {
+            if (m.id == null) {
+                // Someone met without a face to compare: nobody can be told apart from them.
+                return false;
+            }
+            ids.add(m.id);
+        }
+        metChecking = true;
+        metCheckAt = now;
+        metNextCheckAt = now + tuning.metCheckIntervalMs;
+        note("asking Claude whether this person was just met (" + ids.size() + " met recently)");
+        port.recentlyMet(new CuriosityPort.RecentlyMetRequest(jpeg, box, ids), tuning.metCheckTimeoutMs);
+        return true;
+    }
+
+    /**
+     * Each step: the check's answer, or its deadline. Only "none of them" lets him
+     * approach: the stop waiting on it goes on with the pick, or a roaming person is
+     * cleared for metClearedMs. Anything else is just met: the stop's pick becomes a
+     * remark, and roaming carries on.
+     */
+    private void metCheckStep(long now) {
+        if (!metChecking) {
+            return;
+        }
+        CuriosityPort.Recently a;
+        if (now - metCheckAt >= tuning.metCheckTimeoutMs) {
+            cancelMetCheck();
+            note("no recently-met answer in " + tuning.metCheckTimeoutMs + " ms");
+            a = CuriosityPort.Recently.failed();
+        } else {
+            a = port.recentlyMetAnswer();
+            if (a == null) {
+                return;
+            }
+            metChecking = false;
+        }
+        boolean cleared = a.status == CuriosityPort.Recently.Status.DIFFERENT;
+        note("recently-met check: " + a + (cleared ? ": someone new" : ": just met, leaving them alone"));
+        if (gatedPick != null) {
+            CuriosityPort.Answer g = gatedPick;
+            gatedPick = null;
+            if (state == State.ASK) {
+                takePick(now, g, !cleared);
+            }
+        } else if (cleared) {
+            metClearedUntil = now + tuning.metClearedMs;
+        }
+    }
+
+    private void cancelMetCheck() {
+        if (metChecking) {
+            metChecking = false;
+            port.cancelRecentlyMet();
+        }
+    }
+
     // ---- entering states ----
 
     private void enterEyesOnly(String why) {
@@ -3254,6 +3544,10 @@ final class ExploreBrain {
         backForTurn = false;
         turnRetrying = false;
         cancelDoorway(clock.nowMs(), "lease or sensors lost");
+        cancelMetCheck();
+        gatedPick = null;
+        remarkOnly = false;
+        meetingHeld = false;
         hopNext = false;
         plannedTicks = -1;
         lookForLeg = false;

@@ -116,6 +116,30 @@ interface CuriosityPort {
     /** Abandon the running doorway(), if any: its late answer must never be returned. */
     void cancelDoorway();
 
+    // ---- people while roaming: the recently-met check (explore nav plan U7, KTD4, KTD8) ----
+
+    /**
+     * Ask whether the person in this frame's person box is one of the people met in
+     * the last 10 minutes (request.met: the handles metId() gave for them, oldest
+     * first). The adapter crops the face from the frame and sends it with the stored
+     * faces of those people, like match(). Never carries names, and nothing is
+     * written anywhere (R15): not even the face debug switch sees this crop.
+     */
+    void recentlyMet(RecentlyMetRequest request, long timeoutMs);
+
+    /** The answer to the last recentlyMet(), or null while it is running. */
+    Recently recentlyMetAnswer();
+
+    /** Abandon the running recentlyMet(), if any: its late answer must never be returned. */
+    void cancelRecentlyMet();
+
+    /**
+     * A meeting just ended: an opaque handle for the person the last match() met,
+     * for later recentlyMet() requests, or null when there is no face of them to
+     * compare against (no face was found). Never a name.
+     */
+    String metId();
+
     /** No Claude: every stop takes the path it took before U4. */
     CuriosityPort NONE = new CuriosityPort() {
         public boolean canAsk() {
@@ -202,6 +226,20 @@ interface CuriosityPort {
         }
 
         public void cancelDoorway() {
+        }
+
+        public void recentlyMet(RecentlyMetRequest request, long timeoutMs) {
+        }
+
+        public Recently recentlyMetAnswer() {
+            return Recently.failed();
+        }
+
+        public void cancelRecentlyMet() {
+        }
+
+        public String metId() {
+            return null;
         }
     };
 
@@ -491,6 +529,63 @@ interface CuriosityPort {
         public String toString() {
             return status == Status.DOOR ? String.format(java.util.Locale.US, "open doorway at x %.2f", x)
                     : status.toString();
+        }
+    }
+
+    /**
+     * The recently-met check: the frame and the person box in it (frame fractions)
+     * to crop the face from, and the handles of everyone met in the last 10 minutes,
+     * oldest first.
+     */
+    final class RecentlyMetRequest {
+        final byte[] frameJpeg;
+        final Detection personBox;
+        final List<String> met;
+
+        RecentlyMetRequest(byte[] frameJpeg, Detection personBox, List<String> met) {
+            this.frameJpeg = frameJpeg;
+            this.personBox = personBox;
+            this.met = Collections.unmodifiableList(met);
+        }
+    }
+
+    /**
+     * Claude's recently-met answer. SAME carries which of the request's people it is
+     * (index into RecentlyMetRequest.met); DIFFERENT: none of them; UNSURE: can't
+     * tell (no face found, too small, turned away); FAILED: a refused, malformed or
+     * failed request. Only DIFFERENT lets him approach (KTD8).
+     */
+    final class Recently {
+        enum Status { SAME, DIFFERENT, UNSURE, FAILED }
+
+        final Status status;
+        final int index;
+
+        private Recently(Status status, int index) {
+            this.status = status;
+            this.index = index;
+        }
+
+        static Recently same(int index) {
+            return new Recently(Status.SAME, index);
+        }
+
+        static Recently different() {
+            return new Recently(Status.DIFFERENT, -1);
+        }
+
+        static Recently unsure() {
+            return new Recently(Status.UNSURE, -1);
+        }
+
+        static Recently failed() {
+            return new Recently(Status.FAILED, -1);
+        }
+
+        /** Numbers only, for the trace. */
+        @Override
+        public String toString() {
+            return status == Status.SAME ? "same as person " + (index + 1) : status.toString();
         }
     }
 }

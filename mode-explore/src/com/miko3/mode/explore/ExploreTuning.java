@@ -347,6 +347,20 @@ final class ExploreTuning {
     final double doorwayFacingDeg;
     final long doorwayExpireMs;
     final long doorwayExpireCounts;
+    /**
+     * People while roaming (explore nav plan U7, R9, R10, KTD8). A person box he sees
+     * while roaming is approached until it is politeHeight of the frame's height (any
+     * person approach stops there). Everyone he meets is left alone for
+     * metLeaveAloneMs from the end of their meeting: while anyone is on that list, a
+     * person is approached only after Claude's recently-met check answers "none of
+     * them", at most one check per metCheckIntervalMs, each given up after
+     * metCheckTimeoutMs; a "none of them" clears a roaming person for metClearedMs.
+     */
+    final float politeHeight;
+    final long metLeaveAloneMs;
+    final long metCheckIntervalMs;
+    final long metCheckTimeoutMs;
+    final long metClearedMs;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -481,6 +495,11 @@ final class ExploreTuning {
         doorwayFacingDeg = b.doorwayFacingDeg;
         doorwayExpireMs = b.doorwayExpireMs;
         doorwayExpireCounts = b.doorwayExpireCounts;
+        politeHeight = b.politeHeight;
+        metLeaveAloneMs = Math.max(0, b.metLeaveAloneMs);
+        metCheckIntervalMs = Math.max(0, b.metCheckIntervalMs);
+        metCheckTimeoutMs = Math.max(1, b.metCheckTimeoutMs);
+        metClearedMs = Math.max(0, b.metClearedMs);
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
@@ -706,9 +725,10 @@ final class ExploreTuning {
         private double escapeTriedDeg = 45;
         private float escapeTriedPenalty = 0.5f;
         private long backOutMaxMs = 4000;
-        // ~0.75 s at backTickMs, a few centimetres: no rear sensor, so as little as frees a turn.
-        // Shorter than the stall watch's grace, so at this length its time ends it first.
-        private int blockedTurnBackTicks = 3;
+        // ~2 s at backTickMs: the owner's manual reverse that freed him (live 2026-09-25,
+        // 8 frames at 250 ms). Still blind with no rear sensor, so bounded by its time, and
+        // the stall watch stops it early against something behind him.
+        private int blockedTurnBackTicks = 8;
         // R8 and the owner's cap (Key Decisions): about once a minute, so room pictures
         // sent to Claude stay infrequent. A navigation ask answers in ~3-6 s live (U5).
         private long doorwayAskMs = 60000;
@@ -722,6 +742,18 @@ final class ExploreTuning {
         // the next ask by then says afresh. Not measured; U8 checks it.
         private long doorwayExpireMs = 60000;
         private long doorwayExpireCounts = 6000;
+        // A person's box reaching 60% of the frame's height: roughly an arm's length or
+        // two from a standing adult for a camera ~25 cm off the floor, short of fillHeight.
+        // Not measured; U8 checks it on the floor with the owner.
+        private float politeHeight = 0.6f;
+        // The owner's 10 minutes (Key Decisions, user-approved), from each meeting's end.
+        private long metLeaveAloneMs = 600000;
+        // KTD8: one recently-met check a minute keeps face pictures sent to Claude rare.
+        private long metCheckIntervalMs = 60000;
+        // Like a look try (askTimeoutMs): a person request answers in ~3-6 s live.
+        private long metCheckTimeoutMs = 10000;
+        // Long enough to reach the next leg decision after the answer comes back.
+        private long metClearedMs = 15000;
 
         /** A fixed leg length. */
         Builder hopTicks(int v) { hopTicks = v; hopTicksMax = v; return this; }
@@ -923,6 +955,15 @@ final class ExploreTuning {
         Builder doorwayExpire(long ms, long counts) {
             doorwayExpireMs = ms;
             doorwayExpireCounts = counts;
+            return this;
+        }
+
+        Builder politeHeight(float v) { politeHeight = v; return this; }
+        Builder recentlyMet(long leaveAloneMs, long checkIntervalMs, long checkTimeoutMs, long clearedMs) {
+            metLeaveAloneMs = leaveAloneMs;
+            metCheckIntervalMs = checkIntervalMs;
+            metCheckTimeoutMs = checkTimeoutMs;
+            metClearedMs = clearedMs;
             return this;
         }
 

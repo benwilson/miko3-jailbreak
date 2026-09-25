@@ -106,6 +106,11 @@ public final class ExploreBrainHarness {
         double rateDegS = 60;
         /** The wheels turn but he doesn't (wedged under a desk, explore nav plan U5): the yaw stays flat. */
         boolean stuck;
+        /** Only turns this way are stuck (+1 left, -1 right, 0 neither): live 2026-09-25, left
+         * was blocked while right and reversing were free. */
+        int stuckDir;
+        /** The first turn's way becomes stuckDir. */
+        boolean blockFirstTurnsSide;
         double biasCounts = 92;
         double coastDeg;
         /** Unwrapped, left positive, starting at 0. */
@@ -130,6 +135,9 @@ public final class ExploreBrainHarness {
 
         void turn(int d) {
             finish();
+            if (blockFirstTurnsSide && stuckDir == 0) {
+                stuckDir = d;
+            }
             dir = d;
             coastLeft = 0;
             turnStartDeg = trueDeg;
@@ -151,7 +159,7 @@ public final class ExploreBrainHarness {
         void advance(long ms) {
             double s = rateDegS * ms / 1000.0;
             if (dir != 0) {
-                if (!stuck) {
+                if (!stuck && dir != stuckDir) {
                     trueDeg += dir * s;
                 }
             } else if (coastLeft > 0) {
@@ -179,11 +187,11 @@ public final class ExploreBrainHarness {
             return (int) Math.round(biasAt(t) + gyro.sign * rate * gyro.countSecondsPer360 / 360.0);
         }
 
-        /** r with this sim's gyro (and the given wheel counts). */
-        SensorReading wrap(SensorReading r, long wl, long wr) {
+        /** r with this sim's gyro (and the given wheel counts, if it has any). */
+        SensorReading wrap(SensorReading r, boolean hasWheels, long wl, long wr) {
             int raw = rawAt(r.timestampMs);
-            return new SensorReading(r.timestampMs, r.tof, r.ir1, r.ir2, r.cpl, r.fault, wl, wr,
-                    gyro.axis == 0 ? raw : 0, gyro.axis == 1 ? raw : 0, gyro.axis == 2 ? raw : 0);
+            return new SensorReading(r.timestampMs, r.tof, r.ir1, r.ir2, r.cpl, r.fault, hasWheels, wl, wr,
+                    true, gyro.axis == 0 ? raw : 0, gyro.axis == 1 ? raw : 0, gyro.axis == 2 ? raw : 0);
         }
 
         double wrapped() {
@@ -296,6 +304,31 @@ public final class ExploreBrainHarness {
 
     interface NameScript {
         CuriosityPort.Named find(String transcript);
+    }
+
+    /** The scripted recently-met checks (explore nav plan U7): the nth check's answer, or null for none ever. */
+    interface MetScript {
+        CuriosityPort.Recently answer(Rig rig, CuriosityPort.RecentlyMetRequest request, int nth);
+    }
+
+    /** One recently-met check as the fake Claude saw it: when, in which brain state, and what it carried. */
+    static final class MetCheck {
+        final long t;
+        final String state;
+        final CuriosityPort.RecentlyMetRequest request;
+        final long timeoutMs;
+
+        MetCheck(long t, String state, CuriosityPort.RecentlyMetRequest request, long timeoutMs) {
+            this.t = t;
+            this.state = state;
+            this.request = request;
+            this.timeoutMs = timeoutMs;
+        }
+
+        @Override
+        public String toString() {
+            return "check@" + t + " " + state + " " + request.met;
+        }
     }
 
     /** What the fake launcher and Claude answer in the meet flow; a null answer never comes. */
@@ -411,6 +444,16 @@ public final class ExploreBrainHarness {
         CuriosityPort.Doorway pendingDoorway;
         long pendingDoorwayAt;
         int doorwayCancels;
+        /** The fake recently-met check (explore nav plan U7): null script means every check fails. */
+        MetScript metChecks;
+        long metCheckDelayMs = 1000;
+        final List<MetCheck> metCheckLog = new ArrayList<MetCheck>();
+        CuriosityPort.Recently pendingMet;
+        long pendingMetAt;
+        int metCancels;
+        /** metId() hands out "met-1", "met-2", ... (null while facelessMeetings: no face to compare). */
+        boolean facelessMeetings;
+        final List<String> metIdsGiven = new ArrayList<String>();
         /** The true heading at each look's capture time (explore nav plan U5), for aiming checks. */
         final java.util.Map<Long, Double> lookHeadings = new java.util.HashMap<Long, Double>();
         /** Every straight drive, in order; the current one while it runs. */
@@ -516,8 +559,10 @@ public final class ExploreBrainHarness {
                     if (r != null && (yaw != null || simWheels)) {
                         long wl = simWheels ? wheelLeft : r.wheelLeft;
                         long wr = simWheels ? wheelRight : r.wheelRight;
-                        r = yaw != null ? yaw.wrap(r, wl, wr)
-                                : new SensorReading(r.timestampMs, r.tof, r.ir1, r.ir2, r.cpl, r.fault, wl, wr);
+                        boolean has = simWheels || r.hasWheels();
+                        r = yaw != null ? yaw.wrap(r, has, wl, wr)
+                                : new SensorReading(r.timestampMs, r.tof, r.ir1, r.ir2, r.cpl, r.fault, has, wl, wr,
+                                false, 0, 0, 0);
                     }
                     if (r != null) {
                         lastFed = r;
@@ -941,6 +986,39 @@ public final class ExploreBrainHarness {
             log.add(new Event(now, "touch"));
         }
 
+        @Override
+        public void recentlyMet(CuriosityPort.RecentlyMetRequest request, long timeoutMs) {
+            metCheckLog.add(new MetCheck(now, brain.state().name(), request, timeoutMs));
+            pendingMet = metChecks == null ? CuriosityPort.Recently.failed()
+                    : metChecks.answer(this, request, metCheckLog.size());
+            pendingMetAt = now + metCheckDelayMs;
+            log.add(new Event(now, "met-check " + request.met.size()));
+        }
+
+        @Override
+        public CuriosityPort.Recently recentlyMetAnswer() {
+            if (pendingMet == null || now < pendingMetAt) {
+                return null;
+            }
+            CuriosityPort.Recently a = pendingMet;
+            pendingMet = null;
+            log.add(new Event(now, "met-check answer " + a.status));
+            return a;
+        }
+
+        @Override
+        public void cancelRecentlyMet() {
+            pendingMet = null;
+            metCancels++;
+        }
+
+        @Override
+        public String metId() {
+            String id = facelessMeetings ? null : "met-" + (metIdsGiven.size() + 1);
+            metIdsGiven.add(id);
+            return id;
+        }
+
         // ---- log queries ----
 
         int count(String what) {
@@ -1111,6 +1189,7 @@ public final class ExploreBrainHarness {
         escapeScenarios();
         pinnedScenarios();
         doorwayScenarios();
+        peopleScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -2813,8 +2892,11 @@ public final class ExploreBrainHarness {
             rig.started();
             rig.runUntil(22000);
             int remember = rig.first("remember Sam", 0);
+            // Nothing said before he is back to wandering (the next stop's person pick is a
+            // remark about someone just met, explore nav plan U7).
+            long resumed = rig.timeOf(rig.firstAfter("eyes IDLE", rig.timeOf(remember)));
             check(n, remember >= 0 && resumedBy(rig, rig.timeOf(remember), rig.timeOf(remember) + 4000)
-                            && rig.countPrefix("say", rig.timeOf(remember), 22001) == 0
+                            && rig.countPrefix("say", rig.timeOf(remember), resumed + 1) == 0
                             && rig.violations.isEmpty(),
                     rig.tail());
         });
@@ -2841,11 +2923,16 @@ public final class ExploreBrainHarness {
             rig.people.match = (r, k) -> k == 1 ? STRANGER
                     : CuriosityPort.MatchAnswer.known("Sarah", "Welcome back, {name}!", "Hi again!");
             rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Sarah");
+            // Each recently-met check says someone new, so she is met again (explore nav plan U7).
+            rig.metChecks = (r, req, k) -> CuriosityPort.Recently.different();
             rig.started();
             rig.runUntil(40000);
-            boolean clean = rig.meets.size() >= 2;
+            boolean clean = rig.meets.size() >= 2 && !rig.metCheckLog.isEmpty();
             for (String m : rig.meets) {
                 clean &= m.startsWith("jpeg@") && m.endsWith(" person") && !m.contains("Sarah");
+            }
+            for (MetCheck c : rig.metCheckLog) {
+                clean &= !c.request.met.toString().contains("Sarah");
             }
             boolean quiet = true;
             for (String note : notes) {
@@ -3102,7 +3189,7 @@ public final class ExploreBrainHarness {
                 wr++;
             }
             if (now % 100 == 0) {
-                h.offer(yaw.wrap(clear(now), wl, wr), commanded);
+                h.offer(yaw.wrap(clear(now), true, wl, wr), commanded);
             }
         }
 
@@ -4377,10 +4464,11 @@ public final class ExploreBrainHarness {
             rig.yaw.stuck = true;
             rig.started();
             runUntil(rig, 30000, r -> entered(r, ExploreBrain.State.CIRCLE, 0) >= 0);
-            // No back-out along a leg: only the short back-ups before retried turns (3 ticks).
+            // No back-out along a leg: only the short back-ups before retried turns (blockedTurnBackTicks).
+            long shortMs = rig.tuning.blockedTurnBackTicks * 250 + 100;
             boolean shortOnly = true;
             for (Drive d : rig.drives) {
-                shortOnly &= !d.kind.equals("back") || (d.end > 0 && d.end - d.t <= 3 * 250 + 100);
+                shortOnly &= !d.kind.equals("back") || (d.end > 0 && d.end - d.t <= shortMs);
             }
             check(n, entered(rig, ExploreBrain.State.CIRCLE, 0) > 0
                             && drivesIn(rig, "RETRACE", "back", 0, Long.MAX_VALUE).isEmpty() && shortOnly
@@ -4408,15 +4496,129 @@ public final class ExploreBrainHarness {
             }
             Drive first = backs.isEmpty() ? null : backs.get(0);
             long took = first == null ? -1 : first.end - first.t;
-            // After it, only the short back-ups before retried turns (3 ticks), one per blocked turn.
+            // After it, only the short back-ups before retried turns (blockedTurnBackTicks, or
+            // less when the stall watch stops one), one per blocked turn.
             boolean restShort = true;
             for (int i = 1; i < backs.size(); i++) {
-                restShort &= backs.get(i).end - backs.get(i).t <= 3 * 250 + 100;
+                restShort &= backs.get(i).end - backs.get(i).t <= rig.tuning.blockedTurnBackTicks * 250 + 100;
             }
             check(n, first != null && first.state.equals("RETRACE") && took >= 900 && took <= 1500
                             && Math.abs(first.counts) <= 2 && restShort
                             && rig.brain.state() == ExploreBrain.State.CORNERED && rig.violations.isEmpty(),
                     "backs=" + backs + " " + rig.tail());
+        });
+        // ---- a blocked side: the retry and later turns go the other way (live 2026-09-25) ----
+        scenario("blocked_side_backs_up_then_turns_the_other_way_and_drives_off", n -> {
+            // The first turn's way is blocked, the other way and reversing are free.
+            Rig rig = new Rig(escTuning().turnChance(1.0).build(), CLEAR, NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.blockFirstTurnsSide = true;
+            rig.started();
+            rig.runUntil(15000);
+            int first = rig.first("turn", 0);
+            List<Drive> backs = drivesIn(rig, "BACK_OFF", "back", 0, Long.MAX_VALUE);
+            Drive back = backs.isEmpty() ? null : backs.get(0);
+            int retry = back == null || back.end < 0 ? -1 : rig.firstAfter("turn", back.end);
+            String other = rig.what(first).equals("turn LEFT") ? "turn RIGHT" : "turn LEFT";
+            boolean turned = false;
+            for (double r : rig.yaw.turnResults) {
+                turned |= Math.abs(r) >= 15;
+            }
+            Drive hop = retry < 0 ? null : firstDrive(rig, "HOP", "hop", rig.timeOf(retry));
+            boolean escaped = false;
+            for (ExploreBrain.State st : rig.statesSeen) {
+                escaped |= ESCAPING.contains(st);
+            }
+            check(n, first >= 0 && back != null && backs.size() == 1 && back.end - back.t >= 1900
+                            && rig.what(retry).equals(other) && turned && hop != null && !escaped
+                            && rig.violations.isEmpty(),
+                    "first=" + rig.what(first) + " backs=" + backs + " retry=" + rig.what(retry) + " results="
+                            + rig.yaw.turnResults + " " + rig.tail());
+        });
+        scenario("blocked_side_escape_turns_go_the_unblocked_way_even_the_long_way_round", n -> {
+            // Bumped into a wedge; the first turn's way is blocked for good, and nothing behind
+            // him gives (reversing goes nowhere), so the ladder's turns must go the other way:
+            // the retrace's, the circle's and the drive-off's. Every turn after the first does.
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
+            rig.yaw.blockFirstTurnsSide = true;
+            rig.backBlocked = true;
+            rig.openView = deskView();
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "free after") >= 0);
+            int first = rig.first("turn", 0);
+            String blocked = rig.what(first);
+            int second = rig.first("turn", first + 1);
+            boolean otherWay = second > 0;
+            for (int i = second; otherWay && i < rig.log.size(); i++) {
+                otherWay &= !rig.log.get(i).what.equals(blocked);
+            }
+            List<String> key = new ArrayList<String>();
+            for (String x : notes) {
+                if (x.contains("blocked") || x.contains("other way") || x.contains("wedged") || x.contains("free after")) {
+                    key.add(x);
+                }
+            }
+            check(n, first >= 0 && otherWay && notedAt(notes, "measured turn blocked") >= 0
+                            && notedAt(notes, "the long way round") >= 0 && notedAt(notes, "free after") >= 0
+                            && enteredAny(rig, 0, ExploreBrain.State.RETRACE, ExploreBrain.State.CIRCLE) >= 0
+                            && entered(rig, ExploreBrain.State.CORNERED, 0) < 0 && rig.violations.isEmpty(),
+                    "blocked=" + blocked + " notes=" + key + " " + rig.tail());
+        });
+        scenario("blocked_turn_back_up_default_is_about_2_s", n -> {
+            ExploreTuning t = new ExploreTuning.Builder().build();
+            check(n, t.blockedTurnBackTicks * t.backTickMs >= 1500 && t.blockedTurnBackTicks * t.backTickMs <= 2000,
+                    t.blockedTurnBackTicks + " x " + t.backTickMs);
+        });
+        // ---- signed wheel counters (live 2026-09-25: reverse counts down, from 0 at power-up) ----
+        scenario("wheels_negative_counts_back_out_reports_the_real_distance", n -> {
+            // As escape_back_out_stops_at_the_logged_distance...: the counters start below
+            // zero, so the leg in crosses zero and the back-out crosses it again.
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h, t -> {
+                Rig r = h[0];
+                if (r != null && r.count("hop") > 0) {
+                    r.yaw.stuck = true;
+                }
+                return clear(t);
+            }, null);
+            rig.wheelLeft = -60;
+            rig.wheelRight = -40;
+            rig.openView = deskView();
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(12000);
+            Drive back = null;
+            for (Drive d : rig.drives) {
+                if (back == null && d.kind.equals("back")) {
+                    back = d;
+                }
+            }
+            long noted = -1;
+            for (String x : notes) {
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile("backed out (\\d+) counts").matcher(x);
+                if (noted < 0 && m.find()) {
+                    noted = Long.parseLong(m.group(1));
+                }
+            }
+            check(n, back != null && Math.abs(-back.counts - 100) <= 12 && Math.abs(noted - 100) <= 12
+                            && rig.violations.isEmpty(),
+                    "back=" + back + " noted=" + noted + " " + rig.tail());
+        });
+        scenario("wheels_stall_is_detected_below_and_across_zero", n -> {
+            // Below zero: the wheels turn until 2000, then stand still at negative counts.
+            Rig below = new Rig(tuning().hopTicks(20).build(), t -> new SensorReading(t, 300 + jitter(t), 100, 100,
+                    null, false, -900 + Math.min(t, 2000) / 10, -700 + Math.min(t, 2000) / 10)).started();
+            below.runUntil(5500);
+            int stop = below.firstAfter("stop", 1301);
+            // Across zero: counts climb through 0 mid-leg and never stall: the full leg runs.
+            Rig across = new Rig(tuning().hopTicks(20).build(), t -> new SensorReading(t, 300 + jitter(t), 100, 100,
+                    null, false, -300 + t / 10, -250 + t / 10)).started();
+            across.runUntil(6500);
+            check(n, below.timeOf(stop) >= 2900 && below.timeOf(stop) <= 3100 && below.count("startle") == 1
+                            && across.count("startle") == 0 && across.maxHopTicks == 20,
+                    "stop@" + below.timeOf(stop) + " " + below.tail() + " / across " + across.tail());
         });
         // ---- a blocked turn backs up a little first, then tries again once (live: pinned after a CPL stop) ----
         scenario("blocked_turn_backs_up_a_little_then_the_retried_turn_succeeds", n -> {
@@ -4447,7 +4649,8 @@ public final class ExploreBrainHarness {
             }
             check(n, turn >= 0 && back != null && back.state.equals("BACK_OFF") && backs.size() == 1
                             && back.t - rig.timeOf(turn) >= 1400 && back.counts < 0
-                            && back.end - back.t <= 3 * 250 + 100 && retry > 0 && turned && hop != null && !escaped
+                            && back.end - back.t <= rig.tuning.blockedTurnBackTicks * 250 + 100 && retry > 0 && turned
+                            && hop != null && !escaped
                             && rig.violations.isEmpty(),
                     "backs=" + backs + " results=" + rig.yaw.turnResults + " " + rig.tail());
         });
@@ -4795,6 +4998,314 @@ public final class ExploreBrainHarness {
                             && none.status == CuriosityPort.Doorway.Status.NONE
                             && odd.status == CuriosityPort.Doorway.Status.FAILED,
                     ok + " " + fraction + " " + wide + " " + negative + " " + text + " " + noX + " " + none + " " + odd);
+        });
+    }
+    // ---- people while roaming, with a per-person leave-alone (explore nav plan U7, R9, R10, AE4) ----
+    //
+    // Roaming with Claude set up and no curiosity stops, so only a person brings him
+    // to a stop. A person box is straight ahead and grows 0.15 of the frame's height
+    // per approach leg from 0.3: the polite distance (0.6) is reached after 2 legs,
+    // short of filling the frame (0.7). A meeting ends about 10 s in.
+
+    private static ExploreTuning.Builder peopleTuning() {
+        return claudeTuning().curiosityMs(100000000L, 100000000L);
+    }
+
+    /** Approach legs driven since he last went from roaming to facing or approaching someone. */
+    private static int approachLegs(Rig rig) {
+        long from = -1;
+        String prev = "";
+        for (Event e : rig.stateLog) {
+            boolean going = e.what.equals("FACE") || e.what.equals("APPROACH");
+            if (going && !prev.equals("FACE") && !prev.equals("APPROACH")) {
+                from = e.t;
+            }
+            prev = e.what;
+        }
+        if (from < 0) {
+            return 0;
+        }
+        return drivesIn(rig, "APPROACH", "hop", from, Long.MAX_VALUE).size();
+    }
+
+    /** A person straight ahead whenever visible(t), closer after each approach leg. */
+    private static Vision personWhen(java.util.function.LongPredicate visible) {
+        return (rig, t) -> visible.test(t)
+                ? list(box("person", 0.9f, 0.5f, 0.5f, 0.3f, Math.min(1f, 0.3f + 0.15f * approachLegs(rig))))
+                : list();
+    }
+
+    private static Rig peopleRig(ExploreTuning.Builder b, Vision v) {
+        Rig rig = new Rig(b.build(), CLEAR, v, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+        rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah", "Hi {name}!", "Hello again!");
+        return rig;
+    }
+
+    private static List<MetCheck> checksIn(Rig rig, long from, long to) {
+        List<MetCheck> out = new ArrayList<MetCheck>();
+        for (MetCheck c : rig.metCheckLog) {
+            if (c.t >= from && c.t < to) {
+                out.add(c);
+            }
+        }
+        return out;
+    }
+
+    private static String ascii(byte[] b) {
+        return b == null ? "null" : new String(b, java.nio.charset.StandardCharsets.US_ASCII);
+    }
+
+    /** When the brain entered any of these states at or after from (the state log), else -1. */
+    private static long enteredAny(Rig rig, long from, ExploreBrain.State... states) {
+        long first = -1;
+        for (ExploreBrain.State s : states) {
+            long t = entered(rig, s, from);
+            if (t >= 0 && (first < 0 || t < first)) {
+                first = t;
+            }
+        }
+        return first;
+    }
+
+    private static void peopleScenarios() {
+        scenario("people_roaming_person_is_approached_to_the_polite_distance_and_greeted_by_name", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> true));
+            rig.started();
+            rig.runUntil(15000);
+            int match = rig.first("match", 0);
+            int say = rig.first("say ", match);
+            long matchT = rig.timeOf(match);
+            int legsBefore = drivesIn(rig, "APPROACH", "hop", 0, matchT < 0 ? 15001 : matchT).size();
+            check(n, match >= 0 && rig.what(say).equals("say Hi Sarah!") && rig.touches == 1
+                            && legsBefore == 2 && checksIn(rig, 0, matchT).isEmpty()
+                            && rig.count("match") == 1 && rig.metIdsGiven.size() == 1
+                            && rig.statesSeen.contains(ExploreBrain.State.MEET) && rig.violations.isEmpty(),
+                    "match=" + match + " say=" + rig.what(say) + " legs=" + legsBefore + " checks="
+                            + rig.metCheckLog + " " + rig.tail());
+        });
+        scenario("people_ae4_same_person_5_min_later_is_checked_and_left_alone", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> t < 15000 || t >= 310000));
+            rig.metChecks = (r, req, k) -> CuriosityPort.Recently.same(0);
+            rig.started();
+            rig.runUntil(340000);
+            List<MetCheck> late = checksIn(rig, 300000, 340000);
+            MetCheck c = late.isEmpty() ? null : late.get(0);
+            String jpeg = c == null ? "" : ascii(c.request.frameJpeg);
+            boolean roamingFrame = jpeg.startsWith("jpeg@")
+                    && c.t - Long.parseLong(jpeg.substring(5)) <= 3000;
+            boolean carried = c != null && c.request.met.equals(java.util.Arrays.asList("met-1")) && roamingFrame
+                    && c.request.personBox != null && "person".equals(c.request.personBox.label)
+                    && c.state.equals("PAUSE");
+            check(n, rig.count("match") == 1 && carried && rig.countPrefix("hop", c.t, 340001) > 0
+                            && enteredAny(rig, 300000, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH,
+                            ExploreBrain.State.MEET_LOOK, ExploreBrain.State.MEET) < 0
+                            && rig.violations.isEmpty(),
+                    "late=" + late + " jpeg=" + jpeg + " " + rig.tail());
+        });
+        scenario("people_different_person_5_min_later_is_approached", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> t < 15000 || t >= 310000));
+            rig.metChecks = (r, req, k) -> r.now >= 300000 ? CuriosityPort.Recently.different()
+                    : CuriosityPort.Recently.same(0);
+            rig.people.match = (r, k) -> k == 1
+                    ? CuriosityPort.MatchAnswer.known("Sarah", "Hi {name}!", "Hello again!")
+                    : CuriosityPort.MatchAnswer.known("Bob", "Hey {name}!", "Hello again!");
+            rig.started();
+            rig.runUntil(340000);
+            List<MetCheck> late = checksIn(rig, 300000, 340000);
+            int answer = rig.firstAfter("met-check answer DIFFERENT", 300000);
+            int second = rig.firstAfter("match", 300000);
+            int say = rig.first("say Hey Bob!", second);
+            check(n, rig.count("match") == 2 && !late.isEmpty() && answer >= 0 && second > answer && say > second
+                            && rig.violations.isEmpty(),
+                    "late=" + late + " answer=" + answer + " second=" + second + " " + rig.tail());
+        });
+        scenario("people_check_timeout_or_offline_never_approaches", n -> {
+            Rig never = peopleRig(peopleTuning(), personWhen(t -> t < 15000 || t >= 310000));
+            never.metChecks = (r, req, k) -> null;
+            never.started();
+            never.runUntil(340000);
+            Rig offline = peopleRig(peopleTuning(), personWhen(t -> t < 15000 || t >= 310000));
+            offline.started();
+            offline.runUntil(340000);
+            // A curiosity stop's person pick with the check never answering: a remark, no approach.
+            Rig stop = new Rig(peopleTuning().build(), CLEAR, (r, t) -> list(), true, PERSON_AHEAD);
+            stop.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Olive", "Hi {name}!", "Hello again!");
+            stop.metChecks = (r, req, k) -> null;
+            stop.at(1000, () -> stop.brain.requestCuriosity());
+            stop.at(300000, () -> stop.brain.requestCuriosity());
+            stop.started();
+            stop.runUntil(330000);
+            long check2 = checksIn(stop, 300000, 330000).isEmpty() ? -1 : checksIn(stop, 300000, 330000).get(0).t;
+            int remark = stop.firstAfter("say LOOK-LINE", 300000);
+            check(n, never.count("match") == 1 && !checksIn(never, 300000, 340000).isEmpty() && never.metCancels >= 1
+                            && offline.count("match") == 1 && !checksIn(offline, 300000, 340000).isEmpty()
+                            && stop.count("match") == 1 && check2 > 0 && remark >= 0 && stop.timeOf(remark) > check2
+                            && enteredAny(stop, 300000, ExploreBrain.State.APPROACH, ExploreBrain.State.MEET_LOOK,
+                            ExploreBrain.State.MEET) < 0
+                            && never.violations.isEmpty() && offline.violations.isEmpty() && stop.violations.isEmpty(),
+                    "never=" + never.count("match") + "/" + never.metCancels + " offline=" + offline.count("match")
+                            + " stop=" + stop.count("match") + " check2=" + check2 + " remark=" + remark + " "
+                            + stop.tail());
+        });
+        scenario("people_after_10_min_no_check_and_approached", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> t < 15000 || t >= 620000));
+            rig.metChecks = (r, req, k) -> CuriosityPort.Recently.same(0);
+            rig.started();
+            rig.runUntil(650000);
+            int second = rig.firstAfter("match", 600000);
+            // No check before the second meeting (the one after it is about the person just met).
+            check(n, rig.count("match") == 2 && second >= 0 && checksIn(rig, 600000, rig.timeOf(second)).isEmpty()
+                            && rig.violations.isEmpty(),
+                    "second=" + rig.timeOf(second) + " checks=" + rig.metCheckLog + " " + rig.tail());
+        });
+        scenario("people_a_then_b_then_a_check_covers_both_and_a_is_left_alone", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> t < 15000 || (t >= 100000 && t < 115000)
+                    || (t >= 200000 && t < 215000)));
+            rig.metChecks = (r, req, k) -> r.now >= 100000 && r.now < 110000 ? CuriosityPort.Recently.different()
+                    : CuriosityPort.Recently.same(0);
+            rig.people.match = (r, k) -> k == 1
+                    ? CuriosityPort.MatchAnswer.known("Ann", "Hi {name}!", "Hello again!")
+                    : CuriosityPort.MatchAnswer.known("Bob", "Hey {name}!", "Hello again!");
+            rig.started();
+            rig.runUntil(240000);
+            List<MetCheck> third = checksIn(rig, 200000, 240000);
+            boolean both = !third.isEmpty()
+                    && third.get(0).request.met.equals(java.util.Arrays.asList("met-1", "met-2"));
+            check(n, rig.count("match") == 2 && rig.count("say Hi Ann!") == 1 && rig.count("say Hey Bob!") == 1
+                            && both && rig.firstAfter("met-check answer SAME", 200000) >= 0
+                            && enteredAny(rig, 200000, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH,
+                            ExploreBrain.State.MEET) < 0 && rig.violations.isEmpty(),
+                    "checks=" + rig.metCheckLog + " " + rig.tail());
+        });
+        scenario("people_curiosity_pick_of_the_owner_5_min_later_is_a_remark", n -> {
+            Rig rig = new Rig(peopleTuning().build(), CLEAR, (r, t) -> list(), true, PERSON_AHEAD);
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Olive", "Hi {name}!", "Hello again!");
+            rig.metChecks = (r, req, k) -> CuriosityPort.Recently.same(0);
+            rig.at(1000, () -> rig.brain.requestCuriosity());
+            rig.at(300000, () -> rig.brain.requestCuriosity());
+            rig.started();
+            rig.runUntil(330000);
+            List<MetCheck> late = checksIn(rig, 300000, 330000);
+            MetCheck c = late.isEmpty() ? null : late.get(0);
+            CuriosityPort.LookRequest ask2 = rig.asks.size() < 2 ? null : rig.asks.get(1);
+            boolean scanFrame = c != null && ask2 != null
+                    && ascii(c.request.frameJpeg).equals(ascii(ask2.frames.get(2).jpeg));
+            int remark = rig.firstAfter("say LOOK-LINE", 300000);
+            check(n, rig.count("say Hi Olive!") == 1 && rig.count("match") == 1 && c != null && c.state.equals("ASK")
+                            && c.request.met.equals(java.util.Arrays.asList("met-1")) && scanFrame
+                            && remark >= 0 && rig.timeOf(remark) > c.t
+                            && rig.countPrefix("hop", c.t, rig.timeOf(remark) + 1) == 0
+                            && enteredAny(rig, 300000, ExploreBrain.State.APPROACH, ExploreBrain.State.MEET_LOOK,
+                            ExploreBrain.State.MEET) < 0 && rig.violations.isEmpty(),
+                    "late=" + late + " remark=" + remark + " " + rig.tail());
+        });
+        scenario("people_owner_in_view_3_min_gets_at_most_3_checks", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> true));
+            rig.metChecks = (r, req, k) -> CuriosityPort.Recently.same(0);
+            rig.started();
+            rig.runUntil(200000);
+            int say = rig.first("say Hi Sarah!", 0);
+            long ended = rig.timeOf(say) + rig.speechMs;
+            List<MetCheck> checks = checksIn(rig, ended, ended + 180000);
+            check(n, say >= 0 && checks.size() >= 2 && checks.size() <= 3 && rig.count("match") == 1
+                            && rig.violations.isEmpty(),
+                    "ended=" + ended + " checks=" + checks);
+        });
+        scenario("people_hazard_during_a_roaming_approach_drops_the_meeting", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = new Rig(peopleTuning().build(), hazardWhile(h, ExploreBrain.State.APPROACH, t -> edgeAhead(t)),
+                    personWhen(t -> t < 2500), true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+            rig.people.match = (r, k) -> STRANGER;
+            h[0] = rig;
+            rig.started();
+            rig.runUntil(20000);
+            long approach = entered(rig, ExploreBrain.State.APPROACH, 0);
+            int startle = rig.first("startle", 0);
+            check(n, approach >= 0 && startle >= 0 && rig.timeOf(startle) > approach && rig.count("match") == 0
+                            && !rig.statesSeen.contains(ExploreBrain.State.MEET_LOOK)
+                            && !rig.statesSeen.contains(ExploreBrain.State.MEET) && rig.metIdsGiven.isEmpty()
+                            && rig.countPrefix("say", 0, 20001) == 0 && rig.violations.isEmpty(),
+                    "approach=" + approach + " startle=" + startle + " " + rig.tail());
+        });
+        scenario("people_camera_closed_through_a_roaming_meetings_talking_states", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> t < 15000));
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Priya");
+            rig.started();
+            rig.runUntil(30000);
+            boolean talked = rig.statesSeen.containsAll(java.util.Arrays.asList(ExploreBrain.State.MEET,
+                    ExploreBrain.State.ASK_NAME, ExploreBrain.State.LISTEN, ExploreBrain.State.NAME,
+                    ExploreBrain.State.REMEMBER, ExploreBrain.State.SPEAK));
+            boolean closed = true;
+            for (ExploreBrain.State s : new ExploreBrain.State[]{ExploreBrain.State.MEET, ExploreBrain.State.ASK_NAME,
+                    ExploreBrain.State.LISTEN, ExploreBrain.State.NAME, ExploreBrain.State.REMEMBER,
+                    ExploreBrain.State.SPEAK, ExploreBrain.State.NAME_CLIP}) {
+                closed &= !rig.openStates.contains(s);
+            }
+            check(n, talked && closed && rig.openStates.contains(ExploreBrain.State.APPROACH)
+                            && rig.stored.equals(java.util.Arrays.asList("Priya")) && rig.violations.isEmpty(),
+                    "seen=" + rig.statesSeen + " open=" + rig.openStates + " " + rig.tail());
+        });
+        scenario("people_trace_notes_never_carry_a_name", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> t < 15000 || (t >= 100000 && t < 115000)));
+            rig.people.match = (r, k) -> k == 1 ? STRANGER
+                    : CuriosityPort.MatchAnswer.known("Sarah", "Hi {name}!", "Hello again!");
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Priya");
+            rig.metChecks = (r, req, k) -> r.now >= 100000 ? CuriosityPort.Recently.different()
+                    : CuriosityPort.Recently.same(0);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(130000);
+            List<String> leaks = new ArrayList<String>();
+            for (String x : notes) {
+                if (x.contains("Priya") || x.contains("Sarah") || x.contains("What's your name")
+                        || x.contains("shy friend") || x.contains("remember you")) {
+                    leaks.add(x);
+                }
+            }
+            check(n, leaks.isEmpty() && rig.count("match") == 2 && rig.count("say Hi Sarah!") == 1
+                            && notedAt(notes, "just met") >= 0 && rig.violations.isEmpty(),
+                    "leaks=" + leaks + " " + rig.tail());
+        });
+        scenario("replies_recently_met_reads_same_none_unsure_and_rejects_bad_answers", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("same_as", "2");
+            CuriosityPort.Recently two = ClaudeReplies.recentlyMet(json, 2);
+            json.put("same_as", "Person 1");
+            CuriosityPort.Recently labelled = ClaudeReplies.recentlyMet(json, 2);
+            json.put("same_as", 1L);
+            CuriosityPort.Recently number = ClaudeReplies.recentlyMet(json, 2);
+            json.put("same_as", "none");
+            CuriosityPort.Recently none = ClaudeReplies.recentlyMet(json, 2);
+            json.put("same_as", "Unsure");
+            CuriosityPort.Recently unsure = ClaudeReplies.recentlyMet(json, 2);
+            json.put("same_as", "3");
+            CuriosityPort.Recently beyond = ClaudeReplies.recentlyMet(json, 2);
+            json.put("same_as", "0");
+            CuriosityPort.Recently zero = ClaudeReplies.recentlyMet(json, 2);
+            json.put("same_as", "maybe the first");
+            CuriosityPort.Recently odd = ClaudeReplies.recentlyMet(json, 2);
+            json.remove("same_as");
+            CuriosityPort.Recently missing = ClaudeReplies.recentlyMet(json, 2);
+            check(n, two.status == CuriosityPort.Recently.Status.SAME && two.index == 1
+                            && labelled.status == CuriosityPort.Recently.Status.SAME && labelled.index == 0
+                            && number.status == CuriosityPort.Recently.Status.SAME && number.index == 0
+                            && none.status == CuriosityPort.Recently.Status.DIFFERENT
+                            && unsure.status == CuriosityPort.Recently.Status.UNSURE
+                            && beyond.status == CuriosityPort.Recently.Status.FAILED
+                            && zero.status == CuriosityPort.Recently.Status.FAILED
+                            && odd.status == CuriosityPort.Recently.Status.FAILED
+                            && missing.status == CuriosityPort.Recently.Status.FAILED,
+                    two + " " + labelled + " " + number + " " + none + " " + unsure + " " + beyond + " " + zero
+                            + " " + odd + " " + missing);
+        });
+        scenario("people_tuning_defaults_10_min_leave_alone_one_check_a_minute", n -> {
+            ExploreTuning t = new ExploreTuning.Builder().build();
+            check(n, t.metLeaveAloneMs == 600000 && t.metCheckIntervalMs == 60000 && t.metCheckTimeoutMs == 10000
+                            && t.metClearedMs == 15000 && Math.abs(t.politeHeight - 0.6f) < 1e-6
+                            && t.peopleCooldownMs == 120000,
+                    t.metLeaveAloneMs + " " + t.metCheckIntervalMs + " " + t.metCheckTimeoutMs + " " + t.metClearedMs
+                            + " " + t.politeHeight);
         });
     }
 }
