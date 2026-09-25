@@ -314,6 +314,19 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "coverage_no_look_turns_less_while_the_way_ahead_is_new",
         "coverage_uncalibrated_roams_exactly_as_before",
         "coverage_trace_notes_carry_counts_only_and_are_forgotten_at_shutdown",
+        # The leg decision waits for a look to steer by (explore nav plan KTD9, live 2026-09-25)
+        "steer_waits_for_a_look_after_a_turn_and_uses_the_legs_own_looks",
+        "steer_wait_times_out_to_todays_leg_and_never_waits_with_the_camera_backed_off",
+        # CPL hiccups on plain floor (owner-approved 2026-09-25)
+        "cpl_on_plain_floor_is_retried_once_and_the_leg_drives_on",
+        "cpl_again_at_the_same_spot_after_the_retry_is_a_hazard",
+        "cpl_with_our_sensor_at_an_edge_is_a_hazard_at_once",
+        "cpl_hiccups_spread_over_a_leg_do_not_make_him_wedged",
+        # Mid-leg re-aim (owner-approved 2026-09-25, KTD9)
+        "reaim_open_space_drifting_right_mid_leg_turns_a_little_toward_it_and_drives_on",
+        "reaim_never_with_the_open_space_straight_ahead",
+        "reaim_is_rate_limited",
+        "reaim_never_toward_a_blocked_side",
     )
 
     @classmethod

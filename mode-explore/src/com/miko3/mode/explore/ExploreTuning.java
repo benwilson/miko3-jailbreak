@@ -247,6 +247,35 @@ final class ExploreTuning {
      * in a row; then a leg of steerShortTicks (the floor sensor guards it).
      */
     final long steerLookFreshMs;
+    /**
+     * Continuous mode: a leg decision with the camera open (not backed off) and no
+     * usable look yet (none taken since the last turn settled, or none fresh) waits
+     * in PAUSE up to steerWaitMs for one, so the steer, the doorway and going
+     * somewhere new get their say; none in time chooses as before. 0: never waits.
+     */
+    final long steerWaitMs;
+    /**
+     * Mid-leg re-aim (owner-approved 2026-09-25; continuous mode, roaming legs
+     * only): a fresh look taken during the leg whose best open band (the steer's
+     * own scoring) lies at least reaimMinDeg off centre stops the leg, turns (by
+     * the gyro) toward it by at most reaimMaxDeg, and drives the leg's remaining
+     * ticks. At most one re-aim per reaimGapMs; none with fewer than
+     * reaimMinTicks left. reaimMinDeg 0: off.
+     */
+    final double reaimMinDeg;
+    final double reaimMaxDeg;
+    final long reaimGapMs;
+    final int reaimMinTicks;
+    /**
+     * CPL hiccups (owner-approved 2026-09-25): the controller refusing forward
+     * (CPL=2) mid-leg while our own floor sensor reads plain floor (no edge, no
+     * obstacle, no fault) stops him, pauses cplRetryPauseMs and retries the leg's
+     * remaining ticks once, not counted as a hazard. CPL again within
+     * cplRetryWindowMs of that stop is a hazard as always. cplRetryPauseMs
+     * negative: never retried.
+     */
+    final long cplRetryPauseMs;
+    final long cplRetryWindowMs;
     final float steerMinConfidence;
     final int steerBandBins;
     final float steerBlocked;
@@ -519,6 +548,13 @@ final class ExploreTuning {
         legsMax = Math.max(1, b.legsMax);
         navigation = b.navigation;
         steerLookFreshMs = b.steerLookFreshMs;
+        steerWaitMs = Math.max(0, b.steerWaitMs);
+        reaimMinDeg = Math.max(0, b.reaimMinDeg);
+        reaimMaxDeg = Math.max(b.reaimMinDeg, b.reaimMaxDeg);
+        reaimGapMs = Math.max(0, b.reaimGapMs);
+        reaimMinTicks = Math.max(1, b.reaimMinTicks);
+        cplRetryPauseMs = b.cplRetryPauseMs;
+        cplRetryWindowMs = Math.max(0, b.cplRetryWindowMs);
         steerMinConfidence = b.steerMinConfidence;
         steerBandBins = Math.max(1, b.steerBandBins);
         steerBlocked = b.steerBlocked;
@@ -756,6 +792,18 @@ final class ExploreTuning {
         private Navigation navigation = Navigation.CONTINUOUS;
         // A live look takes ~0.6 s and up to ~2.5 s; older than this he has moved on.
         private long steerLookFreshMs = 3000;
+        // Looks arrive every ~1-2 s live: after a turn settles (lookSettleMs) the
+        // next one is usually within this.
+        private long steerWaitMs = 2000;
+        // The drive can't curve: a small in-place turn toward open space mid-leg.
+        private double reaimMinDeg = 15;
+        private double reaimMaxDeg = 30;
+        private long reaimGapMs = 2000;
+        private int reaimMinTicks = 2;
+        // Live, the controller refuses forward on open carpet as the nose dips at
+        // a start or stop, with our own tof reading ordinary floor.
+        private long cplRetryPauseMs = 400;
+        private long cplRetryWindowMs = 1500;
         // Openness gives 0.3 with no floor taught yet and 0.9 once taught (full light):
         // until the floor is taught he steers only on what the boxes and horizon say
         // strongly enough, i.e. not at all.
@@ -1004,6 +1052,16 @@ final class ExploreTuning {
         Builder legsMax(int v) { legsMax = v; return this; }
         Builder navigation(Navigation v) { navigation = v; return this; }
         Builder steerLookFreshMs(long v) { steerLookFreshMs = v; return this; }
+        Builder steerWaitMs(long v) { steerWaitMs = v; return this; }
+        Builder reaim(double minDeg, double maxDeg, long gapMs, int minTicks) {
+            reaimMinDeg = minDeg;
+            reaimMaxDeg = maxDeg;
+            reaimGapMs = gapMs;
+            reaimMinTicks = minTicks;
+            return this;
+        }
+        Builder reaimOff() { reaimMinDeg = 0; return this; }
+        Builder cplRetry(long pauseMs, long windowMs) { cplRetryPauseMs = pauseMs; cplRetryWindowMs = windowMs; return this; }
         Builder steer(float minConfidence, int bandBins, float blocked, float open, float minGain) {
             steerMinConfidence = minConfidence;
             steerBandBins = bandBins;

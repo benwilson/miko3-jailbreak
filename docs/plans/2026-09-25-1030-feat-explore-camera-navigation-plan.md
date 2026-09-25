@@ -167,7 +167,7 @@ He gets stuck in corners often. Wedged between a wall and a potted plant, he tur
 
   This replaces the global 2-minute `peopleCooldownMs` for approaches only; the curiosity prompt's cooling-down wording is untouched. Governs R9, R10.
 - KTD10. **Self-adjusting exposure by hand, not the fps-range trick.** A plain-Java brightness controller reads each frame's mean brightness (already computed for openness) and steers manual exposure time and sensitivity (`CONTROL_AE_MODE_OFF`, the path remote-control proved safe on this camera) toward a target, with hysteresis and small steps. Exposure is capped shorter while he is driving (motion blur) and may run longer while he stands still. The frame-rate range stays fixed, since a variable range triggers the driver bug. A camera that does not list `AE_MODE_OFF` keeps today's auto exposure with maximum compensation. Governs R17. (session-settled: user-directed — the owner asked for adjustable, self-improving brightness after the dim gate frames, over leaving auto exposure at its ceiling.)
-- KTD9. **He slows down for what the camera sees; he never stops for it alone.** Detector looks take about 0.6 s, too slow to track while moving. The roaming steer therefore bends the next leg toward the most open columns and shortens a leg when the columns ahead read blocked. Only the floor sensor, stall sensing and the controller's own refusal (CPL=2, never retried) stop him. Governs R2, R6.
+- KTD9. **He slows down for what the camera sees; he never stops for it alone.** Detector looks take about 0.6 s, too slow to track while moving. The roaming steer therefore bends the next leg toward the most open columns and shortens a leg when the columns ahead read blocked. Only the floor sensor, stall sensing and the controller's own refusal (CPL=2; see the CPL hiccup note under Risks) stop him. A leg decision with the camera open and no look taken since the last turn settled waits up to steerWaitMs (2 s) for one before falling back to today's random leg (live 2026-09-25: looks come every 1-2 s, so the steer never got a look). Owner-approved 2026-09-25: stop, re-aim, continue. Mid-leg, a fresh look whose best open band lies 15 deg or more off centre stops the leg, turns up to 30 deg toward it by the gyro and drives the rest, at most once per 2 s. Governs R2, R6.
 
 ### High-Level Technical Design
 
@@ -225,6 +225,8 @@ stateDiagram-v2
 | Claude doorway or way-out answers are wrong or slow | Answers become headings at capture time; stale answers are dropped by generation; the floor sensor still guards every step; offline behaviour is on-robot only (AE7) |
 | More room pictures leave the robot | Capped by R8's interval, one recently-met check per 60 s (KTD8), and the rare escape asks; nothing stored or logged, including under the face debug switch (R15); only consenting people are around the robot (owner, 2026-09-24) |
 | The harness camera invariant is rewritten and could hide a real regression | The new invariant is stricter where it matters: it still fails on the camera open during talking states or lease loss |
+
+CPL hiccup (owner-approved 2026-09-25): live on carpet the controller refuses forward (CPL=2) as the nose dips at starts and stops while our own tof reads ordinary floor. A mid-leg CPL=2 with our sensor reading plain floor (no edge, obstacle or fault) is retried once after a 400 ms stop and not counted toward hazards in a row; CPL again within 1.5 s, at the retry's start, or with our sensor at an edge or obstacle is a hazard as before.
 
 ### Sequencing
 

@@ -44,8 +44,10 @@ public final class ExploreBrainHarness {
                 .ir1IsLeft(true)
                 .reopenGapMs(0)
                 // Scripted timelines count exact leg lengths and bends: going somewhere new
-                // (U10) is off here and switched on by the coverage scenarios.
+                // (U10) is off here and switched on by the coverage scenarios; so is the
+                // mid-leg re-aim, switched on by the reaim_ scenarios.
                 .coverageOff()
+                .reaimOff()
                 .calibration(calibration());
     }
 
@@ -461,6 +463,8 @@ public final class ExploreBrainHarness {
         final Vision vision;
         /** Each look's openness, scripted per heading (explore nav plan U4); null: looks carry none. */
         OpenView openView;
+        /** How often a look arrives (captured 200 ms before it does); the live camera gives one every 1-2 s. */
+        long lookEveryMs = 500;
         final boolean cameraAvailable;
         boolean cameraOpen;
         long openedAt;
@@ -633,7 +637,7 @@ public final class ExploreBrainHarness {
                         a.run.run();
                     }
                 }
-                if (cameraOpen && vision != null && now % 500 == 0 && now >= looksFrom) {
+                if (cameraOpen && vision != null && now % lookEveryMs == 0 && now >= looksFrom) {
                     List<Detection> seen = vision.see(this, now - 200);
                     if (seen != null) {
                         if (yaw != null) {
@@ -1285,6 +1289,9 @@ public final class ExploreBrainHarness {
         backUpFirstScenarios();
         doorwayScenarios();
         peopleScenarios();
+        steerWaitScenarios();
+        cplHiccupScenarios();
+        reaimScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -1631,11 +1638,18 @@ public final class ExploreBrainHarness {
         });
         scenario("ae6_cpl2_never_retries_forward", n -> {
             // The controller refuses forward (CPL=2) while the mode's own thresholds see nothing.
-            Rig rig = new Rig(tuning().build(), t -> t < 1600 ? clear(t) : cpl2(t)).started();
+            // Plain floor: the first refusal is a hiccup, retried once (owner-approved
+            // 2026-09-25), but the retry's start sees CPL=2 still and turns away instead: no
+            // forward command is ever sent against it.
+            Rig rig = new Rig(tuning().build(), t -> t < 1600 ? clear(t) : cpl2(t));
+            List<String> notes = traced(rig);
+            rig.started();
             rig.runUntil(30000);
             int stop = rig.firstAfter("stop", 1600);
             check(n, rig.timeOf(stop) == 1600 && rig.countPrefix("hop", 1600, 30001) == 0
-                            && rig.count("startle") >= 1 && rig.violations.isEmpty(),
+                            && noteAt(notes, "controller refused forward (CPL) on plain floor", 0) == 1600
+                            && noteAt(notes, "hazard at start: CPL", 1601) == 2000
+                            && rig.firstAfter("turn", 2000) > 0 && rig.violations.isEmpty(),
                     "stop@" + rig.timeOf(stop) + " hopsAfter=" + rig.countPrefix("hop", 1600, 30001) + " " + rig.tail());
         });
     }
@@ -3612,6 +3626,217 @@ public final class ExploreBrainHarness {
         return out;
     }
 
+    // ---- the leg decision waits for a look to steer by (explore nav plan KTD9, live 2026-09-25) ----
+    //
+    // Live, looks come every ~1-2 s: the decision right after a turn found no look taken
+    // since it settled, and every decision after a clean leg threw the leg's own looks
+    // away (a leg's stop counted as a turn's), so no leg was ever steered.
+
+    private static void steerWaitScenarios() {
+        scenario("steer_waits_for_a_look_after_a_turn_and_uses_the_legs_own_looks", n -> {
+            // Right open, left blocked; an obstacle at 4000 mid-leg: startle, back-off, the
+            // escape turn LEFT stops at 6000 and the pause ends at 6300, before the next look.
+            Rig rig = navRig(navTuning().pauseMs(300, 300), t -> t >= 3950 && t < 4050 ? obstacle(t) : clear(t),
+                    (r, t) -> prof(0.9f, 0.1f, 0.4f, 0.9f));
+            rig.lookEveryMs = 1500;
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(12000);
+            int esc = rig.firstAfter("turn LEFT", 4000);
+            int escStop = rig.firstAfter("stop", rig.timeOf(esc));
+            long stopAt = rig.timeOf(escStop);
+            long waited = noteAt(notes, "waiting up to 2000 ms for a look to steer by", stopAt);
+            long steered = noteAt(notes, "steer: right", stopAt);
+            int next = rig.firstMotionAfter(stopAt);
+            // The clean leg after that bend ends at 10200: its own look (captured 9700) steers.
+            int legStop = rig.firstAfter("stop", rig.timeOf(rig.firstAfter("hop", rig.timeOf(next))));
+            long legEnd = rig.timeOf(legStop);
+            long legSteer = noteAt(notes, "steer: right", legEnd);
+            long legWait = noteAt(notes, "waiting", legEnd);
+            check(n, esc > 0 && waited == stopAt + 300 && steered == 7500 && rig.what(next).equals("turn RIGHT")
+                            && rig.countPrefix("hop", stopAt, rig.timeOf(next)) == 0
+                            && legEnd > 0 && legSteer == legEnd + 300 && (legWait < 0 || legWait > legSteer)
+                            && noteAt(notes, "no look to steer by in time", 0) < 0 && rig.violations.isEmpty(),
+                    "esc stop@" + stopAt + " waited@" + waited + " steered@" + steered + " next=" + rig.what(next)
+                            + " legEnd=" + legEnd + " legSteer=" + legSteer + " " + notes + " " + rig.tail());
+        });
+        scenario("steer_wait_times_out_to_todays_leg_and_never_waits_with_the_camera_backed_off", n -> {
+            // A camera that gives no looks: the first decision (at 1300) waits steerWaitMs and
+            // then hops as before; once the camera is backed off, decisions do not wait at all.
+            Rig rig = new Rig(navTuning().steerWaitMs(1500).build(), CLEAR, (r, t) -> null, true);
+            rig.openView = (r, t) -> prof(0.9f, 0.1f, 0.4f, 0.9f);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(20000);
+            long timedOut = noteAt(notes, "no look to steer by in time", 0);
+            long off = noteAt(notes, "camera gave no look in time", 0);
+            int hop = rig.firstMotionAfter(0);
+            check(n, noteAt(notes, "waiting", 0) == 1300 && timedOut == 2800 && rig.what(hop).equals("hop")
+                            && rig.timeOf(hop) == 2800 && off > 0
+                            && (noteAt(notes, "waiting", off) < 0 || noteAt(notes, "waiting", off) >= off + 10000)
+                            && rig.countPrefix("hop", off, off + 10000) > 0 && notesStarting(notes, "steer:") == 0
+                            && rig.violations.isEmpty(),
+                    "timedOut@" + timedOut + " off@" + off + " hop=" + rig.what(hop) + "@" + rig.timeOf(hop) + " "
+                            + notes + " " + rig.tail());
+        });
+    }
+
+    // ---- CPL hiccups on plain floor (owner-approved 2026-09-25) ----
+    //
+    // Live on carpet, 11 of 12 hazards were the controller refusing forward (CPL=2) as the
+    // nose dipped at a start or stop, with our own tof reading ordinary floor.
+
+    private static SensorReading cpl2Edge(long t) {
+        return new SensorReading(t, 300 + jitter(t), 900, 900, 2, false);
+    }
+
+    private static void cplHiccupScenarios() {
+        scenario("cpl_on_plain_floor_is_retried_once_and_the_leg_drives_on", n -> {
+            // An 8-tick leg from 1300 (to 3300); one CPL=2 reading at 1600.
+            Rig rig = new Rig(tuning().hopTicks(8).build(), t -> t == 1600 ? cpl2(t) : clear(t));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(4000);
+            int stop = rig.firstAfter("stop", 1600);
+            int retry = rig.firstAfter("hop", 1601);
+            check(n, rig.timeOf(stop) == 1600 && rig.timeOf(retry) == 2000 && rig.countPrefix("hop", 1601, 4000) == 7
+                            && rig.count("startle") == 0 && noteAt(notes, "hazard", 0) < 0
+                            && noteAt(notes, "controller refused forward (CPL) on plain floor", 0) == 1600
+                            && rig.violations.isEmpty(),
+                    "stop@" + rig.timeOf(stop) + " retry@" + rig.timeOf(retry) + " hops after="
+                            + rig.countPrefix("hop", 1601, 4000) + " " + notes + " " + rig.tail());
+        });
+        scenario("cpl_again_at_the_same_spot_after_the_retry_is_a_hazard", n -> {
+            // The retry starts at 2000; CPL=2 again at 2100 is within cplRetryWindowMs.
+            Rig rig = new Rig(tuning().hopTicks(8).build(), t -> t == 1600 || t == 2100 ? cpl2(t) : clear(t));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(4000);
+            int startle = rig.first("startle", 0);
+            check(n, rig.timeOf(startle) == 2100 && noteAt(notes, "hazard while HOP: CPL", 0) == 2100
+                            && notesStarting(notes, "controller refused forward") == 1 && rig.violations.isEmpty(),
+                    "startle@" + rig.timeOf(startle) + " " + notes + " " + rig.tail());
+        });
+        scenario("cpl_with_our_sensor_at_an_edge_is_a_hazard_at_once", n -> {
+            Rig rig = new Rig(tuning().hopTicks(8).build(), t -> t == 1600 ? cpl2Edge(t) : clear(t));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(3000);
+            int startle = rig.first("startle", 0);
+            check(n, rig.timeOf(startle) == 1600 && noteAt(notes, "controller refused forward", 0) < 0
+                            && rig.countPrefix("hop", 1601, 2400) == 0 && rig.violations.isEmpty(),
+                    "startle@" + rig.timeOf(startle) + " " + notes + " " + rig.tail());
+        });
+        scenario("cpl_hiccups_spread_over_a_leg_do_not_make_him_wedged", n -> {
+            // A 24-tick leg from 1300; three CPL=2 hiccups, each well after the last retry.
+            // Counted as hazards (cap 3), today they would corner him.
+            Rig rig = new Rig(tuning().hopTicks(24).build(),
+                    t -> t == 1600 || t == 3700 || t == 5800 ? cpl2(t) : clear(t));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(9000);
+            check(n, notesStarting(notes, "controller refused forward (CPL) on plain floor") == 3
+                            && rig.count("startle") == 0 && noteAt(notes, "wedged", 0) < 0
+                            && noteAt(notes, "cornered", 0) < 0 && noteAt(notes, "hazard", 0) < 0
+                            && rig.countPrefix("hop", 5801, 9000) > 0
+                            && !rig.statesSeen.contains(ExploreBrain.State.CORNERED) && !rig.statesSeen.contains(ExploreBrain.State.STARTLE) && rig.violations.isEmpty(),
+                    notes + " " + rig.tail());
+        });
+    }
+
+    // ---- mid-leg re-aim (owner-approved 2026-09-25, KTD9) ----
+    //
+    // The drive can't curve: forward is straight and turns are in place. A look during a
+    // leg that finds the open space off to one side stops, turns a little toward it, and
+    // drives the rest of the leg.
+
+    private static ExploreTuning.Builder reaimTuning() {
+        return navTuning().gyro(robotGyro()).hopTicks(16).reaim(15, 30, 2000, 2);
+    }
+
+    private static final Openness.Profile ALL_OPEN_PROF = prof(0.9f, 0.9f, 0.9f, 0.9f);
+
+    private static void reaimScenarios() {
+        scenario("reaim_open_space_drifting_right_mid_leg_turns_a_little_toward_it_and_drives_on", n -> {
+            // Straight ahead is open until 2500; then the open space lies right until he turns.
+            Rig rig = navRig(reaimTuning(), CLEAR, (r, t) -> t >= 2500 && r.count("turn RIGHT") == 0
+                    ? prof(0.9f, 0.2f, 0.5f, 0.9f) : ALL_OPEN_PROF);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(8000);
+            long reaim = noteAt(notes, "re-aim: ", 0);
+            int turn = rig.firstMotionAfter(reaim);
+            int after = rig.firstMotionAfter(rig.timeOf(rig.firstAfter("stop", rig.timeOf(turn))));
+            double r = rig.yaw.turnResults.isEmpty() ? 0 : rig.yaw.turnResults.get(0);
+            int before = rig.countPrefix("hop", 0, reaim);
+            int rest = rig.countPrefix("hop", reaim, rig.timeOf(rig.firstAfter("stop", rig.timeOf(after))) + 1);
+            check(n, reaim > 2500 && notesStarting(notes, "re-aim") == 1 && rig.what(turn).equals("turn RIGHT")
+                            && -r >= 15 - rig.tuning.turnToleranceDeg && -r <= 30 + rig.tuning.turnToleranceDeg && rig.what(after).equals("hop")
+                            && before + rest >= 16 && before + rest <= 17 && rig.count("startle") == 0
+                            && rig.violations.isEmpty(),
+                    "reaim@" + reaim + " turn=" + rig.what(turn) + " r=" + f1(r) + " hops " + before + "+" + rest
+                            + " " + notes + " " + rig.tail());
+        });
+        scenario("reaim_never_with_the_open_space_straight_ahead", n -> {
+            Rig rig = navRig(reaimTuning(), CLEAR, (r, t) -> ALL_OPEN_PROF);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(12000);
+            List<Integer> legs = legs(rig);
+            check(n, notesStarting(notes, "re-aim") == 0 && !legs.isEmpty() && legs.get(0) == 16
+                            && rig.count("turn") == 0 && rig.violations.isEmpty(),
+                    "legs=" + legs + " " + notes + " " + rig.tail());
+        });
+        scenario("reaim_is_rate_limited", n -> {
+            // The open space always reads right, however he turns: at most one re-aim per 2 s.
+            Rig rig = navRig(reaimTuning(), CLEAR, (r, t) -> prof(0.9f, 0.2f, 0.6f, 0.9f));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(15000);
+            List<Long> at = new ArrayList<Long>();
+            for (String x : notes) {
+                if (x.startsWith("re-aim: ", x.indexOf(' ') + 1)) {
+                    at.add(Long.parseLong(x.substring(0, x.indexOf(' '))));
+                }
+            }
+            boolean spaced = true;
+            for (int i = 1; i < at.size(); i++) {
+                spaced &= at.get(i) - at.get(i - 1) >= 2000;
+            }
+            check(n, at.size() >= 2 && spaced && rig.violations.isEmpty(), "re-aims at " + at + " " + rig.tail());
+        });
+        scenario("reaim_never_toward_a_blocked_side", n -> {
+            // The first roaming turn's way will not turn (blocked); he backs up and goes the
+            // other way. On the leg after it, the open space reads toward the blocked side.
+            Rig rig = new Rig(escTuning().turnChance(1.0).hopTicks(16).reaim(15, 30, 2000, 2).build(), CLEAR,
+                    NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.blockFirstTurnsSide = true;
+            rig.openView = (r, t) -> {
+                int f = r.first("turn", 0);
+                if (f < 0 || r.countPrefix("hop", r.timeOf(f), Long.MAX_VALUE) == 0) {
+                    return null;
+                }
+                // Open toward the side of the first (blocked) turn.
+                return r.what(f).equals("turn LEFT") ? prof(0.9f, 0.9f, 0.5f, 0.2f) : prof(0.9f, 0.2f, 0.5f, 0.9f);
+            };
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(15000);
+            int f = rig.first("turn", 0);
+            int hop = rig.firstAfter("hop", rig.timeOf(f));
+            int legStop = rig.firstAfter("stop", rig.timeOf(hop));
+            String blocked = rig.what(f);
+            long skipped = noteAt(notes, "re-aim " + (blocked.equals("turn LEFT") ? "LEFT" : "RIGHT")
+                    + " skipped: that side is blocked", rig.timeOf(hop));
+            check(n, f >= 0 && hop > 0 && skipped > 0 && skipped < rig.timeOf(legStop)
+                            && rig.countPrefix(blocked, rig.timeOf(hop), rig.timeOf(legStop) + 1) == 0
+                            && rig.violations.isEmpty(),
+                    "first=" + blocked + " hop@" + rig.timeOf(hop) + " legStop@" + rig.timeOf(legStop) + " skipped@"
+                            + skipped + " " + notes + " " + rig.tail());
+        });
+    }
+
     // ---- going somewhere new (explore nav plan U10, R18) ----
 
     /** U10 on with the shipped weights; the harness's 100 counts/s is 0.25 m/s (the guessed real speed) at 400 counts/m. */
@@ -5478,8 +5703,11 @@ public final class ExploreBrainHarness {
         });
         scenario("blocked_turn_after_a_cpl_stop_still_backs_up_a_little_before_the_retry", n -> {
             // The controller refuses forward mid-leg (CPL): startle, the usual back-off, then the
-            // escape turn will not turn; a short back-up (the second back move) frees it.
-            Rig rig = new Rig(escTuning().build(), t -> t >= 1600 && t < 1800 ? cpl2(t) : clear(t), NOTHING, true);
+            // escape turn will not turn; a short back-up (the second back move) frees it. The
+            // one retry of a CPL on plain floor (owner-approved 2026-09-25) is off here: this is
+            // about the CPL that is a hazard (cpl_* scenarios cover the retry).
+            Rig rig = new Rig(escTuning().cplRetry(-1, 0).build(), t -> t >= 1600 && t < 1800 ? cpl2(t) : clear(t),
+                    NOTHING, true);
             rig.simWheels = true;
             rig.yaw.stuck = true;
             rig.unstickAfterBacks = 2;
@@ -5563,6 +5791,29 @@ public final class ExploreBrainHarness {
             }
         }
         return -1;
+    }
+
+    /** When the first traced note starting with prefix came, at or after from; -1 if none. */
+    private static long noteAt(List<String> notes, String prefix, long from) {
+        for (String x : notes) {
+            int sp = x.indexOf(' ');
+            long t = Long.parseLong(x.substring(0, sp));
+            if (t >= from && x.startsWith(prefix, sp + 1)) {
+                return t;
+            }
+        }
+        return -1;
+    }
+
+    /** How many traced notes start with prefix. */
+    private static int notesStarting(List<String> notes, String prefix) {
+        int c = 0;
+        for (String x : notes) {
+            if (x.startsWith(prefix, x.indexOf(' ') + 1)) {
+                c++;
+            }
+        }
+        return c;
     }
 
     private static List<String> traced(Rig rig) {

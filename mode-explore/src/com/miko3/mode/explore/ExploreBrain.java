@@ -103,9 +103,13 @@ import java.util.Set;
  *    escapes); it is aborted only if a hazard reappears after the view cleared.
  *  - Unavailable sensors or a lost lease stop everything, from every state, and
  *    driving resumes only through PAUSE, never mid-motion.
- *  - CPL=2 (the controller refusing forward, R9) is a hazard like any other:
- *    the brain never retries forward against it, and the cornered cap stops a
- *    stuck CPL=2 from looping.
+ *  - CPL=2 (the controller refusing forward, R9) is a hazard like any other,
+ *    with one exception (owner-approved 2026-09-25): mid-leg, while our own
+ *    floor sensor reads plain floor (no edge, no obstacle, no fault), it is
+ *    retried once after a short stop (cplRetryPauseMs), on a fresh clear
+ *    reading, and not counted toward hazards in a row. Never at an edge or
+ *    obstacle, never twice in a row: CPL again at or soon after the retry is a
+ *    hazard, and the cornered cap stops a stuck CPL=2 from looping.
  *
  * Curiosity keeps every rule above: its turns and legs start on fresh readings
  * and stop on a hazard like any other (an edge during an approach startles and
@@ -134,7 +138,12 @@ import java.util.Set;
  * chosen from the newest fresh look's openness by RoamSteer (a bend toward the
  * most open columns, a length cut by blocked ones; a low-confidence profile
  * chooses as before), and a fresh look reading the way ahead blocked ends a leg
- * at the next tick. The floor sensor, stall sensing and CPL=2 still decide every
+ * at the next tick. With no such look yet at a decision (none taken since the last
+ * turn settled), it waits in PAUSE up to steerWaitMs for one while the camera is
+ * open and not backed off, then chooses as before. Mid-leg, a fresh look whose best
+ * open band lies reaimMinDeg or more off centre stops the leg, turns a little toward
+ * it by the gyro and drives the rest (owner-approved 2026-09-25; the drive can't
+ * curve). The floor sensor, stall sensing and CPL=2 still decide every
  * stop: motion starts only on fresh readings, and the camera never starts one.
  * Look-then-go (ExploreTuning.Navigation.LOOK_THEN_GO) opens the camera at each
  * leg decision, waits for one look, and closes it before the leg. Every reading
@@ -554,6 +563,14 @@ final class ExploreBrain {
     private int plannedTicks = -1;
     /** Look-then-go (KTD7): in PAUSE, waiting for the leg decision's look, captured at or after legLookAfter. */
     private boolean lookForLeg;
+    /** Continuous mode, in PAUSE: a leg decision waiting for a look to steer by, until then (steerWaitMs). */
+    private long steerWaitUntil = NO_WAIT;
+    private static final long NO_WAIT = Long.MIN_VALUE;
+    /** A CPL hiccup's retry (cplRetryPauseMs): CPL again before this is a hazard. */
+    private long cplRetryUntil = Long.MIN_VALUE / 4;
+    /** The last mid-leg re-aim, and the last look it weighed (one decision per look). */
+    private long reaimedAt = Long.MIN_VALUE / 4;
+    private Look reaimLook;
     private long legLookAfter;
     private long legLookDeadline;
     /** What the camera was last told about driving (null: nothing yet). */
@@ -927,7 +944,9 @@ final class ExploreBrain {
                 break;
             case HOP:
                 if (hazard) {
-                    hazardInMotion(now);
+                    if (!cplHiccup(now)) {
+                        hazardInMotion(now);
+                    }
                 } else if (wheelsStalled(now)) {
                     // Pushing against something too low for the front sensor to see.
                     // The sensor can't say when he is past it, so each stall in a row
@@ -948,6 +967,8 @@ final class ExploreBrain {
                     note("camera reads the way ahead blocked: ending the leg early");
                     doorwayLeg = false;
                     legDriven(now);
+                } else if (reaimInLeg(now)) {
+                    break;
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
                     nextTickAt += tuning.hopTickMs;
@@ -1115,6 +1136,20 @@ final class ExploreBrain {
             legLookDeadline = ready + tuning.firstLookTimeoutMs;
         } else {
             Look look = cameraOpen ? roamLook(now) : null;
+            if (look == null && cameraOpen && now >= curiosityOffUntil && tuning.steerWaitMs > 0) {
+                // No look since the last turn settled yet (they come every 1-2 s live):
+                // wait for one, on every fresh reading, so the steer gets its say (KTD9).
+                if (steerWaitUntil == NO_WAIT) {
+                    steerWaitUntil = now + tuning.steerWaitMs;
+                    note("waiting up to " + tuning.steerWaitMs + " ms for a look to steer by");
+                    return;
+                }
+                if (now < steerWaitUntil) {
+                    return;
+                }
+                note("no look to steer by in time: choosing without one");
+            }
+            steerWaitUntil = NO_WAIT;
             if (!seePerson(now, look)) {
                 chooseLeg(now, look);
             }
@@ -1277,6 +1312,78 @@ final class ExploreBrain {
             return;
         }
         enterLook(now, escapeSide(h), true, tuning.escapeTurnMs, tuning.escapeTurnDeg);
+    }
+
+    /**
+     * A roaming leg's CPL=2 while our own floor sensor reads plain floor (owner-approved
+     * 2026-09-25): live, the controller refuses forward on open carpet as the nose dips
+     * at a start or stop. Stop in this same event, pause cplRetryPauseMs, and drive the
+     * leg's remaining ticks once more (the start waits for a fresh, clear reading as
+     * always); not counted toward hazards in a row. CPL again within cplRetryWindowMs,
+     * or at the retry's start, or with our sensor at an edge or obstacle, is a hazard.
+     */
+    private boolean cplHiccup(long now) {
+        HazardClassifier.Hazard h = classifier.hazard();
+        if (tuning.cplRetryPauseMs < 0 || h == null || h.kind != HazardClassifier.Kind.CPL
+                || !classifier.plainFloor() || now < cplRetryUntil) {
+            return false;
+        }
+        int left = ticksRemaining(now);
+        note("controller refused forward (CPL) on plain floor: a hiccup; " + left
+                + " ticks to go, trying once more in " + tuning.cplRetryPauseMs + " ms");
+        stopMotors();
+        cplRetryUntil = now + tuning.cplRetryPauseMs + tuning.cplRetryWindowMs;
+        plannedTicks = left;
+        hopNext = true;
+        enterPause(now, tuning.cplRetryPauseMs, true);
+        return true;
+    }
+
+    /** The current leg's ticks still to drive (at least one). */
+    private int ticksRemaining(long now) {
+        return (int) Math.max(1, (phaseUntil - now + tuning.hopTickMs - 1) / tuning.hopTickMs);
+    }
+
+    /**
+     * Mid-leg re-aim (owner-approved 2026-09-25, KTD9): the drive can't curve, so a
+     * fresh look taken during this leg whose best open band lies reaimMinDeg or more
+     * off centre stops the leg, turns (by the gyro) toward it by at most reaimMaxDeg,
+     * and the leg goes on for its remaining ticks. Continuous mode only, at most once
+     * per reaimGapMs, never toward a blocked side, never with the heading unusable.
+     * The turn starts on a fresh clear reading, from LOOK, like any other.
+     */
+    private boolean reaimInLeg(long now) {
+        if (tuning.reaimMinDeg <= 0 || tuning.navigation != ExploreTuning.Navigation.CONTINUOUS || !cameraOpen
+                || !compass.usable(now) || now - reaimedAt < tuning.reaimGapMs) {
+            return false;
+        }
+        Look look = camera.latest();
+        if (look == null || look == reaimLook || look.frameMs <= hopStartedAt
+                || look.frameMs < headingSettledAt + tuning.lookSettleMs) {
+            return false;
+        }
+        reaimLook = look;
+        int left = ticksRemaining(now);
+        if (left < tuning.reaimMinTicks) {
+            return false;
+        }
+        double deg = steer.reaimDeg(look.openness, doorwayBearing(now), novelty(now));
+        if (Math.abs(deg) < tuning.reaimMinDeg) {
+            return false;
+        }
+        Direction d = deg > 0 ? Direction.LEFT : Direction.RIGHT;
+        if (unblocked(d) != d) {
+            note("re-aim " + d + " skipped: that side is blocked");
+            return false;
+        }
+        double bend = Math.min(Math.abs(deg), tuning.reaimMaxDeg);
+        note("re-aim: open space " + Math.round(Math.abs(deg)) + " deg " + d + ", turning " + Math.round(bend)
+                + " deg, then " + left + " ticks more");
+        reaimedAt = now;
+        stopMotors();
+        plannedTicks = left;
+        enterLook(now, d, false, timedMs(bend), bend);
+        return true;
     }
 
     /** A hazard while moving: stop in this same event, then startle (R11). */
@@ -4033,6 +4140,7 @@ final class ExploreBrain {
     private void enterPause(long now, long ms, boolean keepEyes) {
         state = State.PAUSE;
         lookForLeg = false;
+        steerWaitUntil = NO_WAIT;
         phaseUntil = now + ms;
         if (!keepEyes) {
             show(EyeState.IDLE, null);
@@ -4154,11 +4262,13 @@ final class ExploreBrain {
                 // A turn that got there: that way turns again.
                 blockedSides.remove(heading);
             }
+            // Asked before moving goes false, which drivingForward() needs to see.
+            boolean forward = drivingForward();
             moving = false;
             motor.stop();
             long now = clock.nowMs();
             compass.stopped(now);
-            if (!drivingForward()) {
+            if (!forward) {
                 // A turn (or back-off) ended: looks from before it faced elsewhere.
                 headingSettledAt = now;
             }

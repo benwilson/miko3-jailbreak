@@ -138,24 +138,10 @@ final class RoamSteer {
             return new Plan(doorwayDeg > 0 ? LEFT : RIGHT, Math.abs(doorwayDeg), ahead, true, false, 0f, true);
         }
         double doorX = door ? -doorwayDeg / tuning.cameraHalfFovDeg : 0;
-        int best = -1;
-        float bestScore = -1f;
-        float bestWeighted = -1f;
-        double bestOffset = 0;
-        for (int i = 0; i + w <= n; i++) {
-            float score = mean(p.bins, i, w);
-            double offset = offset(i, w, n);
-            float weighted = score + (door ? doorwayBonus(score, offset, doorX, w, n) : 0f)
-                    + noveltyBonus(nov, score, offset);
-            // Ties go to the band nearest straight ahead.
-            if (weighted > bestWeighted + 1e-6f || (Math.abs(weighted - bestWeighted) <= 1e-6f
-                    && Math.abs(offset) < Math.abs(bestOffset))) {
-                best = i;
-                bestScore = score;
-                bestWeighted = weighted;
-                bestOffset = offset;
-            }
-        }
+        Best b = best(p, door, doorX, nov);
+        float bestScore = b.score;
+        float bestWeighted = b.weighted;
+        double bestOffset = b.offset;
         if (bestScore <= tuning.steerBlocked) {
             int side = bestOffset < 0 ? LEFT : bestOffset > 0 ? RIGHT : LEFT;
             if (turnsOnly < tuning.steerTurnsOnlyMax) {
@@ -189,8 +175,7 @@ final class RoamSteer {
         double deg = 0;
         float open = ahead;
         double aheadOffset = offset((n - w) / 2, w, n);
-        float aheadWeighted = ahead + (door ? doorwayBonus(ahead, aheadOffset, doorX, w, n) : 0f)
-                + noveltyBonus(nov, ahead, aheadOffset);
+        float aheadWeighted = aheadWeighted(p, door, doorX, nov);
         double goOffset = aheadOffset;
         if (bestWeighted - aheadWeighted >= tuning.steerMinGain) {
             deg = Math.abs(bestOffset) * tuning.cameraHalfFovDeg;
@@ -231,6 +216,63 @@ final class RoamSteer {
         Plan plan = new Plan(side, deg, open, false, false, Math.max(0f, Math.min(1f, f)), toward);
         plan.novelty = goNew;
         return plan;
+    }
+
+    /**
+     * Mid-leg re-aim (owner-approved 2026-09-25): the bend toward the best open band
+     * by the same scoring as plan() (doorway in view, new ground), in degrees, left
+     * positive; 0 when p is not confident, nothing in view is open, or the best band
+     * does not beat the one ahead by steerMinGain. Changes no state: a plan's
+     * turn-only count and its turn toward new ground are left as they were.
+     */
+    double reaimDeg(Openness.Profile p, double doorwayDeg, Novelty novelty) {
+        if (!confident(p)) {
+            return 0;
+        }
+        Novelty nov = tuning.coverageWeight > 0 ? novelty : null;
+        boolean door = !Double.isNaN(doorwayDeg) && Math.abs(doorwayDeg) <= tuning.cameraHalfFovDeg;
+        double doorX = door ? -doorwayDeg / tuning.cameraHalfFovDeg : 0;
+        Best b = best(p, door, doorX, nov);
+        if (b.score <= tuning.steerBlocked || b.weighted - aheadWeighted(p, door, doorX, nov) < tuning.steerMinGain) {
+            return 0;
+        }
+        return -b.offset * tuning.cameraHalfFovDeg;
+    }
+
+    /** The best band by weighted openness: its raw openness, weighted score and offset. */
+    private static final class Best {
+        float score = -1f;
+        float weighted = -1f;
+        double offset;
+    }
+
+    private Best best(Openness.Profile p, boolean door, double doorX, Novelty nov) {
+        int n = p.bins.length;
+        int w = Math.min(tuning.steerBandBins, n);
+        Best b = new Best();
+        for (int i = 0; i + w <= n; i++) {
+            float score = mean(p.bins, i, w);
+            double offset = offset(i, w, n);
+            float weighted = score + (door ? doorwayBonus(score, offset, doorX, w, n) : 0f)
+                    + noveltyBonus(nov, score, offset);
+            // Ties go to the band nearest straight ahead.
+            if (weighted > b.weighted + 1e-6f || (Math.abs(weighted - b.weighted) <= 1e-6f
+                    && Math.abs(offset) < Math.abs(b.offset))) {
+                b.score = score;
+                b.weighted = weighted;
+                b.offset = offset;
+            }
+        }
+        return b;
+    }
+
+    /** The band straight ahead, weighted as best() weighs every band. */
+    private float aheadWeighted(Openness.Profile p, boolean door, double doorX, Novelty nov) {
+        int n = p.bins.length;
+        int w = Math.min(tuning.steerBandBins, n);
+        float ahead = aheadOpen(p);
+        double aheadOffset = offset((n - w) / 2, w, n);
+        return ahead + (door ? doorwayBonus(ahead, aheadOffset, doorX, w, n) : 0f) + noveltyBonus(nov, ahead, aheadOffset);
     }
 
     /** A band's pull toward new ground: coverageWeight x its novelty, none on a blocked band. */
