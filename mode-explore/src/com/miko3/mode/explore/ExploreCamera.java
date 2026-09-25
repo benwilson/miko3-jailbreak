@@ -39,11 +39,15 @@ import java.util.concurrent.TimeUnit;
  * Adapted from remote-control's CameraCapture (a copy, not a shared refactor):
  * one hardware-JPEG ImageReader at 640x480, and a FIXED frame-rate range,
  * since a variable one trips this HAL's "pixel rate should not be zero" bug
- * (docs/hardware/camera-vision.md). Unlike remote-control it leaves exposure
- * on auto: its manual exposure washed out U1's test frame. Auto alone left
- * faces too dark indoors (worse with a bright sign behind them), so it asks
- * for the camera's largest exposure compensation, which still adapts to the
- * room and leaves the frame-rate range alone.
+ * (docs/hardware/camera-vision.md). Exposure is set by hand (explore nav
+ * plan U9, KTD10): remote-control's fixed manual exposure washed out U1's test
+ * frame, and auto exposure at its largest compensation left real frames
+ * near-black in office light, so Brightness steers exposure time and
+ * sensitivity from each scored frame's mean luma, capped short while he
+ * drives. The request is re-issued only when they change, on the camera
+ * thread, and each open starts from the last settings that worked. A camera
+ * that does not list CONTROL_AE_MODE_OFF keeps auto exposure with the largest
+ * compensation. The frame-rate range stays the fixed one either way.
  *
  * Frames that arrive while the recognizer is busy (about a second a frame,
  * U1) are dropped, so every result is from a frame captured after the one
@@ -126,6 +130,18 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private final Openness openness = new Openness();
     /** The brain's latest "floor clear and wheels free" (U3), stamped on each captured frame. */
     private volatile boolean floorClear;
+    /** Mean luma of the last openness decode (detect thread); NaN when it failed. */
+    private double decodedLuma = Double.NaN;
+
+    /** Manual exposure for the session (U9); outlives each open, so the next starts where this left off. */
+    private final Brightness brightness = new Brightness();
+    /** Set per open on the camera thread: the camera lists CONTROL_AE_MODE_OFF and both ranges. */
+    private volatile boolean manualExposure;
+    /** The brain's latest "moving", so a repeat call costs nothing. */
+    private volatile Boolean moving;
+    // Camera-thread state for re-issuing the repeating request.
+    private Range<Integer> sessionFps;
+    private int sessionEv;
 
     private volatile boolean busy;
     /** close() has run on the camera thread and open() has not been called since. */
@@ -242,6 +258,19 @@ final class ExploreCamera implements ExploreBrain.Camera {
         }
     }
 
+    /** Driving caps the exposure short against blur (U9); a change is applied on the camera thread. */
+    @Override
+    public void setMoving(boolean moving) {
+        Boolean was = this.moving;
+        if (was != null && was == moving) {
+            return;
+        }
+        this.moving = moving;
+        if (brightness.setMoving(clock.nowMs(), moving) != null && manualExposure) {
+            cameraHandler.post(applyExposure);
+        }
+    }
+
     @Override
     public void floorDrivenOver(final long throughFrameMs) {
         detectHandler.post(new Runnable() {
@@ -319,6 +348,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
             CameraCharacteristics c = manager.getCameraCharacteristics(ids[0]);
             final Range<Integer> fps = fixedFpsRange(c);
             final int ev = maxCompensation(c);
+            manualExposure = manualExposureRanges(c);
             Size size = jpegSize(c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP));
             reader = ImageReader.newInstance(size.getWidth(), size.getHeight(), android.graphics.ImageFormat.JPEG, 2);
             reader.setOnImageAvailableListener(onImage, cameraHandler);
@@ -372,6 +402,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     }
 
     private void startSession(final Range<Integer> fps, final int ev) {
+        sessionFps = fps;
+        sessionEv = ev;
         try {
             List<android.view.Surface> surfaces = Arrays.asList(reader.getSurface());
             device.createCaptureSession(surfaces, new CameraCaptureSession.StateCallback() {
@@ -381,18 +413,13 @@ final class ExploreCamera implements ExploreBrain.Camera {
                         return;
                     }
                     session = s;
-                    try {
-                        CaptureRequest.Builder b = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-                        b.addTarget(reader.getSurface());
-                        if (fps != null) {
-                            b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps);
+                    Brightness.Settings manual = manualExposure ? brightness.start(clock.nowMs()) : null;
+                    if (repeat(manual)) {
+                        if (manual != null) {
+                            logSettings(manual, fps);
+                        } else {
+                            Log.i(TAG, "camera streaming at " + fps + ", exposure compensation " + ev);
                         }
-                        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-                        b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev);
-                        s.setRepeatingRequest(b.build(), null, cameraHandler);
-                        Log.i(TAG, "camera streaming at " + fps + ", exposure compensation " + ev);
-                    } catch (CameraAccessException | IllegalStateException e) {
-                        Log.e(TAG, "setRepeatingRequest failed", e);
                     }
                 }
 
@@ -404,6 +431,56 @@ final class ExploreCamera implements ExploreBrain.Camera {
         } catch (CameraAccessException | IllegalStateException e) {
             Log.e(TAG, "createCaptureSession failed", e);
         }
+    }
+
+    /** Camera thread: re-issue the repeating request with Brightness's current settings. */
+    private final Runnable applyExposure = new Runnable() {
+        @Override
+        public void run() {
+            if (!manualExposure || session == null || device == null) {
+                return;
+            }
+            Brightness.Settings s = brightness.current();
+            if (repeat(s)) {
+                logSettings(s, null);
+            }
+        }
+    };
+
+    /**
+     * Camera thread: the one repeating request, with the fixed frame-rate range and
+     * either these manual settings (AE off, as remote-control's CameraCapture) or,
+     * when null, auto exposure at the largest compensation. False when it failed.
+     */
+    private boolean repeat(Brightness.Settings manual) {
+        try {
+            CaptureRequest.Builder b = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            b.addTarget(reader.getSurface());
+            if (sessionFps != null) {
+                b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, sessionFps);
+            }
+            if (manual != null) {
+                // SENSOR_FRAME_DURATION must be >= the exposure; Brightness sees to it.
+                b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+                b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, manual.exposureNs);
+                b.set(CaptureRequest.SENSOR_SENSITIVITY, manual.sensitivity);
+                b.set(CaptureRequest.SENSOR_FRAME_DURATION, manual.frameDurationNs);
+            } else {
+                b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, sessionEv);
+            }
+            session.setRepeatingRequest(b.build(), null, cameraHandler);
+            return true;
+        } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
+            Log.e(TAG, "setRepeatingRequest failed", e);
+            return false;
+        }
+    }
+
+    /** Only the numbers, and only when they change (R15). */
+    private static void logSettings(Brightness.Settings s, Range<Integer> fps) {
+        Log.i(TAG, (fps != null ? "camera streaming at " + fps + ", " : "") + "exposure " + s.exposureMs()
+                + " ms, ISO " + s.sensitivity);
     }
 
     /** Every device close goes through here, so the reopen waits for onClosed(). */
@@ -487,6 +564,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                         long s0 = clock.nowMs();
                         Openness.Profile profile = scoreOpenness(jpeg, found, frameMs, teachable);
                         Log.i(TAG, "openness in " + (clock.nowMs() - s0) + " ms");
+                        adjustBrightness(frameMs, gen);
                         if (gen == generation) {
                             // The JPEG rides along for Claude's look request (explore on Claude U4, R1).
                             latest = new ExploreBrain.Look(frameMs, found, jpeg, profile);
@@ -508,6 +586,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
      * scored with the look's boxes. Null when it can't be decoded.
      */
     private Openness.Profile scoreOpenness(byte[] jpeg, List<Detection> found, long frameMs, boolean teachable) {
+        decodedLuma = Double.NaN;
         try {
             Bitmap bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, small);
             if (bmp == null) {
@@ -520,6 +599,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 smallPixels = new int[w * h];
             }
             bmp.getPixels(smallPixels, 0, w, 0, 0, w, h);
+            decodedLuma = Brightness.meanLuma(smallPixels, w * h);
             int first = Math.min(h - 1, (int) (Openness.HORIZON * h));
             Openness.Frame floorBand = new Openness.Frame(Arrays.copyOfRange(smallPixels, first * w, h * w),
                     w, h - first, (float) first / h, 1f);
@@ -527,7 +607,22 @@ final class ExploreCamera implements ExploreBrain.Camera {
         } catch (RuntimeException | OutOfMemoryError e) {
             Log.w(TAG, "openness decode failed: " + e.getClass().getSimpleName());
             small.inBitmap = null;
+            decodedLuma = Double.NaN;
             return null;
+        }
+    }
+
+    /**
+     * Detect thread: feed the decoded frame's brightness to the controller (U9) and,
+     * when the settings change, re-issue the request on the camera thread. A frame
+     * whose openness decode failed is skipped.
+     */
+    private void adjustBrightness(long frameMs, int gen) {
+        if (!manualExposure || gen != generation || Double.isNaN(decodedLuma)) {
+            return;
+        }
+        if (brightness.onFrame(frameMs, clock.nowMs(), decodedLuma) != null) {
+            cameraHandler.post(applyExposure);
         }
     }
 
@@ -595,6 +690,28 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private static int maxCompensation(CameraCharacteristics c) {
         Range<Integer> range = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
         return range == null ? 0 : Math.max(0, range.getUpper());
+    }
+
+    /**
+     * Manual exposure is offered (as remote-control's CameraCapture): AE_MODE_OFF is
+     * listed and both ranges are reported. Hands the ranges to Brightness.
+     */
+    private boolean manualExposureRanges(CameraCharacteristics c) {
+        Range<Long> exposure = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+        Range<Integer> sensitivity = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+        int[] modes = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES);
+        boolean off = false;
+        if (modes != null) {
+            for (int m : modes) {
+                off |= m == CaptureRequest.CONTROL_AE_MODE_OFF;
+            }
+        }
+        if (!off || exposure == null || sensitivity == null) {
+            return false;
+        }
+        brightness.setRanges(exposure.getLower(), exposure.getUpper(), sensitivity.getLower(),
+                sensitivity.getUpper(), c.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION));
+        return true;
     }
 
     private static Range<Integer> fixedFpsRange(CameraCharacteristics c) {

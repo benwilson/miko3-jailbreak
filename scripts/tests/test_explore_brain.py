@@ -30,7 +30,7 @@ HARNESS = TESTS / "fixtures" / "explore_brain_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHarness.java"
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
-              "ExplorePrompts.java", "Openness.java")
+              "ExplorePrompts.java", "Openness.java", "Brightness.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):

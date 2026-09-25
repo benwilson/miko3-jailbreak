@@ -24,7 +24,7 @@ deepened: 2026-09-25
 
 ## Product Contract
 
-Product Contract preservation: changed: R12, R13 — the escape scan's pictures are judged by Claude when it is reachable, with on-robot scoring as the offline fallback, and R13 becomes the second Claude ask; added R16 — the owner's direction (2026-09-25) that Claude takes over wherever the robot's hardware falls short.
+Product Contract preservation: added R17 — the owner's request (2026-09-25, after the U3 camera check found frames too dim) that the robot adjust its own camera brightness; changed: R12, R13 — the escape scan's pictures are judged by Claude when it is reachable, with on-robot scoring as the offline fallback, and R13 becomes the second Claude ask; added R16 — the owner's direction (2026-09-25) that Claude takes over wherever the robot's hardware falls short.
 
 ### Summary
 
@@ -42,6 +42,7 @@ He gets stuck in corners often. Wedged between a wall and a potted plant, he tur
 - R2. The front floor sensor and the camera are judged together: the floor sensor decides about the ground right in front of him (edges, stairs, near obstacles), which the camera cannot see, and the camera decides about the room from about 3–4 ft out.
 - R3. Whenever he speaks, he stops driving and the camera is switched off; he resumes roaming once he has finished speaking and the camera has safely reopened.
 - R4. His turns go to measured angles from the gyroscope, so he can turn to face a specific direction he saw and know which directions he has already tried.
+- R17. The robot adjusts its own camera brightness to the light it has: brighter when the picture is too dark, darker when it is too bright, so he can see in dim and bright rooms alike.
 - R5. If the camera fails or will not open, he keeps roaming on the floor sensor and wheel-stall sensing as today and retries the camera now and then; a camera failure never stops Explore.
 
 **Roaming**
@@ -164,6 +165,7 @@ He gets stuck in corners often. Wedged between a wall and a potted plant, he tur
   - At most one check goes out per 60 s. Between checks, any person seen while the list is non-empty counts as "just met".
 
   This replaces the global 2-minute `peopleCooldownMs` for approaches only; the curiosity prompt's cooling-down wording is untouched. Governs R9, R10.
+- KTD10. **Self-adjusting exposure by hand, not the fps-range trick.** A plain-Java brightness controller reads each frame's mean brightness (already computed for openness) and steers manual exposure time and sensitivity (`CONTROL_AE_MODE_OFF`, the path remote-control proved safe on this camera) toward a target, with hysteresis and small steps. Exposure is capped shorter while he is driving (motion blur) and may run longer while he stands still. The frame-rate range stays fixed, since a variable range triggers the driver bug. A camera that does not list `AE_MODE_OFF` keeps today's auto exposure with maximum compensation. Governs R17. (session-settled: user-directed — the owner asked for adjustable, self-improving brightness after the dim gate frames, over leaving auto exposure at its ceiling.)
 - KTD9. **He slows down for what the camera sees; he never stops for it alone.** Detector looks take about 0.6 s, too slow to track while moving. The roaming steer therefore bends the next leg toward the most open columns and shortens a leg when the columns ahead read blocked. Only the floor sensor, stall sensing and the controller's own refusal (CPL=2, never retried) stop him. Governs R2, R6.
 
 ### High-Level Technical Design
@@ -225,7 +227,7 @@ stateDiagram-v2
 
 ### Sequencing
 
-U1 (gyro in the sensor path) comes first. It unblocks U2 (heading tracker), and U2 unblocks every measured turn. U3 (openness) and U4 (camera while roaming) can proceed in parallel with U2. U3's check on real frames gates U4. U5 (escapes) needs U2, U3 and U4. U6 (doorways) and U7 (people) need U2, U3 and U4. U8 (robot QA and docs) comes last.
+U1 (gyro in the sensor path) comes first. It unblocks U2 (heading tracker), and U2 unblocks every measured turn. U3 (openness) and U4 (camera while roaming) can proceed in parallel with U2. U9 (self-adjusting brightness) follows U3, and U3's check on real frames, re-run with U9, gates U4. U5 (escapes) needs U2, U3 and U4. U6 (doorways) and U7 (people) need U2, U3 and U4. U8 (robot QA and docs) comes last.
 
 ---
 
@@ -483,11 +485,38 @@ U1 (gyro in the sensor path) comes first. It unblocks U2 (heading tracker), and 
   - Trace notes never contain a name (the existing privacy tests extend to the new path).
 - **Verification:** Harness scenarios pass. On the robot, he drives to the owner and greets them, then ignores them for the next 10 minutes (U8).
 
+### U9. Self-adjusting camera brightness
+
+- **Goal:** Explore's camera holds a usable picture brightness in dim and bright rooms by adjusting its own exposure and sensitivity.
+- **Requirements:** R17; KTD10.
+- **Dependencies:** U3 (the per-frame brightness it already measures).
+- **Files:**
+  - `mode-explore/src/com/miko3/mode/explore/Brightness.java` (new, plain Java: the controller)
+  - `mode-explore/src/com/miko3/mode/explore/ExploreCamera.java` (manual exposure requests driven by the controller)
+  - `mode-explore/src/com/miko3/mode/explore/ExploreBrain.java` (Camera port: a default no-op "moving" setter the brain calls; U4 wires it)
+  - `scripts/tests/test_explore_brightness.py` (new, with a harness under `scripts/tests/fixtures/`)
+  - `scripts/tests/test_explore_brain.py` (`PLAIN_JAVA`)
+- **Approach:**
+  1. After each frame, the controller takes its mean brightness and returns the next exposure time and sensitivity. It raises exposure first (up to the current cap), then sensitivity; it lowers sensitivity first, then exposure. It uses small multiplicative steps and a dead band around the target, so the picture doesn't flicker.
+  2. The exposure cap is shorter while moving and longer while still. The frame duration follows the exposure, and the frame-rate range is never widened.
+  3. `ExploreCamera` switches to manual exposure only when the camera lists `AE_MODE_OFF`; otherwise it keeps auto exposure with maximum compensation. It re-issues the repeating request only when the settings change. It starts from the last settings that worked this session.
+  4. Only the settings are logged (exposure in ms and sensitivity), never pixels.
+- **Patterns to follow:** `mode-remote-control/src/com/miko3/mode/remotecontrol/CameraCapture.java` (manual exposure, clamping to the camera's ranges, frame duration).
+- **Test scenarios:**
+  - A dark frame series raises exposure step by step to the cap, then raises sensitivity.
+  - A bright series lowers sensitivity first, then exposure.
+  - Brightness inside the dead band changes nothing.
+  - Switching to "moving" pulls a long exposure down to the moving cap at once.
+  - Settings stay within the camera's reported ranges, and a missing range uses safe defaults.
+  - An all-black frame with the lens covered stops at the limits and never oscillates.
+  - `ExploreCamera` source check: no variable frame-rate range is ever requested, and the log carries only numbers.
+- **Verification:** Host tests pass. On the robot, the wall and open-floor frames from the U3 gate come out visibly brighter in the same room light, and the camera log shows no driver errors over a 10-minute run.
+
 ### U8. On-robot QA, measurements, and docs
 
 - **Goal:** The owner can run each new behavior on the floor, the success target and fallback triggers are measured, and the docs match the new camera rule.
 - **Requirements:** Success Criteria; AE1–AE7.
-- **Dependencies:** U1–U7.
+- **Dependencies:** U1–U7, U9.
 - **Files:**
   - `scripts/qa-explore-mode.py` (a `nav` step)
   - `scripts/tests/test_qa_explore_mode.py`

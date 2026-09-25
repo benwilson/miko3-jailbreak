@@ -190,6 +190,13 @@ final class ExploreBrain {
          */
         default void floorDrivenOver(long throughFrameMs) {
         }
+
+        /**
+         * Brightness (explore nav plan U9, KTD10): whether he is driving, which caps
+         * the camera's exposure short against motion blur. No-op by default.
+         */
+        default void setMoving(boolean moving) {
+        }
     }
 
     /**
