@@ -41,6 +41,10 @@ final class ExploreTuning {
     final long startleMs;
     /** No reading for this long means the sensors are unavailable: three missed 100 ms polls (KTD3). */
     final long staleMs;
+    /** The MikoExploreSpin hook's still spell (the gyro bias) and each one-way turn
+     * (explore nav plan U1): long enough for a few full turns the owner marks. */
+    final long spinStillMs;
+    final long spinLegMs;
     /** tof's fault value (KTD3). */
     final int tofFault;
     /** tof unchanged for this long means frozen (leftover TOFDS); 0 turns the rule off (KTD3). */
@@ -198,6 +202,8 @@ final class ExploreTuning {
         lookLeadMs = b.lookLeadMs;
         startleMs = b.startleMs;
         staleMs = b.staleMs;
+        spinStillMs = b.spinStillMs;
+        spinLegMs = b.spinLegMs;
         tofFault = b.tofFault;
         frozenTofWindowMs = b.frozenTofWindowMs;
         recoveryStreak = Math.max(1, b.recoveryStreak);
@@ -316,6 +322,8 @@ final class ExploreTuning {
         private long lookLeadMs = 500;
         private long startleMs = 400;
         private long staleMs = 300;
+        private long spinStillMs = 3000;
+        private long spinLegMs = 20000;
         private int tofFault = 16383;
         // A still robot's tof jitters by tens of counts, so identical values this
         // long mean a stuck sensor (docs/hardware/tof-sensor.md).
@@ -416,6 +424,7 @@ final class ExploreTuning {
         Builder lookLeadMs(long v) { lookLeadMs = v; return this; }
         Builder startleMs(long v) { startleMs = v; return this; }
         Builder staleMs(long v) { staleMs = v; return this; }
+        Builder spinMs(long still, long leg) { spinStillMs = still; spinLegMs = leg; return this; }
         Builder frozenTofWindowMs(long v) { frozenTofWindowMs = v; return this; }
         Builder recoveryStreak(int v) { recoveryStreak = v; return this; }
         Builder cap(int hazards, long windowMs, long cooldown) {

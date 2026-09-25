@@ -47,6 +47,10 @@ final class ExploreLoop {
 
         /** Make a curiosity stop due now instead of after 20-40 s of wandering (camera curiosity U8). */
         boolean curiousNow();
+
+        /** Turn in place one way, then the other, instead of wandering, for the gyro
+         * capture (ExploreSpin; explore nav plan U1). */
+        boolean spinInPlace();
     }
 
     static final Hooks NO_HOOKS = new Hooks() {
@@ -64,6 +68,11 @@ final class ExploreLoop {
         public boolean curiousNow() {
             return false;
         }
+
+        @Override
+        public boolean spinInPlace() {
+            return false;
+        }
     };
 
     private final ExploreBrain.Clock clock;
@@ -74,6 +83,7 @@ final class ExploreLoop {
     private final ExploreBrain.Trace trace;
     private final long tickMs;
     private final ExploreBrain brain;
+    private final ExploreSpin spin;
     private final StopTimer stopTimer;
 
     private volatile boolean running;
@@ -105,8 +115,9 @@ final class ExploreLoop {
         this.hooks = hooks == null ? NO_HOOKS : hooks;
         this.trace = trace;
         this.tickMs = tickMs;
-        this.brain = new ExploreBrain(tuning, clock, new DriveGate(wheels, lease, trace), eyes, sound, camera,
-                port, new Random());
+        DriveGate gate = new DriveGate(wheels, lease, trace);
+        this.brain = new ExploreBrain(tuning, clock, gate, eyes, sound, camera, port, new Random());
+        this.spin = new ExploreSpin(gate, trace, tuning);
         if (trace != null) {
             brain.setTrace(trace);
         }
@@ -165,7 +176,15 @@ final class ExploreLoop {
         boolean leaseReported = false;
         long lastReadingMs = Long.MIN_VALUE;
         while (running) {
-            if (!hooks.freezeBrain()) {
+            if (!hooks.freezeBrain() && hooks.spinInPlace()) {
+                // The brain sits out the spin (no readings, no ticks), so nothing it
+                // decides competes for the wheels; it catches up when the hook goes off.
+                spin.onTick(clock.nowMs(), hooks.staleSensors() ? null : sensors.latest(), lease.held());
+                stopTimer.feed(clock.nowMs());
+            } else if (!hooks.freezeBrain()) {
+                if (spin.active()) {
+                    spin.end();
+                }
                 boolean held = lease.held();
                 if (held != leaseReported) {
                     leaseReported = held;

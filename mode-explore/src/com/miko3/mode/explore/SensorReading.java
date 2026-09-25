@@ -30,6 +30,14 @@ final class SensorReading {
      * the wheels are stalled, e.g. against something too low for the front sensor. */
     final long wheelLeft;
     final long wheelRight;
+    /** True when the reply carried the gyro (explore nav plan U1, KTD1). The rates are
+     * signed, so -1 is a real value: check this rather than the fields. */
+    final boolean hasGyro;
+    /** Raw gyroscope rates, in the controller's counts; which one is yaw, its sign and its
+     * scale are in the calibration file (ExploreCalibration.Gyro). 0 when !hasGyro. */
+    final int gyroX;
+    final int gyroY;
+    final int gyroZ;
 
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault) {
         this(timestampMs, tof, ir1, ir2, cpl, fault, -1, -1);
@@ -37,6 +45,21 @@ final class SensorReading {
 
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault,
                   long wheelLeft, long wheelRight) {
+        this(timestampMs, tof, ir1, ir2, cpl, fault, wheelLeft, wheelRight, false, 0, 0, 0);
+    }
+
+    /** A reading that carried the gyro's three raw rates. */
+    SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault,
+                  long wheelLeft, long wheelRight, int gyroX, int gyroY, int gyroZ) {
+        this(timestampMs, tof, ir1, ir2, cpl, fault, wheelLeft, wheelRight, true, gyroX, gyroY, gyroZ);
+    }
+
+    private SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault,
+                          long wheelLeft, long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ) {
+        this.hasGyro = hasGyro;
+        this.gyroX = gyroX;
+        this.gyroY = gyroY;
+        this.gyroZ = gyroZ;
         this.timestampMs = timestampMs;
         this.tof = tof;
         this.ir1 = ir1;
@@ -55,6 +78,7 @@ final class SensorReading {
     public String toString() {
         return "t=" + timestampMs + " tof=" + tof + " ir1=" + ir1 + " ir2=" + ir2
                 + " cpl=" + cpl + (hasWheels() ? " wheels=" + wheelLeft + "/" + wheelRight : "")
+                + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "")
                 + (fault ? " FAULT" : "");
     }
 }

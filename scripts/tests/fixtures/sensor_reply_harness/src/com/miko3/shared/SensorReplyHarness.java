@@ -104,6 +104,43 @@ public final class SensorReplyHarness {
                         == SensorSnapshot.ABSENT,
                 "expected ABSENT");
 
+        // ---- gyro (explore nav plan U1): IMUGY= is three signed rate fields ----
+        check("captured_record_carries_the_gyro",
+                s != null && s.hasGyro && s.gyroX == 62 && s.gyroY == -757 && s.gyroZ == 93, "got " + s);
+
+        boolean allGyro = true;
+        for (String line : lines) {
+            SensorSnapshot each = SensorReply.parse(padded(replyOf(line)), T);
+            allGyro &= each != null && each.hasGyro && each.gyroY < 0;
+        }
+        check("every_captured_record_carries_the_gyro", allGyro, "a baseline record lost its gyro");
+
+        SensorSnapshot neg = SensorReply.parse(bytes(
+                "IMUGY=-000001234,0000000005,-000000001IMUMG=0TOFIR=00209,XXXX,0,XXXX"), T);
+        check("gyro_sign_and_leading_zeros_are_read",
+                neg != null && neg.hasGyro && neg.gyroX == -1234 && neg.gyroY == 5 && neg.gyroZ == -1,
+                "got " + neg);
+
+        SensorSnapshot allX = SensorReply.parse(bytes("IMUGY=XXXXXXXXXX,XXXXXXXXXX,XXXXXXXXXXIMUMG=0"
+                + "TOFIR=00209,XXXX,0,XXXXLeft=0000068312,Right=0000059810,00"), T);
+        SensorSnapshot none = SensorReply.parse(bytes(
+                "POWER=0,0TOFIR=00209,XXXX,0,XXXXLeft=0000068312,Right=0000059810,00"), T);
+        check("absent_gyro_leaves_the_rest_of_the_record",
+                allX != null && !allX.hasGyro && allX.tof == 209 && allX.wheelLeft == 68312
+                        && none != null && !none.hasGyro && none.tof == 209 && none.wheelRight == 59810,
+                "all-X " + allX + " / missing " + none);
+
+        String tail = "TOFIR=00209,XXXX,0,XXXX";
+        check("cut_off_or_malformed_gyro_is_absent",
+                !SensorReply.parse(bytes(tail + "IMUGY=0000000062,-000000757,00000"), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=0000000062,-000000757IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=00000000X2,1,2IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=1,--2,3IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=1,,3IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=1,2,3,4IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=1,2,00000000001IMUMG=0" + tail), T).hasGyro,
+                "a partial or malformed gyro must not read as a smaller rate");
+
         check("malformed_cpl_is_unknown",
                 SensorReply.parseCpl(bytes("CPL=X,")) == SensorSnapshot.ABSENT
                         && SensorReply.parseCpl((byte[]) null) == SensorSnapshot.ABSENT, "expected ABSENT");

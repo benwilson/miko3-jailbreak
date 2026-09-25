@@ -1,5 +1,5 @@
 """Host-side tests for shared/SensorReply (explore plan U2): parsing the MCU's
-POWER-poll reply into a SensorSnapshot, run against records captured on the
+POWER-poll reply into a SensorSnapshot (and its gyro, explore nav plan U1), run against records captured on the
 robot (scripts/tests/fixtures/explore_sensor_records/)."""
 import subprocess
 import sys
@@ -46,6 +46,11 @@ class SensorReplyHarnessTest(unittest.TestCase):
         "malformed_cpl_is_unknown",
         "wheel_counts_are_read",
         "missing_or_cut_off_wheel_counts_are_absent",
+        "captured_record_carries_the_gyro",
+        "every_captured_record_carries_the_gyro",
+        "gyro_sign_and_leading_zeros_are_read",
+        "absent_gyro_leaves_the_rest_of_the_record",
+        "cut_off_or_malformed_gyro_is_absent",
     )
 
     @classmethod

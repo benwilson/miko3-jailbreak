@@ -1,6 +1,7 @@
 """Tests for scripts/qa-explore-mode.py's host-side logic (explore plan U8): the
-threshold suggestion from calibration captures, the calibration file it writes,
-and step selection. The adb steps themselves are owner-attended on the robot."""
+threshold suggestion from calibration captures, the calibration file it writes
+(merged with the gyro keys, explore nav plan U1), and step selection. The adb
+steps themselves are owner-attended on the robot."""
 import importlib.util
 import unittest
 from pathlib import Path
@@ -72,6 +73,36 @@ class CalibrationTextTest(unittest.TestCase):
     def test_properties_match_what_the_app_reads(self):
         text = qa.calibration_text({"obstacleTofBelow": 120, "edgeTofAbove": -1, "edgeIr": 0, "edgeIrAbove": True})
         self.assertEqual(text, "obstacleTofBelow=120\nedgeTofAbove=-1\nedgeIr=0\nedgeIrAbove=true\n")
+
+
+class CalibrationPushTest(unittest.TestCase):
+    """explore nav plan U1: the push merges into the robot's file, keeping the gyro keys
+    qa-explore-sensors.py --gyro-circle wrote there."""
+
+    def test_pushing_floor_keys_keeps_the_gyro_keys(self):
+        files = {}
+        staged = {}
+        path = f"/data/data/{qa.PACKAGE}/files/{qa.CAL_NAME}"
+        files[path] = "#stored by the app\ngyroAxis=z\ngyroSign=-1\ngyroCountSecondsPer360=4512.25\nobstacleTofBelow=10\n"
+
+        def fake_adb(*args, check=True):
+            if args[:2] == ("shell", "cat"):
+                return files.get(args[2], "")
+            if args[0] == "push":
+                staged[args[2]] = Path(args[1]).read_text()
+            elif args[:2] == ("shell", "cp"):
+                files[args[3]] = staged[args[2]]
+            elif args[:2] == ("shell", "stat"):
+                return "10090:10090\n"
+            return ""
+
+        robot = qa.Robot("serial")
+        robot.adb = fake_adb
+        robot.push_calibration({"obstacleTofBelow": 120, "edgeTofAbove": -1, "edgeIr": 0, "edgeIrAbove": True})
+        props = qa.sensors_module().parse_properties(files[path])
+        self.assertEqual(props, {"gyroAxis": "z", "gyroSign": "-1", "gyroCountSecondsPer360": "4512.25",
+                                 "obstacleTofBelow": "120", "edgeTofAbove": "-1", "edgeIr": "0",
+                                 "edgeIrAbove": "true"})
 
 
 class ParseOnlyTest(unittest.TestCase):

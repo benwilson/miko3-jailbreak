@@ -18,7 +18,7 @@ HARNESS = TESTS / "fixtures" / "explore_drive_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreDriveHarness.java"
 PLAIN_JAVA = [EXPLORE_SRC / "com" / "miko3" / "mode" / "explore" / n
               for n in ("StopTimer.java", "DriveGate.java", "ExploreLoop.java", "ExploreCalibration.java",
-                        "LeaseTrust.java")]
+                        "LeaseTrust.java", "ExploreSpin.java", "SensorReading.java")]
 
 
 class DriveWiringIsPlainJavaTest(unittest.TestCase):
@@ -52,6 +52,17 @@ class ExploreDriveHarnessTest(unittest.TestCase):
         "loop_exit_ends_in_stop_and_goes_quiet",
         "loop_stop_timer_stops_a_frozen_brain",
         "loop_stop_timer_retries_a_failed_stop",
+        # explore nav plan U1: gyro keys in the calibration file, the gyro on each
+        # reading, and the MikoExploreSpin hook.
+        "calibration_without_gyro_keys_reads_gyro_uncalibrated",
+        "calibration_gyro_round_trips",
+        "calibration_writes_keep_each_others_keys",
+        "calibration_bad_gyro_keys_are_gyro_uncalibrated_but_floor_loads",
+        "spin_turns_left_then_right_with_still_spells",
+        "spin_halts_without_lease_or_fresh_readings",
+        "spin_needs_calibrated_floor_sensors",
+        "reading_carries_the_gyro",
+        "loop_spin_hook_turns_in_place_and_ends_in_stop",
     )
 
     @classmethod

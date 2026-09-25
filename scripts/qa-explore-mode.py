@@ -27,7 +27,6 @@ import importlib.util
 import ssl
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -127,10 +126,15 @@ def calibration_complete(cal):
     return cal["obstacleTofBelow"] >= 0 and (cal["edgeTofAbove"] >= 0 or cal["edgeIr"] >= 0)
 
 
+def calibration_values(cal):
+    """The floor-sensor keys as ExploreCalibration reads them (java.util.Properties)."""
+    return {k: str(cal[k]).lower() if isinstance(cal[k], bool) else str(cal[k])
+            for k in ("obstacleTofBelow", "edgeTofAbove", "edgeIr", "edgeIrAbove")}
+
+
 def calibration_text(cal):
-    """The app's calibration file (ExploreCalibration reads java.util.Properties)."""
-    return "".join(f"{k}={str(cal[k]).lower() if isinstance(cal[k], bool) else cal[k]}\n"
-                   for k in ("obstacleTofBelow", "edgeTofAbove", "edgeIr", "edgeIrAbove"))
+    """The floor-sensor part of the app's calibration file."""
+    return "".join(f"{k}={v}\n" for k, v in calibration_values(cal).items())
 
 
 class Robot:
@@ -184,22 +188,10 @@ class Robot:
         finally:
             self.hook("MikoDmdRaw", False)
 
-    def push_calibration(self, text):
-        files = f"/data/data/{PACKAGE}/files"
-        with tempfile.NamedTemporaryFile("w", suffix=".properties", delete=False) as f:
-            f.write(text)
-            local = f.name
-        try:
-            self.adb("push", local, f"/data/local/tmp/{CAL_NAME}")
-        finally:
-            Path(local).unlink()
-        owner = self.adb("shell", "stat", "-c", "%u:%g", f"/data/data/{PACKAGE}").strip()
-        self.adb("shell", "mkdir", "-p", files)
-        self.adb("shell", "cp", f"/data/local/tmp/{CAL_NAME}", f"{files}/{CAL_NAME}")
-        self.adb("shell", "chown", "-R", owner, files)
-        self.adb("shell", "chmod", "600", f"{files}/{CAL_NAME}")
-        self.adb("shell", "restorecon", "-R", files, check=False)
-        self.adb("shell", "rm", f"/data/local/tmp/{CAL_NAME}", check=False)
+    def push_calibration(self, cal):
+        """Read-modify-write the app's calibration file (explore nav plan U1): the floor
+        keys replace their old values and any gyro keys from qa-explore-sensors.py stay."""
+        sensors_module().write_calibration_keys(self.adb, calibration_values(cal))
 
 
 def curiosity_summary(log):
@@ -242,7 +234,7 @@ def step_calibrate(robot, seconds):
         return False
     if not ask("write this calibration and restart the mode?"):
         return False
-    robot.push_calibration(calibration_text(cal))
+    robot.push_calibration(cal)
     ok = "sensor calibration:" in robot.restart_and_log(["ExploreModeApp"])
     print("   the mode loaded the calibration" if ok else "   the mode did not report loading it")
     return ok

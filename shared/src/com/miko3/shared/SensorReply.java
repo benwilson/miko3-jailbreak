@@ -21,6 +21,7 @@ public final class SensorReply {
     private static final String CPL = "CPL=";
     private static final String LEFT = "Left=";
     private static final String RIGHT = "Right=";
+    private static final String IMUGY = "IMUGY=";
 
     private SensorReply() {
     }
@@ -50,9 +51,61 @@ public final class SensorReply {
         if (tof == SensorSnapshot.ABSENT) {
             return null;
         }
-        return new SensorSnapshot(timestampMs, tof, number(fields[1]),
-                fields.length > 2 ? number(fields[2]) : SensorSnapshot.ABSENT,
-                count(text, LEFT), count(text, RIGHT));
+        int ir1 = number(fields[1]);
+        int ir2 = fields.length > 2 ? number(fields[2]) : SensorSnapshot.ABSENT;
+        long left = count(text, LEFT);
+        long right = count(text, RIGHT);
+        int[] gyro = gyro(text);
+        return gyro == null
+                ? new SensorSnapshot(timestampMs, tof, ir1, ir2, left, right)
+                : new SensorSnapshot(timestampMs, tof, ir1, ir2, left, right, gyro[0], gyro[1], gyro[2]);
+    }
+
+    /** The three signed gyro rates after IMUGY= ("0000000062,-000000757,0000000093"), or
+     * null unless all three read cleanly (explore nav plan U1). The section must end at
+     * the next section key: one running into the end of the reply may be cut off
+     * mid-field, and a partial rate would read as a smaller one. */
+    private static int[] gyro(String text) {
+        int start = text.indexOf(IMUGY);
+        if (start < 0) {
+            return null;
+        }
+        int from = start + IMUGY.length();
+        String body = sectionBody(text, from);
+        if (from + body.length() >= text.length()) {
+            return null;
+        }
+        String[] fields = body.split(",", -1);
+        if (fields.length != 3) {
+            return null;
+        }
+        int[] out = new int[3];
+        for (int i = 0; i < 3; i++) {
+            Integer v = signed(fields[i]);
+            if (v == null) {
+                return null;
+            }
+            out[i] = v;
+        }
+        return out;
+    }
+
+    /** An optional '-' then 1-10 ASCII digits, as its value; anything else (padding,
+     * empty, a stray sign, out of int range) is null. Beside number(), which reads only
+     * unsigned fields of up to 5 digits. */
+    private static Integer signed(String field) {
+        int i = field.startsWith("-") ? 1 : 0;
+        int digits = field.length() - i;
+        if (digits < 1 || digits > 10) {
+            return null;
+        }
+        for (int k = i; k < field.length(); k++) {
+            if (field.charAt(k) < '0' || field.charAt(k) > '9') {
+                return null;
+            }
+        }
+        long v = Long.parseLong(field);
+        return v < Integer.MIN_VALUE || v > Integer.MAX_VALUE ? null : Integer.valueOf((int) v);
     }
 
     /** The wheel encoder count after {@code key} ("Left=0000068312,"): 1-10 digits ended

@@ -24,12 +24,32 @@ public final class SensorSnapshot {
      * climb while a wheel turns and stand still while it is stalled. */
     public final long wheelLeft;
     public final long wheelRight;
+    /** True when the record carried a whole IMUGY= section (explore nav plan U1, KTD1).
+     * The gyro fields are signed rates, so -1 is a real value there: check this, not ABSENT. */
+    public final boolean hasGyro;
+    /** The raw gyroscope rates from IMUGY=, in the controller's counts; ABSENT when
+     * !hasGyro. Which axis is yaw, its sign and its scale come from the owner-guided
+     * capture (scripts/qa-explore-sensors.py --gyro-circle), never from here. */
+    public final int gyroX;
+    public final int gyroY;
+    public final int gyroZ;
 
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2) {
         this(timestampMs, tof, ir1, ir2, ABSENT, ABSENT);
     }
 
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, long wheelLeft, long wheelRight) {
+        this(timestampMs, tof, ir1, ir2, wheelLeft, wheelRight, false, ABSENT, ABSENT, ABSENT);
+    }
+
+    /** A reading that carried the gyro: its three raw rates. */
+    public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, long wheelLeft, long wheelRight,
+                          int gyroX, int gyroY, int gyroZ) {
+        this(timestampMs, tof, ir1, ir2, wheelLeft, wheelRight, true, gyroX, gyroY, gyroZ);
+    }
+
+    private SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, long wheelLeft, long wheelRight,
+                           boolean hasGyro, int gyroX, int gyroY, int gyroZ) {
         this.timestampMs = timestampMs;
         this.tof = tof;
         this.ir1 = ir1;
@@ -37,11 +57,16 @@ public final class SensorSnapshot {
         this.fault = tof == DEAD_TOF;
         this.wheelLeft = wheelLeft;
         this.wheelRight = wheelRight;
+        this.hasGyro = hasGyro;
+        this.gyroX = gyroX;
+        this.gyroY = gyroY;
+        this.gyroZ = gyroZ;
     }
 
     @Override
     public String toString() {
         return "SensorSnapshot{t=" + timestampMs + " tof=" + tof + " ir1=" + ir1 + " ir2=" + ir2
-                + " wheels=" + wheelLeft + "/" + wheelRight + (fault ? " FAULT" : "") + "}";
+                + " wheels=" + wheelLeft + "/" + wheelRight
+                + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "") + (fault ? " FAULT" : "") + "}";
     }
 }
