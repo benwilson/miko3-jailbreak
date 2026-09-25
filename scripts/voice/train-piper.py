@@ -408,6 +408,8 @@ speech from scripts/voice/synthesize-dataset.py, then exported to ONNX with
 sherpa-onnx's Piper metadata. No training audio or transcripts live here; the
 dataset stays in the gitignored voice-work/.
 
+- Synthetic dataset: {rows} utterances (lines from scripts/voice/script-lines.txt)
+- Fine-tuned to epoch {epoch} ({extra} epochs past the base checkpoint)
 - model.onnx: from {ckpt}
 - tokens.txt: the voice config's phoneme_id_map
 - espeak-ng-data/: sherpa-onnx's bundle
@@ -423,7 +425,8 @@ EXPORT_SHIM = ("import functools, runpy, sys, torch\n"
                "runpy.run_module('piper.train.export_onnx', run_name='__main__')\n")
 
 
-def export(ckpt, config_path, out_dir, espeak_src, runner=None, add_metadata=onnx_add_metadata):
+def export(ckpt, config_path, out_dir, espeak_src, runner=None, add_metadata=onnx_add_metadata,
+           rows="?", epoch="?"):
     out = Path(out_dir)
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     run = runner or (lambda cmd: subprocess.run(cmd, check=True))
@@ -438,7 +441,9 @@ def export(ckpt, config_path, out_dir, espeak_src, runner=None, add_metadata=onn
     add_metadata(str(model), sherpa_metadata(config))
     (tmp / "tokens.txt").write_text(tokens_text(config), encoding="utf-8")
     shutil.copytree(espeak_src, tmp / "espeak-ng-data")
-    (tmp / "README.md").write_text(README.format(ckpt=Path(ckpt).name), encoding="utf-8")
+    (tmp / "README.md").write_text(README.format(
+        ckpt=Path(ckpt).name, rows=rows, epoch=epoch,
+        extra=epoch - 2164 if isinstance(epoch, int) else "?"), encoding="utf-8")
     missing = missing_sherpa_files(tmp)
     if missing:
         fail(f"export is missing {missing}")
@@ -523,7 +528,9 @@ def main(argv=None):
         print("\n".join(m["commands"]))
     elif a.export:
         espeak = Path(a.espeak_data) if a.espeak_data else default_espeak_data()
-        export(a.export, a.config, a.out, espeak)
+        csv = PIPER_DIR / "metadata.csv"
+        rows = sum(1 for _ in csv.open(encoding="utf-8")) if csv.is_file() else "?"
+        export(a.export, a.config, a.out, espeak, rows=rows, epoch=ckpt_epoch(a.export))
 
 
 if __name__ == "__main__":

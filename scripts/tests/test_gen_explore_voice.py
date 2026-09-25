@@ -1,8 +1,9 @@
 """Tests for scripts/gen-explore-voice.py: the spoken names explore says when it
-inspects something (camera curiosity plan U6, KTD7). The clips are rendered with
-macOS `say`, whose output differs between machines, so the committed clips are
-checked for presence and format (Opus in WebM, a sane length and size), never
-for byte equality."""
+inspects something (camera curiosity plan U6, KTD7; robot voice plan U6, KTD7,
+R14). The clips are rendered with the robot's trained Piper voice through
+sherpa-onnx, whose output can differ between machines and library versions, so
+the committed clips are checked for presence and format (Opus in WebM, a sane
+length and size), never for byte equality."""
 import importlib.util
 import shutil
 import subprocess
@@ -81,6 +82,55 @@ class SlugAndPhraseTest(unittest.TestCase):
     def test_every_label_has_a_phrase(self):
         for label in voice.VOCABULARY:
             self.assertTrue(voice.phrase(label).startswith("ooh, "), label)
+
+
+class FakeAudio:
+    def __init__(self, seconds, rate):
+        self.sample_rate = rate
+        n = int(seconds * rate)
+        self.samples = [0.5 if i % 2 else -0.5 for i in range(n)]
+
+
+class FakeTts:
+    """Stands in for sherpa_onnx.OfflineTts: speech 3 s long at speed 1, shorter
+    when spoken faster."""
+    def __init__(self, seconds=3.0, rate=None):
+        self.seconds, self.rate, self.calls = seconds, rate or voice.RATE, []
+
+    def generate(self, text, sid=0, speed=1.0):
+        self.calls.append((text, sid, speed))
+        return FakeAudio(self.seconds / speed, self.rate)
+
+
+class TrainedVoiceTest(unittest.TestCase):
+    def test_the_voice_is_the_launchers_trained_model(self):
+        self.assertEqual(voice.VOICE_DIR, ROOT / "launcher" / "assets" / "voice")
+
+    def test_no_say_and_no_robot_effect(self):
+        # R14/KTD7: the trained voice as it is, no macOS `say`, no ring-mod buzz.
+        src = SCRIPT.read_text(encoding="utf-8")
+        for gone in ('"say"', "aeval", "vibrato", "asetrate", "sin(2*PI"):
+            self.assertNotIn(gone, src)
+        self.assertFalse(hasattr(voice, "FILTERS"))
+        self.assertFalse(hasattr(voice, "PITCH"))
+
+    def test_render_speaks_the_phrase(self):
+        tts = FakeTts(seconds=1.0)
+        samples = voice.render("apple", tts)
+        self.assertEqual(tts.calls, [("ooh, an apple", 0, 1.0)])
+        self.assertLessEqual(len(samples) / voice.RATE, voice.MAX_SECONDS)
+        self.assertEqual(max(abs(s) for s in samples), round(voice.PEAK * 32767))
+
+    def test_render_speeds_up_a_long_phrase(self):
+        tts = FakeTts(seconds=3.0)
+        samples = voice.render("plant", tts)
+        self.assertGreater(len(tts.calls), 1)
+        self.assertGreater(tts.calls[-1][2], 1.0)
+        self.assertLessEqual(len(samples) / voice.RATE, voice.MAX_SECONDS)
+
+    def test_render_rejects_a_voice_at_another_rate(self):
+        with self.assertRaises(RuntimeError):
+            voice.render("plant", FakeTts(seconds=1.0, rate=16000))
 
 
 class CommittedNameClipsTest(unittest.TestCase):

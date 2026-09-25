@@ -6,38 +6,37 @@ curiosity plan U6, KTD7, R8, R14).
 The vocabulary is mode-explore/assets/vocabulary.txt, the same list the detector is
 exported with (scripts/export-explore-detector.py). Each name gets a short phrase
 with the right article, or none for plural and mass nouns ("ooh, socks"), and
-fixed capitals where a name needs them ("a TV"). The phrase is spoken by a built-in macOS `say` voice,
-then ffmpeg turns it into a small robot voice to match the idle songs' WALL-E-style
-babble in the deeper register: pitched down a little, a light warble (vibrato) and
-a light ring-modulated buzz. Finally the clip is trimmed, faded and normalized here
-and encoded as Opus in WebM: a few hundred names as WAV would add ~17 MB to the
-APK (assets are stored uncompressed), as Opus ~1.5 MB. The robot's MediaPlayer
-plays Opus in WebM (checked on the device; Opus in Ogg needs Android 10). Every
-name is original speech; nothing comes from the film.
+fixed capitals where a name needs them ("a TV"). The phrase is spoken by the
+robot's own trained Piper voice (launcher/assets/voice/, robot voice plan U4)
+through sherpa-onnx, the same engine the launcher speaks with, with no robot
+effect: the clips sound like the rest of his speech (robot voice plan U6, KTD7,
+R14). Finally the clip is trimmed, faded and normalized here and encoded as
+Opus in WebM: a few hundred names as WAV would add ~17 MB to the APK (assets
+are stored uncompressed), as Opus ~1.5 MB. The robot's MediaPlayer plays Opus
+in WebM (checked on the device; Opus in Ogg needs Android 10).
 
-`say` output differs between macOS versions and machines, so the committed clips are
-checked for presence and format only (scripts/tests/test_gen_explore_voice.py).
-Requires macOS `say` and ffmpeg with libopus.
+sherpa-onnx output can differ between machines and versions, so the committed
+clips are checked for presence and format only (scripts/tests/test_gen_explore_voice.py).
+Requires the sherpa-onnx Python package (voice-work/.venv-piper has it) and
+ffmpeg with libopus.
 
-  python3 scripts/gen-explore-voice.py                  # write mode-explore/assets/
-  python3 scripts/gen-explore-voice.py OUT_DIR          # write somewhere else
-  python3 scripts/gen-explore-voice.py --voice Fred     # a different built-in voice
+  voice-work/.venv-piper/bin/python scripts/gen-explore-voice.py          # mode-explore/assets/
+  voice-work/.venv-piper/bin/python scripts/gen-explore-voice.py OUT_DIR  # somewhere else
 """
 import argparse
 import array
-import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-RATE = 22050  # same as scripts/gen-explore-sounds.py; the tests check they agree
-VOICE = "Samantha"  # clear on a small speaker; the ffmpeg chain supplies the robot
-SAY_RATE = 175       # words per minute; raised automatically if a phrase runs long
+RATE = 22050  # same as scripts/gen-explore-sounds.py and the voice; the tests check
+VOICE_DIR = Path(__file__).resolve().parents[1] / "launcher" / "assets" / "voice"
+SPEED = 1.0          # sherpa-onnx speed; raised automatically if a phrase runs long
+MAX_SPEED = 1.5
+SPEED_STEP = 0.1
 MAX_SECONDS = 2.3    # keep every clip under the 2.5 s the brain budgets for a name
 PEAK = 0.62          # of full scale, like the startle chirps
-PITCH = 0.84         # pitch factor (tempo is restored), a little deeper than the voice
 
 VOCABULARY_FILE = Path(__file__).resolve().parents[1] / "mode-explore" / "assets" / "vocabulary.txt"
 OPUS_BITRATE = "24k"  # speech; transparent enough on the robot's small speaker
@@ -109,37 +108,26 @@ def phrase(label):
     return f"ooh, {'an' if vowel else 'a'} {word}"
 
 
-# ffmpeg chain, after `say` writes 16-bit mono at RATE:
-#   highpass       drop rumble the small speaker can't reproduce anyway
-#   asetrate/atempo/aresample  pitch down by PITCH, restore the tempo, back to RATE
-#   vibrato        light warble, like the songs' syllable wobble
-#   aeval          light ring modulation: a 90 Hz carrier mixed in at 25% for a buzz
-FILTERS = ",".join((
-    "highpass=f=90",
-    f"asetrate={RATE}*{PITCH}",
-    f"atempo={1 / PITCH:.4f}",
-    f"aresample={RATE}",
-    "vibrato=f=6.5:d=0.18",
-    "aeval='val(0)*(0.75+0.25*sin(2*PI*90*t))'",
-))
+def load_voice(voice_dir=VOICE_DIR):
+    """The trained voice as a sherpa_onnx.OfflineTts (imported here so the tests
+    run without sherpa-onnx)."""
+    import sherpa_onnx
+    d = Path(voice_dir)
+    config = sherpa_onnx.OfflineTtsConfig(
+        model=sherpa_onnx.OfflineTtsModelConfig(
+            vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                model=str(d / "model.onnx"), tokens=str(d / "tokens.txt"),
+                data_dir=str(d / "espeak-ng-data")),
+            num_threads=2, provider="cpu"))
+    return sherpa_onnx.OfflineTts(config)
 
 
-def speak(text, voice, words_per_minute, workdir):
-    """Speak and process one phrase; returns raw mono samples at RATE."""
-    spoken = Path(workdir) / "say.wav"
-    subprocess.run(
-        ["say", "-v", voice, "-r", str(words_per_minute), "-o", str(spoken),
-         f"--data-format=LEI16@{RATE}", text],
-        check=True)
-    out = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(spoken), "-af", FILTERS,
-         "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-acodec", "pcm_s16le", "-"],
-        check=True, stdout=subprocess.PIPE).stdout
-    samples = array.array("h")
-    samples.frombytes(out)
-    if sys.byteorder != "little":
-        samples.byteswap()
-    return samples
+def speak(text, tts, speed):
+    """Speak one phrase; returns raw 16-bit mono samples at RATE."""
+    audio = tts.generate(text, sid=0, speed=speed)
+    if audio.sample_rate != RATE:
+        raise RuntimeError(f"voice speaks at {audio.sample_rate} Hz, clips need {RATE}")
+    return array.array("h", (int(round(max(-1.0, min(1.0, s)) * 32767)) for s in audio.samples))
 
 
 def finish(samples):
@@ -187,28 +175,27 @@ def clip_seconds(path):
     return float(out.stdout.strip())
 
 
-def render(label, voice, workdir):
+def render(label, tts):
     """One label's finished clip, speeding the voice up if it would run too long."""
-    wpm = SAY_RATE
+    speed = SPEED
     while True:
-        samples = finish(speak(phrase(label), voice, wpm, workdir))
-        if len(samples) / RATE <= MAX_SECONDS or wpm >= 280:
+        samples = finish(speak(phrase(label), tts, round(speed, 2)))
+        if len(samples) / RATE <= MAX_SECONDS or speed >= MAX_SPEED - 1e-9:
             return samples
-        wpm += 20
+        speed += SPEED_STEP
 
 
-def generate(out_dir, voice=VOICE):
+def generate(out_dir, voice_dir=VOICE_DIR):
     """Write a name clip for every vocabulary label into out_dir; returns their paths."""
-    for tool in ("say", "ffmpeg"):
-        if shutil.which(tool) is None:
-            raise SystemExit(f"{tool} not found; this script needs macOS `say` and ffmpeg")
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg not found; this script needs ffmpeg with libopus")
     out_dir.mkdir(parents=True, exist_ok=True)
+    tts = load_voice(voice_dir)
     paths = []
-    with tempfile.TemporaryDirectory(prefix="explore_voice_") as workdir:
-        for label in VOCABULARY:
-            path = out_dir / clip_name(label)
-            write_clip(path, render(label, voice, workdir))
-            paths.append(path)
+    for label in VOCABULARY:
+        path = out_dir / clip_name(label)
+        write_clip(path, render(label, tts))
+        paths.append(path)
     return paths
 
 
@@ -216,12 +203,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("out", nargs="?", type=Path,
                         default=Path(__file__).resolve().parents[1] / "mode-explore" / "assets")
-    parser.add_argument("--voice", default=os.environ.get("EXPLORE_VOICE", VOICE),
-                        help=f"built-in macOS voice (default {VOICE})")
+    parser.add_argument("--voice-dir", type=Path, default=VOICE_DIR,
+                        help="sherpa-onnx Piper voice (default launcher/assets/voice/)")
     args = parser.parse_args()
     for stale in args.out.glob("name-*.wav"):  # the earlier WAV clips
         stale.unlink()
-    for path in generate(args.out, args.voice):
+    for path in generate(args.out, args.voice_dir):
         print(f"wrote {path.name} ({clip_seconds(path) or 0:.2f}s, {path.stat().st_size} bytes)")
 
 
