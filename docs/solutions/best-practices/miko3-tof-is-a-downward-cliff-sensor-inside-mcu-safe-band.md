@@ -1,6 +1,7 @@
 ---
 title: "The Miko 3 front ToF is a downward cliff sensor gated by the MCU's own safe band, not a forward rangefinder"
 date: 2026-09-22
+last_updated: 2026-09-25
 category: best-practices
 module: "Miko 3 front ToF/edge sensor (shared DirectMotorDriver + SensorReply, mode-explore HazardClassifier)"
 problem_type: best_practice
@@ -18,11 +19,14 @@ tags:
   - "nose-bob"
   - "explore-mode"
   - "hazard-classification"
+  - "carpet"
+  - "surface-change"
 applies_when:
   - "Tuning explore mode's hazard thresholds or cornered cap, or reading its startle logs"
   - "Writing another autonomous mode that drives forward on the ToF/TOFIR readings"
   - "The robot stops well short of a desk edge, or startles on an open desk"
   - "A reply reads TOFIR=16383 and you need to decide between edge, lifted, and dead sensor"
+  - "The robot moved to a new surface (desk to floor, or a different carpet) and now spins or startles in open space"
 ---
 
 # The Miko 3 front ToF is a downward cliff sensor gated by the MCU's own safe band, not a forward rangefinder
@@ -49,7 +53,18 @@ The mode was designed as if the ToF were a forward rangefinder with an independe
 - `python3 scripts/qa-explore-mode.py --only calibrate` captures clear, hand, and edge readings. `suggest_calibration()` then puts `obstacleTofBelow` 30% of the way from the clear cluster toward the hand cluster, and it prefers an IR flag that separates edge from clear over a ToF threshold (`scripts/qa-explore-mode.py:72-111`). It writes `explore-calibration.properties` to the app's files dir (`:31`). The mode will not drive without a complete calibration (`HazardClassifier.java:57-61`).
 - `adb shell setprop log.tag.MikoDmdRaw DEBUG` makes `DirectMotorDriver` log every raw reply, tagged with the frame that was sent (`DirectMotorDriver.java:263-290, 308-310`). `python3 scripts/qa-explore-sensors.py` switches this on and off for you and parses the lines (`scripts/qa-explore-sensors.py:25-27, 104, 125`). Look at `TOFIR=` and `CPL=` in the `sent=POWER` lines while the robot hops.
 
-**7. Available option, not adopted: a settle filter.** One way to cut bounce startles: stop at once on a hazard, wait about 300 ms still, and startle only if the hazard is still there. This was prototyped during the session, and the owner **declined** it. They accepted the edge margin and the occasional bounce startle as they are, so the current tree does not include it. If bounce startles become a problem later, this is the known lever. Keep the immediate stop and delay only the startle and cornered-count reaction, because the MCU refusal must still take effect at once.
+**7. Recalibrate whenever the surface changes, and take the "clear" numbers while he drives, not while he stands still.** The thresholds belong to one surface. On 2026-09-25 the robot moved from the desk to office carpet with the desk calibration still loaded (`obstacleTofBelow=157`). He then spun full circles in open carpet logging "no clear way" and rested as cornered. The escape turn only ends when the floor reads clear for `escapeClearMs`, and it never did. Carpet reads differently from the desk, and differently again in motion:
+- standing still: about 175 (169-185);
+- driving: 200-220, because the nose pitches up;
+- starts, stops and turns: dips to 146-170, the nose bob again.
+
+`--only calibrate` captures "clear" with the robot standing still, so on carpet it suggested 157 again, which sits inside the motion dips. The fix was to record raw replies with `MikoDmdRaw` for 30 s of roaming on open carpet, look at the tof histogram, and set `obstacleTofBelow=135`, below every in-motion dip. It was set by editing `explore-calibration.properties` in the app's files dir on the robot, keeping the gyro keys already in it.
+
+Two related facts from the same session:
+- Standing on carpet at about 175 sits just above the MCU's band floor (about 170). The MCU's own refusal (`CPL=2`) therefore still fired about 3 times in 6 minutes of roaming. It is firmware; app thresholds cannot remove it, and it must not be overridden (point 3).
+- The ToF does not see a cabinet or wall the robot is pressed against: with his face on a cabinet it read about 175, plain floor. Walls and furniture are for the camera and wheel-stall detection, not this sensor.
+
+**8. Available option, not adopted: a settle filter.** One way to cut bounce startles: stop at once on a hazard, wait about 300 ms still, and startle only if the hazard is still there. This was prototyped during the session, and the owner **declined** it. They accepted the edge margin and the occasional bounce startle as they are, so the current tree does not include it. If bounce startles become a problem later, this is the known lever. Keep the immediate stop and delay only the startle and cornered-count reaction, because the MCU refusal must still take effect at once.
 
 ## Why This Matters
 
@@ -82,6 +97,16 @@ The existing hardware note (`docs/hardware/tof-sensor.md`) was written before ca
 | Front held past the desk edge | 16383 | absent | 1 |
 
 `suggest_calibration()` result: `obstacleTofBelow=157` (203 − 0.3 × (203 − 50) ≈ 157), `edgeIr>0` via `ir2`, `edgeTofAbove=-1` (off).
+
+**Office carpet, desk calibration still loaded (device captures 2026-09-25, `MikoDmdRaw`):**
+
+| Situation | tof |
+|---|---|
+| Standing on open carpet | 169-185 (mostly ~175) |
+| Roaming on open carpet, 30 s, 241 readings | median 208, 5th percentile 153, min 146 |
+| Pressed against a cabinet (face on it) | ~175, same as floor |
+
+Histogram of the roaming capture: 140s: 4, 150s: 12, 160s: 5, 170s: 4, 180s: 15, 190s: 14, 200s: 93, 210s: 90, 220s: 4. With `obstacleTofBelow=157` the 140-160 dips read as obstacles; `135` cleared them, and the stops the owner checked afterwards were all real obstacles.
 
 **Hop trace: the nose bob carries tof past the MCU band (device captures 2026-09-22):**
 
