@@ -42,7 +42,11 @@ interface CuriosityPort {
 
     // ---- people (U5): match, then greet, or ask the name, listen and remember ----
 
-    /** Compare the person in this frame's box with the stored faces (KTD3). Never carries names. */
+    /**
+     * Compare the face in this frame's person box with the stored faces (KTD3).
+     * Never carries names. When no face is found in the box, nothing is sent
+     * for matching: the answer is a faceless NEW person (text-only lines).
+     */
     void match(byte[] frameJpeg, Detection personBox, long timeoutMs);
 
     /** The answer to the last match(), or null while it is running. */
@@ -53,6 +57,13 @@ interface CuriosityPort {
 
     /** What listen() heard, or null while it is listening. */
     Heard heard();
+
+    /** A faceless new person replied: ask for a text-only "nice to meet you" line that never
+     * promises to remember them. Stores nothing (R12). */
+    void welcome(String name, long timeoutMs);
+
+    /** The line to say after welcome(), or null while it is running. */
+    Answer welcomed();
 
     /** Store the face from the last match() with this name (null: unnamed) and ask for the
      * "I'll remember you" line (R11, R12). */
@@ -114,6 +125,13 @@ interface CuriosityPort {
         }
 
         public void remember(String name, long timeoutMs) {
+        }
+
+        public void welcome(String name, long timeoutMs) {
+        }
+
+        public Answer welcomed() {
+            return Answer.failed();
         }
 
         public Answer remembered() {
@@ -264,6 +282,9 @@ interface CuriosityPort {
 
         static final MatchAnswer FAILED = new MatchAnswer(Status.FAILED, null, null, null, null, null);
 
+        /** NEW with no face found: asked their name, but never matched or stored (R12). */
+        final boolean faceless;
+
         final Status status;
         final String name;
         final String namedLine;
@@ -279,8 +300,19 @@ interface CuriosityPort {
             return new MatchAnswer(Status.NEW, null, null, null, askLine, noReplyLine);
         }
 
+        /** No face in the person box: a new person to talk to, with nothing to store. */
+        static MatchAnswer faceless(String askLine, String noReplyLine) {
+            return new MatchAnswer(Status.NEW, null, null, null, askLine, noReplyLine, true);
+        }
+
         MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
                     String noReplyLine) {
+            this(status, name, namedLine, unnamedLine, askLine, noReplyLine, false);
+        }
+
+        MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
+                    String noReplyLine, boolean faceless) {
+            this.faceless = faceless;
             this.status = status;
             this.name = name;
             this.namedLine = namedLine;

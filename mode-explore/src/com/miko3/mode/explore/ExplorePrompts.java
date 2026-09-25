@@ -147,6 +147,21 @@ final class ExplorePrompts {
 
     static final Map<String, Object> REMEMBER_SCHEMA = object("line", type("string"));
 
+    /**
+     * Text only: the line for someone new who replied but whose face he couldn't
+     * see well enough to keep. Nothing is stored, so it must not promise to remember them.
+     */
+    static String welcomeAsk(String nameOrNull) {
+        return "Miko has just met someone new. "
+                + (nameOrNull == null
+                ? "They answered him but he didn't catch a name. "
+                : "They told him their name is " + nameOrNull + ". ")
+                + "Write the line he says next: a warm, excited \"nice to meet you\""
+                + (nameOrNull == null ? "" : " that uses their name")
+                + ". He could not get a good look at their face, so he will NOT remember them: do not say or"
+                + " imply that he will remember or recognise them later.";
+    }
+
     // ---- schema building ----
 
     private static String kindWord(CuriosityPort.Kind k) {

@@ -154,6 +154,8 @@ public final class ExploreBrainHarness {
         };
         boolean nameAsksClaude;
         CuriosityPort.Answer remembered = CuriosityPort.Answer.line("Nice to meet you! I'll remember you!");
+        /** The faceless hello's line (no promise to remember). */
+        CuriosityPort.Answer welcomed = CuriosityPort.Answer.line("So nice to meet you!");
     }
 
     static final class Rig implements ExploreBrain.Clock, ExploreBrain.Motor, ExploreBrain.Eyes, ExploreBrain.Sound,
@@ -219,6 +221,8 @@ public final class ExploreBrainHarness {
         long pendingNameAt;
         CuriosityPort.Answer pendingRemembered;
         long pendingRememberedAt;
+        CuriosityPort.Answer pendingWelcomed;
+        long pendingWelcomedAt;
         /** Every brain state seen, and every state seen with the camera open. */
         final java.util.Set<ExploreBrain.State> statesSeen = new java.util.TreeSet<ExploreBrain.State>();
         final java.util.Set<ExploreBrain.State> openStates = new java.util.TreeSet<ExploreBrain.State>();
@@ -551,6 +555,23 @@ public final class ExploreBrainHarness {
             CuriosityPort.Answer a = pendingRemembered;
             pendingRemembered = null;
             log.add(new Event(now, "remembered " + a.status));
+            return a;
+        }
+
+        // No @Override: these compile against the port with or without welcome().
+        public void welcome(String name, long timeoutMs) {
+            pendingWelcomed = people.welcomed;
+            pendingWelcomedAt = now + claudeDelayMs;
+            log.add(new Event(now, "welcome " + (name == null ? "(unnamed)" : name)));
+        }
+
+        public CuriosityPort.Answer welcomed() {
+            if (pendingWelcomed == null || now < pendingWelcomedAt) {
+                return null;
+            }
+            CuriosityPort.Answer a = pendingWelcomed;
+            pendingWelcomed = null;
+            log.add(new Event(now, "welcomed " + a.status));
             return a;
         }
 
@@ -1837,7 +1858,8 @@ public final class ExploreBrainHarness {
     /** A curiosity stop, from SCAN until he is back to wandering. */
     private static boolean isStop(ExploreBrain.State s) {
         switch (s) {
-            case SCAN: case FACE: case APPROACH: case INSPECT: case REACT_HERE: case ASK: case ORIENT: case MEET:
+            case SCAN: case FACE: case APPROACH: case INSPECT: case REACT_HERE: case ASK: case ORIENT: case MEET_LOOK:
+            case MEET:
             case SPEAK: case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP:
                 return true;
             default:
@@ -2424,12 +2446,93 @@ public final class ExploreBrainHarness {
                     eyes = rig.log.get(i).what;
                 }
             }
+            // MEET_LOOK opens it for one fresh look at the person before the match (the face crop).
             java.util.Set<ExploreBrain.State> allowed = java.util.EnumSet.of(
-                    ExploreBrain.State.SCAN, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH);
+                    ExploreBrain.State.SCAN, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH,
+                    ExploreBrain.State.MEET_LOOK);
             check(n, eyes.equals("eyes THINKING") && allowed.containsAll(rig.openStates)
                             && rig.countPrefix("camera open", rig.timeOf(match), rig.timeOf(match) + 8000) == 0
                             && rig.violations.isEmpty(),
                     "open in " + rig.openStates + " " + rig.tail());
+        });
+        // ---- the face crop (owner report: a stored face showed the wall) ----
+        scenario("meet_face_is_cut_from_a_fresh_look_after_turning_with_the_detectors_box", n -> {
+            // Claude picks someone off to the right in the first scan frame, which the
+            // detector missed; ORIENT turns toward them, and only then is the face cut,
+            // from a new look and the detector's own person box in it.
+            Vision afterTurn = (r, t) -> lookAt(r, t) >= 3 ? list(box("person", 0.9f, 0.5f, 0.55f, 0.3f, 0.8f))
+                    : list();
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, afterTurn, true,
+                    (r, req, k) -> pick(0, "woman in a red top", CuriosityPort.Kind.PERSON, "LOOK-LINE",
+                            0.8f, 0.5f, 0.25f, 0.7f));
+            rig.people.match = (r, k) -> STRANGER;
+            rig.started();
+            rig.runUntil(16000);
+            int match = rig.first("match", 0);
+            long lastTurn = -1;
+            for (int i = 0; i < match && i >= 0; i++) {
+                if (rig.log.get(i).what.startsWith("turn")) {
+                    lastTurn = rig.log.get(i).t;
+                }
+            }
+            String meet = rig.meets.isEmpty() ? "" : rig.meets.get(0);
+            long shot = meet.startsWith("jpeg@") ? Long.parseLong(meet.substring(5, meet.indexOf(' '))) : -1;
+            check(n, match >= 0 && meet.endsWith(" person") && lastTurn > 0 && shot > lastTurn
+                            && rig.violations.isEmpty(),
+                    "meet=" + meet + " lastTurn=" + lastTurn + " " + rig.tail());
+        });
+        scenario("meet_without_a_person_box_in_the_fresh_look_uses_claudes_box_in_its_own_frame", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.started();
+            rig.runUntil(12000);
+            int answer = rig.first("answer PICK", 0);
+            int open = rig.first("camera open", answer);
+            int match = rig.first("match", answer);
+            // Frame 3 of the scan was captured at 3800: Claude's box is in that frame's coordinates.
+            check(n, open > answer && match > open && rig.meets.size() == 1
+                            && rig.meets.get(0).equals("jpeg@3800 person") && rig.violations.isEmpty(),
+                    "meets=" + rig.meets + " " + rig.tail());
+        });
+        scenario("meet_the_person_box_is_the_one_matching_the_pick", n -> {
+            // Claude's pick at the right edge; ORIENT's turn puts it in the middle.
+            Detection expect = ExploreBrain.recentred(new Detection("woman", 1f, 0.7f, 0.2f, 0.9f, 0.9f), true);
+            Detection them = box("person", 0.9f, 0.52f, 0.55f, 0.22f, 0.7f);
+            Detection p = ExploreBrain.personIn(list(box("person", 0.9f, 0.12f, 0.5f, 0.2f, 0.7f), them,
+                    box("chair", 0.9f, 0.5f, 0.5f, 0.3f, 0.7f)), expect, 0.3f);
+            Detection none = ExploreBrain.personIn(list(box("person", 0.9f, 0.1f, 0.5f, 0.15f, 0.7f)), expect, 0.3f);
+            Detection same = ExploreBrain.recentred(expect, false);
+            check(n, p == them && none == null && same == expect && Math.abs(expect.x0 - 0.4f) < 1e-6,
+                    p + " " + none + " " + expect);
+        });
+        scenario("meet_faceless_new_person_is_asked_but_never_stored_or_promised", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless("Hello! What's your name?",
+                    "No worries, shy friend!");
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Sam");
+            rig.people.welcomed = CuriosityPort.Answer.line("So nice to meet you, Sam!");
+            rig.started();
+            rig.runUntil(16000);
+            int ask = rig.first("say Hello! What's your name?", 0);
+            int welcome = rig.first("welcome Sam", ask);
+            int say = rig.first("say So nice to meet you, Sam!", welcome);
+            check(n, ask >= 0 && welcome > ask && say > welcome && rig.stored.isEmpty()
+                            && rig.countPrefix("remember", 0, 16001) == 0
+                            && resumedBy(rig, rig.timeOf(say), rig.timeOf(say) + 1500) && rig.violations.isEmpty(),
+                    "stored=" + rig.stored + " " + rig.tail());
+        });
+        scenario("meet_faceless_without_a_hello_line_says_the_friendly_line", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless("Hello! What's your name?",
+                    "No worries, shy friend!");
+            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            rig.people.welcomed = CuriosityPort.Answer.failed();
+            rig.started();
+            rig.runUntil(16000);
+            int welcome = rig.first("welcome Sam", 0);
+            int say = rig.first("say No worries, shy friend!", welcome);
+            check(n, welcome >= 0 && say > welcome && rig.stored.isEmpty() && rig.violations.isEmpty(),
+                    "stored=" + rig.stored + " " + rig.tail());
         });
     }
 
@@ -2443,10 +2546,66 @@ public final class ExploreBrainHarness {
             check(n, sq[2] == 160 && sq[0] == 240 && sq[1] == 130 && edge[0] == 0 && edge[1] == 0 && edge[2] == 160,
                     java.util.Arrays.toString(sq) + " " + java.util.Arrays.toString(edge));
         });
-        scenario("face_crop_without_a_face_uses_the_top_quarter_of_the_person", n -> {
-            // A person box from (0.25, 0.1) to (0.75, 0.9): 384 px tall, so a 96 px square at its top centre.
-            int[] sq = FaceCrop.Square.topOfPerson(new Detection("person", 1f, 0.25f, 0.1f, 0.75f, 0.9f), 640, 480);
-            check(n, sq[2] == 96 && sq[0] == 272 && sq[1] == 48, java.util.Arrays.toString(sq));
+        scenario("face_crop_has_no_top_of_person_fallback", n -> {
+            // Owner report: a stored face showed the wall. The top quarter of a loose or
+            // small person box is not a face, and nothing without a detected face is stored.
+            java.util.List<String> names = new java.util.ArrayList<String>();
+            for (java.lang.reflect.Method m : FaceCrop.Square.class.getDeclaredMethods()) {
+                names.add(m.getName());
+            }
+            boolean noTopShare = true;
+            for (java.lang.reflect.Field f : FaceCrop.class.getDeclaredFields()) {
+                noTopShare &= !f.getName().equals("TOP_SHARE");
+            }
+            check(n, !names.contains("topOfPerson") && noTopShare, names.toString());
+        });
+        scenario("face_crop_square_shrinks_and_stays_inside_a_small_frame", n -> {
+            // Eyes 100 px apart want a 400 px square; a 120x90 frame holds at most 90, pushed inside.
+            int[] sq = FaceCrop.Square.aroundFace(110f, 80f, 100f, 120, 90);
+            check(n, sq[2] == 90 && sq[0] == 30 && sq[1] == 0, java.util.Arrays.toString(sq));
+        });
+        scenario("face_crop_region_is_the_person_box_in_pixels_clamped_with_an_even_width", n -> {
+            // A live box, [0.66,0.58,0.88,0.79] of 640x480: x 422..564 (142 wide), y 278..380.
+            int[] r = FaceCrop.Square.region(new Detection("person", 1f, 0.66f, 0.58f, 0.88f, 0.79f), 640, 480);
+            // Odd widths drop a pixel; the right edge stays inside the frame.
+            int[] edge = FaceCrop.Square.region(new Detection("person", 1f, 0.9f, 0.1f, 1.2f, 0.9f), 641, 480);
+            int[] tiny = FaceCrop.Square.region(new Detection("person", 1f, 0.9f, 0.0f, 1.0f, 0.02f), 640, 480);
+            check(n, r != null && r[0] == 422 && r[1] == 278 && r[2] == 142 && r[3] == 102
+                            && edge != null && edge[0] + edge[2] <= 641 && edge[2] % 2 == 0 && tiny == null,
+                    java.util.Arrays.toString(r) + " " + java.util.Arrays.toString(edge) + " "
+                            + java.util.Arrays.toString(tiny));
+        });
+        scenario("face_crop_scales_small_regions_up_before_detection", n -> {
+            check(n, Math.abs(FaceCrop.Square.detectScale(160) - 2f) < 1e-6
+                            && FaceCrop.Square.detectScale(400) == 1f && FaceCrop.Square.detectScale(40) == 4f
+                            && FaceCrop.Square.evenScaled(141, 2.25f) == 316,
+                    FaceCrop.Square.detectScale(160) + " " + FaceCrop.Square.evenScaled(141, 2.25f));
+        });
+        scenario("face_crop_reads_pixel_and_normalized_boxes_alike", n -> {
+            float[] px = FaceCrop.Square.fractions(new double[] {422, 278, 563, 379}, 640, 480);
+            float[] norm = FaceCrop.Square.fractions(new double[] {0.66, 0.58, 0.88, 0.79}, 640, 480);
+            float[] whole = FaceCrop.Square.fractions(new double[] {0, 0, 640, 480}, 640, 480);
+            float[] bad = FaceCrop.Square.fractions(new double[] {0, Double.NaN, 1, 1}, 640, 480);
+            boolean same = true;
+            for (int i = 0; i < 4; i++) {
+                same &= Math.abs(px[i] - norm[i]) < 0.005f;
+            }
+            check(n, same && Math.abs(norm[0] - 0.66f) < 1e-6 && whole[2] == 1f && whole[3] == 1f && bad == null,
+                    java.util.Arrays.toString(px) + " " + java.util.Arrays.toString(norm));
+        });
+        scenario("replies_look_accepts_a_normalized_box", n -> {
+            // Divided by 640x480 again, [0.66,...] would become a sub-pixel box in the top-left corner.
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("interesting", Boolean.TRUE);
+            json.put("frame", 1L);
+            json.put("box", java.util.Arrays.<Object>asList(0.66, 0.58, 0.88, 0.79));
+            json.put("kind", "person");
+            json.put("label", "person");
+            json.put("line", "Hi there!");
+            CuriosityPort.Answer a = ClaudeReplies.look(json, new int[] {640}, new int[] {480});
+            check(n, a.status == CuriosityPort.Answer.Status.PICK && Math.abs(a.box.x0 - 0.66f) < 1e-4
+                            && Math.abs(a.box.y1 - 0.79f) < 1e-4,
+                    a + " " + a.box);
         });
         scenario("replies_look_reads_the_frame_box_kind_and_line", n -> {
             java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();

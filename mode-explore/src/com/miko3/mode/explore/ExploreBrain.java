@@ -51,8 +51,13 @@ import java.util.Set;
  *              each tick; askAttempts tries of askTimeoutMs, then the fallback
  *   ORIENT     turn to the picked frame's scan heading plus the box's offset
  *              (or, on the fallback, back to the look that held the detector's pick)
+ *   MEET_LOOK  a person pick, facing them and stopped: thinking eyes while the
+ *              camera takes a FRESH look; the face is cropped from the detector's
+ *              person box in it that matches the pick (by IoU, from where the turn
+ *              should have put the pick), else from Claude's box in the picked
+ *              scan frame (no person box, or no look in time)
  *   MEET       a person pick (U5, KTD3): thinking eyes; the match request with
- *              the face from the picked frame, one try of meetTimeoutMs; on a
+ *              that face, one try of meetTimeoutMs; on a
  *              failure or refusal, one text-only request for the two lines
  *              a stranger needs
  *   SPEAK      Claude's line through the port; waits for its finished flag,
@@ -233,12 +238,13 @@ final class ExploreBrain {
     enum State {
         EYES_ONLY, PAUSE, LOOK, TURN, HOP, STARTLE, BACK_OFF, CORNERED, STOPPED,
         SCAN, FACE, APPROACH, INSPECT, REACT_HERE,
-        ASK, ORIENT, MEET, SPEAK,
+        ASK, ORIENT, MEET_LOOK, MEET, SPEAK,
         ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP;
 
         /** The camera is open in exactly these (R2, AE6). */
         boolean curious() {
-            return this == SCAN || this == FACE || this == APPROACH || this == INSPECT || this == REACT_HERE;
+            return this == SCAN || this == FACE || this == APPROACH || this == INSPECT || this == REACT_HERE
+                    || this == MEET_LOOK;
         }
 
         /** Part of a curiosity stop, from the scan until he is back to wandering. */
@@ -324,6 +330,8 @@ final class ExploreBrain {
     private Direction scanDir;
     /** What he is investigating: the latest box for it, and its name. */
     private Detection target;
+    /** MEET_LOOK: where the picked person should be in the fresh look. */
+    private Detection meetExpect;
     private int faceTurns;
     private int legs;
     private long legStartedAt;
@@ -357,6 +365,8 @@ final class ExploreBrain {
     /** A line waiting for the camera and detector to go quiet, and how long it waits at most. */
     private String pendingLine;
     private long quietUntil;
+    /** Whether ORIENT added the pick's offset, so the pick should now sit at the frame's centre. */
+    private boolean pickRecentred;
     /** When Claude's pick arrived, and a pick whose turn or approach a hazard cut short (said after the escape). */
     private long pickAt;
     private CuriosityPort.Answer heldPick;
@@ -622,6 +632,9 @@ final class ExploreBrain {
             // Standing still, like INSPECT: a hazard ahead matters only once he moves again.
             case ASK:
                 askStep(now);
+                break;
+            case MEET_LOOK:
+                meetLookStep(now);
                 break;
             case MEET:
                 meetStep(now);
@@ -1197,6 +1210,7 @@ final class ExploreBrain {
     private void clearStop() {
         cancelAsk();
         target = null;
+        meetExpect = null;
         pick = null;
         stranger = null;
         pendingLine = null;
@@ -1326,6 +1340,7 @@ final class ExploreBrain {
         float cx = a.box.centerX();
         long offset = Math.abs(cx) > tuning.centreTolerance
                 ? (cx < 0 ? -1 : 1) * Math.max(100, (long) (Math.abs(cx) * tuning.turnMsPerUnit)) : 0;
+        pickRecentred = offset != 0;
         Detection agree = detectorAgrees(scanned.get(look).detections, a);
         if (agree != null) {
             note("the detector sees it too, as a " + agree.label + ": approaching");
@@ -1533,7 +1548,7 @@ final class ExploreBrain {
 
     private void speakPick(long now) {
         if (pick.kind == CuriosityPort.Kind.PERSON) {
-            enterMeet(now);
+            enterMeetLook(now);
             return;
         }
         speak(now, pick.line);
@@ -1541,8 +1556,83 @@ final class ExploreBrain {
 
     // ---- meeting a person (explore on Claude U5; R9-R14, KTD3, KTD4) ----
 
-    /** MEET: thinking eyes while Claude compares the face in the picked frame with the stored ones. */
-    private void enterMeet(long now) {
+    /**
+     * MEET_LOOK: turned toward the person and stopped. The scan frame is from
+     * before every turn and leg since, so the face comes from a fresh look
+     * taken now (settled, the camera reopened if it had closed).
+     */
+    private void enterMeetLook(long now) {
+        stopMotors();
+        state = State.MEET_LOOK;
+        show(EyeState.THINKING, null);
+        // The detector's own box for it (tracked through FACE and APPROACH), else
+        // Claude's box moved to where ORIENT's turn should have put it.
+        meetExpect = target != null ? target : recentred(pick.box, pickRecentred);
+        firstLook = !cameraOpen;
+        waitForLook(now);
+        note("a person: taking a fresh look at them");
+    }
+
+    private void meetLookStep(long now) {
+        Look look = camera.latest();
+        if (look != null && look.frameMs >= lookAfter && look.jpeg != null) {
+            Detection box = personIn(look.detections, meetExpect, tuning.pickMatchIou);
+            if (box != null) {
+                note("the detector boxes the person in the fresh look");
+                enterMeet(now, look.jpeg, box);
+                return;
+            }
+            note("no person box in the fresh look; using Claude's box in the picked frame");
+        } else if (now < lookDeadline) {
+            return;
+        } else {
+            note("no fresh look in time; using Claude's box in the picked frame");
+        }
+        enterMeet(now, askedFrames.get(pick.frame).jpeg, pick.box);
+    }
+
+    /** Where the pick should be after ORIENT: its box shifted to the frame's centre when the turn included its offset. */
+    static Detection recentred(Detection box, boolean recentred) {
+        if (!recentred) {
+            return box;
+        }
+        float dx = 0.5f - (box.x0 + box.x1) / 2f;
+        return new Detection(box.label, box.score, box.x0 + dx, box.y0, box.x1 + dx, box.y1);
+    }
+
+    /**
+     * The detector's person box in a fresh look that is the picked person: the
+     * best IoU with where they should be, at least minIou; else the largest
+     * person box holding that spot's centre; else null.
+     */
+    static Detection personIn(List<Detection> found, Detection expect, float minIou) {
+        if (found == null || expect == null) {
+            return null;
+        }
+        Detection best = null;
+        float bestIou = 0f;
+        Detection holding = null;
+        float cx = (expect.x0 + expect.x1) / 2f;
+        float cy = (expect.y0 + expect.y1) / 2f;
+        for (Detection d : found) {
+            if (CuriosityPort.Kind.of(d.label) != CuriosityPort.Kind.PERSON) {
+                continue;
+            }
+            float iou = d.iou(expect);
+            if (iou >= minIou && iou > bestIou) {
+                best = d;
+                bestIou = iou;
+            }
+            if (cx >= d.x0 && cx <= d.x1 && cy >= d.y0 && cy <= d.y1
+                    && (holding == null || d.area() > holding.area())) {
+                holding = d;
+            }
+        }
+        return best != null ? best : holding;
+    }
+
+    /** MEET: thinking eyes while Claude compares the face in this frame's person box with the stored ones. */
+    private void enterMeet(long now, byte[] frameJpeg, Detection personBox) {
         stopMotors();
         state = State.MEET;
         stranger = null;
@@ -1550,7 +1640,7 @@ final class ExploreBrain {
         show(EyeState.THINKING, null);
         meetDeadline = now + tuning.meetTimeoutMs;
         note("a person: checking whether we've met");
-        port.match(askedFrames.get(pick.frame).jpeg, pick.box, tuning.meetTimeoutMs);
+        port.match(frameJpeg, personBox, tuning.meetTimeoutMs);
     }
 
     private void meetStep(long now) {
@@ -1640,26 +1730,43 @@ final class ExploreBrain {
         }
     }
 
-    /** NAME: a reply was heard, so the face is kept either way, named or not (R12). */
+    /**
+     * NAME: a reply was heard, so the face is kept either way, named or not (R12)
+     * -- unless no face was found, when nothing is stored and the line he says
+     * next makes no promise to remember them.
+     */
     private void nameStep(long now) {
         CuriosityPort.Named n = port.foundName();
         if (n == null && now < meetDeadline) {
             return;
         }
         String name = n != null && n.status == CuriosityPort.Named.Status.NAME ? n.name : null;
-        note(name != null ? "got a name; remembering them" : "no clear name; remembering them unnamed");
         state = State.REMEMBER;
         meetDeadline = now + tuning.meetTimeoutMs;
+        if (faceless()) {
+            note("no face to remember them by; just saying hello");
+            port.welcome(name, tuning.meetTimeoutMs);
+            return;
+        }
+        note(name != null ? "got a name; remembering them" : "no clear name; remembering them unnamed");
         port.remember(name, tuning.meetTimeoutMs);
     }
 
+    private boolean faceless() {
+        return stranger != null && stranger.faceless;
+    }
+
     private void rememberStep(long now) {
-        CuriosityPort.Answer a = port.remembered();
+        boolean faceless = faceless();
+        CuriosityPort.Answer a = faceless ? port.welcomed() : port.remembered();
         if (a == null && now < meetDeadline) {
             return;
         }
         if (a != null && a.status == CuriosityPort.Answer.Status.PICK && usable(a.line)) {
             speak(now, a.line);
+        } else if (faceless && usable(stranger.noReplyLine)) {
+            note("no hello line; saying the friendly line instead");
+            speak(now, stranger.noReplyLine);
         } else {
             note("no remember line; carrying on");
             finishPick(now);

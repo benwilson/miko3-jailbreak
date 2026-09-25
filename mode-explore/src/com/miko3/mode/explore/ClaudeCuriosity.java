@@ -14,6 +14,8 @@ import com.miko3.shared.RobotPeopleClient;
 import com.miko3.shared.RobotSettingsClient;
 import com.miko3.shared.RobotSpeechClient;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -46,6 +48,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 final class ClaudeCuriosity implements CuriosityPort {
     private static final String TAG = "ExploreClaude";
+    /**
+     * The owner's face-crop check: with log.tag.MikoExploreFaceDebug=DEBUG, the
+     * last crop and its source frame go to this app's private files directory
+     * (last-face.jpg, last-face-src.jpg), overwritten each time. Never shared
+     * storage, never image data in the log.
+     */
+    static final String FACE_DEBUG_TAG = "MikoExploreFaceDebug";
+    static final String LAST_FACE = "last-face.jpg";
+    static final String LAST_FACE_SRC = "last-face-src.jpg";
     /** Assumed when a frame's size can't be read: the camera's own (ExploreCamera). */
     private static final int FRAME_W = 640;
     private static final int FRAME_H = 480;
@@ -74,6 +85,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Heard> hearings = new Slot<Heard>();
     private final Slot<Named> names = new Slot<Named>();
     private final Slot<Answer> remembers = new Slot<Answer>();
+    private final Slot<Answer> welcomes = new Slot<Answer>();
 
     /** The face cut out by the last match(), for remember(); and the id it matched, for touch(). */
     private volatile byte[] meetFace;
@@ -240,11 +252,21 @@ final class ClaudeCuriosity implements CuriosityPort {
     /** The person request: the new face and up to MAX_RECENT stored ones, labelled by number only. */
     private MatchAnswer person(int g, byte[] frameJpeg, Detection personBox, long timeoutMs) {
         long t0 = System.currentTimeMillis();
-        byte[] face = cropper.crop(frameJpeg, personBox);
-        if (face == null) {
-            Log.w(TAG, "person request: no face crop");
-            return MatchAnswer.FAILED;
+        FaceCrop.Result crop = cropper.crop(frameJpeg, personBox);
+        debugFace(frameJpeg, personBox, crop);
+        if (!crop.found()) {
+            // No face in the person box: nothing to match or store (R12). A new person
+            // to talk to, with the text-only lines; the brain promises nothing.
+            Log.i(TAG, "person request: no face found in the person box; asking as a new person, storing nothing");
+            ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM,
+                    textOnly(ExplorePrompts.LINES_ASK), ExplorePrompts.LINES_SCHEMA, (int) timeoutMs);
+            MatchAnswer lines = r.ok() ? ClaudeReplies.lines(r.json) : MatchAnswer.FAILED;
+            Log.i(TAG, "faceless lines request: " + (r.ok() ? lines.status.toString() : r.describe()) + " in "
+                    + (System.currentTimeMillis() - t0) + " ms");
+            return lines.status == MatchAnswer.Status.NEW
+                    ? MatchAnswer.faceless(lines.askLine, lines.noReplyLine) : MatchAnswer.FAILED;
         }
+        byte[] face = crop.face;
         RobotPeople.Face[] gallery;
         try {
             gallery = RobotPeopleClient.recent(app, RobotPeople.MAX_RECENT);
@@ -412,8 +434,9 @@ final class ClaudeCuriosity implements CuriosityPort {
     /** Store the face (a reply is the consent, R12), then ask for the "I'll remember you" line. */
     private Answer keep(byte[] face, String nameOrNull, long timeoutMs) {
         if (face == null) {
-            Log.w(TAG, "remember: no face from the match to store");
-            return Answer.failed();
+            // Nothing to store: never promise to remember them.
+            Log.w(TAG, "remember: no face from the match to store; a hello without the promise");
+            return hello(nameOrNull, timeoutMs);
         }
         String how = nameOrNull == null ? "unnamed" : "with a name";
         try {
@@ -438,6 +461,85 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public Answer remembered() {
         return remembers.poll();
+    }
+
+    @Override
+    public void welcome(final String nameOrNull, final long timeoutMs) {
+        final int g = welcomes.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                welcomes.finish(g, hello(nameOrNull, timeoutMs));
+            }
+        }, welcomes, g, Answer.failed());
+    }
+
+    @Override
+    public Answer welcomed() {
+        return welcomes.poll();
+    }
+
+    /** Text only: a "nice to meet you" that doesn't promise to remember them. Stores nothing. */
+    private Answer hello(String nameOrNull, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM,
+                textOnly(ExplorePrompts.welcomeAsk(nameOrNull)), ExplorePrompts.REMEMBER_SCHEMA, (int) timeoutMs);
+        Answer a = r.ok() ? ClaudeReplies.remembered(r.json) : Answer.failed();
+        Log.i(TAG, "hello request: " + (r.ok() ? a.status.toString() : r.describe()) + " in "
+                + (System.currentTimeMillis() - t0) + " ms");
+        return a;
+    }
+
+    private static List<Map<String, Object>> textOnly(String text) {
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        content.add(ClaudeApi.textBlock(text));
+        return content;
+    }
+
+    /**
+     * The owner's crop check (FACE_DEBUG_TAG): the source frame and the crop, in
+     * this app's private files directory, overwritten each time. No crop (no
+     * face found) deletes last-face.jpg, so a stale one is never mistaken for it.
+     */
+    private void debugFace(byte[] frameJpeg, Detection personBox, FaceCrop.Result crop) {
+        if (!Log.isLoggable(FACE_DEBUG_TAG, Log.DEBUG)) {
+            return;
+        }
+        File dir = app.getFilesDir();
+        write(new File(dir, LAST_FACE_SRC), frameJpeg);
+        File face = new File(dir, LAST_FACE);
+        if (crop.found()) {
+            write(face, crop.face);
+        } else if (face.exists() && !face.delete()) {
+            Log.w(FACE_DEBUG_TAG, "could not delete the previous " + LAST_FACE);
+        }
+        // Geometry only: never image data, and never the box's label (Claude's description of a person).
+        int[] square = crop.square;
+        Log.d(FACE_DEBUG_TAG, String.format(java.util.Locale.US, "person box [%.2f,%.2f,%.2f,%.2f]",
+                personBox.x0, personBox.y0, personBox.x1, personBox.y1) + (square != null
+                ? ": face at " + java.util.Arrays.toString(square) + " (left, top, side px)"
+                : ": no face found"));
+    }
+
+    private static void write(File f, byte[] bytes) {
+        if (bytes == null) {
+            return;
+        }
+        FileOutputStream out = null;
+        try {
+            out = new FileOutputStream(f);
+            out.write(bytes);
+        } catch (IOException e) {
+            Log.w(FACE_DEBUG_TAG, "could not write " + f.getName() + ": " + e.getMessage());
+        } finally {
+            if (out != null) {
+                try {
+                    out.close();
+                } catch (IOException ignored) {
+                    // Nothing more to do for a debug file.
+                }
+            }
+        }
     }
 
     // ---- plumbing ----

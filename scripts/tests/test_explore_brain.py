@@ -160,7 +160,18 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "meet_camera_stays_closed_and_eyes_think_while_matching",
         # FaceCrop geometry (KTD5) and Claude's replies (U6)
         "face_crop_expands_the_face_hit_1_6x",
-        "face_crop_without_a_face_uses_the_top_quarter_of_the_person",
+        "face_crop_has_no_top_of_person_fallback",
+        "face_crop_square_shrinks_and_stays_inside_a_small_frame",
+        "face_crop_region_is_the_person_box_in_pixels_clamped_with_an_even_width",
+        "face_crop_scales_small_regions_up_before_detection",
+        "face_crop_reads_pixel_and_normalized_boxes_alike",
+        "replies_look_accepts_a_normalized_box",
+        # The face crop from a fresh look (owner report: a stored face showed the wall)
+        "meet_face_is_cut_from_a_fresh_look_after_turning_with_the_detectors_box",
+        "meet_without_a_person_box_in_the_fresh_look_uses_claudes_box_in_its_own_frame",
+        "meet_the_person_box_is_the_one_matching_the_pick",
+        "meet_faceless_new_person_is_asked_but_never_stored_or_promised",
+        "meet_faceless_without_a_hello_line_says_the_friendly_line",
         "replies_look_reads_the_frame_box_kind_and_line",
         "replies_name_keeps_one_or_two_words_and_fills_the_placeholder",
         # The fixes from Explore on Claude's first live test

@@ -9,10 +9,11 @@ import java.io.ByteArrayOutputStream;
 
 /**
  * FaceCrop on the robot (explore on Claude plan KTD5): Android's built-in
- * FaceDetector (API 1, offline, no new model) looks inside the person box,
- * and the first face it finds is cut out 1.6x larger as a 224 px JPEG. With
- * no face, the top quarter of the person box stands in. See FaceCrop for the
- * geometry. Called on the curiosity adapter's worker thread, never the brain's.
+ * FaceDetector (API 1, offline, no new model) looks inside the person box, and
+ * the most confident face it finds is cut out 1.6x larger as a 224 px JPEG.
+ * With no face there is no crop at all: nothing that isn't a detected face is
+ * matched or stored. See FaceCrop for the geometry. Called on the curiosity
+ * adapter's worker thread, never the brain's.
  */
 final class FaceCropper implements FaceCrop {
     /** FaceDetector's own floor for a real face. */
@@ -21,23 +22,20 @@ final class FaceCropper implements FaceCrop {
     private static final int JPEG_QUALITY = 85;
 
     @Override
-    public byte[] crop(byte[] frameJpeg, Detection personBox) {
+    public Result crop(byte[] frameJpeg, Detection personBox) {
         if (frameJpeg == null || personBox == null) {
-            return null;
+            return Result.NONE;
         }
-        BitmapFactory.Options opts = new BitmapFactory.Options();
-        // FaceDetector reads RGB_565 only.
-        opts.inPreferredConfig = Bitmap.Config.RGB_565;
-        Bitmap frame = BitmapFactory.decodeByteArray(frameJpeg, 0, frameJpeg.length, opts);
+        Bitmap frame = BitmapFactory.decodeByteArray(frameJpeg, 0, frameJpeg.length);
         if (frame == null) {
-            return null;
+            return Result.NONE;
         }
         try {
             int w = frame.getWidth();
             int h = frame.getHeight();
             int[] sq = findFace(frame, personBox, w, h);
             if (sq == null) {
-                sq = FaceCrop.Square.topOfPerson(personBox, w, h);
+                return Result.NONE;
             }
             Bitmap cut = Bitmap.createBitmap(frame, sq[0], sq[1], sq[2], sq[2]);
             Bitmap scaled = Bitmap.createScaledBitmap(cut, SIDE_PX, SIDE_PX, true);
@@ -49,7 +47,7 @@ final class FaceCropper implements FaceCrop {
             if (cut != frame) {
                 cut.recycle();
             }
-            return out.toByteArray();
+            return new Result(out.toByteArray(), sq);
         } finally {
             frame.recycle();
         }
@@ -57,19 +55,24 @@ final class FaceCropper implements FaceCrop {
 
     /** The square around the most confident face inside the person box, in frame pixels, or null. */
     private static int[] findFace(Bitmap frame, Detection box, int w, int h) {
-        int left = Math.max(0, (int) (box.x0 * w));
-        int top = Math.max(0, (int) (box.y0 * h));
-        int right = Math.min(w, (int) Math.ceil(box.x1 * w));
-        int bottom = Math.min(h, (int) Math.ceil(box.y1 * h));
-        int bw = (right - left) & ~1; // FaceDetector needs an even width
-        int bh = bottom - top;
-        if (bw < 16 || bh < 16) {
+        int[] r = FaceCrop.Square.region(box, w, h);
+        if (r == null) {
             return null;
         }
-        Bitmap region = Bitmap.createBitmap(frame, left, top, bw, bh);
+        // FaceDetector reads RGB_565 only, an even width, and misses faces whose
+        // eyes are a few pixels apart: an RGB_565 copy of the region, scaled up if small.
+        float s = FaceCrop.Square.detectScale(r[2]);
+        int dw = FaceCrop.Square.evenScaled(r[2], s);
+        int dh = Math.max(2, (int) (r[3] * s));
+        Bitmap region = Bitmap.createBitmap(frame, r[0], r[1], r[2], r[3]);
+        Bitmap sized = dw == r[2] && dh == r[3] ? region : Bitmap.createScaledBitmap(region, dw, dh, true);
+        Bitmap rgb565 = sized.copy(Bitmap.Config.RGB_565, false);
         try {
+            if (rgb565 == null) {
+                return null;
+            }
             FaceDetector.Face[] faces = new FaceDetector.Face[MAX_FACES];
-            int found = new FaceDetector(bw, bh, MAX_FACES).findFaces(region, faces);
+            int found = new FaceDetector(dw, dh, MAX_FACES).findFaces(rgb565, faces);
             FaceDetector.Face best = null;
             for (int i = 0; i < found; i++) {
                 if (faces[i] != null && faces[i].confidence() >= MIN_CONFIDENCE
@@ -82,8 +85,17 @@ final class FaceCropper implements FaceCrop {
             }
             PointF mid = new PointF();
             best.getMidPoint(mid);
-            return FaceCrop.Square.aroundFace(left + mid.x, top + mid.y, best.eyesDistance(), w, h);
+            // Back from the scaled region to frame pixels.
+            float sx = r[2] / (float) dw;
+            float sy = r[3] / (float) dh;
+            return FaceCrop.Square.aroundFace(r[0] + mid.x * sx, r[1] + mid.y * sy, best.eyesDistance() * sx, w, h);
         } finally {
+            if (rgb565 != null) {
+                rgb565.recycle();
+            }
+            if (sized != region) {
+                sized.recycle();
+            }
             if (region != frame) {
                 region.recycle();
             }

@@ -19,7 +19,8 @@ final class ClaudeReplies {
 
     /**
      * The look reply. frameCount frames were sent, each widths[i] x heights[i]
-     * pixels; "frame" is 1-based and the box is in that frame's pixels.
+     * pixels; "frame" is 1-based and the box is in that frame's pixels (or, if
+     * all four values are 0..1, already fractions of it).
      */
     static CuriosityPort.Answer look(Map<String, Object> json, int[] widths, int[] heights) {
         Object interesting = json.get("interesting");
@@ -39,13 +40,18 @@ final class ClaudeReplies {
             return CuriosityPort.Answer.failed();
         }
         int f = (int) (frame - 1);
-        float[] b = new float[4];
+        double[] raw = new double[4];
         for (int i = 0; i < 4; i++) {
             Object v = ((List<?>) box).get(i);
             if (!(v instanceof Number)) {
                 return CuriosityPort.Answer.failed();
             }
-            b[i] = ((Number) v).floatValue() / (i % 2 == 0 ? widths[f] : heights[f]);
+            raw[i] = ((Number) v).doubleValue();
+        }
+        // Pixels of this frame, or already 0..1 (FaceCrop.Square.fractions).
+        float[] b = FaceCrop.Square.fractions(raw, widths[f], heights[f]);
+        if (b == null) {
+            return CuriosityPort.Answer.failed();
         }
         Detection d = new Detection(label, 1f, b[0], b[1], b[2], b[3]);
         if (d.width() <= 0f || d.height() <= 0f) {

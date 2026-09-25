@@ -130,12 +130,57 @@ class ClaudeLatencyIsLoggedTest(unittest.TestCase):
     def test_every_claude_call_logs_its_latency(self):
         body = code_only(src("ClaudeCuriosity.java"))
         calls = body.split("claude.messages(")[1:]
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 7)
         for i, after in enumerate(calls):
             window = after[:900]
             logs = re.findall(r"Log\.[diwe]\((.*?)\);", window, re.S)
             self.assertTrue(logs, f"call {i + 1}: no Log after it")
             self.assertRegex(logs[0], r'" ms"', f"call {i + 1}: its first Log has no latency: {logs[0]}")
+
+
+class FaceCropStoresOnlyFacesTest(unittest.TestCase):
+    """Owner report: a stored face showed the wall. The top quarter of a loose or
+    small person box stood in whenever FaceDetector found nothing, and was stored."""
+
+    def test_the_cropper_has_no_stand_in_and_detects_on_rgb_565(self):
+        cropper = code_only(src("FaceCropper.java"))
+        self.assertNotIn("topOfPerson", cropper)
+        self.assertIn("copy(Bitmap.Config.RGB_565", cropper)
+        self.assertIn("new FaceDetector(", cropper)
+        self.assertIn("return Result.NONE;", cropper)
+
+    def test_no_face_skips_the_match_and_stores_nothing(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        person = a[a.index("private MatchAnswer person("):]
+        self.assertLess(person.index("if (!crop.found())"), person.index("RobotPeopleClient.recent"))
+        self.assertIn("MatchAnswer.faceless(", person[:person.index("RobotPeopleClient.recent")])
+        keep = a[a.index("private Answer keep("):]
+        self.assertLess(keep.index("return hello("), keep.index("RobotPeopleClient.add"))
+
+    def test_the_hello_never_promises_to_remember(self):
+        prompts = src("ExplorePrompts.java")
+        hello = prompts[prompts.index("static String welcomeAsk("):]
+        hello = hello[:hello.index("}")]
+        self.assertIn("do not say or", hello)
+        self.assertIn("will NOT remember", hello)
+
+
+class FaceDebugSwitchTest(unittest.TestCase):
+    """The owner's crop check: behind log.tag.MikoExploreFaceDebug=DEBUG, the last crop
+    and its frame go to Explore's private files directory, never shared storage or the log."""
+
+    def test_the_switch_writes_private_files_only(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertIn('FACE_DEBUG_TAG = "MikoExploreFaceDebug"', a)
+        self.assertIn("Log.isLoggable(FACE_DEBUG_TAG, Log.DEBUG)", a)
+        self.assertIn('LAST_FACE = "last-face.jpg"', a)
+        self.assertIn('LAST_FACE_SRC = "last-face-src.jpg"', a)
+        self.assertIn("app.getFilesDir()", a)
+        for shared in ("getExternal", "Environment.", "MediaStore", "Base64", "/sdcard"):
+            self.assertNotIn(shared, a, shared)
+
+    def test_the_tag_fits_androids_limit(self):
+        self.assertLessEqual(len("MikoExploreFaceDebug"), 23)
 
 
 class BrainTraceIsPrivateTest(unittest.TestCase):
