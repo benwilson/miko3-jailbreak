@@ -17,7 +17,9 @@ import java.util.Set;
  * whoever asked; a line is never cut off mid-sentence. cancel(owner) drops
  * that caller's waiting lines at once and stops its playing line at the next
  * sentence boundary; other callers' lines are never touched. Every line ends
- * with exactly one callback, finished or cancelled.
+ * with exactly one callback: finished, cancelled (its owner asked), or
+ * failed(reason) (the voice broke while making or playing it, or the queue
+ * shut down with it still waiting, reason REFUSE_UNAVAILABLE).
  *
  * It also owns splitting a line into what sherpa-onnx is handed per generate
  * call: one sentence at a time, so the first sentence plays while the next is
@@ -32,6 +34,8 @@ final class SpeechQueue {
     static final String REFUSE_EMPTY = "nothing to say";
     static final String REFUSE_TOO_LONG = "line too long";
     static final String REFUSE_UNAVAILABLE = "speech unavailable";
+    /** Why a line failed when synthesis or playback broke part way. */
+    static final String FAIL_VOICE = "voice failed";
     /** About a minute of speech: plenty for any one line a mode says. */
     static final int MAX_CHARS = 1000;
 
@@ -40,6 +44,10 @@ final class SpeechQueue {
         void finished();
 
         void cancelled();
+
+        /** The line could not be (fully) said: reason is FAIL_VOICE or
+         * REFUSE_UNAVAILABLE. */
+        void failed(String reason);
     }
 
     /** Synthesis and playback, called only from the thread running playNext. */
@@ -50,8 +58,9 @@ final class SpeechQueue {
          * before it has all played. */
         void speak(String chunk);
 
-        /** Returns once everything spoken for this line has played (cancelled or
-         * not: a cancelled line still lets its current sentence finish). */
+        /** Returns once everything spoken for this line has played; or, if the
+         * line is cancelled (cancelled here, or cancelRequested(id) while it
+         * drains), once the sentence playing at that moment has finished. */
         void endLine(long id, boolean cancelled);
     }
 
@@ -63,6 +72,7 @@ final class SpeechQueue {
         final Listener listener;
         final long queuedAtNanos;
         boolean cancelled; // guarded by the queue
+        String failure; // guarded by the queue
 
         Line(long id, Object owner, String text, List<String> chunks, Listener listener) {
             this.id = id;
@@ -145,8 +155,9 @@ final class SpeechQueue {
         fireCancelled(dropped);
     }
 
-    /** No voice (it failed to load, or the launcher is going away): cancels
-     * everything and refuses new lines with REFUSE_UNAVAILABLE. */
+    /** No voice (it failed to load, or the launcher is going away): fails
+     * every waiting line (and the playing one, at its next sentence boundary)
+     * with REFUSE_UNAVAILABLE, and refuses new lines with it. */
     void shutdown() {
         List<Line> dropped;
         synchronized (this) {
@@ -155,10 +166,13 @@ final class SpeechQueue {
             waiting.clear();
             if (playing != null) {
                 playing.cancelled = true;
+                playing.failure = REFUSE_UNAVAILABLE;
             }
             notifyAll();
         }
-        fireCancelled(dropped);
+        for (Line l : dropped) {
+            fireFailed(l, REFUSE_UNAVAILABLE);
+        }
     }
 
     /** Lines waiting to play, not counting the one playing. */
@@ -183,7 +197,7 @@ final class SpeechQueue {
             line = waiting.pollFirst();
             playing = line;
         }
-        boolean failed = false;
+        String failure = null;
         try {
             voice.startLine(line.id, line.text, line.queuedAtNanos);
             for (String chunk : line.chunks) {
@@ -193,20 +207,34 @@ final class SpeechQueue {
                 voice.speak(chunk);
             }
         } catch (RuntimeException e) {
-            failed = true;
+            failure = FAIL_VOICE;
         }
-        boolean cancelled = failed || isCancelled(line);
         try {
-            voice.endLine(line.id, cancelled);
+            voice.endLine(line.id, failure != null || isCancelled(line));
         } catch (RuntimeException e) {
-            cancelled = true;
+            failure = FAIL_VOICE;
         }
+        boolean cancelled;
         synchronized (this) {
-            cancelled |= line.cancelled;
+            cancelled = line.cancelled;
+            if (failure == null) {
+                failure = line.failure;
+            }
             playing = null;
         }
-        fire(line, cancelled);
+        if (failure != null) {
+            fireFailed(line, failure);
+        } else {
+            fire(line, cancelled);
+        }
         return true;
+    }
+
+    /** True once the line with this id, playing now, has been cancelled (or
+     * the queue shut down under it). The voice polls this while the line's
+     * last audio drains, to stop at the end of the sentence then playing. */
+    synchronized boolean cancelRequested(long id) {
+        return playing != null && playing.id == id && playing.cancelled;
     }
 
     private synchronized boolean isCancelled(Line line) {
@@ -216,6 +244,14 @@ final class SpeechQueue {
     private static void fireCancelled(List<Line> lines) {
         for (Line l : lines) {
             fire(l, true);
+        }
+    }
+
+    private static void fireFailed(Line line, String reason) {
+        try {
+            line.listener.failed(reason);
+        } catch (RuntimeException ignored) {
+            // A broken listener must not stop the queue.
         }
     }
 

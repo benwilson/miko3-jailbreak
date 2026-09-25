@@ -318,6 +318,7 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "say_empty_text_refused",
         "say_too_long_text_refused",
         "say_while_voice_loading_refused",
+        "say_after_voice_failed_says_not_available",
         "say_speaks_and_redirects",
         "say_status_never_echoes_text",
         "get_on_say_path_refused",

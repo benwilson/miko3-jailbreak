@@ -21,7 +21,8 @@ import com.miko3.shared.RobotSpeech;
  * loaded the voice at launcher start. A line belongs to the calling uid:
  * cancel() only reaches that uid's lines. Each line's callback binder is
  * linked to death, so a mode that dies with lines queued has them cancelled
- * the same way.
+ * the same way. The queue's verdict (finished, cancelled, or failed with a
+ * fixed reason) goes back over the line's one-way callback.
  */
 public class SpeechService extends Service {
     private static final String TAG = "SpeechService";
@@ -45,7 +46,7 @@ public class SpeechService extends Service {
                 Log.i(TAG, "uid " + uid + " refused: " + e.getMessage());
                 throw e;
             }
-            Log.i(TAG, "uid " + uid + " queued line " + line.id + ": \"" + text + "\"");
+            Log.i(TAG, "uid " + uid + " queued line " + line.id + " (" + text.length() + " chars)");
             if (!callback.asBinder().isBinderAlive()) {
                 speech().queue().cancelLine(line.id);
             }
@@ -122,6 +123,16 @@ public class SpeechService extends Service {
             unlink();
             try {
                 callback.cancelled();
+            } catch (RemoteException e) {
+                // The caller is gone; nothing to tell.
+            }
+        }
+
+        @Override
+        public void failed(String reason) {
+            unlink();
+            try {
+                callback.failed(reason);
             } catch (RemoteException e) {
                 // The caller is gone; nothing to tell.
             }

@@ -40,8 +40,16 @@ import java.nio.charset.StandardCharsets;
  * the playback head has passed its last frame, as VoicePlayer judges it,
  * never when the writes return.
  *
- * Log lines carry the spoken text and the timing (time to first audio is
- * measured from speak() to the head first moving).
+ * The track handling (buffer sizing, recovering from an underrun between
+ * sentences, the drain) lives in the plain-Java SpeechPlayer so host tests
+ * can run it. Synthesis runs ahead of playback, so a cancel usually arrives
+ * with more sentences already written than played; the player (LineDrain)
+ * stops the track at the end of the sentence playing when the cancel is seen,
+ * polling the queue while the line drains, and the rest is dropped.
+ *
+ * Log lines carry line ids, character counts and the timing (time to first
+ * audio is measured from speak() to the head first moving), never the spoken
+ * text itself.
  */
 final class SpeechEngine implements SpeechQueue.Voice, Runnable {
     static final String TAG = "SpeechEngine";
@@ -49,10 +57,6 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
     private static final String STAMP = "stamp.txt";
     /** Which voice the build staged ("stock lessac medium" or "trained"). */
     private static final String LABEL = "label.txt";
-    /** Frames per blocking write; between slices the head is checked. */
-    private static final int SLICE_FRAMES = 1024;
-    /** Slack past a line's own length before it is given up on. */
-    private static final long DRAIN_SLACK_MS = 3000;
     private static final String WARM_UP = "Hello there, it is nice to meet you, and I hope we can play together soon.";
 
     private final Context context;
@@ -65,14 +69,13 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
     private int rate;
     private int startFrames;
     private int capacityFrames;
+    private SpeechPlayer player;
     private long lineId;
     private long queuedAtNanos;
-    private long startedAtNanos;
-    private long written;
-    private boolean heard;
-    private short[] pcm = new short[0];
     // Set once the voice has loaded and warmed up; read by the Settings page.
     private volatile boolean ready;
+    // Set if the voice failed to load; it will then never be ready.
+    private volatile boolean failed;
 
     SpeechEngine(Context context) {
         this.context = context.getApplicationContext();
@@ -92,6 +95,12 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
     /** True once the voice has loaded and warmed up, so a line plays soon. */
     boolean isReady() {
         return ready;
+    }
+
+    /** True once the voice has failed to load: the robot cannot speak until
+     * the launcher restarts. */
+    boolean hasFailed() {
+        return failed;
     }
 
     /** The staged voice's label from assets/voice/label.txt, or "unknown". */
@@ -122,6 +131,7 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
             tts = load(dir);
             rate = tts.getSampleRate();
             track = createTrack(rate);
+            player = new SpeechPlayer(new TrackSpeaker(track), rate, startFrames, capacityFrames);
             // One generate before the first real line, about as long as the
             // longest chunk, so the first line doesn't also pay ONNX Runtime's
             // first-run allocations (the first line after loading was seen at
@@ -135,6 +145,7 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
             ready = true;
         } catch (Throwable t) {
             Log.e(TAG, "voice failed to load; the robot cannot speak", t);
+            failed = true;
             queue.shutdown();
             return;
         }
@@ -290,13 +301,9 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
     public void startLine(long id, String text, long queuedAt) {
         lineId = id;
         queuedAtNanos = queuedAt;
-        startedAtNanos = System.nanoTime();
-        written = 0;
-        heard = false;
-        track.setBufferSizeInFrames(startFrames);
-        track.play();
-        Log.i(TAG, "line " + id + " starting after " + ms(startedAtNanos - queuedAt) + " ms in the queue: \""
-                + text + "\"");
+        player.startLine(queuedAt);
+        Log.i(TAG, "line " + id + " starting after " + ms(System.nanoTime() - queuedAt) + " ms in the queue ("
+                + text.length() + " chars)");
     }
 
     @Override
@@ -306,85 +313,91 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
             tts.generateWithCallback(chunk, 0, 1.0f, new OfflineTtsCallback() {
                 @Override
                 public Integer invoke(float[] samples) {
-                    write(samples);
+                    player.write(samples);
                     return 1;
                 }
             });
         } catch (RuntimeException e) {
-            Log.e(TAG, "line " + lineId + ": synthesis failed for \"" + chunk + "\"", e);
+            Log.e(TAG, "line " + lineId + ": synthesis failed for a chunk of " + chunk.length() + " chars", e);
             throw e;
         }
-        Log.i(TAG, "line " + lineId + ": made \"" + chunk + "\" in " + ms(System.nanoTime() - t0) + " ms");
+        player.chunkEnded();
+        Log.i(TAG, "line " + lineId + ": made a chunk of " + chunk.length() + " chars in "
+                + ms(System.nanoTime() - t0) + " ms");
     }
 
     @Override
-    public void endLine(long id, boolean cancelled) {
-        long speechEnd = written;
-        // Pad with a start buffer of silence, so a short line still fills the
-        // buffer once and starts; the line has ended when the head passes speechEnd.
-        writePcm(new short[startFrames], startFrames);
-        long deadline = SystemClock.elapsedRealtime() + speechEnd * 1000 / rate + DRAIN_SLACK_MS;
-        while (head() < speechEnd) {
-            checkHead();
-            if (SystemClock.elapsedRealtime() > deadline) {
-                Log.w(TAG, "line " + id + ": playback head stuck at " + head() + " of " + speechEnd
-                        + " frames; ending the line");
-                break;
+    public void endLine(final long id, boolean cancelled) {
+        long speechEnd = player.written();
+        // Polled while the line drains, so a cancel stops it at the end of the
+        // sentence playing then, however far synthesis ran ahead.
+        boolean reached = player.endLine(cancelled, new LineDrain.CancelCheck() {
+            @Override
+            public boolean cancelled() {
+                return queue.cancelRequested(id);
             }
-            SystemClock.sleep(10);
+        });
+        if (!reached) {
+            Log.w(TAG, "line " + id + ": playback head stuck short of " + speechEnd + " frames; ended the line");
         }
-        checkHead();
-        try {
-            track.pause();
-            track.flush();
-        } catch (IllegalStateException ignored) {
-        }
+        cancelled |= queue.cancelRequested(id);
         Log.i(TAG, "line " + id + (cancelled ? " cancelled" : " finished") + " " + ms(System.nanoTime()
                 - queuedAtNanos) + " ms after speak(), " + (speechEnd * 1000 / Math.max(1, rate))
                 + " ms of audio");
     }
 
-    private void write(float[] samples) {
-        if (pcm.length < samples.length) {
-            pcm = new short[samples.length];
-        }
-        for (int i = 0; i < samples.length; i++) {
-            float s = samples[i];
-            s = s > 1f ? 1f : (s < -1f ? -1f : s);
-            pcm[i] = (short) (s * 32767f);
-        }
-        writePcm(pcm, samples.length);
-        written += samples.length;
-    }
+    /** The AudioTrack behind SpeechPlayer. */
+    private final class TrackSpeaker implements SpeechPlayer.Speaker {
+        private final AudioTrack t;
 
-    /** Blocking writes in slices, checking the head between them. */
-    private void writePcm(short[] data, int frames) {
-        int off = 0;
-        while (off < frames) {
-            int n = track.write(data, off, Math.min(SLICE_FRAMES, frames - off), AudioTrack.WRITE_BLOCKING);
-            if (n < 0) {
-                throw new IllegalStateException("speaker write failed: " + n);
-            }
-            off += n;
-            checkHead();
+        TrackSpeaker(AudioTrack t) {
+            this.t = t;
         }
-    }
 
-    /** Once the head first moves: log the time to first audio and open the
-     * buffer to its full capacity, so later writes stop waiting on playback. */
-    private void checkHead() {
-        if (heard || head() <= 0) {
-            return;
+        @Override
+        public long head() {
+            return t.getPlaybackHeadPosition() & 0xffffffffL;
         }
-        heard = true;
-        track.setBufferSizeInFrames(capacityFrames);
-        long now = System.nanoTime();
-        Log.i(TAG, "line " + lineId + ": first audio " + ms(now - queuedAtNanos) + " ms after speak() ("
-                + ms(now - startedAtNanos) + " ms after it started)");
-    }
 
-    private long head() {
-        return track.getPlaybackHeadPosition() & 0xffffffffL;
+        @Override
+        public int write(short[] data, int off, int frames) {
+            return t.write(data, off, frames, AudioTrack.WRITE_BLOCKING);
+        }
+
+        @Override
+        public void setBufferSizeInFrames(int frames) {
+            t.setBufferSizeInFrames(frames);
+        }
+
+        @Override
+        public void play() {
+            t.play();
+        }
+
+        @Override
+        public void pause() {
+            t.pause();
+        }
+
+        @Override
+        public void flush() {
+            t.flush();
+        }
+
+        @Override
+        public long nowMs() {
+            return SystemClock.elapsedRealtime();
+        }
+
+        @Override
+        public void sleep(long ms) {
+            SystemClock.sleep(ms);
+        }
+
+        @Override
+        public void note(String message) {
+            Log.i(TAG, "line " + lineId + ": " + message);
+        }
     }
 
     private static long ms(long nanos) {

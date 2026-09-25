@@ -13,7 +13,9 @@ import android.os.RemoteException;
  * than binding directly.
  *
  * speak() queues a line behind whatever is playing, from any mode, and
- * returns at once; the line's Callback is told once, finished or cancelled.
+ * returns at once; the line's Callback is told once: finished, cancelled, or
+ * failed(reason) when the launcher's voice broke while making or playing it
+ * or went away with it still queued.
  * cancel() drops every line this app queued, and stops its playing line at
  * the next sentence boundary; other apps' lines are untouched. The launcher
  * checks the caller on every call and throws SecurityException to any app
@@ -27,16 +29,20 @@ public interface RobotSpeech extends IInterface {
     void cancel() throws RemoteException;
 
     /** How one line ended. Called one-way from the launcher, on a Binder
-     * thread of the calling app; exactly one of the two, once. */
+     * thread of the calling app; exactly one of the three, once. */
     interface Callback extends IInterface {
         void finished() throws RemoteException;
 
         void cancelled() throws RemoteException;
 
+        /** The line could not be (fully) said; reason is a fixed string. */
+        void failed(String reason) throws RemoteException;
+
         abstract class Stub extends Binder implements Callback {
             private static final String DESCRIPTOR = "com.miko3.shared.RobotSpeech.Callback";
             static final int TRANSACTION_finished = 1;
             static final int TRANSACTION_cancelled = 2;
+            static final int TRANSACTION_failed = 3;
 
             public Stub() {
                 attachInterface(this, DESCRIPTOR);
@@ -69,6 +75,10 @@ public interface RobotSpeech extends IInterface {
                         data.enforceInterface(DESCRIPTOR);
                         cancelled();
                         return true;
+                    case TRANSACTION_failed:
+                        data.enforceInterface(DESCRIPTOR);
+                        failed(data.readString());
+                        return true;
                     case IBinder.INTERFACE_TRANSACTION:
                         reply.writeString(DESCRIPTOR);
                         return true;
@@ -91,19 +101,27 @@ public interface RobotSpeech extends IInterface {
 
                 @Override
                 public void finished() throws RemoteException {
-                    send(TRANSACTION_finished);
+                    send(TRANSACTION_finished, null);
                 }
 
                 @Override
                 public void cancelled() throws RemoteException {
-                    send(TRANSACTION_cancelled);
+                    send(TRANSACTION_cancelled, null);
+                }
+
+                @Override
+                public void failed(String reason) throws RemoteException {
+                    send(TRANSACTION_failed, reason);
                 }
 
                 /** One-way, so the launcher's audio thread never waits on a mode. */
-                private void send(int code) throws RemoteException {
+                private void send(int code, String reason) throws RemoteException {
                     Parcel data = Parcel.obtain();
                     try {
                         data.writeInterfaceToken(DESCRIPTOR);
+                        if (code == TRANSACTION_failed) {
+                            data.writeString(reason);
+                        }
                         remote.transact(code, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();

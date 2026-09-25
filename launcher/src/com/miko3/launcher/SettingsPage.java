@@ -59,6 +59,7 @@ final class SettingsPage {
     static final String SAY_TOO_LONG = "Nothing said: that is longer than " + SpeechQueue.MAX_CHARS + " characters.";
     static final String SAY_LOADING = "The voice is still loading; try again in a few seconds.";
     static final String SAY_SPEAKING = "Speaking.";
+    static final String SAY_UNAVAILABLE = "Nothing said: the robot's voice is not available.";
 
     /**
      * The robot's voice, as the Voice section sees it. LauncherApp backs it
@@ -67,6 +68,9 @@ final class SettingsPage {
     interface Speaker {
         /** True once the voice has loaded and warmed up. */
         boolean ready();
+
+        /** True once the voice has failed to load: it will never be ready. */
+        boolean failed();
 
         /** Which voice the build staged, e.g. "stock lessac medium" or "trained". */
         String voiceName();
@@ -175,6 +179,9 @@ final class SettingsPage {
         if (text.length() > SpeechQueue.MAX_CHARS) {
             return SAY_TOO_LONG;
         }
+        if (speaker.failed()) {
+            return SAY_UNAVAILABLE;
+        }
         if (!speaker.ready()) {
             return SAY_LOADING;
         }
@@ -183,7 +190,7 @@ final class SettingsPage {
         } catch (IllegalArgumentException e) {
             // The queue shut down (the voice failed to load) or refused the line.
             return SpeechQueue.REFUSE_UNAVAILABLE.equals(e.getMessage())
-                    ? "Nothing said: the robot's voice is not available." : SAY_EMPTY;
+                    ? SAY_UNAVAILABLE : SAY_EMPTY;
         }
         return SAY_SPEAKING;
     }

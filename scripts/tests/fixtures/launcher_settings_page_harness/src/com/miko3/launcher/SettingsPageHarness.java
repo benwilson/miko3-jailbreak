@@ -71,11 +71,16 @@ public final class SettingsPageHarness {
     /** Records what the page asked the robot to say. */
     static final class FakeSpeaker implements SettingsPage.Speaker {
         boolean ready = true;
+        boolean failed;
         String voice = "stock lessac medium";
         final List<String> said = new ArrayList<String>();
 
         public boolean ready() {
             return ready;
+        }
+
+        public boolean failed() {
+            return failed;
         }
 
         public String voiceName() {
@@ -677,6 +682,19 @@ public final class SettingsPageHarness {
                 f.speaker.ready = false;
                 Resp r = say(f, "Hello");
                 check(n, "The voice is still loading; try again in a few seconds.".equals(r.status())
+                        && f.speaker.said.isEmpty(), r.status());
+            }
+        });
+
+        scenario("say_after_voice_failed_says_not_available", new Scenario() {
+            public void run(String n) throws Exception {
+                // The voice failed to load: it will never be ready, so the page
+                // must not keep saying "still loading".
+                Fixture f = new Fixture();
+                f.speaker.ready = false;
+                f.speaker.failed = true;
+                Resp r = say(f, "Hello");
+                check(n, "Nothing said: the robot's voice is not available.".equals(r.status())
                         && f.speaker.said.isEmpty(), r.status());
             }
         });

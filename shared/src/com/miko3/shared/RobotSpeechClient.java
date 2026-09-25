@@ -30,7 +30,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * method is then called, once, on a Binder thread: onFinished() when its
  * last sound has actually played, onCancelled() when this app's cancel()
  * dropped or stopped it, or onFailed(reason) when it was never queued (the
- * launcher refused the line, or couldn't be reached) or the launcher died.
+ * launcher refused the line, or couldn't be reached), the launcher's voice
+ * broke while making or playing it (reason "voice failed"), or the launcher
+ * went away with it still queued ("speech unavailable") or died.
  * cancel() drops every line this app queued, and stops one that is playing at
  * the next sentence boundary; to interrupt yourself, cancel() then speak().
  *
@@ -131,12 +133,20 @@ public final class RobotSpeechClient {
     }
 
     /** Drops every line this app queued and stops its playing line at the
-     * next sentence boundary. Their listeners get onCancelled(). */
+     * next sentence boundary. Their listeners get onCancelled(). A line not
+     * yet handed to the launcher (still waiting for the binding, or handed to
+     * the worker but not sent) is marked cancelled under the lock, so it is
+     * never sent even if the connection raced this call. */
     public void cancel() {
-        List<Line> dropped;
+        List<Line> dropped = new ArrayList<Line>();
         final RobotSpeech s;
         synchronized (this) {
-            dropped = new ArrayList<Line>(unsent);
+            for (Line line : outstanding) {
+                if (!line.sent) {
+                    line.cancelled = true;
+                    dropped.add(line);
+                }
+            }
             unsent.clear();
             s = service;
         }
@@ -179,6 +189,10 @@ public final class RobotSpeechClient {
         final String text;
         final Listener listener;
         final AtomicBoolean done = new AtomicBoolean();
+        // Guarded by RobotSpeechClient.this: handed to the launcher, or
+        // cancelled by this app before it was.
+        boolean sent;
+        boolean cancelled;
 
         Line(String text, Listener listener) {
             this.text = text;
@@ -189,6 +203,11 @@ public final class RobotSpeechClient {
         public void run() {
             RobotSpeech s;
             synchronized (RobotSpeechClient.this) {
+                if (cancelled) {
+                    // cancel() won the race and has already told the listener.
+                    return;
+                }
+                sent = true;
                 s = service;
             }
             if (s == null) {
@@ -220,6 +239,12 @@ public final class RobotSpeechClient {
                 lineDone(this);
                 listener.onCancelled();
             }
+        }
+
+        /** The launcher's voice broke on this line, or went away with it queued. */
+        @Override
+        public void failed(String reason) {
+            fail(reason == null ? "launcher speech failed" : reason);
         }
 
         void fail(String reason) {

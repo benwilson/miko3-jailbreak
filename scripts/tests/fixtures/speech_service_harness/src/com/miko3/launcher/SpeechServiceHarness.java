@@ -67,6 +67,11 @@ public final class SpeechServiceHarness {
         public void cancelled() {
             log.add("cancelled:" + name);
         }
+
+        @Override
+        public void failed(String reason) {
+            log.add("failed:" + name + ":" + reason);
+        }
     }
 
     /** Records each call; runs a hook when a given chunk is spoken, standing in
@@ -75,6 +80,7 @@ public final class SpeechServiceHarness {
         final Log log;
         final Map<String, Runnable> hooks = new HashMap<String, Runnable>();
         String failOn;
+        boolean failEnd;
 
         FakeVoice(Log log) {
             this.log = log;
@@ -99,7 +105,238 @@ public final class SpeechServiceHarness {
 
         @Override
         public void endLine(long id, boolean cancelled) {
+            if (failEnd) {
+                throw new IllegalStateException("speaker write failed");
+            }
             log.add("end:" + (cancelled ? "cancelled" : "played"));
+        }
+    }
+
+    /**
+     * A voice whose synthesis runs ahead of playback, as SpeechEngine's does
+     * with its 20 s track: speak() "writes" 1000 frames per word at once and
+     * returns, while a simulated playback head moves 100 frames per idle()
+     * (and playedPerSpeak frames during each speak()). endLine drains through
+     * the engine's own LineDrain, polling the queue for a cancel as the engine
+     * does. Records where playback was stopped.
+     */
+    static final class AheadVoice implements SpeechQueue.Voice, LineDrain.Track {
+        final Log log;
+        final SpeechQueue queue;
+        final LineDrain drain = new LineDrain();
+        long written;
+        long head;
+        long now;
+        long playedPerSpeak;
+        long stoppedAt = -1;
+        /** Run once when the head first reaches cancelAtHead. */
+        long cancelAtHead = -1;
+        Runnable onHead;
+        /** Run inside speak() of this chunk. */
+        String hookOn;
+        Runnable hook;
+
+        AheadVoice(Log log, SpeechQueue queue) {
+            this.log = log;
+            this.queue = queue;
+        }
+
+        @Override
+        public void startLine(long id, String text, long queuedAtNanos) {
+            written = 0;
+            head = 0;
+            drain.startLine();
+        }
+
+        @Override
+        public void speak(String chunk) {
+            written += 1000L * words(chunk);
+            drain.chunkEnded(written);
+            log.add("made:" + chunk);
+            advance(playedPerSpeak);
+            if (chunk.equals(hookOn) && hook != null) {
+                hook.run();
+            }
+        }
+
+        @Override
+        public void endLine(final long id, boolean cancelled) {
+            boolean reached = drain.await(this, written, cancelled, new LineDrain.CancelCheck() {
+                public boolean cancelled() {
+                    return queue.cancelRequested(id);
+                }
+            }, now + 60000);
+            stoppedAt = head;
+            log.add("stopped:" + head + (reached ? "" : ":stuck"));
+        }
+
+        private void advance(long frames) {
+            for (long i = 0; i < frames; i += 100) {
+                head = Math.min(written, head + 100);
+                if (onHead != null && cancelAtHead >= 0 && head >= cancelAtHead) {
+                    Runnable r = onHead;
+                    onHead = null;
+                    r.run();
+                }
+            }
+        }
+
+        @Override
+        public long head() {
+            return head;
+        }
+
+        @Override
+        public void idle() {
+            now += 10;
+            advance(100);
+        }
+
+        @Override
+        public long nowMs() {
+            return now;
+        }
+    }
+
+    /**
+     * A streaming track as the platform runs one, in simulated milliseconds at
+     * 22050 Hz. It starts only once its queued frames reach the buffer size
+     * (setBufferSizeInFrames), and after an underrun it waits to refill to
+     * the buffer size again before the head moves on: what the robot showed
+     * when the buffer had been opened to its 20 s capacity.
+     */
+    static final class SimTrack implements SpeechPlayer.Speaker {
+        static final int RATE = 22050;
+        final int capacity;
+        int bufferSize;
+        long ready;
+        long head;
+        long now;
+        long headAtPause = -1;
+        boolean playing;
+        boolean filling;
+        int underruns;
+        final List<String> notes = new ArrayList<String>();
+        private double owed;
+
+        SimTrack(int capacity) {
+            this.capacity = capacity;
+            this.bufferSize = capacity;
+        }
+
+        void advance(long ms) {
+            for (long i = 0; i < ms; i++) {
+                now++;
+                refill();
+                if (!playing || filling) {
+                    continue;
+                }
+                owed += RATE / 1000.0;
+                long n = Math.min(ready, (long) owed);
+                owed -= n;
+                head += n;
+                ready -= n;
+                if (ready == 0) {
+                    underruns++;
+                    filling = true;
+                    owed = 0;
+                }
+            }
+        }
+
+        private void refill() {
+            if (filling && ready >= bufferSize) {
+                filling = false;
+            }
+        }
+
+        public long head() {
+            return head;
+        }
+
+        public int write(short[] data, int off, int frames) {
+            long start = now;
+            while (bufferSize - ready <= 0) {
+                if (now - start > 10000) {
+                    return -6; // would block forever
+                }
+                advance(1);
+            }
+            int n = (int) Math.min(frames, bufferSize - ready);
+            ready += n;
+            refill();
+            return n;
+        }
+
+        public void setBufferSizeInFrames(int frames) {
+            bufferSize = Math.min(frames, capacity);
+            refill();
+        }
+
+        public void play() {
+            if (!playing) {
+                playing = true;
+                filling = true;
+            }
+            refill();
+        }
+
+        public void pause() {
+            playing = false;
+            headAtPause = head;
+        }
+
+        public void flush() {
+            ready = 0;
+            head = 0;
+        }
+
+        public long nowMs() {
+            return now;
+        }
+
+        public void sleep(long ms) {
+            advance(ms);
+        }
+
+        public void note(String message) {
+            notes.add(message);
+        }
+    }
+
+    /** A voice that plays through the engine's own SpeechPlayer into a
+     * SimTrack; each chunk takes its given synthesis time and frame count. */
+    static final class PlayerVoice implements SpeechQueue.Voice {
+        final SimTrack track;
+        final SpeechPlayer player;
+        final Map<String, long[]> costs = new HashMap<String, long[]>(); // chunk -> {synthMs, frames}
+        boolean reached;
+        long speechEnd;
+
+        PlayerVoice(SimTrack track) {
+            this.track = track;
+            // SpeechEngine's sizes: a 200 ms start buffer, a 20 s capacity.
+            this.player = new SpeechPlayer(track, SimTrack.RATE, SimTrack.RATE / 5, track.capacity);
+        }
+
+        public void startLine(long id, String text, long queuedAtNanos) {
+            player.startLine(queuedAtNanos);
+        }
+
+        public void speak(String chunk) {
+            long[] c = costs.get(chunk);
+            track.advance(c[0]);
+            player.write(new float[(int) c[1]]);
+            player.chunkEnded();
+        }
+
+        public void endLine(long id, boolean cancelled) {
+            speechEnd = player.written();
+            reached = player.endLine(cancelled, new LineDrain.CancelCheck() {
+                public boolean cancelled() {
+                    return false;
+                }
+            });
         }
     }
 
@@ -233,6 +470,142 @@ public final class SpeechServiceHarness {
                 check(n, log.count("say:First part.") == 1 && log.count("say:Second part.") == 0
                         && log.count("end:cancelled") == 1 && log.count("cancelled:e") == 1
                         && log.count("finished:e") == 0, log.toString());
+            }
+        });
+        scenario("uncancelled_line_plays_every_sentence_made_ahead", new Scenario() {
+            public void run(String n) throws Exception {
+                Log log = new Log();
+                SpeechQueue q = new SpeechQueue(16);
+                q.speak(EXPLORE, "One two. Three four. Five six.", new Line("e", log));
+                AheadVoice v = new AheadVoice(log, q);
+                drain(q, v);
+                check(n, v.stoppedAt == 6000 && log.count("finished:e") == 1, log.toString());
+            }
+        });
+        scenario("cancel_while_draining_stops_after_the_playing_sentence", new Scenario() {
+            public void run(String n) throws Exception {
+                // Synthesis has made all three sentences before playback leaves the
+                // first; the cancel lands while the line drains, head in sentence 1.
+                Log log = new Log();
+                final SpeechQueue q = new SpeechQueue(16);
+                q.speak(EXPLORE, "One two. Three four. Five six.", new Line("e", log));
+                AheadVoice v = new AheadVoice(log, q);
+                v.cancelAtHead = 500;
+                v.onHead = new Runnable() {
+                    public void run() {
+                        q.cancel(EXPLORE);
+                    }
+                };
+                drain(q, v);
+                check(n, v.stoppedAt == 2000 && log.count("made:Five six.") == 1
+                        && log.count("cancelled:e") == 1 && log.count("finished:e") == 0,
+                        "stopped at " + v.stoppedAt + " " + log);
+            }
+        });
+        scenario("cancel_during_synthesis_stops_after_the_playing_sentence", new Scenario() {
+            public void run(String n) throws Exception {
+                // Every sentence is made (2000 frames each) while only 1200 frames
+                // play per sentence made; cancel arrives with the last one, head
+                // in sentence 2: sentence 3, already written, must not play.
+                Log log = new Log();
+                final SpeechQueue q = new SpeechQueue(16);
+                q.speak(EXPLORE, "One two. Three four. Five six.", new Line("e", log));
+                AheadVoice v = new AheadVoice(log, q);
+                v.playedPerSpeak = 1200;
+                v.hookOn = "Five six.";
+                v.hook = new Runnable() {
+                    public void run() {
+                        q.cancel(EXPLORE);
+                    }
+                };
+                drain(q, v);
+                check(n, v.stoppedAt == 4000 && log.count("cancelled:e") == 1,
+                        "stopped at " + v.stoppedAt + " " + log);
+            }
+        });
+        scenario("other_callers_cancel_does_not_cut_a_draining_line", new Scenario() {
+            public void run(String n) throws Exception {
+                Log log = new Log();
+                final SpeechQueue q = new SpeechQueue(16);
+                q.speak(VOICE, "One two. Three four. Five six.", new Line("v", log));
+                AheadVoice v = new AheadVoice(log, q);
+                v.cancelAtHead = 500;
+                v.onHead = new Runnable() {
+                    public void run() {
+                        q.cancel(EXPLORE);
+                    }
+                };
+                drain(q, v);
+                check(n, v.stoppedAt == 6000 && log.count("finished:v") == 1, "stopped at " + v.stoppedAt + " " + log);
+            }
+        });
+        scenario("stuck_head_ends_the_line_at_the_deadline", new Scenario() {
+            public void run(String n) throws Exception {
+                LineDrain d = new LineDrain();
+                d.startLine();
+                d.chunkEnded(2000);
+                final long[] clock = {0};
+                boolean reached = d.await(new LineDrain.Track() {
+                    public long head() {
+                        return 0;
+                    }
+
+                    public void idle() {
+                        clock[0] += 10;
+                    }
+
+                    public long nowMs() {
+                        return clock[0];
+                    }
+                }, 2000, false, new LineDrain.CancelCheck() {
+                    public boolean cancelled() {
+                        return false;
+                    }
+                }, 500);
+                check(n, !reached && clock[0] > 500 && clock[0] < 600, "reached=" + reached + " at " + clock[0]);
+            }
+        });
+        scenario("short_first_sentence_underrun_still_plays_the_whole_line", new Scenario() {
+            public void run(String n) throws Exception {
+                // The robot's line 4: "Hello!" (16640 frames, made in 560 ms), then a
+                // sentence that took 1550 ms to make while "Hello!" played out in
+                // 750 ms. The track underran with its buffer opened to 20 s, and
+                // never started again: the rest was written but never heard.
+                Log log = new Log();
+                SpeechQueue q = new SpeechQueue(16);
+                q.speak(EXPLORE, "Hello! I am the robot, and I would love to meet you today. Shall we play?",
+                        new Line("e", log));
+                SimTrack track = new SimTrack(SimTrack.RATE * 20);
+                PlayerVoice v = new PlayerVoice(track);
+                v.costs.put("Hello!", new long[] {560, 16640});
+                v.costs.put("I am the robot, and I would love to meet you today.", new long[] {1550, 50000});
+                v.costs.put("Shall we play?", new long[] {700, 23607});
+                drain(q, v);
+                check(n, track.underruns >= 1 && v.reached && track.headAtPause >= v.speechEnd
+                                && v.speechEnd == 90247 && log.count("finished:e") == 1,
+                        "underruns=" + track.underruns + " reached=" + v.reached + " head=" + track.headAtPause
+                                + " of " + v.speechEnd + " notes=" + track.notes + " " + log);
+            }
+        });
+        scenario("line_without_underrun_plays_through_untouched", new Scenario() {
+            public void run(String n) throws Exception {
+                // Synthesis keeps ahead: no underrun, so no restart either.
+                Log log = new Log();
+                SpeechQueue q = new SpeechQueue(16);
+                q.speak(EXPLORE, "I am the robot, and I would love to meet you today. Shall we play?",
+                        new Line("e", log));
+                SimTrack track = new SimTrack(SimTrack.RATE * 20);
+                PlayerVoice v = new PlayerVoice(track);
+                v.costs.put("I am the robot, and I would love to meet you today.", new long[] {900, 50000});
+                v.costs.put("Shall we play?", new long[] {400, 23607});
+                drain(q, v);
+                boolean restarted = false;
+                for (String note : track.notes) {
+                    restarted |= note.contains("underran");
+                }
+                check(n, track.underruns == 0 && !restarted && v.reached && track.headAtPause >= v.speechEnd
+                                && log.count("finished:e") == 1,
+                        "underruns=" + track.underruns + " notes=" + track.notes + " head=" + track.headAtPause);
             }
         });
         scenario("cancel_with_nothing_queued_is_harmless", new Scenario() {
@@ -380,11 +753,13 @@ public final class SpeechServiceHarness {
                 q.shutdown();
                 String r = refusal(q, "B.");
                 boolean more = q.playNext(new FakeVoice(log), false);
-                check(n, log.count("cancelled:a") == 1 && SpeechQueue.REFUSE_UNAVAILABLE.equals(r) && !more,
+                // Nobody cancelled line a: it failed, with the fixed reason.
+                check(n, log.count("failed:a:" + SpeechQueue.REFUSE_UNAVAILABLE) == 1
+                        && log.count("cancelled:a") == 0 && SpeechQueue.REFUSE_UNAVAILABLE.equals(r) && !more,
                         log + " " + r);
             }
         });
-        scenario("voice_failure_cancels_that_line_only", new Scenario() {
+        scenario("voice_failure_fails_that_line_only", new Scenario() {
             public void run(String n) throws Exception {
                 Log log = new Log();
                 SpeechQueue q = new SpeechQueue(16);
@@ -393,7 +768,23 @@ public final class SpeechServiceHarness {
                 FakeVoice v = new FakeVoice(log);
                 v.failOn = "Broken.";
                 drain(q, v);
-                check(n, log.count("cancelled:a") == 1 && log.count("finished:b") == 1, log.toString());
+                check(n, log.count("failed:a:" + SpeechQueue.FAIL_VOICE) == 1 && log.count("cancelled:a") == 0
+                        && log.count("finished:a") == 0 && log.count("finished:b") == 1, log.toString());
+            }
+        });
+        scenario("playback_failure_fails_that_line_only", new Scenario() {
+            public void run(String n) throws Exception {
+                Log log = new Log();
+                SpeechQueue q = new SpeechQueue(16);
+                q.speak(EXPLORE, "Broken.", new Line("a", log));
+                FakeVoice v = new FakeVoice(log);
+                v.failEnd = true;
+                q.playNext(v, false);
+                v.failEnd = false;
+                q.speak(VOICE, "Fine.", new Line("b", log));
+                drain(q, v);
+                check(n, log.count("failed:a:" + SpeechQueue.FAIL_VOICE) == 1 && log.count("cancelled:a") == 0
+                        && log.count("finished:a") == 0 && log.count("finished:b") == 1, log.toString());
             }
         });
         scenario("tuning_defaults", new Scenario() {

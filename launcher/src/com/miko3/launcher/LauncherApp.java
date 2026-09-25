@@ -81,6 +81,11 @@ public class LauncherApp extends Application {
         }
 
         @Override
+        public boolean failed() {
+            return speech.hasFailed();
+        }
+
+        @Override
         public String voiceName() {
             String name = voiceName;
             if (name == null) {
@@ -99,6 +104,10 @@ public class LauncherApp extends Application {
 
                 @Override
                 public void cancelled() {
+                }
+
+                @Override
+                public void failed(String reason) {
                 }
             });
             Log.i(TAG, "settings page queued line " + id);

@@ -29,10 +29,13 @@ SHARED_SRC = REPO / "shared" / "src"
 SHARED = SHARED_SRC / "com" / "miko3" / "shared"
 HARNESS = TESTS / "fixtures" / "speech_service_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "launcher" / "SpeechServiceHarness.java"
+CLIENT_HARNESS = TESTS / "fixtures" / "speech_client_harness"
+CLIENT_HARNESS_MAIN = CLIENT_HARNESS / "src" / "com" / "miko3" / "shared" / "SpeechClientHarness.java"
 QUEUE = LAUNCHER / "SpeechQueue.java"
 TUNING = LAUNCHER / "SpeechTuning.java"
 SERVICE = LAUNCHER / "SpeechService.java"
 ENGINE = LAUNCHER / "SpeechEngine.java"
+PLAYER = LAUNCHER / "SpeechPlayer.java"
 GATE = LAUNCHER / "CallerGate.java"
 APP = LAUNCHER / "LauncherApp.java"
 INTERFACE = SHARED / "RobotSpeech.java"
@@ -73,6 +76,17 @@ class SpeechServiceHarnessTest(unittest.TestCase):
         "cancel_drops_only_callers_queued_lines",
         "cancel_leaves_other_callers_playing_line",
         "cancel_stops_own_playing_line_at_sentence_boundary",
+        # Synthesis runs ahead of playback: cancel still stops at the end of
+        # the sentence playing, not after everything already made.
+        "uncancelled_line_plays_every_sentence_made_ahead",
+        "cancel_while_draining_stops_after_the_playing_sentence",
+        "cancel_during_synthesis_stops_after_the_playing_sentence",
+        "other_callers_cancel_does_not_cut_a_draining_line",
+        "stuck_head_ends_the_line_at_the_deadline",
+        # An underrun between sentences (short first sentence, slow second)
+        # must not leave the track waiting to refill a 20 s buffer.
+        "short_first_sentence_underrun_still_plays_the_whole_line",
+        "line_without_underrun_plays_through_untouched",
         "cancel_with_nothing_queued_is_harmless",
         # linkToDeath path.
         "dead_caller_lines_are_dropped",
@@ -92,7 +106,8 @@ class SpeechServiceHarnessTest(unittest.TestCase):
         "refused_line_queues_nothing",
         "unpinned_caller_is_denied",
         "shutdown_cancels_queued_and_refuses_new",
-        "voice_failure_cancels_that_line_only",
+        "voice_failure_fails_that_line_only",
+        "playback_failure_fails_that_line_only",
         # Tuning (KTD8).
         "tuning_defaults",
         "tuning_overrides_and_clamps",
@@ -137,6 +152,59 @@ class SpeechServiceHarnessTest(unittest.TestCase):
 
 
 jvm_harness.add_scenario_tests(SpeechServiceHarnessTest)
+
+
+class SpeechClientHarnessTest(unittest.TestCase):
+    """RobotSpeechClient itself, compiled against android.* stubs, with a fake
+    Context and a fake launcher service."""
+    SCENARIOS = (
+        "speak_before_connect_is_sent_on_connect",
+        "bind_failure_fails_the_line_once",
+        "disconnect_fails_sent_lines_but_leaves_unsent_alone",
+        "cancel_before_connect_cancels_unsent_lines_once",
+        "cancel_while_connecting_skips_lines_not_yet_sent",
+        "last_callback_unbinds_and_next_speak_rebinds",
+        "duplicate_callback_fires_the_listener_once",
+        "failed_callback_reaches_on_failed_with_its_reason",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        jdk = jvm_harness.find_jdk()
+        if jdk is None:
+            raise unittest.SkipTest("no JDK (javac + java) found")
+        cls._td = tempfile.TemporaryDirectory(prefix="speech_client_harness_")
+        out = cls._td.name
+        c = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, [CLIENT_HARNESS_MAIN],
+                                                 [CLIENT_HARNESS / "src", CLIENT_HARNESS / "stubs", SHARED_SRC]),
+                           capture_output=True, text=True)
+        cls.compiled = c.returncode == 0
+        cls.compile_output = (c.stdout + c.stderr)[-3000:]
+        cls.results = {}
+        cls.run_output = ""
+        if c.returncode == 0:
+            r = subprocess.run([jdk[1], "-cp", out, "com.miko3.shared.SpeechClientHarness"],
+                               capture_output=True, text=True, timeout=60)
+            cls.run_output = (r.stdout + r.stderr)[-6000:]
+            cls.results = jvm_harness.parse_verdicts(r.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def setUp(self):
+        self.assertTrue(self.compiled, f"client harness failed to compile:\n{self.compile_output}")
+
+    def _assert_pass(self, name):
+        self.assertIn(name, self.results, f"scenario {name} never reported:\n{self.run_output}")
+        verdict, detail = self.results[name]
+        self.assertEqual(verdict, "PASS", f"{name}: {detail}")
+
+    def test_harness_reports_exactly_the_expected_scenarios(self):
+        self.assertEqual(sorted(self.results), sorted(self.SCENARIOS), self.run_output)
+
+
+jvm_harness.add_scenario_tests(SpeechClientHarnessTest)
 
 
 class PlainJavaTest(unittest.TestCase):
@@ -205,6 +273,20 @@ class EngineWiringTest(unittest.TestCase):
     def test_line_end_judged_by_playback_head(self):
         self.assertIn("getPlaybackHeadPosition()", self.src)
 
+    def test_playback_goes_through_speech_player(self):
+        # The harness covers SpeechPlayer and LineDrain; this pins the engine to them.
+        speak = _method_body(self.src, "public void speak") or ""
+        self.assertIn("player.write(", speak)
+        self.assertIn("player.chunkEnded()", speak)
+        end = _method_body(self.src, "public void endLine") or ""
+        self.assertIn("player.endLine(", end)
+        self.assertIn("queue.cancelRequested(", end)
+        player = _read(PLAYER)
+        self.assertIn("drain.await(", _method_body(player, "boolean endLine") or "")
+        self.assertIn("speaker.pause()", player)
+        self.assertIn("speaker.flush()", player)
+        self.assertEqual([ln for ln in PLAYER.read_text().splitlines() if ln.startswith("import android")], [])
+
     def test_plays_on_the_music_stream(self):
         self.assertIn("AudioAttributes.USAGE_MEDIA", self.src)
         self.assertIn("AudioTrack.MODE_STREAM", self.src)
@@ -225,8 +307,20 @@ class EngineWiringTest(unittest.TestCase):
         self.assertIn("new Thread(", self.src)
         self.assertIn(".start()", _method_body(self.src, "void start") or "")
 
+    def test_no_logging_of_spoken_text(self):
+        # What the robot says can be a child's words played back: logs carry
+        # ids, character counts and timings, never the text itself.
+        for path in (SERVICE, ENGINE, PLAYER, QUEUE, CLIENT, APP):
+            src = _read(path)
+            with self.subTest(file=path.name):
+                self.assertTrue(src, f"{path.name} missing")
+                for stmt in re.findall(r"Log\.\w\([^;]*;", src, flags=re.S):
+                    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', stmt)
+                    self.assertNotRegex(code, r"\b(text|chunk|transcript|line\.text)\b(?!\.length\(\))",
+                                        f"Log call names spoken text: {stmt}")
+
     def test_no_logging_of_secrets(self):
-        # Logging the spoken text is fine; the settings key never is.
+        # The settings key is never logged.
         for path in (SERVICE, ENGINE, QUEUE, INTERFACE, CLIENT, GATE):
             src = _read(path)
             with self.subTest(file=path.name):
@@ -263,6 +357,22 @@ class InterfaceAndClientTest(unittest.TestCase):
         body = _read(INTERFACE).split("abstract class Stub", 1)[0]
         self.assertRegex(body, r"void speak\(String \w+, Callback \w+\) throws RemoteException;")
         self.assertRegex(body, r"void cancel\(\) throws RemoteException;")
+
+    def test_callback_has_one_way_failed_transaction(self):
+        src = _read(INTERFACE)
+        body = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(body, r"void failed\(String \w+\) throws RemoteException;")
+        self.assertRegex(src, r"TRANSACTION_failed\s*=\s*3;")
+        self.assertRegex(src, r"case TRANSACTION_failed:[^}]*readString\(\)")
+        send = _method_body(src, "private void send")
+        self.assertIsNotNone(send)
+        self.assertIn("FLAG_ONEWAY", send)
+
+    def test_service_forwards_failed(self):
+        body = _method_body(_read(SERVICE), "public void failed")
+        self.assertIsNotNone(body, "SpeechService.LineCallback has no failed()")
+        self.assertIn("callback.failed(", body)
+        self.assertIn("unlink()", body)
 
     def test_client_binds_by_action_and_keeps_binding_until_callback(self):
         src = _read(CLIENT)
