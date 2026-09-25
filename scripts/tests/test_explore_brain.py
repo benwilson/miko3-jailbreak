@@ -243,6 +243,10 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "escape_back_out_stops_at_the_logged_distance_and_the_retrace_distance",
         "escape_back_out_needs_a_logged_leg",
         "escape_stall_during_back_out_stops_it",
+        # Pinned: one ladder, then longer rests while still pinned, reset by a clean drive-off
+        "pinned_runs_the_ladder_once_with_two_asks_then_rests",
+        "pinned_after_the_rest_waits_longer_before_the_next_ladder",
+        "pinned_backoff_resets_after_a_clean_drive_off",
     )
 
     @classmethod

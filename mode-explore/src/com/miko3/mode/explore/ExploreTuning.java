@@ -82,6 +82,15 @@ final class ExploreTuning {
     final int capHazards;
     final long capWindowMs;
     final long cooldownMs;
+    /**
+     * Still pinned (live: every turn blocked, a ladder with its two Claude asks every
+     * ~40 s): after a failed escape ladder's rest, a wedge within pinnedWindowMs of
+     * the rest ending means he never got anywhere. The next ladder then waits
+     * cooldownMs x 2^k (k failed ladders in a row, capped at pinnedMaxRestMs);
+     * a clean drive-off or clean leg resets k.
+     */
+    final long pinnedWindowMs;
+    final long pinnedMaxRestMs;
     /** Whether ir1 is the left-hand edge sensor. Unverified until U1/U8; only steers which way to turn away. */
     final boolean ir1IsLeft;
     /**
@@ -349,6 +358,8 @@ final class ExploreTuning {
         capHazards = Math.max(1, b.capHazards);
         capWindowMs = b.capWindowMs;
         cooldownMs = b.cooldownMs;
+        pinnedWindowMs = b.pinnedWindowMs;
+        pinnedMaxRestMs = b.pinnedMaxRestMs;
         ir1IsLeft = b.ir1IsLeft;
         approachBandLower = b.approachBandLower;
         confidenceFloor = b.confidenceFloor;
@@ -533,6 +544,8 @@ final class ExploreTuning {
         private int capHazards = 8;
         private long capWindowMs = 20000;
         private long cooldownMs = 30000;
+        private long pinnedWindowMs = 10000;
+        private long pinnedMaxRestMs = 240000;
         private boolean ir1IsLeft = true;
         // docs/solutions/best-practices/miko3-tof-is-a-downward-cliff-sensor-inside-mcu-safe-band.md
         private int approachBandLower = 170;
@@ -704,6 +717,11 @@ final class ExploreTuning {
             capHazards = hazards;
             capWindowMs = windowMs;
             cooldownMs = cooldown;
+            return this;
+        }
+        Builder pinned(long windowMs, long maxRestMs) {
+            pinnedWindowMs = windowMs;
+            pinnedMaxRestMs = maxRestMs;
             return this;
         }
         Builder ir1IsLeft(boolean v) { ir1IsLeft = v; return this; }

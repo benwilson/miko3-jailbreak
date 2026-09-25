@@ -22,7 +22,12 @@ import java.util.List;
  *   DRIVE_OFF  turn to that heading and drive off: freed, else SECOND_ASK.
  *   SECOND_ASK one more ask with the frame he sees now (never twice): its heading,
  *              SECOND_DRIVE_OFF; else REST.
- *   REST       the cornered rest, as before U5.
+ *   REST       the cornered rest, as before U5; one failed escape. Still pinned when
+ *              it ends (the first move blocked too), the brain rests longer before the
+ *              next ladder (ExploreTuning.pinnedWindowMs, pinnedMaxRestMs).
+ *
+ * A drive-off frees him only if the encoders moved at least the stall rate over
+ * it: its ticks end before the stall watch can rule.
  *
  * Every step has a budget (ExploreTuning.escape*Ms, adding to ~30 s up to the
  * first drive-off); a step out of time has failed and the next starts, and a

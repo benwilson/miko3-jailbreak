@@ -539,6 +539,16 @@ final class ExploreBrain {
 
     private Esc esc;
     private EscThen escThen;
+    /**
+     * Escape ladders that ended in rest, in a row (reset by a clean drive-off or a
+     * clean leg); they set how long he rests when still pinned (pinnedRestMs()).
+     */
+    private int failedLadders;
+    /** When the last cornered rest ended (its first move after is the pinned check). */
+    private long restEndedAt = Long.MIN_VALUE / 4;
+    /** This rest is the still-pinned one: when it ends, the ladder, not the wider turn. */
+    private boolean ladderAfterRest;
+    private boolean ladderTurnBlocked;
     private Direction escDir;
     private double escTurnAmount;
     /** This turn has had its back-out already. */
@@ -883,7 +893,11 @@ final class ExploreBrain {
                 escapeTick(now, fresh, hazard);
                 break;
             case CORNERED:
-                if (now >= phaseUntil) {
+                if (now >= phaseUntil && ladderAfterRest) {
+                    ladderAfterRest = false;
+                    startLadder(now, "still pinned after the longer rest", ladderTurnBlocked);
+                } else if (now >= phaseUntil) {
+                    restEndedAt = now;
                     hazardTimes.clear();
                     Direction d = lastHazardSide != null ? lastHazardSide.opposite() : randomDirection();
                     note("cool-down over, trying a wider turn " + d);
@@ -903,6 +917,7 @@ final class ExploreBrain {
         compass.droveOffCleanly();
         hazardTimes.clear();
         stallStreak = 0;
+        failedLadders = 0;
         escapeFailures.clear();
         escapeSide = null;
         enterPause(now, pauseMs(), false);
@@ -2437,8 +2452,37 @@ final class ExploreBrain {
             enterCornered(now);
             return;
         }
+        if (failedLadders > 0 && now - restEndedAt <= tuning.pinnedWindowMs) {
+            // The first move after the rest is blocked too: still pinned. The ladder (and
+            // its two Claude asks) waits out a longer rest instead of running again now.
+            restEndedAt = Long.MIN_VALUE / 4;
+            long rest = pinnedRestMs();
+            note("still pinned after the rest: " + why + " (" + failedLadders + " failed escapes in a row); resting "
+                    + rest + " ms before the next escape");
+            rest(now, rest);
+            ladderAfterRest = true;
+            ladderTurnBlocked = turnBlocked;
+            return;
+        }
+        startLadder(now, why, turnBlocked);
+    }
+
+    /**
+     * The rest before the next ladder when still pinned: cooldownMs doubled for each
+     * failed ladder in a row, capped at pinnedMaxRestMs.
+     */
+    private long pinnedRestMs() {
+        long rest = tuning.cooldownMs;
+        for (int i = 0; i < failedLadders && rest < tuning.pinnedMaxRestMs; i++) {
+            rest *= 2;
+        }
+        return Math.min(rest, Math.max(tuning.cooldownMs, tuning.pinnedMaxRestMs));
+    }
+
+    /** The escape ladder from its first step (retrace, circle, way out, drive off). */
+    private void startLadder(long now, String why, boolean turnBlocked) {
         note("wedged: " + why + " (" + hazardTimes.size() + " hazards, " + stallStreak + " stalls, "
-                + escapeFailures.size() + " failed escapes); escaping");
+                + failedLadders + " failed escapes in a row); escaping");
         hazardTimes.clear();
         escapeFailures.clear();
         planner.begin(now, compass.degrees());
@@ -2500,9 +2544,14 @@ final class ExploreBrain {
                 escTurnTo(now, planner.driveHeading(), EscThen.DRIVE);
                 break;
             case REST:
+                // The whole ladder failed: one failed escape, counted for the pinned rests.
                 planner.reset();
                 esc = null;
-                enterCornered(now);
+                failedLadders++;
+                stopMotors();
+                note("cornered: " + failedLadders + " failed escapes in a row, " + hazardTimes.size()
+                        + " hazards; resting " + tuning.cooldownMs + " ms");
+                rest(now, tuning.cooldownMs);
                 break;
             default:
                 break;
@@ -2662,6 +2711,24 @@ final class ExploreBrain {
         }
         boolean done = escGoal > 0 ? escMoved >= escGoal
                 : escTicks >= tuning.escapeDriveTicks && now >= nextTickAt;
+        if (done && escGoal <= 0 && escDroveNowhere(now)) {
+            // Live, pinned: the drive-off's ticks ran out before the stall watch could
+            // rule (grace + window), and "free" wiped the ladder; the next move was
+            // blocked and a whole new ladder began. Its encoders decide instead.
+            stopMotors();
+            note("wheels stalled driving in the escape's " + planner.phase() + ": " + escMoved + " counts in "
+                    + (now - hopStartedAt) + " ms");
+            show(EyeState.FLINCH, null);
+            planner.next(now);
+            if (tuning.backTicks > 0) {
+                escGoal = 0;
+                escThen = EscThen.PHASE;
+                esc = Esc.BACK_READY;
+            } else {
+                escapePhase(now);
+            }
+            return;
+        }
         if (done) {
             stopMotors();
             if (planner.phase() == EscapePlanner.Phase.RETRACE) {
@@ -2675,6 +2742,15 @@ final class ExploreBrain {
             nextTickAt += tuning.hopTickMs;
             motor.hopTick();
         }
+    }
+
+    /**
+     * The escape drive so far moved less than the stall rate (stallMinCounts, both
+     * wheels, per stallWindowMs): the wheels went nowhere. False without encoders.
+     */
+    private boolean escDroveNowhere(long now) {
+        long ms = Math.max(1, now - hopStartedAt);
+        return escFrom != null && 2 * escMoved * tuning.stallWindowMs < tuning.stallMinCounts * ms;
     }
 
     /** Backing out (goal counts, bounded by backOutMaxMs) or a hazard's timed back-off (blind either way). */
@@ -2893,7 +2969,8 @@ final class ExploreBrain {
     /** A step out of time has failed (U5's budgets); driving clear when it ran out has freed him. */
     private void escapeOutOfTime(long now) {
         EscapePlanner.Phase p = planner.phase();
-        boolean clear = esc == Esc.DRIVING && moving && escTicks >= tuning.escapeFreeTicks;
+        boolean clear = esc == Esc.DRIVING && moving && escTicks >= tuning.escapeFreeTicks
+                && (escGoal > 0 || !escDroveNowhere(now));
         stopMotors();
         cancelWayOut();
         if (clear && (p == EscapePlanner.Phase.RETRACE || p == EscapePlanner.Phase.DRIVE_OFF
@@ -2922,6 +2999,7 @@ final class ExploreBrain {
         compass.droveOffCleanly();
         hazardTimes.clear();
         stallStreak = 0;
+        failedLadders = 0;
         escapeFailures.clear();
         escapeSide = null;
         lastHazardSide = null;
@@ -3050,11 +3128,18 @@ final class ExploreBrain {
     private void enterCornered(long now) {
         stopMotors();
         note("cornered: " + escapeFailures.size() + " failed escapes, " + hazardTimes.size()
-                + " hazards; resting");
+                + " hazards; resting " + tuning.cooldownMs + " ms");
+        rest(now, tuning.cooldownMs);
+    }
+
+    /** The cornered rest: eyes resting, no motion, for restMs; then the wider turn. */
+    private void rest(long now, long restMs) {
+        stopMotors();
         hazardTimes.clear();
         escapeFailures.clear();
+        ladderAfterRest = false;
         state = State.CORNERED;
-        phaseUntil = now + tuning.cooldownMs;
+        phaseUntil = now + restMs;
         show(EyeState.RESTING, null);
     }
 

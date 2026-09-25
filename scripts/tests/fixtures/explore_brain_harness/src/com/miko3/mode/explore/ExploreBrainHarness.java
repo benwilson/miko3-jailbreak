@@ -1039,6 +1039,7 @@ public final class ExploreBrainHarness {
         headingScenarios();
         navScenarios();
         escapeScenarios();
+        pinnedScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -3754,6 +3755,132 @@ public final class ExploreBrainHarness {
      * (ahead middling, so no look ends the first leg early). */
     private static OpenView deskView() {
         return (r, t) -> r.count("hop") == 0 ? prof(0.9f, 0.9f, 0.9f, 0.9f) : prof(0.9f, 0.1f, 0.5f, 0.9f);
+    }
+
+    // ---- pinned (live: every turn blocked, the wheels going nowhere either way) ----
+
+    /** Pins or frees the rig: turns, reversing and driving forward all go nowhere (0 counts). */
+    private static void pin(Rig r, boolean on) {
+        r.yaw.stuck = on;
+        r.backBlocked = on;
+        r.blockedFrom = on ? Math.min(r.blockedFrom, r.now) : Long.MAX_VALUE;
+    }
+
+    /** A pinned rig whose Claude always points straight ahead in the first frame (no turn needed). */
+    private static Rig pinnedRig(List<String> notes) {
+        Rig[] h = new Rig[1];
+        Rig rig = escRig(escTuning().turnChance(1.0), h, CLEAR, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+        rig.creepPer100 = 0;
+        rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+        pin(rig, true);
+        rig.blockedFrom = 0;
+        return rig;
+    }
+
+    /** Each entry into state s, in order. */
+    private static List<Long> entries(Rig rig, ExploreBrain.State s) {
+        List<Long> out = new ArrayList<Long>();
+        for (Event e : rig.stateLog) {
+            if (e.what.equals(s.name())) {
+                out.add(e.t);
+            }
+        }
+        return out;
+    }
+
+    /** How long the rest entered at t lasted (until the next state), else -1. */
+    private static long restLength(Rig rig, long t) {
+        Event next = nextState(rig, t);
+        return next == null ? -1 : next.t - t;
+    }
+
+    private static int notesWith(List<String> notes, String part) {
+        int n = 0;
+        for (String x : notes) {
+            n += x.contains(part) ? 1 : 0;
+        }
+        return n;
+    }
+
+    private static void pinnedScenarios() {
+        scenario("pinned_runs_the_ladder_once_with_two_asks_then_rests", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            runUntil(rig, 60000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            long rest = entered(rig, ExploreBrain.State.CORNERED, 0);
+            long retrace = entered(rig, ExploreBrain.State.RETRACE, 0);
+            long circle = entered(rig, ExploreBrain.State.CIRCLE, retrace);
+            long ask = entered(rig, ExploreBrain.State.WAY_OUT, circle);
+            long off = entered(rig, ExploreBrain.State.DRIVE_OFF, ask);
+            long second = entered(rig, ExploreBrain.State.WAY_OUT, off);
+            long off2 = entered(rig, ExploreBrain.State.DRIVE_OFF, second);
+            check(n, retrace > 0 && circle > retrace && ask > circle && off > ask && second > off && off2 > second
+                            && rest > off2 && entries(rig, ExploreBrain.State.RETRACE).size() == 1
+                            && rig.wayOutRequests.size() == 2 && !rig.wayOutRequests.get(0).second
+                            && rig.wayOutRequests.get(1).second && notesWith(notes, "wedged:") == 1
+                            && notesWith(notes, "free after") == 0 && notesWith(notes, "cornered: 1 failed escape") == 1
+                            && rig.violations.isEmpty(),
+                    "retrace@" + retrace + " circle@" + circle + " ask@" + ask + " off@" + off + " second@" + second
+                            + " off2@" + off2 + " rest@" + rest + " asks=" + rig.wayOutRequests.size() + " notes=" + notes);
+        });
+        scenario("pinned_after_the_rest_waits_longer_before_the_next_ladder", n -> {
+            // Rests: 30 s after each failed ladder; a still-pinned first move after it rests
+            // again 30 s x 2^k (k failed ladders in a row, capped at 240 s) before the next
+            // ladder. Ladders start near 0 s, ~103 s, ~264 s here: at most 3 in 5 minutes,
+            // so at most 6 way-out asks (two per ladder) where 30 s rests alone gave ~7 ladders.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            rig.runUntil(300000);
+            List<Long> ladders = entries(rig, ExploreBrain.State.RETRACE);
+            List<Long> rests = entries(rig, ExploreBrain.State.CORNERED);
+            long firstRest = rests.isEmpty() ? -1 : rests.get(0);
+            long longRest = -1;
+            for (long t : rests) {
+                if (longRest < 0 && t > firstRest && ladders.size() > 1 && t < ladders.get(1)) {
+                    longRest = restLength(rig, t);
+                }
+            }
+            check(n, ladders.size() >= 2 && ladders.size() <= 3 && rig.wayOutRequests.size() <= 6
+                            && rig.wayOutRequests.size() == 2 * ladders.size()
+                            && restLength(rig, firstRest) == 30000 && longRest == 60000
+                            && ladders.get(1) - firstRest >= 30000 + 60000
+                            && notesWith(notes, "free after") == 0 && rig.violations.isEmpty(),
+                    "ladders=" + ladders + " rests=" + rests + " longRest=" + longRest + " asks="
+                            + rig.wayOutRequests.size() + " " + rig.tail());
+        });
+        scenario("pinned_backoff_resets_after_a_clean_drive_off", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            // Pinned: ladder 1 fails, the rest, still pinned, the longer rest.
+            runUntil(rig, 120000, r -> entries(r, ExploreBrain.State.CORNERED).size() >= 2);
+            long longRestAt = rig.now;
+            pin(rig, false);
+            // Freed by hand during the longer rest: ladder 2 drives off cleanly.
+            runUntil(rig, 240000, r -> notesWith(notes, "free after") > 0);
+            long freeAt = rig.now;
+            pin(rig, true);
+            // Pinned again: the next wedge runs its ladder at once, and the rest after it and
+            // the still-pinned one are the first ones again (30 s, then 60 s).
+            runUntil(rig, 400000, r -> entries(r, ExploreBrain.State.CORNERED).size() >= 4);
+            rig.runUntil(rig.now + 61000);
+            List<Long> ladders = entries(rig, ExploreBrain.State.RETRACE);
+            List<Long> rests = entries(rig, ExploreBrain.State.CORNERED);
+            long ladder3 = -1;
+            for (long t : ladders) {
+                if (ladder3 < 0 && t > freeAt) {
+                    ladder3 = t;
+                }
+            }
+            long rest3 = rests.size() >= 3 ? rests.get(2) : -1;
+            long rest4 = rests.size() >= 4 ? rests.get(3) : -1;
+            check(n, freeAt > longRestAt && ladder3 > freeAt && ladder3 - freeAt <= 10000 && rest3 > ladder3
+                            && restLength(rig, rest3) == 30000 && rest4 > rest3 && restLength(rig, rest4) == 60000
+                            && rig.violations.isEmpty(),
+                    "free@" + freeAt + " ladders=" + ladders + " rests=" + rests + " " + rig.tail());
+        });
     }
 
     private static void escapeScenarios() {
