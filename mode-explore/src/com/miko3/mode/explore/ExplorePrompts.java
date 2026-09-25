@@ -162,6 +162,40 @@ final class ExplorePrompts {
                 + " imply that he will remember or recognise them later.";
     }
 
+    // ---- the way out of a wedge (explore nav plan U5, KTD4): one schema for both asks ----
+
+    /** The system prompt for navigation asks: no lines to write, only where to drive. */
+    static final String NAV_SYSTEM =
+            "You help Miko, a small, friendly home robot about 25 cm tall, find his way around the house. "
+            + "You see through his camera, which sits low near the floor and looks straight ahead. "
+            + "He drives on wheels on the floor and needs a gap wider than himself to get through.";
+
+    /** The text before the frames: what they are. */
+    static String wayOutIntro(int frames, int width, int height, boolean second) {
+        return (second
+                ? "Miko is stuck and could not drive out the way he chose. This is what his camera sees right"
+                + " now, labelled Frame 1."
+                : "Miko is stuck: he keeps bumping into things. He turned a full circle in steps, taking " + frames
+                + " photos in order, labelled Frame 1 to Frame " + frames + ".")
+                + " Each is " + width + " x " + height + " pixels.";
+    }
+
+    /** The text after the frames: what counts as a way out, and what to answer. */
+    static String wayOutAsk(int frames, boolean second) {
+        return "Which way is out? Pick the single best direction for him to drive: open floor he can roll across,"
+                + " an open doorway, or toward a person. Avoid walls, furniture, a closed door, stairs or a drop,"
+                + " and gaps too narrow for him. Answer way_out true with the frame number"
+                + (frames > 1 ? " (1 to " + frames + ")" : " (1)")
+                + " and x, the pixel column in that frame where the way out is (0 is the left edge)."
+                + " Answer way_out false if nothing looks open"
+                + (second ? "." : " in any frame.");
+    }
+
+    static final Map<String, Object> WAY_OUT_SCHEMA = object(
+            "way_out", type("boolean"),
+            "frame", type("integer"),
+            "x", type("integer"));
+
     // ---- schema building ----
 
     private static String kindWord(CuriosityPort.Kind k) {

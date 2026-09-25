@@ -252,6 +252,68 @@ final class ExploreTuning {
      * wheels) forward since the look arrived, with no hazard or stall in between.
      */
     final long floorTeachCounts;
+    /**
+     * A measured turn the gyro says isn't turning (explore nav plan U5; live 2026-09-25,
+     * wedged under a desk: "asked 120 deg, turned 0 deg", each waiting out the 15 s
+     * backstop): less than turnStallDeg of progress for turnStallMs, from the turn's
+     * start or its last progress, is a blocked turn. It stops at once and counts as
+     * wedged. 5 deg in 1.5 s is far below any real turn (~60 deg/s) and well above
+     * the gyro's drift while still.
+     */
+    final double turnStallDeg;
+    final long turnStallMs;
+    /**
+     * Wedged (explore nav plan U5, R11-R14): with the heading usable, wedgeHazards
+     * hazard reactions within capWindowMs with no clean leg between, wedgeStalls
+     * stalls in a row, wedgeFailedEscapes failed escape sweeps, or a blocked turn
+     * start the escape planner (EscapePlanner) instead of today's escape turns; the
+     * cornered cap above still applies uncalibrated.
+     */
+    final int wedgeHazards;
+    final int wedgeStalls;
+    final int wedgeFailedEscapes;
+    /**
+     * The retrace (KTD6): back along the leg log, newest leg first, turning to face
+     * each leg's reverse and driving it forward, up to escapeRetraceCounts in all
+     * (encoder counts, the mean of both wheels). A move under escapeRetraceMinCounts
+     * is encoder slack and skipped. Legs within escapeLineToleranceDeg of opposite
+     * (a leg and its back-off) cancel; within it of his facing they lie on his line
+     * for a straight back-out when he cannot turn.
+     */
+    final long escapeRetraceCounts;
+    final long escapeRetraceMinCounts;
+    final double escapeLineToleranceDeg;
+    /**
+     * Each escape step's time budget (U5's table, ~30 s to driving off after the
+     * circle's way-out answer); a step out of time has failed and the next starts.
+     * The second ask comes after the target has been missed, so its own budget is
+     * outside it; its drive-off gets escapeDriveOffMs like the first.
+     */
+    final long escapeRetraceMs;
+    final long escapeCircleMs;
+    final long escapeAskMs;
+    final long escapeDriveOffMs;
+    final long escapeSecondAskMs;
+    /**
+     * The measured circle: escapeCircleSteps looks escapeCircleStepDeg apart, each
+     * from a frame captured escapeSettleMs after he stopped (the gyro's bias is
+     * re-estimated in that stillness: headingSettleMs plus a few readings).
+     */
+    final int escapeCircleSteps;
+    final double escapeCircleStepDeg;
+    final long escapeSettleMs;
+    /**
+     * A drive-off is escapeDriveTicks forward ticks clear of hazards and stalls. A step
+     * whose budget ends while he is driving forward cleanly, escapeFreeTicks in, has
+     * freed him rather than failed.
+     */
+    final int escapeDriveTicks;
+    final int escapeFreeTicks;
+    /** The on-robot way out: a heading within escapeTriedDeg of one tried this escape loses escapeTriedPenalty. */
+    final double escapeTriedDeg;
+    final float escapeTriedPenalty;
+    /** A back-out is blind: never longer than this, whatever the leg log allows. */
+    final long backOutMaxMs;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -356,6 +418,27 @@ final class ExploreTuning {
         steerTurnsOnlyMax = Math.max(0, b.steerTurnsOnlyMax);
         steerShortTicks = Math.max(1, b.steerShortTicks);
         floorTeachCounts = b.floorTeachCounts;
+        turnStallDeg = b.turnStallDeg;
+        turnStallMs = b.turnStallMs;
+        wedgeHazards = Math.max(1, b.wedgeHazards);
+        wedgeStalls = Math.max(1, b.wedgeStalls);
+        wedgeFailedEscapes = Math.max(1, b.wedgeFailedEscapes);
+        escapeRetraceCounts = Math.max(0, b.escapeRetraceCounts);
+        escapeRetraceMinCounts = Math.max(1, b.escapeRetraceMinCounts);
+        escapeLineToleranceDeg = b.escapeLineToleranceDeg;
+        escapeRetraceMs = b.escapeRetraceMs;
+        escapeCircleMs = b.escapeCircleMs;
+        escapeAskMs = b.escapeAskMs;
+        escapeDriveOffMs = b.escapeDriveOffMs;
+        escapeSecondAskMs = b.escapeSecondAskMs;
+        escapeCircleSteps = Math.max(1, b.escapeCircleSteps);
+        escapeCircleStepDeg = b.escapeCircleStepDeg;
+        escapeSettleMs = b.escapeSettleMs;
+        escapeDriveTicks = Math.max(1, b.escapeDriveTicks);
+        escapeFreeTicks = Math.max(1, b.escapeFreeTicks);
+        escapeTriedDeg = b.escapeTriedDeg;
+        escapeTriedPenalty = b.escapeTriedPenalty;
+        backOutMaxMs = b.backOutMaxMs;
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
@@ -551,6 +634,34 @@ final class ExploreTuning {
         // driving, about the distance to the frame's bottom rows with this tilted-up
         // camera ~10 cm off the floor. Not measured; U8 checks it.
         private long floorTeachCounts = 1000;
+        private double turnStallDeg = 5;
+        private long turnStallMs = 1500;
+        // Three hazards with no clean leg between: the wall-and-plant nook (AE1) gives
+        // exactly that, where today's cap (8) took minutes of failed sweeps.
+        private int wedgeHazards = 3;
+        private int wedgeStalls = 2;
+        private int wedgeFailedEscapes = 1;
+        // ~2 s of driving at 650-880 counts/s (docs/hardware/tof-sensor.md): out of a
+        // nook the size of the robot or two. Not measured; U8 checks it.
+        private long escapeRetraceCounts = 1500;
+        private long escapeRetraceMinCounts = 60;
+        private double escapeLineToleranceDeg = 20;
+        // U5's step budget table: 6 + 12 + 6 + 3 = 27 s, inside the ~30 s target.
+        private long escapeRetraceMs = 6000;
+        private long escapeCircleMs = 12000;
+        private long escapeAskMs = 6000;
+        private long escapeDriveOffMs = 3000;
+        private long escapeSecondAskMs = 6000;
+        private int escapeCircleSteps = 6;
+        private double escapeCircleStepDeg = 60;
+        // Heading U2: the bias needs ~0.8 s still (headingSettleMs + biasSamplesMin readings).
+        private long escapeSettleMs = 800;
+        // ~1.5 s of driving off; 1 s of it clean is free when a budget ends mid-drive.
+        private int escapeDriveTicks = 6;
+        private int escapeFreeTicks = 4;
+        private double escapeTriedDeg = 45;
+        private float escapeTriedPenalty = 0.5f;
+        private long backOutMaxMs = 4000;
 
         /** A fixed leg length. */
         Builder hopTicks(int v) { hopTicks = v; hopTicksMax = v; return this; }
@@ -699,6 +810,40 @@ final class ExploreTuning {
             return this;
         }
         Builder floorTeachCounts(long v) { floorTeachCounts = v; return this; }
+        Builder turnStall(double deg, long ms) { turnStallDeg = deg; turnStallMs = ms; return this; }
+        Builder wedge(int hazards, int stalls, int failedEscapes) {
+            wedgeHazards = hazards;
+            wedgeStalls = stalls;
+            wedgeFailedEscapes = failedEscapes;
+            return this;
+        }
+        Builder escapeRetrace(long counts, long minCounts) {
+            escapeRetraceCounts = counts;
+            escapeRetraceMinCounts = minCounts;
+            return this;
+        }
+        Builder escapeLineToleranceDeg(double v) { escapeLineToleranceDeg = v; return this; }
+        Builder escapeBudgets(long retraceMs, long circleMs, long askMs, long driveOffMs, long secondAskMs) {
+            escapeRetraceMs = retraceMs;
+            escapeCircleMs = circleMs;
+            escapeAskMs = askMs;
+            escapeDriveOffMs = driveOffMs;
+            escapeSecondAskMs = secondAskMs;
+            return this;
+        }
+        Builder escapeCircle(int steps, double stepDeg, long settleMs) {
+            escapeCircleSteps = steps;
+            escapeCircleStepDeg = stepDeg;
+            escapeSettleMs = settleMs;
+            return this;
+        }
+        Builder escapeDrive(int ticks, int freeTicks) {
+            escapeDriveTicks = ticks;
+            escapeFreeTicks = freeTicks;
+            return this;
+        }
+        Builder escapeTried(double deg, float penalty) { escapeTriedDeg = deg; escapeTriedPenalty = penalty; return this; }
+        Builder backOutMaxMs(long v) { backOutMaxMs = v; return this; }
 
         ExploreTuning build() {
             return new ExploreTuning(this);

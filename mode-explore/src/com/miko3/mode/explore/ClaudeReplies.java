@@ -61,6 +61,41 @@ final class ClaudeReplies {
     }
 
     /**
+     * The way-out reply (explore nav plan U5): "frame" 1-based among the frames sent
+     * (widths[i] pixels wide each), "x" the pixel column of the way out (or, as a
+     * fraction, 0..1). A frame out of range (frame 7 of 6), a column outside its frame,
+     * or anything missing is a failure; way_out false is NONE.
+     */
+    static CuriosityPort.WayOut wayOut(Map<String, Object> json, int[] widths) {
+        Object way = json.get("way_out");
+        if (Boolean.FALSE.equals(way)) {
+            return CuriosityPort.WayOut.none();
+        }
+        if (!Boolean.TRUE.equals(way)) {
+            return CuriosityPort.WayOut.failed();
+        }
+        Long frame = integer(json.get("frame"));
+        Object xv = json.get("x");
+        if (frame == null || frame < 1 || frame > widths.length || !(xv instanceof Number)) {
+            return CuriosityPort.WayOut.failed();
+        }
+        int f = (int) (frame - 1);
+        double width = widths[f];
+        Long px = integer(xv);
+        double at;
+        if (px != null) {
+            at = px / width;
+        } else {
+            // Not a whole number: a fraction of the frame's width.
+            at = ((Number) xv).doubleValue();
+        }
+        if (width <= 0 || Double.isNaN(at) || at < 0 || at > 1) {
+            return CuriosityPort.WayOut.failed();
+        }
+        return CuriosityPort.WayOut.way(f, (float) (at * 2 - 1));
+    }
+
+    /**
      * The person reply against a gallery of galleryCount references. Returns
      * the 0-based reference matched, or -1 for "none", "unsure", a number
      * beyond the gallery, or anything else (all a new person, KTD3), plus the

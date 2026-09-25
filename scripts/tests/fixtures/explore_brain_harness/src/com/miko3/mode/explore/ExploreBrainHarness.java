@@ -104,6 +104,8 @@ public final class ExploreBrainHarness {
     static class YawSim {
         final ExploreCalibration.Gyro gyro;
         double rateDegS = 60;
+        /** The wheels turn but he doesn't (wedged under a desk, explore nav plan U5): the yaw stays flat. */
+        boolean stuck;
         double biasCounts = 92;
         double coastDeg;
         /** Unwrapped, left positive, starting at 0. */
@@ -149,7 +151,9 @@ public final class ExploreBrainHarness {
         void advance(long ms) {
             double s = rateDegS * ms / 1000.0;
             if (dir != 0) {
-                trueDeg += dir * s;
+                if (!stuck) {
+                    trueDeg += dir * s;
+                }
             } else if (coastLeft > 0) {
                 double m = Math.min(coastLeft, s);
                 trueDeg += coastDir * m;
@@ -232,6 +236,33 @@ public final class ExploreBrainHarness {
      */
     interface Claude {
         CuriosityPort.Answer answer(Rig rig, CuriosityPort.LookRequest request, int nth);
+    }
+
+    /** The scripted way-out answers (explore nav plan U5): the nth wayOut()'s answer, or null for none ever. */
+    interface WayOutScript {
+        CuriosityPort.WayOut answer(Rig rig, CuriosityPort.WayOutRequest request, int nth);
+    }
+
+    /** One straight drive: when it started, the true heading then, and the counts it moved (back: negative). */
+    static final class Drive {
+        final long t;
+        final double heading;
+        final String kind;
+        final String state;
+        long end = -1;
+        long counts;
+
+        Drive(long t, double heading, String kind, String state) {
+            this.t = t;
+            this.heading = heading;
+            this.kind = kind;
+            this.state = state;
+        }
+
+        @Override
+        public String toString() {
+            return kind + "@" + t + "-" + end + " " + state + " " + Math.round(heading) + "deg " + counts;
+        }
     }
 
     interface MatchScript {
@@ -339,6 +370,25 @@ public final class ExploreBrainHarness {
         long pendingRememberedAt;
         CuriosityPort.Answer pendingWelcomed;
         long pendingWelcomedAt;
+        /** The fake way-out request (explore nav plan U5): null script means every request fails. */
+        WayOutScript wayOuts;
+        long wayOutDelayMs = 1000;
+        final List<CuriosityPort.WayOutRequest> wayOutRequests = new ArrayList<CuriosityPort.WayOutRequest>();
+        final List<Long> wayOutTimeouts = new ArrayList<Long>();
+        CuriosityPort.WayOut pendingWayOut;
+        long pendingWayOutAt;
+        /** The true heading at each look's capture time (explore nav plan U5), for aiming checks. */
+        final java.util.Map<Long, Double> lookHeadings = new java.util.HashMap<Long, Double>();
+        /** Every straight drive, in order; the current one while it runs. */
+        final List<Drive> drives = new ArrayList<Drive>();
+        Drive drive;
+        long driveStartWheel;
+        /** When the current (or last) forward leg started. */
+        long legStartT;
+        /** Reversing moves nothing (a stall during a back-out). */
+        boolean backBlocked;
+        /** The true heading when the brain first entered CIRCLE (NaN before). */
+        double circleFrom = Double.NaN;
         /** Every brain state seen, and every state seen with the camera open. */
         final java.util.Set<ExploreBrain.State> statesSeen = new java.util.TreeSet<ExploreBrain.State>();
         final java.util.Set<ExploreBrain.State> openStates = new java.util.TreeSet<ExploreBrain.State>();
@@ -378,8 +428,10 @@ public final class ExploreBrainHarness {
                     wheelRight += creepPer100;
                 }
             } else if ("back".equals(motion)) {
-                wheelLeft--;
-                wheelRight--;
+                if (!backBlocked) {
+                    wheelLeft--;
+                    wheelRight--;
+                }
             } else if ("turn".equals(motion)) {
                 wheelLeft--;
                 wheelRight++;
@@ -415,6 +467,9 @@ public final class ExploreBrainHarness {
                 if (cameraOpen && vision != null && now % 500 == 0 && now >= looksFrom) {
                     List<Detection> seen = vision.see(this, now - 200);
                     if (seen != null) {
+                        if (yaw != null) {
+                            lookHeadings.put(now - 200, yaw.wrapped());
+                        }
                         latestLook = new ExploreBrain.Look(staleLooks ? openedAt - 1000 : now - 200, seen,
                                 ("jpeg@" + (now - 200)).getBytes(java.nio.charset.StandardCharsets.US_ASCII),
                                 openView == null ? null : openView.at(this, now - 200));
@@ -443,6 +498,9 @@ public final class ExploreBrainHarness {
                 statesSeen.add(brain.state());
                 if (brain.state() != lastState) {
                     lastState = brain.state();
+                    if (lastState == ExploreBrain.State.CIRCLE && Double.isNaN(circleFrom) && yaw != null) {
+                        circleFrom = yaw.wrapped();
+                    }
                     stateLog.add(new Event(now, lastState.name()));
                 }
                 if (cameraOpen) {
@@ -527,6 +585,8 @@ public final class ExploreBrainHarness {
         public void hopTick() {
             if (!moving) {
                 checkStart("hop", true);
+                legStartT = now;
+                startDrive("hop");
                 if (hopTicksThisHop > 0) {
                     legLengths.add(hopTicksThisHop);
                     minHopTicks = Math.min(minHopTicks, hopTicksThisHop);
@@ -560,6 +620,9 @@ public final class ExploreBrainHarness {
 
         @Override
         public void backTick() {
+            if (!moving || !"back".equals(motion)) {
+                startDrive("back");
+            }
             moving = true;
             motion = "back";
             log.add(new Event(now, "back"));
@@ -567,12 +630,23 @@ public final class ExploreBrainHarness {
 
         @Override
         public void stop() {
+            if (drive != null) {
+                drive.end = now;
+                drive.counts = wheelLeft - driveStartWheel;
+                drive = null;
+            }
             moving = false;
             motion = null;
             if (yaw != null) {
                 yaw.stop();
             }
             log.add(new Event(now, "stop"));
+        }
+
+        private void startDrive(String kind) {
+            drive = new Drive(now, yaw == null ? Double.NaN : yaw.wrapped(), kind, brain.state().name());
+            driveStartWheel = wheelLeft;
+            drives.add(drive);
         }
 
         @Override
@@ -765,6 +839,33 @@ public final class ExploreBrainHarness {
         }
 
         @Override
+        public void wayOut(CuriosityPort.WayOutRequest request, long timeoutMs) {
+            wayOutRequests.add(request);
+            wayOutTimeouts.add(timeoutMs);
+            pendingWayOut = wayOuts == null ? CuriosityPort.WayOut.failed()
+                    : wayOuts.answer(this, request, wayOutRequests.size());
+            pendingWayOutAt = now + wayOutDelayMs;
+            log.add(new Event(now, "way-out " + request.frames.size() + " frames"));
+        }
+
+        @Override
+        public CuriosityPort.WayOut wayOutAnswer() {
+            if (pendingWayOut == null || now < pendingWayOutAt) {
+                return null;
+            }
+            CuriosityPort.WayOut a = pendingWayOut;
+            pendingWayOut = null;
+            log.add(new Event(now, "way-out answer " + a.status));
+            return a;
+        }
+
+        @Override
+        public void cancelWayOut() {
+            pendingWayOut = null;
+            log.add(new Event(now, "cancel way-out"));
+        }
+
+        @Override
         public void touch() {
             touches++;
             log.add(new Event(now, "touch"));
@@ -937,6 +1038,7 @@ public final class ExploreBrainHarness {
         hazardDuringPickScenarios();
         headingScenarios();
         navScenarios();
+        escapeScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -3517,6 +3619,583 @@ public final class ExploreBrainHarness {
                             && moving && still && rig.violations.isEmpty(),
                     "taught=" + (first == null ? "none" : first[0] + "/" + first[1]) + " moving=" + rig.movingCalls
                             + " " + rig.tail());
+        });
+    }
+
+    // ---- wedged escapes: retrace, measured circle, Claude's way out, rest (explore nav plan U5) ----
+    //
+    // Legs of 4 ticks (1 s: 100 counts at the rig's 100 counts/s), curiosity stops off,
+    // the camera open with nothing in view. bumps() puts an obstacle in front of him 700
+    // ms into each of his first few roaming legs: three in a row wedge him at the third
+    // startle's end, with the leg log holding the three legs (~70 counts each) and the
+    // two back-offs (25) between them. The circle's budget is generous here (20 s) so its
+    // six looks always fit; escape_full_budgets_... runs the shipped budgets.
+
+    private static final java.util.Set<ExploreBrain.State> ESCAPING = java.util.EnumSet.of(
+            ExploreBrain.State.RETRACE, ExploreBrain.State.CIRCLE, ExploreBrain.State.WAY_OUT,
+            ExploreBrain.State.DRIVE_OFF);
+
+    private static boolean escaping(Rig r) {
+        return ESCAPING.contains(r.brain.state());
+    }
+
+    interface RigTest {
+        boolean test(Rig r);
+    }
+
+    private static ExploreTuning.Builder escTuning() {
+        return gyroTuning()
+                .hopTicks(4)
+                .curiosityMs(1000000, 1000000)
+                .lookTiming(200, 3000, 2000)
+                .cameraBackoffMs(10000)
+                .cap(8, 20000, 30000)
+                .wedge(3, 2, 1)
+                .escapeRetrace(1500, 10)
+                .escapeBudgets(6000, 20000, 6000, 3000, 6000)
+                .escapeCircle(6, 60, 500)
+                .escapeDrive(4, 2);
+    }
+
+    /** An obstacle 700 ms into each roaming leg while there have been fewer than `times` startles. */
+    private static Feed bumps(Rig[] h, int times) {
+        return t -> {
+            Rig r = h[0];
+            boolean on = r != null && r.brain.state() == ExploreBrain.State.HOP && r.moving
+                    && r.count("startle") < times && t - r.legStartT >= 700;
+            return on ? obstacle(t) : clear(t);
+        };
+    }
+
+    /** bumps(), and an obstacle 200 ms into any forward drive of the escape while `block` holds. */
+    private static Feed bumpsThen(Rig[] h, int times, RigTest block) {
+        Feed b = bumps(h, times);
+        return t -> {
+            Rig r = h[0];
+            if (r != null && escaping(r) && "hop".equals(r.motion) && t - r.legStartT >= 200 && block.test(r)) {
+                return obstacle(t);
+            }
+            return b.at(t);
+        };
+    }
+
+    /** A rig for the escape scenarios: camera, simulated wheels and yaw; claude null is no Claude at all. */
+    private static Rig escRig(ExploreTuning.Builder b, Rig[] h, Feed feed, WayOutScript claude) {
+        Rig rig = claude == null ? new Rig(b.build(), feed, NOTHING, true)
+                : new Rig(b.build(), feed, NOTHING, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+        rig.wayOuts = claude;
+        rig.simWheels = true;
+        h[0] = rig;
+        return rig;
+    }
+
+    private static void runUntil(Rig rig, long limit, RigTest done) {
+        while (rig.now < limit && !done.test(rig)) {
+            rig.runUntil(rig.now + 10);
+        }
+    }
+
+    /** The first drive of this kind started in this brain state at or after from, else null. */
+    private static Drive firstDrive(Rig rig, String state, String kind, long from) {
+        for (Drive d : rig.drives) {
+            if (d.t >= from && d.state.equals(state) && d.kind.equals(kind)) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    private static List<Drive> drivesIn(Rig rig, String state, String kind, long from, long to) {
+        List<Drive> out = new ArrayList<Drive>();
+        for (Drive d : rig.drives) {
+            if (d.t >= from && d.t < to && d.state.equals(state) && d.kind.equals(kind)) {
+                out.add(d);
+            }
+        }
+        return out;
+    }
+
+    /** The first state entered after t (the state log), and when. */
+    private static Event nextState(Rig rig, long t) {
+        for (Event e : rig.stateLog) {
+            if (e.t > t) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    /** Open straight ahead (0.9) within 25 deg of these offsets from where the circle began, else
+     * blocked (0.1); confident. Nothing while roaming, so the steer keeps today's legs. */
+    private static OpenView openAt(double... offsets) {
+        return (r, t) -> {
+            if (!escaping(r) || Double.isNaN(r.circleFrom)) {
+                return null;
+            }
+            for (double o : offsets) {
+                if (Math.abs(Heading.delta(r.yaw.wrapped(), Heading.wrap(r.circleFrom + o))) <= 25) {
+                    return prof(0.9f, 0.9f, 0.9f, 0.9f);
+                }
+            }
+            return prof(0.9f, 0.1f, 0.1f, 0.1f);
+        };
+    }
+
+    private static long captured(CuriosityPort.Frame f) {
+        String s = new String(f.jpeg, java.nio.charset.StandardCharsets.US_ASCII);
+        return Long.parseLong(s.substring(s.indexOf('@') + 1));
+    }
+
+    private static boolean near(double a, double b, double tol) {
+        return !Double.isNaN(a) && !Double.isNaN(b) && Math.abs(Heading.delta(a, b)) <= tol;
+    }
+
+    /** Roaming on a desk-like spot: one clean straight leg (100 counts), then the steer bends right
+     * (ahead middling, so no look ends the first leg early). */
+    private static OpenView deskView() {
+        return (r, t) -> r.count("hop") == 0 ? prof(0.9f, 0.9f, 0.9f, 0.9f) : prof(0.9f, 0.1f, 0.5f, 0.9f);
+    }
+
+    private static void escapeScenarios() {
+        scenario("escape_ae1_wall_and_plant_retraces_the_way_in_and_roams_again", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(60, 10), h, bumps(h, 3), null);
+            rig.started();
+            runUntil(rig, 40000, r -> entered(r, ExploreBrain.State.RETRACE, 0) >= 0);
+            List<Heading.Leg> legs = rig.brain.heading().legs();
+            long wedged = entered(rig, ExploreBrain.State.RETRACE, 0);
+            rig.runUntil(wedged + 30000);
+            Drive back = firstDrive(rig, "RETRACE", "hop", wedged);
+            Drive roam = firstDrive(rig, "HOP", "hop", wedged);
+            Heading.Leg newest = legs.isEmpty() ? null : legs.get(legs.size() - 1);
+            check(n, wedged > 0 && newest != null && back != null
+                            && near(back.heading, Heading.wrap(newest.heading + 180), 8)
+                            && Math.abs(back.counts - 60) <= 12 && roam != null && roam.t - wedged <= 15000
+                            && entered(rig, ExploreBrain.State.CIRCLE, 0) < 0 && rig.count("eyes RESTING") == 0
+                            && rig.violations.isEmpty(),
+                    "wedged@" + wedged + " legs=" + legs + " drives=" + rig.drives + " " + rig.tail());
+        });
+        scenario("escape_retrace_hazard_partway_moves_on_to_the_circle", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h,
+                    bumpsThen(h, 3, r -> r.brain.state() == ExploreBrain.State.RETRACE), null);
+            rig.started();
+            runUntil(rig, 60000, r -> entered(r, ExploreBrain.State.CIRCLE, 0) >= 0);
+            long wedged = entered(rig, ExploreBrain.State.RETRACE, 0);
+            long circle = entered(rig, ExploreBrain.State.CIRCLE, 0);
+            Drive cut = firstDrive(rig, "RETRACE", "hop", wedged);
+            Drive back = cut == null ? null : firstDrive(rig, "RETRACE", "back", cut.t);
+            check(n, wedged > 0 && cut != null && cut.end > 0 && cut.counts <= 40 && back != null
+                            && back.t >= cut.end && circle >= back.end && circle - cut.end <= 1500
+                            && rig.count("eyes RESTING") == 0 && rig.violations.isEmpty(),
+                    "wedged@" + wedged + " circle@" + circle + " drives=" + rig.drives + " " + rig.tail());
+        });
+        scenario("escape_three_short_legs_retrace_newest_first_up_to_the_retrace_distance", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(150, 10).escapeBudgets(20000, 20000, 6000, 3000, 6000),
+                    h, bumps(h, 3), null);
+            rig.started();
+            runUntil(rig, 40000, r -> entered(r, ExploreBrain.State.RETRACE, 0) >= 0);
+            List<Heading.Leg> legs = rig.brain.heading().legs();
+            long wedged = entered(rig, ExploreBrain.State.RETRACE, 0);
+            rig.runUntil(wedged + 25000);
+            List<Drive> back = drivesIn(rig, "RETRACE", "hop", wedged, Long.MAX_VALUE);
+            boolean ok = legs.size() == 5 && back.size() == 3;
+            long total = 0;
+            if (ok) {
+                // Newest first: L3 whole (~70), L2 less its back-off (~45), L1 less its back-off, cut at 150.
+                long l3 = legs.get(4).counts;
+                long l2 = legs.get(2).counts - legs.get(3).counts;
+                long l1 = Math.min(legs.get(0).counts - legs.get(1).counts, 150 - l3 - l2);
+                ok = near(back.get(0).heading, Heading.wrap(legs.get(4).heading + 180), 8)
+                        && near(back.get(1).heading, Heading.wrap(legs.get(2).heading + 180), 8)
+                        && near(back.get(2).heading, Heading.wrap(legs.get(0).heading + 180), 8)
+                        && Math.abs(back.get(0).counts - l3) <= 12 && Math.abs(back.get(1).counts - l2) <= 12
+                        && Math.abs(back.get(2).counts - l1) <= 12;
+                for (Drive d : back) {
+                    total += d.counts;
+                }
+            }
+            check(n, ok && total <= 165 && firstDrive(rig, "HOP", "hop", wedged) != null
+                            && entered(rig, ExploreBrain.State.CIRCLE, 0) < 0 && rig.violations.isEmpty(),
+                    "legs=" + legs + " retrace=" + back + " " + rig.tail());
+        });
+        scenario("escape_claude_frame_5_centre_turns_to_that_frames_heading_and_drives_off", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, bumps(h, 3),
+                    (r, req, nth) -> CuriosityPort.WayOut.way(4, 0f));
+            rig.started();
+            runUntil(rig, 60000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null && !r.moving);
+            rig.runUntil(rig.now + 5000);
+            CuriosityPort.WayOutRequest req = rig.wayOutRequests.isEmpty() ? null : rig.wayOutRequests.get(0);
+            Double aim = req == null || req.frames.size() < 5 ? null : rig.lookHeadings.get(captured(req.frames.get(4)));
+            Drive off = firstDrive(rig, "DRIVE_OFF", "hop", 0);
+            check(n, req != null && req.frames.size() == 6 && !req.second && aim != null && off != null
+                            && near(off.heading, aim, 8) && rig.wayOutRequests.size() == 1
+                            && firstDrive(rig, "HOP", "hop", off.t) != null && rig.violations.isEmpty(),
+                    "aim=" + aim + " off=" + off + " " + rig.tail());
+        });
+        scenario("escape_ae7_offline_uses_the_most_open_heading_on_the_robot", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, bumps(h, 3), null);
+            rig.openView = openAt(180);
+            rig.started();
+            runUntil(rig, 60000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null && !r.moving);
+            rig.runUntil(rig.now + 5000);
+            Drive off = firstDrive(rig, "DRIVE_OFF", "hop", 0);
+            check(n, off != null && near(off.heading, Heading.wrap(rig.circleFrom + 180), 10)
+                            && rig.wayOutRequests.isEmpty() && rig.count("eyes RESTING") == 0
+                            && firstDrive(rig, "HOP", "hop", off.t) != null && rig.violations.isEmpty(),
+                    "from=" + f1(rig.circleFrom) + " off=" + off + " " + rig.tail());
+        });
+        scenario("escape_on_robot_heading_penalises_headings_already_tried", n -> {
+            // The way he faced when wedged and its opposite read equally open: he takes the opposite.
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, bumps(h, 3), null);
+            rig.openView = openAt(0, 180);
+            rig.started();
+            runUntil(rig, 60000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null);
+            Drive off = firstDrive(rig, "DRIVE_OFF", "hop", 0);
+            check(n, off != null && near(off.heading, Heading.wrap(rig.circleFrom + 180), 10)
+                            && rig.violations.isEmpty(),
+                    "from=" + f1(rig.circleFrom) + " off=" + off + " " + rig.tail());
+        });
+        scenario("escape_late_claude_answer_is_dropped_and_the_robot_heading_used", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, bumps(h, 3),
+                    (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.wayOutDelayMs = 7000;
+            rig.openView = openAt(180);
+            rig.started();
+            runUntil(rig, 60000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null);
+            rig.runUntil(rig.now + 3000);
+            int ask = rig.first("way-out", 0);
+            int cancel = rig.first("cancel way-out", ask);
+            Drive off = firstDrive(rig, "DRIVE_OFF", "hop", 0);
+            check(n, ask >= 0 && cancel > ask && Math.abs(rig.timeOf(cancel) - rig.timeOf(ask) - 6000) <= 100
+                            && rig.first("way-out answer", 0) < 0 && off != null
+                            && near(off.heading, Heading.wrap(rig.circleFrom + 180), 10) && rig.violations.isEmpty(),
+                    "off=" + off + " " + rig.tail());
+        });
+        scenario("escape_frame_7_of_6_is_rejected_and_the_robot_heading_used", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, bumps(h, 3),
+                    (r, req, nth) -> CuriosityPort.WayOut.way(6, 0f));
+            rig.openView = openAt(180);
+            rig.started();
+            runUntil(rig, 60000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null);
+            Drive off = firstDrive(rig, "DRIVE_OFF", "hop", 0);
+            check(n, rig.first("way-out answer WAY", 0) >= 0 && off != null
+                            && near(off.heading, Heading.wrap(rig.circleFrom + 180), 10) && rig.violations.isEmpty(),
+                    "off=" + off + " " + rig.tail());
+        });
+        scenario("replies_way_out_reads_frame_and_x_and_rejects_bad_answers", n -> {
+            int[] w = {640, 640, 640, 640, 640, 640};
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("way_out", Boolean.TRUE);
+            json.put("frame", 5L);
+            json.put("x", 480L);
+            CuriosityPort.WayOut ok = ClaudeReplies.wayOut(json, w);
+            json.put("x", 0.25);
+            CuriosityPort.WayOut fraction = ClaudeReplies.wayOut(json, w);
+            json.put("x", 320L);
+            json.put("frame", 7L);
+            CuriosityPort.WayOut seventh = ClaudeReplies.wayOut(json, w);
+            json.put("frame", 0L);
+            CuriosityPort.WayOut zeroth = ClaudeReplies.wayOut(json, w);
+            json.put("frame", "5");
+            CuriosityPort.WayOut text = ClaudeReplies.wayOut(json, w);
+            json.put("frame", 5L);
+            json.put("x", 900L);
+            CuriosityPort.WayOut wide = ClaudeReplies.wayOut(json, w);
+            json.remove("x");
+            CuriosityPort.WayOut noX = ClaudeReplies.wayOut(json, w);
+            json.put("way_out", Boolean.FALSE);
+            CuriosityPort.WayOut none = ClaudeReplies.wayOut(json, w);
+            json.put("way_out", "yes");
+            CuriosityPort.WayOut odd = ClaudeReplies.wayOut(json, w);
+            CuriosityPort.WayOut.Status F = CuriosityPort.WayOut.Status.FAILED;
+            check(n, ok.status == CuriosityPort.WayOut.Status.WAY && ok.frame == 4 && Math.abs(ok.x - 0.5f) < 1e-4
+                            && fraction.status == CuriosityPort.WayOut.Status.WAY && Math.abs(fraction.x + 0.5f) < 1e-4
+                            && seventh.status == F && zeroth.status == F && text.status == F && wide.status == F
+                            && noX.status == F && none.status == CuriosityPort.WayOut.Status.NONE && odd.status == F,
+                    ok + " " + fraction + " " + seventh + " " + zeroth + " " + text + " " + wide + " " + noX + " "
+                            + none + " " + odd);
+        });
+        scenario("escape_full_budgets_drive_off_within_30_s_of_wedged", n -> {
+            // The shipped budgets; slow turns (25 deg/s) make the retrace's turn and the circle
+            // run out of time, and Claude answers just inside its own (the last frame, ahead).
+            ExploreTuning d = new ExploreTuning.Builder().build();
+            Rig[] h = new Rig[1];
+            ExploreTuning.Builder b = escTuning()
+                    .escapeBudgets(d.escapeRetraceMs, d.escapeCircleMs, d.escapeAskMs, d.escapeDriveOffMs,
+                            d.escapeSecondAskMs)
+                    .escapeCircle(d.escapeCircleSteps, d.escapeCircleStepDeg, d.escapeSettleMs);
+            Rig rig = escRig(b, h, bumps(h, 3),
+                    (r, req, nth) -> CuriosityPort.WayOut.way(req.frames.size() - 1, 0f));
+            rig.wayOutDelayMs = 5900;
+            rig.yaw.rateDegS = 25;
+            rig.started();
+            runUntil(rig, 120000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null);
+            long wedged = entered(rig, ExploreBrain.State.RETRACE, 0);
+            long circle = entered(rig, ExploreBrain.State.CIRCLE, 0);
+            long ask = entered(rig, ExploreBrain.State.WAY_OUT, 0);
+            long answer = rig.timeOf(rig.first("way-out answer", 0));
+            Drive off = firstDrive(rig, "DRIVE_OFF", "hop", 0);
+            long sum = d.escapeRetraceMs + d.escapeCircleMs + d.escapeAskMs + d.escapeDriveOffMs;
+            check(n, wedged > 0 && off != null && off.t - wedged <= 30000 && circle - wedged >= 5900
+                            && ask - circle >= 11900 && answer - ask >= 5800 && sum >= 25000 && sum <= 30000
+                            && d.escapeCircleSteps == 6 && d.escapeCircleStepDeg == 60 && rig.violations.isEmpty(),
+                    "wedged@" + wedged + " circle@" + circle + " ask@" + ask + " answer@" + answer + " off=" + off
+                            + " " + rig.tail());
+        });
+        scenario("escape_second_ask_is_sent_once_per_escape", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h,
+                    bumpsThen(h, 3, r -> r.brain.state() == ExploreBrain.State.DRIVE_OFF),
+                    (r, req, nth) -> CuriosityPort.WayOut.way(nth == 1 ? 3 : 0, 0f));
+            rig.started();
+            runUntil(rig, 90000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            rig.runUntil(rig.now + 5000);
+            List<CuriosityPort.WayOutRequest> asks = rig.wayOutRequests;
+            check(n, asks.size() == 2 && asks.get(0).frames.size() == 6 && !asks.get(0).second
+                            && asks.get(1).frames.size() == 1 && asks.get(1).second
+                            && drivesIn(rig, "DRIVE_OFF", "hop", 0, Long.MAX_VALUE).size() == 2
+                            && rig.brain.state() == ExploreBrain.State.CORNERED && rig.violations.isEmpty(),
+                    "asks=" + asks.size() + " drives=" + rig.drives + " " + rig.tail());
+        });
+        scenario("escape_all_steps_fail_rests_cornered_then_roams", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h,
+                    bumpsThen(h, 3, r -> !r.statesSeen.contains(ExploreBrain.State.CORNERED)),
+                    (r, req, nth) -> CuriosityPort.WayOut.failed());
+            rig.started();
+            runUntil(rig, 120000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            long rest = entered(rig, ExploreBrain.State.CORNERED, 0);
+            rig.runUntil(rest + 30000 + 8000);
+            long retrace = entered(rig, ExploreBrain.State.RETRACE, 0);
+            long circle = entered(rig, ExploreBrain.State.CIRCLE, retrace);
+            long ask = entered(rig, ExploreBrain.State.WAY_OUT, circle);
+            long off = entered(rig, ExploreBrain.State.DRIVE_OFF, ask);
+            long second = entered(rig, ExploreBrain.State.WAY_OUT, off);
+            Drive roam = firstDrive(rig, "HOP", "hop", rest);
+            check(n, retrace > 0 && circle > retrace && ask > circle && off > ask && second > off && rest > second
+                            && rig.wayOutRequests.size() == 2 && rig.motions(rest + 1, rest + 30000) == 0
+                            && roam != null && roam.t > rest + 30000 && rig.violations.isEmpty(),
+                    "retrace@" + retrace + " circle@" + circle + " ask@" + ask + " off@" + off + " second@" + second
+                            + " rest@" + rest + " " + rig.tail());
+        });
+        scenario("escape_lease_loss_during_the_circle_goes_eyes_only_stopped", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, bumps(h, 3), null);
+            rig.started();
+            runUntil(rig, 60000, r -> r.brain.state() == ExploreBrain.State.CIRCLE && r.moving);
+            long at = rig.now;
+            boolean turning = rig.moving;
+            rig.brain.onLeaseChanged(false);
+            rig.runUntil(at + 3000);
+            check(n, turning && rig.timeOf(rig.firstAfter("stop", at)) == at
+                            && rig.timeOf(rig.firstAfter("camera close", at)) == at
+                            && rig.brain.state() == ExploreBrain.State.EYES_ONLY && rig.motions(at + 1, at + 3000) == 0
+                            && rig.violations.isEmpty(),
+                    "at=" + at + " " + rig.tail());
+        });
+        scenario("escape_way_out_carries_only_the_circles_frames_and_notes_carry_counts", n -> {
+            Rig[] h = new Rig[1];
+            List<String> notes = new ArrayList<String>();
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, bumps(h, 3),
+                    (r, req, nth) -> CuriosityPort.WayOut.way(3, 0f));
+            rig.openView = openAt(180);
+            rig.brain.setTrace(notes::add);
+            rig.started();
+            runUntil(rig, 60000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null);
+            long circle = entered(rig, ExploreBrain.State.CIRCLE, 0);
+            CuriosityPort.WayOutRequest req = rig.wayOutRequests.isEmpty() ? null : rig.wayOutRequests.get(0);
+            boolean framesOk = req != null && req.frames.size() == 6;
+            java.util.Set<Long> times = new java.util.HashSet<Long>();
+            if (framesOk) {
+                for (CuriosityPort.Frame f : req.frames) {
+                    long t = captured(f);
+                    framesOk &= t >= circle && rig.lookHeadings.containsKey(t) && times.add(t);
+                }
+            }
+            boolean numbersOnly = true;
+            boolean spoke = false;
+            for (String note : notes) {
+                numbersOnly &= !note.contains("jpeg") && !note.contains("bins") && !note.contains("confidence");
+                spoke |= note.contains("way out");
+            }
+            check(n, framesOk && numbersOnly && spoke && rig.violations.isEmpty(),
+                    "frames=" + (req == null ? 0 : req.frames.size()) + " notes=" + notes);
+        });
+        scenario("escape_uncalibrated_keeps_todays_escape", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = new Rig(tuning().hopTicks(4).cap(3, 20000, 30000).wedge(3, 2, 1).build(), bumps(h, 3));
+            rig.simWheels = true;
+            h[0] = rig;
+            rig.started();
+            rig.runUntil(20000);
+            boolean escaped = false;
+            for (ExploreBrain.State st : rig.statesSeen) {
+                escaped |= ESCAPING.contains(st);
+            }
+            check(n, rig.statesSeen.contains(ExploreBrain.State.CORNERED) && !escaped && rig.violations.isEmpty(),
+                    "seen=" + rig.statesSeen + " " + rig.tail());
+        });
+        // ---- a turn the gyro says isn't turning (live: wedged under a desk, "asked 120 deg, turned 0") ----
+        scenario("turn_flat_yaw_in_the_circle_is_blocked_within_1_5_s_and_the_escape_advances", n -> {
+            Rig[] h = new Rig[1];
+            Feed b = bumps(h, 3);
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, t -> {
+                Rig r = h[0];
+                if (r != null && r.brain.state() == ExploreBrain.State.CIRCLE) {
+                    r.yaw.stuck = true;
+                }
+                return b.at(t);
+            }, null);
+            rig.started();
+            runUntil(rig, 60000, r -> entered(r, ExploreBrain.State.DRIVE_OFF, 0) >= 0);
+            long circle = entered(rig, ExploreBrain.State.CIRCLE, 0);
+            int turn = rig.firstAfter("turn", circle);
+            int stop = rig.first("stop", turn);
+            long took = rig.timeOf(stop) - rig.timeOf(turn);
+            Event next = nextState(rig, rig.timeOf(stop) - 1);
+            check(n, circle > 0 && turn > 0 && took >= 1400 && took <= 1700 && next != null
+                            && next.t - rig.timeOf(stop) <= 300 && !next.what.equals("CIRCLE")
+                            && rig.violations.isEmpty(),
+                    "took=" + took + " next=" + next + " " + rig.tail());
+        });
+        scenario("turn_flat_yaw_while_roaming_is_blocked_and_counts_as_wedged", n -> {
+            Rig rig = new Rig(escTuning().turnChance(1.0).build(), CLEAR, NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.stuck = true;
+            rig.started();
+            runUntil(rig, 20000, r -> escaping(r));
+            int turn = rig.first("turn", 0);
+            int stop = rig.first("stop", turn);
+            long took = rig.timeOf(stop) - rig.timeOf(turn);
+            long escape = -1;
+            for (Event e : rig.stateLog) {
+                if (escape < 0 && e.t >= rig.timeOf(stop) && ESCAPING.contains(ExploreBrain.State.valueOf(e.what))) {
+                    escape = e.t;
+                }
+            }
+            check(n, turn >= 0 && took >= 1400 && took <= 1700 && escape >= 0 && escape - rig.timeOf(stop) <= 300
+                            && rig.violations.isEmpty(),
+                    "took=" + took + " escape@" + escape + " " + rig.tail());
+        });
+        scenario("turn_slow_but_moving_is_not_blocked", n -> {
+            Rig rig = new Rig(escTuning().turnChance(1.0).turnDeg(40, 40).build(), CLEAR, NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.rateDegS = 8;
+            rig.started();
+            rig.runUntil(12000);
+            double r = rig.yaw.turnResults.isEmpty() ? 0 : rig.yaw.turnResults.get(0);
+            boolean escaped = false;
+            for (ExploreBrain.State st : rig.statesSeen) {
+                escaped |= ESCAPING.contains(st);
+            }
+            check(n, Math.abs(Math.abs(r) - 40) <= 6 && !escaped && rig.firstAfter("hop", 5000) >= 0
+                            && rig.violations.isEmpty(),
+                    "result=" + f1(r) + " " + rig.tail());
+        });
+        // ---- turns blocked: back out straight along the last leg first (live: under a desk) ----
+        scenario("escape_blocked_turns_back_out_along_the_last_leg_then_turn_and_drive_off", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h, t -> {
+                Rig r = h[0];
+                if (r != null) {
+                    boolean backedOut = false;
+                    for (Drive d : r.drives) {
+                        backedOut |= d.kind.equals("back") && d.end > 0;
+                    }
+                    r.yaw.stuck = r.count("hop") > 0 && !backedOut;
+                }
+                return clear(t);
+            }, null);
+            rig.openView = deskView();
+            rig.started();
+            rig.runUntil(20000);
+            Drive back = null;
+            for (Drive d : rig.drives) {
+                if (back == null && d.kind.equals("back")) {
+                    back = d;
+                }
+            }
+            int turn = back == null ? -1 : rig.firstAfter("turn", back.end);
+            long turnAt = rig.timeOf(turn);
+            boolean turned = false;
+            for (long[] tt : turnTimes(rig)) {
+                turned |= tt[0] == turnAt;
+            }
+            double last = rig.yaw.turnResults.isEmpty() ? 0 : rig.yaw.turnResults.get(rig.yaw.turnResults.size() - 1);
+            Drive roam = back == null ? null : firstDrive(rig, "HOP", "hop", back.end);
+            check(n, back != null && back.state.equals("RETRACE") && Math.abs(back.counts + 100) <= 12
+                            && turn > 0 && turned && Math.abs(last) >= 10 && roam != null && roam.t > turnAt
+                            && entered(rig, ExploreBrain.State.CIRCLE, 0) < 0 && rig.violations.isEmpty(),
+                    "back=" + back + " last=" + f1(last) + " drives=" + rig.drives + " " + rig.tail());
+        });
+        scenario("escape_back_out_stops_at_the_logged_distance_and_the_retrace_distance", n -> {
+            long[] got = new long[2];
+            long[] cap = {1500, 60};
+            String detail = "";
+            for (int i = 0; i < 2; i++) {
+                Rig[] h = new Rig[1];
+                Rig rig = escRig(escTuning().escapeRetrace(cap[i], 10), h, t -> {
+                    Rig r = h[0];
+                    if (r != null && r.count("hop") > 0) {
+                        r.yaw.stuck = true;
+                    }
+                    return clear(t);
+                }, null);
+                rig.openView = deskView();
+                rig.started();
+                rig.runUntil(12000);
+                Drive back = null;
+                for (Drive d : rig.drives) {
+                    if (back == null && d.kind.equals("back")) {
+                        back = d;
+                    }
+                }
+                got[i] = back == null ? 0 : -back.counts;
+                detail += " cap " + cap[i] + ": " + back + " " + rig.violations;
+            }
+            check(n, Math.abs(got[0] - 100) <= 12 && Math.abs(got[1] - 60) <= 12, detail);
+        });
+        scenario("escape_back_out_needs_a_logged_leg", n -> {
+            Rig rig = new Rig(escTuning().turnChance(1.0).build(), CLEAR, NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.stuck = true;
+            rig.started();
+            runUntil(rig, 30000, r -> entered(r, ExploreBrain.State.CIRCLE, 0) >= 0);
+            check(n, entered(rig, ExploreBrain.State.CIRCLE, 0) > 0 && rig.count("back") == 0
+                            && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("escape_stall_during_back_out_stops_it", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h, t -> {
+                Rig r = h[0];
+                if (r != null && r.count("hop") > 0) {
+                    r.yaw.stuck = true;
+                }
+                return clear(t);
+            }, null);
+            rig.backBlocked = true;
+            rig.openView = deskView();
+            rig.started();
+            runUntil(rig, 30000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            List<Drive> backs = new ArrayList<Drive>();
+            for (Drive d : rig.drives) {
+                if (d.kind.equals("back")) {
+                    backs.add(d);
+                }
+            }
+            Drive first = backs.isEmpty() ? null : backs.get(0);
+            long took = first == null ? -1 : first.end - first.t;
+            check(n, first != null && took >= 900 && took <= 1500 && Math.abs(first.counts) <= 2 && backs.size() == 1
+                            && rig.brain.state() == ExploreBrain.State.CORNERED && rig.violations.isEmpty(),
+                    "backs=" + backs + " " + rig.tail());
         });
     }
 }

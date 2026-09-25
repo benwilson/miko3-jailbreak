@@ -87,6 +87,21 @@ interface CuriosityPort {
     /** What findName() found, or null while it is running. */
     Named foundName();
 
+    // ---- the way out of a wedge (explore nav plan U5, KTD4) ----
+
+    /**
+     * Ask which way is out: the circle's frames (with their look indices), or, for the
+     * second ask, the one frame he sees now. One schema serves both. The frames leave
+     * the robot only inside this request (R15).
+     */
+    void wayOut(WayOutRequest request, long timeoutMs);
+
+    /** The answer to the last wayOut(), or null while it is running. */
+    WayOut wayOutAnswer();
+
+    /** Abandon the running wayOut(), if any: its late answer must never be returned. */
+    void cancelWayOut();
+
     /** No Claude: every stop takes the path it took before U4. */
     CuriosityPort NONE = new CuriosityPort() {
         public boolean canAsk() {
@@ -153,6 +168,16 @@ interface CuriosityPort {
 
         public Named foundName() {
             return Named.FAILED;
+        }
+
+        public void wayOut(WayOutRequest request, long timeoutMs) {
+        }
+
+        public WayOut wayOutAnswer() {
+            return WayOut.failed();
+        }
+
+        public void cancelWayOut() {
         }
     };
 
@@ -354,6 +379,57 @@ interface CuriosityPort {
 
         static Named of(String nameOrNull) {
             return nameOrNull == null || nameOrNull.trim().isEmpty() ? NONE : new Named(Status.NAME, nameOrNull.trim());
+        }
+    }
+
+    /** The way-out request: the frames in order, and whether this is the second ask (one frame, now). */
+    final class WayOutRequest {
+        final List<Frame> frames;
+        final boolean second;
+
+        WayOutRequest(List<Frame> frames, boolean second) {
+            this.frames = Collections.unmodifiableList(frames);
+            this.second = second;
+        }
+    }
+
+    /**
+     * Claude's way out. WAY carries the frame (an index into WayOutRequest.frames) and
+     * where across it the way out is (x, -1 at the frame's left edge .. 1 at its right);
+     * the brain turns it into a heading at once. NONE: nothing looks open. FAILED: a
+     * refused, malformed, out-of-range or failed request.
+     */
+    final class WayOut {
+        enum Status { WAY, NONE, FAILED }
+
+        final Status status;
+        final int frame;
+        final float x;
+
+        private WayOut(Status status, int frame, float x) {
+            this.status = status;
+            this.frame = frame;
+            this.x = x;
+        }
+
+        static WayOut way(int frame, float x) {
+            return new WayOut(Status.WAY, frame, x);
+        }
+
+        static WayOut none() {
+            return new WayOut(Status.NONE, -1, 0f);
+        }
+
+        static WayOut failed() {
+            return new WayOut(Status.FAILED, -1, 0f);
+        }
+
+        /** Numbers only, for the trace. */
+        @Override
+        public String toString() {
+            return status == Status.WAY
+                    ? String.format(java.util.Locale.US, "way out in frame %d at x %.2f", frame, x)
+                    : status.toString();
         }
     }
 }

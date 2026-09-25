@@ -87,6 +87,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Named> names = new Slot<Named>();
     private final Slot<Answer> remembers = new Slot<Answer>();
     private final Slot<Answer> welcomes = new Slot<Answer>();
+    private final Slot<WayOut> wayOuts = new Slot<WayOut>();
 
     /** The face cut out by the last match(), for remember(); and the id it matched, for touch(). */
     private volatile byte[] meetFace;
@@ -201,6 +202,59 @@ final class ClaudeCuriosity implements CuriosityPort {
         String outcome = r.ok() ? a.status.toString() : r.describe();
         Log.i(TAG, "look request with " + n + " frames: " + outcome + " in " + (System.currentTimeMillis() - t0)
                 + " ms");
+        return a;
+    }
+
+    // ---- the way out of a wedge (explore nav plan U5, KTD4) ----
+
+    @Override
+    public void wayOut(final WayOutRequest request, final long timeoutMs) {
+        final int g = wayOuts.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                wayOuts.finish(g, findWayOut(request, timeoutMs));
+            }
+        }, wayOuts, g, WayOut.failed());
+    }
+
+    @Override
+    public WayOut wayOutAnswer() {
+        return wayOuts.poll();
+    }
+
+    @Override
+    public void cancelWayOut() {
+        wayOuts.cancel();
+    }
+
+    /** The frames go only into this request (R15): nothing is kept, written or logged but counts. */
+    private WayOut findWayOut(WayOutRequest request, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        int n = request.frames.size();
+        if (n == 0) {
+            return WayOut.failed();
+        }
+        int[] w = new int[n];
+        int[] h = new int[n];
+        for (int i = 0; i < n; i++) {
+            int[] size = jpegSize(request.frames.get(i).jpeg);
+            w[i] = size[0];
+            h[i] = size[1];
+        }
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        content.add(ClaudeApi.textBlock(ExplorePrompts.wayOutIntro(n, w[0], h[0], request.second)));
+        for (int i = 0; i < n; i++) {
+            content.add(ClaudeApi.textBlock("Frame " + (i + 1) + ":"));
+            content.add(ClaudeApi.jpegBlock(request.frames.get(i).jpeg));
+        }
+        content.add(ClaudeApi.textBlock(ExplorePrompts.wayOutAsk(n, request.second)));
+        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.NAV_SYSTEM, content,
+                ExplorePrompts.WAY_OUT_SCHEMA, (int) timeoutMs);
+        WayOut a = r.ok() ? ClaudeReplies.wayOut(r.json, w) : WayOut.failed();
+        String outcome = r.ok() ? a.status.toString() : r.describe();
+        Log.i(TAG, (request.second ? "second " : "") + "way-out request with " + n + " frames: " + outcome + " in "
+                + (System.currentTimeMillis() - t0) + " ms");
         return a;
     }
 

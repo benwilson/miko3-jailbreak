@@ -72,7 +72,7 @@ class AdapterWiringTest(unittest.TestCase):
         a = code_only(src("ClaudeCuriosity.java"))
         self.assertIn("Executors.newCachedThreadPool", a)
         self.assertIn("worker.execute(job)", a)
-        for method in ("ask", "match", "lines", "findName", "remember"):
+        for method in ("ask", "match", "lines", "findName", "remember", "wayOut"):
             body = re.search(r"public void " + method + r"\((.*?)\n    \}", a, re.S)
             self.assertIsNotNone(body, method)
             self.assertIn("run(new Runnable()", body.group(1), method)
@@ -115,6 +115,52 @@ class PromptsTest(unittest.TestCase):
             self.assertIn('"' + field + '"', match)
 
 
+class WayOutRequestTest(unittest.TestCase):
+    """The way-out ask (explore nav plan U5, KTD4): one schema for the circle's frames
+    and the second ask's one frame, polled like the look request, never written to disk."""
+
+    def test_the_port_and_its_no_claude_stand_in_have_the_request(self):
+        port = code_only(src("CuriosityPort.java"))
+        for sig in (r"void wayOut\(WayOutRequest request, long timeoutMs\);", r"WayOut wayOutAnswer\(\);",
+                    r"void cancelWayOut\(\);"):
+            self.assertRegex(port, sig)
+        none = port[port.index("CuriosityPort NONE = new CuriosityPort()"):]
+        body = re.search(r"public WayOut wayOutAnswer\(\)\s*\{(.*?)\}", none, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn("WayOut.failed()", body.group(1))
+
+    def test_the_adapter_polls_a_slot_with_generations(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertIn("Slot<WayOut> wayOuts = new Slot<WayOut>()", a)
+        way = re.search(r"public void wayOut\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("wayOuts.start()", way)
+        self.assertIn("wayOuts.finish(g,", way)
+        self.assertRegex(a, r"public WayOut wayOutAnswer\(\)\s*\{\s*return wayOuts\.poll\(\);")
+        self.assertRegex(a, r"public void cancelWayOut\(\)\s*\{\s*wayOuts\.cancel\(\);")
+
+    def test_the_request_uses_its_schema_and_validation_and_writes_nothing(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        body = a[a.index("private WayOut findWayOut("):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("ExplorePrompts.WAY_OUT_SCHEMA", body)
+        self.assertIn("ClaudeReplies.wayOut(", body)
+        self.assertIn("ClaudeApi.jpegBlock(", body)
+        for disk in ("debugFace", "write(", "FileOutputStream", "getFilesDir"):
+            self.assertNotIn(disk, body, disk)
+
+    def test_one_schema_frame_and_x_for_both_asks(self):
+        p = src("ExplorePrompts.java")
+        schema = p[p.index("WAY_OUT_SCHEMA = object("):]
+        schema = schema[:schema.index(");")]
+        for field in ("way_out", "frame", "x"):
+            self.assertIn('"' + field + '"', schema)
+        self.assertEqual(p.count("WAY_OUT_SCHEMA = "), 1)
+        ask = p[p.index("static String wayOutAsk("):]
+        ask = ask[:ask.index("\n    }\n")]
+        for words in ("open doorway", "person", "open floor", "closed door"):
+            self.assertIn(words, ask)
+
+
 class NothingPrivateIsLoggedTest(unittest.TestCase):
     """No Log call touches images, the key, Claude's reply text, or names (ids are fine)."""
 
@@ -141,7 +187,7 @@ class ClaudeLatencyIsLoggedTest(unittest.TestCase):
     def test_every_claude_call_logs_its_latency(self):
         body = code_only(src("ClaudeCuriosity.java"))
         calls = body.split("claude.messages(")[1:]
-        self.assertEqual(len(calls), 7)
+        self.assertEqual(len(calls), 8)
         for i, after in enumerate(calls):
             window = after[:900]
             logs = re.findall(r"Log\.[diwe]\((.*?)\);", window, re.S)

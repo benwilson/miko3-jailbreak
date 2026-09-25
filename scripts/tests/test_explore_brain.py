@@ -31,7 +31,7 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHar
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
-              "RoamSteer.java")
+              "RoamSteer.java", "EscapePlanner.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -218,6 +218,31 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "roam_steer_low_confidence_keeps_todays_legs",
         "roam_blocked_look_mid_leg_ends_the_leg_at_the_next_tick",
         "roam_floor_is_taught_after_driving_over_it_and_motion_is_reported",
+        # Wedged escapes: retrace, measured circle, Claude's way out, rest (explore nav plan U5, AE1, AE7)
+        "escape_ae1_wall_and_plant_retraces_the_way_in_and_roams_again",
+        "escape_retrace_hazard_partway_moves_on_to_the_circle",
+        "escape_three_short_legs_retrace_newest_first_up_to_the_retrace_distance",
+        "escape_claude_frame_5_centre_turns_to_that_frames_heading_and_drives_off",
+        "escape_ae7_offline_uses_the_most_open_heading_on_the_robot",
+        "escape_on_robot_heading_penalises_headings_already_tried",
+        "escape_late_claude_answer_is_dropped_and_the_robot_heading_used",
+        "escape_frame_7_of_6_is_rejected_and_the_robot_heading_used",
+        "replies_way_out_reads_frame_and_x_and_rejects_bad_answers",
+        "escape_full_budgets_drive_off_within_30_s_of_wedged",
+        "escape_second_ask_is_sent_once_per_escape",
+        "escape_all_steps_fail_rests_cornered_then_roams",
+        "escape_lease_loss_during_the_circle_goes_eyes_only_stopped",
+        "escape_way_out_carries_only_the_circles_frames_and_notes_carry_counts",
+        "escape_uncalibrated_keeps_todays_escape",
+        # A measured turn the gyro says isn't turning is blocked (live: wedged under a desk)
+        "turn_flat_yaw_in_the_circle_is_blocked_within_1_5_s_and_the_escape_advances",
+        "turn_flat_yaw_while_roaming_is_blocked_and_counts_as_wedged",
+        "turn_slow_but_moving_is_not_blocked",
+        # Turns blocked: back out straight along the last leg first (live: under a desk)
+        "escape_blocked_turns_back_out_along_the_last_leg_then_turn_and_drive_off",
+        "escape_back_out_stops_at_the_logged_distance_and_the_retrace_distance",
+        "escape_back_out_needs_a_logged_leg",
+        "escape_stall_during_back_out_stops_it",
     )
 
     @classmethod

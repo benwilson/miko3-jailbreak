@@ -140,6 +140,28 @@ import java.util.Set;
  * teaching, U3), a look's floor is taught once he has driven floorTeachCounts
  * past it, and the camera hears when he starts and stops moving (U9).
  *
+ * Wedged escapes (explore nav plan U5, R11-R14, KTD4-KTD6): with the heading
+ * usable, wedgeHazards hazards with no clean leg between, wedgeStalls stalls in a
+ * row, a failed escape sweep, or a measured turn the gyro says isn't turning
+ * (turnStallDeg in turnStallMs: every measured turn is watched) make him wedged,
+ * and EscapePlanner's steps run instead of today's escape turns and rest:
+ *
+ *   RETRACE    back along the leg log, newest first: face each leg's reverse and
+ *              drive it forward, up to the retrace distance; when he can't turn, he
+ *              first reverses straight along the most recent forward leg(s), capped
+ *              at their logged distance (ground he just drove over), then turns
+ *   CIRCLE     escapeCircleSteps measured stops, one fresh stationary look at each
+ *   WAY_OUT    Claude picks the way out from the circle's frames (THINKING eyes, the
+ *              camera stays open); offline or late, the best on-robot openness
+ *              heading; the second ask, with one frame of now, happens here too
+ *   DRIVE_OFF  turn to the chosen heading and drive off
+ *
+ * Each step has a time budget; out of time or a hazard, it has failed and the next
+ * one starts. Turns in an escape ignore hazards (turning in place is how he gets
+ * out); a hazard or stall while driving forward stops at once, backs off
+ * backTicks, and moves on. All failing ends in CORNERED as before. Uncalibrated,
+ * every wedge is today's: the cornered cap and the failed-sweep count.
+ *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
  */
@@ -299,7 +321,8 @@ final class ExploreBrain {
         EYES_ONLY, PAUSE, LOOK, TURN, HOP, STARTLE, BACK_OFF, CORNERED, STOPPED,
         SCAN, FACE, APPROACH, INSPECT, REACT_HERE,
         ASK, ORIENT, MEET_LOOK, MEET, SPEAK,
-        ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP;
+        ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP,
+        RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF;
 
         /** A curiosity stop's looking states: the camera is always open in these (R2, AE6). */
         boolean curious() {
@@ -314,7 +337,12 @@ final class ExploreBrain {
          */
         boolean roams() {
             return this == PAUSE || this == LOOK || this == TURN || this == HOP || this == STARTLE
-                    || this == BACK_OFF;
+                    || this == BACK_OFF || escapes();
+        }
+
+        /** A wedged escape's steps (explore nav plan U5): the camera stays open through them. */
+        boolean escapes() {
+            return this == RETRACE || this == CIRCLE || this == WAY_OUT || this == DRIVE_OFF;
         }
 
         /** Part of a curiosity stop, from the scan until he is back to wandering. */
@@ -497,6 +525,44 @@ final class ExploreBrain {
 
     private final ArrayDeque<Picked> picked = new ArrayDeque<Picked>();
 
+    // ---- wedged escapes (explore nav plan U5) ----
+    /** Where a measured turn last made progress (turnStallDeg), for the blocked-turn check. */
+    private double turnProgressDeg;
+    private long turnProgressAt;
+    /** The steps, budgets and headings of the escape; the brain runs them. */
+    private final EscapePlanner planner;
+    /** Within an escape step: what he is doing right now. */
+    private enum Esc { TURN_READY, TURNING, DRIVE_READY, DRIVING, BACK_READY, BACKING, READY, LOOKING, ASKING }
+
+    /** What follows the current turn, back-out or wait. */
+    private enum EscThen { DRIVE, LOOK, RETRACE_NEXT, RETRY_TURN, PHASE }
+
+    private Esc esc;
+    private EscThen escThen;
+    private Direction escDir;
+    private double escTurnAmount;
+    /** This turn has had its back-out already. */
+    private boolean escBackedOut;
+    /** Wedged by a blocked turn: back out before the retrace's first turn. */
+    private boolean escBackOutFirst;
+    /** Counts to drive or back out (0: a drive-off's escapeDriveTicks, a hazard's backTicks). */
+    private long escGoal;
+    /** Counts moved in this drive or back-out, and the reading they were last counted from. */
+    private long escMoved;
+    private SensorReading escFrom;
+    private int escTicks;
+    private long escUntil;
+    private long escWaitSince;
+    private long escLookAfter;
+    private Look escLookBefore;
+    private Direction circleDir;
+    /** The frames asked about, and the heading each was taken at. */
+    private final List<CuriosityPort.Frame> escAsked = new ArrayList<CuriosityPort.Frame>();
+    private final List<Double> escAskedHeadings = new ArrayList<Double>();
+    private boolean wayOutAsking;
+    /** The newest reading, where a drive's counts start from. */
+    private SensorReading lastReading;
+
     ExploreBrain(ExploreTuning tuning, Clock clock, Motor motor, Eyes eyes, Sound sound, Random random) {
         this(tuning, clock, motor, eyes, sound, NO_CAMERA, random);
     }
@@ -519,6 +585,7 @@ final class ExploreBrain {
         this.classifier = new HazardClassifier(tuning);
         this.compass = new Heading(tuning.gyro, tuning);
         this.steer = new RoamSteer(tuning);
+        this.planner = new EscapePlanner(tuning);
     }
 
     /** The heading tracker, for the navigation that builds on it (explore nav plan U2, U5). */
@@ -555,6 +622,8 @@ final class ExploreBrain {
         }
         classifier.offer(reading);
         trackWheels(reading);
+        countEscapeWheels(reading);
+        lastReading = reading;
         compass.offer(reading, moving);
         teachFloor(reading);
         double[] turn = compass.takeTurnResult();
@@ -587,6 +656,8 @@ final class ExploreBrain {
         moving = false;
         motor.stop();
         cancelAsk();
+        cancelWayOut();
+        planner.reset();
         state = State.STOPPED;
         syncCamera();
         syncMoving();
@@ -680,6 +751,10 @@ final class ExploreBrain {
                 }
                 break;
             case TURN:
+                if (turnBlocked(now)) {
+                    turnWouldNotTurn(now);
+                    break;
+                }
                 if (escape) {
                     escapeStep(now, hazard);
                     break;
@@ -729,7 +804,7 @@ final class ExploreBrain {
             case STARTLE:
                 if (now >= phaseUntil) {
                     if (corneredAfterStartle) {
-                        enterCornered(now);
+                        wedged(now, "hazards in a row", false);
                     } else {
                         startBackOff(now);
                     }
@@ -800,6 +875,12 @@ final class ExploreBrain {
                     note("speech never reported finished; moving on");
                     finishPick(now);
                 }
+                break;
+            case RETRACE:
+            case CIRCLE:
+            case WAY_OUT:
+            case DRIVE_OFF:
+                escapeTick(now, fresh, hazard);
                 break;
             case CORNERED:
                 if (now >= phaseUntil) {
@@ -920,8 +1001,9 @@ final class ExploreBrain {
         hopNext = false;
         plannedTicks = -1;
         lastHazardSide = h == null ? null : h.side;
-        if (recordHazard(now)) {
-            enterCornered(now);
+        boolean capped = recordHazard(now);
+        if (capped || wedgedNow(now)) {
+            wedged(now, "hazards in a row", false);
             return;
         }
         enterLook(now, escapeSide(h), true, tuning.escapeTurnMs, tuning.escapeTurnDeg);
@@ -944,6 +1026,7 @@ final class ExploreBrain {
         lastHazardSide = h == null ? null : h.side;
         escapeDir = escapeSide(h);
         corneredAfterStartle = recordHazard(now);
+        corneredAfterStartle |= wedgedNow(now);
         // One "whoa" per stall streak: repeat stalls flinch quietly.
         if (!stalledNow || stallStreak == 1) {
             sound.playStartle();
@@ -1031,8 +1114,9 @@ final class ExploreBrain {
                 escapeFailures.pollFirst();
             }
             note("no clear way turning " + heading + " (" + escapeFailures.size() + " failed escapes)");
-            if (escapeFailures.size() >= tuning.escapeFailuresMax) {
-                enterCornered(now);
+            if (escapeFailures.size() >= tuning.escapeFailuresMax
+                    || (compass.usable(now) && escapeFailures.size() >= tuning.wedgeFailedEscapes)) {
+                wedged(now, "no clear way all round", false);
                 return;
             }
             escapeSide = heading.opposite();
@@ -1076,6 +1160,8 @@ final class ExploreBrain {
     /** Starts a measured turn now if the gyro can measure it (motor.turn(heading) just went out). */
     private void measureTurn(long now, double deg) {
         measured = deg > 0 && compass.usable(now);
+        turnProgressDeg = 0;
+        turnProgressAt = now;
         if (measured) {
             compass.startTurn(heading == Direction.LEFT ? Heading.LEFT : Heading.RIGHT,
                     escape && state == State.TURN ? Math.min(deg, tuning.escapeSweepDeg) : deg);
@@ -1087,7 +1173,7 @@ final class ExploreBrain {
      * while hopping: turns and back-offs move the wheels differently.
      */
     private void trackWheels(SensorReading r) {
-        if (state != State.HOP || !r.hasWheels()) {
+        if (!(state == State.HOP || escapeDriving()) || !r.hasWheels()) {
             return;
         }
         if (lastWheels != null) {
@@ -1197,7 +1283,9 @@ final class ExploreBrain {
                 break;
             case TURNING:
                 // Like a discretionary turn: any hazard stops it.
-                if (hazard) {
+                if (turnBlocked(now)) {
+                    turnWouldNotTurn(now);
+                } else if (hazard) {
                     hazardInMotion(now);
                 } else if (turnDone(now)) {
                     stopMotors();
@@ -1599,7 +1687,7 @@ final class ExploreBrain {
             countsFrom = null;
         }
         boolean clear = classifier.status(now) == HazardClassifier.Status.CLEAR
-                && !(state == State.HOP && wheelsStalled(now))
+                && !((state == State.HOP || escapeDriving()) && wheelsStalled(now))
                 && (!moving || forward);
         camera.setFloorClear(now, clear);
         if (!clear) {
@@ -2303,11 +2391,560 @@ final class ExploreBrain {
         return Math.max(100, (long) (Math.abs(d.centerX()) * tuning.turnMsPerUnit));
     }
 
+    // ---- wedged escapes (explore nav plan U5) ----
+
+    /**
+     * A measured turn the gyro says isn't turning (live, under a desk: "asked 120 deg,
+     * turned 0"): less than turnStallDeg of progress for turnStallMs since the turn
+     * started or last moved on. Only measured turns can tell; timed ones run as before.
+     */
+    private boolean turnBlocked(long now) {
+        if (!measured || !compass.usable(now)) {
+            return false;
+        }
+        double t = compass.turned();
+        if (t >= turnProgressDeg + tuning.turnStallDeg) {
+            turnProgressDeg = t;
+            turnProgressAt = now;
+        }
+        return now - turnProgressAt >= tuning.turnStallMs;
+    }
+
+    /** A roaming, escape or curiosity turn that would not turn: stop at once, and he is wedged. */
+    private void turnWouldNotTurn(long now) {
+        stopMotors();
+        note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
+                + " deg in " + (now - turnStartedAt) + " ms");
+        leaveStopForHazard();
+        wedged(now, "a turn that would not turn", true);
+    }
+
+    /** Today's triggers, counted lower once the heading can steer an escape (wedgeHazards, wedgeStalls). */
+    private boolean wedgedNow(long now) {
+        return compass.usable(now) && (hazardTimes.size() >= tuning.wedgeHazards || stallStreak >= tuning.wedgeStalls);
+    }
+
+    /**
+     * Wedged: with the heading usable, the escape planner's steps (retrace, circle,
+     * way out, drive off); without it, today's rest.
+     */
+    private void wedged(long now, String why, boolean turnBlocked) {
+        stopMotors();
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        if (!compass.usable(now)) {
+            enterCornered(now);
+            return;
+        }
+        note("wedged: " + why + " (" + hazardTimes.size() + " hazards, " + stallStreak + " stalls, "
+                + escapeFailures.size() + " failed escapes); escaping");
+        hazardTimes.clear();
+        escapeFailures.clear();
+        planner.begin(now, compass.degrees());
+        escBackOutFirst = turnBlocked;
+        circleDir = escapeSide != null ? escapeSide : Direction.LEFT;
+        escapePhase(now);
+    }
+
+    /** Enters the planner's current step. */
+    private void escapePhase(long now) {
+        switch (planner.phase()) {
+            case RETRACE:
+                state = State.RETRACE;
+                show(EyeState.IDLE, null);
+                if (escBackOutFirst) {
+                    escBackOutFirst = false;
+                    if (startBackOut(EscThen.RETRACE_NEXT)) {
+                        return;
+                    }
+                }
+                escWait(now, EscThen.RETRACE_NEXT);
+                break;
+            case CIRCLE:
+                state = State.CIRCLE;
+                if (!cameraWanted(now)) {
+                    note("no camera for the circle");
+                    planner.next(now);
+                    escapePhase(now);
+                    return;
+                }
+                show(EyeState.IDLE, null);
+                escLook(now);
+                break;
+            case WAY_OUT:
+                state = State.WAY_OUT;
+                escAsked.clear();
+                escAskedHeadings.clear();
+                for (CuriosityPort.Frame f : planner.frames()) {
+                    escAsked.add(f);
+                    escAskedHeadings.add(planner.lookHeading(f.look));
+                }
+                askWayOut(now);
+                break;
+            case SECOND_ASK:
+                state = State.WAY_OUT;
+                if (!port.canAsk() || !cameraWanted(now)) {
+                    note("no second way-out ask: " + (port.canAsk() ? "no camera" : "Claude unreachable"));
+                    planner.next(now);
+                    escapePhase(now);
+                    return;
+                }
+                show(EyeState.THINKING, null);
+                escLook(now);
+                break;
+            case DRIVE_OFF:
+            case SECOND_DRIVE_OFF:
+                state = State.DRIVE_OFF;
+                escGoal = 0;
+                escTurnTo(now, planner.driveHeading(), EscThen.DRIVE);
+                break;
+            case REST:
+                planner.reset();
+                esc = null;
+                enterCornered(now);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** Each tick of an escape step: its budget, then what it is doing. */
+    private void escapeTick(long now, boolean fresh, boolean hazard) {
+        if (!compass.usable(now)) {
+            stopMotors();
+            cancelWayOut();
+            planner.reset();
+            esc = null;
+            note("heading lost mid-escape: turning away as before");
+            enterLook(now, escapeSide != null ? escapeSide : randomDirection(), true, tuning.escapeTurnMs,
+                    tuning.escapeTurnDeg);
+            return;
+        }
+        if (now >= planner.stepUntil()) {
+            escapeOutOfTime(now);
+            return;
+        }
+        // A move made ready by this step starts on the same fresh reading.
+        for (int i = 0; i < 4 && planner.active() && state.escapes(); i++) {
+            Esc was = esc;
+            escapeOnce(now, fresh, hazard);
+            if (esc == was || !(esc == Esc.TURN_READY || esc == Esc.DRIVE_READY || esc == Esc.BACK_READY)) {
+                break;
+            }
+        }
+    }
+
+    private void escapeOnce(long now, boolean fresh, boolean hazard) {
+        if (esc == null) {
+            return;
+        }
+        switch (esc) {
+            case READY:
+                // A fresh reading after the wait began: the last leg has closed in the log.
+                if (fresh && now > escWaitSince) {
+                    if (escThen == EscThen.RETRACE_NEXT) {
+                        retraceNext(now);
+                    } else {
+                        escapePhase(now);
+                    }
+                }
+                break;
+            case TURN_READY:
+                // Turning in place is how he gets out: a hazard in view doesn't stop it.
+                if (fresh) {
+                    heading = escDir;
+                    turnDeg = escTurnAmount;
+                    moving = true;
+                    motor.turn(escDir);
+                    turnStartedAt = now;
+                    phaseUntil = now + timedMs(escTurnAmount);
+                    measureTurn(now, escTurnAmount);
+                    esc = Esc.TURNING;
+                }
+                break;
+            case TURNING:
+                if (turnBlocked(now)) {
+                    stopMotors();
+                    escTurnBlocked(now);
+                } else if (turnDone(now)) {
+                    stopMotors();
+                    escAfterTurn(now);
+                }
+                break;
+            case DRIVE_READY:
+                if (!fresh) {
+                    break;
+                }
+                if (hazard) {
+                    escFailed(now, "the way ahead reads blocked");
+                    break;
+                }
+                show(EyeState.IDLE, null);
+                startEscapeMotion(now);
+                escTicks = 1;
+                nextTickAt = now + tuning.hopTickMs;
+                esc = Esc.DRIVING;
+                motor.hopTick();
+                compass.startLeg(false, now);
+                break;
+            case DRIVING:
+                escDriveStep(now, hazard);
+                break;
+            case BACK_READY:
+                if (fresh) {
+                    startEscapeMotion(now);
+                    escUntil = now + (escGoal > 0 ? tuning.backOutMaxMs : tuning.backTicks * tuning.backTickMs);
+                    nextTickAt = now + tuning.backTickMs;
+                    esc = Esc.BACKING;
+                    motor.backTick();
+                    compass.startLeg(true, now);
+                }
+                break;
+            case BACKING:
+                escBackStep(now);
+                break;
+            case LOOKING:
+                escLookStep(now);
+                break;
+            case ASKING:
+                escAskStep(now);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** A drive or back-out starts: its counts and stall watch from here. */
+    private void startEscapeMotion(long now) {
+        moving = true;
+        escMoved = 0;
+        escFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        hopStartedAt = now;
+        lastWheels = null;
+        wheelMoves.clear();
+    }
+
+    /** Driving or backing out in an escape: the counts it has moved, from each reading's encoders. */
+    private boolean escapeDriving() {
+        return state.escapes() && moving && (esc == Esc.DRIVING || esc == Esc.BACKING);
+    }
+
+    private void countEscapeWheels(SensorReading r) {
+        if (!escapeDriving() || !r.hasWheels()) {
+            return;
+        }
+        if (escFrom != null) {
+            escMoved += (Math.abs(r.wheelLeft - escFrom.wheelLeft) + Math.abs(r.wheelRight - escFrom.wheelRight)) / 2;
+        }
+        escFrom = r;
+    }
+
+    private void escDriveStep(long now, boolean hazard) {
+        boolean stalled = wheelsStalled(now);
+        if (hazard || stalled) {
+            stopMotors();
+            note((hazard ? "hazard" : "wheels stalled") + " driving in the escape's " + planner.phase() + " after "
+                    + escMoved + " counts");
+            if (planner.phase() == EscapePlanner.Phase.RETRACE) {
+                planner.addRetraced(escMoved);
+            }
+            show(EyeState.FLINCH, null);
+            planner.next(now);
+            if (tuning.backTicks > 0) {
+                escGoal = 0;
+                escThen = EscThen.PHASE;
+                esc = Esc.BACK_READY;
+            } else {
+                escapePhase(now);
+            }
+            return;
+        }
+        boolean done = escGoal > 0 ? escMoved >= escGoal
+                : escTicks >= tuning.escapeDriveTicks && now >= nextTickAt;
+        if (done) {
+            stopMotors();
+            if (planner.phase() == EscapePlanner.Phase.RETRACE) {
+                planner.addRetraced(escMoved);
+                escWait(now, EscThen.RETRACE_NEXT);
+            } else {
+                escapeFreed(now, "drove off");
+            }
+        } else if (now >= nextTickAt) {
+            escTicks++;
+            nextTickAt += tuning.hopTickMs;
+            motor.hopTick();
+        }
+    }
+
+    /** Backing out (goal counts, bounded by backOutMaxMs) or a hazard's timed back-off (blind either way). */
+    private void escBackStep(long now) {
+        boolean reached = escGoal > 0 && escMoved >= escGoal;
+        boolean stalled = escGoal > 0 && wheelsStalled(now);
+        if (reached || stalled || now >= escUntil) {
+            stopMotors();
+            if (escGoal > 0) {
+                planner.addRetraced(escMoved);
+                if (stalled && !reached) {
+                    planner.backOutStalled();
+                    note("back-out stalled after " + escMoved + " counts");
+                } else {
+                    note("backed out " + escMoved + " counts");
+                }
+            }
+            if (escThen == EscThen.RETRY_TURN) {
+                escThen = escThenAfterRetry;
+                esc = Esc.TURN_READY;
+            } else if (escThen == EscThen.RETRACE_NEXT) {
+                escWait(now, EscThen.RETRACE_NEXT);
+            } else {
+                escapePhase(now);
+            }
+        } else if (now >= nextTickAt) {
+            nextTickAt += tuning.backTickMs;
+            motor.backTick();
+        }
+    }
+
+    /**
+     * Straight back along the most recent forward leg(s) he is facing along, capped at
+     * their logged distance and the retrace distance; false when the log has none.
+     */
+    private boolean startBackOut(EscThen then) {
+        long counts = planner.backOutCounts(compass.legs(), compass.degrees());
+        if (counts <= 0) {
+            return false;
+        }
+        note("backing out straight along the way in: " + counts + " counts");
+        escGoal = counts;
+        escThen = then;
+        esc = Esc.BACK_READY;
+        return true;
+    }
+
+    /** Wait for the next fresh reading (the last leg closes on it), then go on. */
+    private void escWait(long now, EscThen then) {
+        escThen = then;
+        escWaitSince = now;
+        esc = Esc.READY;
+    }
+
+    /** The retrace's next move from the leg log as it is now, or its end. */
+    private void retraceNext(long now) {
+        EscapePlanner.Move m = planner.nextRetraceMove(compass.legs());
+        if (m == null) {
+            if (planner.retraced() > 0) {
+                escapeFreed(now, "retraced " + planner.retraced() + " counts");
+            } else {
+                note("nothing logged to retrace");
+                planner.next(now);
+                escapePhase(now);
+            }
+            return;
+        }
+        note("retrace: facing " + m);
+        planner.tried(m.heading);
+        escGoal = m.counts;
+        escTurnTo(now, m.heading, EscThen.DRIVE);
+    }
+
+    private void escTurnTo(long now, double target, EscThen then) {
+        double delta = Heading.delta(compass.degrees(), target);
+        if (Math.abs(delta) < tuning.turnToleranceDeg) {
+            escThen = then;
+            escAfterTurn(now);
+            return;
+        }
+        escTurnBy(delta > 0 ? Direction.LEFT : Direction.RIGHT, Math.abs(delta), then);
+    }
+
+    private void escTurnBy(Direction d, double deg, EscThen then) {
+        escDir = d;
+        escTurnAmount = deg;
+        escThen = then;
+        escBackedOut = false;
+        esc = Esc.TURN_READY;
+        show(EyeState.LOOK, d);
+    }
+
+    private void escAfterTurn(long now) {
+        if (escThen == EscThen.LOOK) {
+            escLook(now);
+        } else {
+            esc = Esc.DRIVE_READY;
+        }
+    }
+
+    /** A turn in the escape that would not turn: back out once if the log allows, else the step failed. */
+    private void escTurnBlocked(long now) {
+        note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
+                + " deg in " + (now - turnStartedAt) + " ms");
+        if (!escBackedOut) {
+            escBackedOut = true;
+            EscThen after = planner.phase() == EscapePlanner.Phase.RETRACE ? EscThen.RETRACE_NEXT : EscThen.RETRY_TURN;
+            EscThen keep = escThen;
+            if (startBackOut(after)) {
+                if (after == EscThen.RETRY_TURN) {
+                    // The retried turn keeps what follows it.
+                    escThenAfterRetry = keep;
+                }
+                return;
+            }
+        }
+        escFailed(now, "a turn that would not turn");
+    }
+
+    /** What follows a turn retried after a back-out. */
+    private EscThen escThenAfterRetry;
+
+    private void escFailed(long now, String why) {
+        stopMotors();
+        note("escape's " + planner.phase() + " failed: " + why);
+        planner.next(now);
+        escapePhase(now);
+    }
+
+    /** One fresh stationary look, captured escapeSettleMs after he stopped (the bias re-estimated meanwhile). */
+    private void escLook(long now) {
+        esc = Esc.LOOKING;
+        escLookAfter = now + tuning.escapeSettleMs;
+        escLookBefore = camera.latest();
+    }
+
+    private void escLookStep(long now) {
+        Look look = camera.latest();
+        if (look == null || look == escLookBefore || look.frameMs < escLookAfter) {
+            return;
+        }
+        double at = compass.degrees();
+        if (planner.phase() == EscapePlanner.Phase.CIRCLE) {
+            planner.addLook(at, look.openness, look.jpeg);
+            note("circle look " + planner.looks() + " of " + tuning.escapeCircleSteps + " at " + Math.round(at) + " deg");
+            if (planner.circleDone()) {
+                planner.next(now);
+                escapePhase(now);
+            } else {
+                escTurnBy(circleDir, tuning.escapeCircleStepDeg, EscThen.LOOK);
+            }
+            return;
+        }
+        escAsked.clear();
+        escAskedHeadings.clear();
+        if (look.jpeg != null) {
+            escAsked.add(new CuriosityPort.Frame(0, look.jpeg));
+            escAskedHeadings.add(at);
+        }
+        askWayOut(now);
+    }
+
+    /** Claude's way out from escAsked (the circle's frames, or the second ask's one), within the step's budget. */
+    private void askWayOut(long now) {
+        boolean second = planner.phase() == EscapePlanner.Phase.SECOND_ASK;
+        if (escAsked.isEmpty() || !port.canAsk()) {
+            note("no way-out ask (" + escAsked.size() + " frames, Claude " + (port.canAsk() ? "set up" : "unreachable")
+                    + ")");
+            wayOutFailed(now);
+            return;
+        }
+        show(EyeState.THINKING, null);
+        note("asking Claude the way out (" + escAsked.size() + " frames" + (second ? ", second ask" : "") + ")");
+        port.wayOut(new CuriosityPort.WayOutRequest(new ArrayList<CuriosityPort.Frame>(escAsked), second),
+                Math.max(1, planner.stepUntil() - now));
+        wayOutAsking = true;
+        esc = Esc.ASKING;
+    }
+
+    private void escAskStep(long now) {
+        CuriosityPort.WayOut a = port.wayOutAnswer();
+        if (a == null) {
+            return;
+        }
+        wayOutAsking = false;
+        if (a.status == CuriosityPort.WayOut.Status.WAY && a.frame >= 0 && a.frame < escAsked.size()
+                && a.x >= -1f && a.x <= 1f) {
+            // Frame coordinates become a gyro heading the moment the answer arrives (KTD4).
+            double h = EscapePlanner.aim(escAskedHeadings.get(a.frame), a.x, tuning.cameraHalfFovDeg);
+            note("Claude's " + a + ": the way out is at " + Math.round(h) + " deg");
+            planner.driveOff(now, h);
+            escapePhase(now);
+            return;
+        }
+        note("Claude's way-out answer is unusable: " + a);
+        wayOutFailed(now);
+    }
+
+    /** No way out from Claude: the first ask falls back on the robot's own; the second ends in rest. */
+    private void wayOutFailed(long now) {
+        if (planner.phase() == EscapePlanner.Phase.SECOND_ASK) {
+            planner.next(now);
+            escapePhase(now);
+        } else {
+            onRobotWayOut(now);
+        }
+    }
+
+    private void onRobotWayOut(long now) {
+        double h = planner.bestOpenHeading(compass.degrees());
+        note("way out on the robot: " + Math.round(h) + " deg (from " + planner.looks() + " looks)");
+        planner.driveOff(now, h);
+        escapePhase(now);
+    }
+
+    /** A step out of time has failed (U5's budgets); driving clear when it ran out has freed him. */
+    private void escapeOutOfTime(long now) {
+        EscapePlanner.Phase p = planner.phase();
+        boolean clear = esc == Esc.DRIVING && moving && escTicks >= tuning.escapeFreeTicks;
+        stopMotors();
+        cancelWayOut();
+        if (clear && (p == EscapePlanner.Phase.RETRACE || p == EscapePlanner.Phase.DRIVE_OFF
+                || p == EscapePlanner.Phase.SECOND_DRIVE_OFF)) {
+            if (p == EscapePlanner.Phase.RETRACE) {
+                planner.addRetraced(escMoved);
+            }
+            escapeFreed(now, "driving clear when the step's time ran out");
+            return;
+        }
+        note("escape's " + p + " out of time after " + planner.budget(p) + " ms");
+        if (p == EscapePlanner.Phase.WAY_OUT) {
+            onRobotWayOut(now);
+            return;
+        }
+        planner.next(now);
+        escapePhase(now);
+    }
+
+    /** Out: whatever wedged him is behind him, as after a clean leg. */
+    private void escapeFreed(long now, String how) {
+        stopMotors();
+        note("free after " + (now - planner.startedAt()) + " ms: " + how);
+        planner.reset();
+        esc = null;
+        compass.droveOffCleanly();
+        hazardTimes.clear();
+        stallStreak = 0;
+        escapeFailures.clear();
+        escapeSide = null;
+        lastHazardSide = null;
+        if (!sayHeldLine(now)) {
+            enterPause(now, pauseMs(), false);
+        }
+    }
+
+    private void cancelWayOut() {
+        if (wayOutAsking) {
+            wayOutAsking = false;
+            port.cancelWayOut();
+        }
+    }
+
     // ---- entering states ----
 
     private void enterEyesOnly(String why) {
         stopMotors();
         cancelAsk();
+        cancelWayOut();
+        planner.reset();
+        esc = null;
         hopNext = false;
         plannedTicks = -1;
         lookForLeg = false;
@@ -2438,7 +3075,8 @@ final class ExploreBrain {
 
     /** A forward leg is under way: a roaming hop, or an approach leg. */
     private boolean drivingForward() {
-        return moving && (state == State.HOP || (state == State.APPROACH && step == Step.LEG));
+        return moving && (state == State.HOP || (state == State.APPROACH && step == Step.LEG)
+                || (state.escapes() && esc == Esc.DRIVING));
     }
 
     private void show(EyeState s, Direction gaze) {
