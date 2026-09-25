@@ -32,9 +32,11 @@ import java.util.Locale;
  * Plain Java (no Android or shared-driver imports) so it runs on the host JVM.
  * It never logs and keeps no pixels, only colour means (R15). Methods are
  * synchronized: ExploreCamera scores on its detect thread and forwards the
- * brain's teach and hazard calls. Thresholds were tuned on U3's gate frames
- * (this camera is dim and tilted up; see HORIZON and the luma constants), and
- * colour distances are scaled for dim light (apart()).
+ * brain's teach and hazard calls. Thresholds were tuned on U3's gate frames,
+ * dim ones and bright ones from after the camera ran its own exposure (U9);
+ * this camera is tilted up (see HORIZON), and colour distances are scaled for
+ * dim light (apart()). Colour never overrules the horizon: a grey wall can be
+ * the grey carpet's colour, so only where the floor run ends says how near.
  */
 final class Openness {
     static final int BINS = 16;
@@ -90,12 +92,23 @@ final class Openness {
     private static final float MAX_FLOOR_TOLERANCE = 60f;
     /** A bin's row is floor when at least this share of its pixels match a patch. */
     private static final float FLOOR_ROW_SHARE = 0.6f;
+    /**
+     * Floor rows past a gap in the bottom run (at least this share of the band's
+     * rows) mean the floor is seen beyond whatever broke the run.
+     */
+    private static final float FLOOR_BEYOND_SHARE = 0.08f;
     /** The teaching sample: the bottom rows (the nearer half of the ground), centre columns (what he drives onto next). */
     private static final float SAMPLE_TOP = 0.9f;
     private static final float SAMPLE_LEFT = 0.3f;
     private static final float SAMPLE_RIGHT = 0.7f;
-    /** A sample more varied than this is not one floor (a toy, a seam, an edge). */
+    /**
+     * A sample more varied than this is not one floor (a toy, a seam, an edge).
+     * Texture grows with brightness: a carpet read 4 in dim light and 21 once
+     * the camera brightened itself (U9), so the limit is the larger of a fixed
+     * floor and a share of the sample's luma.
+     */
     private static final float MAX_SAMPLE_SPREAD = 18f;
+    private static final float MAX_SAMPLE_SPREAD_SHARE = 0.45f;
     /**
      * Mean frame luma below DARK: no confidence; above DIM: full. This camera's
      * office-light frames average luma ~30, so DIM sits there, not at a bright
@@ -321,7 +334,7 @@ final class Openness {
             int x1 = Math.min(w, ((b + 1) * w + BINS - 1) / BINS);
             float colour = UNSURE;
             int free = 0;
-            boolean floorBeyond = false;
+            int beyond = 0;
             if (!patches.isEmpty() && x1 > x0) {
                 boolean run = true;
                 for (int y = rows - 1; y >= 0; y--) {
@@ -336,17 +349,19 @@ final class Openness {
                     if (run) {
                         free++;
                     } else if (isFloor) {
-                        floorBeyond = true;
+                        beyond++;
                     }
                 }
                 colour = UNSURE + (1f - UNSURE) * free / rows;
             }
             float reach = columns[b] == 0 ? 0f : reachSum[b] / columns[b];
+            boolean floorBeyond = beyond >= FLOOR_BEYOND_SHARE * rows;
             if (!patches.isEmpty() && reach > STANDING_REACH && !floorBeyond) {
                 // A surface comes well down from the horizon and no taught floor shows
                 // between it and the floor run at the bottom (if any): it stands where
                 // that run ends, even where its colour broke first (a chair's seat
-                // above its base). Floor seen beyond a gap keeps the gap unsure (KTD9).
+                // above its base). Floor seen beyond a gap keeps the gap unsure (KTD9);
+                // a stray row of shadowed carpet at a chair's foot is not a view past it.
                 reach = Math.max(reach, 1f - (float) free / rows);
             }
             float horizon = 1f - clamp01((reach - REACH_MARGIN) / (1f - REACH_MARGIN));
@@ -357,9 +372,12 @@ final class Openness {
 
     /**
      * Per lower-frame column, the mean colour of whole's rows just above the
-     * horizon, packed r,g,b; NaN where that surface is floor (it crosses nothing).
+     * horizon, packed r,g,b; NaN only when the frame has no rows there. Floor
+     * never shows above the horizon, so this is never floor, even when its colour
+     * is the floor's: a grey wall over a grey carpet (the camera brightened by
+     * U9) matched the carpet and was waved through as open floor.
      */
-    private float[] referenceAboveHorizon(Frame whole, int w) {
+    private static float[] referenceAboveHorizon(Frame whole, int w) {
         int from = -1;
         int to = -1;
         for (int y = 0; y < whole.height; y++) {
@@ -394,8 +412,7 @@ final class Openness {
             r /= n;
             g /= n;
             b /= n;
-            boolean isFloor = matchesFloor(r, g, b);
-            ref[x * 3] = isFloor ? Float.NaN : r;
+            ref[x * 3] = r;
             ref[x * 3 + 1] = g;
             ref[x * 3 + 2] = b;
         }
@@ -407,7 +424,11 @@ final class Openness {
      * down this column: pixel to pixel, so the shading down a plain wall is
      * followed, but never drifting far from its colour at the horizon. It ends at
      * floor only across an edge (a wall's base, its shadow line): a dim wall can
-     * shade smoothly into a floor-like grey without ever reaching the floor.
+     * shade smoothly into a floor-like grey without ever reaching the floor, and
+     * a bright grey wall can be the floor's colour all the way down. Each pixel
+     * is averaged with its left and right neighbours first: an edge the surface
+     * ends at runs across the column, while single-pixel JPEG noise (steps over
+     * FLOOR_EDGE on a plain bright wall) does not.
      */
     private static float reach(Frame lower, int first, int rows, boolean[] floor, int x, float[] ref) {
         float r = ref[x * 3];
@@ -420,11 +441,22 @@ final class Openness {
         float pg = g;
         float pb = b;
         int last = -1;
+        int xl = Math.max(0, x - 1);
+        int xr = Math.min(lower.width - 1, x + 1);
         for (int y = 0; y < rows; y++) {
-            int p = lower.at(x, first + y);
-            float cr = (p >> 16) & 0xff;
-            float cg = (p >> 8) & 0xff;
-            float cb = p & 0xff;
+            float cr = 0f;
+            float cg = 0f;
+            float cb = 0f;
+            for (int xx = xl; xx <= xr; xx++) {
+                int p = lower.at(xx, first + y);
+                cr += (p >> 16) & 0xff;
+                cg += (p >> 8) & 0xff;
+                cb += p & 0xff;
+            }
+            int n = xr - xl + 1;
+            cr /= n;
+            cg /= n;
+            cb /= n;
             float step = apart(cr, cg, cb, pr, pg, pb);
             if (step > SAME_SURFACE || apart(cr, cg, cb, r, g, b) > SURFACE_DRIFT
                     || (floor[y * lower.width + x] && step > FLOOR_EDGE)) {
@@ -497,7 +529,7 @@ final class Openness {
             }
         }
         float spread = (float) Math.sqrt(var / n);
-        if (spread > MAX_SAMPLE_SPREAD) {
+        if (spread > Math.max(MAX_SAMPLE_SPREAD, MAX_SAMPLE_SPREAD_SHARE * luma(mr, mg, mb))) {
             return;
         }
         // The patch's spread widens its tolerance, which is in apart()'s scaled units.

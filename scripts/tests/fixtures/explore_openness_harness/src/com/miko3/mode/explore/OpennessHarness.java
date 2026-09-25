@@ -26,7 +26,7 @@ public final class OpennessHarness {
 
     public static void main(String[] args) {
         check("wall_on_the_left_scores_left_low_and_right_high", wallOnTheLeft());
-        check("all_floor_frame_scores_every_bin_open", allFloor());
+        check("floor_up_to_the_horizon_scores_every_bin_open", allFloor());
         check("box_reaching_the_bottom_blocks_floor_coloured_columns", lowBox());
         check("high_box_lowers_its_columns_only_slightly", highBox());
         check("taught_rug_stays_open_and_untaught_colour_reads_unsure", rugAndUntaught());
@@ -49,6 +49,8 @@ public final class OpennessHarness {
         check("wall_filling_the_frame_scores_blocked_once_floor_is_taught", wallFillsTheFrame());
         check("untaught_floor_filling_the_ground_under_a_far_wall_stays_unsure", unknownFloorFillsTheGround());
         check("standing_thing_stands_where_the_floor_run_ends", standsWhereTheRunEnds());
+        check("grey_wall_the_colour_of_a_bright_taught_carpet_still_reads_blocked", greyWallOverGreyCarpet());
+        check("a_stray_floor_row_at_a_chairs_foot_is_not_a_view_past_it", strayRowAtTheFoot());
     }
 
     // ---- scenes ----
@@ -58,6 +60,7 @@ public final class OpennessHarness {
         private final List<float[]> rects = new ArrayList<>();
         private final List<Integer> colours = new ArrayList<>();
         private final List<Integer> shadedTo = new ArrayList<>();
+        private final List<Boolean> woven = new ArrayList<>();
         private final int farWall;
         private final int floor;
         private boolean checker;
@@ -77,6 +80,14 @@ public final class OpennessHarness {
             rects.add(new float[] {x0, y0, x1, y1});
             colours.add(top);
             shadedTo.add(bottom);
+            woven.add(false);
+            return this;
+        }
+
+        /** A textured surface (a carpet's weave): a fine two-colour checker, cells 0.0125 of the frame. */
+        Scene weave(float x0, float y0, float x1, float y1, int a, int b) {
+            shade(x0, y0, x1, y1, a, b);
+            woven.set(woven.size() - 1, true);
             return this;
         }
 
@@ -92,7 +103,11 @@ public final class OpennessHarness {
             for (int i = 0; i < rects.size(); i++) {
                 float[] r = rects.get(i);
                 if (fx >= r[0] && fx < r[2] && fy >= r[1] && fy < r[3]) {
-                    c = mix(colours.get(i), shadedTo.get(i), (fy - r[1]) / (r[3] - r[1]));
+                    if (woven.get(i)) {
+                        c = (((int) (fx / 0.0125f) + (int) (fy / 0.0125f)) & 1) == 0 ? colours.get(i) : shadedTo.get(i);
+                    } else {
+                        c = mix(colours.get(i), shadedTo.get(i), (fy - r[1]) / (r[3] - r[1]));
+                    }
                 }
             }
             if (checker && fx >= checkerRect[0] && fx < checkerRect[2] && fy >= checkerRect[1] && fy < checkerRect[3]) {
@@ -172,9 +187,15 @@ public final class OpennessHarness {
         return null;
     }
 
+    /**
+     * Every row below the horizon is floor, the far wall's base right at it. (The
+     * floor is not painted above the horizon: this up-tilted camera never sees
+     * floor there, so a floor-coloured surface above it is a wall; see
+     * greyWallOverGreyCarpet.)
+     */
     private static String allFloor() {
         Openness o = taughtRoom();
-        Openness.Profile p = score(o, room().paint(0f, 0f, 1f, 1f, FLOOR), NONE, 200, false);
+        Openness.Profile p = score(o, room().paint(0f, Openness.HORIZON, 1f, 1f, FLOOR), NONE, 200, false);
         float lo = min(p.bins, 0, Openness.BINS - 1);
         return lo > 0.8f ? null : "lowest bin " + lo + " " + p;
     }
@@ -499,6 +520,50 @@ public final class OpennessHarness {
                 .paint(0.25f, ground(0.5f), 0.5f, ground(0.8f), rgb(200, 200, 200));
         Openness.Profile p = score(o, s, NONE, 200, false);
         float chair = max(p.bins, 4, 7);
+        float clear = min(p.bins, 10, 15);
+        return chair < 0.35f && clear > 0.8f ? null : "chair " + chair + " clear " + clear + " " + p;
+    }
+
+    /**
+     * Real failure 3 (after the camera brightened itself, U9): a bright grey carpet
+     * with a coarse weave is taught, then a plain grey wall 2-3 ft away, whose
+     * colour at and below the horizon is within the carpet's tolerance, fills the
+     * frame above a sliver of carpet. Colour cannot tell them apart; the horizon
+     * can (floor never shows above it), so every bin reads blocked.
+     */
+    private static String greyWallOverGreyCarpet() {
+        int weaveA = rgb(100, 100, 104);
+        int weaveB = rgb(72, 72, 76);
+        Openness o = new Openness();
+        Scene carpet = room().weave(0f, ground(0.09f), 1f, 1f, weaveA, weaveB);
+        teach(o, carpet, 100);
+        if (o.patches() != 1) {
+            return "the bright woven carpet was not taught: patches " + o.patches();
+        }
+        Openness.Profile open = score(o, carpet, NONE, 200, false);
+        if (min(open.bins, 0, Openness.BINS - 1) <= 0.8f) {
+            return "the taught carpet reads " + open;
+        }
+        float base = ground(0.95f);
+        Scene wall = room().weave(0f, ground(0.09f), 1f, 1f, weaveA, weaveB)
+                .shade(0f, 0f, 1f, base, rgb(128, 128, 124), rgb(92, 92, 92));
+        Openness.Profile p = score(o, wall, NONE, 300, false);
+        float hi = max(p.bins, 0, Openness.BINS - 1);
+        return hi <= 0.2f ? null : "a grey wall over the grey carpet reads " + p;
+    }
+
+    /**
+     * A dark chair base with one thin row of floor-coloured shadow showing between
+     * its legs, just above the floor run: that row is not the floor seen past the
+     * chair, so the chair still stands where the run ends.
+     */
+    private static String strayRowAtTheFoot() {
+        Openness o = taughtRoom();
+        float gap = 1f / 120f;
+        Scene s = room().paint(0.25f, 0.3f, 0.5f, ground(0.7f), rgb(30, 30, 40))
+                .paint(0.25f, ground(0.5f), 0.5f, ground(0.5f) + gap, FLOOR);
+        Openness.Profile p = score(o, s, NONE, 200, false);
+        float chair = max(p.bins, 5, 7);
         float clear = min(p.bins, 10, 15);
         return chair < 0.35f && clear > 0.8f ? null : "chair " + chair + " clear " + clear + " " + p;
     }

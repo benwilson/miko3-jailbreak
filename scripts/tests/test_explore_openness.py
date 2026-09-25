@@ -30,8 +30,22 @@ HARNESS = TESTS / "fixtures" / "explore_openness_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "OpennessHarness.java"
 GATE_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "OpennessGate.java"
 # The owner's real frames for U3's gate: private, gitignored, often absent.
+# Two pairs from the same spots: dim (before the camera ran its own exposure,
+# U9) and bright (after). Each: label, open frame, wall frame, doorway bins.
+# The bright frame sits about a bin further left, so its red door panel covers
+# bin 7 (a standing surface, rightly not open): its doorway is bins 8-10.
 NAV_FRAMES = REPO / "voice-work" / "nav-frames"
-GATE_FRAMES = (NAV_FRAMES / "open-floor-doorway.jpg", NAV_FRAMES / "wall-2ft.jpg")
+GATE_PAIRS = (
+    ("dim", NAV_FRAMES / "open-floor-doorway.jpg", NAV_FRAMES / "wall-2ft.jpg", (7, 10)),
+    ("bright", NAV_FRAMES / "open-floor-doorway-bright.jpg", NAV_FRAMES / "wall-2ft-bright.jpg", (8, 10)),
+)
+GATE_CHECKS = (
+    "carpet_teaches",
+    "open_frame_is_trusted_once_taught",
+    "wall_reads_blocked_in_every_bin",
+    "wall_scores_clearly_below_the_doorway",
+    "plant_and_chair_stay_below_the_doorway",
+)
 
 
 def src(name):
@@ -48,7 +62,7 @@ class OpennessHarnessTest(unittest.TestCase):
     SCENARIOS = (
         # Happy paths (KTD3)
         "wall_on_the_left_scores_left_low_and_right_high",
-        "all_floor_frame_scores_every_bin_open",
+        "floor_up_to_the_horizon_scores_every_bin_open",
         "box_reaching_the_bottom_blocks_floor_coloured_columns",
         "high_box_lowers_its_columns_only_slightly",
         "taught_rug_stays_open_and_untaught_colour_reads_unsure",
@@ -76,6 +90,9 @@ class OpennessHarnessTest(unittest.TestCase):
         "wall_filling_the_frame_scores_blocked_once_floor_is_taught",
         "untaught_floor_filling_the_ground_under_a_far_wall_stays_unsure",
         "standing_thing_stands_where_the_floor_run_ends",
+        # After U9 brightened the camera: a grey wall over a grey carpet
+        "grey_wall_the_colour_of_a_bright_taught_carpet_still_reads_blocked",
+        "a_stray_floor_row_at_a_chairs_foot_is_not_a_view_past_it",
     )
 
     @classmethod
@@ -111,27 +128,29 @@ jvm_harness.add_scenario_tests(OpennessHarnessTest)
 
 
 class OpennessRealFrameGateTest(unittest.TestCase):
-    """U3's gate on the owner's two real robot frames (open floor with a doorway;
-    a plain wall 2-3 ft away), sampled as ExploreCamera samples them. Optional:
-    the frames are private and not in git, so this skips without them."""
+    """U3's gate on the owner's real robot frames (open floor with a doorway; a
+    plain wall 2-3 ft away), dim and bright pairs, sampled as ExploreCamera
+    samples them. Each pair is taught from its own open frame; with both pairs,
+    each taught model also scores the other pair's wall. Optional: the frames
+    are private and not in git, so a pair without its files is skipped."""
 
-    SCENARIOS = (
-        "the_dim_carpet_teaches",
-        "the_open_frame_is_trusted_once_taught",
-        "the_wall_scores_clearly_below_the_doorway",
-        "the_plant_and_chair_stay_below_the_doorway",
-    )
+    SCENARIOS = tuple(f"{label}_{check}" for label, *_ in GATE_PAIRS for check in GATE_CHECKS) + tuple(
+        f"{a}_taught_{b}_wall_never_reads_open"
+        for a, *_ in GATE_PAIRS for b, *_ in GATE_PAIRS if a != b)
 
     @classmethod
     def setUpClass(cls):
-        missing = [f.name for f in GATE_FRAMES if not f.is_file()]
-        if missing:
-            raise unittest.SkipTest(f"private gate frames absent: {', '.join(missing)}")
+        cls.present = [p for p in GATE_PAIRS if p[1].is_file() and p[2].is_file()]
+        if not cls.present:
+            raise unittest.SkipTest("private gate frames absent")
         jdk = jvm_harness.find_jdk()
         if jdk is None:
             raise unittest.SkipTest("no JDK (javac + java) found")
         cls.results = {}
         cls.run_output = ""
+        args = []
+        for label, open_frame, wall_frame, (door_from, door_to) in cls.present:
+            args += [label, str(open_frame), str(wall_frame), str(door_from), str(door_to)]
         with tempfile.TemporaryDirectory(prefix="explore_openness_gate_") as out:
             c = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, [GATE_MAIN], [HARNESS, EXPLORE_SRC]),
                                capture_output=True, text=True)
@@ -139,20 +158,29 @@ class OpennessRealFrameGateTest(unittest.TestCase):
             cls.compile_output = (c.stdout + c.stderr)[-3000:]
             if cls.compiled:
                 r = subprocess.run([jdk[1], "-Djava.awt.headless=true", "-cp", out,
-                                    "com.miko3.mode.explore.OpennessGate"] + [str(f) for f in GATE_FRAMES],
-                                   capture_output=True, text=True, timeout=60)
+                                    "com.miko3.mode.explore.OpennessGate"] + args,
+                                   capture_output=True, text=True, timeout=120)
                 cls.run_output = (r.stdout + r.stderr)[-6000:]
                 cls.results = jvm_harness.parse_verdicts(r.stdout)
+
+    @classmethod
+    def expected(cls):
+        labels = [p[0] for p in cls.present]
+        return sorted(n for n in cls.SCENARIOS
+                      if n.split("_", 1)[0] in labels
+                      and ("_taught_" not in n or n.split("_taught_")[1].split("_", 1)[0] in labels))
 
     def setUp(self):
         self.assertTrue(self.compiled, f"gate failed to compile:\n{self.compile_output}")
 
     def _assert_pass(self, name):
+        if name not in self.expected():
+            self.skipTest(f"private frames for {name} absent")
         verdict, detail = self.results.get(name, ("MISSING", self.run_output))
         self.assertEqual(verdict, "PASS", detail)
 
-    def test_gate_ran_exactly_the_listed_checks(self):
-        self.assertEqual(sorted(self.results), sorted(self.SCENARIOS), self.run_output)
+    def test_gate_ran_exactly_the_checks_for_the_present_pairs(self):
+        self.assertEqual(sorted(self.results), self.expected(), self.run_output)
 
 
 jvm_harness.add_scenario_tests(OpennessRealFrameGateTest)
