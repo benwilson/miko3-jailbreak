@@ -50,6 +50,17 @@ class AdapterWiringTest(unittest.TestCase):
         self.assertIn("ears.close()", body.group(1))
         self.assertIn("worker.shutdownNow()", body.group(1))
 
+    def test_every_way_a_spoken_line_ends_finishes_the_say(self):
+        # SPEAK waits on sayFinished(): a finished, cancelled or failed line
+        # (the launcher's failed(reason) callback) must all end the wait.
+        a = code_only(src("ClaudeCuriosity.java"))
+        say = re.search(r"public void say\(String line\)\s*\{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(say)
+        for cb in ("onFinished", "onCancelled", "onFailed"):
+            m = re.search(r"public void " + cb + r"\([^)]*\)\s*\{(.*?)\n            \}", say.group(1), re.S)
+            self.assertIsNotNone(m, cb)
+            self.assertIn("says.finish(g,", m.group(1), cb)
+
     def test_settings_are_fetched_every_stop_and_unset_means_no_asking(self):
         a = code_only(src("ClaudeCuriosity.java"))
         can_ask = re.search(r"public boolean canAsk\(\)\s*\{(.*?)\n    \}", a, re.S)

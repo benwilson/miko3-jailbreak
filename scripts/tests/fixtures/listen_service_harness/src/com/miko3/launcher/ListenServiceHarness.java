@@ -194,6 +194,10 @@ public final class ListenServiceHarness {
         public void cancelled() {
             log.add("speech-cancelled");
         }
+
+        public void failed(String reason) {
+            log.add("speech-failed");
+        }
     }
 
     static ListenSession.Idle idleOf(final SpeechQueue q) {
