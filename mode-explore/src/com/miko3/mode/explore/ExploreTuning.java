@@ -396,6 +396,32 @@ final class ExploreTuning {
     final long metCheckIntervalMs;
     final long metCheckTimeoutMs;
     final long metClearedMs;
+    /**
+     * Going somewhere new (explore nav plan U10, R18). Coverage dead-reckons a rough
+     * position from the gyro heading and the signed encoder distance, at
+     * coverageCountsPerMetre (mean of the two wheels), and marks coverageCellM cells
+     * visited; a visit fades out over coverageFadeMs. A heading's novelty (0..1) is
+     * how little the next coverageLookaheadM along it runs over recently visited
+     * cells. The steer adds up to coverageWeight x novelty to each open band (a
+     * blocked band never gains); when the way the steer would take is at or below
+     * coverageStaleNovelty, a heading out of view at least coverageMinGain more novel
+     * is turned to (never two such turns in a row), and a turn from a view with
+     * nothing open may grow to face ground coverageMinGain newer. A fully open leg drives up to
+     * coverageLongTicksMax, in proportion to its novelty. Without a camera plan, a
+     * way ahead at least coverageNovelAhead novel cuts turnChance by
+     * coverageTurnScale, and a turn goes the most novel way. coverageWeight 0 turns
+     * all of it off; with no usable heading none of it applies.
+     */
+    final double coverageCountsPerMetre;
+    final double coverageCellM;
+    final long coverageFadeMs;
+    final double coverageLookaheadM;
+    final float coverageWeight;
+    final float coverageStaleNovelty;
+    final float coverageMinGain;
+    final int coverageLongTicksMax;
+    final float coverageNovelAhead;
+    final double coverageTurnScale;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -541,6 +567,16 @@ final class ExploreTuning {
         metCheckIntervalMs = Math.max(0, b.metCheckIntervalMs);
         metCheckTimeoutMs = Math.max(1, b.metCheckTimeoutMs);
         metClearedMs = Math.max(0, b.metClearedMs);
+        coverageCountsPerMetre = Math.max(1, b.coverageCountsPerMetre);
+        coverageCellM = Math.max(0.05, b.coverageCellM);
+        coverageFadeMs = Math.max(1, b.coverageFadeMs);
+        coverageLookaheadM = Math.max(0, b.coverageLookaheadM);
+        coverageWeight = Math.max(0f, b.coverageWeight);
+        coverageStaleNovelty = b.coverageStaleNovelty;
+        coverageMinGain = b.coverageMinGain;
+        coverageLongTicksMax = Math.max(0, b.coverageLongTicksMax);
+        coverageNovelAhead = b.coverageNovelAhead;
+        coverageTurnScale = Math.max(0, Math.min(1, b.coverageTurnScale));
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
@@ -806,6 +842,30 @@ final class ExploreTuning {
         private long metCheckTimeoutMs = 10000;
         // Long enough to reach the next leg decision after the answer comes back.
         private long metClearedMs = 15000;
+        // ~650-880 counts/s per wheel forward (docs/hardware/tof-sensor.md) at a guessed
+        // ~0.25 m/s. Not measured: U8 measures a leg with a tape; it only scales the
+        // grid, so an error here makes cells bigger or smaller, not wrong.
+        private double coverageCountsPerMetre = 3000;
+        // About two of his body lengths: coarse enough that gyro drift barely moves a cell.
+        private double coverageCellM = 0.5;
+        // A few minutes (R18): the 4 ft area the owner saw on 2026-09-25 took 15; after
+        // this an old area is fair game again, and dead-reckoning drift is forgotten.
+        private long coverageFadeMs = 180000;
+        // The next leg or two.
+        private double coverageLookaheadM = 1.5;
+        // Like doorwayWeight: a fully new open band beats an equally open visited one by
+        // more than steerMinGain, but never lifts a blocked one.
+        private float coverageWeight = 0.3f;
+        // Half the ground ahead covered lately: worth a turn toward ground at least 0.2
+        // newer (host room runs, 2026-09-25: ~1.4-1.6x the cells of novelty off).
+        private float coverageStaleNovelty = 0.5f;
+        private float coverageMinGain = 0.2f;
+        // 15 s of driving (~4 m at the guessed speed), vs 4-10 s drawn today; a look
+        // reading blocked ahead still ends it at the next tick, the floor sensor any time.
+        private int coverageLongTicksMax = 60;
+        private float coverageNovelAhead = 0.7f;
+        // turnChance 0.7 becomes ~0.2 while the way ahead is new ground.
+        private double coverageTurnScale = 0.3;
 
         /** A fixed leg length. */
         Builder hopTicks(int v) { hopTicks = v; hopTicksMax = v; return this; }
@@ -1023,6 +1083,27 @@ final class ExploreTuning {
         }
 
         Builder politeHeight(float v) { politeHeight = v; return this; }
+        Builder coverageGrid(double countsPerMetre, double cellM, long fadeMs, double lookaheadM) {
+            coverageCountsPerMetre = countsPerMetre;
+            coverageCellM = cellM;
+            coverageFadeMs = fadeMs;
+            coverageLookaheadM = lookaheadM;
+            return this;
+        }
+        Builder coverageSteer(float weight, float staleNovelty, float minGain, int longTicksMax) {
+            coverageWeight = weight;
+            coverageStaleNovelty = staleNovelty;
+            coverageMinGain = minGain;
+            coverageLongTicksMax = longTicksMax;
+            return this;
+        }
+        /** Novelty steering and long legs off: the roaming before U10 (the grid is still kept). */
+        Builder coverageOff() { coverageWeight = 0f; return this; }
+        Builder coverageTurns(float novelAhead, double turnScale) {
+            coverageNovelAhead = novelAhead;
+            coverageTurnScale = turnScale;
+            return this;
+        }
         Builder recentlyMet(long leaveAloneMs, long checkIntervalMs, long checkTimeoutMs, long clearedMs) {
             metLeaveAloneMs = leaveAloneMs;
             metCheckIntervalMs = checkIntervalMs;

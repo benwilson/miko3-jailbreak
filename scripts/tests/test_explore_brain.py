@@ -31,7 +31,7 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHar
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
-              "RoamSteer.java", "EscapePlanner.java")
+              "RoamSteer.java", "EscapePlanner.java", "Coverage.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -305,6 +305,15 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "people_trace_notes_never_carry_a_name",
         "replies_recently_met_reads_same_none_unsure_and_rejects_bad_answers",
         "people_tuning_defaults_10_min_leave_alone_one_check_a_minute",
+        # Going somewhere new (explore nav plan U10, R18)
+        "coverage_open_room_covers_more_cells_than_with_novelty_off",
+        "coverage_two_equally_open_ways_picks_the_unvisited_one",
+        "coverage_open_floor_gives_a_longer_leg_and_a_blocked_view_still_shortens",
+        "coverage_floor_sensor_still_ends_a_long_leg",
+        "coverage_visited_cells_fade_so_an_old_area_is_eligible_again",
+        "coverage_no_look_turns_less_while_the_way_ahead_is_new",
+        "coverage_uncalibrated_roams_exactly_as_before",
+        "coverage_trace_notes_carry_counts_only_and_are_forgotten_at_shutdown",
     )
 
     @classmethod

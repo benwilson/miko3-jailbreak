@@ -188,6 +188,16 @@ import java.util.Set;
  * since), or he is wedged. Floor hazards, stalls and CPL stop him as always (AE3);
  * offline the ask fails quietly (AE7). Notes carry numbers only (R15).
  *
+ * Going somewhere new (explore nav plan U10, R18): Coverage dead-reckons where he
+ * has been this session from the heading and the signed wheel counts, in fading
+ * ~0.5 m cells, and is forgotten at shutdown. With the heading usable, each leg
+ * decision hands RoamSteer the novelty of every bearing (open new ground wins over
+ * equally open visited ground, a fully open new leg runs long, a view of only
+ * covered ground turns him toward newer ground), and without a camera plan a new
+ * way ahead cuts the random turn chance and a turn goes the newest way it may.
+ * The hazard's side, a blocked side, the floor sensor, stalls, CPL and escapes rule
+ * as before; with no usable heading nothing changes. Notes carry counts only.
+ *
  * People while roaming (explore nav plan U7, R9, R10, KTD4, KTD8): a detector person
  * box in a leg decision's look, with Claude set up, becomes a synthetic PERSON pick
  * (the look is its frame 0): FACE, APPROACH until the box is politeHeight of the
@@ -409,6 +419,9 @@ final class ExploreBrain {
     private final Heading compass;
     /** Bends and shortens roaming legs from the looks' openness (explore nav plan U4). */
     private final RoamSteer steer;
+    /** Where he has been this session (explore nav plan U10), forgotten at shutdown. */
+    private final Coverage coverage;
+    private int coverageNoted = -1;
     /** Times of the hazard reactions since the last successful hop, for the cornered cap. */
     private final ArrayDeque<Long> hazardTimes = new ArrayDeque<Long>();
 
@@ -702,7 +715,13 @@ final class ExploreBrain {
         this.classifier = new HazardClassifier(tuning);
         this.compass = new Heading(tuning.gyro, tuning);
         this.steer = new RoamSteer(tuning);
+        this.coverage = new Coverage(tuning);
         this.planner = new EscapePlanner(tuning);
+    }
+
+    /** Where he has been this session (explore nav plan U10), for tests. */
+    Coverage coverage() {
+        return coverage;
     }
 
     /** The heading tracker, for the navigation that builds on it (explore nav plan U2, U5). */
@@ -747,6 +766,7 @@ final class ExploreBrain {
         countEscapeWheels(reading);
         lastReading = reading;
         compass.offer(reading, moving);
+        coverage.offer(reading, compass.degrees(), compass.usable(reading.timestampMs));
         teachFloor(reading);
         double[] turn = compass.takeTurnResult();
         if (turn != null) {
@@ -782,6 +802,7 @@ final class ExploreBrain {
         cancelDoorway(clock.nowMs(), null);
         cancelMetCheck();
         planner.reset();
+        coverage.clear();
         probing = false;
         state = State.STOPPED;
         syncCamera();
@@ -1140,7 +1161,12 @@ final class ExploreBrain {
             forgetDoorway();
             door = Double.NaN;
         }
-        RoamSteer.Plan plan = look == null ? null : steer.plan(look.openness, door);
+        RoamSteer.Novelty novelty = novelty(now);
+        if (novelty != null && coverage.cells(now) != coverageNoted) {
+            coverageNoted = coverage.cells(now);
+            note("coverage: " + coverageNoted + " cells");
+        }
+        RoamSteer.Plan plan = look == null ? null : steer.plan(look.openness, door, novelty);
         doorwayLeg = false;
         if (plan != null) {
             note("steer: " + plan);
@@ -1163,8 +1189,9 @@ final class ExploreBrain {
                 bend = 360 - bend;
             }
             enterLook(now, d, false, timedMs(bend), compass.usable(now) ? bend : 0);
-        } else if (random.nextDouble() < tuning.turnChance) {
+        } else if (random.nextDouble() < turnChance(novelty)) {
             Direction d;
+            boolean forced = lastHazardSide != null;
             if (lastHazardSide != null) {
                 d = lastHazardSide.opposite();
                 lastHazardSide = null;
@@ -1174,6 +1201,31 @@ final class ExploreBrain {
             d = unblocked(d);
             if (compass.usable(now)) {
                 double deg = tuning.turnMinDeg + random.nextDouble() * (tuning.turnMaxDeg - tuning.turnMinDeg);
+                if (novelty != null) {
+                    // Toward the newest ground among the turns he may make (U10); the hazard's
+                    // side and a blocked side still rule out the other way.
+                    double bestNew = novelty.at(d == Direction.LEFT ? deg : -deg);
+                    Direction bestDir = d;
+                    double bestDeg = deg;
+                    Direction other = d.opposite();
+                    boolean otherOk = !forced && unblocked(other) == other;
+                    for (Direction c : new Direction[]{d, other}) {
+                        if (c != d && !otherOk) {
+                            continue;
+                        }
+                        for (double a : new double[]{tuning.turnMinDeg, (tuning.turnMinDeg + tuning.turnMaxDeg) / 2,
+                                tuning.turnMaxDeg}) {
+                            double v = novelty.at(c == Direction.LEFT ? a : -a);
+                            if (!Double.isNaN(v) && (Double.isNaN(bestNew) || v > bestNew + 0.05)) {
+                                bestNew = v;
+                                bestDir = c;
+                                bestDeg = a;
+                            }
+                        }
+                    }
+                    d = bestDir;
+                    deg = bestDeg;
+                }
                 enterLook(now, d, false, timedMs(deg), deg);
             } else {
                 enterLook(now, d, false, between(tuning.turnMinMs, tuning.turnMaxMs), 0);
@@ -1181,6 +1233,32 @@ final class ExploreBrain {
         } else {
             startHop(now);
         }
+    }
+
+    /**
+     * How new the ground is along each bearing off his facing (explore nav plan U10),
+     * or null (as before U10) with the heading not usable, no position kept yet, or
+     * coverageWeight 0.
+     */
+    private RoamSteer.Novelty novelty(final long now) {
+        if (tuning.coverageWeight <= 0 || !compass.usable(now) || !coverage.tracking()) {
+            return null;
+        }
+        final double facing = compass.degrees();
+        // An anonymous class, not a lambda: the Android build's bootclasspath has no LambdaMetafactory.
+        return new RoamSteer.Novelty() {
+            @Override
+            public double at(double bearing) {
+                return coverage.novelty(Heading.wrap(facing + bearing), now);
+            }
+        };
+    }
+
+    /** turnChance, cut by coverageTurnScale while the way ahead is new ground (U10). */
+    private double turnChance(RoamSteer.Novelty novelty) {
+        double ahead = novelty == null ? Double.NaN : novelty.at(0);
+        return !Double.isNaN(ahead) && ahead >= tuning.coverageNovelAhead
+                ? tuning.turnChance * tuning.coverageTurnScale : tuning.turnChance;
     }
 
     /** A hazard in view when a move would start: no move, turn away (or rest, if cornered). */

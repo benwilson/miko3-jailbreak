@@ -21,6 +21,8 @@ import java.util.Random;
  */
 public final class ExploreBrainHarness {
     private static int failures;
+    /** The seed of the next Rig's brain Random (the coverage scenarios run several). */
+    private static long rigSeed = 1;
 
     /** Tuning for the scripted runs: fixed pause and turn lengths, so timelines are exact. */
     private static ExploreTuning.Builder tuning() {
@@ -41,6 +43,9 @@ public final class ExploreBrainHarness {
                 .cap(3, 20000, 30000)
                 .ir1IsLeft(true)
                 .reopenGapMs(0)
+                // Scripted timelines count exact leg lengths and bends: going somewhere new
+                // (U10) is off here and switched on by the coverage scenarios.
+                .coverageOff()
                 .calibration(calibration());
     }
 
@@ -196,6 +201,78 @@ public final class ExploreBrainHarness {
 
         double wrapped() {
             return Heading.wrap(trueDeg);
+        }
+    }
+
+    /**
+     * A walled room for the coverage scenarios (explore nav plan U10): he starts in
+     * the middle facing heading 0 (along x); each wheel count moves him 1/countsPerMetre
+     * along the true yaw, never closer than 0.15 m to a wall. The floor sensor reads an
+     * obstacle when the spot 0.25 m ahead is within 0.1 m of a wall; the camera's
+     * openness per column is its distance to the wall. Every 0.5 m cell his true
+     * position passes through is counted.
+     */
+    static final class Room {
+        final double width;
+        final double depth;
+        final double countsPerMetre;
+        double x;
+        double y;
+        final java.util.Set<Long> cells = new java.util.HashSet<Long>();
+
+        Room(double width, double depth, double countsPerMetre) {
+            this.width = width;
+            this.depth = depth;
+            this.countsPerMetre = countsPerMetre;
+            x = width / 2;
+            y = depth / 2;
+            visit();
+        }
+
+        /** One count forward (+1) or back (-1) along trueDeg; false (and no move) at a wall. */
+        boolean move(int counts, double trueDeg) {
+            double r = Math.toRadians(trueDeg);
+            double nx = x + counts / countsPerMetre * Math.cos(r);
+            double ny = y + counts / countsPerMetre * Math.sin(r);
+            if (nx < 0.15 || ny < 0.15 || nx > width - 0.15 || ny > depth - 0.15) {
+                return false;
+            }
+            x = nx;
+            y = ny;
+            visit();
+            return true;
+        }
+
+        private void visit() {
+            cells.add(((long) Math.floor(x / 0.5) << 32) ^ ((long) Math.floor(y / 0.5) & 0xffffffffL));
+        }
+
+        /** Metres to the wall along heading deg. */
+        double wallDistance(double deg) {
+            double r = Math.toRadians(deg);
+            double cx = Math.cos(r);
+            double cy = Math.sin(r);
+            double d = Double.MAX_VALUE;
+            if (cx > 1e-9) d = Math.min(d, (width - x) / cx);
+            if (cx < -1e-9) d = Math.min(d, -x / cx);
+            if (cy > 1e-9) d = Math.min(d, (depth - y) / cy);
+            if (cy < -1e-9) d = Math.min(d, -y / cy);
+            return d;
+        }
+
+        SensorReading reading(long t, double trueDeg) {
+            return wallDistance(trueDeg) < 0.35 ? obstacle(t) : clear(t);
+        }
+
+        /** The camera's view at trueDeg: each column open by its distance to the wall. */
+        Openness.Profile view(double trueDeg, double halfFovDeg) {
+            float[] b = new float[Openness.BINS];
+            for (int i = 0; i < b.length; i++) {
+                double offset = (i + 0.5) / b.length * 2 - 1;
+                double d = wallDistance(trueDeg - offset * halfFovDeg);
+                b[i] = (float) Math.max(0.1, Math.min(0.9, (d - 0.3) / 1.5));
+            }
+            return new Openness.Profile(b, 0.9f);
         }
     }
 
@@ -473,6 +550,8 @@ public final class ExploreBrainHarness {
         int unstickAfterBacks;
         /** The true heading when the brain first entered CIRCLE (NaN before). */
         double circleFrom = Double.NaN;
+        /** A room (explore nav plan U10): walls, a true position the simulated wheels move; null: none. */
+        Room room;
         /** Every brain state seen, and every state seen with the camera open. */
         final java.util.Set<ExploreBrain.State> statesSeen = new java.util.TreeSet<ExploreBrain.State>();
         final java.util.Set<ExploreBrain.State> openStates = new java.util.TreeSet<ExploreBrain.State>();
@@ -495,8 +574,8 @@ public final class ExploreBrainHarness {
             this.cameraAvailable = cameraAvailable;
             this.claude = claude;
             this.brain = claude == null
-                    ? new ExploreBrain(tuning, this, this, this, this, this, new Random(1))
-                    : new ExploreBrain(tuning, this, this, this, this, this, this, new Random(1));
+                    ? new ExploreBrain(tuning, this, this, this, this, this, new Random(rigSeed))
+                    : new ExploreBrain(tuning, this, this, this, this, this, this, new Random(rigSeed));
             this.yaw = tuning.gyro == null ? null : new YawSim(tuning.gyro);
         }
 
@@ -507,6 +586,8 @@ public final class ExploreBrainHarness {
                         && Math.abs(Heading.delta(yaw.wrapped(), wallAt)) <= wallHalfDeg;
                 if (wall) {
                     // Nose to the wall: nothing moves.
+                } else if (room != null && !room.move(1, yaw.trueDeg)) {
+                    // Nose to a room wall: nothing moves.
                 } else if (now <= blockedFrom) {
                     wheelLeft++;
                     wheelRight++;
@@ -516,7 +597,7 @@ public final class ExploreBrainHarness {
                     wheelRight += creepPer100;
                 }
             } else if ("back".equals(motion)) {
-                if (!backBlocked) {
+                if (!backBlocked && (room == null || room.move(-1, yaw.trueDeg))) {
                     wheelLeft--;
                     wheelRight--;
                 }
@@ -1195,6 +1276,7 @@ public final class ExploreBrainHarness {
         hazardDuringPickScenarios();
         headingScenarios();
         navScenarios();
+        coverageScenarios();
         escapeScenarios();
         pinnedScenarios();
         budgetScenarios();
@@ -3528,6 +3610,209 @@ public final class ExploreBrainHarness {
             out.add(ticks);
         }
         return out;
+    }
+
+    // ---- going somewhere new (explore nav plan U10, R18) ----
+
+    /** U10 on with the shipped weights; the harness's 100 counts/s is 0.25 m/s (the guessed real speed) at 400 counts/m. */
+    private static ExploreTuning.Builder coverageTuning(ExploreTuning.Builder b) {
+        return b.coverageGrid(400, 0.5, 180000, 1.5).coverageSteer(0.3f, 0.5f, 0.2f, 60).coverageTurns(0.7f, 0.3);
+    }
+
+    /** An 8 x 6 m room (192 cells), camera on, gyro and wheels simulated, roaming with today's leg lengths and turns. */
+    private static Rig roomRig(boolean novelty) {
+        return roomRig(novelty, 1);
+    }
+
+    private static Rig roomRig(boolean novelty, long seed) {
+        ExploreTuning.Builder b = navTuning().gyro(robotGyro()).hopTicks(16, 40).turnChance(0.7).turnDeg(20, 55)
+                .cap(8, 20000, 30000);
+        b = novelty ? coverageTuning(b) : coverageTuning(b).coverageOff();
+        Rig[] h = new Rig[1];
+        rigSeed = seed;
+        Rig rig = new Rig(b.build(), t -> h[0].room.reading(t, h[0].yaw.trueDeg), NOTHING, true);
+        rigSeed = 1;
+        h[0] = rig;
+        rig.room = new Room(8, 6, 400);
+        rig.simWheels = true;
+        rig.openView = (r, t) -> r.room.view(r.yaw.trueDeg, r.tuning.cameraHalfFovDeg);
+        return rig;
+    }
+
+    /** A Coverage fed straight: drives metres along deg from t (1 s per metre, readings every 100 ms). */
+    static final class CoverageBench {
+        final Coverage cov;
+        long t;
+        long wheels;
+
+        CoverageBench(ExploreTuning tuning) {
+            cov = new Coverage(tuning);
+            offer(0);
+        }
+
+        void drive(double metres, double deg) {
+            int steps = (int) Math.round(Math.abs(metres) * 10);
+            for (int i = 0; i < steps; i++) {
+                wheels += Math.round(Math.signum(metres) * 100);
+                t += 100;
+                offer(deg);
+            }
+        }
+
+        void offer(double deg) {
+            cov.offer(new SensorReading(t, 300, 100, 100, null, false, true, wheels, wheels, true, 0, 0, 0), deg, true);
+        }
+    }
+
+    private static ExploreTuning benchTuning() {
+        // 1000 counts/m: 100 counts per reading is 0.1 m.
+        return tuning().coverageGrid(1000, 0.5, 180000, 1.5).coverageSteer(0.3f, 0.5f, 0.2f, 60).build();
+    }
+
+    private static void coverageScenarios() {
+        scenario("coverage_open_room_covers_more_cells_than_with_novelty_off", n -> {
+            // Five runs each (brain seeds 1-5): one run's count swings with where the walls turn him.
+            int a = 0;
+            int b = 0;
+            boolean clean = true;
+            StringBuilder each = new StringBuilder();
+            for (long seed = 1; seed <= 5; seed++) {
+                Rig on = roomRig(true, seed);
+                on.started();
+                on.runUntil(600000);
+                Rig off = roomRig(false, seed);
+                off.started();
+                off.runUntil(600000);
+                a += on.room.cells.size();
+                b += off.room.cells.size();
+                clean &= on.violations.isEmpty() && off.violations.isEmpty();
+                each.append(' ').append(on.room.cells.size()).append('/').append(off.room.cells.size());
+            }
+            check(n, a >= b * 1.3 && clean, "cells on/off per seed" + each);
+        });
+        scenario("coverage_two_equally_open_ways_picks_the_unvisited_one", n -> {
+            ExploreTuning tu = benchTuning();
+            CoverageBench b = new CoverageBench(tu);
+            // Out 1.5 m at 20 deg left and back: the ground ahead-left is covered, ahead-right is not.
+            b.drive(1.5, 20);
+            b.drive(-1.5, 20);
+            long now = b.t;
+            Openness.Profile p = prof(0.9f, 0.9f, 0.1f, 0.9f);
+            RoamSteer.Plan without = new RoamSteer(tu).plan(p, Double.NaN, null);
+            RoamSteer.Plan with = new RoamSteer(tu).plan(p, Double.NaN, x -> b.cov.novelty(Heading.wrap(x), now));
+            check(n, without.side == RoamSteer.LEFT && with.side == RoamSteer.RIGHT && !with.turnOnly
+                            && with.novelty >= 0.9 && b.cov.novelty(15, now) < 0.5,
+                    "without=" + without + " with=" + with + " left=" + f1(b.cov.novelty(15, now)));
+        });
+        scenario("coverage_open_floor_gives_a_longer_leg_and_a_blocked_view_still_shortens", n -> {
+            int[] first = new int[5];
+            OpenView[] views = {ALL_OPEN, ALL_OPEN, ALL_OPEN, (r, t) -> prof(0.9f, 0.5f, 0.5f, 0.5f),
+                    (r, t) -> prof(0.9f, 0.1f, 0.1f, 0.1f)};
+            for (int i = 0; i < 5; i++) {
+                ExploreTuning.Builder b = navTuning();
+                if (i != 2) {
+                    b = coverageTuning(b.gyro(robotGyro()));
+                    if (i == 1) {
+                        b = b.coverageOff();
+                    }
+                } else {
+                    b = coverageTuning(b); // no gyro: uncalibrated, today's legs
+                }
+                Rig rig = navRig(b, CLEAR, views[i]);
+                rig.simWheels = true;
+                rig.started();
+                rig.runUntil(i == 4 ? 15000 : 25000);
+                List<Integer> legs = legs(rig);
+                int max = 0;
+                for (int l : legs) {
+                    max = Math.max(max, l);
+                }
+                first[i] = i == 4 ? max : legs.isEmpty() ? -1 : legs.get(0);
+            }
+            // 8 ticks drawn; open and all new: 8 + 1.0 x (60 - 8) = 60.
+            check(n, first[0] == 60 && first[1] == 8 && first[2] == 8 && first[3] > 0 && first[3] < 8
+                            && first[4] <= 2,
+                    "open=" + first[0] + " off=" + first[1] + " uncalibrated=" + first[2] + " middling=" + first[3]
+                            + " blocked max=" + first[4]);
+        });
+        scenario("coverage_floor_sensor_still_ends_a_long_leg", n -> {
+            // A 60-tick leg on open new ground from 1300; an obstacle at 5000 (tick 15).
+            Rig rig = navRig(coverageTuning(navTuning().gyro(robotGyro())), t -> t >= 5000 && t < 5500 ? obstacle(t)
+                    : clear(t), ALL_OPEN);
+            rig.simWheels = true;
+            rig.started();
+            rig.runUntil(6000);
+            int stop = rig.firstAfter("stop", 1300);
+            check(n, rig.timeOf(stop) == 5000 && rig.count("startle") == 1
+                            && rig.countPrefix("hop", 5000, 6000) == 0 && rig.violations.isEmpty(),
+                    "stop@" + rig.timeOf(stop) + " " + rig.tail());
+        });
+        scenario("coverage_visited_cells_fade_so_an_old_area_is_eligible_again", n -> {
+            ExploreTuning tu = benchTuning();
+            CoverageBench b = new CoverageBench(tu);
+            b.drive(1.5, 0);
+            b.drive(-1.5, 0);
+            long t0 = b.t;
+            double fresh = b.cov.novelty(0, t0);
+            int cells = b.cov.cells(t0);
+            double half = b.cov.novelty(0, t0 + 90000);
+            double faded = b.cov.novelty(0, t0 + 180000);
+            int left = b.cov.cells(t0 + 180000);
+            check(n, fresh < 0.1 && cells >= 3 && half > 0.3 && half < 0.7 && faded == 1.0 && left == 0
+                            && b.cov.novelty(180, t0) == 1.0,
+                    "fresh=" + f1(fresh) + " cells=" + cells + " half=" + f1(half) + " faded=" + f1(faded)
+                            + " left=" + left);
+        });
+        scenario("coverage_no_look_turns_less_while_the_way_ahead_is_new", n -> {
+            int[] turns = new int[2];
+            for (int i = 0; i < 2; i++) {
+                ExploreTuning.Builder b = coverageTuning(tuning().gyro(robotGyro()).hopTicks(16, 40).turnChance(0.7)
+                        .turnDeg(20, 55));
+                Rig rig = new Rig((i == 0 ? b : b.coverageOff()).build(), CLEAR);
+                rig.simWheels = true;
+                rig.started();
+                rig.runUntil(180000);
+                turns[i] = rig.countPrefix("turn", 0, rig.now + 1);
+            }
+            check(n, turns[0] > 0 && turns[0] * 2 <= turns[1], "turns on=" + turns[0] + " off=" + turns[1]);
+        });
+        scenario("coverage_uncalibrated_roams_exactly_as_before", n -> {
+            List<String> logs = new ArrayList<String>();
+            for (int i = 0; i < 2; i++) {
+                ExploreTuning.Builder b = coverageTuning(navTuning().hopTicks(16, 40).turnChance(0.7));
+                Rig rig = navRig(i == 0 ? b : b.coverageOff(), t -> t % 7000 >= 5000 && t % 7000 < 5200
+                        ? obstacle(t) : clear(t), (r, t) -> r.now % 3000 < 1500 ? null : prof(0.9f, 0.3f, 0.9f, 0.6f));
+                rig.simWheels = true;
+                rig.started();
+                rig.runUntil(60000);
+                logs.add(rig.log.toString());
+            }
+            check(n, logs.get(0).equals(logs.get(1)), "differ");
+        });
+        scenario("coverage_trace_notes_carry_counts_only_and_are_forgotten_at_shutdown", n -> {
+            Rig rig = roomRig(true);
+            List<String> notes = traced(rig);
+            rig.at(120000, () -> rig.brain.shutdown());
+            rig.started();
+            rig.runUntil(119990);
+            int before = rig.brain.coverage().cells();
+            rig.runUntil(121000);
+            int counted = 0;
+            boolean numbersOnly = true;
+            for (String note : notes) {
+                String text = note.substring(note.indexOf(' ') + 1);
+                if (text.startsWith("coverage")) {
+                    counted++;
+                    numbersOnly &= text.matches("coverage: \\d+ cells");
+                }
+                if (text.contains(", new ")) {
+                    numbersOnly &= text.matches(".*, new \\d\\.\\d\\d$");
+                }
+            }
+            check(n, before > 3 && counted > 0 && numbersOnly && rig.brain.coverage().cells() == 0
+                            && !rig.brain.coverage().tracking(),
+                    "before=" + before + " counted=" + counted + " numbersOnly=" + numbersOnly + " " + notes);
+        });
     }
 
     private static void navScenarios() {
