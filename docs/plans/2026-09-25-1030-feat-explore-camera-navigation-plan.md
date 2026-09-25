@@ -24,7 +24,7 @@ deepened: 2026-09-25
 
 ## Product Contract
 
-Product Contract preservation: added R17 — the owner's request (2026-09-25, after the U3 camera check found frames too dim) that the robot adjust its own camera brightness; changed: R12, R13 — the escape scan's pictures are judged by Claude when it is reachable, with on-robot scoring as the offline fallback, and R13 becomes the second Claude ask; added R16 — the owner's direction (2026-09-25) that Claude takes over wherever the robot's hardware falls short.
+Product Contract preservation: added R18 — the owner's request (2026-09-25, after he spent 15 minutes in one 4 ft area) that he explore somewhere new; added R17 — the owner's request (2026-09-25, after the U3 camera check found frames too dim) that the robot adjust its own camera brightness; changed: R12, R13 — the escape scan's pictures are judged by Claude when it is reachable, with on-robot scoring as the offline fallback, and R13 becomes the second Claude ask; added R16 — the owner's direction (2026-09-25) that Claude takes over wherever the robot's hardware falls short.
 
 ### Summary
 
@@ -48,6 +48,7 @@ He gets stuck in corners often. Wedged between a wall and a potted plant, he tur
 **Roaming**
 
 - R6. He prefers open floor and steers away from walls and furniture he can see ahead, before he reaches them.
+- R18. He goes somewhere new: during a run he prefers directions leading away from ground he has already covered, and drives longer legs when the way ahead is open, instead of circling one small area.
 - R7. He is drawn to open doorways and goes through them into other rooms; he treats a closed door as a wall.
 - R8. While roaming he asks Claude where the open doorways are at most about once a minute, and never while he is approaching or meeting a person.
 
@@ -513,6 +514,28 @@ U1 (gyro in the sensor path) comes first. It unblocks U2 (heading tracker), and 
   - An all-black frame with the lens covered stops at the limits and never oscillates.
   - `ExploreCamera` source check: no variable frame-rate range is ever requested, and the log carries only numbers.
 - **Verification:** Host tests pass. On the robot, the wall and open-floor frames from the U3 gate come out visibly brighter in the same room light, and the camera log shows no driver errors over a 10-minute run.
+
+### U10. Go somewhere new
+
+- **Goal:** During a run he spreads out over the space instead of circling one small area.
+- **Requirements:** R18; KTD1.
+- **Dependencies:** U2 (heading and wheel distance), U4 (RoamSteer).
+- **Files:**
+  - `mode-explore/src/com/miko3/mode/explore/Coverage.java` (new, plain Java: a coarse in-session grid of where he has been, from heading and encoder distance)
+  - `mode-explore/src/com/miko3/mode/explore/RoamSteer.java`, `ExploreBrain.java`, `ExploreTuning.java`
+  - brain harness and `scripts/tests/test_explore_brain.py`
+- **Approach:**
+  1. Dead-reckon a rough position from the gyro heading and the signed encoder distance of each forward and reverse leg; mark coarse cells (about 0.5 m) visited with a timestamp. Forget it all when Explore stops (the plan's no-map-between-sessions boundary still holds).
+  2. When choosing a leg or a turn, score candidate headings by how little they lead back into recently visited cells, alongside openness and any doorway heading; the floor sensor, stalls, CPL and escapes still win.
+  3. In open space (openness high ahead), drive longer legs than today's random length, up to a cap.
+  4. Being moved by hand breaks dead reckoning; accept the drift (cells fade after a few minutes).
+- **Test scenarios:**
+  - In an open rig, over 10 simulated minutes he covers clearly more distinct cells than with the novelty weight off.
+  - Given two equally open directions, one back over visited cells, he picks the new one.
+  - Open floor ahead gives a longer leg than today's; a blocked view still shortens it.
+  - Visited cells fade, so an old area becomes eligible again.
+  - Coverage is plain Java (in `PLAIN_JAVA`) and logs only counts.
+- **Verification:** Harness scenarios pass. On the robot over 15 minutes he visits clearly more of the room than the 4 ft area seen on 2026-09-25.
 
 ### U8. On-robot QA, measurements, and docs
 
