@@ -21,6 +21,9 @@ import android.util.Log;
 import android.util.Range;
 import android.util.Size;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
@@ -45,6 +48,14 @@ import java.util.concurrent.TimeUnit;
  * Frames that arrive while the recognizer is busy (about a second a frame,
  * U1) are dropped, so every result is from a frame captured after the one
  * before it. The recognizer is loaded on first use and kept for the session.
+ *
+ * Each look also carries an openness profile (explore nav plan U3, KTD3): the
+ * kept JPEG is decoded a second time at a quarter scale, the whole frame
+ * averaged down again and the floor band below the horizon kept at that
+ * sharper scale, and scored by Openness with the look's boxes. Only the
+ * scoring time is logged, never pixels or profiles (R15). The brain's
+ * floor-clear flag rides with each captured frame so Openness learns the
+ * floor only from frames he could safely drive onto.
  */
 final class ExploreCamera implements ExploreBrain.Camera {
     private static final String TAG = "ExploreCamera";
@@ -57,6 +68,17 @@ final class ExploreCamera implements ExploreBrain.Camera {
      * no look and curiosity went off (seen on the robot with back-to-back stops).
      */
     private static final long REOPEN_GAP_MS = 3000;
+    /**
+     * The owner's openness gate check (explore nav plan U3): with
+     * log.tag.MikoExploreNavDebug=DEBUG, the last scored look's JPEG and its
+     * profile numbers go to this app's private files directory (last-nav.jpg,
+     * last-nav.txt), overwritten each time. Never shared storage, never the log.
+     */
+    static final String NAV_DEBUG_TAG = "MikoExploreNavDebug";
+    static final String LAST_NAV = "last-nav.jpg";
+    static final String LAST_NAV_PROFILE = "last-nav.txt";
+    /** The openness decode: a quarter of the camera's 640x480 (160x120). */
+    private static final int OPENNESS_SAMPLE = 4;
 
     /** Builds the recognizer on the detect thread, the first time a frame needs it. */
     interface RecognizerFactory {
@@ -98,6 +120,12 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private Recognizer recognizer;
     private volatile boolean recognizerFailed;
     private final BitmapFactory.Options decode = new BitmapFactory.Options();
+    private final BitmapFactory.Options small = new BitmapFactory.Options();
+    private int[] smallPixels = new int[0];
+    /** Holds the floor model; used on the detect thread (the brain's calls are posted there). */
+    private final Openness openness = new Openness();
+    /** The brain's latest "floor clear and wheels free" (U3), stamped on each captured frame. */
+    private volatile boolean floorClear;
 
     private volatile boolean busy;
     /** close() has run on the camera thread and open() has not been called since. */
@@ -121,6 +149,9 @@ final class ExploreCamera implements ExploreBrain.Camera {
         detectHandler = new Handler(detectThread.getLooper());
         decode.inPreferredConfig = Bitmap.Config.ARGB_8888;
         decode.inMutable = true;
+        small.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        small.inMutable = true;
+        small.inSampleSize = OPENNESS_SAMPLE;
     }
 
     @Override
@@ -194,6 +225,31 @@ final class ExploreCamera implements ExploreBrain.Camera {
     @Override
     public ExploreBrain.Look latest() {
         return latest;
+    }
+
+    /** A turn to false is a hazard or stall: drop the floor patches seen up to now. */
+    @Override
+    public void setFloorClear(final long nowMs, boolean clearAndFree) {
+        boolean was = floorClear;
+        floorClear = clearAndFree;
+        if (was && !clearAndFree) {
+            detectHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    openness.floorHazard(nowMs);
+                }
+            });
+        }
+    }
+
+    @Override
+    public void floorDrivenOver(final long throughFrameMs) {
+        detectHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                openness.floorDrivenOver(throughFrameMs);
+            }
+        });
     }
 
     /**
@@ -391,7 +447,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 byte[] jpeg = new byte[buf.remaining()];
                 buf.get(jpeg);
                 busy = true;
-                recognize(jpeg, clock.nowMs(), generation);
+                recognize(jpeg, clock.nowMs(), generation, floorClear);
             } finally {
                 image.close();
             }
@@ -400,7 +456,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     // ---- detect thread ----
 
-    private void recognize(final byte[] jpeg, final long frameMs, final int gen) {
+    private void recognize(final byte[] jpeg, final long frameMs, final int gen, final boolean teachable) {
         detectHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -427,9 +483,15 @@ final class ExploreCamera implements ExploreBrain.Camera {
                     long t0 = clock.nowMs();
                     List<Detection> found = recognizer.detect(frame);
                     if (gen == generation) {
-                        // The JPEG rides along for Claude's look request (explore on Claude U4, R1).
-                        latest = new ExploreBrain.Look(frameMs, found, jpeg);
                         Log.i(TAG, "look in " + (clock.nowMs() - t0) + " ms: " + found);
+                        long s0 = clock.nowMs();
+                        Openness.Profile profile = scoreOpenness(jpeg, found, frameMs, teachable);
+                        Log.i(TAG, "openness in " + (clock.nowMs() - s0) + " ms");
+                        if (gen == generation) {
+                            // The JPEG rides along for Claude's look request (explore on Claude U4, R1).
+                            latest = new ExploreBrain.Look(frameMs, found, jpeg, profile);
+                            debugNav(jpeg, profile);
+                        }
                     }
                 } catch (Exception | OutOfMemoryError | LinkageError e) {
                     Log.e(TAG, "recognition failed", e);
@@ -438,6 +500,92 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 }
             }
         });
+    }
+
+    /**
+     * Detect thread: the frame again at a quarter scale, as a whole frame averaged
+     * down to an eighth and the floor band below the horizon kept at a quarter,
+     * scored with the look's boxes. Null when it can't be decoded.
+     */
+    private Openness.Profile scoreOpenness(byte[] jpeg, List<Detection> found, long frameMs, boolean teachable) {
+        try {
+            Bitmap bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, small);
+            if (bmp == null) {
+                return null;
+            }
+            small.inBitmap = bmp;
+            int w = bmp.getWidth();
+            int h = bmp.getHeight();
+            if (smallPixels.length != w * h) {
+                smallPixels = new int[w * h];
+            }
+            bmp.getPixels(smallPixels, 0, w, 0, 0, w, h);
+            int first = Math.min(h - 1, (int) (Openness.HORIZON * h));
+            Openness.Frame floorBand = new Openness.Frame(Arrays.copyOfRange(smallPixels, first * w, h * w),
+                    w, h - first, (float) first / h, 1f);
+            return openness.score(halve(smallPixels, w, h), floorBand, found, frameMs, teachable);
+        } catch (RuntimeException | OutOfMemoryError e) {
+            Log.w(TAG, "openness decode failed: " + e.getClass().getSimpleName());
+            small.inBitmap = null;
+            return null;
+        }
+    }
+
+    /** The whole frame at half the given scale, each pixel the mean of a 2x2 block. */
+    private static Openness.Frame halve(int[] px, int w, int h) {
+        int hw = Math.max(1, w / 2);
+        int hh = Math.max(1, h / 2);
+        int[] out = new int[hw * hh];
+        for (int y = 0; y < hh; y++) {
+            for (int x = 0; x < hw; x++) {
+                int r = 0;
+                int g = 0;
+                int b = 0;
+                int n = 0;
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        int sx = Math.min(w - 1, x * 2 + dx);
+                        int sy = Math.min(h - 1, y * 2 + dy);
+                        int p = px[sy * w + sx];
+                        r += (p >> 16) & 0xff;
+                        g += (p >> 8) & 0xff;
+                        b += p & 0xff;
+                        n++;
+                    }
+                }
+                out[y * hw + x] = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+            }
+        }
+        return new Openness.Frame(out, hw, hh, 0f, 1f);
+    }
+
+    /** The owner's gate check (NAV_DEBUG_TAG): the look and its numbers, private files only. */
+    private void debugNav(byte[] jpeg, Openness.Profile profile) {
+        if (profile == null || !Log.isLoggable(NAV_DEBUG_TAG, Log.DEBUG)) {
+            return;
+        }
+        File dir = context.getFilesDir();
+        write(new File(dir, LAST_NAV), jpeg);
+        write(new File(dir, LAST_NAV_PROFILE),
+                (profile.toString() + "\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+    }
+
+    private static void write(File f, byte[] bytes) {
+        FileOutputStream out = null;
+        try {
+            out = new FileOutputStream(f);
+            out.write(bytes);
+        } catch (IOException e) {
+            Log.w(NAV_DEBUG_TAG, "could not write " + f.getName() + ": " + e.getMessage());
+        } finally {
+            if (out != null) {
+                try {
+                    out.close();
+                } catch (IOException ignored) {
+                    // Nothing more to do for a debug file.
+                }
+            }
+        }
     }
 
     // ---- selection, as remote-control's CameraCapture ----

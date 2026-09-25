@@ -173,26 +173,50 @@ final class ExploreBrain {
          * flight. close() is asynchronous, so speech waits for this (R6).
          */
         boolean quiet();
+
+        /**
+         * Floor teaching (explore nav plan U3, KTD3): whether the floor sensor reads
+         * floor and the wheels turn freely, given on every reading. The camera stamps
+         * each captured frame with it; a frame's bottom-row patch becomes pending only
+         * while it is true, and every pending patch seen up to a turn to false (a
+         * hazard or stall) is dropped. No-op by default: nothing is taught.
+         */
+        default void setFloorClear(long nowMs, boolean clearAndFree) {
+        }
+
+        /**
+         * He has driven at least the distance to the patches seen in frames captured
+         * up to this time (Look.frameMs), with no hazard or stall: teach them as floor.
+         */
+        default void floorDrivenOver(long throughFrameMs) {
+        }
     }
 
     /**
      * One recognized camera frame: when it was captured (brain clock), what was in
      * it, and the frame's JPEG (null when the camera didn't keep it), which the
-     * look request sends to Claude (explore on Claude U4).
+     * look request sends to Claude (explore on Claude U4), and its openness profile
+     * (explore nav plan U3; null when the camera didn't score it).
      */
     static final class Look {
         final long frameMs;
         final List<Detection> detections;
         final byte[] jpeg;
+        final Openness.Profile openness;
 
         Look(long frameMs, List<Detection> detections) {
             this(frameMs, detections, null);
         }
 
         Look(long frameMs, List<Detection> detections, byte[] jpeg) {
+            this(frameMs, detections, jpeg, null);
+        }
+
+        Look(long frameMs, List<Detection> detections, byte[] jpeg, Openness.Profile openness) {
             this.frameMs = frameMs;
             this.detections = detections;
             this.jpeg = jpeg;
+            this.openness = openness;
         }
     }
 
