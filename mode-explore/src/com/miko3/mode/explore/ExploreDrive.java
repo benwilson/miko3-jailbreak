@@ -316,11 +316,9 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         // classifier judges itself (it can be an edge when the IR flag agrees). A dead
         // keepalive shows up as the readings going stale.
         lastSnapshot = s;
-        lastReading = s.hasGyro
-                ? new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false,
-                        s.wheelLeft, s.wheelRight, s.gyroX, s.gyroY, s.gyroZ)
-                : new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false,
-                        s.wheelLeft, s.wheelRight);
+        // The wheel counts are signed (reverse counts down past 0): presence is its own flag.
+        lastReading = new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false,
+                s.hasWheels, s.wheelLeft, s.wheelRight, s.hasGyro, s.gyroX, s.gyroY, s.gyroZ);
         return lastReading;
     }
 

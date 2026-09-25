@@ -53,12 +53,13 @@ public final class SensorReply {
         }
         int ir1 = number(fields[1]);
         int ir2 = fields.length > 2 ? number(fields[2]) : SensorSnapshot.ABSENT;
-        long left = count(text, LEFT);
-        long right = count(text, RIGHT);
+        Long left = count(text, LEFT);
+        Long right = count(text, RIGHT);
+        boolean wheels = left != null && right != null;
         int[] gyro = gyro(text);
-        return gyro == null
-                ? new SensorSnapshot(timestampMs, tof, ir1, ir2, left, right)
-                : new SensorSnapshot(timestampMs, tof, ir1, ir2, left, right, gyro[0], gyro[1], gyro[2]);
+        return new SensorSnapshot(timestampMs, tof, ir1, ir2, wheels, wheels ? left : SensorSnapshot.ABSENT,
+                wheels ? right : SensorSnapshot.ABSENT, gyro != null, gyro == null ? SensorSnapshot.ABSENT : gyro[0],
+                gyro == null ? SensorSnapshot.ABSENT : gyro[1], gyro == null ? SensorSnapshot.ABSENT : gyro[2]);
     }
 
     /** The three signed gyro rates after IMUGY= ("0000000062,-000000757,0000000093"), or
@@ -108,23 +109,25 @@ public final class SensorReply {
         return v < Integer.MIN_VALUE || v > Integer.MAX_VALUE ? null : Integer.valueOf((int) v);
     }
 
-    /** The wheel encoder count after {@code key} ("Left=0000068312,"): 1-10 digits ended
-     * by a comma (both counts always have one), else ABSENT. A count cut off mid-field
-     * is ABSENT, never a smaller number. */
-    private static long count(String text, String key) {
+    /** The wheel encoder count after {@code key} ("Left=0000068312," or, reversing past
+     * zero, "Left=-000002764,"): an optional '-' then 1-10 digits, ended by a comma (both
+     * counts always have one), else null. A count cut off mid-field is null, never a
+     * smaller number. Signed: -1 is a real count (live 2026-09-25). */
+    private static Long count(String text, String key) {
         int start = text.indexOf(key);
         if (start < 0) {
-            return SensorSnapshot.ABSENT;
+            return null;
         }
-        int i = start + key.length();
+        int sign = start + key.length();
+        int i = sign < text.length() && text.charAt(sign) == '-' ? sign + 1 : sign;
         int end = i;
-        while (end < text.length() && Character.isDigit(text.charAt(end))) {
+        while (end < text.length() && text.charAt(end) >= '0' && text.charAt(end) <= '9') {
             end++;
         }
         if (end == i || end - i > 10 || end >= text.length() || text.charAt(end) != ',') {
-            return SensorSnapshot.ABSENT;
+            return null;
         }
-        return Long.parseLong(text.substring(i, end));
+        return Long.parseLong(text.substring(sign, end));
     }
 
     /** The CPL motion-ack value in {@code reply} (2 = the MCU refused forward motion for an

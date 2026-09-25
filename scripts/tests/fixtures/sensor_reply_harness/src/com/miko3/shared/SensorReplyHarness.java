@@ -97,12 +97,31 @@ public final class SensorReplyHarness {
                 w != null && w.wheelLeft == 68312 && w.wheelRight == 59810, "got " + w);
 
         check("missing_or_cut_off_wheel_counts_are_absent",
-                SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXX"), T).wheelLeft == SensorSnapshot.ABSENT
-                        && SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=00000683"), T).wheelLeft
-                        == SensorSnapshot.ABSENT
-                        && SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=XXXX,Right=1,"), T).wheelLeft
-                        == SensorSnapshot.ABSENT,
-                "expected ABSENT");
+                w.hasWheels && !SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXX"), T).hasWheels
+                        && !SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=00000683"), T).hasWheels
+                        && !SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=XXXX,Right=1,"), T).hasWheels,
+                "expected no wheel counts");
+
+        // Live 2026-09-25: the counters are signed and cumulative, reverse counts down
+        // and they start at 0 after a power cycle ("Left=-000002764,Right=-000001789,").
+        String head = "POWER=0,0TOFIR=00209,XXXX,0,XXXXHEADTM=0";
+        SensorSnapshot back = SensorReply.parse(bytes(head + "Left=-000002764,Right=-000001789,00,00,0"), T);
+        SensorSnapshot mixed = SensorReply.parse(bytes(head + "Left=0000001963,Right=-000000012,00,00,0"), T);
+        check("negative_wheel_counts_are_read",
+                back != null && back.hasWheels && back.wheelLeft == -2764 && back.wheelRight == -1789
+                        && mixed != null && mixed.hasWheels && mixed.wheelLeft == 1963 && mixed.wheelRight == -12,
+                "got " + back + " / " + mixed);
+        check("a_stray_or_cut_off_minus_is_absent",
+                !SensorReply.parse(bytes(head + "Left=-,Right=5,00"), T).hasWheels
+                        && !SensorReply.parse(bytes(head + "Left=--5,Right=5,00"), T).hasWheels
+                        && !SensorReply.parse(bytes(head + "Left=5,Right=-"), T).hasWheels
+                        && !SensorReply.parse(bytes(head + "Left=5,Right=-00000"), T).hasWheels
+                        && !SensorReply.parse(bytes(head + "Left=-00000000001,Right=5,00"), T).hasWheels,
+                "expected no wheel counts");
+        SensorSnapshot minusOne = SensorReply.parse(bytes(head + "Left=-000000001,Right=0000000000,00"), T);
+        check("a_count_of_minus_one_is_present",
+                minusOne != null && minusOne.hasWheels && minusOne.wheelLeft == -1 && minusOne.wheelRight == 0,
+                "got " + minusOne);
 
         // ---- gyro (explore nav plan U1): IMUGY= is three signed rate fields ----
         check("captured_record_carries_the_gyro",
