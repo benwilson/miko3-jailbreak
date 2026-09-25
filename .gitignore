@@ -72,3 +72,6 @@ hooks/sd-free/miko3-test/
 scripts/route-a-cache/
 tools/third_party/
 tools/detector-export/
+
+# Private voice training material (clips, transcripts, references, venv) — never commit
+voice-work/

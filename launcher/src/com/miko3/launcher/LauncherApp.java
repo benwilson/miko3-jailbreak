@@ -60,11 +60,59 @@ public class LauncherApp extends Application {
     private RoutingHttpServer server;
     private WifiHttpHandler wifi;
     private ClaudeSettings claudeSettings;
+    private SpeechEngine speech;
     // The Settings page's tokens (KTD6). Four, so the robot's own WebView sitting
     // on the page doesn't expire a LAN browser's form, or the other way round.
     private final PageToken settingsToken = new PageToken(4);
     private final ClaudeApi claudeApi = new ClaudeApi(new ClaudeHttpsTransport());
     private volatile byte[] cssBytes;
+
+    // The Settings page's Voice section speaks in-process, straight into the
+    // engine's queue (no binding to our own SpeechService). Its lines are owned
+    // by this object, so a mode's cancel() never drops them.
+    private final SettingsPage.Speaker settingsSpeaker = new SettingsSpeaker();
+
+    private final class SettingsSpeaker implements SettingsPage.Speaker {
+        private volatile String voiceName;
+
+        @Override
+        public boolean ready() {
+            return speech.isReady();
+        }
+
+        @Override
+        public boolean failed() {
+            return speech.hasFailed();
+        }
+
+        @Override
+        public String voiceName() {
+            String name = voiceName;
+            if (name == null) {
+                name = speech.voiceName();
+                voiceName = name;
+            }
+            return name;
+        }
+
+        @Override
+        public void say(String text) {
+            long id = speech.queue().speak(this, text, new SpeechQueue.Listener() {
+                @Override
+                public void finished() {
+                }
+
+                @Override
+                public void cancelled() {
+                }
+
+                @Override
+                public void failed(String reason) {
+                }
+            });
+            Log.i(TAG, "settings page queued line " + id);
+        }
+    }
 
     // Held only to create and keep alive DriveLeaseService, the modes' motor
     // arbiter (R3/KTD3). The launcher never queries the holder: which mode is
@@ -92,6 +140,10 @@ public class LauncherApp extends Application {
                         return System.currentTimeMillis();
                     }
                 });
+        // The robot's voice (voice plan U5): loaded once, on its own thread, so
+        // SpeechService is ready by the time a mode asks it to speak.
+        speech = new SpeechEngine(this);
+        speech.start();
         wifi = new WifiHttpHandler(this);
         startServer();
 
@@ -108,6 +160,11 @@ public class LauncherApp extends Application {
      * page and the settings service. */
     ClaudeSettings claudeSettings() {
         return claudeSettings;
+    }
+
+    /** The robot's voice and its queue of lines, for SpeechService. */
+    SpeechEngine speech() {
+        return speech;
     }
 
     /**
@@ -209,7 +266,7 @@ public class LauncherApp extends Application {
         RoutingHttpServer.RouteHandler settingsHandler = new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {
-                SettingsPage.handle(req, res, settingsToken, claudeSettings, claudeApi);
+                SettingsPage.handle(req, res, settingsToken, claudeSettings, claudeApi, settingsSpeaker);
             }
         };
         server.route(LauncherProtocol.SETTINGS_PATH, settingsHandler);
@@ -217,6 +274,7 @@ public class LauncherApp extends Application {
         server.route(LauncherProtocol.SETTINGS_CLAUDE_MODELS_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_CLAUDE_TEST_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_CLAUDE_FORGET_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_VOICE_SAY_PATH, settingsHandler);
         server.route(LauncherProtocol.LAUNCH_MODE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {

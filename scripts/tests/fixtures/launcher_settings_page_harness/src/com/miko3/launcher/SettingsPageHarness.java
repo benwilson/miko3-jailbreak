@@ -68,6 +68,30 @@ public final class SettingsPageHarness {
         }
     }
 
+    /** Records what the page asked the robot to say. */
+    static final class FakeSpeaker implements SettingsPage.Speaker {
+        boolean ready = true;
+        boolean failed;
+        String voice = "stock lessac medium";
+        final List<String> said = new ArrayList<String>();
+
+        public boolean ready() {
+            return ready;
+        }
+
+        public boolean failed() {
+            return failed;
+        }
+
+        public String voiceName() {
+            return voice;
+        }
+
+        public void say(String text) {
+            said.add(text);
+        }
+    }
+
     static final class Fixture {
         final MemStore store = new MemStore();
         final ClaudeSettings settings = new ClaudeSettings(store, new ClaudeSettings.Clock() {
@@ -79,6 +103,7 @@ public final class SettingsPageHarness {
         final PageToken token = new PageToken(4);
         final FakeTransport transport = new FakeTransport();
         final ClaudeApi api = new ClaudeApi(transport);
+        final FakeSpeaker speaker = new FakeSpeaker();
     }
 
     static final class Resp {
@@ -114,7 +139,7 @@ public final class SettingsPageHarness {
         HttpRequest req = new HttpRequest(method, path, HttpRequest.parseQuery(query), headers,
                 new ByteArrayInputStream(body));
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        SettingsPage.handle(req, new HttpResponse(out), f.token, f.settings, f.api);
+        SettingsPage.handle(req, new HttpResponse(out), f.token, f.settings, f.api, f.speaker);
         String raw = new String(out.toByteArray(), StandardCharsets.UTF_8);
         int split = raw.indexOf("\r\n\r\n");
         Resp r = new Resp();
@@ -148,6 +173,18 @@ public final class SettingsPageHarness {
 
     static Resp action(Fixture f, String path) throws Exception {
         return request(f, "POST", path, "", "t=" + token(f));
+    }
+
+    static Resp say(Fixture f, String text) throws Exception {
+        return request(f, "POST", "/settings/voice/say", "", "t=" + token(f) + "&text=" + enc(text));
+    }
+
+    static String repeat(char c, int n) {
+        StringBuilder b = new StringBuilder(n);
+        for (int i = 0; i < n; i++) {
+            b.append(c);
+        }
+        return b.toString();
     }
 
     /** The <form> whose action is the given path, or "" when there is none. */
@@ -575,6 +612,130 @@ public final class SettingsPageHarness {
                         && !hostile.contains("script") && hostile.contains("https://<robot address>:")
                         && hostile.contains(":8443/settings") && none.contains(":8443/settings");
                 check(n, ok, named + " | " + hostile + " | " + none);
+            }
+        });
+
+        // Voice: the owner types a line and the robot says it.
+        scenario("voice_section_shows_say_form_and_voice_name", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String html = get(f);
+                String form = form(html, "/settings/voice/say");
+                f.speaker.voice = "trained";
+                String trained = get(f);
+                check(n, html.contains("<section id=\"voice\">") && html.indexOf("id=\"voice\"") > html.indexOf("Claude API")
+                                && fieldNames(form).equals(Arrays.asList("t", "text"))
+                                && form.contains("maxlength=\"" + SpeechQueue.MAX_CHARS + "\"")
+                                && form.contains(">Say it</button>")
+                                && html.contains("stock lessac medium") && trained.contains("trained"),
+                        form);
+            }
+        });
+
+        scenario("say_without_token_rejected", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = request(f, "POST", "/settings/voice/say", "", "text=" + enc("Hello"));
+                check(n, r.code() == 302 && r.status().contains("expired") && f.speaker.said.isEmpty(),
+                        r.head);
+            }
+        });
+
+        scenario("say_with_stale_token_rejected", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String stale = token(f);
+                for (int i = 0; i < 4; i++) {
+                    token(f);
+                }
+                Resp r = request(f, "POST", "/settings/voice/say", "", "t=" + stale + "&text=" + enc("Hello"));
+                check(n, r.status().contains("expired") && f.speaker.said.isEmpty(), r.status());
+            }
+        });
+
+        scenario("say_empty_text_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = say(f, "   ");
+                Resp missing = request(f, "POST", "/settings/voice/say", "", "t=" + token(f));
+                check(n, "Nothing said: type something to say.".equals(r.status())
+                                && r.status().equals(missing.status()) && f.speaker.said.isEmpty(),
+                        r.status() + " | " + missing.status());
+            }
+        });
+
+        scenario("say_too_long_text_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = say(f, repeat('a', SpeechQueue.MAX_CHARS + 1));
+                Resp max = say(f, repeat('b', SpeechQueue.MAX_CHARS));
+                check(n, ("Nothing said: that is longer than " + SpeechQueue.MAX_CHARS + " characters.")
+                                .equals(r.status()) && "Speaking.".equals(max.status())
+                                && f.speaker.said.size() == 1,
+                        r.status() + " | " + max.status());
+            }
+        });
+
+        scenario("say_while_voice_loading_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.speaker.ready = false;
+                Resp r = say(f, "Hello");
+                check(n, "The voice is still loading; try again in a few seconds.".equals(r.status())
+                        && f.speaker.said.isEmpty(), r.status());
+            }
+        });
+
+        scenario("say_after_voice_failed_says_not_available", new Scenario() {
+            public void run(String n) throws Exception {
+                // The voice failed to load: it will never be ready, so the page
+                // must not keep saying "still loading".
+                Fixture f = new Fixture();
+                f.speaker.ready = false;
+                f.speaker.failed = true;
+                Resp r = say(f, "Hello");
+                check(n, "Nothing said: the robot's voice is not available.".equals(r.status())
+                        && f.speaker.said.isEmpty(), r.status());
+            }
+        });
+
+        scenario("say_speaks_and_redirects", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = say(f, "Hello! I can talk now.");
+                check(n, r.code() == 302 && r.location().startsWith("/settings?status=")
+                                && "Speaking.".equals(r.status())
+                                && f.speaker.said.equals(Arrays.asList("Hello! I can talk now.")),
+                        r.head + " said=" + f.speaker.said);
+            }
+        });
+
+        scenario("say_status_never_echoes_text", new Scenario() {
+            public void run(String n) throws Exception {
+                String marker = "zqxmarker";
+                List<String> leaks = new ArrayList<String>();
+                for (boolean ready : new boolean[] {true, false}) {
+                    for (String text : Arrays.asList(marker, marker + repeat('x', SpeechQueue.MAX_CHARS),
+                            "<b>" + marker + "</b>")) {
+                        Fixture f = new Fixture();
+                        f.speaker.ready = ready;
+                        Resp r = say(f, text);
+                        if (r.location().contains(marker) || r.status().contains(marker)) {
+                            leaks.add(r.location());
+                        }
+                    }
+                }
+                check(n, leaks.isEmpty(), leaks.toString());
+            }
+        });
+
+        scenario("get_on_say_path_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = request(f, "GET", "/settings/voice/say", "t=" + token(f) + "&text=Hello", null);
+                check(n, r.code() == 405 && f.speaker.said.isEmpty()
+                                && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_VOICE_SAY_PATH),
+                        r.head);
             }
         });
 

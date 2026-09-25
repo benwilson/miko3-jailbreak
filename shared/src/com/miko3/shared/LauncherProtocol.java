@@ -17,6 +17,10 @@ public final class LauncherProtocol {
      * (settings plan U5). Modes go through RobotSettingsClient, not this directly. */
     public static final String ROBOT_SETTINGS_ACTION = "com.miko3.launcher.ROBOT_SETTINGS";
 
+    /** Intent action a mode app binds to reach the launcher's SpeechService
+     * (voice plan U5). Modes go through RobotSpeechClient, not this directly. */
+    public static final String ROBOT_SPEECH_ACTION = "com.miko3.launcher.ROBOT_SPEECH";
+
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 
     /** Boolean extra on a launch Intent the launcher sends a mode's Activity, asking
@@ -49,6 +53,8 @@ public final class LauncherProtocol {
     public static final String SETTINGS_CLAUDE_MODELS_PATH = "/settings/claude/models";
     public static final String SETTINGS_CLAUDE_TEST_PATH = "/settings/claude/test";
     public static final String SETTINGS_CLAUDE_FORGET_PATH = "/settings/claude/forget";
+    /** Voice: the robot says the typed line through the launcher's speech queue. */
+    public static final String SETTINGS_VOICE_SAY_PATH = "/settings/voice/say";
 
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;
