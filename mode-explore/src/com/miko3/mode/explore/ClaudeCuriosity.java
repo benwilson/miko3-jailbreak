@@ -65,7 +65,8 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final ClaudeApi claude = new ClaudeApi(new ClaudeHttpsTransport());
     private final RobotSpeechClient speech;
     private final RobotListenClient ears;
-    private final FaceCrop cropper = new FaceCropper();
+    /** YuNet on ONNX Runtime; its model loads at the first MEET and is freed by release(). */
+    private final FaceCropper cropper;
     private final ExecutorService worker = Executors.newCachedThreadPool(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
@@ -95,6 +96,7 @@ final class ClaudeCuriosity implements CuriosityPort {
         app = context.getApplicationContext();
         speech = new RobotSpeechClient(app);
         ears = new RobotListenClient(app);
+        cropper = new FaceCropper(app);
         refreshSettings();
     }
 
@@ -106,6 +108,8 @@ final class ClaudeCuriosity implements CuriosityPort {
         speech.close();
         ears.close();
         worker.shutdownNow();
+        // Waits for a crop still running, then frees the face model.
+        cropper.close();
     }
 
     // ---- settings ----

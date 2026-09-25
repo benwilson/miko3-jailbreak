@@ -37,7 +37,7 @@ class AdapterWiringTest(unittest.TestCase):
                        "RobotListenClient"):
             self.assertIn(client, a, client)
         for call in ("RobotPeopleClient.recent", "RobotPeopleClient.add", "RobotPeopleClient.touch",
-                     "RobotPeopleClient.nameOf", "NameExtractor.extract", "new FaceCropper()"):
+                     "RobotPeopleClient.nameOf", "NameExtractor.extract", "new FaceCropper(app)"):
             self.assertIn(call, a, call)
 
     def test_release_closes_both_clients(self):
@@ -142,12 +142,30 @@ class FaceCropStoresOnlyFacesTest(unittest.TestCase):
     """Owner report: a stored face showed the wall. The top quarter of a loose or
     small person box stood in whenever FaceDetector found nothing, and was stored."""
 
-    def test_the_cropper_has_no_stand_in_and_detects_on_rgb_565(self):
+    def test_the_cropper_has_no_stand_in_and_detects_with_yunet(self):
+        # Android's FaceDetector missed an obvious frontal face in glasses (~115 px wide
+        # in 640x480), so nothing was ever stored: YuNet on ONNX Runtime replaced it.
         cropper = code_only(src("FaceCropper.java"))
         self.assertNotIn("topOfPerson", cropper)
-        self.assertIn("copy(Bitmap.Config.RGB_565", cropper)
-        self.assertIn("new FaceDetector(", cropper)
+        self.assertNotIn("FaceDetector", cropper)
+        self.assertIn('MODEL = "face_yunet.onnx"', cropper)
+        self.assertIn("env.createSession(HttpUtil.readAssetBytes(context, MODEL)", cropper)
+        self.assertIn("YuNetDecoder.largestInside(", cropper)
         self.assertIn("return Result.NONE;", cropper)
+
+    def test_the_face_model_uses_few_threads_and_is_freed_on_release(self):
+        cropper = code_only(src("FaceCropper.java"))
+        threads = int(re.search(r"THREADS = (\d+);", cropper).group(1))
+        self.assertIn(threads, (1, 2))
+        self.assertIn("setIntraOpNumThreads(THREADS)", cropper)
+        self.assertIn("synchronized void close()", cropper)
+        self.assertIn("public synchronized Result crop(", cropper)
+        a = code_only(src("ClaudeCuriosity.java"))
+        body = re.search(r"void release\(\)\s*\{(.*?)\n    \}", a, re.S)
+        self.assertIn("cropper.close()", body.group(1))
+
+    def test_the_face_model_is_packaged(self):
+        self.assertTrue((REPO / "mode-explore" / "assets" / "face_yunet.onnx").is_file())
 
     def test_no_face_skips_the_match_and_stores_nothing(self):
         a = code_only(src("ClaudeCuriosity.java"))

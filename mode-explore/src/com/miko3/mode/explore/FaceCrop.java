@@ -2,19 +2,17 @@ package com.miko3.mode.explore;
 
 /**
  * Cuts a person's face out of a camera frame for the match request (explore on
- * Claude plan KTD5, R9, R13). FaceCropper does it on the robot with Android's
- * FaceDetector; this interface and its geometry are plain Java, so the brain
- * and the host harness never touch android.*.
+ * Claude plan KTD5, R9, R13). FaceCropper does it on the robot with the YuNet
+ * face detector (YuNetDecoder); this interface and its geometry are plain Java,
+ * so the brain and the host harness never touch android.*.
  *
  * The geometry, all in the frame's pixels:
  *  - The person box (fractions of the frame, as every Detection is) becomes a
- *    pixel region inside the frame, an even number of pixels wide (FaceDetector
- *    needs that). A small region is scaled up by detectScale() before the
- *    detector looks, since it misses faces whose eyes are only a few pixels apart.
- *  - A face hit (the midpoint between the eyes and the eye distance) becomes a
- *    square about FACE_WIDTHS eye distances wide, a little below the eyes so
- *    the chin is in, then EXPAND times larger (1.6x) for hair and shoulders.
- *  - With no hit there is NO crop: a person box without a detected face is
+ *    pixel region inside the frame. The detector looks at the whole frame, and
+ *    the largest face whose centre is inside that region is the person's.
+ *  - The face box becomes a square as wide as its longer side, on the same
+ *    centre, then EXPAND times larger (1.6x) for hair, chin and shoulders.
+ *  - With no face there is NO crop: a person box without a detected face is
  *    never stored or matched as a face. (An earlier stand-in, the top quarter
  *    of the box, stored a patch of wall whenever the box was loose or the
  *    person small: the People page showed the wall.)
@@ -46,29 +44,22 @@ interface FaceCrop {
 
     int SIDE_PX = 224;
     float EXPAND = 1.6f;
-    /** A face is about this many eye distances wide (FaceDetector's own guidance: 2.5-3). */
-    float FACE_WIDTHS = 2.5f;
-    /** The face's centre sits this many eye distances below the eyes' midpoint. */
-    float DROP = 0.25f;
-    /** Regions narrower than this are scaled up before detection, by at most MAX_DETECT_SCALE. */
-    int DETECT_MIN_WIDTH = 320;
-    float MAX_DETECT_SCALE = 4f;
 
     /** Where to cut and how to read boxes, in the frame's pixels. */
     final class Square {
         private Square() {
         }
 
-        /** The square around a face hit, inside a w x h frame: {left, top, side}. */
-        static int[] aroundFace(float midX, float midY, float eyesDistance, int w, int h) {
-            float side = eyesDistance * FACE_WIDTHS * EXPAND;
-            return clamp(midX, midY + eyesDistance * DROP, side, w, h);
+        /** The square around a face box (frame pixels), inside a w x h frame: {left, top, side}. */
+        static int[] aroundFace(float x0, float y0, float x1, float y1, int w, int h) {
+            float side = Math.max(x1 - x0, y1 - y0) * EXPAND;
+            return clamp((x0 + x1) / 2f, (y0 + y1) / 2f, side, w, h);
         }
 
         /**
          * The person box as a pixel region of a w x h frame, {left, top, width,
          * height}: clamped inside the frame, and an even width. Null when it is
-         * too small for a detector to look in (under 16 px either way).
+         * too small to hold a face (under 16 px either way).
          */
         static int[] region(Detection box, int w, int h) {
             int left = Math.max(0, Math.min(w, (int) Math.floor(box.x0 * w)));
@@ -81,19 +72,6 @@ interface FaceCrop {
                 return null;
             }
             return new int[] {left, top, rw, rh};
-        }
-
-        /** How much to scale a region regionWidth px wide before detection: 1 or more, at most MAX_DETECT_SCALE. */
-        static float detectScale(int regionWidth) {
-            if (regionWidth <= 0 || regionWidth >= DETECT_MIN_WIDTH) {
-                return 1f;
-            }
-            return Math.min(MAX_DETECT_SCALE, DETECT_MIN_WIDTH / (float) regionWidth);
-        }
-
-        /** A dimension scaled by s, rounded down to an even number of pixels (FaceDetector needs an even width). */
-        static int evenScaled(int px, float s) {
-            return Math.max(2, ((int) (px * s)) & ~1);
         }
 
         /**

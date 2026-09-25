@@ -2540,11 +2540,15 @@ public final class ExploreBrainHarness {
 
     private static void faceCropScenarios() {
         scenario("face_crop_expands_the_face_hit_1_6x", n -> {
-            // Eyes 40 px apart at (320, 200) in a 640x480 frame: a 100 px face, 160 px after 1.6x, 10 px lower.
-            int[] sq = FaceCrop.Square.aroundFace(320f, 200f, 40f, 640, 480);
-            int[] edge = FaceCrop.Square.aroundFace(10f, 10f, 40f, 640, 480);
-            check(n, sq[2] == 160 && sq[0] == 240 && sq[1] == 130 && edge[0] == 0 && edge[1] == 0 && edge[2] == 160,
-                    java.util.Arrays.toString(sq) + " " + java.util.Arrays.toString(edge));
+            // A 100 px face box centred at (320, 200) in a 640x480 frame: a 160 px square on the same centre.
+            int[] sq = FaceCrop.Square.aroundFace(270f, 150f, 370f, 250f, 640, 480);
+            // A tall 80x120 box: the longer side sets the square (192 px), centred at (340, 160).
+            int[] tall = FaceCrop.Square.aroundFace(300f, 100f, 380f, 220f, 640, 480);
+            int[] edge = FaceCrop.Square.aroundFace(0f, 0f, 100f, 100f, 640, 480);
+            check(n, sq[2] == 160 && sq[0] == 240 && sq[1] == 120 && tall[2] == 192 && tall[0] == 244
+                            && tall[1] == 64 && edge[0] == 0 && edge[1] == 0 && edge[2] == 160,
+                    java.util.Arrays.toString(sq) + " " + java.util.Arrays.toString(tall) + " "
+                            + java.util.Arrays.toString(edge));
         });
         scenario("face_crop_has_no_top_of_person_fallback", n -> {
             // Owner report: a stored face showed the wall. The top quarter of a loose or
@@ -2560,8 +2564,8 @@ public final class ExploreBrainHarness {
             check(n, !names.contains("topOfPerson") && noTopShare, names.toString());
         });
         scenario("face_crop_square_shrinks_and_stays_inside_a_small_frame", n -> {
-            // Eyes 100 px apart want a 400 px square; a 120x90 frame holds at most 90, pushed inside.
-            int[] sq = FaceCrop.Square.aroundFace(110f, 80f, 100f, 120, 90);
+            // A 100 px face wants a 160 px square; a 120x90 frame holds at most 90, pushed inside.
+            int[] sq = FaceCrop.Square.aroundFace(60f, 30f, 160f, 130f, 120, 90);
             check(n, sq[2] == 90 && sq[0] == 30 && sq[1] == 0, java.util.Arrays.toString(sq));
         });
         scenario("face_crop_region_is_the_person_box_in_pixels_clamped_with_an_even_width", n -> {
@@ -2574,12 +2578,6 @@ public final class ExploreBrainHarness {
                             && edge != null && edge[0] + edge[2] <= 641 && edge[2] % 2 == 0 && tiny == null,
                     java.util.Arrays.toString(r) + " " + java.util.Arrays.toString(edge) + " "
                             + java.util.Arrays.toString(tiny));
-        });
-        scenario("face_crop_scales_small_regions_up_before_detection", n -> {
-            check(n, Math.abs(FaceCrop.Square.detectScale(160) - 2f) < 1e-6
-                            && FaceCrop.Square.detectScale(400) == 1f && FaceCrop.Square.detectScale(40) == 4f
-                            && FaceCrop.Square.evenScaled(141, 2.25f) == 316,
-                    FaceCrop.Square.detectScale(160) + " " + FaceCrop.Square.evenScaled(141, 2.25f));
         });
         scenario("face_crop_reads_pixel_and_normalized_boxes_alike", n -> {
             float[] px = FaceCrop.Square.fractions(new double[] {422, 278, 563, 379}, 640, 480);

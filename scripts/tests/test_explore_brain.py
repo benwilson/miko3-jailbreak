@@ -163,7 +163,6 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "face_crop_has_no_top_of_person_fallback",
         "face_crop_square_shrinks_and_stays_inside_a_small_frame",
         "face_crop_region_is_the_person_box_in_pixels_clamped_with_an_even_width",
-        "face_crop_scales_small_regions_up_before_detection",
         "face_crop_reads_pixel_and_normalized_boxes_alike",
         "replies_look_accepts_a_normalized_box",
         # The face crop from a fresh look (owner report: a stored face showed the wall)
