@@ -263,3 +263,25 @@ class ExportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DropValMosCallbackTest(unittest.TestCase):
+    """The val_mos ModelCheckpoint crashes newer Lightning at the first validation."""
+
+    SAMPLE = (
+        "_DEFAULT_CALLBACKS = [\n"
+        "    ModelCheckpoint(\n        monitor=_MONITOR,\n        save_last=True,\n    ),\n"
+        "    ModelCheckpoint(\n        monitor=\"val_mos\",\n        mode=\"max\",\n    ),\n"
+        "]\n")
+
+    def test_removes_only_the_val_mos_callback_and_is_idempotent(self):
+        mod = tp
+        with tempfile.TemporaryDirectory() as d:
+            main = Path(d) / "__main__.py"
+            main.write_text(self.SAMPLE)
+            self.assertTrue(mod.drop_val_mos_callback(main))
+            text = main.read_text()
+            self.assertNotIn("val_mos", text)
+            self.assertIn("monitor=_MONITOR", text)
+            self.assertFalse(mod.drop_val_mos_callback(main))
+            self.assertEqual(main.read_text(), text)

@@ -55,6 +55,7 @@ REPO = Path(__file__).resolve().parents[2]
 WORK_ROOT = REPO / "voice-work"
 DATASET_DIR = WORK_ROOT / "dataset"
 PIPER_DIR = WORK_ROOT / "piper"
+PIPER_SRC = WORK_ROOT / "piper1-gpl" / "src"
 TRIAL_DIR = WORK_ROOT / "piper-trial"
 CHECKPOINTS = WORK_ROOT / "checkpoints"
 BASE_CKPT = CHECKPOINTS / "epoch=2164-step=1355540.ckpt"
@@ -163,6 +164,20 @@ def ckpt_epoch(path):
 
 
 # --------------------------------------------------------------- training
+
+
+def drop_val_mos_callback(main=None):
+    """piper1-gpl's second ModelCheckpoint monitors val_mos (UTMOS), which this setup
+    never logs; newer Lightning raises instead of skipping, killing the run at the
+    first validation. Remove that callback from the local clone (idempotent)."""
+    main = Path(main) if main else PIPER_SRC / "piper" / "train" / "__main__.py"
+    text = main.read_text()
+    start = text.find("    ModelCheckpoint(\n        monitor=\"val_mos\"")
+    if start < 0:
+        return False
+    end = text.index("    ),\n", start) + len("    ),\n")
+    main.write_text(text[:start] + text[end:])
+    return True
 
 def fit_args(csv, audio_dir, cache_dir, config_path, ckpt, max_epochs, accelerator,
              batch_size=BATCH_SIZE, root_dir=None, validation_split=VALIDATION_SPLIT,
@@ -454,6 +469,7 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=12, help="timed steps (the first is warm-up)")
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     ap.add_argument("--full-rows", type=int, help="rows to project for (default: script lines)")
+    ap.add_argument("--resume", type=Path, help="checkpoint to continue --train from (default: the converted base)")
     ap.add_argument("--extra-epochs", type=int, default=EXTRA_EPOCHS,
                     help=f"epochs to train past the checkpoint for --train (default {EXTRA_EPOCHS})")
     ap.add_argument("--accelerator", choices=("auto", "mps", "cpu", "gpu"), default="auto")
@@ -489,8 +505,9 @@ def main(argv=None):
         if not CKPT.is_file():
             convert_checkpoint()
         acc = a.accelerator if a.accelerator != "auto" else ("mps" if mps_ok() else "cpu")
+        drop_val_mos_callback()
         args = fit_args(PIPER_DIR / "metadata.csv", Path(a.dataset) / "wavs", PIPER_DIR / "cache",
-                        PIPER_DIR / "config.json", CKPT, ckpt_epoch(CKPT) + 1 + a.extra_epochs,
+                        PIPER_DIR / "config.json", a.resume or CKPT, ckpt_epoch(CKPT) + 1 + a.extra_epochs,
                         acc, a.batch_size, root_dir=PIPER_DIR / "train",
                         extra=["--trainer.check_val_every_n_epoch", str(VAL_EVERY)])
         os.execv(sys.executable, [sys.executable, "-m", "piper.train", "fit"] + args)
