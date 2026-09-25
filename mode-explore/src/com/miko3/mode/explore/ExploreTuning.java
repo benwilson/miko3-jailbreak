@@ -323,6 +323,30 @@ final class ExploreTuning {
     final float escapeTriedPenalty;
     /** A back-out is blind: never longer than this, whatever the leg log allows. */
     final long backOutMaxMs;
+    /**
+     * A measured turn that will not turn backs up blind this many back ticks first
+     * (bounded by their time, stopped early by a stall), once per turn, then tries the
+     * same turn again (live 2026-09-25: pinned after a CPL stop with no leg to back out
+     * along, "all he needed was to back up a tiny bit and then spin"). 0: no back-up.
+     */
+    final int blockedTurnBackTicks;
+    /**
+     * Open doorways through Claude (explore nav plan U6, R7, R8, KTD4, KTD5). While
+     * he roams with the heading usable, one frame is asked about at most every
+     * doorwayAskMs (the interval restarts when an answer, a failure or a drop ends
+     * the ask; the brain gives up on one after doorwayAskTimeoutMs). An answer
+     * becomes a remembered heading; the steer adds up to doorwayWeight to the open
+     * bands nearest it. Within doorwayFacingDeg of it, the band there must read
+     * open or it is dropped (the door was closed since). It is forgotten after
+     * doorwayExpireMs or doorwayExpireCounts forward encoder counts (mean of the
+     * wheels), or once a full leg is driven toward it with the way reading open.
+     */
+    final long doorwayAskMs;
+    final long doorwayAskTimeoutMs;
+    final float doorwayWeight;
+    final double doorwayFacingDeg;
+    final long doorwayExpireMs;
+    final long doorwayExpireCounts;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -450,6 +474,13 @@ final class ExploreTuning {
         escapeTriedDeg = b.escapeTriedDeg;
         escapeTriedPenalty = b.escapeTriedPenalty;
         backOutMaxMs = b.backOutMaxMs;
+        blockedTurnBackTicks = Math.max(0, b.blockedTurnBackTicks);
+        doorwayAskMs = Math.max(0, b.doorwayAskMs);
+        doorwayAskTimeoutMs = Math.max(1, b.doorwayAskTimeoutMs);
+        doorwayWeight = Math.max(0f, b.doorwayWeight);
+        doorwayFacingDeg = b.doorwayFacingDeg;
+        doorwayExpireMs = b.doorwayExpireMs;
+        doorwayExpireCounts = b.doorwayExpireCounts;
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
@@ -675,6 +706,22 @@ final class ExploreTuning {
         private double escapeTriedDeg = 45;
         private float escapeTriedPenalty = 0.5f;
         private long backOutMaxMs = 4000;
+        // ~0.75 s at backTickMs, a few centimetres: no rear sensor, so as little as frees a turn.
+        // Shorter than the stall watch's grace, so at this length its time ends it first.
+        private int blockedTurnBackTicks = 3;
+        // R8 and the owner's cap (Key Decisions): about once a minute, so room pictures
+        // sent to Claude stay infrequent. A navigation ask answers in ~3-6 s live (U5).
+        private long doorwayAskMs = 60000;
+        private long doorwayAskTimeoutMs = 15000;
+        // Enough to beat a band ahead that reads as open (0.9 vs 0.9 + 0.3 > steerMinGain),
+        // never enough to lift a blocked band (bands at or below steerBlocked get none).
+        private float doorwayWeight = 0.3f;
+        // About one steer band (~15 deg of the ~60 deg view).
+        private double doorwayFacingDeg = 15;
+        // A minute, or ~8 s of driving at 650-880 counts/s (docs/hardware/tof-sensor.md):
+        // the next ask by then says afresh. Not measured; U8 checks it.
+        private long doorwayExpireMs = 60000;
+        private long doorwayExpireCounts = 6000;
 
         /** A fixed leg length. */
         Builder hopTicks(int v) { hopTicks = v; hopTicksMax = v; return this; }
@@ -862,6 +909,22 @@ final class ExploreTuning {
         }
         Builder escapeTried(double deg, float penalty) { escapeTriedDeg = deg; escapeTriedPenalty = penalty; return this; }
         Builder backOutMaxMs(long v) { backOutMaxMs = v; return this; }
+        Builder blockedTurnBackTicks(int v) { blockedTurnBackTicks = v; return this; }
+        Builder doorwayAsk(long intervalMs, long timeoutMs) {
+            doorwayAskMs = intervalMs;
+            doorwayAskTimeoutMs = timeoutMs;
+            return this;
+        }
+        Builder doorwaySteer(float weight, double facingDeg) {
+            doorwayWeight = weight;
+            doorwayFacingDeg = facingDeg;
+            return this;
+        }
+        Builder doorwayExpire(long ms, long counts) {
+            doorwayExpireMs = ms;
+            doorwayExpireCounts = counts;
+            return this;
+        }
 
         ExploreTuning build() {
             return new ExploreTuning(this);

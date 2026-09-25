@@ -196,6 +196,28 @@ final class ExplorePrompts {
             "frame", type("integer"),
             "x", type("integer"));
 
+    // ---- open doorways (explore nav plan U6, KTD4): one roaming frame ----
+
+    /** The text before the frame: what it is. */
+    static String doorwayIntro(int width, int height) {
+        return "Miko is exploring the house. This is what his camera sees right now, " + width + " x " + height
+                + " pixels.";
+    }
+
+    /** The text after the frame: only an open doorway counts, and what to answer. */
+    static String doorwayAsk() {
+        return "Is there an open doorway in view: a passable opening into another room or space, wide enough"
+                + " for him to drive through along the floor? A closed door is not an open doorway, even if it"
+                + " is a door: treat it as a wall. Neither is a window, a mirror, a picture, a cupboard, or a gap"
+                + " under furniture. Answer open_doorway true with x, the pixel column of the middle of the"
+                + " opening (0 is the left edge); if there are several, the one easiest for him to reach."
+                + " Answer open_doorway false if there is none, or if you are not sure it is open.";
+    }
+
+    static final Map<String, Object> DOORWAY_SCHEMA = object(
+            "open_doorway", type("boolean"),
+            "x", type("integer"));
+
     // ---- schema building ----
 
     private static String kindWord(CuriosityPort.Kind k) {

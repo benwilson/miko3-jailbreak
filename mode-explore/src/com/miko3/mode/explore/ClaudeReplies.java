@@ -96,6 +96,28 @@ final class ClaudeReplies {
     }
 
     /**
+     * The doorway reply (explore nav plan U6): "x" the pixel column of the open
+     * doorway in a frame width pixels wide (or, as a fraction, 0..1). A column outside
+     * the frame, a non-number, or anything missing is a failure; open_doorway false is NONE.
+     */
+    static CuriosityPort.Doorway doorway(Map<String, Object> json, int width) {
+        Object door = json.get("open_doorway");
+        if (Boolean.FALSE.equals(door)) {
+            return CuriosityPort.Doorway.none();
+        }
+        Object xv = json.get("x");
+        if (!Boolean.TRUE.equals(door) || !(xv instanceof Number) || width <= 0) {
+            return CuriosityPort.Doorway.failed();
+        }
+        Long px = integer(xv);
+        double at = px != null ? px / (double) width : ((Number) xv).doubleValue();
+        if (Double.isNaN(at) || at < 0 || at > 1) {
+            return CuriosityPort.Doorway.failed();
+        }
+        return CuriosityPort.Doorway.door((float) (at * 2 - 1));
+    }
+
+    /**
      * The person reply against a gallery of galleryCount references. Returns
      * the 0-based reference matched, or -1 for "none", "unsure", a number
      * beyond the gallery, or anything else (all a new person, KTD3), plus the

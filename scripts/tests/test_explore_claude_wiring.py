@@ -72,7 +72,7 @@ class AdapterWiringTest(unittest.TestCase):
         a = code_only(src("ClaudeCuriosity.java"))
         self.assertIn("Executors.newCachedThreadPool", a)
         self.assertIn("worker.execute(job)", a)
-        for method in ("ask", "match", "lines", "findName", "remember", "wayOut"):
+        for method in ("ask", "match", "lines", "findName", "remember", "wayOut", "doorway"):
             body = re.search(r"public void " + method + r"\((.*?)\n    \}", a, re.S)
             self.assertIsNotNone(body, method)
             self.assertIn("run(new Runnable()", body.group(1), method)
@@ -161,6 +161,57 @@ class WayOutRequestTest(unittest.TestCase):
             self.assertIn(words, ask)
 
 
+class DoorwayRequestTest(unittest.TestCase):
+    """The doorway ask (explore nav plan U6, KTD4): one roaming frame, answered with
+    none or a horizontal position, polled like the way-out ask, never written to disk."""
+
+    def test_the_port_and_its_no_claude_stand_in_have_the_request(self):
+        port = code_only(src("CuriosityPort.java"))
+        for sig in (r"void doorway\(byte\[\] jpeg, long timeoutMs\);", r"Doorway doorwayAnswer\(\);",
+                    r"void cancelDoorway\(\);"):
+            self.assertRegex(port, sig)
+        none = port[port.index("CuriosityPort NONE = new CuriosityPort()"):]
+        body = re.search(r"public Doorway doorwayAnswer\(\)\s*\{(.*?)\}", none, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn("Doorway.failed()", body.group(1))
+
+    def test_the_adapter_polls_a_slot_with_generations(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertIn("Slot<Doorway> doorways = new Slot<Doorway>()", a)
+        ask = re.search(r"public void doorway\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("doorways.start()", ask)
+        self.assertIn("doorways.finish(g,", ask)
+        self.assertRegex(a, r"public Doorway doorwayAnswer\(\)\s*\{\s*return doorways\.poll\(\);")
+        self.assertRegex(a, r"public void cancelDoorway\(\)\s*\{\s*doorways\.cancel\(\);")
+
+    def test_the_request_sends_one_frame_with_its_schema_and_writes_nothing(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        body = a[a.index("private Doorway findDoorway("):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("ExplorePrompts.DOORWAY_SCHEMA", body)
+        self.assertIn("ClaudeReplies.doorway(", body)
+        self.assertEqual(body.count("ClaudeApi.jpegBlock("), 1)
+        self.assertIn("ExplorePrompts.NAV_SYSTEM", body)
+        for disk in ("debugFace", "write(", "FileOutputStream", "getFilesDir"):
+            self.assertNotIn(disk, body, disk)
+
+    def test_the_schema_is_none_or_a_horizontal_position(self):
+        p = src("ExplorePrompts.java")
+        schema = p[p.index("DOORWAY_SCHEMA = object("):]
+        schema = schema[:schema.index(");")]
+        for field in ("open_doorway", "x"):
+            self.assertIn('"' + field + '"', schema)
+        self.assertNotIn('"frame"', schema)
+        self.assertNotIn('"y"', schema)
+
+    def test_the_prompt_asks_for_open_doorways_only_and_a_closed_door_is_not_one(self):
+        p = src("ExplorePrompts.java")
+        ask = p[p.index("static String doorwayAsk("):]
+        ask = ask[:ask.index("\n    }\n")]
+        for words in ("open doorway", "passable opening", "another room", "closed door is not"):
+            self.assertIn(words, ask)
+
+
 class NothingPrivateIsLoggedTest(unittest.TestCase):
     """No Log call touches images, the key, Claude's reply text, or names (ids are fine)."""
 
@@ -187,7 +238,7 @@ class ClaudeLatencyIsLoggedTest(unittest.TestCase):
     def test_every_claude_call_logs_its_latency(self):
         body = code_only(src("ClaudeCuriosity.java"))
         calls = body.split("claude.messages(")[1:]
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(calls), 9)
         for i, after in enumerate(calls):
             window = after[:900]
             logs = re.findall(r"Log\.[diwe]\((.*?)\);", window, re.S)

@@ -247,6 +247,23 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "pinned_runs_the_ladder_once_with_two_asks_then_rests",
         "pinned_after_the_rest_waits_longer_before_the_next_ladder",
         "pinned_backoff_resets_after_a_clean_drive_off",
+        # A blocked turn backs up a little first, then tries again once (live: pinned after a CPL stop)
+        "blocked_turn_backs_up_a_little_then_the_retried_turn_succeeds",
+        "blocked_turn_after_a_cpl_stop_still_backs_up_a_little_before_the_retry",
+        "blocked_turn_backs_up_at_most_once_per_turn_and_stops_on_a_stall",
+        # Open doorways through Claude (explore nav plan U6, AE2, AE3, AE7)
+        "doorway_right_third_sets_a_heading_20_deg_right_and_legs_bend_that_way",
+        "doorway_none_leaves_the_steering_unchanged",
+        "doorway_second_ask_waits_the_60_s_interval",
+        "doorway_never_asked_during_a_stop_an_approach_a_meeting_or_an_escape",
+        "doorway_ae7_offline_ask_fails_quietly_and_roaming_continues",
+        "doorway_ae3_floor_edge_at_the_doorway_stops_and_escapes_as_today",
+        "doorway_heading_expires_by_time_or_distance_and_steering_returns_to_openness",
+        "doorway_closed_since_reads_blocked_when_faced_and_is_dropped",
+        "doorway_passed_through_after_a_leg_toward_it_is_forgotten",
+        "doorway_ask_carries_one_roaming_frame_and_notes_carry_numbers_only",
+        "roam_steer_doorway_weights_open_bands_and_turns_to_face_one_out_of_view",
+        "replies_doorway_reads_x_and_rejects_bad_answers",
     )
 
     @classmethod

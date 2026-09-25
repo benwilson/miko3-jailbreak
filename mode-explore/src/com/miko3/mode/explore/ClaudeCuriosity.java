@@ -88,6 +88,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Answer> remembers = new Slot<Answer>();
     private final Slot<Answer> welcomes = new Slot<Answer>();
     private final Slot<WayOut> wayOuts = new Slot<WayOut>();
+    private final Slot<Doorway> doorways = new Slot<Doorway>();
 
     /** The face cut out by the last match(), for remember(); and the id it matched, for touch(). */
     private volatile byte[] meetFace;
@@ -255,6 +256,48 @@ final class ClaudeCuriosity implements CuriosityPort {
         String outcome = r.ok() ? a.status.toString() : r.describe();
         Log.i(TAG, (request.second ? "second " : "") + "way-out request with " + n + " frames: " + outcome + " in "
                 + (System.currentTimeMillis() - t0) + " ms");
+        return a;
+    }
+
+    // ---- open doorways (explore nav plan U6, KTD4) ----
+
+    @Override
+    public void doorway(final byte[] jpeg, final long timeoutMs) {
+        final int g = doorways.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                doorways.finish(g, findDoorway(jpeg, timeoutMs));
+            }
+        }, doorways, g, Doorway.failed());
+    }
+
+    @Override
+    public Doorway doorwayAnswer() {
+        return doorways.poll();
+    }
+
+    @Override
+    public void cancelDoorway() {
+        doorways.cancel();
+    }
+
+    /** The one frame goes only into this request (R15): nothing is kept, written or logged but numbers. */
+    private Doorway findDoorway(byte[] jpeg, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        if (jpeg == null) {
+            return Doorway.failed();
+        }
+        int[] size = jpegSize(jpeg);
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        content.add(ClaudeApi.textBlock(ExplorePrompts.doorwayIntro(size[0], size[1])));
+        content.add(ClaudeApi.jpegBlock(jpeg));
+        content.add(ClaudeApi.textBlock(ExplorePrompts.doorwayAsk()));
+        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.NAV_SYSTEM, content,
+                ExplorePrompts.DOORWAY_SCHEMA, (int) timeoutMs);
+        Doorway a = r.ok() ? ClaudeReplies.doorway(r.json, size[0]) : Doorway.failed();
+        String outcome = r.ok() ? a.status.toString() : r.describe();
+        Log.i(TAG, "doorway request: " + outcome + " in " + (System.currentTimeMillis() - t0) + " ms");
         return a;
     }
 

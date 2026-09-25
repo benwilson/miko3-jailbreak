@@ -243,6 +243,31 @@ public final class ExploreBrainHarness {
         CuriosityPort.WayOut answer(Rig rig, CuriosityPort.WayOutRequest request, int nth);
     }
 
+    /** The scripted doorway answers (explore nav plan U6): the nth doorway()'s answer, or null for none ever. */
+    interface DoorwayScript {
+        CuriosityPort.Doorway answer(Rig rig, int nth);
+    }
+
+    /** One doorway ask as the fake Claude saw it: when, in which brain state, and the frame it carried. */
+    static final class DoorAsk {
+        final long t;
+        final String state;
+        final byte[] jpeg;
+        final long timeoutMs;
+
+        DoorAsk(long t, String state, byte[] jpeg, long timeoutMs) {
+            this.t = t;
+            this.state = state;
+            this.jpeg = jpeg;
+            this.timeoutMs = timeoutMs;
+        }
+
+        @Override
+        public String toString() {
+            return "ask@" + t + " " + state;
+        }
+    }
+
     /** One straight drive: when it started, the true heading then, and the counts it moved (back: negative). */
     static final class Drive {
         final long t;
@@ -377,6 +402,15 @@ public final class ExploreBrainHarness {
         final List<Long> wayOutTimeouts = new ArrayList<Long>();
         CuriosityPort.WayOut pendingWayOut;
         long pendingWayOutAt;
+        /** The fake doorway request (explore nav plan U6): null script means every request fails. */
+        DoorwayScript doorways;
+        long doorwayDelayMs = 1000;
+        final List<DoorAsk> doorwayAsks = new ArrayList<DoorAsk>();
+        /** The brain state each doorway answer was handed over in. */
+        final List<String> doorwayAnswerStates = new ArrayList<String>();
+        CuriosityPort.Doorway pendingDoorway;
+        long pendingDoorwayAt;
+        int doorwayCancels;
         /** The true heading at each look's capture time (explore nav plan U5), for aiming checks. */
         final java.util.Map<Long, Double> lookHeadings = new java.util.HashMap<Long, Double>();
         /** Every straight drive, in order; the current one while it runs. */
@@ -387,6 +421,8 @@ public final class ExploreBrainHarness {
         long legStartT;
         /** Reversing moves nothing (a stall during a back-out). */
         boolean backBlocked;
+        /** The yaw unsticks as the nth back move starts (0: never): a little reversing frees the turn. */
+        int unstickAfterBacks;
         /** The true heading when the brain first entered CIRCLE (NaN before). */
         double circleFrom = Double.NaN;
         /** Every brain state seen, and every state seen with the camera open. */
@@ -622,6 +658,15 @@ public final class ExploreBrainHarness {
         public void backTick() {
             if (!moving || !"back".equals(motion)) {
                 startDrive("back");
+                if (unstickAfterBacks > 0 && yaw != null) {
+                    int backs = 0;
+                    for (Drive d : drives) {
+                        backs += d.kind.equals("back") ? 1 : 0;
+                    }
+                    if (backs >= unstickAfterBacks) {
+                        yaw.stuck = false;
+                    }
+                }
             }
             moving = true;
             motion = "back";
@@ -860,6 +905,31 @@ public final class ExploreBrainHarness {
         }
 
         @Override
+        public void doorway(byte[] jpeg, long timeoutMs) {
+            doorwayAsks.add(new DoorAsk(now, brain.state().name(), jpeg, timeoutMs));
+            pendingDoorway = doorways == null ? CuriosityPort.Doorway.failed()
+                    : doorways.answer(this, doorwayAsks.size());
+            pendingDoorwayAt = now + doorwayDelayMs;
+        }
+
+        @Override
+        public CuriosityPort.Doorway doorwayAnswer() {
+            if (pendingDoorway == null || now < pendingDoorwayAt) {
+                return null;
+            }
+            CuriosityPort.Doorway a = pendingDoorway;
+            pendingDoorway = null;
+            doorwayAnswerStates.add(brain.state().name());
+            return a;
+        }
+
+        @Override
+        public void cancelDoorway() {
+            pendingDoorway = null;
+            doorwayCancels++;
+        }
+
+        @Override
         public void cancelWayOut() {
             pendingWayOut = null;
             log.add(new Event(now, "cancel way-out"));
@@ -1040,6 +1110,7 @@ public final class ExploreBrainHarness {
         navScenarios();
         escapeScenarios();
         pinnedScenarios();
+        doorwayScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -4186,11 +4257,17 @@ public final class ExploreBrainHarness {
             int turn = rig.firstAfter("turn", circle);
             int stop = rig.first("stop", turn);
             long took = rig.timeOf(stop) - rig.timeOf(turn);
+            // One short back-up, then the same turn once more; blocked again, the step fails.
+            int back = rig.first("back", stop);
+            int retry = rig.first("turn", stop);
+            int stop2 = rig.first("stop", retry);
+            long took2 = rig.timeOf(stop2) - rig.timeOf(retry);
             Event next = nextState(rig, rig.timeOf(stop) - 1);
-            check(n, circle > 0 && turn > 0 && took >= 1400 && took <= 1700 && next != null
-                            && next.t - rig.timeOf(stop) <= 300 && !next.what.equals("CIRCLE")
+            check(n, circle > 0 && turn > 0 && took >= 1400 && took <= 1700 && back > stop && retry > back
+                            && took2 >= 1400 && took2 <= 1700 && next != null && next.t >= rig.timeOf(stop2)
+                            && next.t - rig.timeOf(stop2) <= 300 && !next.what.equals("CIRCLE")
                             && rig.violations.isEmpty(),
-                    "took=" + took + " next=" + next + " " + rig.tail());
+                    "took=" + took + " took2=" + took2 + " next=" + next + " " + rig.tail());
         });
         scenario("turn_flat_yaw_while_roaming_is_blocked_and_counts_as_wedged", n -> {
             Rig rig = new Rig(escTuning().turnChance(1.0).build(), CLEAR, NOTHING, true);
@@ -4201,13 +4278,18 @@ public final class ExploreBrainHarness {
             int turn = rig.first("turn", 0);
             int stop = rig.first("stop", turn);
             long took = rig.timeOf(stop) - rig.timeOf(turn);
+            // Nothing logged to back out along: a short back-up, the same turn again, then wedged.
+            int back = rig.first("back", stop);
+            int retry = rig.first("turn", stop);
+            int stop2 = rig.first("stop", retry);
             long escape = -1;
             for (Event e : rig.stateLog) {
                 if (escape < 0 && e.t >= rig.timeOf(stop) && ESCAPING.contains(ExploreBrain.State.valueOf(e.what))) {
                     escape = e.t;
                 }
             }
-            check(n, turn >= 0 && took >= 1400 && took <= 1700 && escape >= 0 && escape - rig.timeOf(stop) <= 300
+            check(n, turn >= 0 && took >= 1400 && took <= 1700 && back > stop && retry > back
+                            && escape >= rig.timeOf(stop2) && escape - rig.timeOf(stop2) <= 300
                             && rig.violations.isEmpty(),
                     "took=" + took + " escape@" + escape + " " + rig.tail());
         });
@@ -4295,9 +4377,15 @@ public final class ExploreBrainHarness {
             rig.yaw.stuck = true;
             rig.started();
             runUntil(rig, 30000, r -> entered(r, ExploreBrain.State.CIRCLE, 0) >= 0);
-            check(n, entered(rig, ExploreBrain.State.CIRCLE, 0) > 0 && rig.count("back") == 0
+            // No back-out along a leg: only the short back-ups before retried turns (3 ticks).
+            boolean shortOnly = true;
+            for (Drive d : rig.drives) {
+                shortOnly &= !d.kind.equals("back") || (d.end > 0 && d.end - d.t <= 3 * 250 + 100);
+            }
+            check(n, entered(rig, ExploreBrain.State.CIRCLE, 0) > 0
+                            && drivesIn(rig, "RETRACE", "back", 0, Long.MAX_VALUE).isEmpty() && shortOnly
                             && rig.violations.isEmpty(),
-                    rig.tail());
+                    rig.drives + " " + rig.tail());
         });
         scenario("escape_stall_during_back_out_stops_it", n -> {
             Rig[] h = new Rig[1];
@@ -4320,9 +4408,393 @@ public final class ExploreBrainHarness {
             }
             Drive first = backs.isEmpty() ? null : backs.get(0);
             long took = first == null ? -1 : first.end - first.t;
-            check(n, first != null && took >= 900 && took <= 1500 && Math.abs(first.counts) <= 2 && backs.size() == 1
+            // After it, only the short back-ups before retried turns (3 ticks), one per blocked turn.
+            boolean restShort = true;
+            for (int i = 1; i < backs.size(); i++) {
+                restShort &= backs.get(i).end - backs.get(i).t <= 3 * 250 + 100;
+            }
+            check(n, first != null && first.state.equals("RETRACE") && took >= 900 && took <= 1500
+                            && Math.abs(first.counts) <= 2 && restShort
                             && rig.brain.state() == ExploreBrain.State.CORNERED && rig.violations.isEmpty(),
                     "backs=" + backs + " " + rig.tail());
+        });
+        // ---- a blocked turn backs up a little first, then tries again once (live: pinned after a CPL stop) ----
+        scenario("blocked_turn_backs_up_a_little_then_the_retried_turn_succeeds", n -> {
+            // Nothing logged to back out along: the first move is a turn, and it will not turn.
+            Rig rig = new Rig(escTuning().turnChance(1.0).build(), CLEAR, NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.stuck = true;
+            rig.unstickAfterBacks = 1;
+            rig.started();
+            rig.runUntil(15000);
+            int turn = rig.first("turn", 0);
+            List<Drive> backs = new ArrayList<Drive>();
+            for (Drive d : rig.drives) {
+                if (d.kind.equals("back")) {
+                    backs.add(d);
+                }
+            }
+            Drive back = backs.isEmpty() ? null : backs.get(0);
+            int retry = back == null || back.end < 0 ? -1 : rig.firstAfter("turn", back.end);
+            boolean turned = false;
+            for (double r : rig.yaw.turnResults) {
+                turned |= Math.abs(r) >= 15;
+            }
+            Drive hop = retry < 0 ? null : firstDrive(rig, "HOP", "hop", rig.timeOf(retry));
+            boolean escaped = false;
+            for (ExploreBrain.State st : rig.statesSeen) {
+                escaped |= ESCAPING.contains(st);
+            }
+            check(n, turn >= 0 && back != null && back.state.equals("BACK_OFF") && backs.size() == 1
+                            && back.t - rig.timeOf(turn) >= 1400 && back.counts < 0
+                            && back.end - back.t <= 3 * 250 + 100 && retry > 0 && turned && hop != null && !escaped
+                            && rig.violations.isEmpty(),
+                    "backs=" + backs + " results=" + rig.yaw.turnResults + " " + rig.tail());
+        });
+        scenario("blocked_turn_after_a_cpl_stop_still_backs_up_a_little_before_the_retry", n -> {
+            // The controller refuses forward mid-leg (CPL): startle, the usual back-off, then the
+            // escape turn will not turn; a short back-up (the second back move) frees it.
+            Rig rig = new Rig(escTuning().build(), t -> t >= 1600 && t < 1800 ? cpl2(t) : clear(t), NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.stuck = true;
+            rig.unstickAfterBacks = 2;
+            rig.started();
+            rig.runUntil(15000);
+            List<Drive> backs = new ArrayList<Drive>();
+            for (Drive d : rig.drives) {
+                if (d.kind.equals("back")) {
+                    backs.add(d);
+                }
+            }
+            Drive second = backs.size() < 2 ? null : backs.get(1);
+            int blocked = second == null ? -1 : rig.firstAfter("turn", backs.get(0).end);
+            int retry = second == null || second.end < 0 ? -1 : rig.firstAfter("turn", second.end);
+            boolean turned = false;
+            for (double r : rig.yaw.turnResults) {
+                turned |= Math.abs(r) >= 30;
+            }
+            boolean escaped = false;
+            for (ExploreBrain.State st : rig.statesSeen) {
+                escaped |= ESCAPING.contains(st);
+            }
+            check(n, rig.count("startle") == 1 && second != null && blocked > 0
+                            && second.t - rig.timeOf(blocked) >= 1400 && second.state.equals("BACK_OFF")
+                            && retry > 0 && turned && !escaped && rig.violations.isEmpty(),
+                    "backs=" + backs + " results=" + rig.yaw.turnResults + " " + rig.tail());
+        });
+        scenario("blocked_turn_backs_up_at_most_once_per_turn_and_stops_on_a_stall", n -> {
+            // Pinned: turns and reversing go nowhere. A long back-up (12 ticks, 3 s) stops on the
+            // stall watch (~1 s here); the retried turn is still blocked, so he is wedged, and each
+            // blocked turn of the escape's circle backs up once too.
+            Rig rig = new Rig(escTuning().turnChance(1.0).blockedTurnBackTicks(12).build(), CLEAR, NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.stuck = true;
+            rig.backBlocked = true;
+            rig.started();
+            runUntil(rig, 60000, r -> entered(r, ExploreBrain.State.CIRCLE, 0) >= 0
+                    && r.brain.state() != ExploreBrain.State.CIRCLE);
+            long retrace = entered(rig, ExploreBrain.State.RETRACE, 0);
+            long circle = entered(rig, ExploreBrain.State.CIRCLE, 0);
+            List<Drive> roam = drivesIn(rig, "BACK_OFF", "back", 0, retrace < 0 ? Long.MAX_VALUE : retrace);
+            List<Drive> inCircle = drivesIn(rig, "CIRCLE", "back", 0, Long.MAX_VALUE);
+            boolean stalled = true;
+            for (Drive d : roam) {
+                stalled &= d.end > 0 && d.end - d.t >= 900 && d.end - d.t < 12 * 250 && Math.abs(d.counts) <= 2;
+            }
+            for (Drive d : inCircle) {
+                stalled &= d.end > 0 && d.end - d.t >= 900 && d.end - d.t < 12 * 250 && Math.abs(d.counts) <= 2;
+            }
+            check(n, retrace > 0 && circle > retrace && roam.size() == 1 && inCircle.size() == 1 && stalled
+                            && rig.violations.isEmpty(),
+                    "roam=" + roam + " circle=" + inCircle + " " + rig.tail());
+        });
+    }
+
+    // ---- open doorways through Claude (explore nav plan U6, AE2, AE3, AE7) ----
+    //
+    // Continuous roaming with the gyro: the camera opens at 300, looks arrive every
+    // 500 ms from 1000, the first pause ends at 1300 and legs are 8 ticks (2 s). The
+    // first doorway ask goes with the first fresh look (~1000) and answers 1 s later.
+
+    private static ExploreTuning.Builder doorTuning() {
+        return navTuning().gyro(robotGyro());
+    }
+
+    private static Rig doorRig(ExploreTuning.Builder b, Feed feed, OpenView view, DoorwayScript script) {
+        Rig rig = new Rig(b.build(), feed, NOTHING, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+        rig.openView = view;
+        rig.doorways = script;
+        rig.simWheels = true;
+        return rig;
+    }
+
+    private static final OpenView ALL_OPEN = (r, t) -> prof(0.9f, 0.9f, 0.9f, 0.9f);
+
+    /** When the brain first noted something containing part (notes are "t message"), else -1. */
+    private static long notedAt(List<String> notes, String part) {
+        for (String x : notes) {
+            if (x.contains(part)) {
+                return Long.parseLong(x.substring(0, x.indexOf(' ')));
+            }
+        }
+        return -1;
+    }
+
+    private static List<String> traced(Rig rig) {
+        List<String> notes = new ArrayList<String>();
+        rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+        return notes;
+    }
+
+    /** Only roaming states, never a stop, a meeting or an escape. */
+    private static boolean roamingOnly(List<String> states) {
+        for (String st : states) {
+            if (!st.equals("PAUSE") && !st.equals("HOP") && !st.equals("LOOK") && !st.equals("TURN")
+                    && !st.equals("STARTLE") && !st.equals("BACK_OFF")) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void doorwayScenarios() {
+        scenario("doorway_right_third_sets_a_heading_20_deg_right_and_legs_bend_that_way", n -> {
+            Rig rig = doorRig(doorTuning(), CLEAR, ALL_OPEN, (r, k) -> CuriosityPort.Doorway.door(0.667f));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(2100);
+            DoorAsk ask = rig.doorwayAsks.isEmpty() ? null : rig.doorwayAsks.get(0);
+            Double at = ask == null ? null : rig.lookHeadings.get(captured(new CuriosityPort.Frame(0, ask.jpeg)));
+            double door = rig.brain.doorwayHeading();
+            rig.runUntil(8000);
+            int turn = rig.firstAfter("turn", 2100);
+            double r = rig.yaw.turnResults.isEmpty() ? 0 : rig.yaw.turnResults.get(0);
+            check(n, ask != null && at != null && near(door, Heading.wrap(at - 20), 3)
+                            && rig.what(turn).equals("turn RIGHT") && Math.abs(-r - 18.75) <= 6
+                            && notedAt(notes, "open doorway") >= 0 && rig.violations.isEmpty(),
+                    "ask=" + ask + " at=" + at + " door=" + f1(door) + " turn=" + f1(r) + " " + rig.tail());
+        });
+        scenario("doorway_none_leaves_the_steering_unchanged", n -> {
+            Rig rig = doorRig(doorTuning(), CLEAR, ALL_OPEN, (r, k) -> CuriosityPort.Doorway.none());
+            rig.started();
+            rig.runUntil(12000);
+            check(n, rig.doorwayAsks.size() == 1 && rig.doorwayAnswerStates.size() == 1
+                            && Double.isNaN(rig.brain.doorwayHeading()) && rig.count("turn LEFT") == 0
+                            && rig.count("turn RIGHT") == 0 && legs(rig).size() >= 3 && rig.violations.isEmpty(),
+                    "asks=" + rig.doorwayAsks + " legs=" + legs(rig) + " " + rig.tail());
+        });
+        scenario("doorway_second_ask_waits_the_60_s_interval", n -> {
+            Rig rig = doorRig(doorTuning(), CLEAR, ALL_OPEN, (r, k) -> CuriosityPort.Doorway.none());
+            rig.started();
+            rig.runUntil(130000);
+            List<DoorAsk> asks = rig.doorwayAsks;
+            boolean spaced = asks.size() == 3;
+            for (int i = 1; spaced && i < asks.size(); i++) {
+                long gap = asks.get(i).t - asks.get(i - 1).t;
+                // The interval restarts when the answer comes (1 s after the ask).
+                spaced = gap >= 61000 && gap <= 64000;
+            }
+            check(n, spaced && rig.violations.isEmpty(), "asks=" + asks);
+        });
+        scenario("doorway_never_asked_during_a_stop_an_approach_a_meeting_or_an_escape", n -> {
+            // Asks due every 2 s: none goes out, or is answered, outside roaming.
+            Rig meet = meetRig(claudeTuning().gyro(robotGyro()).doorwayAsk(2000, 15000));
+            meet.people.match = (r, k) -> STRANGER;
+            meet.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            meet.doorways = (r, k) -> CuriosityPort.Doorway.none();
+            meet.doorwayDelayMs = 1500;
+            meet.started();
+            meet.runUntil(30000);
+            // A plant Claude can't be asked about: the detector's pick is approached.
+            Rig near = new Rig(curious().gyro(robotGyro()).doorwayAsk(2000, 15000).build(), CLEAR, PLANT, true,
+                    (r, req, k) -> CuriosityPort.Answer.failed());
+            near.doorways = (r, k) -> CuriosityPort.Doorway.none();
+            near.doorwayDelayMs = 1500;
+            near.started();
+            near.runUntil(30000);
+            Rig[] h = new Rig[1];
+            Rig esc = escRig(escTuning().escapeRetrace(0, 10).doorwayAsk(2000, 15000), h, bumps(h, 3),
+                    (r, req, k) -> CuriosityPort.WayOut.way(3, 0f));
+            esc.doorways = (r, k) -> CuriosityPort.Doorway.none();
+            esc.doorwayDelayMs = 1500;
+            esc.started();
+            runUntil(esc, 60000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null);
+            esc.runUntil(esc.now + 5000);
+            List<String> sent = new ArrayList<String>();
+            for (DoorAsk a : meet.doorwayAsks) {
+                sent.add(a.state);
+            }
+            for (DoorAsk a : esc.doorwayAsks) {
+                sent.add(a.state);
+            }
+            for (DoorAsk a : near.doorwayAsks) {
+                sent.add(a.state);
+            }
+            boolean onlyPauseOrHop = true;
+            for (String st : sent) {
+                onlyPauseOrHop &= st.equals("PAUSE") || st.equals("HOP");
+            }
+            check(n, meet.statesSeen.contains(ExploreBrain.State.MEET) && near.statesSeen.contains(ExploreBrain.State.APPROACH)
+                            && near.doorwayAsks.size() >= 2 && roamingOnly(near.doorwayAnswerStates)
+                            && near.violations.isEmpty()
+                            && esc.statesSeen.contains(ExploreBrain.State.CIRCLE) && meet.doorwayAsks.size() >= 2
+                            && esc.doorwayAsks.size() >= 1 && onlyPauseOrHop
+                            && roamingOnly(meet.doorwayAnswerStates) && roamingOnly(esc.doorwayAnswerStates)
+                            && meet.violations.isEmpty() && esc.violations.isEmpty(),
+                    "sent=" + sent + " answered=" + meet.doorwayAnswerStates + esc.doorwayAnswerStates + " meet="
+                            + meet.statesSeen + " esc=" + esc.statesSeen + " near=" + near.statesSeen + " "
+                            + near.doorwayAsks.size() + " " + meet.violations + esc.violations);
+        });
+        scenario("doorway_ae7_offline_ask_fails_quietly_and_roaming_continues", n -> {
+            // Set up but unreachable: every ask fails; and not set up at all: none is sent.
+            Rig rig = doorRig(doorTuning(), CLEAR, ALL_OPEN, null);
+            rig.started();
+            rig.runUntil(70000);
+            Rig none = new Rig(doorTuning().build(), CLEAR, NOTHING, true);
+            none.openView = ALL_OPEN;
+            none.started();
+            none.runUntil(20000);
+            check(n, rig.doorwayAsks.size() == 2 && rig.doorwayAsks.get(1).t - rig.doorwayAsks.get(0).t >= 61000
+                            && Double.isNaN(rig.brain.doorwayHeading()) && rig.count("eyes THINKING") == 0
+                            && rig.countPrefix("hop", 60000, 70000) > 0 && none.doorwayAsks.isEmpty()
+                            && none.countPrefix("hop", 10000, 20000) > 0 && rig.violations.isEmpty(),
+                    "asks=" + rig.doorwayAsks + " " + rig.tail());
+        });
+        scenario("doorway_ae3_floor_edge_at_the_doorway_stops_and_escapes_as_today", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = doorRig(doorTuning(), t -> {
+                Rig r = h[0];
+                boolean at = r != null && !Double.isNaN(r.brain.doorwayHeading())
+                        && r.brain.state() == ExploreBrain.State.HOP && r.moving && r.count("startle") == 0
+                        && t - r.legStartT >= 500;
+                return at ? edgeAhead(t) : clear(t);
+            }, ALL_OPEN, (r, k) -> CuriosityPort.Doorway.door(0f));
+            h[0] = rig;
+            rig.started();
+            rig.runUntil(12000);
+            int startle = rig.first("startle", 0);
+            long t = rig.timeOf(startle);
+            int stop = rig.firstAfter("stop", t - 1);
+            int back = rig.firstAfter("back", t);
+            int turn = rig.firstAfter("turn", t);
+            check(n, startle >= 0 && rig.timeOf(stop) == t && rig.floorClearFalseAt >= t && back > startle
+                            && turn > back && rig.violations.isEmpty(),
+                    "startle@" + t + " " + rig.tail());
+        });
+        scenario("doorway_heading_expires_by_time_or_distance_and_steering_returns_to_openness", n -> {
+            // Middling everywhere (never open enough to go through): one bend toward the
+            // doorway, then straight legs; after it expires, no bend toward where it was.
+            OpenView middling = (r, t) -> prof(0.9f, 0.5f, 0.5f, 0.5f);
+            Rig timed = doorRig(doorTuning().doorwayExpire(8000, 1000000), CLEAR, middling,
+                    (r, k) -> CuriosityPort.Doorway.door(0.667f));
+            List<String> tNotes = traced(timed);
+            timed.started();
+            timed.runUntil(20000);
+            Rig driven = doorRig(doorTuning().doorwayExpire(1000000, 200), CLEAR, middling,
+                    (r, k) -> CuriosityPort.Doorway.door(0.667f));
+            List<String> dNotes = traced(driven);
+            driven.started();
+            driven.runUntil(20000);
+            long te = notedAt(tNotes, "doorway heading expired");
+            long de = notedAt(dNotes, "doorway heading expired");
+            check(n, te >= 10000 && te <= 10600 && Double.isNaN(timed.brain.doorwayHeading())
+                            && timed.countPrefix("turn", 0, te) == 1 && timed.countPrefix("turn", te, 20001) == 0
+                            && de > 2000 && de < 12000 && Double.isNaN(driven.brain.doorwayHeading())
+                            && driven.countPrefix("turn", de, 20001) == 0
+                            && timed.violations.isEmpty() && driven.violations.isEmpty(),
+                    "timed@" + te + " driven@" + de + " " + tNotes + " " + timed.tail());
+        });
+        scenario("doorway_closed_since_reads_blocked_when_faced_and_is_dropped", n -> {
+            // Answered straight ahead; by the next decision the way ahead reads blocked.
+            Rig rig = doorRig(doorTuning(), CLEAR,
+                    (r, t) -> r.doorwayAnswerStates.isEmpty() ? prof(0.9f, 0.9f, 0.9f, 0.9f)
+                            : prof(0.9f, 0.9f, 0.1f, 0.9f),
+                    (r, k) -> CuriosityPort.Doorway.door(0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(6000);
+            long set = notedAt(notes, "open doorway");
+            long dropped = notedAt(notes, "reads blocked");
+            check(n, set > 0 && dropped > set && dropped <= set + 3500 && Double.isNaN(rig.brain.doorwayHeading())
+                            && notedAt(notes, "expired") < 0 && rig.violations.isEmpty(),
+                    "set@" + set + " dropped@" + dropped + " " + notes);
+        });
+        scenario("doorway_passed_through_after_a_leg_toward_it_is_forgotten", n -> {
+            Rig rig = doorRig(doorTuning(), CLEAR, ALL_OPEN, (r, k) -> CuriosityPort.Doorway.door(0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(9000);
+            long set = notedAt(notes, "open doorway");
+            long through = notedAt(notes, "through the doorway");
+            // Set during the first leg (1300-3300); the next leg (4300-6300) goes through.
+            check(n, set > 0 && through >= 6300 && through <= 6400 && Double.isNaN(rig.brain.doorwayHeading())
+                            && rig.violations.isEmpty(),
+                    "set@" + set + " through@" + through + " " + notes);
+        });
+        scenario("doorway_ask_carries_one_roaming_frame_and_notes_carry_numbers_only", n -> {
+            Rig rig = doorRig(doorTuning(), CLEAR, ALL_OPEN, (r, k) -> CuriosityPort.Doorway.door(0.667f));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(8000);
+            DoorAsk ask = rig.doorwayAsks.isEmpty() ? null : rig.doorwayAsks.get(0);
+            long cap = ask == null ? -1 : captured(new CuriosityPort.Frame(0, ask.jpeg));
+            boolean numbersOnly = true;
+            for (String x : notes) {
+                numbersOnly &= !x.contains("jpeg") && !x.contains("bins") && !x.contains("confidence");
+            }
+            check(n, ask != null && cap >= rig.openedAt && rig.lookHeadings.containsKey(cap) && ask.t - cap <= 3000
+                            && ask.timeoutMs == rig.tuning.doorwayAskTimeoutMs && numbersOnly
+                            && notedAt(notes, "asking Claude for an open doorway") >= 0 && rig.violations.isEmpty(),
+                    "ask=" + ask + " cap=" + cap + " notes=" + notes);
+        });
+        scenario("roam_steer_doorway_weights_open_bands_and_turns_to_face_one_out_of_view", n -> {
+            RoamSteer steer = new RoamSteer(doorTuning().build());
+            Openness.Profile open = prof(0.9f, 0.9f, 0.9f, 0.9f);
+            RoamSteer.Plan plain = steer.plan(open);
+            RoamSteer.Plan right = steer.plan(open, -20);
+            RoamSteer.Plan behind = steer.plan(open, 90);
+            // The doorway's band reads blocked: the steer never bends into it.
+            Openness.Profile closed = prof(0.9f, 0.9f, 0.9f, 0.1f);
+            RoamSteer.Plan intoClosed = steer.plan(closed, -20);
+            boolean blockedFaced = steer.doorwayReadsBlocked(prof(0.9f, 0.9f, 0.1f, 0.9f), 5);
+            boolean openFaced = steer.doorwayReadsBlocked(open, 5);
+            boolean notFaced = steer.doorwayReadsBlocked(prof(0.9f, 0.9f, 0.1f, 0.9f), 25);
+            check(n, plain.side == RoamSteer.STRAIGHT && !plain.towardDoorway
+                            && right.side == RoamSteer.RIGHT && Math.abs(right.bendDeg - 18.75) < 0.01 && right.towardDoorway
+                            && !right.turnOnly && behind.side == RoamSteer.LEFT && behind.turnOnly
+                            && Math.abs(behind.bendDeg - 90) < 0.01
+                            && intoClosed.side != RoamSteer.RIGHT && !intoClosed.towardDoorway
+                            && blockedFaced && !openFaced && !notFaced,
+                    "plain=" + plain + " right=" + right + " behind=" + behind + " intoClosed=" + intoClosed);
+        });
+        scenario("replies_doorway_reads_x_and_rejects_bad_answers", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("open_doorway", Boolean.TRUE);
+            json.put("x", 533L);
+            CuriosityPort.Doorway ok = ClaudeReplies.doorway(json, 640);
+            json.put("x", 0.5);
+            CuriosityPort.Doorway fraction = ClaudeReplies.doorway(json, 640);
+            json.put("x", 700L);
+            CuriosityPort.Doorway wide = ClaudeReplies.doorway(json, 640);
+            json.put("x", -3L);
+            CuriosityPort.Doorway negative = ClaudeReplies.doorway(json, 640);
+            json.put("x", "533");
+            CuriosityPort.Doorway text = ClaudeReplies.doorway(json, 640);
+            json.remove("x");
+            CuriosityPort.Doorway noX = ClaudeReplies.doorway(json, 640);
+            json.put("open_doorway", Boolean.FALSE);
+            CuriosityPort.Doorway none = ClaudeReplies.doorway(json, 640);
+            json.put("open_doorway", "yes");
+            CuriosityPort.Doorway odd = ClaudeReplies.doorway(json, 640);
+            check(n, ok.status == CuriosityPort.Doorway.Status.DOOR && Math.abs(ok.x - 0.666f) < 0.01f
+                            && fraction.status == CuriosityPort.Doorway.Status.DOOR && Math.abs(fraction.x) < 0.01f
+                            && wide.status == CuriosityPort.Doorway.Status.FAILED
+                            && negative.status == CuriosityPort.Doorway.Status.FAILED
+                            && text.status == CuriosityPort.Doorway.Status.FAILED
+                            && noX.status == CuriosityPort.Doorway.Status.FAILED
+                            && none.status == CuriosityPort.Doorway.Status.NONE
+                            && odd.status == CuriosityPort.Doorway.Status.FAILED,
+                    ok + " " + fraction + " " + wide + " " + negative + " " + text + " " + noX + " " + none + " " + odd);
         });
     }
 }

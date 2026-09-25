@@ -160,7 +160,19 @@ import java.util.Set;
  * one starts. Turns in an escape ignore hazards (turning in place is how he gets
  * out); a hazard or stall while driving forward stops at once, backs off
  * backTicks, and moves on. All failing ends in CORNERED as before. Uncalibrated,
- * every wedge is today's: the cornered cap and the failed-sweep count.
+ * every wedge is today's: the cornered cap and the failed-sweep count. A blocked
+ * measured turn with no leg to back out along first backs up blockedTurnBackTicks
+ * (stopped by a stall, not logged as a leg) and tries the same turn once more.
+ *
+ * Open doorways (explore nav plan U6, R7, R8, KTD4): while he roams (PAUSE or HOP,
+ * camera open, heading usable, Claude set up) one fresh roaming frame goes to
+ * Claude in the background at most every doorwayAskMs, never in a stop, a meeting
+ * or an escape (an ask still running when one starts is dropped). An open doorway's
+ * position plus the frame's heading is remembered; RoamSteer weights legs toward it
+ * until he has driven a full leg toward it with the way reading open, it expires
+ * (doorwayExpireMs, doorwayExpireCounts), a look facing it reads blocked (closed
+ * since), or he is wedged. Floor hazards, stalls and CPL stop him as always (AE3);
+ * offline the ask fails quietly (AE7). Notes carry numbers only (R15).
  *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
@@ -570,6 +582,21 @@ final class ExploreBrain {
     private final List<CuriosityPort.Frame> escAsked = new ArrayList<CuriosityPort.Frame>();
     private final List<Double> escAskedHeadings = new ArrayList<Double>();
     private boolean wayOutAsking;
+
+    // ---- open doorways (explore nav plan U6) ----
+    /** An ask is out: sent at doorwayAskAt, for a frame taken facing doorwayAskFacing. */
+    private boolean doorwayAsking;
+    private long doorwayAskAt;
+    private double doorwayAskFacing;
+    /** The next ask may go at this time (the interval restarts when an ask ends). */
+    private long doorwayNextAskAt;
+    /** The remembered doorway's heading (NaN: none), when it was set and the forward counts then. */
+    private double doorway = Double.NaN;
+    private long doorwaySetAt;
+    private long doorwaySetCounts;
+    /** The leg under way heads for the doorway with the way reading open: driven in full, he is through. */
+    private boolean doorwayLeg;
+
     /** The newest reading, where a drive's counts start from. */
     private SensorReading lastReading;
 
@@ -601,6 +628,11 @@ final class ExploreBrain {
     /** The heading tracker, for the navigation that builds on it (explore nav plan U2, U5). */
     Heading heading() {
         return compass;
+    }
+
+    /** The remembered open doorway's heading, NaN for none (explore nav plan U6), for tests and logs. */
+    double doorwayHeading() {
+        return doorway;
     }
 
     void setTrace(Trace trace) {
@@ -667,6 +699,7 @@ final class ExploreBrain {
         motor.stop();
         cancelAsk();
         cancelWayOut();
+        cancelDoorway(clock.nowMs(), null);
         planner.reset();
         state = State.STOPPED;
         syncCamera();
@@ -743,6 +776,7 @@ final class ExploreBrain {
         }
         boolean hazard = s == HazardClassifier.Status.HAZARD;
         watchLooks(now);
+        doorwayStep(now);
         switch (state) {
             case PAUSE:
                 if (lookForLeg) {
@@ -799,11 +833,16 @@ final class ExploreBrain {
                     compass.legStalled(now - tuning.stallWindowMs);
                     hazardInMotion(now, null);
                 } else if (now >= phaseUntil) {
+                    if (doorwayLeg) {
+                        note("through the doorway at " + Math.round(doorway) + " deg");
+                        forgetDoorway();
+                    }
                     legDriven(now);
                 } else if (blockedAheadInLeg()) {
                     // He never stops for the camera alone (KTD9): the leg just ends here,
                     // like a short one, and the next decision bends away.
                     note("camera reads the way ahead blocked: ending the leg early");
+                    doorwayLeg = false;
                     legDriven(now);
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
@@ -821,8 +860,18 @@ final class ExploreBrain {
                 }
                 break;
             case BACK_OFF:
-                // Blind (nothing watches behind him): bounded by time only, hazards ignored.
-                if (now >= phaseUntil) {
+                // Blind (nothing watches behind him): bounded by time, hazards ignored; the
+                // short back-up before a retried turn also stops on a stall.
+                if (backForTurn && now < phaseUntil && wheelsStalled(now)) {
+                    note("wheels stalled backing up");
+                    phaseUntil = now;
+                }
+                if (now >= phaseUntil && backForTurn) {
+                    stopMotors();
+                    backForTurn = false;
+                    enterLook(now, retryDir, retryEscape, retryMs, retryDeg);
+                    turnRetrying = true;
+                } else if (now >= phaseUntil) {
                     stopMotors();
                     enterLook(now, escapeDir, true, escapeTurnMs(), escapeTurnDeg());
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
@@ -978,9 +1027,21 @@ final class ExploreBrain {
      * is confident, else as before the camera roamed: a random turn or a hop.
      */
     private void chooseLeg(long now, Look look) {
-        RoamSteer.Plan plan = look == null ? null : steer.plan(look.openness);
+        double door = doorwayBearing(now);
+        if (look != null && steer.doorwayReadsBlocked(look.openness, door)) {
+            note("the doorway at " + Math.round(doorway) + " deg reads blocked now: forgotten");
+            forgetDoorway();
+            door = Double.NaN;
+        }
+        RoamSteer.Plan plan = look == null ? null : steer.plan(look.openness, door);
+        doorwayLeg = false;
         if (plan != null) {
             note("steer: " + plan);
+            if (plan.towardDoorway && !plan.turnOnly && !plan.shortLeg && plan.open >= tuning.steerOpen) {
+                double after = compass.degrees() + (plan.side == RoamSteer.LEFT ? plan.bendDeg
+                        : plan.side == RoamSteer.RIGHT ? -plan.bendDeg : 0);
+                doorwayLeg = Math.abs(Heading.delta(Heading.wrap(after), doorway)) <= tuning.doorwayFacingDeg;
+            }
             lastHazardSide = null;
             plannedTicks = steer.legTicks(plan, drawTicks());
             if (plan.side == RoamSteer.STRAIGHT) {
@@ -1014,6 +1075,7 @@ final class ExploreBrain {
         note("hazard at start: " + h);
         leaveStopForHazard();
         hopNext = false;
+        doorwayLeg = false;
         plannedTicks = -1;
         lastHazardSide = h == null ? null : h.side;
         boolean capped = recordHazard(now);
@@ -1035,6 +1097,7 @@ final class ExploreBrain {
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
         stopMotors();
         leaveStopForHazard();
+        doorwayLeg = false;
         stalledNow = h == null && state == State.HOP && stallStreak > 0;
         hopNext = false;
         plannedTicks = -1;
@@ -1188,7 +1251,7 @@ final class ExploreBrain {
      * while hopping: turns and back-offs move the wheels differently.
      */
     private void trackWheels(SensorReading r) {
-        if (!(state == State.HOP || escapeDriving()) || !r.hasWheels()) {
+        if (!(state == State.HOP || escapeDriving() || (state == State.BACK_OFF && backForTurn)) || !r.hasWheels()) {
             return;
         }
         if (lastWheels != null) {
@@ -2430,8 +2493,38 @@ final class ExploreBrain {
         stopMotors();
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
                 + " deg in " + (now - turnStartedAt) + " ms");
+        if (state == State.TURN && !turnRetrying && tuning.blockedTurnBackTicks > 0
+                && !planner.hasLegToBackAlong(compass.legs(), compass.degrees())) {
+            // Live, pinned after a CPL stop with no leg to back out along (the ladder backs
+            // out along one when there is): a little room behind him is often all a turn needs.
+            retryDir = heading;
+            retryEscape = escape;
+            retryMs = turnMs;
+            retryDeg = turnDeg;
+            startShortBack(now);
+            return;
+        }
+        turnRetrying = false;
         leaveStopForHazard();
         wedged(now, "a turn that would not turn", true);
+    }
+
+    /** The short blind back-up before a blocked roaming turn is tried again (BACK_OFF, backForTurn). */
+    private void startShortBack(long now) {
+        note("backing up a little, then trying the turn again");
+        int ticks = tuning.blockedTurnBackTicks;
+        state = State.BACK_OFF;
+        backForTurn = true;
+        ticksLeft = ticks - 1;
+        nextTickAt = now + tuning.backTickMs;
+        phaseUntil = now + ticks * tuning.backTickMs;
+        hopStartedAt = now;
+        lastWheels = null;
+        wheelMoves.clear();
+        moving = true;
+        motor.backTick();
+        // Not logged as a leg: a retrace of it would only drive him back into the spot
+        // it freed him from (and call that a clean escape).
     }
 
     /** Today's triggers, counted lower once the heading can steer an escape (wedgeHazards, wedgeStalls). */
@@ -2445,6 +2538,10 @@ final class ExploreBrain {
      */
     private void wedged(long now, String why, boolean turnBlocked) {
         stopMotors();
+        if (!Double.isNaN(doorway)) {
+            note("wedged: the doorway at " + Math.round(doorway) + " deg is forgotten");
+            forgetDoorway();
+        }
         hopNext = false;
         plannedTicks = -1;
         lookForLeg = false;
@@ -2487,6 +2584,7 @@ final class ExploreBrain {
         escapeFailures.clear();
         planner.begin(now, compass.degrees());
         escBackOutFirst = turnBlocked;
+        escShortBack = false;
         circleDir = escapeSide != null ? escapeSide : Direction.LEFT;
         escapePhase(now);
     }
@@ -2643,11 +2741,15 @@ final class ExploreBrain {
             case BACK_READY:
                 if (fresh) {
                     startEscapeMotion(now);
-                    escUntil = now + (escGoal > 0 ? tuning.backOutMaxMs : tuning.backTicks * tuning.backTickMs);
+                    escUntil = now + (escShortBack ? tuning.blockedTurnBackTicks * tuning.backTickMs
+                            : escGoal > 0 ? tuning.backOutMaxMs : tuning.backTicks * tuning.backTickMs);
                     nextTickAt = now + tuning.backTickMs;
                     esc = Esc.BACKING;
                     motor.backTick();
-                    compass.startLeg(true, now);
+                    if (!escShortBack) {
+                        // The short back-up is not a leg (see startShortBack).
+                        compass.startLeg(true, now);
+                    }
                 }
                 break;
             case BACKING:
@@ -2756,10 +2858,14 @@ final class ExploreBrain {
     /** Backing out (goal counts, bounded by backOutMaxMs) or a hazard's timed back-off (blind either way). */
     private void escBackStep(long now) {
         boolean reached = escGoal > 0 && escMoved >= escGoal;
-        boolean stalled = escGoal > 0 && wheelsStalled(now);
+        boolean stalled = (escGoal > 0 || escShortBack) && wheelsStalled(now);
         if (reached || stalled || now >= escUntil) {
             stopMotors();
-            if (escGoal > 0) {
+            if (escShortBack) {
+                escShortBack = false;
+                escGoal = escGoalAfterRetry;
+                note((stalled ? "back-up stalled after " : "backed up ") + escMoved + " counts");
+            } else if (escGoal > 0) {
                 planner.addRetraced(escMoved);
                 if (stalled && !reached) {
                     planner.backOutStalled();
@@ -2866,12 +2972,38 @@ final class ExploreBrain {
                 }
                 return;
             }
+            if (tuning.blockedTurnBackTicks > 0) {
+                // No leg to back out along: a short blind back-up, then the same turn once more.
+                note("backing up a little, then trying the turn again");
+                escThenAfterRetry = keep;
+                escGoalAfterRetry = escGoal;
+                escGoal = 0;
+                escShortBack = true;
+                escThen = EscThen.RETRY_TURN;
+                esc = Esc.BACK_READY;
+                return;
+            }
         }
         escFailed(now, "a turn that would not turn");
     }
 
     /** What follows a turn retried after a back-out. */
     private EscThen escThenAfterRetry;
+    /** The escape's back-out is the short blind back-up before a retried turn (blockedTurnBackTicks). */
+    private boolean escShortBack;
+    /** The retried turn's drive goal (a retrace leg's counts), kept across the short back-up. */
+    private long escGoalAfterRetry;
+    /**
+     * A roaming turn that would not turn: BACK_OFF is the short back-up before it is
+     * tried again (backForTurn), with the turn to retry; turnRetrying marks the retry,
+     * which, blocked too, is wedged as before.
+     */
+    private boolean backForTurn;
+    private boolean turnRetrying;
+    private Direction retryDir;
+    private boolean retryEscape;
+    private long retryMs;
+    private double retryDeg;
 
     private void escFailed(long now, String why) {
         stopMotors();
@@ -2973,6 +3105,7 @@ final class ExploreBrain {
                 && (escGoal > 0 || !escDroveNowhere(now));
         stopMotors();
         cancelWayOut();
+        escShortBack = false;
         if (clear && (p == EscapePlanner.Phase.RETRACE || p == EscapePlanner.Phase.DRIVE_OFF
                 || p == EscapePlanner.Phase.SECOND_DRIVE_OFF)) {
             if (p == EscapePlanner.Phase.RETRACE) {
@@ -3015,6 +3148,100 @@ final class ExploreBrain {
         }
     }
 
+    // ---- open doorways (explore nav plan U6, R7, R8, KTD4) ----
+
+    /**
+     * Each step: an answer to take, an ask to drop (he left roaming) or give up on,
+     * a remembered doorway expiring, and a new ask when one is due.
+     */
+    private void doorwayStep(long now) {
+        if (doorwayAsking) {
+            if (!state.roams() || state.escapes() || state == State.CORNERED) {
+                cancelDoorway(now, "not roaming");
+            } else if (now - doorwayAskAt >= tuning.doorwayAskTimeoutMs) {
+                cancelDoorway(now, "no answer in " + tuning.doorwayAskTimeoutMs + " ms");
+            } else {
+                CuriosityPort.Doorway a = port.doorwayAnswer();
+                if (a != null) {
+                    doorwayAsking = false;
+                    doorwayNextAskAt = now + tuning.doorwayAskMs;
+                    doorwayAnswered(now, a);
+                }
+            }
+        }
+        if (!Double.isNaN(doorway) && (now - doorwaySetAt >= tuning.doorwayExpireMs
+                || forwardCounts - doorwaySetCounts >= tuning.doorwayExpireCounts)) {
+            note("doorway heading expired after " + (now - doorwaySetAt) + " ms, "
+                    + (forwardCounts - doorwaySetCounts) + " counts");
+            forgetDoorway();
+        }
+        if (!doorwayAsking && now >= doorwayNextAskAt) {
+            askDoorway(now);
+        }
+    }
+
+    /**
+     * Only while roaming straight or paused (never a turn, a hazard reaction, a stop,
+     * a meeting or an escape), with a fresh look taken since he last turned: the
+     * heading he faces now is the frame's.
+     */
+    private void askDoorway(long now) {
+        if (!(state == State.PAUSE || state == State.HOP) || lookForLeg || escape || !cameraOpen
+                || !compass.usable(now) || !port.canAsk()) {
+            return;
+        }
+        Look look = roamLook(now);
+        if (look == null || look.jpeg == null) {
+            return;
+        }
+        doorwayAskFacing = compass.degrees();
+        doorwayAskAt = now;
+        doorwayAsking = true;
+        note("asking Claude for an open doorway (facing " + Math.round(doorwayAskFacing) + " deg)");
+        port.doorway(look.jpeg, tuning.doorwayAskTimeoutMs);
+    }
+
+    /** The answer becomes a heading from the frame's (KTD4); none leaves the steering as it was. */
+    private void doorwayAnswered(long now, CuriosityPort.Doorway a) {
+        if (a.status == CuriosityPort.Doorway.Status.DOOR && a.x >= -1f && a.x <= 1f) {
+            doorway = EscapePlanner.aim(doorwayAskFacing, a.x, tuning.cameraHalfFovDeg);
+            doorwaySetAt = now;
+            doorwaySetCounts = forwardCounts;
+            doorwayLeg = false;
+            note("Claude sees an " + a + ": remembered at " + Math.round(doorway) + " deg");
+        } else if (a.status == CuriosityPort.Doorway.Status.NONE) {
+            note("Claude sees no open doorway");
+        } else {
+            note("doorway ask failed: roaming on");
+        }
+    }
+
+    /** Drop the running ask (why null: quietly); the interval restarts from now. */
+    private void cancelDoorway(long now, String why) {
+        if (!doorwayAsking) {
+            return;
+        }
+        doorwayAsking = false;
+        port.cancelDoorway();
+        doorwayNextAskAt = now + tuning.doorwayAskMs;
+        if (why != null) {
+            note("doorway ask dropped: " + why);
+        }
+    }
+
+    /** The remembered doorway's bearing from his facing (left positive), NaN for none or no usable heading. */
+    private double doorwayBearing(long now) {
+        if (Double.isNaN(doorway) || !compass.usable(now)) {
+            return Double.NaN;
+        }
+        return Heading.delta(compass.degrees(), doorway);
+    }
+
+    private void forgetDoorway() {
+        doorway = Double.NaN;
+        doorwayLeg = false;
+    }
+
     // ---- entering states ----
 
     private void enterEyesOnly(String why) {
@@ -3023,6 +3250,10 @@ final class ExploreBrain {
         cancelWayOut();
         planner.reset();
         esc = null;
+        escShortBack = false;
+        backForTurn = false;
+        turnRetrying = false;
+        cancelDoorway(clock.nowMs(), "lease or sensors lost");
         hopNext = false;
         plannedTicks = -1;
         lookForLeg = false;
@@ -3050,6 +3281,7 @@ final class ExploreBrain {
     /** Eyes toward d, then a turn of ms, or deg once measured (0: timed only). */
     private void enterLook(long now, Direction d, boolean escapeTurn, long ms, double deg) {
         state = State.LOOK;
+        turnRetrying = false;
         heading = d;
         escape = escapeTurn;
         turnMs = ms;

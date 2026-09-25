@@ -14,6 +14,11 @@ package com.miko3.mode.explore;
  * The image's left is the robot's left: bin 0 is the frame's left edge, and a
  * band's offset from the centre, times cameraHalfFovDeg, is the bend.
  *
+ * A remembered open doorway (explore nav plan U6), given as its bearing from where
+ * he faces, weights the choice: in view, the open bands nearest it gain up to
+ * doorwayWeight (a blocked band never gains); out of view, the plan is a turn to
+ * face it and look again.
+ *
  * Plain Java (no Android or shared-driver imports), so it runs on the host JVM.
  * Its only state is how many turn-only plans came in a row. Not thread-safe; the
  * brain calls it from its one thread.
@@ -36,8 +41,16 @@ final class RoamSteer {
         final boolean shortLeg;
         /** Share of the drawn leg to drive (1 = all of it), when neither of the above. */
         final float lengthFactor;
+        /** The leg (or the turn) heads for the remembered doorway. */
+        final boolean towardDoorway;
 
         Plan(int side, double bendDeg, float open, boolean turnOnly, boolean shortLeg, float lengthFactor) {
+            this(side, bendDeg, open, turnOnly, shortLeg, lengthFactor, false);
+        }
+
+        Plan(int side, double bendDeg, float open, boolean turnOnly, boolean shortLeg, float lengthFactor,
+             boolean towardDoorway) {
+            this.towardDoorway = towardDoorway;
             this.side = side;
             this.bendDeg = bendDeg;
             this.open = open;
@@ -52,7 +65,7 @@ final class RoamSteer {
             String s = side == LEFT ? "left" : side == RIGHT ? "right" : "straight";
             return String.format(java.util.Locale.US, "%s %.0f deg, open %.2f%s", s, bendDeg, open,
                     turnOnly ? ", turn only" : shortLeg ? ", short leg" : String.format(java.util.Locale.US,
-                            ", leg x%.2f", lengthFactor));
+                            ", leg x%.2f", lengthFactor)) + (towardDoorway ? ", toward the doorway" : "");
         }
     }
 
@@ -70,23 +83,40 @@ final class RoamSteer {
 
     /** The next leg from p, or null when p is missing or not confident (choose as before). */
     Plan plan(Openness.Profile p) {
+        return plan(p, Double.NaN);
+    }
+
+    /**
+     * The next leg from p, weighted toward a remembered doorway doorwayDeg off his
+     * facing (left positive; NaN: none), or null when p is missing or not confident.
+     */
+    Plan plan(Openness.Profile p, double doorwayDeg) {
         if (!confident(p)) {
             return null;
         }
         int n = p.bins.length;
         int w = Math.min(tuning.steerBandBins, n);
         float ahead = aheadOpen(p);
+        boolean door = !Double.isNaN(doorwayDeg);
+        if (door && Math.abs(doorwayDeg) > tuning.cameraHalfFovDeg) {
+            // Out of view: face it, then look again (the next look must read it open).
+            return new Plan(doorwayDeg > 0 ? LEFT : RIGHT, Math.abs(doorwayDeg), ahead, true, false, 0f, true);
+        }
+        double doorX = door ? -doorwayDeg / tuning.cameraHalfFovDeg : 0;
         int best = -1;
         float bestScore = -1f;
+        float bestWeighted = -1f;
         double bestOffset = 0;
         for (int i = 0; i + w <= n; i++) {
             float score = mean(p.bins, i, w);
             double offset = offset(i, w, n);
+            float weighted = score + (door ? doorwayBonus(score, offset, doorX, w, n) : 0f);
             // Ties go to the band nearest straight ahead.
-            if (score > bestScore + 1e-6f || (Math.abs(score - bestScore) <= 1e-6f
+            if (weighted > bestWeighted + 1e-6f || (Math.abs(weighted - bestWeighted) <= 1e-6f
                     && Math.abs(offset) < Math.abs(bestOffset))) {
                 best = i;
                 bestScore = score;
+                bestWeighted = weighted;
                 bestOffset = offset;
             }
         }
@@ -105,20 +135,50 @@ final class RoamSteer {
         int side = STRAIGHT;
         double deg = 0;
         float open = ahead;
-        if (bestScore - ahead >= tuning.steerMinGain) {
+        double aheadOffset = offset((n - w) / 2, w, n);
+        float aheadWeighted = ahead + (door ? doorwayBonus(ahead, aheadOffset, doorX, w, n) : 0f);
+        double goOffset = aheadOffset;
+        if (bestWeighted - aheadWeighted >= tuning.steerMinGain) {
             deg = Math.abs(bestOffset) * tuning.cameraHalfFovDeg;
             if (deg >= tuning.turnToleranceDeg) {
                 side = bestOffset < 0 ? LEFT : RIGHT;
                 open = bestScore;
+                goOffset = bestOffset;
             } else {
                 deg = 0;
             }
         }
+        boolean toward = door && open > tuning.steerBlocked && Math.abs(goOffset - doorX) < 2.0 * w / n;
         if (open <= tuning.steerBlocked) {
             return new Plan(side, deg, open, false, true, 0f);
         }
         float f = (open - tuning.steerBlocked) / Math.max(1e-6f, tuning.steerOpen - tuning.steerBlocked);
-        return new Plan(side, deg, open, false, false, Math.max(0f, Math.min(1f, f)));
+        return new Plan(side, deg, open, false, false, Math.max(0f, Math.min(1f, f)), toward);
+    }
+
+    /**
+     * Facing within doorwayFacingDeg of a remembered doorway (doorwayDeg off his
+     * facing), a confident look reads the band there blocked: it is closed now.
+     */
+    boolean doorwayReadsBlocked(Openness.Profile p, double doorwayDeg) {
+        if (!confident(p) || Double.isNaN(doorwayDeg) || Math.abs(doorwayDeg) > tuning.doorwayFacingDeg) {
+            return false;
+        }
+        int n = p.bins.length;
+        int w = Math.min(tuning.steerBandBins, n);
+        double x = -doorwayDeg / tuning.cameraHalfFovDeg;
+        int start = (int) Math.round((x + 1) / 2 * n - w / 2.0);
+        start = Math.max(0, Math.min(n - w, start));
+        return mean(p.bins, start, w) <= tuning.steerBlocked;
+    }
+
+    /** The doorway's pull on a band: full at its column, none a band's width away or on a blocked band. */
+    private float doorwayBonus(float score, double offset, double doorX, int w, int n) {
+        if (score <= tuning.steerBlocked) {
+            return 0f;
+        }
+        double span = 2.0 * w / n;
+        return (float) (tuning.doorwayWeight * Math.max(0, 1 - Math.abs(offset - doorX) / span));
     }
 
     /** The leg's forward ticks after this plan, given the leg length drawn as before (0: turn only). */

@@ -236,6 +236,23 @@ final class EscapePlanner {
         if (backOutSpent) {
             return 0;
         }
+        long avail = lineCounts(legs, facing);
+        long left = tuning.escapeRetraceCounts - retraced;
+        long counts = Math.min(avail, left);
+        return counts >= tuning.escapeRetraceMinCounts ? counts : 0;
+    }
+
+    /**
+     * Whether the leg log alone (no escape under way) has a leg to back out along,
+     * facing `facing`: a blocked roaming turn then leaves the back-out to the ladder
+     * rather than backing up blind.
+     */
+    boolean hasLegToBackAlong(List<Heading.Leg> legs, double facing) {
+        return Math.min(lineCounts(legs, facing), tuning.escapeRetraceCounts) >= tuning.escapeRetraceMinCounts;
+    }
+
+    /** The net counts along his line, newest leg first, or 0 with no forward leg on it. */
+    private long lineCounts(List<Heading.Leg> legs, double facing) {
         long avail = 0;
         boolean forward = false;
         for (int i = legs.size() - 1; i >= 0; i--) {
@@ -250,9 +267,7 @@ final class EscapePlanner {
                 break;
             }
         }
-        long left = tuning.escapeRetraceCounts - retraced;
-        long counts = forward ? Math.min(avail, left) : 0;
-        return counts >= tuning.escapeRetraceMinCounts ? counts : 0;
+        return forward ? avail : 0;
     }
 
     /** A back-out stalled: the wheels can't move him back either. */

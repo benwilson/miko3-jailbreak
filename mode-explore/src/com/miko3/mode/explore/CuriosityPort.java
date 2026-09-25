@@ -102,6 +102,20 @@ interface CuriosityPort {
     /** Abandon the running wayOut(), if any: its late answer must never be returned. */
     void cancelWayOut();
 
+    // ---- open doorways (explore nav plan U6, KTD4) ----
+
+    /**
+     * Ask whether an open doorway is in this one roaming frame, and where across it.
+     * The frame leaves the robot only inside this request (R15).
+     */
+    void doorway(byte[] jpeg, long timeoutMs);
+
+    /** The answer to the last doorway(), or null while it is running. */
+    Doorway doorwayAnswer();
+
+    /** Abandon the running doorway(), if any: its late answer must never be returned. */
+    void cancelDoorway();
+
     /** No Claude: every stop takes the path it took before U4. */
     CuriosityPort NONE = new CuriosityPort() {
         public boolean canAsk() {
@@ -178,6 +192,16 @@ interface CuriosityPort {
         }
 
         public void cancelWayOut() {
+        }
+
+        public void doorway(byte[] jpeg, long timeoutMs) {
+        }
+
+        public Doorway doorwayAnswer() {
+            return Doorway.failed();
+        }
+
+        public void cancelDoorway() {
         }
     };
 
@@ -429,6 +453,43 @@ interface CuriosityPort {
         public String toString() {
             return status == Status.WAY
                     ? String.format(java.util.Locale.US, "way out in frame %d at x %.2f", frame, x)
+                    : status.toString();
+        }
+    }
+
+    /**
+     * Claude's doorway answer. DOOR carries where across the frame the open doorway
+     * is (x, -1 at the frame's left edge .. 1 at its right); the brain turns it into a
+     * heading at once. NONE: no open doorway in view (a closed door is not one).
+     * FAILED: a refused, malformed, out-of-range or failed request.
+     */
+    final class Doorway {
+        enum Status { DOOR, NONE, FAILED }
+
+        final Status status;
+        final float x;
+
+        private Doorway(Status status, float x) {
+            this.status = status;
+            this.x = x;
+        }
+
+        static Doorway door(float x) {
+            return new Doorway(Status.DOOR, x);
+        }
+
+        static Doorway none() {
+            return new Doorway(Status.NONE, 0f);
+        }
+
+        static Doorway failed() {
+            return new Doorway(Status.FAILED, 0f);
+        }
+
+        /** Numbers only, for the trace. */
+        @Override
+        public String toString() {
+            return status == Status.DOOR ? String.format(java.util.Locale.US, "open doorway at x %.2f", x)
                     : status.toString();
         }
     }
