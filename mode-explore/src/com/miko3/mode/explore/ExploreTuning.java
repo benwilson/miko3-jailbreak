@@ -362,10 +362,11 @@ final class ExploreTuning {
         private long disappointedMs = 1400;
         private long puzzledMs = 1100;
         private long peopleCooldownMs = 120000;
-        // Two tries of 15 s (R7): live, look requests took ~3 s but two in a row ran
-        // past 10 s. A stop with Claude unreachable falls back within ~30 s (AE4).
+        // Two tries of about 10 s (R7): a stop with Claude unreachable falls back
+        // within ~20 s (AE4). Owner's call after live tests: a look usually takes ~3 s,
+        // and a slow one is retried rather than waited on longer.
         private int askAttempts = 2;
-        private long askTimeoutMs = 15000;
+        private long askTimeoutMs = 10000;
         // A few seconds of speech (R5), plus the launcher's synthesis; only a backstop.
         private long sayTimeoutMs = 15000;
         private long quietWaitMs = 1500;

@@ -40,6 +40,16 @@ class AdapterWiringTest(unittest.TestCase):
                      "RobotPeopleClient.nameOf", "NameExtractor.extract", "new FaceCropper()"):
             self.assertIn(call, a, call)
 
+    def test_release_closes_both_clients(self):
+        # A new ClaudeCuriosity per Explore start: release() must give back the
+        # speech and listen clients' executor threads, or each start leaks them.
+        a = code_only(src("ClaudeCuriosity.java"))
+        body = re.search(r"void release\(\)\s*\{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn("speech.close()", body.group(1))
+        self.assertIn("ears.close()", body.group(1))
+        self.assertIn("worker.shutdownNow()", body.group(1))
+
     def test_settings_are_fetched_every_stop_and_unset_means_no_asking(self):
         a = code_only(src("ClaudeCuriosity.java"))
         can_ask = re.search(r"public boolean canAsk\(\)\s*\{(.*?)\n    \}", a, re.S)

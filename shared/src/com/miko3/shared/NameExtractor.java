@@ -36,13 +36,14 @@ public final class NameExtractor {
     };
 
     /** Contraction tails left when the recognizer clips the front of a reply
-     * ("'S BEN" from "name's Ben"); skipped at the start like fillers. */
-    private static final Set<String> FRAGMENTS = set("s", "m", "re", "ll", "ve", "d", "t");
+     * ("'RE BEN" from "you're Ben"); skipped at the start like fillers.
+     * One-letter tails ("'S BEN") never get here: words() drops them. */
+    private static final Set<String> FRAGMENTS = set("re", "ll", "ve");
 
     /** Skipped at the start of a reply. */
     private static final Set<String> FILLERS = set(
             "hi", "hello", "hey", "hiya", "um", "uh", "erm", "er", "oh", "well", "so", "yeah", "yes",
-            "ok", "okay", "sure", "oh", "ah", "hmm", "robot", "miko");
+            "ok", "okay", "sure", "ah", "hmm", "robot", "miko");
 
     /** Ends the name: what comes after it is not part of it. */
     private static final Set<String> STOPS = set(

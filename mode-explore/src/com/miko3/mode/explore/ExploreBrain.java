@@ -610,8 +610,6 @@ final class ExploreBrain {
             case SCAN:
             case FACE:
             case APPROACH:
-                curiosityStep(now, fresh, hazard);
-                break;
             case ORIENT:
                 curiosityStep(now, fresh, hazard);
                 break;
@@ -748,7 +746,7 @@ final class ExploreBrain {
             return;
         }
         boolean going = state == State.ORIENT || state == State.FACE || state == State.APPROACH;
-        if (going && pick != null && !pick.kind.equals(CuriosityPort.Kind.PERSON) && usable(pick.line)) {
+        if (going && pick != null && pick.kind != CuriosityPort.Kind.PERSON && usable(pick.line)) {
             note("keeping Claude's line for after the escape");
             heldPick = pick;
             heldPickAt = pickAt;
@@ -1296,7 +1294,7 @@ final class ExploreBrain {
 
     private boolean validPick(CuriosityPort.Answer a) {
         return a.frame >= 0 && a.frame < askedFrames.size() && a.box != null && a.kind != null
-                && a.line != null && !a.line.trim().isEmpty();
+                && usable(a.line);
     }
 
     private void retryOrFallback(long now) {
@@ -1584,7 +1582,7 @@ final class ExploreBrain {
     private void greet(long now, CuriosityPort.MatchAnswer a) {
         String line = null;
         if (a.name != null && !a.name.trim().isEmpty() && usable(a.namedLine)) {
-            line = a.namedLine.replace("{name}", a.name.trim());
+            line = ClaudeReplies.fill(a.namedLine, a.name.trim());
             note("someone we've met, with a name");
         } else if (usable(a.unnamedLine)) {
             line = a.unnamedLine;
@@ -1672,13 +1670,18 @@ final class ExploreBrain {
     private void nameClip(long now) {
         stopMotors();
         state = State.NAME_CLIP;
+        stareAtPick();
+        sound.playName(target != null ? target.label : "person");
+        phaseUntil = now + tuning.nameMs;
+    }
+
+    /** The detector's target when it has one, else the height of Claude's box. */
+    private void stareAtPick() {
         if (target != null) {
             stare(target);
         } else {
             stareAt(0f, pick.box.centerY());
         }
-        sound.playName(target != null ? target.label : "person");
-        phaseUntil = now + tuning.nameMs;
     }
 
     private static boolean usable(String line) {
@@ -1697,11 +1700,7 @@ final class ExploreBrain {
         // this step: synthesis competes with them for the CPU (R6, KTD6). Live,
         // a line after APPROACH took 2.8 s to first audio.
         syncCamera();
-        if (target != null) {
-            stare(target);
-        } else {
-            stareAt(0f, pick.box.centerY());
-        }
+        stareAtPick();
         pendingLine = line;
         quietUntil = now + tuning.quietWaitMs;
         lineStarted(now);

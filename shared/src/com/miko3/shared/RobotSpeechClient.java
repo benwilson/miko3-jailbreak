@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -39,6 +40,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * The client stays bound to the launcher from speak() until the last
  * outstanding line's callback, so the launcher isn't at background priority
  * while it speaks, then unbinds by itself.
+ *
+ * close() is for an owner that is going away: it stops this app's lines,
+ * unbinds, and ends the client's worker thread. No listener is called after
+ * it, and a later speak() fails at once. Calling it again does nothing.
  *
  * Speak after heavy work pauses (KTD8). Speech is made on the robot's four
  * CPU cores; with Explore's camera and detector busy, the medium voice
@@ -73,18 +78,22 @@ public final class RobotSpeechClient {
     private final List<Line> unsent = new ArrayList<Line>();
     private RobotSpeech service;
     private boolean bound;
+    private boolean closed;
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
             List<Line> send;
             synchronized (RobotSpeechClient.this) {
+                if (closed) {
+                    return;
+                }
                 service = RobotSpeech.Stub.asInterface(binder);
                 send = new ArrayList<Line>(unsent);
                 unsent.clear();
             }
             for (Line line : send) {
-                worker.execute(line);
+                post(line);
             }
         }
 
@@ -94,6 +103,9 @@ public final class RobotSpeechClient {
             // it had queued. Android rebinds by itself when it restarts.
             List<Line> lost;
             synchronized (RobotSpeechClient.this) {
+                if (closed) {
+                    return;
+                }
                 service = null;
                 lost = new ArrayList<Line>(outstanding);
                 lost.removeAll(unsent);
@@ -113,23 +125,27 @@ public final class RobotSpeechClient {
         Line line = new Line(text, listener);
         RobotSpeech s;
         synchronized (this) {
-            outstanding.add(line);
-            if (!bound) {
-                Intent intent = new Intent(LauncherProtocol.ROBOT_SPEECH_ACTION);
-                intent.setPackage(LauncherProtocol.LAUNCHER_PACKAGE);
-                bound = app.bindService(intent, connection, Context.BIND_AUTO_CREATE);
-            }
-            s = service;
-            if (bound && s == null) {
-                unsent.add(line);
-                return;
+            if (closed) {
+                s = null;
+            } else {
+                outstanding.add(line);
+                if (!bound) {
+                    Intent intent = new Intent(LauncherProtocol.ROBOT_SPEECH_ACTION);
+                    intent.setPackage(LauncherProtocol.LAUNCHER_PACKAGE);
+                    bound = app.bindService(intent, connection, Context.BIND_AUTO_CREATE);
+                }
+                s = service;
+                if (bound && s == null) {
+                    unsent.add(line);
+                    return;
+                }
             }
         }
         if (s == null) {
-            line.fail("launcher speech service not found");
+            line.fail(isClosed() ? "speech client closed" : "launcher speech service not found");
             return;
         }
-        worker.execute(line);
+        post(line);
     }
 
     /** Drops every line this app queued and stops its playing line at the
@@ -153,8 +169,8 @@ public final class RobotSpeechClient {
         for (Line line : dropped) {
             line.cancelled();
         }
-        if (s != null) {
-            worker.execute(new Runnable() {
+        if (s != null && !isClosed()) {
+            post(new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -166,6 +182,67 @@ public final class RobotSpeechClient {
                 }
             });
         }
+    }
+
+    /**
+     * Stops this app's lines (the launcher cancels the playing one at its next
+     * sentence boundary), unbinds, and shuts the worker thread down. No
+     * listener is called afterwards; speak() then fails at once. Idempotent.
+     */
+    public void close() {
+        final RobotSpeech s;
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            for (Line line : outstanding) {
+                line.done.set(true);
+            }
+            outstanding.clear();
+            unsent.clear();
+            s = service;
+            service = null;
+            if (bound) {
+                bound = false;
+                try {
+                    app.unbindService(connection);
+                } catch (IllegalArgumentException ignored) {
+                    // Nothing was registered.
+                }
+            }
+        }
+        // Drops queued sends and a queued cancel(); the cancel is sent below instead.
+        worker.shutdownNow();
+        if (s != null) {
+            // A Binder call, kept off the caller's (often main) thread; this
+            // thread ends as soon as the call returns.
+            Thread t = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        s.cancel();
+                    } catch (RemoteException | RuntimeException ignored) {
+                        // The launcher died or turned this app away: nothing plays.
+                    }
+                }
+            }, "robot-speech-close");
+            t.setDaemon(true);
+            t.start();
+        }
+    }
+
+    /** Runs r on the worker; after close() it is dropped (its line was already ended). */
+    private void post(Runnable r) {
+        try {
+            worker.execute(r);
+        } catch (RejectedExecutionException closedMeanwhile) {
+            // close() ran between the check and here.
+        }
+    }
+
+    private synchronized boolean isClosed() {
+        return closed;
     }
 
     private void lineDone(Line line) {

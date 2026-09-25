@@ -1988,14 +1988,14 @@ public final class ExploreBrainHarness {
     }
 
     private static void liveFixScenarios() {
-        scenario("tuning_defaults_roam_45_to_90_s_and_two_15_s_claude_tries", n -> {
+        scenario("tuning_defaults_roam_45_to_90_s_and_two_10_s_claude_tries", n -> {
             ExploreTuning t = new ExploreTuning.Builder().calibration(calibration()).build();
             Rig rig = new Rig(curious().scan(3, 500).sayTimeoutMs(6000).build(), CLEAR, (r, tt) -> list(), true,
                     (r, req, nth) -> null).started();
             rig.runUntil(9000);
             check(n, t.curiosityMinMs == 45000 && t.curiosityMaxMs == 90000 && t.askAttempts == 2
-                            && t.askTimeoutMs == 15000 && t.pickMatchIou == 0.3f
-                            && !rig.askTimeouts.isEmpty() && rig.askTimeouts.get(0) == 15000,
+                            && t.askTimeoutMs == 10000 && t.pickMatchIou == 0.3f
+                            && !rig.askTimeouts.isEmpty() && rig.askTimeouts.get(0) == 10000,
                     t.curiosityMinMs + ".." + t.curiosityMaxMs + " " + t.askAttempts + "x" + t.askTimeoutMs
                             + " iou " + t.pickMatchIou + " rig " + rig.askTimeouts);
         });

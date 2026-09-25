@@ -164,7 +164,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "replies_look_reads_the_frame_box_kind_and_line",
         "replies_name_keeps_one_or_two_words_and_fills_the_placeholder",
         # The fixes from Explore on Claude's first live test
-        "tuning_defaults_roam_45_to_90_s_and_two_15_s_claude_tries",
+        "tuning_defaults_roam_45_to_90_s_and_two_10_s_claude_tries",
         "claude_other_pick_on_a_differently_named_detector_box_faces_without_driving",
         "claude_other_pick_with_a_synonym_or_shared_word_is_approached",
         "claude_pick_needs_iou_0_3_not_a_centre_inside_its_box",

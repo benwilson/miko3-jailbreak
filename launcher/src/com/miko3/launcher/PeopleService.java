@@ -7,6 +7,7 @@ import android.os.IBinder;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotPeople;
 
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -41,9 +42,7 @@ public class PeopleService extends Service {
             }
             if (count < faces.length) {
                 // A face forgotten between the two reads; answer the rest.
-                RobotPeople.Face[] some = new RobotPeople.Face[count];
-                System.arraycopy(faces, 0, some, 0, count);
-                return some;
+                return Arrays.copyOf(faces, count);
             }
             return faces;
         }

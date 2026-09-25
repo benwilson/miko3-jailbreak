@@ -248,6 +248,27 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertIsNotNone(release, "client has no done()")
         self.assertIn("unbindService(", release)
 
+    def test_client_close_shuts_down_its_worker_and_is_idempotent(self):
+        # ClaudeCuriosity is rebuilt on every Explore start; close() is how its
+        # release() gets this client's executor thread back (no leak per start).
+        src = _read(CLIENT)
+        body = _method_body(src, "public void close")
+        self.assertIsNotNone(body, "client has no close()")
+        self.assertIn("shutdownNow()", body)
+        self.assertIn("unbindService(", body)
+        # Idempotent: a second close() returns before doing anything.
+        self.assertRegex(body, r"if \(closed\)\s*\{?\s*return;")
+        self.assertIn("closed = true", body)
+        # Late launcher callbacks are dropped: every open call is marked ended.
+        self.assertIn("ended.set(true)", body)
+
+    def test_client_drops_calls_and_callbacks_after_close(self):
+        src = _read(CLIENT)
+        for name in ("public void listen", "public void onServiceConnected", "public void onServiceDisconnected"):
+            body = _method_body(src, name)
+            self.assertIsNotNone(body, name)
+            self.assertIn("closed", body, name)
+
     def test_client_has_a_timeout_backstop(self):
         # A launcher that never answers can't leave Explore waiting forever.
         src = _read(CLIENT)

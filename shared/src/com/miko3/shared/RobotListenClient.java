@@ -8,6 +8,7 @@ import android.os.IBinder;
 import android.os.RemoteException;
 
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
@@ -37,6 +38,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * One listen at a time per client: a listen() while one is outstanding fails
  * at once. The client stays bound to the launcher until the answer, so the
  * launcher isn't at background priority while it records, then unbinds.
+ *
+ * close() is for an owner that is going away: it drops the listen, unbinds,
+ * and ends the client's worker thread. No listener is called after it, and a
+ * later listen() fails at once. Calling it again does nothing.
  */
 public final class RobotListenClient {
     /** How one listen ended. Called once, on a Binder or worker thread. */
@@ -67,17 +72,21 @@ public final class RobotListenClient {
     private Call current;
     private RobotListen service;
     private boolean bound;
+    private boolean closed;
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
             Call send;
             synchronized (RobotListenClient.this) {
+                if (closed) {
+                    return;
+                }
                 service = RobotListen.Stub.asInterface(binder);
                 send = current != null && !current.sent ? current : null;
             }
             if (send != null) {
-                worker.execute(send);
+                post(send);
             }
         }
 
@@ -86,6 +95,9 @@ public final class RobotListenClient {
             // The launcher's process died: no answer will come.
             Call lost;
             synchronized (RobotListenClient.this) {
+                if (closed) {
+                    return;
+                }
                 service = null;
                 lost = current != null && current.sent ? current : null;
             }
@@ -103,9 +115,20 @@ public final class RobotListenClient {
     public void listen(long maxMs, Listener listener) {
         final Call call = new Call(maxMs, listener);
         RobotListen s;
+        boolean isClosed;
         synchronized (this) {
+            isClosed = closed;
+        }
+        if (isClosed) {
+            call.fail("listen client closed");
+            return;
+        }
+        synchronized (this) {
+            if (closed) {
+                return; // close() raced this listen; no listener is called after it.
+            }
             if (current != null) {
-                worker.execute(new Runnable() {
+                post(new Runnable() {
                     @Override
                     public void run() {
                         call.listener.onFailed("already listening");
@@ -121,20 +144,61 @@ public final class RobotListenClient {
             }
             s = service;
         }
-        worker.schedule(new Runnable() {
-            @Override
-            public void run() {
-                call.fail("no answer from the launcher");
-            }
-        }, Math.max(0, maxMs) + TIMEOUT_MARGIN_MS, TimeUnit.MILLISECONDS);
+        try {
+            worker.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    call.fail("no answer from the launcher");
+                }
+            }, Math.max(0, maxMs) + TIMEOUT_MARGIN_MS, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException closedMeanwhile) {
+            return; // close() ended the call.
+        }
         if (!bound) {
             call.fail("launcher listen service not found");
             return;
         }
         if (s != null) {
-            worker.execute(call);
+            post(call);
         }
         // else onServiceConnected sends it.
+    }
+
+    /**
+     * Drops the outstanding listen (its listener is never called), unbinds,
+     * and shuts the worker thread down, cancelling the timeout backstop.
+     * listen() then fails at once. Idempotent.
+     */
+    public void close() {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            if (current != null) {
+                current.ended.set(true);
+                current = null;
+            }
+            service = null;
+            if (bound) {
+                bound = false;
+                try {
+                    app.unbindService(connection);
+                } catch (IllegalArgumentException ignored) {
+                    // Nothing was registered.
+                }
+            }
+        }
+        worker.shutdownNow();
+    }
+
+    /** Runs r on the worker; after close() it is dropped. */
+    private void post(Runnable r) {
+        try {
+            worker.execute(r);
+        } catch (RejectedExecutionException closedMeanwhile) {
+            // close() ran between the check and here; its call was already ended.
+        }
     }
 
     private void done(Call call) {

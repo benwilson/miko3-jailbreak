@@ -90,6 +90,9 @@ final class ClaudeCuriosity implements CuriosityPort {
     void release() {
         released = true;
         speech.cancel();
+        // A new adapter is built per Explore start: give back the clients' threads.
+        speech.close();
+        ears.close();
         worker.shutdownNow();
     }
 

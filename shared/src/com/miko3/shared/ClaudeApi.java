@@ -333,10 +333,8 @@ public final class ClaudeApi {
         if (model == null || model.isEmpty()) {
             return Result.failure(Reason.NOT_SET_UP, 0);
         }
-        for (int k = 0; k < model.length(); k++) {
-            if (Character.isISOControl(model.charAt(k))) {
-                return Result.failure(Reason.BAD_MODEL_NAME, 0);
-            }
+        if (hasControlChar(model)) {
+            return Result.failure(Reason.BAD_MODEL_NAME, 0);
         }
         Map<String, Object> message = new LinkedHashMap<String, Object>();
         message.put("role", "user");
@@ -387,10 +385,8 @@ public final class ClaudeApi {
         if (bad != null) {
             return MessageResult.failure(bad.reason, 0);
         }
-        for (int k = 0; k < access.model.length(); k++) {
-            if (Character.isISOControl(access.model.charAt(k))) {
-                return MessageResult.failure(Reason.BAD_MODEL_NAME, 0);
-            }
+        if (hasControlChar(access.model)) {
+            return MessageResult.failure(Reason.BAD_MODEL_NAME, 0);
         }
         boolean useOutputConfig = schema != null && !schemaInPrompt;
         Request request = messagesRequest(base, access, system, content, schema, useOutputConfig, timeoutMs);
@@ -435,7 +431,16 @@ public final class ClaudeApi {
             body.put("output_config", Collections.singletonMap("format", format));
         }
         return new Request("POST", base + "/v1/messages", headers(access.apiKey, true), Json.write(body),
-                Math.max(0, timeoutMs));
+                timeoutMs);
+    }
+
+    private static boolean hasControlChar(String s) {
+        for (int k = 0; k < s.length(); k++) {
+            if (Character.isISOControl(s.charAt(k))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** A 400 whose error message names output_config: the endpoint (or a proxy) doesn't take it. */
