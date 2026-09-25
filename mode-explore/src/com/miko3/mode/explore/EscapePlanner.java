@@ -30,8 +30,11 @@ import java.util.List;
  * it: its ticks end before the stall watch can rule.
  *
  * Every step has a budget (ExploreTuning.escape*Ms, adding to ~30 s up to the
- * first drive-off); a step out of time has failed and the next starts, and a
- * hazard at any point moves on the same way instead of restarting.
+ * first drive-off), plus the time its measured turns need at the escape turn rate
+ * (allowTurn; live 2026-09-25, a fixed 3 s drive-off ran out mid-turn on carpet);
+ * a step out of time has failed and the next starts, and a hazard at any point
+ * moves on the same way instead of restarting. The brain never cuts a turn that
+ * is still making progress for time: only the blocked-turn rule does.
  *
  * Plain Java, no android.* or shared imports; brain thread only.
  */
@@ -58,6 +61,8 @@ final class EscapePlanner {
     private Phase phase = Phase.IDLE;
     private long startedAt;
     private long stepUntil;
+    /** The turn time added to this step's budget so far (allowTurn). */
+    private long stepTurnMs;
     /** Counts driven back along the way in (the retrace and any back-out). */
     private long retraced;
     /** A back-out stalled: no more this escape. */
@@ -145,6 +150,42 @@ final class EscapePlanner {
     private void to(Phase p, long now) {
         phase = p;
         stepUntil = now + budget(p);
+        stepTurnMs = 0;
+    }
+
+    /** The current step starts over from now with its whole budget (after a forward try that failed). */
+    void restartStep(long now) {
+        to(phase, now);
+    }
+
+    /**
+     * A measured turn of deg starts in this step: its time at rateDegS joins the
+     * step's budget, up to escapeTurnAllowanceMaxMs for the step. Returns the ms added.
+     */
+    long allowTurn(double deg, double rateDegS) {
+        if (phase == Phase.IDLE || deg <= 0 || rateDegS <= 0) {
+            return 0;
+        }
+        long ms = Math.round(Math.abs(deg) * 1000.0 / rateDegS);
+        ms = Math.max(0, Math.min(ms, tuning.escapeTurnAllowanceMaxMs - stepTurnMs));
+        stepTurnMs += ms;
+        stepUntil += ms;
+        return ms;
+    }
+
+    /** The turn time added to the current step's budget so far. */
+    long stepTurnMs() {
+        return stepTurnMs;
+    }
+
+    /**
+     * The escape turn rate for budgets: the learned rate (NaN: none yet) no faster
+     * than escapeTurnRateDegS, no slower than escapeTurnRateFloorDegS.
+     */
+    double turnRate(double learnedDegS) {
+        double r = Double.isNaN(learnedDegS) ? tuning.escapeTurnRateDegS
+                : Math.min(learnedDegS, tuning.escapeTurnRateDegS);
+        return Math.max(tuning.escapeTurnRateFloorDegS, r);
     }
 
     long budget(Phase p) {

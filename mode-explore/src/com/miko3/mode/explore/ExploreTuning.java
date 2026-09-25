@@ -304,6 +304,34 @@ final class ExploreTuning {
     final long escapeDriveOffMs;
     final long escapeSecondAskMs;
     /**
+     * A step's budget also covers the measured turns it makes (live 2026-09-25: on
+     * carpet he turns ~40 deg/s, not the ~60 the timed turns assume, and the 3 s
+     * drive-off ran out 125 deg into a 208 deg turn that would have freed him). Each
+     * escape turn adds its angle at the escape turn rate to its step's budget: the
+     * rate learned from recent measured turns (Heading.turnRateDegS()), never above
+     * escapeTurnRateDegS nor below escapeTurnRateFloorDegS, the extra capped at
+     * escapeTurnAllowanceMaxMs per step. The ~30 s target above is the fixed
+     * allowances; the real one is that plus the ladder's turning at this rate (a
+     * retrace turn of up to 180 deg, the circle's 300, a drive-off's up to 180: ~19 s
+     * more at the default 35 deg/s). A measured turn still making progress is never
+     * cut off by a budget (only the blocked-turn rule or turnBackstopMs end it), and
+     * a drive-off whose turn is done drives its ticks whatever its budget says.
+     */
+    final double escapeTurnRateDegS;
+    final double escapeTurnRateFloorDegS;
+    final long escapeTurnAllowanceMaxMs;
+    /**
+     * Forward first: when an escape step runs out of time, when a ladder is about to
+     * end in rest, and when a cornered rest ends, he first tries escapeProbeTicks
+     * forward ticks if the floor sensor reads clear, the camera (if up) does not read
+     * the way ahead blocked, and (except after a rest) no forward drive within
+     * escapeProbeClearDeg of this heading has just hit a hazard or stalled. Driven
+     * cleanly (the encoders moved, no hazard or stall), he is free and roams on;
+     * blocked, the ladder, the rest or the turn goes on as before.
+     */
+    final int escapeProbeTicks;
+    final double escapeProbeClearDeg;
+    /**
      * The measured circle: escapeCircleSteps looks escapeCircleStepDeg apart, each
      * from a frame captured escapeSettleMs after he stopped (the gyro's bias is
      * re-estimated in that stillness: headingSettleMs plus a few readings).
@@ -480,6 +508,11 @@ final class ExploreTuning {
         escapeAskMs = b.escapeAskMs;
         escapeDriveOffMs = b.escapeDriveOffMs;
         escapeSecondAskMs = b.escapeSecondAskMs;
+        escapeTurnRateDegS = Math.max(1, b.escapeTurnRateDegS);
+        escapeTurnRateFloorDegS = Math.max(1, Math.min(b.escapeTurnRateFloorDegS, escapeTurnRateDegS));
+        escapeTurnAllowanceMaxMs = Math.max(0, b.escapeTurnAllowanceMaxMs);
+        escapeProbeTicks = Math.max(0, b.escapeProbeTicks);
+        escapeProbeClearDeg = b.escapeProbeClearDeg;
         escapeCircleSteps = Math.max(1, b.escapeCircleSteps);
         escapeCircleStepDeg = b.escapeCircleStepDeg;
         escapeSettleMs = b.escapeSettleMs;
@@ -709,12 +742,22 @@ final class ExploreTuning {
         private long escapeRetraceCounts = 1500;
         private long escapeRetraceMinCounts = 60;
         private double escapeLineToleranceDeg = 20;
-        // U5's step budget table: 6 + 12 + 6 + 3 = 27 s, inside the ~30 s target.
+        // U5's step budget table: 6 + 12 + 6 + 3 = 27 s, inside the ~30 s target, which
+        // assumes the default escape turn rate below; each step adds its turns' time.
         private long escapeRetraceMs = 6000;
         private long escapeCircleMs = 12000;
         private long escapeAskMs = 6000;
         private long escapeDriveOffMs = 3000;
         private long escapeSecondAskMs = 6000;
+        // Below the ~40 deg/s measured on carpet (live 2026-09-25), so a turn fits its step;
+        // a learned slower rate counts down to the floor, and one step's extra is capped
+        // at 20 s (the circle's 300 deg at the floor).
+        private double escapeTurnRateDegS = 35;
+        private double escapeTurnRateFloorDegS = 15;
+        private long escapeTurnAllowanceMaxMs = 20000;
+        // ~0.75 s forward: enough for the encoders and the floor sensor to rule.
+        private int escapeProbeTicks = 3;
+        private double escapeProbeClearDeg = 30;
         private int escapeCircleSteps = 6;
         private double escapeCircleStepDeg = 60;
         // Heading U2: the bias needs ~0.8 s still (headingSettleMs + biasSamplesMin readings).
@@ -926,6 +969,17 @@ final class ExploreTuning {
             escapeAskMs = askMs;
             escapeDriveOffMs = driveOffMs;
             escapeSecondAskMs = secondAskMs;
+            return this;
+        }
+        Builder escapeTurnRate(double defaultDegS, double floorDegS, long allowanceMaxMs) {
+            escapeTurnRateDegS = defaultDegS;
+            escapeTurnRateFloorDegS = floorDegS;
+            escapeTurnAllowanceMaxMs = allowanceMaxMs;
+            return this;
+        }
+        Builder escapeProbe(int ticks, double clearDeg) {
+            escapeProbeTicks = ticks;
+            escapeProbeClearDeg = clearDeg;
             return this;
         }
         Builder escapeCircle(int steps, double stepDeg, long settleMs) {

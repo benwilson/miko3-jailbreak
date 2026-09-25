@@ -2,6 +2,7 @@ package com.miko3.mode.explore;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
@@ -157,13 +158,21 @@ import java.util.Set;
  *              heading; the second ask, with one frame of now, happens here too
  *   DRIVE_OFF  turn to the chosen heading and drive off
  *
- * Each step has a time budget; out of time or a hazard, it has failed and the next
- * one starts. Turns in an escape ignore hazards (turning in place is how he gets
- * out); a hazard or stall while driving forward stops at once, backs off
- * backTicks, and moves on. All failing ends in CORNERED as before. Uncalibrated,
- * every wedge is today's: the cornered cap and the failed-sweep count. A blocked
- * measured turn with no leg to back out along first backs up blockedTurnBackTicks
- * (stopped by a stall, not logged as a leg) and tries the same turn once more.
+ * Each step has a time budget, plus its measured turns' time at the learned turn
+ * rate (ExploreTuning.escapeTurnRateDegS); out of time or a hazard, it has failed
+ * and the next one starts, but a turn still making progress, or a drive-off whose
+ * turn is done, is never cut off for time. Turns in an escape ignore hazards
+ * (turning in place is how he gets out); a hazard or stall while driving forward
+ * stops at once, backs off backTicks, and moves on. All failing ends in CORNERED
+ * as before. Forward first: a step that ran out of time or failed, a ladder about
+ * to rest, and the end of a cornered rest first try escapeProbeTicks forward when
+ * the way ahead looks clear; driven cleanly, he is free. Uncalibrated, every wedge
+ * is today's: the cornered cap and the failed-sweep count. A blocked measured turn
+ * with no leg to back out along first backs up blockedTurnBackTicks (stopped by a
+ * stall, not logged as a leg) and tries the turn once more, the other way. A way a
+ * turn would not turn is avoided by every later turn (unblocked()) until he drives
+ * off forward cleanly or a turn that way gets there; with both blocked, the one
+ * blocked longer ago is tried first.
  *
  * Open doorways (explore nav plan U6, R7, R8, KTD4): while he roams (PAUSE or HOP,
  * camera open, heading usable, Claude set up) one fresh roaming frame goes to
@@ -567,6 +576,13 @@ final class ExploreBrain {
 
     private Esc esc;
     private EscThen escThen;
+    /** A short forward try (ExploreTuning.escapeProbeTicks) is under way, and what follows it if blocked. */
+    private boolean probing;
+    private enum ProbeThen { STEP, REST, AFTER_REST }
+    private ProbeThen probeThen;
+    private long probeSince;
+    /** Where a forward drive last hit a hazard or stalled (NaN: none since a clean drive). */
+    private double blockedAheadAt = Double.NaN;
     /**
      * Escape ladders that ended in rest, in a row (reset by a clean drive-off or a
      * clean leg); they set how long he rests when still pinned (pinnedRestMs()).
@@ -581,6 +597,10 @@ final class ExploreBrain {
     private double escTurnAmount;
     /** This turn has had its back-out already. */
     private boolean escBackedOut;
+    /** Encoder counts (both wheels) moved in the current roaming leg. */
+    private long hopMoved;
+    /** This ladder has driven forward cleanly (a retrace move), not only backed out. */
+    private boolean escDroveForward;
     /** Wedged by a blocked turn: back out before the retrace's first turn. */
     private boolean escBackOutFirst;
     /** Counts to drive or back out (0: a drive-off's escapeDriveTicks, a hazard's backTicks). */
@@ -744,6 +764,7 @@ final class ExploreBrain {
         cancelDoorway(clock.nowMs(), null);
         cancelMetCheck();
         planner.reset();
+        probing = false;
         state = State.STOPPED;
         syncCamera();
         syncMoving();
@@ -986,16 +1007,15 @@ final class ExploreBrain {
                 escapeTick(now, fresh, hazard);
                 break;
             case CORNERED:
-                if (now >= phaseUntil && ladderAfterRest) {
-                    ladderAfterRest = false;
-                    startLadder(now, "still pinned after the longer rest", ladderTurnBlocked);
-                } else if (now >= phaseUntil) {
-                    restEndedAt = now;
-                    hazardTimes.clear();
-                    Direction d = unblocked(lastHazardSide != null ? lastHazardSide.opposite() : randomDirection());
-                    note("cool-down over, trying a wider turn " + d);
-                    escapeSide = d;
-                    enterLook(now, d, true, tuning.corneredTurnMs, tuning.corneredTurnDeg);
+                if (now >= phaseUntil) {
+                    if (!ladderAfterRest) {
+                        restEndedAt = now;
+                        hazardTimes.clear();
+                    }
+                    // Facing open floor after the rest, a turn would only face him away from it.
+                    if (!tryForwardFirst(now, "after the rest", true, ProbeThen.AFTER_REST)) {
+                        afterRest(now);
+                    }
                 }
                 break;
             default:
@@ -1003,10 +1023,31 @@ final class ExploreBrain {
         }
     }
 
+    /** After a cornered rest (and its forward try, if any): the next ladder when still pinned, else the wider turn. */
+    private void afterRest(long now) {
+        if (ladderAfterRest) {
+            ladderAfterRest = false;
+            startLadder(now, "still pinned after the longer rest", ladderTurnBlocked);
+            return;
+        }
+        restEndedAt = now;
+        Direction d = unblocked(lastHazardSide != null ? lastHazardSide.opposite() : randomDirection());
+        note("cool-down over, trying a wider turn " + d);
+        escapeSide = d;
+        enterLook(now, d, true, tuning.corneredTurnMs, tuning.corneredTurnDeg);
+    }
+
     /** A roaming leg ended without a hazard or stall (its time, or the camera saw the way blocked). */
     private void legDriven(long now) {
         stopMotors();
-        blockedSides.clear();
+        if (legWentNowhere(now)) {
+            // Too short for the stall watch to rule, but the encoders say he never moved:
+            // not a drive-off, so the blocked ways stay avoided.
+            aheadBlocked();
+        } else {
+            blockedSides.clear();
+            blockedAheadAt = Double.NaN;
+        }
         // Driven away cleanly: whatever cornered him is behind him.
         compass.droveOffCleanly();
         hazardTimes.clear();
@@ -1097,7 +1138,13 @@ final class ExploreBrain {
                 return;
             }
             Direction d = plan.side == RoamSteer.LEFT ? Direction.LEFT : Direction.RIGHT;
-            enterLook(now, d, false, timedMs(plan.bendDeg), compass.usable(now) ? plan.bendDeg : 0);
+            double bend = plan.bendDeg;
+            if (unblocked(d) != d) {
+                note("the " + d + " side is blocked: bending the long way round");
+                d = d.opposite();
+                bend = 360 - bend;
+            }
+            enterLook(now, d, false, timedMs(bend), compass.usable(now) ? bend : 0);
         } else if (random.nextDouble() < tuning.turnChance) {
             Direction d;
             if (lastHazardSide != null) {
@@ -1122,6 +1169,7 @@ final class ExploreBrain {
     private void refuse(long now) {
         HazardClassifier.Hazard h = classifier.hazard();
         note("hazard at start: " + h);
+        aheadBlocked();
         leaveStopForHazard();
         hopNext = false;
         doorwayLeg = false;
@@ -1144,6 +1192,9 @@ final class ExploreBrain {
 
     /** As above, for a hazard the classifier did not see (h null: side unknown). */
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
+        if (state == State.HOP) {
+            aheadBlocked();
+        }
         stopMotors();
         leaveStopForHazard();
         doorwayLeg = false;
@@ -1292,7 +1343,7 @@ final class ExploreBrain {
         turnProgressAt = now;
         if (measured) {
             compass.startTurn(heading == Direction.LEFT ? Heading.LEFT : Heading.RIGHT,
-                    escape && state == State.TURN ? Math.min(deg, tuning.escapeSweepDeg) : deg);
+                    escape && state == State.TURN ? Math.min(deg, tuning.escapeSweepDeg) : deg, now);
         }
     }
 
@@ -1305,8 +1356,11 @@ final class ExploreBrain {
             return;
         }
         if (lastWheels != null) {
-            wheelMoves.addLast(new long[]{r.timestampMs,
-                    Math.abs(r.wheelLeft - lastWheels.wheelLeft) + Math.abs(r.wheelRight - lastWheels.wheelRight)});
+            long moved = Math.abs(r.wheelLeft - lastWheels.wheelLeft) + Math.abs(r.wheelRight - lastWheels.wheelRight);
+            if (state == State.HOP) {
+                hopMoved += moved;
+            }
+            wheelMoves.addLast(new long[]{r.timestampMs, moved});
         } else {
             wheelsSince = r.timestampMs;
         }
@@ -1356,7 +1410,7 @@ final class ExploreBrain {
         scheduleCuriosity(now);
         state = State.SCAN;
         scanLooksLeft = tuning.scanLooks;
-        scanDir = randomDirection();
+        scanDir = unblocked(randomDirection());
         target = null;
         claudeStop = port.canAsk();
         heldPick = null;
@@ -1535,6 +1589,12 @@ final class ExploreBrain {
     }
 
     private void startCuriosityTurn(long now, Direction d, long ms, double deg, boolean lead) {
+        if (deg > 0 && unblocked(d) != d) {
+            // Measured toward something, and that side is blocked: the long way round.
+            d = d.opposite();
+            deg = 360 - deg;
+            ms = timedMs(deg);
+        }
         heading = d;
         turnMs = ms;
         turnDeg = deg;
@@ -2584,7 +2644,7 @@ final class ExploreBrain {
         stopMotors();
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
                 + " deg in " + (now - turnStartedAt) + " ms");
-        blockedSides.add(heading);
+        blockSide(heading);
         if (state == State.TURN && !turnRetrying && tuning.blockedTurnBackTicks > 0
                 && !planner.hasLegToBackAlong(compass.legs(), compass.degrees())) {
             // Live, pinned after a CPL stop with no leg to back out along (the ladder backs
@@ -2677,6 +2737,7 @@ final class ExploreBrain {
         hazardTimes.clear();
         escapeFailures.clear();
         planner.begin(now, compass.degrees());
+        escDroveForward = false;
         escBackOutFirst = turnBlocked;
         escShortBack = false;
         circleDir = unblocked(escapeSide != null ? escapeSide : Direction.LEFT);
@@ -2736,22 +2797,33 @@ final class ExploreBrain {
                 escTurnTo(now, planner.driveHeading(), EscThen.DRIVE);
                 break;
             case REST:
-                // The whole ladder failed: one failed escape, counted for the pinned rests.
-                planner.reset();
-                esc = null;
-                failedLadders++;
-                stopMotors();
-                note("cornered: " + failedLadders + " failed escapes in a row, " + hazardTimes.size()
-                        + " hazards; resting " + tuning.cooldownMs + " ms");
-                rest(now, tuning.cooldownMs);
+                if (tryForwardFirst(now, "before resting", false, ProbeThen.REST)) {
+                    return;
+                }
+                ladderRest(now);
                 break;
             default:
                 break;
         }
     }
 
+    /** The whole ladder failed: one failed escape, counted for the pinned rests. */
+    private void ladderRest(long now) {
+        planner.reset();
+        esc = null;
+        failedLadders++;
+        stopMotors();
+        note("cornered: " + failedLadders + " failed escapes in a row, " + hazardTimes.size()
+                + " hazards; resting " + tuning.cooldownMs + " ms");
+        rest(now, tuning.cooldownMs);
+    }
+
     /** Each tick of an escape step: its budget, then what it is doing. */
     private void escapeTick(long now, boolean fresh, boolean hazard) {
+        if (probing) {
+            probeStep(now, fresh, hazard);
+            return;
+        }
         if (!compass.usable(now)) {
             stopMotors();
             cancelWayOut();
@@ -2762,7 +2834,7 @@ final class ExploreBrain {
                     tuning.escapeTurnDeg);
             return;
         }
-        if (now >= planner.stepUntil()) {
+        if (now >= planner.stepUntil() && !budgetWaits(now)) {
             escapeOutOfTime(now);
             return;
         }
@@ -2802,6 +2874,14 @@ final class ExploreBrain {
                     phaseUntil = now + timedMs(escTurnAmount);
                     measureTurn(now, escTurnAmount);
                     esc = Esc.TURNING;
+                    if (measured) {
+                        double rate = planner.turnRate(compass.turnRateDegS());
+                        long more = planner.allowTurn(escTurnAmount, rate);
+                        if (more > 0) {
+                            note("the " + planner.phase() + " step gets " + more + " ms more for its "
+                                    + Math.round(escTurnAmount) + " deg turn at " + Math.round(rate) + " deg/s");
+                        }
+                    }
                 }
                 break;
             case TURNING:
@@ -2889,6 +2969,7 @@ final class ExploreBrain {
         boolean stalled = wheelsStalled(now);
         if (hazard || stalled) {
             stopMotors();
+            aheadBlocked();
             note((hazard ? "hazard" : "wheels stalled") + " driving in the escape's " + planner.phase() + " after "
                     + escMoved + " counts");
             if (planner.phase() == EscapePlanner.Phase.RETRACE) {
@@ -2912,6 +2993,7 @@ final class ExploreBrain {
             // rule (grace + window), and "free" wiped the ladder; the next move was
             // blocked and a whole new ladder began. Its encoders decide instead.
             stopMotors();
+            aheadBlocked();
             note("wheels stalled driving in the escape's " + planner.phase() + ": " + escMoved + " counts in "
                     + (now - hopStartedAt) + " ms");
             show(EyeState.FLINCH, null);
@@ -2927,6 +3009,7 @@ final class ExploreBrain {
         }
         if (done) {
             stopMotors();
+            escDroveForward = true;
             if (planner.phase() == EscapePlanner.Phase.RETRACE) {
                 planner.addRetraced(escMoved);
                 escWait(now, EscThen.RETRACE_NEXT);
@@ -3011,7 +3094,7 @@ final class ExploreBrain {
         EscapePlanner.Move m = planner.nextRetraceMove(compass.legs());
         if (m == null) {
             if (planner.retraced() > 0) {
-                escapeFreed(now, "retraced " + planner.retraced() + " counts");
+                escapeFreed(now, "retraced " + planner.retraced() + " counts", escDroveForward);
             } else {
                 note("nothing logged to retrace");
                 planner.next(now);
@@ -3065,7 +3148,7 @@ final class ExploreBrain {
     private void escTurnBlocked(long now) {
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
                 + " deg in " + (now - turnStartedAt) + " ms (" + escDir + ")");
-        blockedSides.add(escDir);
+        blockSide(escDir);
         if (!escBackedOut) {
             escBackedOut = true;
             EscThen after = planner.phase() == EscapePlanner.Phase.RETRACE ? EscThen.RETRACE_NEXT : EscThen.RETRY_TURN;
@@ -3111,7 +3194,9 @@ final class ExploreBrain {
      * and ladder turn went left again). A blocked turn is retried the other way, and
      * later turns go the unblocked way (unblocked()), even the long way round.
      */
-    private final EnumSet<Direction> blockedSides = EnumSet.noneOf(Direction.class);
+    private final EnumMap<Direction, Long> blockedSides = new EnumMap<Direction, Long>(Direction.class);
+    /** Each block is numbered, so with both ways blocked the older one is tried again first. */
+    private long blockSeq;
     /** The escape turn's target heading (NaN: a circle step, whose way doesn't matter). */
     private double escTarget = Double.NaN;
     private Direction retryDir;
@@ -3119,9 +3204,24 @@ final class ExploreBrain {
     private long retryMs;
     private double retryDeg;
 
-    /** d, unless only d has been blocked since the last clean drive-off: then the other way. */
+    /**
+     * d, unless d has been blocked since the last clean drive-off: then the other way.
+     * With both ways blocked, the one blocked longer ago (it has had longest to come
+     * free), so he alternates rather than trying one side for ever (live 2026-09-25:
+     * "he only tries turning left").
+     */
     private Direction unblocked(Direction d) {
-        return d != null && blockedSides.contains(d) && !blockedSides.contains(d.opposite()) ? d.opposite() : d;
+        if (d == null || !blockedSides.containsKey(d)) {
+            return d;
+        }
+        Long other = blockedSides.get(d.opposite());
+        return other == null || other < blockedSides.get(d) ? d.opposite() : d;
+    }
+
+    private void blockSide(Direction d) {
+        if (d != null) {
+            blockedSides.put(d, ++blockSeq);
+        }
     }
 
     /**
@@ -3146,8 +3246,13 @@ final class ExploreBrain {
 
     private void escFailed(long now, String why) {
         stopMotors();
-        note("escape's " + planner.phase() + " failed: " + why);
+        EscapePlanner.Phase p = planner.phase();
+        note("escape's " + p + " failed: " + why);
         planner.next(now);
+        if (planner.phase() != EscapePlanner.Phase.REST
+                && tryForwardFirst(now, "the " + p + " step failed", false, ProbeThen.STEP)) {
+            return;
+        }
         escapePhase(now);
     }
 
@@ -3171,6 +3276,7 @@ final class ExploreBrain {
                 planner.next(now);
                 escapePhase(now);
             } else {
+                circleDir = unblocked(circleDir);
                 escTurnBy(circleDir, tuning.escapeCircleStepDeg, EscThen.LOOK);
             }
             return;
@@ -3253,20 +3359,188 @@ final class ExploreBrain {
             escapeFreed(now, "driving clear when the step's time ran out");
             return;
         }
-        note("escape's " + p + " out of time after " + planner.budget(p) + " ms");
+        note("escape's " + p + " out of time after " + (planner.budget(p) + planner.stepTurnMs()) + " ms ("
+                + planner.budget(p) + " fixed, " + planner.stepTurnMs() + " for its turns)");
         if (p == EscapePlanner.Phase.WAY_OUT) {
             onRobotWayOut(now);
             return;
         }
         planner.next(now);
+        if (planner.phase() != EscapePlanner.Phase.REST
+                && tryForwardFirst(now, "the " + p + " step ran out of time", false, ProbeThen.STEP)) {
+            return;
+        }
         escapePhase(now);
+    }
+
+    /**
+     * The step's budget has run out, but what he is doing now is not cut off for it:
+     * a measured turn still making progress (the blocked-turn rule and turnBackstopMs
+     * end one that isn't; live 2026-09-25, the drive-off's 3 s ran out 125 deg into a
+     * turn that would have freed him), or a drive-off whose turn is done (he faces the
+     * way out: its drive's ticks, hazards and stall watch decide).
+     */
+    private boolean budgetWaits(long now) {
+        if (esc == Esc.TURNING && measured && compass.usable(now)) {
+            return true;
+        }
+        EscapePlanner.Phase p = planner.phase();
+        return (p == EscapePlanner.Phase.DRIVE_OFF || p == EscapePlanner.Phase.SECOND_DRIVE_OFF)
+                && (esc == Esc.DRIVE_READY || esc == Esc.DRIVING);
+    }
+
+    // ---- forward first (live 2026-09-25: facing open floor, he rested, then turned away) ----
+
+    /** A forward drive hit a hazard or stalled facing this way. */
+    private void aheadBlocked() {
+        blockedAheadAt = compass.usable(clock.nowMs()) ? compass.degrees() : Double.NaN;
+    }
+
+    /**
+     * Before the ladder's next step, its rest, or the turn after a rest: a short leg
+     * forward if the way ahead looks clear (the floor sensor, the camera if it has a
+     * look since he last turned, and, except after a rest, no hazard or stall driving
+     * this way just now). Returns whether it started; `then` follows if it is blocked.
+     */
+    private boolean tryForwardFirst(long now, String why, boolean afterRest, ProbeThen then) {
+        if (tuning.escapeProbeTicks <= 0 || !compass.usable(now)
+                || classifier.status(now) == HazardClassifier.Status.HAZARD) {
+            return false;
+        }
+        if (!afterRest && !Double.isNaN(blockedAheadAt)
+                && Math.abs(Heading.delta(compass.degrees(), blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return false;
+        }
+        Look look = camera.latest();
+        if (look != null && look.openness != null && look.frameMs >= headingSettledAt
+                && steer.blockedAhead(look.openness)) {
+            return false;
+        }
+        stopMotors();
+        cancelWayOut();
+        note("trying a short leg forward first: " + why);
+        probing = true;
+        probeThen = then;
+        probeSince = now;
+        state = State.DRIVE_OFF;
+        show(EyeState.IDLE, null);
+        escGoal = 0;
+        esc = Esc.DRIVE_READY;
+        return true;
+    }
+
+    private void probeStep(long now, boolean fresh, boolean hazard) {
+        switch (esc == null ? Esc.READY : esc) {
+            case DRIVE_READY:
+                if (!fresh) {
+                    break;
+                }
+                if (hazard) {
+                    probeBlocked(now, "the way ahead reads blocked", false);
+                    break;
+                }
+                startEscapeMotion(now);
+                escTicks = 1;
+                nextTickAt = now + tuning.hopTickMs;
+                esc = Esc.DRIVING;
+                motor.hopTick();
+                compass.startLeg(false, now);
+                break;
+            case DRIVING: {
+                boolean stalled = wheelsStalled(now);
+                if (hazard || stalled) {
+                    stopMotors();
+                    probeBlocked(now, (hazard ? "hazard" : "wheels stalled") + " after " + escMoved + " counts", hazard);
+                    break;
+                }
+                boolean done = escTicks >= tuning.escapeProbeTicks && now >= nextTickAt;
+                if (done && escDroveNowhere(now)) {
+                    stopMotors();
+                    probeBlocked(now, "the wheels went nowhere (" + escMoved + " counts in " + (now - hopStartedAt)
+                            + " ms)", false);
+                } else if (done) {
+                    stopMotors();
+                    probing = false;
+                    probeThen = null;
+                    escapeFreed(now, "a short leg forward drove cleanly");
+                } else if (now >= nextTickAt) {
+                    escTicks++;
+                    nextTickAt += tuning.hopTickMs;
+                    motor.hopTick();
+                }
+                break;
+            }
+            case BACK_READY:
+                if (fresh) {
+                    startEscapeMotion(now);
+                    escUntil = now + tuning.backTicks * tuning.backTickMs;
+                    nextTickAt = now + tuning.backTickMs;
+                    esc = Esc.BACKING;
+                    motor.backTick();
+                    compass.startLeg(true, now);
+                }
+                break;
+            case BACKING:
+                if (now >= escUntil) {
+                    stopMotors();
+                    probeDone(now);
+                } else if (now >= nextTickAt) {
+                    nextTickAt += tuning.backTickMs;
+                    motor.backTick();
+                }
+                break;
+            default:
+                probeDone(now);
+                break;
+        }
+    }
+
+    /** The forward try is blocked: remembered for this heading; after a hazard, the usual back-off first. */
+    private void probeBlocked(long now, String why, boolean backOff) {
+        note("short leg forward blocked: " + why);
+        aheadBlocked();
+        show(EyeState.FLINCH, null);
+        if (backOff && tuning.backTicks > 0) {
+            esc = Esc.BACK_READY;
+        } else {
+            probeDone(now);
+        }
+    }
+
+    /** What the forward try stood in front of: the ladder's step, its rest, or the turn after a rest. */
+    private void probeDone(long now) {
+        ProbeThen then = probeThen;
+        probing = false;
+        probeThen = null;
+        esc = null;
+        if (then == ProbeThen.STEP) {
+            planner.restartStep(now);
+            escapePhase(now);
+        } else if (then == ProbeThen.REST) {
+            ladderRest(now);
+        } else {
+            afterRest(now);
+        }
     }
 
     /** Out: whatever wedged him is behind him, as after a clean leg. */
     private void escapeFreed(long now, String how) {
+        escapeFreed(now, how, true);
+    }
+
+    /**
+     * droveForward false: freed by backing out alone. The ways a turn would not turn
+     * stay avoided then (live 2026-09-25, "he only tries turning left": a back-out that
+     * freed him wiped the blocked side, and the next turn went left into it again).
+     */
+    private void escapeFreed(long now, String how, boolean droveForward) {
         stopMotors();
-        note("free after " + (now - planner.startedAt()) + " ms: " + how);
-        blockedSides.clear();
+        note("free after " + (now - (planner.active() ? planner.startedAt() : probeSince)) + " ms: " + how);
+        if (droveForward) {
+            blockedSides.clear();
+        }
+        blockedAheadAt = Double.NaN;
+        ladderAfterRest = false;
         planner.reset();
         esc = null;
         compass.droveOffCleanly();
@@ -3540,6 +3814,8 @@ final class ExploreBrain {
         cancelWayOut();
         planner.reset();
         esc = null;
+        probing = false;
+        probeThen = null;
         escShortBack = false;
         backForTurn = false;
         turnRetrying = false;
@@ -3574,6 +3850,9 @@ final class ExploreBrain {
 
     /** Eyes toward d, then a turn of ms, or deg once measured (0: timed only). */
     private void enterLook(long now, Direction d, boolean escapeTurn, long ms, double deg) {
+        // Every turn through here is unaimed (its way doesn't matter, only its amount):
+        // it goes the unblocked way. Aimed ones (the steer's bend) come round already.
+        d = unblocked(d);
         state = State.LOOK;
         turnRetrying = false;
         heading = d;
@@ -3608,9 +3887,16 @@ final class ExploreBrain {
         hopStartedAt = now;
         lastWheels = null;
         wheelMoves.clear();
+        hopMoved = 0;
         moving = true;
         motor.hopTick();
         compass.startLeg(false, now);
+    }
+
+    /** This roaming leg's encoders (both wheels) moved less than the stall rate: he went nowhere. */
+    private boolean legWentNowhere(long now) {
+        long ms = Math.max(1, now - hopStartedAt);
+        return lastWheels != null && hopMoved * tuning.stallWindowMs < tuning.stallMinCounts * ms;
     }
 
     /** A leg's length as before the steer: random in hopTicks..hopTicksMax. */
@@ -3673,6 +3959,10 @@ final class ExploreBrain {
 
     private void stopMotors() {
         if (moving) {
+            if (measured && heading != null && compass.turnReached()) {
+                // A turn that got there: that way turns again.
+                blockedSides.remove(heading);
+            }
             moving = false;
             motor.stop();
             long now = clock.nowMs();

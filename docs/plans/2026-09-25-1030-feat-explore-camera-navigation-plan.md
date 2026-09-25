@@ -399,6 +399,8 @@ U1 (gyro in the sensor path) comes first. It unblocks U2 (heading tracker), and 
      | Turn to the chosen heading and drive off | 3 s |
      | Second ask plus drive-off | 3 s, plus the second ask's own 6 s outside the target |
 
+     Each step's budget also adds the time its measured turns need at the escape turn rate (the rate learned from recent measured turns, capped at 35 deg/s and floored at 15 deg/s; the ~30 s target is the fixed allowances, and the ladder's turning at the default rate adds ~19 s), a turn still making progress is never cut off by a budget, and when a step runs out of time or fails, a ladder is about to rest, or a cornered rest ends while the way ahead reads clear, he first tries a short leg forward (live 2026-09-25: on carpet at ~40 deg/s the fixed 3 s drive-off ran out 125° into a turn that would have freed him).
+
      The second ask runs only after the ~30 s target has already been missed. It is the last try before resting, so its time is not counted in the target.
 - **Patterns to follow:** The `ask`/`answer` poll pattern and `Slot` generations in `ClaudeCuriosity`; `ExplorePrompts.LOOK_SCHEMA` and `ClaudeReplies.look()` validation; `orient()` for frame-to-direction conversion (now to degrees).
 - **Test scenarios:**

@@ -1188,6 +1188,9 @@ public final class ExploreBrainHarness {
         navScenarios();
         escapeScenarios();
         pinnedScenarios();
+        budgetScenarios();
+        forwardFirstScenarios();
+        sideScenarios();
         doorwayScenarios();
         peopleScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
@@ -4016,7 +4019,8 @@ public final class ExploreBrainHarness {
             runUntil(rig, 120000, r -> entries(r, ExploreBrain.State.CORNERED).size() >= 2);
             long longRestAt = rig.now;
             pin(rig, false);
-            // Freed by hand during the longer rest: ladder 2 drives off cleanly.
+            // Freed by hand during the longer rest: the forward try after it drives off cleanly
+            // (forward first; before it, ladder 2 did).
             runUntil(rig, 240000, r -> notesWith(notes, "free after") > 0);
             long freeAt = rig.now;
             pin(rig, true);
@@ -4038,6 +4042,363 @@ public final class ExploreBrainHarness {
                             && restLength(rig, rest3) == 30000 && rest4 > rest3 && restLength(rig, rest4) == 60000
                             && rig.violations.isEmpty(),
                     "free@" + freeAt + " ladders=" + ladders + " rests=" + rests + " " + rig.tail());
+        });
+    }
+
+    // ---- a step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, the 3 s drive-off ran out mid-turn) ----
+
+    /** Claude's way out: the frame and x that aim `deg` left of where he faces when asked. */
+    private static WayOutScript leftOfHere(double deg) {
+        return (r, req, nth) -> {
+            double want = Heading.wrap(r.brain.heading().degrees() + deg);
+            for (int k = 0; k < req.frames.size(); k++) {
+                Double at = r.lookHeadings.get(captured(req.frames.get(k)));
+                if (at == null) {
+                    continue;
+                }
+                double off = Heading.delta(at, want);
+                if (Math.abs(off) <= 0.9 * r.tuning.cameraHalfFovDeg) {
+                    return CuriosityPort.WayOut.way(k, (float) (-off / r.tuning.cameraHalfFovDeg));
+                }
+            }
+            return CuriosityPort.WayOut.failed();
+        };
+    }
+
+    /** The first turn command at or after t, and the stop that ended it: {turn index, stop index}. */
+    private static int[] turnFrom(Rig rig, long t) {
+        int turn = rig.firstAfter("turn", t);
+        return new int[]{turn, turn < 0 ? -1 : rig.first("stop", turn)};
+    }
+
+    private static void budgetScenarios() {
+        scenario("budget_drive_off_turn_at_40_deg_s_completes_and_drives_off", n -> {
+            // The live log: turning at 40 deg/s, the way out 130 deg round. The fixed 3 s
+            // ran out 125 deg in; now the drive-off's budget adds 130 deg at 35 deg/s.
+            Rig[] h = new Rig[1];
+            ExploreTuning d = new ExploreTuning.Builder().build();
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10).escapeBudgets(6000, 20000, 6000, d.escapeDriveOffMs, 6000),
+                    h, bumps(h, 3), leftOfHere(130));
+            List<String> notes = traced(rig);
+            rig.yaw.rateDegS = 40;
+            rig.started();
+            runUntil(rig, 90000, r -> notedAt(notes, "free after") >= 0);
+            long off = entered(rig, ExploreBrain.State.DRIVE_OFF, 0);
+            int[] turn = turnFrom(rig, off);
+            long took = rig.timeOf(turn[1]) - rig.timeOf(turn[0]);
+            Drive drive = firstDrive(rig, "DRIVE_OFF", "hop", off);
+            double result = rig.yaw.turnResults.isEmpty() ? 0 : rig.yaw.turnResults.get(rig.yaw.turnResults.size() - 1);
+            check(n, off > 0 && d.escapeDriveOffMs == 3000 && d.escapeTurnRateDegS == 35 && took > 3000
+                            && Math.abs(Math.abs(result) - 130) <= 15 && drive != null && drive.t >= rig.timeOf(turn[1])
+                            && notesWith(notes, "out of time") == 0 && notesWith(notes, "free after") == 1
+                            && notedAt(notes, "drove off") >= 0 && rig.violations.isEmpty(),
+                    "off@" + off + " took=" + took + " result=" + f1(result) + " drive=" + drive + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 8), notes.size()));
+        });
+        scenario("budget_slow_but_progressing_turn_is_never_cut_by_the_step_budget", n -> {
+            // 10 deg/s in the drive-off only (it learned ~60 before, so its budget is 3 s +
+            // 130 deg at 35 deg/s, ~6.7 s): the 13 s turn outlives it and still finishes.
+            Rig[] h = new Rig[1];
+            Feed b = bumps(h, 3);
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, t -> {
+                Rig r = h[0];
+                if (r != null) {
+                    r.yaw.rateDegS = r.brain.state() == ExploreBrain.State.DRIVE_OFF ? 10 : 60;
+                }
+                return b.at(t);
+            }, leftOfHere(130));
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 120000, r -> notedAt(notes, "free after") >= 0);
+            long off = entered(rig, ExploreBrain.State.DRIVE_OFF, 0);
+            int[] turn = turnFrom(rig, off);
+            long took = rig.timeOf(turn[1]) - rig.timeOf(turn[0]);
+            double result = rig.yaw.turnResults.isEmpty() ? 0 : rig.yaw.turnResults.get(rig.yaw.turnResults.size() - 1);
+            Drive drive = firstDrive(rig, "DRIVE_OFF", "hop", off);
+            check(n, off > 0 && took >= 11000 && took < rig.tuning.turnBackstopMs && Math.abs(Math.abs(result) - 130) <= 15
+                            && drive != null && drive.t >= rig.timeOf(turn[1]) && notesWith(notes, "out of time") == 0
+                            && notesWith(notes, "measured turn blocked") == 0 && notedAt(notes, "drove off") >= 0
+                            && rig.violations.isEmpty(),
+                    "off@" + off + " took=" + took + " result=" + f1(result) + " drive=" + drive + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 8), notes.size()));
+        });
+        scenario("budget_blocked_drive_off_turn_still_fails_the_step_within_1_5_s", n -> {
+            // The way out needs a turn, and the drive-off's turns go nowhere: blocked at ~1.5 s,
+            // one back-up and the turn the other way, blocked again, and the step has failed.
+            Rig[] h = new Rig[1];
+            Feed b = bumps(h, 3);
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, t -> {
+                Rig r = h[0];
+                if (r != null && r.brain.state() == ExploreBrain.State.DRIVE_OFF) {
+                    r.yaw.stuck = true;
+                }
+                return b.at(t);
+            }, null);
+            rig.openView = openAt(180);
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 90000, r -> notedAt(notes, "escape's DRIVE_OFF failed") >= 0);
+            long off = entered(rig, ExploreBrain.State.DRIVE_OFF, 0);
+            int[] first = turnFrom(rig, off);
+            int[] retry = turnFrom(rig, rig.timeOf(first[1]) + 1);
+            long took = rig.timeOf(first[1]) - rig.timeOf(first[0]);
+            long took2 = rig.timeOf(retry[1]) - rig.timeOf(retry[0]);
+            long failed = notedAt(notes, "escape's DRIVE_OFF failed: a turn that would not turn");
+            check(n, off > 0 && took >= 1400 && took <= 1700 && took2 >= 1400 && took2 <= 1700
+                            && !rig.what(first[0]).equals(rig.what(retry[0])) && failed >= rig.timeOf(retry[1])
+                            && failed - rig.timeOf(retry[1]) <= 300 && notesWith(notes, "out of time") == 0
+                            && rig.violations.isEmpty(),
+                    "took=" + took + " took2=" + took2 + " failed@" + failed + " " + rig.tail());
+        });
+        scenario("budget_turn_rate_defaults_35_deg_s_floor_15_and_the_rate_is_learned", n -> {
+            ExploreTuning d = new ExploreTuning.Builder().build();
+            EscapePlanner p = new EscapePlanner(d);
+            Rig rig = new Rig(gyroTuning().turnChance(1.0).build(), CLEAR, NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.rateDegS = 40;
+            rig.started();
+            rig.runUntil(20000);
+            double learned = rig.brain.heading().turnRateDegS();
+            check(n, d.escapeTurnRateDegS == 35 && d.escapeTurnRateFloorDegS == 15 && d.escapeTurnAllowanceMaxMs == 20000
+                            && p.turnRate(Double.NaN) == 35 && p.turnRate(60) == 35 && p.turnRate(25) == 25
+                            && p.turnRate(5) == 15 && Math.abs(learned - 40) <= 6,
+                    "learned=" + f1(learned) + " " + rig.tail());
+        });
+    }
+
+    // ---- forward first (live 2026-09-25: facing open floor after a turn, he rested, then turned away) ----
+
+    private static void forwardFirstScenarios() {
+        scenario("forward_first_after_a_rest_facing_open_floor_drives_forward_instead_of_turning", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            runUntil(rig, 60000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            long rest = rig.now;
+            pin(rig, false);
+            rig.runUntil(rest + 30000 + 8000);
+            int firstMove = rig.firstMotionAfter(rest + 1);
+            Drive fwd = firstDrive(rig, "DRIVE_OFF", "hop", rest + 1);
+            long free = notedAt(notes, "a short leg forward drove cleanly");
+            check(n, rig.what(firstMove).equals("hop") && rig.timeOf(firstMove) >= rest + 30000
+                            && rig.timeOf(firstMove) - (rest + 30000) <= 300 && fwd != null && fwd.t == rig.timeOf(firstMove)
+                            && free > fwd.t && rig.countPrefix("turn", rest + 1, free + 1) == 0
+                            && firstDrive(rig, "HOP", "hop", free) != null && rig.violations.isEmpty(),
+                    "rest@" + rest + " first=" + rig.what(firstMove) + "@" + rig.timeOf(firstMove) + " free@" + free
+                            + " " + rig.tail());
+        });
+        scenario("forward_first_after_a_rest_facing_a_blocked_way_still_turns_and_rests_longer", n -> {
+            // Pinned: the forward try goes nowhere, then the wider turn and the still-pinned
+            // rest as before; with an obstacle in front, no forward try at all, only the turn.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            runUntil(rig, 60000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            long rest = rig.now;
+            rig.runUntil(rest + 30000 + 15000 + 61000);
+            int firstMove = rig.firstMotionAfter(rest + 1);
+            long blocked = -1;
+            for (long t : notedTimes(notes, "short leg forward blocked")) {
+                if (blocked < 0 && t >= rest + 30000) {
+                    blocked = t;
+                }
+            }
+            int turn = rig.firstAfter("turn", rest + 30000);
+            List<Long> rests = entries(rig, ExploreBrain.State.CORNERED);
+
+            List<String> notes2 = new ArrayList<String>();
+            Rig[] h = new Rig[1];
+            Rig rig2 = escRig(escTuning().turnChance(1.0), h, t -> {
+                Rig r = h[0];
+                return r != null && r.statesSeen.contains(ExploreBrain.State.CORNERED) ? obstacle(t) : clear(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig2.creepPer100 = 0;
+            rig2.brain.setTrace(x -> notes2.add(h[0].now + " " + x));
+            pin(rig2, true);
+            rig2.blockedFrom = 0;
+            rig2.started();
+            runUntil(rig2, 60000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            long rest2 = rig2.now;
+            rig2.runUntil(rest2 + 30000 + 3000);
+            int firstMove2 = rig2.firstMotionAfter(rest2 + 1);
+            check(n, rig.what(firstMove).equals("hop") && blocked > rest + 30000 && turn > 0 && rig.timeOf(turn) > blocked
+                            && rests.size() >= 2 && restLength(rig, rests.get(1)) == 60000
+                            && notesWith(notes, "free after") == 0 && rig2.what(firstMove2).startsWith("turn")
+                            && notesWith(notes2, "trying a short leg forward first: after the rest") == 0
+                            && rig.violations.isEmpty() && rig2.violations.isEmpty(),
+                    "first=" + rig.what(firstMove) + " blocked@" + blocked + " turn@" + rig.timeOf(turn) + " rests=" + rests
+                            + " first2=" + rig2.what(firstMove2) + " " + rig2.tail());
+        });
+        scenario("forward_first_when_an_escape_step_runs_out_of_time_facing_clear_floor", n -> {
+            // The circle's third look never comes (the frames go stale), so the circle runs
+            // out of time two turns round, facing floor nothing has blocked: forward first.
+            Rig[] h = new Rig[1];
+            Feed b = bumps(h, 3);
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10).escapeBudgets(6000, 4000, 6000, 3000, 6000), h, t -> {
+                Rig r = h[0];
+                if (r != null) {
+                    r.staleLooks = r.brain.state() == ExploreBrain.State.CIRCLE && !Double.isNaN(r.circleFrom)
+                            && Math.abs(Heading.delta(r.yaw.wrapped(), r.circleFrom)) >= 100;
+                }
+                return b.at(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 90000, r -> notedAt(notes, "free after") >= 0);
+            long late = notedAt(notes, "escape's CIRCLE out of time");
+            int hop = rig.firstAfter("hop", late);
+            Drive fwd = firstDrive(rig, "DRIVE_OFF", "hop", late);
+            check(n, late > 0 && hop >= 0 && rig.timeOf(hop) - late <= 300 && fwd != null && fwd.t == rig.timeOf(hop)
+                            && notedAt(notes, "a short leg forward drove cleanly") > late
+                            && entered(rig, ExploreBrain.State.WAY_OUT, 0) < 0 && rig.wayOutRequests.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "late@" + late + " hop@" + rig.timeOf(hop) + " notes=" + notes.subList(Math.max(0, notes.size() - 8),
+                            notes.size()) + " " + rig.tail());
+        });
+    }
+
+    // ---- the avoided side, at the motor (live 2026-09-25: "he only tries turning left") ----
+
+    /** Each turn command's direction, in order, with its time: {t, +1 LEFT / -1 RIGHT}. */
+    private static List<long[]> turnCommands(Rig rig, long from, long to) {
+        List<long[]> out = new ArrayList<long[]>();
+        for (Event e : rig.log) {
+            if (e.t >= from && e.t < to && e.what.startsWith("turn ")) {
+                out.add(new long[]{e.t, e.what.equals("turn LEFT") ? 1 : -1});
+            }
+        }
+        return out;
+    }
+
+    /** Times of each note containing part. */
+    private static List<Long> notedTimes(List<String> notes, String part) {
+        List<Long> out = new ArrayList<Long>();
+        for (String x : notes) {
+            if (x.contains(part)) {
+                out.add(Long.parseLong(x.substring(0, x.indexOf(' '))));
+            }
+        }
+        return out;
+    }
+
+    /** After each blocked LEFT turn, the next turn command is RIGHT; returns the offending times. */
+    private static List<Long> leftAfterBlockedLeft(Rig rig, List<String> notes) {
+        List<Long> bad = new ArrayList<Long>();
+        List<long[]> turns = turnCommands(rig, 0, Long.MAX_VALUE);
+        for (long bt : notedTimes(notes, "measured turn blocked")) {
+            long[] last = null;
+            long[] next = null;
+            for (long[] c : turns) {
+                if (c[0] <= bt) {
+                    last = c;
+                } else if (next == null) {
+                    next = c;
+                }
+            }
+            if (last != null && last[1] == 1 && next != null && next[1] == 1) {
+                bad.add(bt);
+            }
+        }
+        return bad;
+    }
+
+    private static void sideScenarios() {
+        scenario("side_left_blocked_roaming_retry_commands_right_every_time", n -> {
+            // Only LEFT is blocked; RIGHT, reversing and driving are free.
+            Rig rig = new Rig(escTuning().turnChance(1.0).build(), CLEAR, NOTHING, true);
+            rig.simWheels = true;
+            rig.yaw.stuckDir = 1;
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(90000);
+            List<Long> blocked = notedTimes(notes, "measured turn blocked");
+            List<Long> bad = leftAfterBlockedLeft(rig, notes);
+            boolean escaped = false;
+            for (ExploreBrain.State st : rig.statesSeen) {
+                escaped |= ESCAPING.contains(st);
+            }
+            // A blocked turn with a leg behind him to back out along still wedges him (U5);
+            // only the directions matter here.
+            check(n, blocked.size() >= 3 && bad.isEmpty() && rig.violations.isEmpty(),
+                    "blocked=" + blocked + " bad=" + bad + " escaped=" + escaped + " " + rig.tail());
+        });
+        scenario("side_left_blocked_escape_ladder_commands_no_left_turn_until_free", n -> {
+            // Wedged by bumps with LEFT blocked for good and nothing behind him giving: once a
+            // LEFT turn has been blocked, every turn the ladder commands (retrace, circle,
+            // drive-off, retries) is RIGHT, the long way round where it must be, until free.
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
+            rig.yaw.stuckDir = 1;
+            rig.backBlocked = true;
+            rig.openView = openAt(90);
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 120000, r -> notedAt(notes, "free after") >= 0 || r.brain.state() == ExploreBrain.State.CORNERED);
+            long wedged = entered(rig, ExploreBrain.State.RETRACE, 0);
+            long firstBlocked = -1;
+            for (long t : notedTimes(notes, "measured turn blocked")) {
+                if (firstBlocked < 0 && t >= wedged) {
+                    firstBlocked = t;
+                }
+            }
+            long end = notedAt(notes, "free after") >= 0 ? notedAt(notes, "free after") : rig.now;
+            int lefts = 0;
+            int rights = 0;
+            for (long[] c : turnCommands(rig, firstBlocked + 1, end + 1)) {
+                lefts += c[1] == 1 ? 1 : 0;
+                rights += c[1] == -1 ? 1 : 0;
+            }
+            check(n, wedged > 0 && firstBlocked > 0 && lefts == 0 && rights >= 2 && rig.violations.isEmpty(),
+                    "wedged@" + wedged + " blocked@" + firstBlocked + " lefts=" + lefts + " rights=" + rights + " "
+                            + rig.tail());
+        });
+        scenario("side_left_blocked_the_turn_after_a_rest_and_the_next_ladder_go_right", n -> {
+            // Pinned for driving (forward and back go nowhere), turns blocked LEFT only: the
+            // ladder fails, and after the rest (its forward try blocked) the wider turn, the
+            // still-pinned rest and the next ladder never command LEFT.
+            // Legs long enough (3 s) for the stall watch to rule, so stalls wedge him.
+            List<String> notes = new ArrayList<String>();
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().turnChance(1.0).hopTicks(12), h, CLEAR,
+                    (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            pin(rig, true);
+            rig.blockedFrom = 0;
+            rig.yaw.stuck = false;
+            rig.yaw.stuckDir = 1;
+            rig.started();
+            runUntil(rig, 120000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            long rest = entered(rig, ExploreBrain.State.CORNERED, 0);
+            rig.runUntil(Math.max(rest, 0) + 30000 + 120000);
+            long firstBlocked = notedTimes(notes, "measured turn blocked").isEmpty() ? -1
+                    : notedTimes(notes, "measured turn blocked").get(0);
+            int turn = rig.firstAfter("turn", rest + 30000);
+            int lefts = 0;
+            for (long[] c : turnCommands(rig, firstBlocked + 1, Long.MAX_VALUE)) {
+                lefts += c[1] == 1 ? 1 : 0;
+            }
+            check(n, rest > 0 && firstBlocked > 0 && firstBlocked < rest && rig.what(turn).equals("turn RIGHT") && lefts == 0
+                            && entries(rig, ExploreBrain.State.RETRACE).size() >= 2
+                            && notesWith(notes, "free after") == 0 && rig.violations.isEmpty(),
+                    "rest@" + rest + " blocked@" + firstBlocked + " turn=" + rig.what(turn) + " lefts=" + lefts + " "
+                            + rig.tail());
+        });
+        scenario("side_both_blocked_alternates_instead_of_one_side_for_ever", n -> {
+            // Every turn blocked: the retries and ladders go back and forth, not LEFT every time.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            rig.runUntil(120000);
+            List<long[]> turns = turnCommands(rig, 0, Long.MAX_VALUE);
+            int lefts = 0;
+            int rights = 0;
+            for (long[] c : turns) {
+                lefts += c[1] == 1 ? 1 : 0;
+                rights += c[1] == -1 ? 1 : 0;
+            }
+            check(n, turns.size() >= 4 && lefts >= 2 && rights >= 2 && rig.violations.isEmpty(),
+                    "lefts=" + lefts + " rights=" + rights + " " + rig.tail());
         });
     }
 
@@ -4208,31 +4569,42 @@ public final class ExploreBrainHarness {
                             + none + " " + odd);
         });
         scenario("escape_full_budgets_drive_off_within_30_s_of_wedged", n -> {
-            // The shipped budgets; slow turns (25 deg/s) make the retrace's turn and the circle
-            // run out of time, and Claude answers just inside its own (the last frame, ahead).
+            // The shipped budgets and turn rates, turning at 25 deg/s. Before steps covered
+            // their turns, the retrace's turn and the circle ran out of time here (their 6 s
+            // and 12 s only, drive-off by 30 s). Now each step's budget adds its turns at the
+            // learned 25 deg/s, and a turn still turning is never cut: the retrace turns round
+            // (its drive meets a hazard), the circle takes all six looks past its fixed 12 s,
+            // and the drive-off comes within the target scaled the same way: the 27 s of fixed
+            // allowances (the ~30 s target at the default turn rate) plus the ladder's turns
+            // (retrace 180, circle 300, drive-off up to 180 deg) at 25 deg/s.
             ExploreTuning d = new ExploreTuning.Builder().build();
             Rig[] h = new Rig[1];
             ExploreTuning.Builder b = escTuning()
                     .escapeBudgets(d.escapeRetraceMs, d.escapeCircleMs, d.escapeAskMs, d.escapeDriveOffMs,
                             d.escapeSecondAskMs)
-                    .escapeCircle(d.escapeCircleSteps, d.escapeCircleStepDeg, d.escapeSettleMs);
-            Rig rig = escRig(b, h, bumps(h, 3),
-                    (r, req, nth) -> CuriosityPort.WayOut.way(req.frames.size() - 1, 0f));
+                    .escapeCircle(d.escapeCircleSteps, d.escapeCircleStepDeg, d.escapeSettleMs)
+                    .escapeTurnRate(d.escapeTurnRateDegS, d.escapeTurnRateFloorDegS, d.escapeTurnAllowanceMaxMs);
+            List<String> notes = new ArrayList<String>();
+            Rig rig = escRig(b, h, bumpsThen(h, 3, r -> r.brain.state() == ExploreBrain.State.RETRACE),
+                    (r, req, nth) -> CuriosityPort.WayOut.way(3, 0f));
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
             rig.wayOutDelayMs = 5900;
             rig.yaw.rateDegS = 25;
             rig.started();
-            runUntil(rig, 120000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null);
+            runUntil(rig, 150000, r -> firstDrive(r, "DRIVE_OFF", "hop", 0) != null);
             long wedged = entered(rig, ExploreBrain.State.RETRACE, 0);
             long circle = entered(rig, ExploreBrain.State.CIRCLE, 0);
             long ask = entered(rig, ExploreBrain.State.WAY_OUT, 0);
             long answer = rig.timeOf(rig.first("way-out answer", 0));
             Drive off = firstDrive(rig, "DRIVE_OFF", "hop", 0);
             long sum = d.escapeRetraceMs + d.escapeCircleMs + d.escapeAskMs + d.escapeDriveOffMs;
-            check(n, wedged > 0 && off != null && off.t - wedged <= 30000 && circle - wedged >= 5900
-                            && ask - circle >= 11900 && answer - ask >= 5800 && sum >= 25000 && sum <= 30000
+            long target = sum + Math.round((180 + 300 + 180) * 1000.0 / 25);
+            check(n, wedged > 0 && circle > wedged && off != null && off.t - wedged <= target
+                            && ask - circle > d.escapeCircleMs && answer - ask >= 5800 && notesWith(notes, "out of time") == 0
+                            && notesWith(notes, "circle look 6 of 6") == 1 && sum >= 25000 && sum <= 30000
                             && d.escapeCircleSteps == 6 && d.escapeCircleStepDeg == 60 && rig.violations.isEmpty(),
                     "wedged@" + wedged + " circle@" + circle + " ask@" + ask + " answer@" + answer + " off=" + off
-                            + " " + rig.tail());
+                            + " target=" + target + " " + rig.tail());
         });
         scenario("escape_second_ask_is_sent_once_per_escape", n -> {
             Rig[] h = new Rig[1];
@@ -4487,10 +4859,15 @@ public final class ExploreBrainHarness {
             rig.backBlocked = true;
             rig.openView = deskView();
             rig.started();
-            runUntil(rig, 30000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
+            // Driving forward is free here, so the first ladder ends in a forward try once a
+            // step fails (forward first), not always in the rest: only its back moves count.
+            runUntil(rig, 30000, r -> r.brain.state() == ExploreBrain.State.CORNERED
+                    || entries(r, ExploreBrain.State.RETRACE).size() >= 2);
+            List<Long> ladders = entries(rig, ExploreBrain.State.RETRACE);
+            long ladderEnd = ladders.size() >= 2 ? ladders.get(1) : Long.MAX_VALUE;
             List<Drive> backs = new ArrayList<Drive>();
             for (Drive d : rig.drives) {
-                if (d.kind.equals("back")) {
+                if (d.kind.equals("back") && d.t < ladderEnd) {
                     backs.add(d);
                 }
             }
@@ -4503,8 +4880,8 @@ public final class ExploreBrainHarness {
                 restShort &= backs.get(i).end - backs.get(i).t <= rig.tuning.blockedTurnBackTicks * 250 + 100;
             }
             check(n, first != null && first.state.equals("RETRACE") && took >= 900 && took <= 1500
-                            && Math.abs(first.counts) <= 2 && restShort
-                            && rig.brain.state() == ExploreBrain.State.CORNERED && rig.violations.isEmpty(),
+                            && Math.abs(first.counts) <= 2 && restShort && (ladders.size() >= 2
+                            || rig.brain.state() == ExploreBrain.State.CORNERED) && rig.violations.isEmpty(),
                     "backs=" + backs + " " + rig.tail());
         });
         // ---- a blocked side: the retry and later turns go the other way (live 2026-09-25) ----

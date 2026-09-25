@@ -247,6 +247,20 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "pinned_runs_the_ladder_once_with_two_asks_then_rests",
         "pinned_after_the_rest_waits_longer_before_the_next_ladder",
         "pinned_backoff_resets_after_a_clean_drive_off",
+        # A step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, drive-off cut mid-turn)
+        "budget_drive_off_turn_at_40_deg_s_completes_and_drives_off",
+        "budget_slow_but_progressing_turn_is_never_cut_by_the_step_budget",
+        "budget_blocked_drive_off_turn_still_fails_the_step_within_1_5_s",
+        "budget_turn_rate_defaults_35_deg_s_floor_15_and_the_rate_is_learned",
+        # Forward first: after a rest, and when a step ends, facing clear floor (live 2026-09-25)
+        "forward_first_after_a_rest_facing_open_floor_drives_forward_instead_of_turning",
+        "forward_first_after_a_rest_facing_a_blocked_way_still_turns_and_rests_longer",
+        "forward_first_when_an_escape_step_runs_out_of_time_facing_clear_floor",
+        # The avoided side, at the motor (live 2026-09-25: "he only tries turning left")
+        "side_left_blocked_roaming_retry_commands_right_every_time",
+        "side_left_blocked_escape_ladder_commands_no_left_turn_until_free",
+        "side_left_blocked_the_turn_after_a_rest_and_the_next_ladder_go_right",
+        "side_both_blocked_alternates_instead_of_one_side_for_ever",
         # A blocked side: the retry and later turns go the other way (live 2026-09-25)
         "blocked_side_backs_up_then_turns_the_other_way_and_drives_off",
         "blocked_side_escape_turns_go_the_unblocked_way_even_the_long_way_round",

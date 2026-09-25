@@ -87,6 +87,9 @@ final class Heading {
     private long stoppedAt;
     private double overshoot;
     private double[] result;
+    /** When the current turn started (the brain's clock), and the learned turn rate (NaN: none yet). */
+    private long turnStartMs = -1;
+    private double rateDegS = Double.NaN;
 
     private final ArrayDeque<Leg> legs = new ArrayDeque<Leg>();
     private boolean legOpen;
@@ -200,7 +203,13 @@ final class Heading {
 
     /** The motor has just started turning dir; it should turn amountDeg in all. */
     void startTurn(int dir, double amountDeg) {
+        startTurn(dir, amountDeg, lastGyroMs);
+    }
+
+    /** As above, started at nowMs: its degrees over its time teach the turn rate (turnRateDegS). */
+    void startTurn(int dir, double amountDeg, long nowMs) {
         finishCoast();
+        turnStartMs = nowMs;
         turning = true;
         turnDir = dir;
         turnAmount = amountDeg;
@@ -220,6 +229,7 @@ final class Heading {
     /** The motor stopped: a turn in progress starts coasting; an open leg ends with the next reading. */
     void stopped(long nowMs) {
         if (turning) {
+            learnRate(nowMs);
             turning = false;
             coasting = true;
             turnedAtStop = turned;
@@ -228,6 +238,28 @@ final class Heading {
         if (legOpen) {
             legClosing = true;
         }
+    }
+
+    /**
+     * The turn rate recent measured turns made, degrees turned over the time they
+     * took (spin-up included), each turn moving it halfway; NaN before the first
+     * turn of at least RATE_MIN_DEG in RATE_MIN_MS. Carpet or a low battery slow him
+     * (live 2026-09-25: ~40 deg/s), and the escape's step budgets follow it.
+     */
+    double turnRateDegS() {
+        return rateDegS;
+    }
+
+    private static final double RATE_MIN_DEG = 20;
+    private static final long RATE_MIN_MS = 300;
+
+    private void learnRate(long nowMs) {
+        long ms = nowMs - turnStartMs;
+        if (turnStartMs < 0 || ms < RATE_MIN_MS || turned < RATE_MIN_DEG) {
+            return;
+        }
+        double seen = turned * 1000.0 / ms;
+        rateDegS = Double.isNaN(rateDegS) ? seen : rateDegS + 0.5 * (seen - rateDegS);
     }
 
     /** The last finished turn once, as {amount asked, turned, overshoot now}; else null. */
