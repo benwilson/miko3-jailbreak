@@ -30,7 +30,7 @@ HARNESS = TESTS / "fixtures" / "explore_brain_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHarness.java"
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
-              "ExplorePrompts.java", "Openness.java", "Brightness.java")
+              "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -190,6 +190,18 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "meet_hazard_on_the_way_to_a_person_drops_the_meet",
         "claude_line_older_than_the_freshness_window_is_not_spoken",
         "claude_hazard_mid_speak_neither_cuts_nor_repeats_the_line",
+        # Heading, measured turns and the leg log (explore nav plan U2, KTD1)
+        "heading_turn_takes_the_shorter_way_across_0_360",
+        "heading_bias_drift_is_re_estimated_at_each_stop",
+        "heading_motion_during_a_stop_leaves_the_bias_alone",
+        "measured_90_degree_turn_without_bias_error_ends_within_tolerance",
+        "measured_turn_overshoot_is_learned_and_the_next_turn_is_closer",
+        "stalled_leg_logs_no_distance_for_the_stalled_time",
+        "clean_drive_off_restarts_the_leg_log",
+        "uncalibrated_turns_stay_timed_even_with_gyro_readings",
+        "calibrated_without_gyro_in_the_readings_turns_stay_timed",
+        "measured_escape_turn_turns_its_angle_not_its_time",
+        "measured_orient_turns_to_the_picked_looks_heading_plus_its_offset",
     )
 
     @classmethod

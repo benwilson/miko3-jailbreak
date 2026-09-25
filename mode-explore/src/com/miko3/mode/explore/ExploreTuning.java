@@ -31,7 +31,7 @@ final class ExploreTuning {
     /** Discretionary turn length, drawn from [turnMinMs, turnMaxMs]; short ones read as a glance around (R2). */
     final long turnMinMs;
     final long turnMaxMs;
-    /** Turn away from a hazard. There is no heading feedback, so a turn is only ever a duration (KTD5). */
+    /** Turn away from a hazard, as a duration: used while the gyro is uncalibrated (KTD5; explore nav plan U2). */
     final long escapeTurnMs;
     /** The larger turn tried after a cornered cool-down (KTD8). */
     final long corneredTurnMs;
@@ -175,6 +175,48 @@ final class ExploreTuning {
     final long reopenGapMs;
     /** Edge and obstacle thresholds from the device, or null when uncalibrated (KTD9). */
     final Calibration calibration;
+    /**
+     * The gyro's yaw calibration from the device (explore nav plan U1), or null:
+     * then every turn is the timed duration above, as before U2.
+     */
+    final ExploreCalibration.Gyro gyro;
+    /**
+     * The heading tracker (explore nav plan U2, KTD1). A stop's bias samples start
+     * headingSettleMs after the wheels stood still with nothing commanded; the bias
+     * is their mean once there are biasSamplesMin (readings are ~100 ms apart).
+     */
+    final long headingSettleMs;
+    final int biasSamplesMin;
+    /**
+     * Measured turns: an angle within turnToleranceDeg needs no turn; turnBackstopMs
+     * ends any measured turn that never gets there (a turn blocked by something).
+     * The coast after a stop is learned: after each turn the overshoot moves
+     * overshootGain of the way toward what was seen once the coast has died down
+     * (or overshootSettleMs), capped at overshootMaxDeg.
+     */
+    final double turnToleranceDeg;
+    final long turnBackstopMs;
+    final double overshootGain;
+    final double overshootMaxDeg;
+    final long overshootSettleMs;
+    /**
+     * The measured twins of the timed turns above, used once the gyro is calibrated:
+     * discretionary turns, the escape turn's minimum, the cornered turn, the stall
+     * turn and its step, a full escape sweep, and the scan step. The timed defaults
+     * assumed about 60 deg/s (escapeSweepMaxMs's "6 s is about a full circle").
+     */
+    final double turnMinDeg;
+    final double turnMaxDeg;
+    final double escapeTurnDeg;
+    final double corneredTurnDeg;
+    final double stallTurnDeg;
+    final double stallTurnStepDeg;
+    final double escapeSweepDeg;
+    final double scanTurnDeg;
+    /** Half the camera's horizontal view: a box at the frame's edge is this far off ahead. */
+    final double cameraHalfFovDeg;
+    /** The leg log's length (KTD6): the oldest legs drop off. */
+    final int legsMax;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -250,11 +292,34 @@ final class ExploreTuning {
         pickMatchIou = b.pickMatchIou;
         reopenGapMs = b.reopenGapMs;
         calibration = b.calibration;
+        gyro = b.gyro;
+        headingSettleMs = b.headingSettleMs;
+        biasSamplesMin = Math.max(1, b.biasSamplesMin);
+        turnToleranceDeg = b.turnToleranceDeg;
+        turnBackstopMs = b.turnBackstopMs;
+        overshootGain = b.overshootGain;
+        overshootMaxDeg = b.overshootMaxDeg;
+        overshootSettleMs = b.overshootSettleMs;
+        turnMinDeg = b.turnMinDeg;
+        turnMaxDeg = Math.max(b.turnMinDeg, b.turnMaxDeg);
+        escapeTurnDeg = b.escapeTurnDeg;
+        corneredTurnDeg = b.corneredTurnDeg;
+        stallTurnDeg = b.stallTurnDeg;
+        stallTurnStepDeg = b.stallTurnStepDeg;
+        escapeSweepDeg = Math.max(b.escapeTurnDeg, b.escapeSweepDeg);
+        scanTurnDeg = b.scanTurnDeg;
+        cameraHalfFovDeg = b.cameraHalfFovDeg;
+        legsMax = Math.max(1, b.legsMax);
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
     static ExploreTuning defaults(Calibration calibration) {
-        return new Builder().calibration(calibration).build();
+        return defaults(calibration, null);
+    }
+
+    /** The shipped defaults with the floor calibration and the gyro's (either may be null). */
+    static ExploreTuning defaults(Calibration calibration, ExploreCalibration.Gyro gyro) {
+        return new Builder().calibration(calibration).gyro(gyro).build();
     }
 
     /**
@@ -389,6 +454,31 @@ final class ExploreTuning {
         private float pickMatchIou = 0.3f;
         private long reopenGapMs = 3000;
         private Calibration calibration;
+        private ExploreCalibration.Gyro gyro;
+        // Readings come ~100 ms apart; the stationary fixture's bias drifts by a
+        // count or two, so a few samples after half a second of stillness will do.
+        private long headingSettleMs = 500;
+        private int biasSamplesMin = 3;
+        // About one reading's step at 60 deg/s; the robot check wants four 90 deg
+        // turns back within 15 deg (plan U2 verification).
+        private double turnToleranceDeg = 5;
+        private long turnBackstopMs = 15000;
+        private double overshootGain = 0.5;
+        private double overshootMaxDeg = 45;
+        private long overshootSettleMs = 1000;
+        // The timed defaults at ~60 deg/s: 300-900 ms, 1200 ms, 2400 ms, 2000 + 1000 ms, 700 ms.
+        private double turnMinDeg = 20;
+        private double turnMaxDeg = 55;
+        private double escapeTurnDeg = 70;
+        private double corneredTurnDeg = 145;
+        private double stallTurnDeg = 120;
+        private double stallTurnStepDeg = 60;
+        private double escapeSweepDeg = 360;
+        private double scanTurnDeg = 40;
+        // Not measured on this camera: "right third" of the frame is about 20 deg
+        // right (explore nav plan U6), i.e. a 60 deg view.
+        private double cameraHalfFovDeg = 30;
+        private int legsMax = 16;
 
         /** A fixed leg length. */
         Builder hopTicks(int v) { hopTicks = v; hopTicksMax = v; return this; }
@@ -492,6 +582,34 @@ final class ExploreTuning {
         Builder pickMatchIou(float v) { pickMatchIou = v; return this; }
         Builder reopenGapMs(long v) { reopenGapMs = v; return this; }
         Builder calibration(Calibration v) { calibration = v; return this; }
+        Builder gyro(ExploreCalibration.Gyro v) { gyro = v; return this; }
+        Builder heading(long settleMs, int biasSamples) {
+            headingSettleMs = settleMs;
+            biasSamplesMin = biasSamples;
+            return this;
+        }
+        Builder measuredTurns(double toleranceDeg, long backstopMs) {
+            turnToleranceDeg = toleranceDeg;
+            turnBackstopMs = backstopMs;
+            return this;
+        }
+        Builder overshoot(double gain, double maxDeg, long settleMs) {
+            overshootGain = gain;
+            overshootMaxDeg = maxDeg;
+            overshootSettleMs = settleMs;
+            return this;
+        }
+        Builder turnDeg(double min, double max) { turnMinDeg = min; turnMaxDeg = max; return this; }
+        Builder escapeDeg(double turn, double cornered, double sweep) {
+            escapeTurnDeg = turn;
+            corneredTurnDeg = cornered;
+            escapeSweepDeg = sweep;
+            return this;
+        }
+        Builder stallTurnDeg(double turn, double step) { stallTurnDeg = turn; stallTurnStepDeg = step; return this; }
+        Builder scanTurnDeg(double v) { scanTurnDeg = v; return this; }
+        Builder cameraHalfFovDeg(double v) { cameraHalfFovDeg = v; return this; }
+        Builder legsMax(int v) { legsMax = v; return this; }
 
         ExploreTuning build() {
             return new ExploreTuning(this);

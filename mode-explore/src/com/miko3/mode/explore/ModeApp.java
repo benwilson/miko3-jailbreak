@@ -149,7 +149,14 @@ public class ModeApp extends Application {
             Log.i(TAG, calibration == null
                     ? "no sensor calibration -- eyes only until scripts/qa-explore-mode.py calibrates"
                     : "sensor calibration: " + calibration);
-            final ExploreTuning tuning = ExploreTuning.defaults(calibration);
+            // Measured turns and the leg log need the gyro's capture (explore nav plan U1, U2);
+            // without it every turn stays timed.
+            ExploreCalibration.Gyro gyro =
+                    ExploreCalibration.readGyro(new File(getFilesDir(), ExploreCalibration.FILE_NAME));
+            Log.i(TAG, gyro == null
+                    ? "no gyro calibration -- timed turns until qa-explore-sensors.py --gyro-circle"
+                    : "gyro calibration: " + gyro);
+            final ExploreTuning tuning = ExploreTuning.defaults(calibration, gyro);
             clips = new ClipPlayer(this);
             // Opened only during curiosity stops (camera curiosity KTD3); the
             // recognizer loads on the camera's detect thread on first use.

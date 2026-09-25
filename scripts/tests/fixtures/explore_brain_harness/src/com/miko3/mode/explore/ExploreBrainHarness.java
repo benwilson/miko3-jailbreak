@@ -90,6 +90,103 @@ public final class ExploreBrainHarness {
         SensorReading at(long t);
     }
 
+    /** The robot's measured gyro calibration (explore nav plan U1, 2026-09-25): z, +1, 23199.53. */
+    static ExploreCalibration.Gyro robotGyro() {
+        return new ExploreCalibration.Gyro(2, 1, 23199.53);
+    }
+
+    /**
+     * A simulated yaw (explore nav plan U2): the true heading turns at rateDegS while
+     * the motor turns, then coasts coastDeg further after a stop (the overshoot). Each
+     * reading carries the mean rate since the previous one as raw counts on the
+     * calibration's axis, plus biasCounts (or biasAt(t)). Left is positive.
+     */
+    static class YawSim {
+        final ExploreCalibration.Gyro gyro;
+        double rateDegS = 60;
+        double biasCounts = 92;
+        double coastDeg;
+        /** Unwrapped, left positive, starting at 0. */
+        double trueDeg;
+        int dir;
+        int coastDir;
+        double coastLeft;
+        double lastReadDeg;
+        long lastReadT = -1;
+        double turnStartDeg;
+        boolean resultPending;
+        /** Each turn's true signed change, coast included, in order. */
+        final List<Double> turnResults = new ArrayList<Double>();
+
+        YawSim(ExploreCalibration.Gyro gyro) {
+            this.gyro = gyro;
+        }
+
+        double biasAt(long t) {
+            return biasCounts;
+        }
+
+        void turn(int d) {
+            finish();
+            dir = d;
+            coastLeft = 0;
+            turnStartDeg = trueDeg;
+            resultPending = true;
+        }
+
+        void stop() {
+            if (dir != 0) {
+                coastDir = dir;
+                coastLeft = coastDeg;
+            }
+            dir = 0;
+            if (coastLeft <= 0) {
+                finish();
+            }
+        }
+
+        /** Moves the true heading on by ms of motion at rateDegS. */
+        void advance(long ms) {
+            double s = rateDegS * ms / 1000.0;
+            if (dir != 0) {
+                trueDeg += dir * s;
+            } else if (coastLeft > 0) {
+                double m = Math.min(coastLeft, s);
+                trueDeg += coastDir * m;
+                coastLeft -= m;
+                if (coastLeft <= 0) {
+                    finish();
+                }
+            }
+        }
+
+        void finish() {
+            if (resultPending) {
+                turnResults.add(trueDeg - turnStartDeg);
+                resultPending = false;
+            }
+        }
+
+        /** The raw yaw rate a reading at t carries. */
+        int rawAt(long t) {
+            double rate = lastReadT < 0 || t <= lastReadT ? 0 : (trueDeg - lastReadDeg) * 1000.0 / (t - lastReadT);
+            lastReadDeg = trueDeg;
+            lastReadT = t;
+            return (int) Math.round(biasAt(t) + gyro.sign * rate * gyro.countSecondsPer360 / 360.0);
+        }
+
+        /** r with this sim's gyro (and the given wheel counts). */
+        SensorReading wrap(SensorReading r, long wl, long wr) {
+            int raw = rawAt(r.timestampMs);
+            return new SensorReading(r.timestampMs, r.tof, r.ir1, r.ir2, r.cpl, r.fault, wl, wr,
+                    gyro.axis == 0 ? raw : 0, gyro.axis == 1 ? raw : 0, gyro.axis == 2 ? raw : 0);
+        }
+
+        double wrapped() {
+            return Heading.wrap(trueDeg);
+        }
+    }
+
     /** Something to do to the brain at a scheduled moment (lease changes, shutdown). */
     static final class Action {
         final long at;
@@ -176,6 +273,18 @@ public final class ExploreBrainHarness {
         final java.util.Set<Integer> legLengths = new java.util.TreeSet<Integer>();
         /** Set by a scenario: the next hopTick reports the lease lost from inside the call. */
         boolean loseLeaseInsideHop;
+        /** The yaw model (explore nav plan U2): on whenever the tuning carries a gyro calibration;
+         * a scenario may add one to an uncalibrated brain. Null: readings carry no gyro. */
+        YawSim yaw;
+        /** Simulated encoders: 1 count per wheel per 10 ms driving, creepPer100 per 100 ms once blocked. */
+        boolean simWheels;
+        long blockedFrom = Long.MAX_VALUE;
+        int creepPer100 = 2;
+        long wheelLeft = 50000;
+        long wheelRight = 40000;
+        String motion;
+        /** Wheel counts (per wheel) driven forward before blockedFrom. */
+        long countsBeforeBlocked;
 
         /** The fake camera: a look every 500 ms while open, captured 200 ms before it arrives. */
         final Vision vision;
@@ -247,6 +356,27 @@ public final class ExploreBrainHarness {
             this.brain = claude == null
                     ? new ExploreBrain(tuning, this, this, this, this, this, new Random(1))
                     : new ExploreBrain(tuning, this, this, this, this, this, this, new Random(1));
+            this.yaw = tuning.gyro == null ? null : new YawSim(tuning.gyro);
+        }
+
+        /** One 10 ms step of the simulated wheels. */
+        private void advanceWheels() {
+            if ("hop".equals(motion)) {
+                if (now <= blockedFrom) {
+                    wheelLeft++;
+                    wheelRight++;
+                    countsBeforeBlocked++;
+                } else if (now % 100 == 0) {
+                    wheelLeft += creepPer100;
+                    wheelRight += creepPer100;
+                }
+            } else if ("back".equals(motion)) {
+                wheelLeft--;
+                wheelRight--;
+            } else if ("turn".equals(motion)) {
+                wheelLeft--;
+                wheelRight++;
+            }
         }
 
         /** The usual start: brain up, lease granted at once. */
@@ -264,6 +394,12 @@ public final class ExploreBrainHarness {
         void runUntil(long until) {
             while (now < until) {
                 now += 10;
+                if (yaw != null) {
+                    yaw.advance(10);
+                }
+                if (simWheels) {
+                    advanceWheels();
+                }
                 for (Action a : actions) {
                     if (a.at == now) {
                         a.run.run();
@@ -278,6 +414,12 @@ public final class ExploreBrainHarness {
                 }
                 if (now % 100 == 0) {
                     SensorReading r = feed.at(now);
+                    if (r != null && (yaw != null || simWheels)) {
+                        long wl = simWheels ? wheelLeft : r.wheelLeft;
+                        long wr = simWheels ? wheelRight : r.wheelRight;
+                        r = yaw != null ? yaw.wrap(r, wl, wr)
+                                : new SensorReading(r.timestampMs, r.tof, r.ir1, r.ir2, r.cpl, r.fault, wl, wr);
+                    }
                     if (r != null) {
                         lastFed = r;
                         brain.onReading(r);
@@ -355,6 +497,7 @@ public final class ExploreBrainHarness {
                 hopTicksThisHop = 0;
             }
             moving = true;
+            motion = "hop";
             hopTicksThisHop++;
             maxHopTicks = Math.max(maxHopTicks, hopTicksThisHop);
             log.add(new Event(now, "hop"));
@@ -371,18 +514,27 @@ public final class ExploreBrainHarness {
             }
             checkStart("turn", false);
             moving = true;
+            motion = "turn";
+            if (yaw != null) {
+                yaw.turn(d == ExploreBrain.Direction.LEFT ? 1 : -1);
+            }
             log.add(new Event(now, "turn " + d));
         }
 
         @Override
         public void backTick() {
             moving = true;
+            motion = "back";
             log.add(new Event(now, "back"));
         }
 
         @Override
         public void stop() {
             moving = false;
+            motion = null;
+            if (yaw != null) {
+                yaw.stop();
+            }
             log.add(new Event(now, "stop"));
         }
 
@@ -708,6 +860,7 @@ public final class ExploreBrainHarness {
         faceCropScenarios();
         liveFixScenarios();
         hazardDuringPickScenarios();
+        headingScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -2643,6 +2796,315 @@ public final class ExploreBrainHarness {
                             && missing.status == CuriosityPort.Named.Status.FAILED
                             && ClaudeReplies.fill("Hi {name}!", "Sam").equals("Hi Sam!"),
                     "ok=" + ok.status + " none=" + none.status + " sentence=" + sentence.status);
+        });
+    }
+
+    // ---- heading, measured turns and the leg log (explore nav plan U2) ----
+
+    /** The scripted tuning with the robot's gyro calibration: measured turns. */
+    private static ExploreTuning.Builder gyroTuning() {
+        return tuning().gyro(robotGyro());
+    }
+
+    /** Drives a Heading on its own: 10 ms steps, a reading every 100 ms, like the Rig. */
+    static final class Bench {
+        final Heading h;
+        final YawSim yaw;
+        long now;
+        boolean commanded;
+        boolean wheelsTurning;
+        long wl = 1000;
+        long wr = 1000;
+
+        Bench(ExploreTuning t, YawSim yaw) {
+            this.h = new Heading(t.gyro, t);
+            this.yaw = yaw;
+        }
+
+        private void tick() {
+            now += 10;
+            yaw.advance(10);
+            if (wheelsTurning) {
+                wl++;
+                wr++;
+            }
+            if (now % 100 == 0) {
+                h.offer(yaw.wrap(clear(now), wl, wr), commanded);
+            }
+        }
+
+        void run(long ms) {
+            long until = now + ms;
+            while (now < until) {
+                tick();
+            }
+        }
+
+        void still(long ms) {
+            commanded = false;
+            wheelsTurning = false;
+            run(ms);
+        }
+
+        void drive(long ms) {
+            commanded = true;
+            wheelsTurning = true;
+            run(ms);
+            commanded = false;
+            wheelsTurning = false;
+        }
+
+        /** Something turns him while nothing is commanded: the wheels move and the gyro sees it. */
+        void pushed(long ms, int dir, double rateDegS) {
+            double keep = yaw.rateDegS;
+            yaw.rateDegS = rateDegS;
+            yaw.turn(dir);
+            commanded = false;
+            wheelsTurning = true;
+            run(ms);
+            yaw.stop();
+            yaw.rateDegS = keep;
+            wheelsTurning = false;
+        }
+
+        /** A measured turn as the brain runs one: start on a reading, stop on the reading that reaches it. */
+        void turnBy(int dir, double amount) {
+            h.startTurn(dir, amount);
+            yaw.turn(dir);
+            commanded = true;
+            long start = now;
+            while (!h.turnReached() && now - start < 20000) {
+                tick();
+            }
+            yaw.stop();
+            commanded = false;
+            h.stopped(now);
+        }
+
+        void turnTo(double target) {
+            turnBy(h.directionTo(target), Math.abs(Heading.delta(h.degrees(), target)));
+        }
+
+        /** Tracked minus true heading, in (-180, 180]. */
+        double error() {
+            return Heading.delta(yaw.wrapped(), h.degrees());
+        }
+    }
+
+    private static String f1(double v) {
+        return String.format(java.util.Locale.US, "%.1f", v);
+    }
+
+    /** Each turn's start time and length in the log, in order. */
+    private static List<long[]> turnTimes(Rig rig) {
+        List<long[]> out = new ArrayList<long[]>();
+        for (int i = 0; i < rig.log.size(); i++) {
+            if (rig.log.get(i).what.startsWith("turn")) {
+                long start = rig.log.get(i).t;
+                out.add(new long[]{start, rig.timeOf(rig.first("stop", i)) - start});
+            }
+        }
+        return out;
+    }
+
+    private static void headingScenarios() {
+        scenario("heading_turn_takes_the_shorter_way_across_0_360", n -> {
+            Bench b = new Bench(gyroTuning().build(), new YawSim(robotGyro()));
+            b.still(1000);
+            boolean math = Heading.delta(10, 340) == -30 && Heading.delta(350, 20) == 30
+                    && Math.abs(Heading.delta(0, 180)) == 180 && Heading.wrap(-10) == 350;
+            b.turnTo(20);
+            b.still(1000);
+            // From about 20 to 300: 80 right across 0, not 280 left.
+            int dir = b.h.directionTo(300);
+            b.turnTo(300);
+            b.still(1000);
+            double at300 = b.h.degrees();
+            double true300 = b.yaw.trueDeg;
+            double target = Heading.wrap(at300 + 180);
+            double before = b.yaw.trueDeg;
+            b.turnTo(target);
+            b.still(1000);
+            double turned180 = Math.abs(b.yaw.trueDeg - before);
+            check(n, math && dir == Heading.RIGHT && Math.abs(Heading.delta(at300, 300)) <= 5
+                            && at300 >= 0 && at300 < 360 && Math.abs(true300 - (-60)) <= 5
+                            && Math.abs(Heading.delta(b.h.degrees(), target)) <= 5 && Math.abs(turned180 - 180) <= 5
+                            && Math.abs(b.error()) <= 2,
+                    "math=" + math + " dir=" + dir + " at300=" + f1(at300) + " true=" + f1(true300)
+                            + " turned180=" + f1(turned180) + " err=" + f1(b.error()));
+        });
+        scenario("heading_bias_drift_is_re_estimated_at_each_stop", n -> {
+            // The bias moves by 0.1 deg/s (6.4 counts) after the first stop: a bias fixed
+            // there would be ~5 deg out after the minute; re-estimated at each stop, it isn't.
+            final double drift = 0.1 * robotGyro().countSecondsPer360 / 360.0;
+            YawSim yaw = new YawSim(robotGyro()) {
+                @Override
+                double biasAt(long t) {
+                    return biasCounts + (t >= 2000 ? drift : 0);
+                }
+            };
+            Bench b = new Bench(gyroTuning().build(), yaw);
+            b.still(2000);
+            double firstBias = b.h.biasCounts();
+            while (b.now < 62000) {
+                b.turnBy(Heading.LEFT, 90);
+                b.still(2000);
+                b.drive(5000);
+                b.still(2000);
+                b.turnBy(Heading.RIGHT, 45);
+                b.still(2000);
+            }
+            check(n, Math.abs(firstBias - 92) < 0.5 && Math.abs(b.h.biasCounts() - (92 + drift)) < 1
+                            && Math.abs(b.error()) < 1.0,
+                    "firstBias=" + f1(firstBias) + " bias=" + f1(b.h.biasCounts()) + " err=" + f1(b.error()));
+        });
+        scenario("heading_motion_during_a_stop_leaves_the_bias_alone", n -> {
+            // Nothing commanded, but the wheels move and he turns (pushed, or coasting):
+            // those rates are not bias samples, and the heading still follows the turn.
+            Bench b = new Bench(gyroTuning().build(), new YawSim(robotGyro()));
+            b.still(2000);
+            double before = b.h.biasCounts();
+            b.pushed(1500, Heading.LEFT, 30);
+            b.still(300);
+            double after = b.h.biasCounts();
+            double tracked = b.h.degrees();
+            b.still(2000);
+            check(n, Math.abs(before - 92) < 0.5 && Math.abs(after - 92) < 0.5
+                            && Math.abs(b.h.biasCounts() - 92) < 0.5 && Math.abs(Heading.delta(tracked, 45)) <= 2
+                            && Math.abs(b.error()) <= 2,
+                    "before=" + f1(before) + " after=" + f1(after) + " end=" + f1(b.h.biasCounts())
+                            + " tracked=" + f1(tracked) + " err=" + f1(b.error()));
+        });
+        scenario("measured_90_degree_turn_without_bias_error_ends_within_tolerance", n -> {
+            Rig rig = new Rig(gyroTuning().turnChance(1.0).turnDeg(90, 90).build(), CLEAR);
+            final List<String> notes = new ArrayList<String>();
+            rig.brain.setTrace(notes::add);
+            rig.started();
+            rig.runUntil(5000);
+            List<long[]> turns = turnTimes(rig);
+            double r = rig.yaw.turnResults.isEmpty() ? 0 : Math.abs(rig.yaw.turnResults.get(0));
+            boolean noted = false;
+            for (String note : notes) {
+                noted |= note.matches("measured turn: asked 90 deg, turned \\d+ deg, overshoot \\d+ deg");
+            }
+            check(n, !turns.isEmpty() && Math.abs(r - 90) <= rig.tuning.turnToleranceDeg
+                            && turns.get(0)[1] >= 1300 && noted && rig.violations.isEmpty(),
+                    "result=" + f1(r) + " turnMs=" + (turns.isEmpty() ? -1 : turns.get(0)[1]) + " notes=" + notes
+                            + " " + rig.tail());
+        });
+        scenario("measured_turn_overshoot_is_learned_and_the_next_turn_is_closer", n -> {
+            Rig rig = new Rig(gyroTuning().turnChance(1.0).turnDeg(90, 90).build(), CLEAR);
+            rig.yaw.coastDeg = 15;
+            rig.started();
+            rig.runUntil(20000);
+            List<Double> r = rig.yaw.turnResults;
+            double e1 = r.size() > 0 ? Math.abs(Math.abs(r.get(0)) - 90) : -1;
+            double e2 = r.size() > 1 ? Math.abs(Math.abs(r.get(1)) - 90) : -1;
+            double e3 = r.size() > 2 ? Math.abs(Math.abs(r.get(2)) - 90) : -1;
+            check(n, r.size() >= 3 && e1 >= 10 && e2 < e1 - 3 && e3 < e2 + 1 && e3 <= rig.tuning.turnToleranceDeg
+                            && rig.brain.heading().overshootDeg() > 10 && rig.violations.isEmpty(),
+                    "results=" + r + " overshoot=" + f1(rig.brain.heading().overshootDeg()) + " " + rig.tail());
+        });
+        scenario("stalled_leg_logs_no_distance_for_the_stalled_time", n -> {
+            // A 5 s leg from 1300; the wheels drive until 2500, then only creep (2 counts
+            // per 100 ms): stalled at ~3600. The leg keeps the distance up to 2500 only.
+            Rig rig = new Rig(gyroTuning().hopTicks(20).stall(1000, 1000, 60).build(), CLEAR);
+            rig.simWheels = true;
+            rig.blockedFrom = 2500;
+            rig.started();
+            rig.runUntil(3700);
+            long stop = rig.timeOf(rig.firstAfter("stop", 1301));
+            List<Heading.Leg> legs = rig.brain.heading().legs();
+            long counts = legs.size() == 1 ? legs.get(0).counts : -1;
+            check(n, stop >= 3300 && stop <= 3700 && rig.count("startle") == 1 && legs.size() == 1
+                            && Math.abs(counts - rig.countsBeforeBlocked) <= 3,
+                    "stop@" + stop + " legs=" + legs + " driven=" + rig.countsBeforeBlocked + " " + rig.tail());
+        });
+        scenario("clean_drive_off_restarts_the_leg_log", n -> {
+            // A leg cut short by an obstacle, the back-off, the escape turn, then a clean
+            // leg: before it ends the log holds the way in; after, only the clean leg.
+            Rig rig = new Rig(gyroTuning().build(), t -> t >= 1600 && t < 1700 ? obstacle(t) : clear(t));
+            rig.simWheels = true;
+            rig.started();
+            while (rig.now < 10000 && rig.firstAfter("hop", 3000) < 0) {
+                rig.runUntil(rig.now + 10);
+            }
+            rig.runUntil(rig.now + 300);
+            List<Heading.Leg> during = rig.brain.heading().legs();
+            int hop = rig.firstAfter("hop", 3000);
+            long cleanStop = rig.timeOf(rig.first("stop", hop));
+            while (rig.now < 12000 && cleanStop < 0) {
+                rig.runUntil(rig.now + 10);
+                cleanStop = rig.timeOf(rig.first("stop", hop));
+            }
+            rig.runUntil(rig.now + 100);
+            List<Heading.Leg> after = rig.brain.heading().legs();
+            // The cut-short leg (1300-1600: 30 counts) and the back-off (250 ms: 25), facing the other way.
+            boolean reverse = during.size() == 2 && Math.abs(during.get(0).counts - 30) <= 3
+                    && Math.abs(during.get(1).counts - 25) <= 3
+                    && Math.abs(Heading.delta(during.get(0).heading + 180, during.get(1).heading)) <= 2;
+            check(n, rig.count("startle") == 1 && reverse && after.size() == 1
+                            && Math.abs(after.get(0).counts - 75) <= 3 && rig.violations.isEmpty(),
+                    "during=" + during + " after=" + after + " " + rig.tail());
+        });
+        scenario("uncalibrated_turns_stay_timed_even_with_gyro_readings", n -> {
+            Rig rig = new Rig(tuning().turnChance(1.0).build(), CLEAR);
+            rig.yaw = new YawSim(robotGyro());
+            rig.simWheels = true;
+            rig.started();
+            rig.runUntil(8000);
+            List<long[]> turns = turnTimes(rig);
+            check(n, turns.size() >= 2 && turns.get(0)[1] == 500 && turns.get(1)[1] == 500
+                            && !rig.brain.heading().usable(rig.now) && rig.brain.heading().legs().isEmpty()
+                            && rig.violations.isEmpty(),
+                    "turns=" + turns.size() + " " + rig.tail());
+        });
+        scenario("calibrated_without_gyro_in_the_readings_turns_stay_timed", n -> {
+            Rig rig = new Rig(gyroTuning().turnChance(1.0).build(), CLEAR);
+            rig.yaw = null;
+            rig.started();
+            rig.runUntil(5000);
+            List<long[]> turns = turnTimes(rig);
+            check(n, !turns.isEmpty() && turns.get(0)[1] == 500 && !rig.brain.heading().usable(rig.now)
+                            && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("measured_escape_turn_turns_its_angle_not_its_time", n -> {
+            // Edge on the right mid-hop: the escape turns left at least 90 deg (2 s at
+            // 45 deg/s), not the timed 800 ms, then drives on.
+            Rig rig = new Rig(gyroTuning().escapeDeg(90, 145, 360).build(),
+                    t -> t >= 1600 && t < 1700 ? edgeRight(t) : clear(t));
+            rig.yaw.rateDegS = 45;
+            rig.started();
+            rig.runUntil(7000);
+            List<long[]> turns = turnTimes(rig);
+            double r = rig.yaw.turnResults.isEmpty() ? 0 : rig.yaw.turnResults.get(0);
+            int turn = rig.firstAfter("turn", 1600);
+            check(n, rig.what(turn).equals("turn LEFT") && Math.abs(r - 90) <= rig.tuning.turnToleranceDeg
+                            && turns.get(0)[1] >= 1800 && rig.firstAfter("hop", turns.get(0)[0] + turns.get(0)[1]) >= 0
+                            && rig.violations.isEmpty(),
+                    "result=" + f1(r) + " turnMs=" + (turns.isEmpty() ? -1 : turns.get(0)[1]) + " " + rig.tail());
+        });
+        scenario("measured_orient_turns_to_the_picked_looks_heading_plus_its_offset", n -> {
+            // Claude picks a cat right of centre (cx 0.6) in the FIRST look: after a
+            // two-step scan he turns back to that look's heading and 18 deg (0.6 x 30)
+            // right of it, wherever the scan went.
+            Vision room = (r, t) -> list();
+            Claude catInFirst = (r, req, nth) ->
+                    pick(0, "cat", CuriosityPort.Kind.ANIMAL, "Hello kitty, what a fluffy tail!", 0.8f, 0.5f, 0.2f, 0.3f);
+            Rig rig = new Rig(claudeTuning().gyro(robotGyro()).scanTurnDeg(40).cameraHalfFovDeg(30).build(),
+                    CLEAR, room, true, catInFirst);
+            rig.started();
+            while (rig.now < 15000 && rig.first("say Hello kitty", 0) < 0) {
+                rig.runUntil(rig.now + 10);
+            }
+            List<Double> r = rig.yaw.turnResults;
+            double facing = rig.yaw.trueDeg;
+            check(n, rig.first("say Hello kitty", 0) >= 0 && r.size() == 3
+                            && Math.abs(Math.abs(r.get(0)) - 40) <= 5 && Math.abs(Math.abs(r.get(1)) - 40) <= 5
+                            && Math.abs(Heading.delta(Heading.wrap(facing), Heading.wrap(-18))) <= 6
+                            && rig.countPrefix("hop", 0, rig.now) == 0 && rig.violations.isEmpty(),
+                    "turns=" + r + " facing=" + f1(facing) + " " + rig.tail());
         });
     }
 }

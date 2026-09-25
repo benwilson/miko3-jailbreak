@@ -23,7 +23,8 @@ import java.util.Set;
  *   EYES_ONLY  sensors unavailable or no lease: never drives, eyes show EYES_ONLY (R10, R5)
  *   PAUSE      standing, eyes glancing (R2); ends on a fresh reading
  *   LOOK       eyes on the new heading for lookLeadMs before the turn (R7)
- *   TURN       turning in place for a fixed duration (R3)
+ *   TURN       turning in place for a fixed duration (R3), or to a measured angle
+ *              once the gyro is calibrated (explore nav plan U2, KTD1)
  *   HOP        one leg of continuous driving: a random hopTicks..hopTicksMax forward ticks,
  *              hopTickMs apart (each resend keeps it rolling), then stop (R1)
  *   STARTLE    stopped, startle clip and flinch (R11)
@@ -110,6 +111,18 @@ import java.util.Set;
  * the camera closed. Arrival during an approach is not a hazard (R6). A camera
  * that yields no look in time turns curiosity off for a while and he keeps
  * wandering (KTD8).
+ *
+ * Measured turns (explore nav plan U2, KTD1): with the gyro calibrated and its
+ * bias known (Heading.usable), every turn above -- discretionary, escape (its
+ * minimum and its full-circle failure), cornered, scan step, face, re-centre and
+ * ORIENT -- goes by degrees from the Heading tracker instead of milliseconds, and
+ * ORIENT turns to the heading the picked look was taken at. Uncalibrated, or with
+ * no gyro in the readings, every turn is timed exactly as before. The safety rules
+ * are unchanged: a measured turn starts and stops only on the same events a timed
+ * one does. A gyro that goes quiet mid-turn ends it at its timed length, and
+ * turnBackstopMs ends one that never gets there. Heading also keeps the leg log,
+ * restarted at each clean drive-off (where escape state resets). Trace notes carry
+ * numbers only.
  *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
@@ -297,6 +310,8 @@ final class ExploreBrain {
     private final Camera camera;
     private final CuriosityPort port;
     private final HazardClassifier classifier;
+    /** Heading, measured turns and the leg log (explore nav plan U2). */
+    private final Heading compass;
     /** Times of the hazard reactions since the last successful hop, for the cornered cap. */
     private final ArrayDeque<Long> hazardTimes = new ArrayDeque<Long>();
 
@@ -317,6 +332,9 @@ final class ExploreBrain {
     private Direction heading;
     private boolean escape;
     private long turnMs;
+    /** The same turn in degrees (0: timed only), and whether it is running measured. */
+    private double turnDeg;
+    private boolean measured;
     private boolean sawClearDuringTurn;
     /** A discretionary turn just ended: the next move is its hop, eyes still on the heading. */
     private boolean hopNext;
@@ -380,6 +398,8 @@ final class ExploreBrain {
     private boolean claudeStop;
     /** The scan's looks in order, and the first detector sighting among them (the fallback). */
     private final List<Look> scanned = new ArrayList<Look>();
+    /** The heading each scan look was taken at (NaN: not measured), for ORIENT (explore nav plan U2, R4). */
+    private final List<Double> scanHeadings = new ArrayList<Double>();
     private Sighting detectorPick;
     private int detectorPickLook = -1;
     /** The frames sent (in request order), the tries made, and this try's deadline. */
@@ -447,6 +467,12 @@ final class ExploreBrain {
         this.camera = camera;
         this.random = random;
         this.classifier = new HazardClassifier(tuning);
+        this.compass = new Heading(tuning.gyro, tuning);
+    }
+
+    /** The heading tracker, for the navigation that builds on it (explore nav plan U2, U5). */
+    Heading heading() {
+        return compass;
     }
 
     void setTrace(Trace trace) {
@@ -473,6 +499,12 @@ final class ExploreBrain {
         }
         classifier.offer(reading);
         trackWheels(reading);
+        compass.offer(reading, moving);
+        double[] turn = compass.takeTurnResult();
+        if (turn != null) {
+            note("measured turn: asked " + Math.round(turn[0]) + " deg, turned " + Math.round(turn[1])
+                    + " deg, overshoot " + Math.round(turn[2]) + " deg");
+        }
         step(true);
     }
 
@@ -593,7 +625,7 @@ final class ExploreBrain {
                 sawClearDuringTurn |= !hazard;
                 if (hazard) {
                     hazardInMotion(now);
-                } else if (now >= phaseUntil) {
+                } else if (turnDone(now)) {
                     stopMotors();
                     if (escape) {
                         enterPause(now, pauseMs(), false);
@@ -613,10 +645,12 @@ final class ExploreBrain {
                     // backs off further and turns a set, growing amount (escapeTurn()).
                     stallStreak++;
                     note("wheels stalled while driving: blocked by something low (" + stallStreak + " in a row)");
+                    compass.legStalled(now - tuning.stallWindowMs);
                     hazardInMotion(now, null);
                 } else if (now >= phaseUntil) {
                     stopMotors();
                     // Driven away cleanly: whatever cornered him is behind him.
+                    compass.droveOffCleanly();
                     hazardTimes.clear();
                     stallStreak = 0;
                     escapeFailures.clear();
@@ -641,7 +675,7 @@ final class ExploreBrain {
                 // Blind (nothing watches behind him): bounded by time only, hazards ignored.
                 if (now >= phaseUntil) {
                     stopMotors();
-                    enterLook(now, escapeDir, true, escapeTurnMs());
+                    enterLook(now, escapeDir, true, escapeTurnMs(), escapeTurnDeg());
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
                     nextTickAt += tuning.backTickMs;
@@ -709,7 +743,7 @@ final class ExploreBrain {
                     Direction d = lastHazardSide != null ? lastHazardSide.opposite() : randomDirection();
                     note("cool-down over, trying a wider turn " + d);
                     escapeSide = d;
-                    enterLook(now, d, true, tuning.corneredTurnMs);
+                    enterLook(now, d, true, tuning.corneredTurnMs, tuning.corneredTurnDeg);
                 }
                 break;
             default:
@@ -733,7 +767,12 @@ final class ExploreBrain {
             } else {
                 d = randomDirection();
             }
-            enterLook(now, d, false, between(tuning.turnMinMs, tuning.turnMaxMs));
+            if (compass.usable(now)) {
+                double deg = tuning.turnMinDeg + random.nextDouble() * (tuning.turnMaxDeg - tuning.turnMinDeg);
+                enterLook(now, d, false, timedMs(deg), deg);
+            } else {
+                enterLook(now, d, false, between(tuning.turnMinMs, tuning.turnMaxMs), 0);
+            }
         } else {
             startHop(now);
         }
@@ -750,7 +789,7 @@ final class ExploreBrain {
             enterCornered(now);
             return;
         }
-        enterLook(now, escapeSide(h), true, tuning.escapeTurnMs);
+        enterLook(now, escapeSide(h), true, tuning.escapeTurnMs, tuning.escapeTurnDeg);
     }
 
     /** A hazard while moving: stop in this same event, then startle (R11). */
@@ -844,12 +883,12 @@ final class ExploreBrain {
         } else if (clearSince < 0) {
             clearSince = now;
         }
-        if (clearSince >= 0 && now - clearSince >= tuning.escapeClearMs && now >= phaseUntil) {
+        if (clearSince >= 0 && now - clearSince >= tuning.escapeClearMs && turnDone(now)) {
             stopMotors();
             if (!sayHeldLine(now)) {
                 enterPause(now, pauseMs(), false);
             }
-        } else if (now - turnStartedAt >= tuning.escapeSweepMaxMs) {
+        } else if (sweptFullCircle(now)) {
             stopMotors();
             escapeFailures.addLast(now);
             while (!escapeFailures.isEmpty() && now - escapeFailures.peekFirst() > tuning.escapeFailWindowMs) {
@@ -861,7 +900,49 @@ final class ExploreBrain {
                 return;
             }
             escapeSide = heading.opposite();
-            enterLook(now, escapeSide, true, tuning.escapeTurnMs);
+            enterLook(now, escapeSide, true, tuning.escapeTurnMs, tuning.escapeTurnDeg);
+        }
+    }
+
+    /**
+     * Whether the current turn has gone far enough: its timed length, or, measured,
+     * its angle (turnBackstopMs if it never gets there; the timed length if the gyro
+     * went quiet mid-turn). Measured progress moves only on readings.
+     */
+    private boolean turnDone(long now) {
+        if (!measured) {
+            return now >= phaseUntil;
+        }
+        if (!compass.usable(now)) {
+            return now >= phaseUntil;
+        }
+        return compass.turnReached() || now - turnStartedAt >= tuning.turnBackstopMs;
+    }
+
+    /** An escape turn with no clear way: escapeSweepMaxMs timed, or measured, escapeSweepDeg. */
+    private boolean sweptFullCircle(long now) {
+        if (!measured || !compass.usable(now)) {
+            return now - turnStartedAt >= tuning.escapeSweepMaxMs;
+        }
+        return compass.turned() >= tuning.escapeSweepDeg || now - turnStartedAt >= tuning.turnBackstopMs;
+    }
+
+    /** The timed stand-in for a measured angle, at escapeSweepMaxMs per full circle. */
+    private long timedMs(double deg) {
+        return Math.max(1, Math.round(deg * tuning.escapeSweepMaxMs / 360.0));
+    }
+
+    /** Degrees to turn so a box at d's centre is ahead: its offset x half the camera's view. */
+    private double turnDegFor(Detection d) {
+        return Math.abs(d.centerX()) * tuning.cameraHalfFovDeg;
+    }
+
+    /** Starts a measured turn now if the gyro can measure it (motor.turn(heading) just went out). */
+    private void measureTurn(long now, double deg) {
+        measured = deg > 0 && compass.usable(now);
+        if (measured) {
+            compass.startTurn(heading == Direction.LEFT ? Heading.LEFT : Heading.RIGHT,
+                    escape && state == State.TURN ? Math.min(deg, tuning.escapeSweepDeg) : deg);
         }
     }
 
@@ -930,6 +1011,7 @@ final class ExploreBrain {
         claudeStop = port.canAsk();
         heldPick = null;
         scanned.clear();
+        scanHeadings.clear();
         detectorPick = null;
         detectorPickLook = -1;
         pick = null;
@@ -981,7 +1063,7 @@ final class ExploreBrain {
                 // Like a discretionary turn: any hazard stops it.
                 if (hazard) {
                     hazardInMotion(now);
-                } else if (now >= phaseUntil) {
+                } else if (turnDone(now)) {
                     stopMotors();
                     if (state == State.APPROACH) {
                         step = Step.READY_LEG;
@@ -1016,7 +1098,7 @@ final class ExploreBrain {
             Sighting sighting = Sighting.choose(look.detections, tuning, ignorePeople);
             if (sighting.kind == Sighting.Kind.NOTHING) {
                 if (--scanLooksLeft > 0) {
-                    startCuriosityTurn(now, scanDir, tuning.scanTurnMs, false);
+                    startCuriosityTurn(now, scanDir, tuning.scanTurnMs, tuning.scanTurnDeg, false);
                 } else {
                     note("nothing interesting here");
                     endCuriosity(now);
@@ -1067,7 +1149,7 @@ final class ExploreBrain {
             giveUp(now);
         } else if (Math.abs(target.centerX()) > tuning.centreTolerance) {
             note("re-centring " + sideOf(target) + " on the " + target.label);
-            startCuriosityTurn(now, sideOf(target), turnMsFor(target), false);
+            startCuriosityTurn(now, sideOf(target), turnMsFor(target), turnDegFor(target), false);
         } else {
             step = Step.READY_LEG;
             startLeg(now);
@@ -1093,12 +1175,13 @@ final class ExploreBrain {
         faceTurns++;
         note("turning " + sideOf(target) + " to face the " + target.label);
         // Eyes are already on it; they lead the turn by lookLeadMs (R5).
-        startCuriosityTurn(now, sideOf(target), turnMsFor(target), true);
+        startCuriosityTurn(now, sideOf(target), turnMsFor(target), turnDegFor(target), true);
     }
 
-    private void startCuriosityTurn(long now, Direction d, long ms, boolean lead) {
+    private void startCuriosityTurn(long now, Direction d, long ms, double deg, boolean lead) {
         heading = d;
         turnMs = ms;
+        turnDeg = deg;
         if (lead) {
             step = Step.LEAD;
             phaseUntil = now + tuning.lookLeadMs;
@@ -1116,7 +1199,9 @@ final class ExploreBrain {
         moving = true;
         motor.turn(heading);
         step = Step.TURNING;
+        turnStartedAt = now;
         phaseUntil = now + turnMs;
+        measureTurn(now, turnDeg);
     }
 
     /** Start one approach leg, on a fresh reading, if nothing is in the way (KTD4). */
@@ -1139,6 +1224,7 @@ final class ExploreBrain {
         phaseUntil = now + tuning.approachTicks * tuning.hopTickMs;
         moving = true;
         motor.hopTick();
+        compass.startLeg(false, now);
     }
 
     /** One approach leg: an edge startles (R7), close arrives (R6) after the leg's grace period. */
@@ -1247,6 +1333,7 @@ final class ExploreBrain {
         pendingLine = null;
         afterOrient = null;
         scanned.clear();
+        scanHeadings.clear();
         askedFrames.clear();
         cues.clear();
     }
@@ -1270,6 +1357,7 @@ final class ExploreBrain {
     /** A Claude stop's scan look: keep it (and the detector's first sighting), and take them all (R1). */
     private void scanLook(long now, Look look, boolean ignorePeople) {
         scanned.add(look);
+        scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
         if (detectorPick == null) {
             Sighting s = Sighting.choose(look.detections, tuning, ignorePeople);
             if (s.kind != Sighting.Kind.NOTHING) {
@@ -1279,7 +1367,7 @@ final class ExploreBrain {
             }
         }
         if (--scanLooksLeft > 0) {
-            startCuriosityTurn(now, scanDir, tuning.scanTurnMs, false);
+            startCuriosityTurn(now, scanDir, tuning.scanTurnMs, tuning.scanTurnDeg, false);
         } else {
             enterAsk(now);
         }
@@ -1369,17 +1457,15 @@ final class ExploreBrain {
         pickAt = now;
         remember(a.box.label, a.kind, now);
         float cx = a.box.centerX();
-        long offset = Math.abs(cx) > tuning.centreTolerance
-                ? (cx < 0 ? -1 : 1) * Math.max(100, (long) (Math.abs(cx) * tuning.turnMsPerUnit)) : 0;
-        pickRecentred = offset != 0;
+        pickRecentred = Math.abs(cx) > tuning.centreTolerance;
         Detection agree = detectorAgrees(scanned.get(look).detections, a);
         if (agree != null) {
             note("the detector sees it too, as a " + agree.label + ": approaching");
             target = agree;
-            orient(now, look, offset, Then.FACE);
+            orient(now, look, cx, Then.FACE);
         } else {
             target = null;
-            orient(now, look, offset, Then.SPEAK);
+            orient(now, look, cx, Then.SPEAK);
         }
     }
 
@@ -1506,18 +1592,38 @@ final class ExploreBrain {
             return;
         }
         note("no answer from Claude; falling back to the detector's " + detectorPick);
-        orient(now, detectorPickLook, 0, Then.SIGHTING);
+        orient(now, detectorPickLook, 0f, Then.SIGHTING);
     }
 
     /**
-     * Turn from the last scan look's heading to the given look's, plus offsetMs
-     * (positive = right), then carry on with `then`. The scan stepped scanTurnMs
-     * toward scanDir between looks.
+     * Turn from the last scan look's heading to the given look's, plus the pick's
+     * offset in the frame (cx, -1..1, positive = right; ignored within
+     * centreTolerance), then carry on with `then`. Measured (explore nav plan U2,
+     * R4): to the heading that look was taken at, less cx x cameraHalfFovDeg.
+     * Timed: the scan stepped scanTurnMs toward scanDir between looks, and the
+     * offset is cx x turnMsPerUnit.
      */
-    private void orient(long now, int look, long offsetMs, Then then) {
+    private void orient(long now, int look, float cx, Then then) {
         stopMotors();
         state = State.ORIENT;
         afterOrient = then;
+        boolean offCentre = Math.abs(cx) > tuning.centreTolerance;
+        Double at = look < scanHeadings.size() ? scanHeadings.get(look) : null;
+        if (compass.usable(now) && at != null && !at.isNaN()) {
+            double delta = Heading.delta(compass.degrees(),
+                    at - (offCentre ? cx * tuning.cameraHalfFovDeg : 0));
+            if (Math.abs(delta) < tuning.turnToleranceDeg) {
+                oriented(now);
+                return;
+            }
+            Direction d = delta > 0 ? Direction.LEFT : Direction.RIGHT;
+            note("turning " + d + " " + Math.round(Math.abs(delta)) + " deg toward it");
+            show(EyeState.LOOK, d);
+            startCuriosityTurn(now, d, timedMs(Math.abs(delta)), Math.abs(delta), true);
+            return;
+        }
+        long offsetMs = offCentre
+                ? (cx < 0 ? -1 : 1) * Math.max(100, (long) (Math.abs(cx) * tuning.turnMsPerUnit)) : 0;
         long scanSign = scanDir == Direction.RIGHT ? 1 : -1;
         long ms = (look - (scanned.size() - 1)) * tuning.scanTurnMs * scanSign + offsetMs;
         if (Math.abs(ms) < MIN_ORIENT_MS) {
@@ -1527,7 +1633,7 @@ final class ExploreBrain {
         Direction d = ms > 0 ? Direction.RIGHT : Direction.LEFT;
         note("turning " + d + " " + Math.abs(ms) + " ms toward it");
         show(EyeState.LOOK, d);
-        startCuriosityTurn(now, d, Math.abs(ms), true);
+        startCuriosityTurn(now, d, Math.abs(ms), 0, true);
     }
 
     private static final long MIN_ORIENT_MS = 50;
@@ -1960,11 +2066,13 @@ final class ExploreBrain {
         }
     }
 
-    private void enterLook(long now, Direction d, boolean escapeTurn, long ms) {
+    /** Eyes toward d, then a turn of ms, or deg once measured (0: timed only). */
+    private void enterLook(long now, Direction d, boolean escapeTurn, long ms, double deg) {
         state = State.LOOK;
         heading = d;
         escape = escapeTurn;
         turnMs = ms;
+        turnDeg = deg;
         phaseUntil = now + tuning.lookLeadMs;
         show(EyeState.LOOK, d);
     }
@@ -1977,6 +2085,7 @@ final class ExploreBrain {
         phaseUntil = now + turnMs;
         moving = true;
         motor.turn(heading);
+        measureTurn(now, turnDeg);
     }
 
     private void startHop(long now) {
@@ -1994,6 +2103,7 @@ final class ExploreBrain {
         wheelMoves.clear();
         moving = true;
         motor.hopTick();
+        compass.startLeg(false, now);
     }
 
     /** The escape turn's minimum: longer for each stall in a row (see HOP). */
@@ -2004,10 +2114,18 @@ final class ExploreBrain {
         return Math.min(tuning.escapeSweepMaxMs, tuning.stallTurnMs + (stallStreak - 1) * tuning.stallTurnStepMs);
     }
 
+    /** The same minimum in degrees, for a measured escape turn. */
+    private double escapeTurnDeg() {
+        if (!stalledNow) {
+            return tuning.escapeTurnDeg;
+        }
+        return Math.min(tuning.escapeSweepDeg, tuning.stallTurnDeg + (stallStreak - 1) * tuning.stallTurnStepDeg);
+    }
+
     private void startBackOff(long now) {
         int ticks = stalledNow ? Math.max(tuning.backTicks, tuning.stallBackTicks) : tuning.backTicks;
         if (ticks <= 0) {
-            enterLook(now, escapeDir, true, escapeTurnMs());
+            enterLook(now, escapeDir, true, escapeTurnMs(), escapeTurnDeg());
             return;
         }
         state = State.BACK_OFF;
@@ -2016,6 +2134,7 @@ final class ExploreBrain {
         phaseUntil = now + ticks * tuning.backTickMs;
         moving = true;
         motor.backTick();
+        compass.startLeg(true, now);
     }
 
     private void enterCornered(long now) {
@@ -2035,6 +2154,7 @@ final class ExploreBrain {
         if (moving) {
             moving = false;
             motor.stop();
+            compass.stopped(clock.nowMs());
         }
     }
 
