@@ -53,6 +53,9 @@ import java.io.IOException;
  *   MikoExploreCurious  a curiosity stop is due at every pause (camera curiosity U8)
  *   MikoExploreSpin     turn in place one way then the other, for the gyro capture
  *                       (ExploreSpin; explore nav plan U1)
+ *   MikoExploreLookThenGo  look-then-go navigation (explore nav plan U4, KTD7): the
+ *                       camera opens only at each leg decision; read once as
+ *                       Explore starts (lookThenGo()), so set it before starting
  */
 final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, ExploreLoop.Lease, ExploreLoop.Hooks {
     private static final String TAG = "ExploreDrive";
@@ -271,6 +274,11 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         long delay = Math.min(LEASE_RETRY_BASE_MS << Math.min(leaseRetryAttempt - 1, 4), LEASE_RETRY_MAX_MS);
         Log.i(TAG, "retrying the drive lease in " + delay + "ms (attempt " + leaseRetryAttempt + ")");
         handler.postDelayed(leaseRetry, delay);
+    }
+
+    /** The MikoExploreLookThenGo hook: look-then-go navigation instead of continuous (KTD7). */
+    static boolean lookThenGo() {
+        return hook("MikoExploreLookThenGo");
     }
 
     private static boolean hook(String tag) {

@@ -156,10 +156,16 @@ public class ModeApp extends Application {
             Log.i(TAG, gyro == null
                     ? "no gyro calibration -- timed turns until qa-explore-sensors.py --gyro-circle"
                     : "gyro calibration: " + gyro);
-            final ExploreTuning tuning = ExploreTuning.defaults(calibration, gyro);
+            // Continuous camera navigation unless the look-then-go fallback is switched on
+            // (explore nav plan U4, KTD7): setprop log.tag.MikoExploreLookThenGo DEBUG.
+            ExploreTuning.Navigation navigation = ExploreDrive.lookThenGo()
+                    ? ExploreTuning.Navigation.LOOK_THEN_GO : ExploreTuning.Navigation.CONTINUOUS;
+            Log.i(TAG, "navigation: " + navigation);
+            final ExploreTuning tuning = ExploreTuning.defaults(calibration, gyro, navigation);
             clips = new ClipPlayer(this);
-            // Opened only during curiosity stops (camera curiosity KTD3); the
-            // recognizer loads on the camera's detect thread on first use.
+            // Open whenever he roams, escapes or is curious, closed while he talks
+            // (explore nav plan U4, KTD2); the recognizer loads on the camera's
+            // detect thread on first use.
             camera = new ExploreCamera(this, ExploreDrive.CLOCK, new ExploreCamera.RecognizerFactory() {
                 @Override
                 public Recognizer create() throws Exception {

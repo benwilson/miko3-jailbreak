@@ -33,7 +33,7 @@ import java.util.Set;
  *   STOPPED    after shutdown(); inert
  *
  * Camera curiosity (camera curiosity plan KTD5), entered from PAUSE when a
- * curiosity stop is due; the camera is open in these states and only these:
+ * curiosity stop is due; the camera is always open in these states:
  *
  *   SCAN       step turns with a look after each; the first look that sees
  *              something decides, and nothing after the last look ends it
@@ -123,6 +123,22 @@ import java.util.Set;
  * turnBackstopMs ends one that never gets there. Heading also keeps the leg log,
  * restarted at each clean drive-off (where escape state resets). Trace notes carry
  * numbers only.
+ *
+ * The camera while roaming (explore nav plan U4, KTD2, KTD7, KTD9): syncCamera()
+ * is the one place it opens and closes, by rule (cameraWanted): open in every
+ * roaming, escaping and curiosity state; closed while he meets, asks or talks, at
+ * rest, without the lease or sensors, and for cameraBackoffMs after a camera that
+ * gave no look in time (he roams on the floor sensor meanwhile, R5). Each leg is
+ * chosen from the newest fresh look's openness by RoamSteer (a bend toward the
+ * most open columns, a length cut by blocked ones; a low-confidence profile
+ * chooses as before), and a fresh look reading the way ahead blocked ends a leg
+ * at the next tick. The floor sensor, stall sensing and CPL=2 still decide every
+ * stop: motion starts only on fresh readings, and the camera never starts one.
+ * Look-then-go (ExploreTuning.Navigation.LOOK_THEN_GO) opens the camera at each
+ * leg decision, waits for one look, and closes it before the leg. Every reading
+ * tells the camera whether the floor is clear with the wheels free (floor
+ * teaching, U3), a look's floor is taught once he has driven floorTeachCounts
+ * past it, and the camera hears when he starts and stops moving (U9).
  *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
@@ -285,10 +301,20 @@ final class ExploreBrain {
         ASK, ORIENT, MEET_LOOK, MEET, SPEAK,
         ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP;
 
-        /** The camera is open in exactly these (R2, AE6). */
+        /** A curiosity stop's looking states: the camera is always open in these (R2, AE6). */
         boolean curious() {
             return this == SCAN || this == FACE || this == APPROACH || this == INSPECT || this == REACT_HERE
                     || this == MEET_LOOK;
+        }
+
+        /**
+         * Roaming and escaping (explore nav plan U4, KTD2): the camera is open in these
+         * too, while it is healthy (continuous navigation), or only at a leg decision
+         * in PAUSE (look-then-go, KTD7).
+         */
+        boolean roams() {
+            return this == PAUSE || this == LOOK || this == TURN || this == HOP || this == STARTLE
+                    || this == BACK_OFF;
         }
 
         /** Part of a curiosity stop, from the scan until he is back to wandering. */
@@ -312,6 +338,8 @@ final class ExploreBrain {
     private final HazardClassifier classifier;
     /** Heading, measured turns and the leg log (explore nav plan U2). */
     private final Heading compass;
+    /** Bends and shortens roaming legs from the looks' openness (explore nav plan U4). */
+    private final RoamSteer steer;
     /** Times of the hazard reactions since the last successful hop, for the cornered cap. */
     private final ArrayDeque<Long> hazardTimes = new ArrayDeque<Long>();
 
@@ -432,6 +460,28 @@ final class ExploreBrain {
     /** When the camera last closed, for its reopen gap (tuning.reopenGapMs). */
     private long cameraClosedAt = Long.MIN_VALUE / 4;
 
+    // ---- the camera while roaming (explore nav plan U4) ----
+    /** The last look seen (by identity: a real frame arrived), and when the next must come by. */
+    private Look lastLook;
+    private long roamLookDeadline;
+    /** The last look checked during the current leg for a blocked way ahead. */
+    private Look legLook;
+    /** When the last turn stopped: a look captured before that faced another way. */
+    private long headingSettledAt = Long.MIN_VALUE / 4;
+    /** The next leg's forward ticks as the steer chose them (0: its bend is the whole move; -1: none). */
+    private int plannedTicks = -1;
+    /** Look-then-go (KTD7): in PAUSE, waiting for the leg decision's look, captured at or after legLookAfter. */
+    private boolean lookForLeg;
+    private long legLookAfter;
+    private long legLookDeadline;
+    /** What the camera was last told about driving (null: nothing yet). */
+    private Boolean movingShown;
+    /** Forward encoder counts driven (mean of the wheels), the reading they were last taken from,
+     * and {frameMs, counts} at each look's arrival, oldest first, for floor teaching. */
+    private long forwardCounts;
+    private SensorReading countsFrom;
+    private final ArrayDeque<long[]> teachQueue = new ArrayDeque<long[]>();
+
     /** What he reacted to this session, oldest first, for the look request (KTD2). */
     private static final class Picked {
         final String label;
@@ -468,6 +518,7 @@ final class ExploreBrain {
         this.random = random;
         this.classifier = new HazardClassifier(tuning);
         this.compass = new Heading(tuning.gyro, tuning);
+        this.steer = new RoamSteer(tuning);
     }
 
     /** The heading tracker, for the navigation that builds on it (explore nav plan U2, U5). */
@@ -481,6 +532,11 @@ final class ExploreBrain {
 
     State state() {
         return state;
+    }
+
+    /** The camera is off after a failure (cameraBackoffMs), for tests and logs. */
+    boolean cameraBackedOff() {
+        return clock.nowMs() < curiosityOffUntil;
     }
 
     /** Starts in EYES_ONLY; it leaves only once the lease is held and the sensors are available. */
@@ -500,6 +556,7 @@ final class ExploreBrain {
         classifier.offer(reading);
         trackWheels(reading);
         compass.offer(reading, moving);
+        teachFloor(reading);
         double[] turn = compass.takeTurnResult();
         if (turn != null) {
             note("measured turn: asked " + Math.round(turn[0]) + " deg, turned " + Math.round(turn[1])
@@ -532,6 +589,7 @@ final class ExploreBrain {
         cancelAsk();
         state = State.STOPPED;
         syncCamera();
+        syncMoving();
         note("shutdown");
     }
 
@@ -569,6 +627,7 @@ final class ExploreBrain {
                 f = false;
             } while (again && state != State.STOPPED);
             syncCamera();
+            syncMoving();
             // However a stop ends (a line, NOTHING, a skip, the fallback, a
             // failure, a hazard, the lease), the next one is a full gap of
             // wandering away. Live, stops began ~0.5 s apart and he never roamed.
@@ -602,9 +661,12 @@ final class ExploreBrain {
             return;
         }
         boolean hazard = s == HazardClassifier.Status.HAZARD;
+        watchLooks(now);
         switch (state) {
             case PAUSE:
-                if (fresh && now >= phaseUntil) {
+                if (lookForLeg) {
+                    legLookStep(now, fresh, hazard);
+                } else if (fresh && now >= phaseUntil) {
                     decide(now, hazard);
                 }
                 break;
@@ -629,6 +691,10 @@ final class ExploreBrain {
                     stopMotors();
                     if (escape) {
                         enterPause(now, pauseMs(), false);
+                    } else if (plannedTicks == 0) {
+                        // The steer's turn away from a view with nothing open: look again from here.
+                        plannedTicks = -1;
+                        enterPause(now, pauseMs(), false);
                     } else {
                         // The eyes stay on the heading until the hop is under way (R7).
                         hopNext = true;
@@ -648,14 +714,12 @@ final class ExploreBrain {
                     compass.legStalled(now - tuning.stallWindowMs);
                     hazardInMotion(now, null);
                 } else if (now >= phaseUntil) {
-                    stopMotors();
-                    // Driven away cleanly: whatever cornered him is behind him.
-                    compass.droveOffCleanly();
-                    hazardTimes.clear();
-                    stallStreak = 0;
-                    escapeFailures.clear();
-                    escapeSide = null;
-                    enterPause(now, pauseMs(), false);
+                    legDriven(now);
+                } else if (blockedAheadInLeg()) {
+                    // He never stops for the camera alone (KTD9): the leg just ends here,
+                    // like a short one, and the next decision bends away.
+                    note("camera reads the way ahead blocked: ending the leg early");
+                    legDriven(now);
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
                     nextTickAt += tuning.hopTickMs;
@@ -751,6 +815,18 @@ final class ExploreBrain {
         }
     }
 
+    /** A roaming leg ended without a hazard or stall (its time, or the camera saw the way blocked). */
+    private void legDriven(long now) {
+        stopMotors();
+        // Driven away cleanly: whatever cornered him is behind him.
+        compass.droveOffCleanly();
+        hazardTimes.clear();
+        stallStreak = 0;
+        escapeFailures.clear();
+        escapeSide = null;
+        enterPause(now, pauseMs(), false);
+    }
+
     /** End of a pause, on a fresh reading: hop, turn, look around, or turn away from what is ahead. */
     private void decide(long now, boolean hazard) {
         if (hazard) {
@@ -759,6 +835,64 @@ final class ExploreBrain {
             enterScan(now);
         } else if (hopNext) {
             startHop(now);
+        } else if (tuning.navigation == ExploreTuning.Navigation.LOOK_THEN_GO && camera.available()
+                && now >= curiosityOffUntil) {
+            // Look-then-go (KTD7): the camera opens for this decision (at the end of
+            // this step) and closes again before the leg.
+            lookForLeg = true;
+            long ready = Math.max(now, cameraClosedAt + tuning.reopenGapMs);
+            legLookAfter = ready + tuning.lookSettleMs;
+            legLookDeadline = ready + tuning.firstLookTimeoutMs;
+        } else {
+            chooseLeg(now, cameraOpen ? roamLook(now) : null);
+        }
+    }
+
+    /**
+     * Look-then-go, in PAUSE: the leg decision's look arrived (acted on with a fresh
+     * reading in hand), or none came in time: the camera closes before any motion
+     * and the leg is chosen, from the look if there is one.
+     */
+    private void legLookStep(long now, boolean fresh, boolean hazard) {
+        Look look = camera.latest();
+        boolean arrived = look != null && look.frameMs >= legLookAfter;
+        if (arrived ? !fresh : now < legLookDeadline) {
+            return;
+        }
+        lookForLeg = false;
+        if (!arrived) {
+            note("camera gave no look in time; camera off for " + tuning.cameraBackoffMs + " ms");
+            curiosityOffUntil = now + tuning.cameraBackoffMs;
+        }
+        syncCamera();
+        if (!fresh) {
+            // The deadline passed on a tick: decide on the next reading, without the camera.
+            phaseUntil = now;
+            return;
+        }
+        if (hazard) {
+            refuse(now);
+        } else {
+            chooseLeg(now, arrived ? look : null);
+        }
+    }
+
+    /**
+     * The next roaming leg: steered by the look's openness (RoamSteer, KTD9) when it
+     * is confident, else as before the camera roamed: a random turn or a hop.
+     */
+    private void chooseLeg(long now, Look look) {
+        RoamSteer.Plan plan = look == null ? null : steer.plan(look.openness);
+        if (plan != null) {
+            note("steer: " + plan);
+            lastHazardSide = null;
+            plannedTicks = steer.legTicks(plan, drawTicks());
+            if (plan.side == RoamSteer.STRAIGHT) {
+                startHop(now);
+                return;
+            }
+            Direction d = plan.side == RoamSteer.LEFT ? Direction.LEFT : Direction.RIGHT;
+            enterLook(now, d, false, timedMs(plan.bendDeg), compass.usable(now) ? plan.bendDeg : 0);
         } else if (random.nextDouble() < tuning.turnChance) {
             Direction d;
             if (lastHazardSide != null) {
@@ -784,6 +918,7 @@ final class ExploreBrain {
         note("hazard at start: " + h);
         leaveStopForHazard();
         hopNext = false;
+        plannedTicks = -1;
         lastHazardSide = h == null ? null : h.side;
         if (recordHazard(now)) {
             enterCornered(now);
@@ -805,6 +940,7 @@ final class ExploreBrain {
         leaveStopForHazard();
         stalledNow = h == null && state == State.HOP && stallStreak > 0;
         hopNext = false;
+        plannedTicks = -1;
         lastHazardSide = h == null ? null : h.side;
         escapeDir = escapeSide(h);
         corneredAfterStartle = recordHazard(now);
@@ -1026,7 +1162,7 @@ final class ExploreBrain {
         lookAfter = now + tuning.lookSettleMs;
         // A camera about to (re)open yields nothing until its reopen gap has passed
         // (KTD6): the rest of the gap counts toward this look's deadline.
-        long ready = cameraOpen ? now : Math.max(now, cameraClosedAt + tuning.reopenGapMs);
+        long ready = Math.max(now, cameraClosedAt + tuning.reopenGapMs);
         lookDeadline = ready + (firstLook ? tuning.firstLookTimeoutMs : tuning.lookTimeoutMs);
         firstLook = false;
     }
@@ -1338,17 +1474,144 @@ final class ExploreBrain {
         cues.clear();
     }
 
-    /** Open the camera in the curiosity states, close it everywhere else (R2, AE6). */
+    /**
+     * The one place the camera opens and closes (explore nav plan U4, KTD2): it is
+     * wanted in every roaming, escaping and curiosity state, and never while he
+     * meets, asks or talks (MEET, SPEAK, ASK_NAME, LISTEN, NAME, REMEMBER,
+     * NAME_CLIP, and ASK and ORIENT, which lead into a line: speech is fast only
+     * with the camera and detector idle, R3), nor at rest (CORNERED), without the
+     * lease or the sensors (EYES_ONLY), after shutdown, or during a camera
+     * failure's back-off (R5). Look-then-go (KTD7) keeps it closed while roaming
+     * except at a leg decision.
+     */
+    private boolean cameraWanted(long now) {
+        if (!camera.available() || !leaseHeld || now < curiosityOffUntil) {
+            return false;
+        }
+        if (state.curious()) {
+            return true;
+        }
+        if (!state.roams()) {
+            return false;
+        }
+        if (tuning.navigation == ExploreTuning.Navigation.LOOK_THEN_GO) {
+            return state == State.PAUSE && lookForLeg;
+        }
+        return true;
+    }
+
     private void syncCamera() {
-        boolean want = state.curious();
+        long now = clock.nowMs();
+        boolean want = state != State.STOPPED && cameraWanted(now);
         if (want != cameraOpen) {
             cameraOpen = want;
             if (want) {
                 camera.open();
+                // Nothing comes until the reopen gap has passed, then the camera starts.
+                roamLookDeadline = Math.max(now, cameraClosedAt + tuning.reopenGapMs) + tuning.firstLookTimeoutMs;
+                lastLook = null;
+                legLook = null;
             } else {
                 camera.close();
-                cameraClosedAt = clock.nowMs();
+                cameraClosedAt = now;
+                teachQueue.clear();
             }
+        }
+    }
+
+    /** Tells the camera whether he is driving (U9: exposure is capped short while he is). */
+    private void syncMoving() {
+        if (movingShown == null || movingShown != moving) {
+            movingShown = moving;
+            camera.setMoving(moving);
+        }
+    }
+
+    /**
+     * Each new look (a real frame arrived, R5): noted for floor teaching, and while
+     * roaming it keeps the camera's health deadline moving. No new look by then, in
+     * a roaming state, is a camera failure: it closes for cameraBackoffMs and he
+     * roams on the floor sensor, then it is tried again (AE6). A curiosity stop
+     * watches its own looks (waitForLook), so the deadline only runs while roaming.
+     */
+    private void watchLooks(long now) {
+        if (!cameraOpen) {
+            return;
+        }
+        Look look = camera.latest();
+        if (look != null && look != lastLook) {
+            lastLook = look;
+            roamLookDeadline = now + tuning.lookTimeoutMs;
+            teachQueue.addLast(new long[]{look.frameMs, forwardCounts});
+            while (teachQueue.size() > TEACH_QUEUE_MAX) {
+                teachQueue.pollFirst();
+            }
+        } else if (!state.roams() || lookForLeg) {
+            roamLookDeadline = Math.max(roamLookDeadline, now + tuning.lookTimeoutMs);
+        } else if (now >= roamLookDeadline) {
+            note("camera gave no look in time while roaming; camera off for " + tuning.cameraBackoffMs + " ms");
+            curiosityOffUntil = now + tuning.cameraBackoffMs;
+        }
+    }
+
+    private static final int TEACH_QUEUE_MAX = 8;
+
+    /** The newest look to steer the next leg by: fresh, and taken since he last turned; else null. */
+    private Look roamLook(long now) {
+        Look look = camera.latest();
+        if (look == null || look.frameMs < now - tuning.steerLookFreshMs
+                || look.frameMs < headingSettledAt + tuning.lookSettleMs) {
+            return null;
+        }
+        return look;
+    }
+
+    /** During a leg: a look captured since it started that reads the way ahead blocked. */
+    private boolean blockedAheadInLeg() {
+        if (!cameraOpen) {
+            return false;
+        }
+        Look look = camera.latest();
+        if (look == null || look == legLook || look.frameMs <= hopStartedAt) {
+            return false;
+        }
+        legLook = look;
+        return steer.blockedAhead(look.openness);
+    }
+
+    /**
+     * Floor teaching (explore nav plan U3, KTD3): on every reading the camera hears
+     * whether the floor sensor reads clear floor with the wheels free (and he is not
+     * turning or backing, which would carry a frame's floor patch off his path); a
+     * look's patch is taught once he has driven floorTeachCounts forward since it
+     * arrived. A turn to false drops everything pending (the camera does that).
+     */
+    private void teachFloor(SensorReading r) {
+        long now = clock.nowMs();
+        boolean forward = drivingForward();
+        if (forward && r.hasWheels()) {
+            if (countsFrom != null) {
+                forwardCounts += (Math.abs(r.wheelLeft - countsFrom.wheelLeft)
+                        + Math.abs(r.wheelRight - countsFrom.wheelRight)) / 2;
+            }
+            countsFrom = r;
+        } else {
+            countsFrom = null;
+        }
+        boolean clear = classifier.status(now) == HazardClassifier.Status.CLEAR
+                && !(state == State.HOP && wheelsStalled(now))
+                && (!moving || forward);
+        camera.setFloorClear(now, clear);
+        if (!clear) {
+            teachQueue.clear();
+            return;
+        }
+        long through = Long.MIN_VALUE;
+        while (!teachQueue.isEmpty() && forwardCounts - teachQueue.peekFirst()[1] >= tuning.floorTeachCounts) {
+            through = teachQueue.pollFirst()[0];
+        }
+        if (through != Long.MIN_VALUE) {
+            camera.floorDrivenOver(through);
         }
     }
 
@@ -2046,6 +2309,8 @@ final class ExploreBrain {
         stopMotors();
         cancelAsk();
         hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
         target = null;
         pick = null;
         heldPick = null;
@@ -2060,6 +2325,7 @@ final class ExploreBrain {
 
     private void enterPause(long now, long ms, boolean keepEyes) {
         state = State.PAUSE;
+        lookForLeg = false;
         phaseUntil = now + ms;
         if (!keepEyes) {
             show(EyeState.IDLE, null);
@@ -2092,9 +2358,9 @@ final class ExploreBrain {
         hopNext = false;
         show(EyeState.IDLE, null);
         state = State.HOP;
-        int ticks = tuning.hopTicksMax > tuning.hopTicks
-                ? tuning.hopTicks + random.nextInt(tuning.hopTicksMax - tuning.hopTicks + 1)
-                : tuning.hopTicks;
+        int ticks = plannedTicks > 0 ? plannedTicks : drawTicks();
+        plannedTicks = -1;
+        legLook = camera.latest();
         ticksLeft = ticks - 1;
         nextTickAt = now + tuning.hopTickMs;
         phaseUntil = now + ticks * tuning.hopTickMs;
@@ -2104,6 +2370,13 @@ final class ExploreBrain {
         moving = true;
         motor.hopTick();
         compass.startLeg(false, now);
+    }
+
+    /** A leg's length as before the steer: random in hopTicks..hopTicksMax. */
+    private int drawTicks() {
+        return tuning.hopTicksMax > tuning.hopTicks
+                ? tuning.hopTicks + random.nextInt(tuning.hopTicksMax - tuning.hopTicks + 1)
+                : tuning.hopTicks;
     }
 
     /** The escape turn's minimum: longer for each stall in a row (see HOP). */
@@ -2154,8 +2427,18 @@ final class ExploreBrain {
         if (moving) {
             moving = false;
             motor.stop();
-            compass.stopped(clock.nowMs());
+            long now = clock.nowMs();
+            compass.stopped(now);
+            if (!drivingForward()) {
+                // A turn (or back-off) ended: looks from before it faced elsewhere.
+                headingSettledAt = now;
+            }
         }
+    }
+
+    /** A forward leg is under way: a roaming hop, or an approach leg. */
+    private boolean drivingForward() {
+        return moving && (state == State.HOP || (state == State.APPROACH && step == Step.LEG));
     }
 
     private void show(EyeState s, Direction gaze) {

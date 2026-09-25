@@ -217,6 +217,41 @@ final class ExploreTuning {
     final double cameraHalfFovDeg;
     /** The leg log's length (KTD6): the oldest legs drop off. */
     final int legsMax;
+    /**
+     * How the camera serves roaming (explore nav plan U4, KTD2, KTD7): CONTINUOUS
+     * keeps it open whenever he roams or escapes and steers each leg from the
+     * newest look; LOOK_THEN_GO, the fallback (the MikoExploreLookThenGo hook),
+     * opens it only at each leg decision and closes it before the leg.
+     */
+    enum Navigation { CONTINUOUS, LOOK_THEN_GO }
+
+    final Navigation navigation;
+    /**
+     * The roaming steer (RoamSteer; explore nav plan U4, KTD9). A look older than
+     * steerLookFreshMs, or taken before the last turn ended, is not used. Below
+     * steerMinConfidence the profile is ignored and the leg is chosen as before
+     * the camera roamed. Bins are grouped steerBandBins at a time; a band at or
+     * below steerBlocked reads blocked, at or above steerOpen fully open, and in
+     * between the leg is shortened in proportion. The best band must beat the
+     * band ahead by steerMinGain to bend toward it. Everything blocked is a turn
+     * of at least steerBlockedTurnDeg with no leg, at most steerTurnsOnlyMax times
+     * in a row; then a leg of steerShortTicks (the floor sensor guards it).
+     */
+    final long steerLookFreshMs;
+    final float steerMinConfidence;
+    final int steerBandBins;
+    final float steerBlocked;
+    final float steerOpen;
+    final float steerMinGain;
+    final double steerBlockedTurnDeg;
+    final int steerTurnsOnlyMax;
+    final int steerShortTicks;
+    /**
+     * Floor teaching (explore nav plan U3, KTD3): a look's bottom-of-frame floor
+     * is taught once he has driven this many encoder counts (mean of the two
+     * wheels) forward since the look arrived, with no hazard or stall in between.
+     */
+    final long floorTeachCounts;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -310,6 +345,17 @@ final class ExploreTuning {
         scanTurnDeg = b.scanTurnDeg;
         cameraHalfFovDeg = b.cameraHalfFovDeg;
         legsMax = Math.max(1, b.legsMax);
+        navigation = b.navigation;
+        steerLookFreshMs = b.steerLookFreshMs;
+        steerMinConfidence = b.steerMinConfidence;
+        steerBandBins = Math.max(1, b.steerBandBins);
+        steerBlocked = b.steerBlocked;
+        steerOpen = Math.max(b.steerBlocked, b.steerOpen);
+        steerMinGain = b.steerMinGain;
+        steerBlockedTurnDeg = b.steerBlockedTurnDeg;
+        steerTurnsOnlyMax = Math.max(0, b.steerTurnsOnlyMax);
+        steerShortTicks = Math.max(1, b.steerShortTicks);
+        floorTeachCounts = b.floorTeachCounts;
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
@@ -319,7 +365,12 @@ final class ExploreTuning {
 
     /** The shipped defaults with the floor calibration and the gyro's (either may be null). */
     static ExploreTuning defaults(Calibration calibration, ExploreCalibration.Gyro gyro) {
-        return new Builder().calibration(calibration).gyro(gyro).build();
+        return defaults(calibration, gyro, Navigation.CONTINUOUS);
+    }
+
+    /** ...and the navigation mode (the MikoExploreLookThenGo hook picks LOOK_THEN_GO). */
+    static ExploreTuning defaults(Calibration calibration, ExploreCalibration.Gyro gyro, Navigation navigation) {
+        return new Builder().calibration(calibration).gyro(gyro).navigation(navigation).build();
     }
 
     /**
@@ -479,6 +530,27 @@ final class ExploreTuning {
         // right (explore nav plan U6), i.e. a 60 deg view.
         private double cameraHalfFovDeg = 30;
         private int legsMax = 16;
+        private Navigation navigation = Navigation.CONTINUOUS;
+        // A live look takes ~0.6 s and up to ~2.5 s; older than this he has moved on.
+        private long steerLookFreshMs = 3000;
+        // Openness gives 0.3 with no floor taught yet and 0.9 once taught (full light):
+        // until the floor is taught he steers only on what the boxes and horizon say
+        // strongly enough, i.e. not at all.
+        private float steerMinConfidence = 0.5f;
+        // A quarter of the frame, ~15 deg of the ~60 deg view: about his own width a few feet out.
+        private int steerBandBins = 4;
+        private float steerBlocked = 0.35f;
+        private float steerOpen = 0.7f;
+        private float steerMinGain = 0.15f;
+        // Past the edge of the view: nothing in it is open.
+        private double steerBlockedTurnDeg = 60;
+        private int steerTurnsOnlyMax = 2;
+        // About 1 s of driving.
+        private int steerShortTicks = 4;
+        // ~650-880 counts/s per wheel forward (docs/hardware/tof-sensor.md): ~1.3 s of
+        // driving, about the distance to the frame's bottom rows with this tilted-up
+        // camera ~10 cm off the floor. Not measured; U8 checks it.
+        private long floorTeachCounts = 1000;
 
         /** A fixed leg length. */
         Builder hopTicks(int v) { hopTicks = v; hopTicksMax = v; return this; }
@@ -610,6 +682,23 @@ final class ExploreTuning {
         Builder scanTurnDeg(double v) { scanTurnDeg = v; return this; }
         Builder cameraHalfFovDeg(double v) { cameraHalfFovDeg = v; return this; }
         Builder legsMax(int v) { legsMax = v; return this; }
+        Builder navigation(Navigation v) { navigation = v; return this; }
+        Builder steerLookFreshMs(long v) { steerLookFreshMs = v; return this; }
+        Builder steer(float minConfidence, int bandBins, float blocked, float open, float minGain) {
+            steerMinConfidence = minConfidence;
+            steerBandBins = bandBins;
+            steerBlocked = blocked;
+            steerOpen = open;
+            steerMinGain = minGain;
+            return this;
+        }
+        Builder steerBlockedTurn(double deg, int turnsOnlyMax, int shortTicks) {
+            steerBlockedTurnDeg = deg;
+            steerTurnsOnlyMax = turnsOnlyMax;
+            steerShortTicks = shortTicks;
+            return this;
+        }
+        Builder floorTeachCounts(long v) { floorTeachCounts = v; return this; }
 
         ExploreTuning build() {
             return new ExploreTuning(this);

@@ -30,7 +30,8 @@ HARNESS = TESTS / "fixtures" / "explore_brain_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHarness.java"
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
-              "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java")
+              "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
+              "RoamSteer.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -114,7 +115,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "ae3_edge_during_approach_stops_startles_and_abandons",
         "ae4_person_greeted_then_ignored_during_cooldown",
         "ae5_camera_unavailable_wanders_as_before",
-        "ae6_camera_open_only_while_curious",
+        "ae6_camera_follows_the_camera_rule_through_stops_and_lease_loss",
         "target_lost_during_approach_gives_up",
         "renamed_target_is_kept_by_overlap",
         "different_thing_elsewhere_is_not_the_target",
@@ -202,6 +203,21 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "calibrated_without_gyro_in_the_readings_turns_stay_timed",
         "measured_escape_turn_turns_its_angle_not_its_time",
         "measured_orient_turns_to_the_picked_looks_heading_plus_its_offset",
+        # The camera while roaming, steering by openness, look-then-go (explore nav plan U4, KTD2, KTD7, KTD9)
+        "roam_camera_open_in_every_roaming_state",
+        "roam_speak_stops_closes_the_camera_then_reopens_after_the_gap_and_roams",
+        "roam_camera_closed_through_meet_ask_name_listen_name_remember_and_name_clip",
+        "roam_steer_blocked_left_open_right_bends_right",
+        "roam_steer_bend_is_a_measured_turn_when_the_heading_is_usable",
+        "roam_steer_all_blocked_gives_a_short_leg_or_a_turn_never_a_full_leg",
+        "roam_floor_hazard_mid_leg_aborts_even_when_the_camera_reads_open",
+        "roam_no_looks_backs_off_roams_on_the_floor_sensor_and_retries",
+        "roam_look_then_go_opens_the_camera_only_at_leg_decisions",
+        "roam_lease_loss_closes_the_camera_and_goes_eyes_only",
+        "roam_invariant_flags_a_camera_open_while_talking_or_without_the_lease",
+        "roam_steer_low_confidence_keeps_todays_legs",
+        "roam_blocked_look_mid_leg_ends_the_leg_at_the_next_tick",
+        "roam_floor_is_taught_after_driving_over_it_and_motion_is_reported",
     )
 
     @classmethod

@@ -220,6 +220,11 @@ public final class ExploreBrainHarness {
         List<Detection> see(Rig rig, long t);
     }
 
+    /** The openness profile of a frame captured at t (explore nav plan U4); null = not scored. */
+    interface OpenView {
+        Openness.Profile at(Rig rig, long t);
+    }
+
     /**
      * The scripted Claude (explore on Claude U4), shaped like Vision: the answer to
      * the rig's nth ask() (1-based, counted over the whole run), or null for a
@@ -288,6 +293,8 @@ public final class ExploreBrainHarness {
 
         /** The fake camera: a look every 500 ms while open, captured 200 ms before it arrives. */
         final Vision vision;
+        /** Each look's openness, scripted per heading (explore nav plan U4); null: looks carry none. */
+        OpenView openView;
         final boolean cameraAvailable;
         boolean cameraOpen;
         long openedAt;
@@ -409,7 +416,8 @@ public final class ExploreBrainHarness {
                     List<Detection> seen = vision.see(this, now - 200);
                     if (seen != null) {
                         latestLook = new ExploreBrain.Look(staleLooks ? openedAt - 1000 : now - 200, seen,
-                                ("jpeg@" + (now - 200)).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                                ("jpeg@" + (now - 200)).getBytes(java.nio.charset.StandardCharsets.US_ASCII),
+                                openView == null ? null : openView.at(this, now - 200));
                     }
                 }
                 if (now % 100 == 0) {
@@ -427,8 +435,10 @@ public final class ExploreBrainHarness {
                     }
                 }
                 brain.onTick();
-                if (cameraOpen != brain.state().curious()) {
-                    violations.add(now + ":camera " + (cameraOpen ? "open" : "closed") + " in " + brain.state());
+                String broken = cameraRuleBreak(brain.state(), cameraOpen, cameraAvailable, tuning.navigation,
+                        brain.cameraBackedOff(), moving);
+                if (broken != null) {
+                    violations.add(now + ":" + broken);
                 }
                 statesSeen.add(brain.state());
                 if (brain.state() != lastState) {
@@ -444,6 +454,33 @@ public final class ExploreBrainHarness {
         @Override
         public boolean available() {
             return cameraAvailable;
+        }
+
+        /** Floor teaching and brightness calls (explore nav plan U3, U9), kept out of the call log. */
+        int floorClearCalls;
+        int floorClearFalse;
+        long floorClearFalseAt = -1;
+        /** {when, through frameMs} per floorDrivenOver. */
+        final List<long[]> floorTaught = new ArrayList<long[]>();
+        final List<Event> movingCalls = new ArrayList<Event>();
+
+        @Override
+        public void setFloorClear(long nowMs, boolean clearAndFree) {
+            floorClearCalls++;
+            if (!clearAndFree) {
+                floorClearFalse++;
+                floorClearFalseAt = now;
+            }
+        }
+
+        @Override
+        public void floorDrivenOver(long throughFrameMs) {
+            floorTaught.add(new long[]{now, throughFrameMs});
+        }
+
+        @Override
+        public void setMoving(boolean m) {
+            movingCalls.add(new Event(now, m ? "moving" : "still"));
         }
 
         @Override
@@ -804,6 +841,44 @@ public final class ExploreBrainHarness {
         }
     }
 
+    /**
+     * The camera rule (explore nav plan U4, KTD2), independent of the brain's own:
+     * null when it holds, else what broke. Never open while he meets, asks or talks,
+     * at rest, without the lease or sensors (EYES_ONLY), after shutdown, without a
+     * camera, or in a failure's back-off; always open in a curiosity stop's looking
+     * states; open in every roaming and escaping state while healthy (continuous),
+     * or, look-then-go (KTD7), never while he moves or anywhere but a PAUSE.
+     */
+    static String cameraRuleBreak(ExploreBrain.State s, boolean open, boolean available,
+                                  ExploreTuning.Navigation nav, boolean backedOff, boolean moving) {
+        switch (s) {
+            case MEET: case SPEAK: case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP:
+            case ASK: case ORIENT: case EYES_ONLY: case CORNERED: case STOPPED:
+                return open ? "camera open in " + s : null;
+            default:
+                break;
+        }
+        if (open && !available) {
+            return "camera open without a camera in " + s;
+        }
+        if (open && backedOff) {
+            return "camera open during its back-off in " + s;
+        }
+        if (s.curious()) {
+            return open ? null : "camera closed in " + s;
+        }
+        if (nav == ExploreTuning.Navigation.LOOK_THEN_GO) {
+            if (open && (moving || s != ExploreBrain.State.PAUSE)) {
+                return "camera open while " + (moving ? "moving" : "roaming") + " in look-then-go in " + s;
+            }
+            return null;
+        }
+        if (!open && available && !backedOff) {
+            return "camera closed while roaming in " + s;
+        }
+        return null;
+    }
+
     /** What the rig calls clear, independent of the classifier under test. */
     static boolean isClear(SensorReading r) {
         return r.tof >= 100 && r.ir1 <= 500 && r.ir2 <= 500 && (r.cpl == null || r.cpl != 2);
@@ -861,6 +936,7 @@ public final class ExploreBrainHarness {
         liveFixScenarios();
         hazardDuringPickScenarios();
         headingScenarios();
+        navScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -1502,6 +1578,16 @@ public final class ExploreBrainHarness {
         return list(box("plant", 0.8f, cx, 0.6f, 0.2f, Math.min(1f, 0.3f + 0.15f * rig.count("hop"))));
     };
 
+    /** When the brain first entered s at or after from (the state log), else -1. */
+    static long entered(Rig rig, ExploreBrain.State s, long from) {
+        for (Event e : rig.stateLog) {
+            if (e.t >= from && e.what.equals(s.name())) {
+                return e.t;
+            }
+        }
+        return -1;
+    }
+
     /** Index of the first event starting with prefix at or after index from whose time is at least t. */
     private static int firstFrom(Rig rig, String prefix, int from, long t) {
         for (int i = Math.max(0, from); i < rig.log.size(); i++) {
@@ -1531,20 +1617,20 @@ public final class ExploreBrainHarness {
             int curiousAt = rig.first("react curious", hop);
             int thinking = rig.first("react thinking", curiousAt);
             int name = rig.first("name plant", thinking);
-            int close = rig.first("camera close", name);
-            int open2 = rig.first("camera open", close);
-            int sad = rig.first("react disappointed", open2);
-            int close2 = rig.first("camera close", sad);
+            // The camera stays open while he roams between the stops (explore nav plan U4).
+            long scan2 = entered(rig, ExploreBrain.State.SCAN, rig.timeOf(name));
+            int sad = rig.first("react disappointed", name);
+            long end2 = entered(rig, ExploreBrain.State.PAUSE, rig.timeOf(sad));
             boolean ordered = open >= 0 && stare > open && turn > stare && hop > turn && curiousAt > hop
-                    && thinking > curiousAt && name > thinking && close > name
-                    && open2 > close && sad > open2 && close2 > sad;
+                    && thinking > curiousAt && name > thinking && scan2 > rig.timeOf(name)
+                    && sad > name && rig.timeOf(sad) >= scan2 && end2 > rig.timeOf(sad);
             // Eyes lead the turn toward it (R5), and no motion toward it the second time (R10).
             boolean led = rig.timeOf(turn) - rig.timeOf(stare) >= 500;
-            boolean stayed = ordered && rig.motions(rig.timeOf(open2), rig.timeOf(close2)) == 0;
-            check(n, ordered && led && stayed && rig.brain.seen().contains("plant")
+            boolean stayed = ordered && rig.motions(scan2, end2) == 0;
+            check(n, ordered && led && stayed && rig.brain.seen().contains("plant") && rig.count("camera close") == 0
                             && rig.count("name plant") == 1 && rig.count("startle") == 0 && rig.violations.isEmpty(),
                     "open=" + open + " stare=" + stare + " turn=" + turn + " hop=" + hop + " curious=" + curiousAt
-                            + " name=" + name + " open2=" + open2 + " sad=" + sad + " " + rig.tail());
+                            + " name=" + name + " scan2=" + scan2 + " sad=" + sad + " " + rig.tail());
         });
         scenario("ae2_frame_fill_arrives_without_the_sensor", n -> {
             Vision ahead = (rig, t) -> list(box("cup", 0.8f, 0.5f, 0.6f, 0.2f,
@@ -1568,8 +1654,9 @@ public final class ExploreBrainHarness {
             int back = rig.first("back", startle);
             check(n, hop >= 0 && rig.timeOf(hop) == 2000 && rig.timeOf(stop) == 2100 && startle > stop
                             && back > startle && rig.count("react curious") == 0 && rig.count("name cup") == 0
-                            && rig.firstAfter("camera close", 2100) >= 0
-                            && rig.timeOf(rig.firstAfter("camera close", 2100)) == 2100 && rig.violations.isEmpty(),
+                            // The stop is over at the hazard; escaping, the camera stays open (U4).
+                            && entered(rig, ExploreBrain.State.STARTLE, 2100) == 2100
+                            && rig.count("camera close") == 0 && rig.violations.isEmpty(),
                     "hop@" + rig.timeOf(hop) + " stop@" + rig.timeOf(stop) + " " + rig.tail());
         });
         scenario("ae4_person_greeted_then_ignored_during_cooldown", n -> {
@@ -1596,13 +1683,16 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     rig.tail());
         });
-        scenario("ae6_camera_open_only_while_curious", n -> {
+        scenario("ae6_camera_follows_the_camera_rule_through_stops_and_lease_loss", n -> {
             Rig rig = new Rig(curious().build(), CLEAR, PLANT, true).started();
             rig.at(12000, () -> rig.brain.onLeaseChanged(false));
+            rig.at(15000, () -> rig.brain.onLeaseChanged(true));
             rig.runUntil(30000);
-            // The rig records a violation whenever the camera's state and the brain's disagree.
-            check(n, rig.count("camera open") >= 2 && rig.count("camera open") == rig.count("camera close")
-                            && rig.violations.isEmpty(),
+            // The rig records a violation whenever the camera breaks the camera rule
+            // (cameraRuleBreak): open roaming and curious, closed without the lease.
+            check(n, rig.count("camera open") == 2 && rig.count("camera close") == 1
+                            && rig.timeOf(rig.first("camera close", 0)) == 12000
+                            && rig.statesSeen.contains(ExploreBrain.State.INSPECT) && rig.violations.isEmpty(),
                     rig.tail());
         });
         scenario("target_lost_during_approach_gives_up", n -> {
@@ -1610,9 +1700,9 @@ public final class ExploreBrainHarness {
             Rig rig = new Rig(curious().build(), CLEAR, fleeting, true).started();
             rig.runUntil(8000);
             int hop = rig.first("hop", 0);
-            int close = rig.first("camera close", hop);
-            check(n, hop >= 0 && close > hop && rig.countPrefix("react", 0, 8001) == 0
-                            && rig.countPrefix("hop", rig.timeOf(hop), rig.timeOf(close)) == 2 && rig.violations.isEmpty(),
+            long end = entered(rig, ExploreBrain.State.PAUSE, rig.timeOf(hop));
+            check(n, hop >= 0 && end > rig.timeOf(hop) && rig.countPrefix("react", 0, 8001) == 0
+                            && rig.countPrefix("hop", rig.timeOf(hop), end) == 2 && rig.violations.isEmpty(),
                     rig.tail());
         });
         scenario("renamed_target_is_kept_by_overlap", n -> {
@@ -1641,10 +1731,11 @@ public final class ExploreBrainHarness {
             Vision blurry = (rig, t) -> list(box("cup", 0.25f, 0.5f, 0.6f, 0.2f, 0.3f));
             Rig rig = new Rig(curious().build(), CLEAR, blurry, true).started();
             rig.runUntil(4000);
-            int open = rig.first("camera open", 0);
-            int puzzled = rig.first("react puzzled", open);
-            int close = rig.first("camera close", puzzled);
-            check(n, puzzled > open && close > puzzled && rig.motions(rig.timeOf(open), rig.timeOf(close)) == 0
+            long scan = entered(rig, ExploreBrain.State.SCAN, 0);
+            int puzzled = rig.first("react puzzled", 0);
+            long end = entered(rig, ExploreBrain.State.PAUSE, rig.timeOf(puzzled));
+            check(n, scan >= 0 && rig.timeOf(puzzled) >= scan && end > rig.timeOf(puzzled)
+                            && rig.motions(scan, end) == 0
                             && rig.count("name cup") == 0 && rig.violations.isEmpty(),
                     rig.tail());
         });
@@ -1718,15 +1809,17 @@ public final class ExploreBrainHarness {
             rig.staleLooks = true;
             rig.started();
             rig.runUntil(9000);
-            int close = rig.first("camera close", 0);
-            check(n, rig.timeOf(close) == 4300 && rig.count("camera open") >= 2 && rig.violations.isEmpty(),
-                    "close@" + rig.timeOf(close) + " " + rig.tail());
+            long end = entered(rig, ExploreBrain.State.PAUSE, entered(rig, ExploreBrain.State.SCAN, 0));
+            long next = entered(rig, ExploreBrain.State.SCAN, end);
+            check(n, entered(rig, ExploreBrain.State.SCAN, 0) == 1300 && end == 4300 && next > end
+                            && !rig.brain.cameraBackedOff() && rig.count("camera close") == 0 && rig.violations.isEmpty(),
+                    "end@" + end + " next@" + next + " " + rig.tail());
         });
         scenario("curiosity_requested_now_starts_at_the_next_pause_end", n -> {
             Rig rig = new Rig(curious().curiosityMs(100000, 100000).build(), CLEAR, PLANT, true).started();
             rig.at(1200, () -> rig.brain.requestCuriosity());
             rig.runUntil(1400);
-            check(n, rig.timeOf(rig.first("camera open", 0)) == 1300 && rig.count("hop") == 0,
+            check(n, entered(rig, ExploreBrain.State.SCAN, 0) == 1300 && rig.count("hop") == 0,
                     rig.tail());
         });
         scenario("cpl2_in_leg_grace_stops_the_leg_and_looks_again", n -> {
@@ -1856,7 +1949,8 @@ public final class ExploreBrainHarness {
                             && rig.countPrefix("say", 0, 6001) == 0 && rig.countPrefix("name", 0, 6001) == 0
                             && rig.countPrefix("react", 0, 6001) == 0
                             // The next stop is due after the 1000 ms pause.
-                            && rig.countPrefix("camera open", rig.timeOf(answer), rig.timeOf(answer) + 1000) == 0
+                            && !(entered(rig, ExploreBrain.State.SCAN, rig.timeOf(answer)) >= 0
+                                && entered(rig, ExploreBrain.State.SCAN, rig.timeOf(answer)) < rig.timeOf(answer) + 1000)
                             && rig.motions(rig.timeOf(answer), rig.timeOf(answer) + 1000) == 0
                             && rig.violations.isEmpty(),
                     "answer=" + answer + " idle=" + idle + " " + rig.tail());
@@ -1894,8 +1988,10 @@ public final class ExploreBrainHarness {
             rig.runUntil(12000);
             int ask = rig.first("ask", 0);
             int say = rig.first("say", 0);
+            // Roaming keeps it open too (explore nav plan U4); never while asking or speaking.
             java.util.Set<ExploreBrain.State> allowed = java.util.EnumSet.of(
-                    ExploreBrain.State.SCAN, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH);
+                    ExploreBrain.State.SCAN, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH,
+                    ExploreBrain.State.PAUSE, ExploreBrain.State.LOOK, ExploreBrain.State.TURN, ExploreBrain.State.HOP);
             check(n, rig.timeOf(rig.firstAfter("camera close", 0)) == rig.timeOf(ask)
                             && rig.timeOf(rig.firstAfter("camera close", rig.timeOf(ask) + 1)) == rig.timeOf(say)
                             && rig.statesSeen.contains(ExploreBrain.State.ASK)
@@ -2600,11 +2696,14 @@ public final class ExploreBrainHarness {
                 }
             }
             // MEET_LOOK opens it for one fresh look at the person before the match (the face crop).
+            // Roaming keeps it open too (explore nav plan U4), from the end of the meet.
             java.util.Set<ExploreBrain.State> allowed = java.util.EnumSet.of(
                     ExploreBrain.State.SCAN, ExploreBrain.State.FACE, ExploreBrain.State.APPROACH,
-                    ExploreBrain.State.MEET_LOOK);
-            check(n, eyes.equals("eyes THINKING") && allowed.containsAll(rig.openStates)
-                            && rig.countPrefix("camera open", rig.timeOf(match), rig.timeOf(match) + 8000) == 0
+                    ExploreBrain.State.MEET_LOOK, ExploreBrain.State.PAUSE, ExploreBrain.State.LOOK,
+                    ExploreBrain.State.TURN, ExploreBrain.State.HOP);
+            long over = entered(rig, ExploreBrain.State.PAUSE, rig.timeOf(match));
+            check(n, eyes.equals("eyes THINKING") && allowed.containsAll(rig.openStates) && over > rig.timeOf(match)
+                            && rig.countPrefix("camera open", rig.timeOf(match), over) == 0
                             && rig.violations.isEmpty(),
                     "open in " + rig.openStates + " " + rig.tail());
         });
@@ -3105,6 +3204,319 @@ public final class ExploreBrainHarness {
                             && Math.abs(Heading.delta(Heading.wrap(facing), Heading.wrap(-18))) <= 6
                             && rig.countPrefix("hop", 0, rig.now) == 0 && rig.violations.isEmpty(),
                     "turns=" + r + " facing=" + f1(facing) + " " + rig.tail());
+        });
+    }
+
+    // ---- the camera while roaming, steering by openness, look-then-go (explore nav plan U4) ----
+    //
+    // No curiosity stops: the camera opens with roaming at 300, looks arrive every
+    // 500 ms from 1000 (captured 200 ms earlier), and the first pause ends at 1300.
+
+    private static ExploreTuning.Builder navTuning() {
+        return tuning()
+                .hopTicks(8)
+                .curiosityMs(1000000, 1000000)
+                .lookTiming(200, 3000, 2000)
+                .cameraBackoffMs(10000)
+                .steerBlockedTurn(60, 2, 2);
+    }
+
+    /** A profile: bins 0-5 (left), 6-9 (ahead) and 10-15 (right) at these openness values. */
+    static Openness.Profile prof(float confidence, float left, float ahead, float right) {
+        float[] b = new float[Openness.BINS];
+        for (int i = 0; i < b.length; i++) {
+            b[i] = i < 6 ? left : i < 10 ? ahead : right;
+        }
+        return new Openness.Profile(b, confidence);
+    }
+
+    private static final Vision NOTHING = (rig, t) -> list();
+
+    private static Rig navRig(ExploreTuning.Builder b, Feed feed, OpenView view) {
+        Rig rig = new Rig(b.build(), feed, NOTHING, true);
+        rig.openView = view;
+        return rig;
+    }
+
+    /** Hop ticks in each leg, in order. */
+    private static List<Integer> legs(Rig rig) {
+        List<Integer> out = new ArrayList<Integer>();
+        int ticks = 0;
+        for (Event e : rig.log) {
+            if (e.what.equals("hop")) {
+                ticks++;
+            } else if (e.what.equals("stop") && ticks > 0) {
+                out.add(ticks);
+                ticks = 0;
+            }
+        }
+        if (ticks > 0) {
+            out.add(ticks);
+        }
+        return out;
+    }
+
+    private static void navScenarios() {
+        scenario("roam_camera_open_in_every_roaming_state", n -> {
+            // Obstacles now and then: pauses, turns, legs, startles, back-offs and escapes.
+            Rig rig = navRig(navTuning().turnChance(0.5).cap(8, 20000, 30000),
+                    t -> t % 5000 >= 3500 && t % 5000 < 3700 ? obstacle(t) : clear(t), (r, t) -> null);
+            rig.started();
+            rig.runUntil(40000);
+            java.util.Set<ExploreBrain.State> roaming = java.util.EnumSet.of(ExploreBrain.State.PAUSE,
+                    ExploreBrain.State.LOOK, ExploreBrain.State.TURN, ExploreBrain.State.HOP,
+                    ExploreBrain.State.STARTLE, ExploreBrain.State.BACK_OFF);
+            check(n, rig.openStates.containsAll(roaming) && rig.count("camera open") == 1
+                            && rig.count("camera close") == 0 && rig.violations.isEmpty(),
+                    "open in " + rig.openStates + " " + rig.tail());
+        });
+        scenario("roam_speak_stops_closes_the_camera_then_reopens_after_the_gap_and_roams", n -> {
+            // One stop (requested for the first pause's end, the next 100 s away), then roaming.
+            ExploreTuning.Builder b = claudeTuning().reopenGapMs(3000).hopTicks(8).curiosityMs(100000, 100000);
+            Vision room = (rig, t) -> list();
+            Rig rig = new Rig(b.build(), CLEAR, room, true, CAT_RIGHT_IN_FRAME_3);
+            rig.reopenGapMs = 3000;
+            rig.at(1200, () -> rig.brain.requestCuriosity());
+            rig.openView = (r, t) -> prof(0.9f, 0.9f, 0.9f, 0.9f);
+            rig.started();
+            rig.runUntil(20000);
+            int say = rig.first("say", 0);
+            long speak = entered(rig, ExploreBrain.State.SPEAK, 0);
+            // Closed as the scan ended (ASK), and not reopened before the line.
+            int lastClose = -1;
+            for (int i = 0; i < say; i++) {
+                if (rig.log.get(i).what.equals("camera close")) {
+                    lastClose = i;
+                }
+            }
+            long closedAt = rig.timeOf(lastClose);
+            long lineDone = rig.timeOf(say) + rig.speechMs;
+            int reopen = rig.firstAfter("camera open", rig.timeOf(say));
+            int hop = rig.firstAfter("hop", lineDone);
+            // Stopped (the last motion call before the line is a stop), camera closed at SPEAK.
+            String before = "none";
+            for (int i = 0; i < say; i++) {
+                String w = rig.log.get(i).what;
+                if (w.equals("stop") || w.equals("hop") || w.startsWith("turn") || w.equals("back")) {
+                    before = w;
+                }
+            }
+            check(n, say >= 0 && speak >= 0 && lastClose >= 0 && closedAt <= speak
+                            && rig.countPrefix("camera open", closedAt, rig.timeOf(say) + 1) == 0 && before.equals("stop")
+                            && rig.timeOf(reopen) >= lineDone && hop >= 0
+                            // The first look after the reopen was captured after the close plus the gap.
+                            && rig.looksFrom >= closedAt + 3000
+                            && !rig.brain.cameraBackedOff() && rig.violations.isEmpty(),
+                    "speak@" + speak + " close@" + closedAt + " say@" + rig.timeOf(say) + " reopen@"
+                            + rig.timeOf(reopen) + " hop@" + rig.timeOf(hop) + " " + rig.tail());
+        });
+        scenario("roam_camera_closed_through_meet_ask_name_listen_name_remember_and_name_clip", n -> {
+            Rig named = meetRig();
+            named.people.match = (r, k) -> STRANGER;
+            named.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            named.started();
+            named.runUntil(16000);
+            Rig clip = meetRig();
+            clip.people.match = (r, k) -> CuriosityPort.MatchAnswer.FAILED;
+            clip.people.lines = CuriosityPort.MatchAnswer.FAILED;
+            clip.started();
+            clip.runUntil(12000);
+            java.util.Set<ExploreBrain.State> talking = java.util.EnumSet.of(ExploreBrain.State.MEET,
+                    ExploreBrain.State.ASK_NAME, ExploreBrain.State.LISTEN, ExploreBrain.State.NAME,
+                    ExploreBrain.State.REMEMBER, ExploreBrain.State.SPEAK);
+            boolean seen = named.statesSeen.containsAll(talking)
+                    && clip.statesSeen.contains(ExploreBrain.State.NAME_CLIP);
+            boolean closed = true;
+            for (ExploreBrain.State st : named.openStates) {
+                closed &= !talking.contains(st) && st != ExploreBrain.State.NAME_CLIP;
+            }
+            for (ExploreBrain.State st : clip.openStates) {
+                closed &= !talking.contains(st) && st != ExploreBrain.State.NAME_CLIP;
+            }
+            check(n, seen && closed && named.openStates.contains(ExploreBrain.State.PAUSE)
+                            && named.violations.isEmpty() && clip.violations.isEmpty(),
+                    "seen " + named.statesSeen + " / " + clip.statesSeen + " open " + named.openStates + " / "
+                            + clip.openStates + " " + named.violations + clip.violations);
+        });
+        scenario("roam_steer_blocked_left_open_right_bends_right", n -> {
+            Rig rig = navRig(navTuning(), CLEAR, (r, t) -> r.count("turn RIGHT") == 0
+                    ? prof(0.9f, 0.1f, 0.4f, 0.9f) : prof(0.9f, 0.9f, 0.9f, 0.9f));
+            rig.started();
+            rig.runUntil(4500);
+            int first = rig.firstMotionAfter(1300);
+            int stop = rig.first("stop", first);
+            int hop = rig.first("hop", stop);
+            List<Integer> legs = legs(rig);
+            check(n, rig.what(first).equals("turn RIGHT") && rig.timeOf(rig.first("eyes LOOK RIGHT", 0)) == 1300
+                            && hop > stop && !legs.isEmpty() && legs.get(0) == 8 && rig.violations.isEmpty(),
+                    "first=" + rig.what(first) + " legs=" + legs + " " + rig.tail());
+        });
+        scenario("roam_steer_bend_is_a_measured_turn_when_the_heading_is_usable", n -> {
+            // Only the right quarter is open: 0.75 x 30 = 22.5 deg right, by the gyro (a
+            // timed bend would be 22.5 x 3000 / 360 = 188 ms, 11 deg at 60 deg/s).
+            Rig rig = navRig(navTuning().gyro(robotGyro()), CLEAR, (r, t) -> {
+                if (r.count("turn RIGHT") > 0) {
+                    return prof(0.9f, 0.9f, 0.9f, 0.9f);
+                }
+                Openness.Profile p = prof(0.9f, 0.1f, 0.1f, 0.1f);
+                for (int i = 12; i < 16; i++) {
+                    p.bins[i] = 0.9f;
+                }
+                return p;
+            });
+            rig.started();
+            rig.runUntil(4000);
+            double r = rig.yaw.turnResults.isEmpty() ? 0 : rig.yaw.turnResults.get(0);
+            check(n, rig.what(rig.firstMotionAfter(1300)).equals("turn RIGHT")
+                            && Math.abs(-r - 22.5) <= rig.tuning.turnToleranceDeg && rig.violations.isEmpty(),
+                    "result=" + f1(r) + " " + rig.tail());
+        });
+        scenario("roam_steer_all_blocked_gives_a_short_leg_or_a_turn_never_a_full_leg", n -> {
+            Rig rig = navRig(navTuning(), CLEAR, (r, t) -> prof(0.9f, 0.1f, 0.1f, 0.1f));
+            rig.started();
+            rig.runUntil(15000);
+            List<Integer> legs = legs(rig);
+            int max = 0;
+            for (int l : legs) {
+                max = Math.max(max, l);
+            }
+            check(n, rig.what(rig.firstMotionAfter(1300)).startsWith("turn") && !legs.isEmpty() && max <= 2
+                            && rig.count("startle") == 0 && rig.violations.isEmpty(),
+                    "legs=" + legs + " " + rig.tail());
+        });
+        scenario("roam_floor_hazard_mid_leg_aborts_even_when_the_camera_reads_open", n -> {
+            Rig rig = navRig(navTuning(), t -> t >= 1600 && t < 1800 ? edgeAhead(t) : clear(t),
+                    (r, t) -> prof(0.9f, 0.9f, 0.9f, 0.9f));
+            rig.started();
+            rig.runUntil(4000);
+            int hop = rig.first("hop", 0);
+            int stop = rig.first("stop", hop);
+            int startle = rig.first("startle", stop);
+            check(n, rig.timeOf(hop) == 1300 && rig.timeOf(stop) == 1600 && startle > stop
+                            && rig.floorClearFalseAt >= 1600 && rig.violations.isEmpty(),
+                    "hop@" + rig.timeOf(hop) + " stop@" + rig.timeOf(stop) + " " + rig.tail());
+        });
+        scenario("roam_no_looks_backs_off_roams_on_the_floor_sensor_and_retries", n -> {
+            Vision dark = (rig, t) -> null;
+            Rig rig = new Rig(navTuning().build(), CLEAR, dark, true).started();
+            rig.runUntil(17000);
+            int close = rig.first("camera close", 0);
+            int reopen = rig.first("camera open", close);
+            // Opened at 300; no look by 300 + 3000: off for 10 s, roaming on, then tried again.
+            check(n, rig.timeOf(close) == 3300 && rig.timeOf(reopen) >= 13300 && rig.timeOf(reopen) <= 13400
+                            && rig.countPrefix("hop", 3300, 13300) >= 8 && rig.count("camera close") == 2
+                            && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("roam_look_then_go_opens_the_camera_only_at_leg_decisions", n -> {
+            ExploreTuning.Builder b = navTuning().navigation(ExploreTuning.Navigation.LOOK_THEN_GO);
+            Rig rig = navRig(b, CLEAR, (r, t) -> prof(0.9f, 0.9f, 0.9f, 0.9f));
+            rig.started();
+            rig.runUntil(15000);
+            int open = rig.first("camera open", 0);
+            int close = rig.first("camera close", open);
+            int hop = rig.first("hop", 0);
+            java.util.Set<ExploreBrain.State> onlyPause = java.util.EnumSet.of(ExploreBrain.State.PAUSE);
+            check(n, new ExploreTuning.Builder().build().navigation == ExploreTuning.Navigation.CONTINUOUS
+                            && rig.timeOf(open) == 1300 && rig.timeOf(close) == 2000 && rig.timeOf(hop) == 2000
+                            && close < hop && rig.count("camera open") >= 3
+                            && rig.count("camera open") - rig.count("camera close") <= 1
+                            && onlyPause.containsAll(rig.openStates) && rig.violations.isEmpty(),
+                    "open in " + rig.openStates + " " + rig.tail());
+        });
+        scenario("roam_lease_loss_closes_the_camera_and_goes_eyes_only", n -> {
+            Rig rig = navRig(navTuning(), CLEAR, (r, t) -> null);
+            rig.at(1500, () -> rig.brain.onLeaseChanged(false));
+            rig.started();
+            rig.runUntil(3000);
+            check(n, rig.timeOf(rig.firstAfter("stop", 1500)) == 1500
+                            && rig.timeOf(rig.firstAfter("camera close", 1500)) == 1500
+                            && rig.brain.state() == ExploreBrain.State.EYES_ONLY && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("roam_invariant_flags_a_camera_open_while_talking_or_without_the_lease", n -> {
+            ExploreTuning.Navigation c = ExploreTuning.Navigation.CONTINUOUS;
+            boolean flags = true;
+            for (ExploreBrain.State st : new ExploreBrain.State[]{ExploreBrain.State.SPEAK, ExploreBrain.State.MEET,
+                    ExploreBrain.State.ASK_NAME, ExploreBrain.State.LISTEN, ExploreBrain.State.NAME,
+                    ExploreBrain.State.REMEMBER, ExploreBrain.State.NAME_CLIP, ExploreBrain.State.EYES_ONLY,
+                    ExploreBrain.State.CORNERED}) {
+                flags &= cameraRuleBreak(st, true, true, c, false, false) != null;
+            }
+            flags &= cameraRuleBreak(ExploreBrain.State.HOP, true, true,
+                    ExploreTuning.Navigation.LOOK_THEN_GO, false, true) != null;
+            flags &= cameraRuleBreak(ExploreBrain.State.HOP, false, true, c, false, true) != null;
+            flags &= cameraRuleBreak(ExploreBrain.State.HOP, true, true, c, true, true) != null;
+            boolean allows = cameraRuleBreak(ExploreBrain.State.HOP, true, true, c, false, true) == null
+                    && cameraRuleBreak(ExploreBrain.State.SPEAK, false, true, c, false, false) == null
+                    && cameraRuleBreak(ExploreBrain.State.HOP, false, true, c, true, true) == null;
+            check(n, flags && allows, "flags=" + flags + " allows=" + allows);
+        });
+        scenario("roam_steer_low_confidence_keeps_todays_legs", n -> {
+            Rig plain = navRig(navTuning().turnChance(0.5), CLEAR, (r, t) -> null);
+            Rig dim = navRig(navTuning().turnChance(0.5), CLEAR, (r, t) -> prof(0.3f, 0.1f, 0.1f, 0.9f));
+            plain.started();
+            dim.started();
+            plain.runUntil(20000);
+            dim.runUntil(20000);
+            List<String> a = new ArrayList<String>();
+            List<String> b = new ArrayList<String>();
+            for (Event e : plain.log) {
+                if (!e.what.startsWith("camera")) {
+                    a.add(e.toString());
+                }
+            }
+            for (Event e : dim.log) {
+                if (!e.what.startsWith("camera")) {
+                    b.add(e.toString());
+                }
+            }
+            check(n, a.equals(b) && plain.count("hop") > 0 && dim.violations.isEmpty(),
+                    "plain=" + plain.tail() + " dim=" + dim.tail());
+        });
+        scenario("roam_blocked_look_mid_leg_ends_the_leg_at_the_next_tick", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = navRig(navTuning(), CLEAR, (r, t) -> r.count("hop") == 0
+                    ? prof(0.9f, 0.9f, 0.9f, 0.9f) : prof(0.9f, 0.9f, 0.1f, 0.9f));
+            rig.brain.setTrace(notes::add);
+            rig.started();
+            rig.runUntil(4000);
+            int hop = rig.first("hop", 0);
+            int stop = rig.first("stop", hop);
+            int next = rig.firstMotionAfter(rig.timeOf(stop) + 1);
+            boolean numbersOnly = true;
+            for (String note : notes) {
+                numbersOnly &= !note.contains("jpeg") && !note.contains("bins");
+            }
+            // Leg from 1300 (8 ticks, to 3300); the look captured 1800 arrives at 2000.
+            check(n, rig.timeOf(hop) == 1300 && rig.timeOf(stop) == 2000 && rig.count("startle") == 0
+                            && rig.what(next).startsWith("turn") && numbersOnly && rig.violations.isEmpty(),
+                    "stop@" + rig.timeOf(stop) + " next=" + rig.what(next) + " " + rig.tail());
+        });
+        scenario("roam_floor_is_taught_after_driving_over_it_and_motion_is_reported", n -> {
+            Rig rig = navRig(navTuning().floorTeachCounts(100), CLEAR, (r, t) -> prof(0.9f, 0.9f, 0.9f, 0.9f));
+            rig.simWheels = true;
+            rig.started();
+            rig.runUntil(3200);
+            // 100 counts per wheel is 1 s of driving: from the 1300 leg start, taught from ~2300.
+            long[] first = rig.floorTaught.isEmpty() ? null : rig.floorTaught.get(0);
+            boolean moving = false;
+            boolean still = false;
+            for (Event e : rig.movingCalls) {
+                moving |= e.what.equals("moving") && e.t == 1300;
+                still |= e.what.equals("still") && e.t == 3300;
+            }
+            rig.runUntil(3400);
+            for (Event e : rig.movingCalls) {
+                still |= e.what.equals("still") && e.t == 3300;
+            }
+            check(n, first != null && first[0] >= 2300 && first[0] <= 2500 && first[1] <= 1300
+                            // Not clear only while the sensors came up, before the lease was used.
+                            && rig.floorClearCalls >= 30 && rig.floorClearFalseAt < 300
+                            && rig.movingCalls.size() >= 3 && rig.movingCalls.get(0).what.equals("still")
+                            && moving && still && rig.violations.isEmpty(),
+                    "taught=" + (first == null ? "none" : first[0] + "/" + first[1]) + " moving=" + rig.movingCalls
+                            + " " + rig.tail());
         });
     }
 }
