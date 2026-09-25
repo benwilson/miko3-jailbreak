@@ -686,6 +686,7 @@ public final class ExploreBrainHarness {
         meetScenarios();
         faceCropScenarios();
         liveFixScenarios();
+        hazardDuringPickScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -1860,6 +1861,130 @@ public final class ExploreBrainHarness {
         int answer = rig.first("answer PICK", 0);
         int say = rig.first(sayPrefix, answer);
         return say > 0 && rig.countPrefix("hop", rig.timeOf(answer), rig.timeOf(say) + 1) > 0;
+    }
+
+    // ---- a hazard while going to Claude's pick (owner report: a neon sign's line lost to an obstacle) ----
+    //
+    // Claude picks on the first stop only; the stop after it (curiosity gap 0 here)
+    // is how a test sees that the first one ended. The feed reads a hazard only while the brain is in `during` and moving (for an
+    // approach, once a leg has started), until the first startle; clear after that.
+
+    private static Feed hazardWhile(Rig[] rig, ExploreBrain.State during, Feed hazard) {
+        return t -> {
+            Rig r = rig[0];
+            boolean on = r != null && r.brain.state() == during && r.moving && r.count("startle") == 0
+                    && (during != ExploreBrain.State.APPROACH || r.count("hop") > 0);
+            return on ? hazard.at(t) : clear(t);
+        };
+    }
+
+    /** The line was said once, after the startle, the back-off and the escape turn had all stopped. */
+    private static String saidAfterEscape(Rig rig, String sayPrefix) {
+        int startle = rig.first("startle", 0);
+        int back = rig.first("back", startle);
+        int say = rig.first(sayPrefix, 0);
+        if (startle < 0 || back < 0 || say < 0) {
+            return "startle=" + startle + " back=" + back + " say=" + say;
+        }
+        int lastMotion = -1;
+        for (int i = 0; i < say; i++) {
+            String w = rig.what(i);
+            if (w.equals("hop") || w.startsWith("turn") || w.equals("back")) {
+                lastMotion = i;
+            }
+        }
+        int stop = rig.first("stop", lastMotion);
+        if (!(say > back && lastMotion > back && stop > lastMotion && stop < say)) {
+            return "not after a finished escape: back=" + back + " lastMotion=" + lastMotion + " stop=" + stop
+                    + " say=" + say;
+        }
+        if (rig.countPrefix(sayPrefix, 0, Long.MAX_VALUE) != 1) {
+            return "said " + rig.countPrefix(sayPrefix, 0, Long.MAX_VALUE) + " times";
+        }
+        int early = rig.first("say", startle);
+        if (early < stop) {
+            return "spoke during the hazard handling";
+        }
+        return null;
+    }
+
+    /** Claude picks on the first stop only (NOTHING after), so a later stop can't say the line instead. */
+    private static Claude onlyFirst(Claude c) {
+        return (rig, req, nth) -> nth == 1 ? c.answer(rig, req, nth) : CuriosityPort.Answer.nothing();
+    }
+
+    private static void hazardDuringPickScenarios() {
+        scenario("claude_obstacle_during_orient_says_the_line_after_the_escape", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = new Rig(claudeTuning().build(), hazardWhile(h, ExploreBrain.State.ORIENT, t -> obstacle(t)),
+                    (r, t) -> list(), true, onlyFirst(CAT_RIGHT_IN_FRAME_3));
+            h[0] = rig;
+            rig.started();
+            rig.runUntil(15000);
+            String bad = saidAfterEscape(rig, "say Hello kitty");
+            int turn = rig.firstAfter("turn RIGHT", 5000);
+            check(n, bad == null && rig.first("startle", 0) > turn && turn >= 0 && rig.violations.isEmpty(),
+                    bad + " " + rig.tail());
+        });
+        scenario("claude_edge_during_approach_says_the_line_after_the_escape", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = new Rig(claudeTuning().build(), hazardWhile(h, ExploreBrain.State.APPROACH, t -> edgeAhead(t)),
+                    cupIn(2), true, onlyFirst(MUG_ON_THE_CUP));
+            h[0] = rig;
+            rig.started();
+            rig.runUntil(18000);
+            String bad = saidAfterEscape(rig, "say Ooh, a mug");
+            int hop = rig.first("hop", 0);
+            check(n, bad == null && hop >= 0 && rig.first("startle", 0) > hop && rig.violations.isEmpty(),
+                    bad + " " + rig.tail());
+        });
+        scenario("meet_hazard_on_the_way_to_a_person_drops_the_meet", n -> {
+            Rig[] h = new Rig[1];
+            // A person off to the right in look 3: he turns toward them (ORIENT), then would MEET.
+            Rig rig = new Rig(claudeTuning().build(), hazardWhile(h, ExploreBrain.State.ORIENT, t -> obstacle(t)),
+                    (r, t) -> list(), true,
+                    onlyFirst((r, req, nth) -> pick(2, "person", CuriosityPort.Kind.PERSON, "LOOK-LINE",
+                            0.8f, 0.5f, 0.3f, 0.8f)));
+            rig.people.match = (r, k) -> STRANGER;
+            h[0] = rig;
+            rig.started();
+            rig.runUntil(15000);
+            int startle = rig.first("startle", 0);
+            check(n, startle >= 0 && rig.count("match") == 0 && rig.countPrefix("say", 0, 15001) == 0
+                            && rig.count("listen") == 0 && rig.stored.isEmpty() && rig.touches == 0
+                            && !rig.statesSeen.contains(ExploreBrain.State.MEET)
+                            && rig.firstAfter("ask", rig.timeOf(startle)) >= 0 && rig.violations.isEmpty(),
+                    "startle=" + startle + " " + rig.tail());
+        });
+        scenario("claude_line_older_than_the_freshness_window_is_not_spoken", n -> {
+            Rig[] h = new Rig[1];
+            // The escape takes ~2 s; the line keeps for 1 s.
+            Rig rig = new Rig(claudeTuning().heldLineFreshMs(1000).build(),
+                    hazardWhile(h, ExploreBrain.State.ORIENT, t -> obstacle(t)), (r, t) -> list(), true,
+                    onlyFirst(CAT_RIGHT_IN_FRAME_3));
+            h[0] = rig;
+            rig.started();
+            rig.runUntil(15000);
+            int startle = rig.first("startle", 0);
+            check(n, startle >= 0 && rig.countPrefix("say", 0, 15001) == 0
+                            && rig.firstAfter("ask", rig.timeOf(startle)) >= 0 && rig.violations.isEmpty(),
+                    "startle=" + startle + " " + rig.tail());
+        });
+        scenario("claude_hazard_mid_speak_neither_cuts_nor_repeats_the_line", n -> {
+            // Standing still while he speaks: an obstacle then is not reacted to, and the line is said once.
+            Rig[] h = new Rig[1];
+            Rig rig = new Rig(claudeTuning().build(),
+                    t -> h[0] != null && h[0].brain.state() == ExploreBrain.State.SPEAK ? obstacle(t) : clear(t),
+                    (r, t) -> list(), true, onlyFirst(CAT_RIGHT_IN_FRAME_3));
+            h[0] = rig;
+            rig.started();
+            rig.runUntil(15000);
+            int say = rig.first("say Hello kitty", 0);
+            check(n, say >= 0 && rig.count("startle") == 0
+                            && rig.countPrefix("say", 0, 15001) == 1
+                            && rig.motions(rig.timeOf(say), rig.timeOf(say) + 1500) == 0 && rig.violations.isEmpty(),
+                    "say@" + rig.timeOf(say) + " " + rig.tail());
+        });
     }
 
     private static void liveFixScenarios() {

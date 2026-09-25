@@ -147,6 +147,11 @@ final class ExploreTuning {
     final long sayTimeoutMs;
     /** A line waits at most this long for the camera and detector to go quiet (R6; a detector run is ~1 s). */
     final long quietWaitMs;
+    /**
+     * Claude's line for a pick whose turn or approach a hazard cut short is still
+     * said once the escape is over, if the pick is younger than this.
+     */
+    final long heldLineFreshMs;
     final int recentPicksMax;
     /**
      * Meeting a person (explore on Claude U5, KTD3, KTD4): the match request and
@@ -231,6 +236,7 @@ final class ExploreTuning {
         askTimeoutMs = b.askTimeoutMs;
         sayTimeoutMs = b.sayTimeoutMs;
         quietWaitMs = Math.max(0, b.quietWaitMs);
+        heldLineFreshMs = Math.max(0, b.heldLineFreshMs);
         recentPicksMax = Math.max(0, b.recentPicksMax);
         meetTimeoutMs = b.meetTimeoutMs;
         listenMs = b.listenMs;
@@ -363,6 +369,8 @@ final class ExploreTuning {
         // A few seconds of speech (R5), plus the launcher's synthesis; only a backstop.
         private long sayTimeoutMs = 15000;
         private long quietWaitMs = 1500;
+        // Long enough for a startle, back-off and escape turn; stale after that.
+        private long heldLineFreshMs = 30000;
         private int recentPicksMax = 8;
         // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
         private long meetTimeoutMs = 12000;
@@ -463,6 +471,7 @@ final class ExploreTuning {
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
         Builder quietWaitMs(long v) { quietWaitMs = v; return this; }
+        Builder heldLineFreshMs(long v) { heldLineFreshMs = v; return this; }
         Builder recentPicksMax(int v) { recentPicksMax = v; return this; }
         Builder meet(long timeoutMs, long listenMs, long listenMarginMs) {
             meetTimeoutMs = timeoutMs;

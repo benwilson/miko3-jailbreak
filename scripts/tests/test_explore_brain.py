@@ -174,6 +174,12 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "claude_speech_waits_for_an_in_flight_detector_run",
         "claude_speech_goes_ahead_when_the_camera_never_goes_quiet",
         "claude_stops_are_45_to_90_s_apart_and_he_roams_between",
+        # A hazard on the way to Claude's pick: safety first, then the line from where he is
+        "claude_obstacle_during_orient_says_the_line_after_the_escape",
+        "claude_edge_during_approach_says_the_line_after_the_escape",
+        "meet_hazard_on_the_way_to_a_person_drops_the_meet",
+        "claude_line_older_than_the_freshness_window_is_not_spoken",
+        "claude_hazard_mid_speak_neither_cuts_nor_repeats_the_line",
     )
 
     @classmethod

@@ -357,6 +357,10 @@ final class ExploreBrain {
     /** A line waiting for the camera and detector to go quiet, and how long it waits at most. */
     private String pendingLine;
     private long quietUntil;
+    /** When Claude's pick arrived, and a pick whose turn or approach a hazard cut short (said after the escape). */
+    private long pickAt;
+    private CuriosityPort.Answer heldPick;
+    private long heldPickAt;
     // ---- meeting a person (explore on Claude U5) ----
     /** MEET waits for the match request, then (if that failed) the lines-only request. */
     private boolean meetLines;
@@ -697,6 +701,7 @@ final class ExploreBrain {
     private void refuse(long now) {
         HazardClassifier.Hazard h = classifier.hazard();
         note("hazard at start: " + h);
+        leaveStopForHazard();
         hopNext = false;
         lastHazardSide = h == null ? null : h.side;
         if (recordHazard(now)) {
@@ -716,6 +721,7 @@ final class ExploreBrain {
     /** As above, for a hazard the classifier did not see (h null: side unknown). */
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
         stopMotors();
+        leaveStopForHazard();
         stalledNow = h == null && state == State.HOP && stallStreak > 0;
         hopNext = false;
         lastHazardSide = h == null ? null : h.side;
@@ -728,6 +734,46 @@ final class ExploreBrain {
         show(EyeState.FLINCH, null);
         state = State.STARTLE;
         phaseUntil = now + tuning.startleMs;
+    }
+
+    /**
+     * A hazard ends any curiosity stop he was moving in: the escape comes first and
+     * nothing is said during it. Claude's line for a thing he was turning to or
+     * driving up to is kept, to be said from wherever the escape leaves him (like
+     * an approach that loses sight); a person's meeting is dropped, since the
+     * person is no longer in front of him.
+     */
+    private void leaveStopForHazard() {
+        if (!state.inStop()) {
+            return;
+        }
+        boolean going = state == State.ORIENT || state == State.FACE || state == State.APPROACH;
+        if (going && pick != null && !pick.kind.equals(CuriosityPort.Kind.PERSON) && usable(pick.line)) {
+            note("keeping Claude's line for after the escape");
+            heldPick = pick;
+            heldPickAt = pickAt;
+        } else if (pick != null) {
+            note("dropping this stop's pick");
+        }
+        clearStop();
+    }
+
+    /** After an escape, standing still: Claude's kept line, if it is still fresh. True if he is saying it. */
+    private boolean sayHeldLine(long now) {
+        CuriosityPort.Answer p = heldPick;
+        heldPick = null;
+        if (p == null) {
+            return false;
+        }
+        if (now - heldPickAt > tuning.heldLineFreshMs) {
+            note("Claude's kept line is " + (now - heldPickAt) + " ms old: dropping it");
+            return false;
+        }
+        note("escape over: saying Claude's line from here");
+        pick = p;
+        target = null;
+        speak(now, p.line);
+        return true;
     }
 
     /**
@@ -758,7 +804,9 @@ final class ExploreBrain {
         }
         if (clearSince >= 0 && now - clearSince >= tuning.escapeClearMs && now >= phaseUntil) {
             stopMotors();
-            enterPause(now, pauseMs(), false);
+            if (!sayHeldLine(now)) {
+                enterPause(now, pauseMs(), false);
+            }
         } else if (now - turnStartedAt >= tuning.escapeSweepMaxMs) {
             stopMotors();
             escapeFailures.addLast(now);
@@ -838,6 +886,7 @@ final class ExploreBrain {
         scanDir = randomDirection();
         target = null;
         claudeStop = port.canAsk();
+        heldPick = null;
         scanned.clear();
         detectorPick = null;
         detectorPickLook = -1;
@@ -1142,6 +1191,12 @@ final class ExploreBrain {
     /** Back to wandering; the camera closes as the state leaves curiosity. */
     private void endCuriosity(long now) {
         stopMotors();
+        clearStop();
+        enterPause(now, pauseMs(), false);
+    }
+
+    /** Forgets everything about the current stop (the camera closes as the state leaves curiosity). */
+    private void clearStop() {
         cancelAsk();
         target = null;
         pick = null;
@@ -1151,7 +1206,6 @@ final class ExploreBrain {
         scanned.clear();
         askedFrames.clear();
         cues.clear();
-        enterPause(now, pauseMs(), false);
     }
 
     /** Open the camera in the curiosity states, close it everywhere else (R2, AE6). */
@@ -1269,6 +1323,7 @@ final class ExploreBrain {
             return;
         }
         pick = a;
+        pickAt = now;
         remember(a.box.label, a.kind, now);
         float cx = a.box.centerX();
         long offset = Math.abs(cx) > tuning.centreTolerance
@@ -1750,6 +1805,7 @@ final class ExploreBrain {
         hopNext = false;
         target = null;
         pick = null;
+        heldPick = null;
         afterOrient = null;
         cues.clear();
         if (state != State.EYES_ONLY || shownState == null) {
