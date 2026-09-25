@@ -261,6 +261,12 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "side_left_blocked_escape_ladder_commands_no_left_turn_until_free",
         "side_left_blocked_the_turn_after_a_rest_and_the_next_ladder_go_right",
         "side_both_blocked_alternates_instead_of_one_side_for_ever",
+        # Wedged: a straight back-up first, then the free way round (live 2026-09-25: nose to a wall)
+        "wedged_nose_to_wall_backs_up_first_then_turns_the_free_way_and_drives_off",
+        "wedged_back_up_blocked_behind_goes_on_with_the_ladder",
+        "wedged_retrace_long_way_round_past_a_blocked_side_is_skipped",
+        # The learned turn rate: completed turns only (live 2026-09-25: collapsed to the floor)
+        "turn_rate_learns_only_from_completed_turns",
         # A blocked side: the retry and later turns go the other way (live 2026-09-25)
         "blocked_side_backs_up_then_turns_the_other_way_and_drives_off",
         "blocked_side_escape_turns_go_the_unblocked_way_even_the_long_way_round",

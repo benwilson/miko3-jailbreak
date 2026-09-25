@@ -355,9 +355,16 @@ final class ExploreTuning {
      * A measured turn that will not turn backs up blind this many back ticks first
      * (bounded by their time, stopped early by a stall), once per turn, then tries the
      * same turn again (live 2026-09-25: pinned after a CPL stop with no leg to back out
-     * along, "all he needed was to back up a tiny bit and then spin"). 0: no back-up.
+     * along, "all he needed was to back up a tiny bit and then spin"). A wedged escape
+     * ladder also starts with one such back-up, whatever the leg log holds. 0: no back-up.
      */
     final int blockedTurnBackTicks;
+    /**
+     * A retrace turn that would go the long way round past a blocked side, further than
+     * this, is skipped for the circle (live 2026-09-25: a 327 deg turn at the learned
+     * rate spent 20 s of the step turning).
+     */
+    final double retraceLongWayMaxDeg;
     /**
      * Open doorways through Claude (explore nav plan U6, R7, R8, KTD4, KTD5). While
      * he roams with the heading usable, one frame is asked about at most every
@@ -522,6 +529,7 @@ final class ExploreTuning {
         escapeTriedPenalty = b.escapeTriedPenalty;
         backOutMaxMs = b.backOutMaxMs;
         blockedTurnBackTicks = Math.max(0, b.blockedTurnBackTicks);
+        retraceLongWayMaxDeg = b.retraceLongWayMaxDeg;
         doorwayAskMs = Math.max(0, b.doorwayAskMs);
         doorwayAskTimeoutMs = Math.max(1, b.doorwayAskTimeoutMs);
         doorwayWeight = Math.max(0f, b.doorwayWeight);
@@ -772,6 +780,7 @@ final class ExploreTuning {
         // 8 frames at 250 ms). Still blind with no rear sensor, so bounded by its time, and
         // the stall watch stops it early against something behind him.
         private int blockedTurnBackTicks = 8;
+        private double retraceLongWayMaxDeg = 200;
         // R8 and the owner's cap (Key Decisions): about once a minute, so room pictures
         // sent to Claude stay infrequent. A navigation ask answers in ~3-6 s live (U5).
         private long doorwayAskMs = 60000;
@@ -996,6 +1005,7 @@ final class ExploreTuning {
         Builder escapeTried(double deg, float penalty) { escapeTriedDeg = deg; escapeTriedPenalty = penalty; return this; }
         Builder backOutMaxMs(long v) { backOutMaxMs = v; return this; }
         Builder blockedTurnBackTicks(int v) { blockedTurnBackTicks = v; return this; }
+        Builder retraceLongWayMaxDeg(double v) { retraceLongWayMaxDeg = v; return this; }
         Builder doorwayAsk(long intervalMs, long timeoutMs) {
             doorwayAskMs = intervalMs;
             doorwayAskTimeoutMs = timeoutMs;

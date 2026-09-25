@@ -169,7 +169,11 @@ import java.util.Set;
  * the way ahead looks clear; driven cleanly, he is free. Uncalibrated, every wedge
  * is today's: the cornered cap and the failed-sweep count. A blocked measured turn
  * with no leg to back out along first backs up blockedTurnBackTicks (stopped by a
- * stall, not logged as a leg) and tries the turn once more, the other way. A way a
+ * stall, not logged as a leg) and tries the turn once more, the other way. Every
+ * ladder starts with one such back-up, whatever the leg log holds (no leg back-out
+ * after it); if it moved him, the turn that would not turn goes the free way and he
+ * drives off, else (or failing) the ladder goes on. A retrace turn the long way
+ * round past a blocked side over retraceLongWayMaxDeg is skipped. A way a
  * turn would not turn is avoided by every later turn (unblocked()) until he drives
  * off forward cleanly or a turn that way gets there; with both blocked, the one
  * blocked longer ago is tried first.
@@ -572,7 +576,7 @@ final class ExploreBrain {
     private enum Esc { TURN_READY, TURNING, DRIVE_READY, DRIVING, BACK_READY, BACKING, READY, LOOKING, ASKING }
 
     /** What follows the current turn, back-out or wait. */
-    private enum EscThen { DRIVE, LOOK, RETRACE_NEXT, RETRY_TURN, PHASE }
+    private enum EscThen { DRIVE, LOOK, RETRACE_NEXT, RETRY_TURN, PHASE, FIRST_BACK }
 
     private Esc esc;
     private EscThen escThen;
@@ -603,6 +607,20 @@ final class ExploreBrain {
     private boolean escDroveForward;
     /** Wedged by a blocked turn: back out before the retrace's first turn. */
     private boolean escBackOutFirst;
+    /**
+     * The ladder's first move is a straight blind back-up (blockedTurnBackTicks), whatever
+     * the leg log holds (live 2026-09-25: nose to a wall, the turn into it blocked, "he
+     * could just back up to get out of there"; the retrace turned 327 deg instead).
+     */
+    private boolean escBackUpFirst;
+    /** After that back-up moved him: the turn the free way and a drive off are under way. */
+    private boolean escFirstRetry;
+    /** The measured turn that would not turn when he was wedged (null: another trigger), and its amount. */
+    private Direction wedgeTurnDir;
+    private double wedgeTurnDeg;
+    /** This ladder's: the blocked turn to try the free way after the first back-up (null: none). */
+    private Direction escRetryDir;
+    private double escRetryDeg;
     /** Counts to drive or back out (0: a drive-off's escapeDriveTicks, a hazard's backTicks). */
     private long escGoal;
     /** Counts moved in this drive or back-out, and the reading they were last counted from. */
@@ -2660,6 +2678,8 @@ final class ExploreBrain {
         }
         turnRetrying = false;
         leaveStopForHazard();
+        wedgeTurnDir = heading;
+        wedgeTurnDeg = turnDeg;
         wedged(now, "a turn that would not turn", true);
     }
 
@@ -2739,6 +2759,10 @@ final class ExploreBrain {
         planner.begin(now, compass.degrees());
         escDroveForward = false;
         escBackOutFirst = turnBlocked;
+        escBackUpFirst = tuning.blockedTurnBackTicks > 0;
+        escFirstRetry = false;
+        escRetryDir = turnBlocked ? wedgeTurnDir : null;
+        escRetryDeg = wedgeTurnDeg;
         escShortBack = false;
         circleDir = unblocked(escapeSide != null ? escapeSide : Direction.LEFT);
         escapePhase(now);
@@ -2750,6 +2774,18 @@ final class ExploreBrain {
             case RETRACE:
                 state = State.RETRACE;
                 show(EyeState.IDLE, null);
+                if (escBackUpFirst) {
+                    // Straight back first, blind and bounded like a blocked turn's back-up
+                    // (its time, the stall watch), not logged as a leg.
+                    escBackUpFirst = false;
+                    note("backing up first: " + tuning.blockedTurnBackTicks + " back ticks");
+                    escGoal = 0;
+                    escGoalAfterRetry = 0;
+                    escShortBack = true;
+                    escThen = EscThen.FIRST_BACK;
+                    esc = Esc.BACK_READY;
+                    return;
+                }
                 if (escBackOutFirst) {
                     escBackOutFirst = false;
                     if (startBackOut(EscThen.RETRACE_NEXT)) {
@@ -2972,11 +3008,17 @@ final class ExploreBrain {
             aheadBlocked();
             note((hazard ? "hazard" : "wheels stalled") + " driving in the escape's " + planner.phase() + " after "
                     + escMoved + " counts");
-            if (planner.phase() == EscapePlanner.Phase.RETRACE) {
-                planner.addRetraced(escMoved);
-            }
             show(EyeState.FLINCH, null);
-            planner.next(now);
+            if (escFirstRetry) {
+                // The drive off after the first back-up: the retrace still follows, after the back-off.
+                escFirstRetry = false;
+                planner.restartStep(now);
+            } else {
+                if (planner.phase() == EscapePlanner.Phase.RETRACE) {
+                    planner.addRetraced(escMoved);
+                }
+                planner.next(now);
+            }
             if (tuning.backTicks > 0) {
                 escGoal = 0;
                 escThen = EscThen.PHASE;
@@ -2997,7 +3039,12 @@ final class ExploreBrain {
             note("wheels stalled driving in the escape's " + planner.phase() + ": " + escMoved + " counts in "
                     + (now - hopStartedAt) + " ms");
             show(EyeState.FLINCH, null);
-            planner.next(now);
+            if (escFirstRetry) {
+                escFirstRetry = false;
+                planner.restartStep(now);
+            } else {
+                planner.next(now);
+            }
             if (tuning.backTicks > 0) {
                 escGoal = 0;
                 escThen = EscThen.PHASE;
@@ -3010,7 +3057,10 @@ final class ExploreBrain {
         if (done) {
             stopMotors();
             escDroveForward = true;
-            if (planner.phase() == EscapePlanner.Phase.RETRACE) {
+            if (escFirstRetry) {
+                escFirstRetry = false;
+                escapeFreed(now, "backed up, turned and drove off");
+            } else if (planner.phase() == EscapePlanner.Phase.RETRACE) {
                 planner.addRetraced(escMoved);
                 escWait(now, EscThen.RETRACE_NEXT);
             } else {
@@ -3051,10 +3101,17 @@ final class ExploreBrain {
                     note("backed out " + escMoved + " counts");
                 }
             }
-            if (escThen == EscThen.RETRY_TURN) {
+            if (escThen == EscThen.FIRST_BACK) {
+                afterFirstBack(now, escMoved >= tuning.stallMinCounts);
+            } else if (escThen == EscThen.RETRY_TURN) {
                 escThen = escThenAfterRetry;
                 flipEscTurn(now);
-                esc = Esc.TURN_READY;
+                if (planner.phase() == EscapePlanner.Phase.RETRACE && !Double.isNaN(escTarget)
+                        && escTurnAmount > tuning.retraceLongWayMaxDeg) {
+                    escFailed(now, "the other way round is " + Math.round(escTurnAmount) + " deg");
+                } else {
+                    esc = Esc.TURN_READY;
+                }
             } else if (escThen == EscThen.RETRACE_NEXT) {
                 escWait(now, EscThen.RETRACE_NEXT);
             } else {
@@ -3064,6 +3121,47 @@ final class ExploreBrain {
             nextTickAt += tuning.backTickMs;
             motor.backTick();
         }
+    }
+
+    /**
+     * The ladder's first back-up is over; no back-out along the leg log follows it this
+     * escape. It went nowhere (something behind him): the ladder goes on as before. It moved him: now
+     * with room to pivot, the turn that would not turn is tried the free way and he
+     * drives off; wedged some other way, a short leg forward if the way ahead looks clear.
+     * Either failing, the ladder goes on from its retrace with the step's whole budget.
+     */
+    private void afterFirstBack(long now, boolean moved) {
+        planner.restartStep(now);
+        // One back-up per ladder, plus the per-blocked-turn short back-ups (reversing stays bounded).
+        planner.backedUpFirst();
+        escBackOutFirst = false;
+        if (!moved) {
+            note("backing up first went nowhere: on with the escape");
+            escapePhase(now);
+            return;
+        }
+        if (escRetryDir != null) {
+            Direction d = unblocked(escRetryDir.opposite());
+            double deg = Math.max(escRetryDeg, tuning.escapeCircleStepDeg);
+            note("backed up: turning " + d + " " + Math.round(deg) + " deg with room to pivot, then driving off");
+            escFirstRetry = true;
+            escGoal = 0;
+            escTurnBy(d, deg, EscThen.DRIVE);
+            return;
+        }
+        if (tryForwardFirst(now, "after backing up", false, ProbeThen.STEP)) {
+            return;
+        }
+        escapePhase(now);
+    }
+
+    /** The turn and drive after the first back-up failed: the ladder goes on from its retrace. */
+    private void firstRetryFailed(long now, String why) {
+        escFirstRetry = false;
+        stopMotors();
+        note("the free way after backing up failed: " + why + "; on with the escape");
+        planner.restartStep(now);
+        escapePhase(now);
     }
 
     /**
@@ -3118,6 +3216,12 @@ final class ExploreBrain {
         Direction d = delta > 0 ? Direction.LEFT : Direction.RIGHT;
         double deg = Math.abs(delta);
         if (unblocked(d) != d) {
+            if (planner.phase() == EscapePlanner.Phase.RETRACE && 360 - deg > tuning.retraceLongWayMaxDeg) {
+                // Not 20 s of turning the long way round (live 2026-09-25): the circle instead.
+                escFailed(now, "the " + d + " side is blocked and the long way round is " + Math.round(360 - deg)
+                        + " deg");
+                return;
+            }
             note("the " + d + " side is blocked: turning the long way round");
             d = d.opposite();
             deg = 360 - deg;
@@ -3149,6 +3253,10 @@ final class ExploreBrain {
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
                 + " deg in " + (now - turnStartedAt) + " ms (" + escDir + ")");
         blockSide(escDir);
+        if (escFirstRetry) {
+            firstRetryFailed(now, "a turn that would not turn");
+            return;
+        }
         if (!escBackedOut) {
             escBackedOut = true;
             EscThen after = planner.phase() == EscapePlanner.Phase.RETRACE ? EscThen.RETRACE_NEXT : EscThen.RETRY_TURN;
@@ -3245,6 +3353,10 @@ final class ExploreBrain {
     }
 
     private void escFailed(long now, String why) {
+        if (escFirstRetry) {
+            firstRetryFailed(now, why);
+            return;
+        }
         stopMotors();
         EscapePlanner.Phase p = planner.phase();
         note("escape's " + p + " failed: " + why);
@@ -3351,6 +3463,7 @@ final class ExploreBrain {
         stopMotors();
         cancelWayOut();
         escShortBack = false;
+        escFirstRetry = false;
         if (clear && (p == EscapePlanner.Phase.RETRACE || p == EscapePlanner.Phase.DRIVE_OFF
                 || p == EscapePlanner.Phase.SECOND_DRIVE_OFF)) {
             if (p == EscapePlanner.Phase.RETRACE) {

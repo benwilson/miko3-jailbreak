@@ -14,6 +14,9 @@ import java.util.List;
  *              he cannot turn, he first reverses straight along the most recent
  *              forward leg(s), capped at their logged distance: ground he just drove
  *              over. Done: freed. Nothing logged, a hazard or out of time: CIRCLE.
+ *              Before all that the brain backs up blind (blockedTurnBackTicks) once,
+ *              and a retrace turn the long way round past a blocked side further than
+ *              retraceLongWayMaxDeg is skipped for the CIRCLE.
  *   CIRCLE     escapeCircleSteps stops, escapeCircleStepDeg apart, each with one
  *              fresh stationary look (openness, frame, heading). Then WAY_OUT.
  *   WAY_OUT    the circle's frames to Claude; the answer (frame and position) is a
@@ -313,6 +316,15 @@ final class EscapePlanner {
 
     /** A back-out stalled: the wheels can't move him back either. */
     void backOutStalled() {
+        backOutSpent = true;
+    }
+
+    /**
+     * The ladder's first blind back-up has run: no back-out along the leg log this
+     * escape. Stalled, nothing behind him gives; moved, he is already behind the
+     * ground the log covers (the back-up is not a leg), so it is no longer known floor.
+     */
+    void backedUpFirst() {
         backOutSpent = true;
     }
 

@@ -229,7 +229,12 @@ final class Heading {
     /** The motor stopped: a turn in progress starts coasting; an open leg ends with the next reading. */
     void stopped(long nowMs) {
         if (turning) {
-            learnRate(nowMs);
+            if (turnReached()) {
+                // Only a turn that got there teaches the rate: a blocked turn, or one a
+                // hazard, stall or backstop cut short, times its stuck spell too (live
+                // 2026-09-25: averaged in, they dragged it to the 15 deg/s floor).
+                learnRate(nowMs);
+            }
             turning = false;
             coasting = true;
             turnedAtStop = turned;
@@ -243,7 +248,8 @@ final class Heading {
     /**
      * The turn rate recent measured turns made, degrees turned over the time they
      * took (spin-up included), each turn moving it halfway; NaN before the first
-     * turn of at least RATE_MIN_DEG in RATE_MIN_MS. Carpet or a low battery slow him
+     * turn of at least RATE_MIN_DEG in RATE_MIN_MS. Only completed turns count (they
+     * reached their amount): never a blocked one or one cut short. Carpet or a low battery slow him
      * (live 2026-09-25: ~40 deg/s), and the escape's step budgets follow it.
      */
     double turnRateDegS() {

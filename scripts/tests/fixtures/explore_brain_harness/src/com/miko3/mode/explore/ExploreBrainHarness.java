@@ -464,6 +464,11 @@ public final class ExploreBrainHarness {
         long legStartT;
         /** Reversing moves nothing (a stall during a back-out). */
         boolean backBlocked;
+        /** A wall at this heading (NaN: none) from wallFrom: driving forward while facing within
+         * wallHalfDeg of it moves nothing (nose to the wall, live 2026-09-25). */
+        double wallAt = Double.NaN;
+        long wallFrom = Long.MAX_VALUE;
+        double wallHalfDeg = 45;
         /** The yaw unsticks as the nth back move starts (0: never): a little reversing frees the turn. */
         int unstickAfterBacks;
         /** The true heading when the brain first entered CIRCLE (NaN before). */
@@ -498,7 +503,11 @@ public final class ExploreBrainHarness {
         /** One 10 ms step of the simulated wheels. */
         private void advanceWheels() {
             if ("hop".equals(motion)) {
-                if (now <= blockedFrom) {
+                boolean wall = !Double.isNaN(wallAt) && now >= wallFrom && yaw != null
+                        && Math.abs(Heading.delta(yaw.wrapped(), wallAt)) <= wallHalfDeg;
+                if (wall) {
+                    // Nose to the wall: nothing moves.
+                } else if (now <= blockedFrom) {
                     wheelLeft++;
                     wheelRight++;
                     countsBeforeBlocked++;
@@ -1191,6 +1200,7 @@ public final class ExploreBrainHarness {
         budgetScenarios();
         forwardFirstScenarios();
         sideScenarios();
+        backUpFirstScenarios();
         doorwayScenarios();
         peopleScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
@@ -4326,6 +4336,8 @@ public final class ExploreBrainHarness {
             // Wedged by bumps with LEFT blocked for good and nothing behind him giving: once a
             // LEFT turn has been blocked, every turn the ladder commands (retrace, circle,
             // drive-off, retries) is RIGHT, the long way round where it must be, until free.
+            // (A retrace move whose long way round is over retraceLongWayMaxDeg is skipped now,
+            // so one RIGHT turn can be all he needs before a forward try frees him.)
             Rig[] h = new Rig[1];
             Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
             rig.yaw.stuckDir = 1;
@@ -4348,7 +4360,7 @@ public final class ExploreBrainHarness {
                 lefts += c[1] == 1 ? 1 : 0;
                 rights += c[1] == -1 ? 1 : 0;
             }
-            check(n, wedged > 0 && firstBlocked > 0 && lefts == 0 && rights >= 2 && rig.violations.isEmpty(),
+            check(n, wedged > 0 && firstBlocked > 0 && lefts == 0 && rights >= 1 && rig.violations.isEmpty(),
                     "wedged@" + wedged + " blocked@" + firstBlocked + " lefts=" + lefts + " rights=" + rights + " "
                             + rig.tail());
         });
@@ -4399,6 +4411,151 @@ public final class ExploreBrainHarness {
             }
             check(n, turns.size() >= 4 && lefts >= 2 && rights >= 2 && rig.violations.isEmpty(),
                     "lefts=" + lefts + " rights=" + rights + " " + rig.tail());
+        });
+    }
+
+    // ---- wedged: back up first (live 2026-09-25: nose to a wall, "he could just back up") ----
+
+    /** Nose to a wall at 0 once the first leg is done: forward toward it goes nowhere; the first
+     * turn's way pivots into the wall (blocked for good), the other way is free. */
+    private static Rig noseToWallRig(List<String> notes, boolean backBlocked) {
+        Rig[] h = new Rig[1];
+        Rig rig = escRig(escTuning().turnChance(1.0), h, t -> {
+            Rig r = h[0];
+            if (r != null && r.wallFrom == Long.MAX_VALUE && !r.drives.isEmpty() && r.drives.get(0).end > 0) {
+                r.wallAt = r.yaw.wrapped();
+                r.wallFrom = t;
+            }
+            return clear(t);
+        }, null);
+        rig.yaw.blockFirstTurnsSide = true;
+        rig.backBlocked = backBlocked;
+        rig.creepPer100 = 0;
+        rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+        return rig;
+    }
+
+    /** Ends a measured turn the way a blocked or cut one ends: moving for movingMs, then stuck. */
+    private static void cutTurn(Bench b, int dir, double amount, long movingMs, long stuckMs) {
+        b.h.startTurn(dir, amount);
+        b.yaw.turn(dir);
+        b.commanded = true;
+        b.run(movingMs);
+        b.yaw.stuck = true;
+        b.run(stuckMs);
+        b.yaw.stop();
+        b.yaw.stuck = false;
+        b.commanded = false;
+        b.h.stopped(b.now);
+    }
+
+    private static void backUpFirstScenarios() {
+        scenario("wedged_nose_to_wall_backs_up_first_then_turns_the_free_way_and_drives_off", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = noseToWallRig(notes, false);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "free after") >= 0 && !r.moving);
+            long wedged = notedAt(notes, "wedged: a turn that would not turn");
+            int first = rig.first("turn", 0);
+            String blocked = rig.what(first);
+            Drive back = wedged < 0 ? null : firstDrive(rig, "RETRACE", "back", wedged);
+            Drive anyFirst = null;
+            for (Drive d : rig.drives) {
+                if (anyFirst == null && d.t >= wedged) {
+                    anyFirst = d;
+                }
+            }
+            int turn = back == null || back.end < 0 ? -1 : rig.firstAfter("turn", back.end);
+            Drive off = turn < 0 ? null : firstDrive(rig, "RETRACE", "hop", rig.timeOf(turn));
+            long free = notedAt(notes, "free after");
+            check(n, wedged > 0 && back != null && anyFirst == back && back.end - back.t >= 1900 && Math.abs(back.counts) > 50
+                            && notedAt(notes, "backing up first") >= wedged
+                            && turn > 0 && !rig.what(turn).equals(blocked) && off != null && off.counts > 0
+                            && free > 0 && free - wedged <= 10000 && notesWith(notes, "long way") == 0
+                            && notesWith(notes, "retrace: facing") == 0 && entered(rig, ExploreBrain.State.CIRCLE, 0) < 0
+                            && Math.abs(Heading.delta(off.heading, rig.wallAt)) > rig.wallHalfDeg
+                            && rig.violations.isEmpty(),
+                    "wedged@" + wedged + " blocked=" + blocked + " back=" + back + " turn=" + rig.what(turn) + " off=" + off
+                            + " wall=" + f1(rig.wallAt) + " notes=" + notes.subList(Math.max(0, notes.size() - 14), notes.size()));
+        });
+        scenario("wedged_back_up_blocked_behind_goes_on_with_the_ladder", n -> {
+            // Something behind him too: the back-up stalls, no back-out along the leg log
+            // follows, and the ladder runs as before (retrace, then on) until he is free.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = noseToWallRig(notes, true);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "free after") >= 0 && !r.moving);
+            long wedged = notedAt(notes, "wedged: a turn that would not turn");
+            List<Drive> backs = drivesIn(rig, "RETRACE", "back", Math.max(0, wedged), Long.MAX_VALUE);
+            long nowhere = notedAt(notes, "backing up first went nowhere");
+            long retrace = notedAt(notes, "retrace: facing");
+            Drive hop = retrace < 0 ? null : firstDrive(rig, "RETRACE", "hop", retrace);
+            Drive anyFirst = null;
+            for (Drive d : rig.drives) {
+                if (anyFirst == null && d.t >= wedged) {
+                    anyFirst = d;
+                }
+            }
+            check(n, wedged > 0 && !backs.isEmpty() && anyFirst == backs.get(0) && Math.abs(backs.get(0).counts) <= 5
+                            && nowhere >= backs.get(0).t && retrace > nowhere && hop != null
+                            && notedAt(notes, "free after") > hop.t && notesWith(notes, "backing out straight") == 0
+                            && notesWith(notes, "backed up: turning") == 0 && rig.violations.isEmpty(),
+                    "wedged@" + wedged + " backs=" + backs + " hop=" + hop + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 14), notes.size()));
+        });
+        scenario("wedged_retrace_long_way_round_past_a_blocked_side_is_skipped", n -> {
+            // Live 2026-09-25: "the LEFT side is blocked: turning the long way round", then 20 s
+            // on a 327 deg turn. LEFT blocked for good, nothing behind him gives: a retrace move
+            // that would go over retraceLongWayMaxDeg the long way is skipped for the next step.
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
+            rig.yaw.stuckDir = 1;
+            rig.backBlocked = true;
+            rig.openView = openAt(90);
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 120000, r -> notedAt(notes, "free after") >= 0 || r.brain.state() == ExploreBrain.State.CORNERED);
+            long skipped = notedAt(notes, "escape's RETRACE failed: the LEFT side is blocked and the long way round is");
+            int longTurns = 0;
+            for (String x : notes) {
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile("RETRACE step gets \\d+ ms more for its (\\d+) deg")
+                        .matcher(x);
+                if (m.find() && Long.parseLong(m.group(1)) > rig.tuning.retraceLongWayMaxDeg) {
+                    longTurns++;
+                }
+            }
+            check(n, rig.tuning.retraceLongWayMaxDeg == 200 && skipped > 0 && longTurns == 0
+                            && notedAt(notes, "free after") > skipped && rig.violations.isEmpty(),
+                    "skipped@" + skipped + " longTurns=" + longTurns + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 12), notes.size()));
+        });
+        scenario("turn_rate_learns_only_from_completed_turns", n -> {
+            // Live 2026-09-25: blocked and cut turns (degrees over 1.5 s of nothing) dragged the
+            // learned rate to the 15 deg/s floor; real turns on that carpet ran ~40 deg/s.
+            Bench b = new Bench(gyroTuning().build(), new YawSim(robotGyro()));
+            b.still(1000);
+            b.yaw.rateDegS = 20;
+            b.turnBy(Heading.LEFT, 90);
+            b.still(1000);
+            double slow = b.h.turnRateDegS();
+            b.yaw.rateDegS = 40;
+            cutTurn(b, Heading.RIGHT, 40, 0, 1500);
+            b.still(1000);
+            cutTurn(b, Heading.LEFT, 90, 750, 1500);
+            b.still(1000);
+            cutTurn(b, Heading.RIGHT, 120, 1000, 0);
+            b.still(1000);
+            double afterCut = b.h.turnRateDegS();
+            b.turnBy(Heading.LEFT, 90);
+            b.still(1000);
+            double afterReal = b.h.turnRateDegS();
+            b.turnBy(Heading.RIGHT, 10);
+            b.still(1000);
+            double afterSmall = b.h.turnRateDegS();
+            check(n, Math.abs(slow - 20) <= 3 && Math.abs(afterCut - slow) < 0.01 && afterReal > slow + 7
+                            && afterReal <= 40 && Math.abs(afterSmall - afterReal) < 0.01,
+                    "slow=" + f1(slow) + " afterCut=" + f1(afterCut) + " afterReal=" + f1(afterReal) + " afterSmall="
+                            + f1(afterSmall));
         });
     }
 
@@ -4770,7 +4927,8 @@ public final class ExploreBrainHarness {
         // ---- turns blocked: back out straight along the last leg first (live: under a desk) ----
         scenario("escape_blocked_turns_back_out_along_the_last_leg_then_turn_and_drive_off", n -> {
             Rig[] h = new Rig[1];
-            Rig rig = escRig(escTuning(), h, t -> {
+            // The leg back-out itself: no blind back-up first (wedged_nose_to_wall_* covers that).
+            Rig rig = escRig(escTuning().blockedTurnBackTicks(0), h, t -> {
                 Rig r = h[0];
                 if (r != null) {
                     boolean backedOut = false;
@@ -4809,7 +4967,7 @@ public final class ExploreBrainHarness {
             String detail = "";
             for (int i = 0; i < 2; i++) {
                 Rig[] h = new Rig[1];
-                Rig rig = escRig(escTuning().escapeRetrace(cap[i], 10), h, t -> {
+                Rig rig = escRig(escTuning().escapeRetrace(cap[i], 10).blockedTurnBackTicks(0), h, t -> {
                     Rig r = h[0];
                     if (r != null && r.count("hop") > 0) {
                         r.yaw.stuck = true;
@@ -4836,14 +4994,16 @@ public final class ExploreBrainHarness {
             rig.yaw.stuck = true;
             rig.started();
             runUntil(rig, 30000, r -> entered(r, ExploreBrain.State.CIRCLE, 0) >= 0);
-            // No back-out along a leg: only the short back-ups before retried turns (blockedTurnBackTicks).
+            // No back-out along a leg: only the short blind back-ups (blockedTurnBackTicks), before
+            // retried turns and, one per ladder, the ladder's first move.
             long shortMs = rig.tuning.blockedTurnBackTicks * 250 + 100;
             boolean shortOnly = true;
             for (Drive d : rig.drives) {
                 shortOnly &= !d.kind.equals("back") || (d.end > 0 && d.end - d.t <= shortMs);
             }
+            int ladderBacks = drivesIn(rig, "RETRACE", "back", 0, Long.MAX_VALUE).size();
             check(n, entered(rig, ExploreBrain.State.CIRCLE, 0) > 0
-                            && drivesIn(rig, "RETRACE", "back", 0, Long.MAX_VALUE).isEmpty() && shortOnly
+                            && ladderBacks <= entries(rig, ExploreBrain.State.RETRACE).size() && shortOnly
                             && rig.violations.isEmpty(),
                     rig.drives + " " + rig.tail());
         });
@@ -4953,7 +5113,7 @@ public final class ExploreBrainHarness {
             // As escape_back_out_stops_at_the_logged_distance...: the counters start below
             // zero, so the leg in crosses zero and the back-out crosses it again.
             Rig[] h = new Rig[1];
-            Rig rig = escRig(escTuning(), h, t -> {
+            Rig rig = escRig(escTuning().blockedTurnBackTicks(0), h, t -> {
                 Rig r = h[0];
                 if (r != null && r.count("hop") > 0) {
                     r.yaw.stuck = true;
