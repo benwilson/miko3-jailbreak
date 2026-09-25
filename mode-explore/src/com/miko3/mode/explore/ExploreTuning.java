@@ -98,7 +98,7 @@ final class ExploreTuning {
     final float fillArea;
     /**
      * Camera curiosity (KTD5). A curiosity stop comes curiosityMin..MaxMs of
-     * wandering after the last one. A scan takes up to scanLooks looks with a
+     * wandering after the last one ends, however it ends. A scan takes up to scanLooks looks with a
      * scanTurnMs step turn between them. A look counts only if its frame was
      * captured lookSettleMs after he stopped moving; no such look within
      * firstLookTimeoutMs of opening the camera (lookTimeoutMs later) is a camera
@@ -136,6 +136,39 @@ final class ExploreTuning {
     final long puzzledMs;
     /** After greeting a person or pet, people and pets are ignored this long (R12). */
     final long peopleCooldownMs;
+    /**
+     * Asking Claude (explore on Claude KTD6): askAttempts tries of askTimeoutMs
+     * each before falling back to the detector (R7, R8). A spoken line is given
+     * up on after sayTimeoutMs if the finished callback never comes (KTD8). The
+     * look request carries the last recentPicksMax picks (KTD2).
+     */
+    final int askAttempts;
+    final long askTimeoutMs;
+    final long sayTimeoutMs;
+    /** A line waits at most this long for the camera and detector to go quiet (R6; a detector run is ~1 s). */
+    final long quietWaitMs;
+    /**
+     * Claude's line for a pick whose turn or approach a hazard cut short is still
+     * said once the escape is over, if the pick is younger than this.
+     */
+    final long heldLineFreshMs;
+    final int recentPicksMax;
+    /**
+     * Meeting a person (explore on Claude U5, KTD3, KTD4): the match request and
+     * each later Claude request get meetTimeoutMs; he listens for up to listenMs
+     * and waits listenMarginMs more for the launcher's answer before giving up.
+     */
+    final long meetTimeoutMs;
+    final long listenMs;
+    final long listenMarginMs;
+    /** Claude's box and a detector box are the same thing at this overlap (KTD7). */
+    final float pickMatchIou;
+    /**
+     * The camera waits this long after closing before it opens again
+     * (ExploreCamera.REOPEN_GAP_MS). Reopening it mid-stop for FACE counts the
+     * rest of the gap toward the first look's deadline (KTD6).
+     */
+    final long reopenGapMs;
     /** Edge and obstacle thresholds from the device, or null when uncalibrated (KTD9). */
     final Calibration calibration;
 
@@ -199,6 +232,17 @@ final class ExploreTuning {
         disappointedMs = b.disappointedMs;
         puzzledMs = b.puzzledMs;
         peopleCooldownMs = b.peopleCooldownMs;
+        askAttempts = Math.max(1, b.askAttempts);
+        askTimeoutMs = b.askTimeoutMs;
+        sayTimeoutMs = b.sayTimeoutMs;
+        quietWaitMs = Math.max(0, b.quietWaitMs);
+        heldLineFreshMs = Math.max(0, b.heldLineFreshMs);
+        recentPicksMax = Math.max(0, b.recentPicksMax);
+        meetTimeoutMs = b.meetTimeoutMs;
+        listenMs = b.listenMs;
+        listenMarginMs = b.listenMarginMs;
+        pickMatchIou = b.pickMatchIou;
+        reopenGapMs = b.reopenGapMs;
         calibration = b.calibration;
     }
 
@@ -291,8 +335,9 @@ final class ExploreTuning {
         private float unsureFloor = 0.2f;
         private float fillHeight = 0.7f;
         private float fillArea = 0.4f;
-        private long curiosityMinMs = 20000;
-        private long curiosityMaxMs = 40000;
+        // 45-90 s of wandering between stops: the owner likes him driving around.
+        private long curiosityMinMs = 45000;
+        private long curiosityMaxMs = 90000;
         private int scanLooks = 3;
         private long scanTurnMs = 700;
         private long lookSettleMs = 400;
@@ -317,6 +362,24 @@ final class ExploreTuning {
         private long disappointedMs = 1400;
         private long puzzledMs = 1100;
         private long peopleCooldownMs = 120000;
+        // Two tries of about 10 s (R7): a stop with Claude unreachable falls back
+        // within ~20 s (AE4). Owner's call after live tests: a look usually takes ~3 s,
+        // and a slow one is retried rather than waited on longer.
+        private int askAttempts = 2;
+        private long askTimeoutMs = 10000;
+        // A few seconds of speech (R5), plus the launcher's synthesis; only a backstop.
+        private long sayTimeoutMs = 15000;
+        private long quietWaitMs = 1500;
+        // Long enough for a startle, back-off and escape turn; stale after that.
+        private long heldLineFreshMs = 30000;
+        private int recentPicksMax = 8;
+        // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
+        private long meetTimeoutMs = 12000;
+        // KTD4's 6 s cap, and room for the launcher to wait out the speech queue and decode.
+        private long listenMs = 6000;
+        private long listenMarginMs = 6000;
+        private float pickMatchIou = 0.3f;
+        private long reopenGapMs = 3000;
         private Calibration calibration;
 
         /** A fixed leg length. */
@@ -406,6 +469,19 @@ final class ExploreTuning {
             return this;
         }
         Builder peopleCooldownMs(long v) { peopleCooldownMs = v; return this; }
+        Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
+        Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
+        Builder quietWaitMs(long v) { quietWaitMs = v; return this; }
+        Builder heldLineFreshMs(long v) { heldLineFreshMs = v; return this; }
+        Builder recentPicksMax(int v) { recentPicksMax = v; return this; }
+        Builder meet(long timeoutMs, long listenMs, long listenMarginMs) {
+            meetTimeoutMs = timeoutMs;
+            this.listenMs = listenMs;
+            this.listenMarginMs = listenMarginMs;
+            return this;
+        }
+        Builder pickMatchIou(float v) { pickMatchIou = v; return this; }
+        Builder reopenGapMs(long v) { reopenGapMs = v; return this; }
         Builder calibration(Calibration v) { calibration = v; return this; }
 
         ExploreTuning build() {

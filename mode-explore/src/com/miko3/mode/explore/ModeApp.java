@@ -52,6 +52,8 @@ public class ModeApp extends Application {
     private ExploreLoop loop;
     private ClipPlayer clips;
     private ExploreCamera camera;
+    // Claude, the launcher's voice, ears and people store at curiosity stops (explore on Claude U6).
+    private ClaudeCuriosity curiosity;
 
     /** How often the brain loop runs; well under a hop tick (ExploreBrain.onTick). */
     private static final long BRAIN_TICK_MS = 20;
@@ -159,8 +161,10 @@ public class ModeApp extends Application {
             });
             drive = new ExploreDrive(this);
             drive.start();
-            loop = new ExploreLoop(tuning, ExploreDrive.CLOCK,
-                    drive, drive, drive, eyes, sound, camera, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
+            // Fetches the Claude settings now and again every stop; with none set up, stops run as before.
+            curiosity = new ClaudeCuriosity(this);
+            loop = new ExploreLoop(tuning, ExploreDrive.CLOCK, drive, drive, drive, eyes, sound, camera, curiosity,
+                    drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
             loop.start();
             Log.i(TAG, "explore started");
         }
@@ -182,10 +186,12 @@ public class ModeApp extends Application {
             }
             exploring = false;
             loop.stop();
+            curiosity.release();
             camera.release();
             drive.release();
             clips.release();
             loop = null;
+            curiosity = null;
             camera = null;
             drive = null;
             clips = null;
@@ -224,6 +230,9 @@ public class ModeApp extends Application {
                     break; // set by stare(), with where to look
                 case EYES_ONLY:
                     setExploreState(ExploreState.of(ExploreState.EYES_ONLY));
+                    break;
+                case THINKING:
+                    setExploreState(ExploreState.of(ExploreState.THINKING));
                     break;
                 default:
                     setExploreState(ExploreState.IDLE_STATE);

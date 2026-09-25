@@ -189,7 +189,7 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
         return dir;
     }
 
-    private static void copyAssets(AssetManager assets, String path, File dest) throws IOException {
+    static void copyAssets(AssetManager assets, String path, File dest) throws IOException {
         String[] children = assets.list(path);
         if (children == null || children.length == 0) {
             InputStream in = assets.open(path);
@@ -217,7 +217,7 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
         }
     }
 
-    private static void deleteTree(File f) {
+    static void deleteTree(File f) {
         File[] kids = f.listFiles();
         if (kids != null) {
             for (File k : kids) {
@@ -227,7 +227,7 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
         f.delete();
     }
 
-    private static String readAll(InputStream in) throws IOException {
+    static String readAll(InputStream in) throws IOException {
         try {
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             byte[] buf = new byte[4096];

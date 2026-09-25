@@ -38,6 +38,9 @@ SETTINGS_PATHS = (
     "SETTINGS_CLAUDE_TEST_PATH",
     "SETTINGS_CLAUDE_FORGET_PATH",
     "SETTINGS_VOICE_SAY_PATH",
+    "SETTINGS_PEOPLE_RENAME_PATH",
+    "SETTINGS_PEOPLE_FORGET_PATH",
+    "SETTINGS_PEOPLE_FACE_PATH",
 )
 
 
@@ -208,9 +211,9 @@ class SettingsPageSourceTest(unittest.TestCase):
 
     def test_page_reads_no_query_parameter_but_status(self):
         # No settings path takes the key (or anything else) from the URL, which
-        # RoutingHttpServer logs.
+        # RoutingHttpServer logs. The face image GET takes only a person's id.
         params = re.findall(r"queryParam\(\s*\"([^\"]*)\"", self.page)
-        self.assertEqual(set(params), {"status"})
+        self.assertEqual(set(params), {"status", "id"})
         self.assertNotIn("req.query.", self.page)
 
     def test_no_logging_near_the_key(self):
@@ -322,6 +325,20 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "say_speaks_and_redirects",
         "say_status_never_echoes_text",
         "get_on_say_path_refused",
+        "people_section_empty",
+        "people_section_lists_faces_names_and_last_seen",
+        "people_name_is_escaped",
+        "people_forms_carry_token_and_id_only",
+        "rename_changes_name_and_redirects",
+        "rename_empty_makes_unnamed",
+        "forget_removes_person_from_store_and_page",
+        "people_actions_on_unknown_id_change_nothing",
+        "people_actions_with_stale_token_refused",
+        "people_status_never_echoes_name",
+        "get_on_people_action_paths_refused",
+        "face_get_serves_the_jpeg",
+        "face_get_refuses_unknown_and_bad_ids",
+        "people_paths_are_tls_only",
     )
 
     @classmethod

@@ -1,6 +1,6 @@
 """Host-side tests for shared/ClaudeApi (settings plan U3, KTD3, KTD4, KTD5):
-the plain-Java Claude client that lists models and runs the one-token
-connection test, mapping every failure to a fixed reason. The harness swaps
+the plain-Java Claude client that lists models, runs the one-token
+connection test and sends image+text requests for JSON (explore plan U1), mapping every failure to a fixed reason. The harness swaps
 in a fake transport, so no request leaves the machine."""
 import re
 import subprocess
@@ -20,7 +20,7 @@ HARNESS = TESTS / "fixtures" / "claude_api_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "shared" / "ClaudeApiHarness.java"
 CLIENT = SHARED / "ClaudeApi.java"
 TRANSPORT = SHARED / "ClaudeHttpsTransport.java"
-PLAIN_JAVA = [CLIENT, TRANSPORT, SHARED / "Json.java"]
+PLAIN_JAVA = [CLIENT, TRANSPORT, SHARED / "Json.java", SHARED / "ClaudeAccess.java"]
 
 
 class ClaudeClientIsPlainJavaTest(unittest.TestCase):
@@ -47,7 +47,11 @@ class HttpsTransportWiringTest(unittest.TestCase):
         self.assertRegex(self.src, r"\.setConnectTimeout\(\s*[A-Z_0-9]+\s*\)")
 
     def test_read_timeout_set(self):
-        self.assertRegex(self.src, r"\.setReadTimeout\(\s*[A-Z_0-9]+\s*\)")
+        # The per-call timeout (explore plan U1, KTD6) with the 30 s default behind it.
+        self.assertRegex(self.src, r"\.setReadTimeout\(\s*request\.readTimeoutMs\s*>\s*0\s*\?\s*request\.readTimeoutMs\s*:\s*READ_TIMEOUT_MS\s*\)")
+
+    def test_default_read_timeout_is_30_s(self):
+        self.assertRegex(self.src, r"READ_TIMEOUT_MS\s*=\s*30000\s*;")
 
     def test_timeouts_are_positive(self):
         for name in ("CONNECT_TIMEOUT_MS", "READ_TIMEOUT_MS"):
@@ -124,6 +128,26 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "timeout_is_unreachable",
         "ssl_failure_is_tls_failed",
         "reasons_are_fixed_text",
+        "messages_images_and_text_serialize_in_order",
+        "messages_json_reply_parses",
+        "messages_schema_sent_as_output_config",
+        "messages_sends_auth_version_and_json_headers",
+        "messages_timeout_reaches_transport",
+        "messages_without_schema_sends_no_output_config",
+        "existing_calls_keep_the_default_timeout",
+        "messages_output_config_400_retries_once_without_it",
+        "messages_later_calls_skip_output_config",
+        "messages_fallback_retries_only_once",
+        "messages_other_400_does_not_retry",
+        "messages_timeout_is_unreachable",
+        "messages_error_status_maps_like_the_connection_test",
+        "messages_invalid_json_is_bad_reply",
+        "messages_malformed_response_body_is_endpoint_error",
+        "messages_prose_wrapped_json_parses",
+        "messages_text_without_json_is_refused",
+        "messages_refusal_stop_reason_is_refused",
+        "messages_not_set_up_makes_no_request",
+        "jpeg_block_base64_has_no_newlines",
     )
 
     @classmethod
@@ -135,7 +159,7 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         out = cls._td.name
         # Only the plain-Java classes are compiled; the rest of shared/ needs the Android SDK.
         # The real transport is compiled too, to prove it builds without Android.
-        sources = [HARNESS_MAIN, CLIENT, TRANSPORT, SHARED / "Json.java"]
+        sources = [HARNESS_MAIN, CLIENT, TRANSPORT, SHARED / "Json.java", SHARED / "ClaudeAccess.java"]
         c = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, sources, [HARNESS]),
                            capture_output=True, text=True)
         cls.compiled = c.returncode == 0

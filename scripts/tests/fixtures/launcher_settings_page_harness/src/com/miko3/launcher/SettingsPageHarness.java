@@ -104,11 +104,40 @@ public final class SettingsPageHarness {
         final FakeTransport transport = new FakeTransport();
         final ClaudeApi api = new ClaudeApi(transport);
         final FakeSpeaker speaker = new FakeSpeaker();
+        final PeopleClock peopleClock = new PeopleClock();
+        final PeopleStore people = new PeopleStore(tempDir(), peopleClock);
+    }
+
+    static final class PeopleClock implements PeopleStore.Clock {
+        long now = 1_700_000_000_000L;
+
+        @Override
+        public long nowMillis() {
+            return now;
+        }
+    }
+
+    static java.io.File tempDir() {
+        try {
+            java.io.File d = java.io.File.createTempFile("settings_people_", "");
+            if (!d.delete() || !d.mkdirs()) {
+                throw new IllegalStateException("no temp dir");
+            }
+            d.deleteOnExit();
+            return d;
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    static byte[] jpeg(int tag) {
+        return new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) tag, 1, 2, 3, (byte) 0xFF, (byte) 0xD9};
     }
 
     static final class Resp {
         String head;
         String body;
+        byte[] bytes;
 
         int code() {
             return Integer.parseInt(head.split(" ")[1]);
@@ -139,13 +168,29 @@ public final class SettingsPageHarness {
         HttpRequest req = new HttpRequest(method, path, HttpRequest.parseQuery(query), headers,
                 new ByteArrayInputStream(body));
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        SettingsPage.handle(req, new HttpResponse(out), f.token, f.settings, f.api, f.speaker);
+        SettingsPage.handle(req, new HttpResponse(out), f.token, f.settings, f.api, f.speaker, f.people);
         String raw = new String(out.toByteArray(), StandardCharsets.UTF_8);
         int split = raw.indexOf("\r\n\r\n");
         Resp r = new Resp();
         r.head = split < 0 ? raw : raw.substring(0, split);
         r.body = split < 0 ? "" : raw.substring(split + 4);
+        byte[] all = out.toByteArray();
+        int at = indexOf(all, "\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+        r.bytes = at < 0 ? new byte[0] : Arrays.copyOfRange(all, at + 4, all.length);
         return r;
+    }
+
+    static int indexOf(byte[] hay, byte[] needle) {
+        outer:
+        for (int i = 0; i + needle.length <= hay.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (hay[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
     }
 
     static String get(Fixture f) throws Exception {
@@ -736,6 +781,209 @@ public final class SettingsPageHarness {
                 check(n, r.code() == 405 && f.speaker.said.isEmpty()
                                 && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_VOICE_SAY_PATH),
                         r.head);
+            }
+        });
+
+        // U2 (explore-on-claude plan): the People section, R15, R16, AE6.
+        scenario("people_section_empty", new Scenario() {
+            public void run(String n) throws Exception {
+                String html = get(new Fixture());
+                int people = html.indexOf("<section id=\"people\">");
+                check(n, people > html.indexOf("<section id=\"voice\">")
+                                && html.contains("id=\"people-empty\"") && !html.contains("<img"),
+                        html);
+            }
+        });
+
+        scenario("people_section_lists_faces_names_and_last_seen", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sarah = f.people.add(jpeg(1), "Sarah");
+                f.peopleClock.now += 60_000;
+                String anon = f.people.add(jpeg(2), null);
+                String html = get(f);
+                String section = html.substring(html.indexOf("<section id=\"people\">"));
+                String img = "src=\"" + LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH + "?id=";
+                boolean faces = section.contains(img + sarah + "\"") && section.contains(img + anon + "\"");
+                boolean names = section.contains("Sarah") && section.contains("unnamed");
+                boolean seen = section.contains(SettingsPage.lastSeen(f.people.all().get(0).lastSeenMillis))
+                        && section.contains("Last seen");
+                boolean order = section.indexOf(anon) < section.indexOf(sarah);
+                boolean forms = !form(section, LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH).isEmpty()
+                        && !form(section, LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH).isEmpty()
+                        && !section.contains("people-empty");
+                check(n, faces && names && seen && order && forms,
+                        "faces=" + faces + " names=" + names + " seen=" + seen + " order=" + order
+                                + " forms=" + forms + " " + section);
+            }
+        });
+
+        scenario("people_name_is_escaped", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.people.add(jpeg(1), "<b>Bo</b>");
+                String html = get(f);
+                check(n, html.contains("&lt;b&gt;Bo&lt;/b&gt;") && !html.contains("<b>Bo"), html);
+            }
+        });
+
+        scenario("people_forms_carry_token_and_id_only", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.people.add(jpeg(1), "Sarah");
+                String html = get(f);
+                List<String> forget = fieldNames(form(html, LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH));
+                List<String> rename = fieldNames(form(html, LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH));
+                check(n, forget.equals(Arrays.asList("t", "id")) && rename.equals(Arrays.asList("t", "id", "name")),
+                        forget + " " + rename);
+            }
+        });
+
+        scenario("rename_changes_name_and_redirects", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(1), null);
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, "",
+                        "t=" + token(f) + "&id=" + id + "&name=" + enc("  Sarah "));
+                check(n, r.location().startsWith("/settings?status=") && "Sarah".equals(f.people.nameOf(id))
+                                && SettingsPage.PEOPLE_RENAMED.equals(r.status()),
+                        r.head + " name=" + f.people.nameOf(id));
+            }
+        });
+
+        scenario("rename_empty_makes_unnamed", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(1), "Sarah");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, "",
+                        "t=" + token(f) + "&id=" + id + "&name=");
+                check(n, "".equals(f.people.nameOf(id)) && get(f).contains("unnamed")
+                        && SettingsPage.PEOPLE_UNNAMED.equals(r.status()), r.head);
+            }
+        });
+
+        // AE6: Forget deletes the face and the name for good.
+        scenario("forget_removes_person_from_store_and_page", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(1), "Sarah");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + token(f) + "&id=" + id);
+                Resp face = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH, "id=" + id, null);
+                String html = get(f);
+                check(n, f.people.nameOf(id) == null && f.people.face(id) == null && !html.contains(id)
+                                && !html.contains("Sarah") && face.code() == 404
+                                && SettingsPage.PEOPLE_FORGOTTEN.equals(r.status()),
+                        r.head + " " + face.head);
+            }
+        });
+
+        scenario("people_actions_on_unknown_id_change_nothing", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(1), "Sarah");
+                Resp r1 = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + token(f) + "&id=" + enc("../x"));
+                Resp r2 = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, "",
+                        "t=" + token(f) + "&id=0123456789abcdef&name=Eve");
+                check(n, SettingsPage.PEOPLE_UNKNOWN.equals(r1.status())
+                                && SettingsPage.PEOPLE_UNKNOWN.equals(r2.status())
+                                && "Sarah".equals(f.people.nameOf(id)) && f.people.all().size() == 1,
+                        r1.status() + " | " + r2.status());
+            }
+        });
+
+        scenario("people_actions_with_stale_token_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(1), "Sarah");
+                String stale = token(f);
+                for (int i = 0; i < 5; i++) {
+                    token(f);
+                }
+                Resp r1 = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + stale + "&id=" + id);
+                Resp r2 = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, "",
+                        "t=" + stale + "&id=" + id + "&name=Eve");
+                Resp r3 = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "", "id=" + id);
+                check(n, "Sarah".equals(f.people.nameOf(id)) && r1.status().contains("expired")
+                                && r2.status().contains("expired") && r3.status().contains("expired"),
+                        r1.status() + " | " + r2.status() + " | " + r3.status());
+            }
+        });
+
+        scenario("people_status_never_echoes_name", new Scenario() {
+            public void run(String n) throws Exception {
+                String marker = "Zqxmarker";
+                List<String> leaks = new ArrayList<String>();
+                for (String name : Arrays.asList(marker, "<b>" + marker + "</b>",
+                        marker + repeat('x', 200), "")) {
+                    Fixture f = new Fixture();
+                    String id = f.people.add(jpeg(1), marker);
+                    for (Resp r : Arrays.asList(
+                            request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, "",
+                                    "t=" + token(f) + "&id=" + id + "&name=" + enc(name)),
+                            request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                                    "t=" + token(f) + "&id=" + id))) {
+                        if (r.location().contains(marker) || r.status().contains(marker)) {
+                            leaks.add(r.location());
+                        }
+                    }
+                }
+                check(n, leaks.isEmpty(), leaks.toString());
+            }
+        });
+
+        scenario("get_on_people_action_paths_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(1), "Sarah");
+                Resp r1 = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH,
+                        "t=" + token(f) + "&id=" + id, null);
+                Resp r2 = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH,
+                        "t=" + token(f) + "&id=" + id + "&name=Eve", null);
+                check(n, r1.code() == 405 && r2.code() == 405 && "Sarah".equals(f.people.nameOf(id)),
+                        r1.head + " | " + r2.head);
+            }
+        });
+
+        scenario("face_get_serves_the_jpeg", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(5), null);
+                Resp r = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH, "id=" + id, null);
+                check(n, r.code() == 200 && r.head.toLowerCase().contains("content-type: image/jpeg")
+                        && Arrays.equals(r.bytes, jpeg(5)), r.head);
+            }
+        });
+
+        scenario("face_get_refuses_unknown_and_bad_ids", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(5), null);
+                List<String> wrong = new ArrayList<String>();
+                for (String q : Arrays.asList("id=0123456789abcdef", "id=" + enc("../" + id), "id=",
+                        "", "id=" + enc(PeopleStore.INDEX_FILE), "id=" + id.toUpperCase())) {
+                    Resp r = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH, q, null);
+                    if (r.code() != 404 || r.body.contains("ÿ")) {
+                        wrong.add(q + "->" + r.head);
+                    }
+                }
+                Resp post = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH, "id=" + id,
+                        "t=" + token(f));
+                if (post.code() != 405) {
+                    wrong.add("POST->" + post.head);
+                }
+                check(n, wrong.isEmpty(), wrong.toString());
+            }
+        });
+
+        scenario("people_paths_are_tls_only", new Scenario() {
+            public void run(String n) {
+                check(n, LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH)
+                                && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH)
+                                && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH),
+                        "a people path is served on plain HTTP");
             }
         });
 

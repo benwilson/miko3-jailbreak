@@ -7,6 +7,8 @@ import java.net.UnknownHostException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -87,6 +89,7 @@ public final class ClaudeApiHarness {
         wire();
         noRequestWhenNotSetUp();
         secrecy();
+        messages();
     }
 
     private static void normalization() {
@@ -372,6 +375,223 @@ public final class ClaudeApiHarness {
                 .testConnection(BASE, KEY, MODEL);
         fixed &= tls.reason.text.contains("clock") && tls.reason.text.contains("certificate");
         check("reasons_are_fixed_text", fixed, "bad=" + bad + " tls=" + tls.reason.text);
+    }
+
+    // ---- messages(): images + text in, parsed JSON out (explore plan U1) ----
+
+    private static final ClaudeAccess ACCESS = ClaudeAccess.setUp(BASE, KEY, MODEL);
+
+    private static Map<String, Object> schema() {
+        Map<String, Object> props = new LinkedHashMap<String, Object>();
+        props.put("interesting", Collections.singletonMap("type", "boolean"));
+        Map<String, Object> s = new LinkedHashMap<String, Object>();
+        s.put("type", "object");
+        s.put("properties", props);
+        s.put("required", Collections.singletonList("interesting"));
+        s.put("additionalProperties", Boolean.FALSE);
+        return s;
+    }
+
+    /** A Messages API success whose single text block is the given text. */
+    private static String reply(String text, String stopReason) {
+        Map<String, Object> block = new LinkedHashMap<String, Object>();
+        block.put("type", "text");
+        block.put("text", text);
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("type", "message");
+        body.put("role", "assistant");
+        body.put("content", Collections.singletonList(block));
+        body.put("stop_reason", stopReason);
+        return Json.write(body);
+    }
+
+    private static String reply(String text) {
+        return reply(text, "end_turn");
+    }
+
+    private static List<Map<String, Object>> threeFramesAndAQuestion() {
+        List<Map<String, Object>> blocks = new ArrayList<Map<String, Object>>();
+        for (int k = 1; k <= 3; k++) {
+            blocks.add(ClaudeApi.textBlock("Image " + k + ":"));
+            blocks.add(ClaudeApi.jpegBlock(new byte[] {(byte) 0xff, (byte) 0xd8, (byte) k}));
+        }
+        blocks.add(ClaudeApi.textBlock("What is most interesting?"));
+        return blocks;
+    }
+
+    private static Map<?, ?> body(ClaudeApi.Request q) {
+        Object v = Json.parse(q.body);
+        return v instanceof Map ? (Map<?, ?>) v : Collections.emptyMap();
+    }
+
+    private static String describe(ClaudeApi.MessageResult r) {
+        return r.ok() ? "ok json=" + r.json : r.reason + " status=" + r.httpStatus;
+    }
+
+    private static ClaudeApi.MessageResult ask(FakeTransport t, String answer) {
+        t.reply(200, answer);
+        return new ClaudeApi(t).messages(ACCESS, "sys", threeFramesAndAQuestion(), schema(), 10000);
+    }
+
+    private static void messages() {
+        FakeTransport t = new FakeTransport();
+        ClaudeApi.MessageResult r = ask(t, reply("{\"interesting\":true,\"label\":\"cat\"}"));
+        Map<?, ?> b = t.requests.isEmpty() ? Collections.emptyMap() : body(t.requests.get(0));
+        String order = "";
+        Object msgs = b.get("messages");
+        if (msgs instanceof List && ((List<?>) msgs).size() == 1) {
+            Map<?, ?> msg = (Map<?, ?>) ((List<?>) msgs).get(0);
+            if ("user".equals(msg.get("role")) && msg.get("content") instanceof List) {
+                for (Object o : (List<?>) msg.get("content")) {
+                    Map<?, ?> blk = (Map<?, ?>) o;
+                    if ("image".equals(blk.get("type"))) {
+                        Map<?, ?> src = (Map<?, ?>) blk.get("source");
+                        order += "img(" + src.get("type") + "," + src.get("media_type") + "," + src.get("data") + ") ";
+                    } else {
+                        order += "txt(" + blk.get("text") + ") ";
+                    }
+                }
+            }
+        }
+        String want = "txt(Image 1:) img(base64,image/jpeg,/9gB) txt(Image 2:) img(base64,image/jpeg,/9gC) "
+                + "txt(Image 3:) img(base64,image/jpeg,/9gD) txt(What is most interesting?) ";
+        check("messages_images_and_text_serialize_in_order",
+                want.equals(order) && "sys".equals(b.get("system")) && MODEL.equals(b.get("model"))
+                        && t.requests.size() == 1 && t.requests.get(0).url.equals(BASE + "/v1/messages")
+                        && "POST".equals(t.requests.get(0).method),
+                order);
+        check("messages_json_reply_parses",
+                r.ok() && Boolean.TRUE.equals(r.json.get("interesting")) && "cat".equals(r.json.get("label")),
+                describe(r));
+        Object oc = b.get("output_config");
+        Object fmt = oc instanceof Map ? ((Map<?, ?>) oc).get("format") : null;
+        check("messages_schema_sent_as_output_config",
+                fmt instanceof Map && "json_schema".equals(((Map<?, ?>) fmt).get("type"))
+                        && Json.write(schema()).equals(Json.write(((Map<?, ?>) fmt).get("schema"))),
+                String.valueOf(oc));
+        check("messages_sends_auth_version_and_json_headers",
+                !t.requests.isEmpty() && KEY.equals(t.requests.get(0).headers.get("x-api-key"))
+                        && "2023-06-01".equals(t.requests.get(0).headers.get("anthropic-version"))
+                        && "application/json".equals(t.requests.get(0).headers.get("content-type")),
+                "headers");
+        check("messages_timeout_reaches_transport",
+                !t.requests.isEmpty() && t.requests.get(0).readTimeoutMs == 10000,
+                t.requests.isEmpty() ? "no request" : "readTimeoutMs=" + t.requests.get(0).readTimeoutMs);
+
+        FakeTransport n = new FakeTransport().reply(200, reply("{\"ask_line\":\"Hi!\"}"));
+        ClaudeApi.MessageResult nr = new ClaudeApi(n).messages(ACCESS, "sys",
+                Collections.singletonList(ClaudeApi.textBlock("Ask a name.")), null, 10000);
+        check("messages_without_schema_sends_no_output_config",
+                nr.ok() && !body(n.requests.get(0)).containsKey("output_config")
+                        && "Hi!".equals(nr.json.get("ask_line")),
+                describe(nr) + " " + n.requests.get(0).body);
+
+        FakeTransport d = new FakeTransport().reply(200, "{}").reply(200, "{\"data\":[]}");
+        ClaudeApi dapi = new ClaudeApi(d);
+        dapi.testConnection(BASE, KEY, MODEL);
+        dapi.listModels(BASE, KEY);
+        check("existing_calls_keep_the_default_timeout",
+                d.requests.size() == 2 && d.requests.get(0).readTimeoutMs == 0 && d.requests.get(1).readTimeoutMs == 0,
+                "requests=" + d.requests.size());
+
+        // The 400 fallback: one retry without output_config, remembered afterwards.
+        FakeTransport f = new FakeTransport()
+                .reply(400, error("invalid_request_error", "output_config: Extra inputs are not permitted"))
+                .reply(200, reply("{\"interesting\":false}"))
+                .reply(200, reply("{\"interesting\":true}"));
+        ClaudeApi fapi = new ClaudeApi(f);
+        ClaudeApi.MessageResult f1 = fapi.messages(ACCESS, "sys", threeFramesAndAQuestion(), schema(), 10000);
+        boolean retried = f.requests.size() == 2 && body(f.requests.get(0)).containsKey("output_config")
+                && !body(f.requests.get(1)).containsKey("output_config");
+        String sys2 = f.requests.size() == 2 ? String.valueOf(body(f.requests.get(1)).get("system")) : "";
+        check("messages_output_config_400_retries_once_without_it",
+                retried && f1.ok() && Boolean.FALSE.equals(f1.json.get("interesting"))
+                        && sys2.startsWith("sys") && sys2.contains("\"additionalProperties\":false")
+                        && f.requests.get(1).readTimeoutMs == 10000,
+                describe(f1) + " requests=" + f.requests.size() + " system=" + sys2);
+        ClaudeApi.MessageResult f2 = fapi.messages(ACCESS, "sys", threeFramesAndAQuestion(), schema(), 10000);
+        check("messages_later_calls_skip_output_config",
+                f2.ok() && f.requests.size() == 3 && !body(f.requests.get(2)).containsKey("output_config")
+                        && String.valueOf(body(f.requests.get(2)).get("system")).contains("additionalProperties"),
+                describe(f2) + " requests=" + f.requests.size());
+
+        FakeTransport twice = new FakeTransport()
+                .reply(400, error("invalid_request_error", "output_config: Extra inputs are not permitted"))
+                .reply(400, error("invalid_request_error", "messages: something else"));
+        ClaudeApi.MessageResult tw = new ClaudeApi(twice).messages(ACCESS, "sys", threeFramesAndAQuestion(), schema(), 10000);
+        check("messages_fallback_retries_only_once",
+                !tw.ok() && tw.reason == ClaudeApi.Reason.INVALID_REQUEST && twice.requests.size() == 2,
+                describe(tw) + " requests=" + twice.requests.size());
+
+        FakeTransport other = new FakeTransport().reply(400, error("invalid_request_error", "messages: bad image"));
+        ClaudeApi.MessageResult o = new ClaudeApi(other).messages(ACCESS, "sys", threeFramesAndAQuestion(), schema(), 10000);
+        check("messages_other_400_does_not_retry",
+                !o.ok() && o.reason == ClaudeApi.Reason.INVALID_REQUEST && o.httpStatus == 400
+                        && other.requests.size() == 1,
+                describe(o) + " requests=" + other.requests.size());
+
+        FakeTransport to = new FakeTransport().fail(new SocketTimeoutException("Read timed out"));
+        ClaudeApi.MessageResult tr = new ClaudeApi(to).messages(ACCESS, "sys", threeFramesAndAQuestion(), schema(), 10000);
+        check("messages_timeout_is_unreachable",
+                !tr.ok() && tr.reason == ClaudeApi.Reason.UNREACHABLE && tr.httpStatus == 0 && to.requests.size() == 1,
+                describe(tr));
+
+        FakeTransport k = new FakeTransport().reply(401, error("authentication_error", "bad key " + KEY));
+        ClaudeApi.MessageResult kr = new ClaudeApi(k).messages(ACCESS, "sys", threeFramesAndAQuestion(), schema(), 10000);
+        check("messages_error_status_maps_like_the_connection_test",
+                !kr.ok() && kr.reason == ClaudeApi.Reason.BAD_KEY && kr.httpStatus == 401
+                        && !kr.describe().contains(KEY),
+                describe(kr));
+
+        String bad = "";
+        for (String answer : new String[] {"{\"interesting\": tru", "[1,2,3]", "{\"a\":1} and {\"b\":2}"}) {
+            ClaudeApi.MessageResult x = ask(new FakeTransport(), reply(answer));
+            if (x.ok() || x.reason != ClaudeApi.Reason.BAD_REPLY) {
+                bad += answer + "->" + describe(x) + " ";
+            }
+        }
+        check("messages_invalid_json_is_bad_reply", bad.isEmpty(), bad);
+
+        String badBody = "";
+        for (String raw : new String[] {"not json at all", "{\"content\":\"nope\"}", "{\"content\":[]}", ""}) {
+            ClaudeApi.MessageResult x = ask(new FakeTransport(), raw);
+            if (x.ok() || x.reason != ClaudeApi.Reason.ENDPOINT_ERROR) {
+                badBody += "[" + raw + "]->" + describe(x) + " ";
+            }
+        }
+        check("messages_malformed_response_body_is_endpoint_error", badBody.isEmpty(), badBody);
+
+        ClaudeApi.MessageResult fenced = ask(new FakeTransport(),
+                reply("Here you go:\n```json\n{\"interesting\":true}\n```"));
+        check("messages_prose_wrapped_json_parses",
+                fenced.ok() && Boolean.TRUE.equals(fenced.json.get("interesting")), describe(fenced));
+
+        ClaudeApi.MessageResult prose = ask(new FakeTransport(),
+                reply("I'm not able to identify people from their faces."));
+        check("messages_text_without_json_is_refused",
+                !prose.ok() && prose.reason == ClaudeApi.Reason.REFUSED && prose.httpStatus == 200, describe(prose));
+
+        ClaudeApi.MessageResult stop = ask(new FakeTransport(), reply("{\"interesting\":true}", "refusal"));
+        ClaudeApi.MessageResult empty = ask(new FakeTransport(),
+                "{\"type\":\"message\",\"content\":[],\"stop_reason\":\"refusal\"}");
+        check("messages_refusal_stop_reason_is_refused",
+                !stop.ok() && stop.reason == ClaudeApi.Reason.REFUSED
+                        && !empty.ok() && empty.reason == ClaudeApi.Reason.REFUSED,
+                describe(stop) + " / " + describe(empty));
+
+        FakeTransport none = new FakeTransport();
+        ClaudeApi napi = new ClaudeApi(none);
+        ClaudeApi.MessageResult n1 = napi.messages(ClaudeAccess.notSetUp(), "sys", threeFramesAndAQuestion(), schema(), 10000);
+        ClaudeApi.MessageResult n2 = napi.messages(null, "sys", threeFramesAndAQuestion(), schema(), 10000);
+        ClaudeApi.MessageResult n3 = napi.messages(ClaudeAccess.setUp("http://x.test", KEY, MODEL), "sys",
+                threeFramesAndAQuestion(), schema(), 10000);
+        check("messages_not_set_up_makes_no_request",
+                none.requests.isEmpty() && n1.reason == ClaudeApi.Reason.NOT_SET_UP
+                        && n2.reason == ClaudeApi.Reason.NOT_SET_UP && n3.reason == ClaudeApi.Reason.BAD_BASE_URL,
+                describe(n1) + " " + describe(n2) + " " + describe(n3) + " requests=" + none.requests.size());
+
+        String big = ClaudeApi.jpegBlock(new byte[4000]).toString();
+        check("jpeg_block_base64_has_no_newlines", !big.contains("\n") && !big.contains("\r"), "newline in base64");
     }
 
     private static String urls(FakeTransport t) {

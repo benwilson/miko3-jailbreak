@@ -11,6 +11,12 @@ modified or uninstalled — this only changes which app Android's persisted
 HOME preference points at, which scripts/restore-stock-launcher.py reverts
 in one command.
 
+The launcher listens for short replies (explore-on-claude plan U3,
+ListenService), so the install also grants it RECORD_AUDIO with
+`pm grant com.miko3.launcher android.permission.RECORD_AUDIO`: the launcher
+has no activity to show a permission dialog from. After an in-place
+`adb install -r`, run that same pm grant by hand if it isn't granted yet.
+
 Usage:
   python3 scripts/install-custom-launcher.py
   python3 scripts/install-custom-launcher.py --no-build   # skip rebuilding the APK first
@@ -30,6 +36,8 @@ BACKUP_ROOT = REPO / "firmware" / "agent-backups"
 CUSTOM_PKG = "com.miko3.launcher"
 CUSTOM_COMPONENT = f"{CUSTOM_PKG}/{CUSTOM_PKG}.MainActivity"
 STOCK_PKG = "com.miko.launcher_app"
+# ListenService records the reply to "what's your name?" (U3).
+PERMISSION = "android.permission.RECORD_AUDIO"
 
 
 def adb(*args, check=True):
@@ -106,6 +114,8 @@ def main():
 
     print(f"== 2/4 installing {APK.name} ==")
     adb("install", "-r", "-t", str(APK))
+    print(f"   granting {PERMISSION} (the launcher never shows a permission dialog)")
+    adb("shell", "pm", "grant", CUSTOM_PKG, PERMISSION)
 
     print(f"== 3/4 clearing 'stopped' state and setting HOME to {CUSTOM_COMPONENT} ==")
     adb("shell", "am", "start", "-n", CUSTOM_COMPONENT)

@@ -37,7 +37,10 @@ import java.util.concurrent.TimeUnit;
  * one hardware-JPEG ImageReader at 640x480, and a FIXED frame-rate range,
  * since a variable one trips this HAL's "pixel rate should not be zero" bug
  * (docs/hardware/camera-vision.md). Unlike remote-control it leaves exposure
- * on auto: its manual exposure washed out U1's test frame.
+ * on auto: its manual exposure washed out U1's test frame. Auto alone left
+ * faces too dark indoors (worse with a bright sign behind them), so it asks
+ * for the camera's largest exposure compensation, which still adapts to the
+ * room and leaves the frame-rate range alone.
  *
  * Frames that arrive while the recognizer is busy (about a second a frame,
  * U1) are dropped, so every result is from a frame captured after the one
@@ -97,6 +100,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private final BitmapFactory.Options decode = new BitmapFactory.Options();
 
     private volatile boolean busy;
+    /** close() has run on the camera thread and open() has not been called since. */
+    private volatile boolean closedDone = true;
     private volatile ExploreBrain.Look latest;
     /** Bumped on every open and close; a result from an older generation is dropped. */
     private volatile int generation;
@@ -127,6 +132,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
     public void open() {
         generation++;
         latest = null;
+        closedDone = false;
         cameraHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -164,15 +170,25 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     @Override
     public void close() {
-        generation++;
+        final int gen = ++generation;
         latest = null;
+        closedDone = false;
         cameraHandler.post(new Runnable() {
             @Override
             public void run() {
                 wanted = false;
                 closeNow();
+                if (gen == generation) {
+                    closedDone = true;
+                }
             }
         });
+    }
+
+    /** Closed on the camera thread, and no detector run in flight (the brain speaks only then, R6). */
+    @Override
+    public boolean quiet() {
+        return closedDone && !busy;
     }
 
     @Override
@@ -246,6 +262,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
             }
             CameraCharacteristics c = manager.getCameraCharacteristics(ids[0]);
             final Range<Integer> fps = fixedFpsRange(c);
+            final int ev = maxCompensation(c);
             Size size = jpegSize(c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP));
             reader = ImageReader.newInstance(size.getWidth(), size.getHeight(), android.graphics.ImageFormat.JPEG, 2);
             reader.setOnImageAvailableListener(onImage, cameraHandler);
@@ -259,7 +276,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                         return;
                     }
                     device = camera;
-                    startSession(fps);
+                    startSession(fps, ev);
                 }
 
                 @Override
@@ -298,7 +315,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
         }
     }
 
-    private void startSession(final Range<Integer> fps) {
+    private void startSession(final Range<Integer> fps, final int ev) {
         try {
             List<android.view.Surface> surfaces = Arrays.asList(reader.getSurface());
             device.createCaptureSession(surfaces, new CameraCaptureSession.StateCallback() {
@@ -315,8 +332,9 @@ final class ExploreCamera implements ExploreBrain.Camera {
                             b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps);
                         }
                         b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                        b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev);
                         s.setRepeatingRequest(b.build(), null, cameraHandler);
-                        Log.i(TAG, "camera streaming at " + fps);
+                        Log.i(TAG, "camera streaming at " + fps + ", exposure compensation " + ev);
                     } catch (CameraAccessException | IllegalStateException e) {
                         Log.e(TAG, "setRepeatingRequest failed", e);
                     }
@@ -409,7 +427,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
                     long t0 = clock.nowMs();
                     List<Detection> found = recognizer.detect(frame);
                     if (gen == generation) {
-                        latest = new ExploreBrain.Look(frameMs, found);
+                        // The JPEG rides along for Claude's look request (explore on Claude U4, R1).
+                        latest = new ExploreBrain.Look(frameMs, found, jpeg);
                         Log.i(TAG, "look in " + (clock.nowMs() - t0) + " ms: " + found);
                     }
                 } catch (Exception | OutOfMemoryError | LinkageError e) {
@@ -424,6 +443,12 @@ final class ExploreCamera implements ExploreBrain.Camera {
     // ---- selection, as remote-control's CameraCapture ----
 
     /** The lowest fixed range: a variable one wedges this HAL (camera-vision.md). */
+    /** The largest exposure-compensation step the camera offers, or 0 if none. */
+    private static int maxCompensation(CameraCharacteristics c) {
+        Range<Integer> range = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+        return range == null ? 0 : Math.max(0, range.getUpper());
+    }
+
     private static Range<Integer> fixedFpsRange(CameraCharacteristics c) {
         Range<Integer>[] ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
         if (ranges == null || ranges.length == 0) {

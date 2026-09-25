@@ -17,12 +17,19 @@ The robot's voice (voice plan U5, KTD3/KTD4): the launcher's SpeechService
 runs a Piper voice through sherpa-onnx. The build downloads sherpa-onnx's
 pinned, checksummed Android release into the gitignored tools/third_party/
 (its Java API jar, and its arm64 libsherpa-onnx-jni.so plus the
-libonnxruntime.so that library was built against) and bundles them. The voice
+libonnxruntime.so that library was built against) and bundles them, with the
+vendor's libmiko_drivers.so for the drive lease (VENDOR_LIB_DIR). The voice
 itself is staged into the APK's assets/voice/ as model.onnx, tokens.txt and
 espeak-ng-data/, plus a stamp.txt the launcher uses to know when to copy it
 out again: from launcher/assets/voice/ once the trained voice is committed
 there (U4), else from sherpa-onnx's stock vits-piper-en_US-lessac-medium,
 downloaded into tools/third_party/ and never committed.
+
+The robot's ears (explore-on-claude plan U3, KTD4): the launcher's
+ListenService runs sherpa-onnx's streaming zipformer-en-20M. The build
+downloads that model's pinned, checksummed release into tools/third_party/,
+and stages its int8 encoder, decoder and joiner plus tokens.txt into the APK's
+assets/listen/ under fixed names, with a stamp.txt like the voice's.
 
 Usage:
   python3 scripts/build-custom-launcher.py
@@ -58,6 +65,15 @@ KEYSTORE = APP_DIR / "miko3-launcher.keystore"
 APK = APP_DIR / "miko3-launcher.apk"
 BUILD = APP_DIR / "build"
 
+# The vendor's libmiko_drivers.so, bundled as the launcher's own native
+# library: DriveLeaseService's DirectMotorDriver uses SensorModule, which
+# System.loadLibrary()s it, and the /system/lib64 copy is out of reach behind
+# linker namespace isolation (live test: NoClassDefFoundError SensorModule).
+# Same source as build-mode-explore.py and build-mode-remote-control.py.
+VENDOR_ABI = "arm64-v8a"
+VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / VENDOR_ABI
+DRIVER_LIB = "libmiko_drivers.so"
+
 KEYSTORE_ALIAS = "miko3launcher"
 KEYSTORE_PASS = "miko3launcher"
 KEYSTORE_CN = "Miko3 Custom Launcher"
@@ -79,6 +95,13 @@ PLACEHOLDER_VOICE = "vits-piper-en_US-lessac-medium"
 PLACEHOLDER_VOICE_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
                          f"{PLACEHOLDER_VOICE}.tar.bz2")
 PLACEHOLDER_VOICE_SHA256 = "9e3febfacf0abf4270172d2958bcec246032b7e88efc2720840cc80c93de334e"
+# The listening model (explore plan U3, KTD4): streaming, English, ~44 MB int8.
+LISTEN_MODEL = "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17"
+LISTEN_MODEL_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+                    f"{LISTEN_MODEL}.tar.bz2")
+LISTEN_MODEL_SHA256 = "9c559283e8498d3fe95913c79ca1cb454bb26281ac2b102b41306c7d752765d9"
+LISTEN_CACHE = REPO / "tools" / "third_party" / LISTEN_MODEL
+LISTEN_PARTS = ("encoder", "decoder", "joiner")
 STAMP = "stamp.txt"
 LABEL = "label.txt"
 
@@ -158,6 +181,40 @@ def extract_placeholder(tarball, out):
     return out
 
 
+def extract_listen_model(tarball, out):
+    """Unpack the zipformer tarball's int8 encoder, decoder and joiner and its
+    tokens.txt into out/listen/ as encoder.onnx, decoder.onnx, joiner.onnx and
+    tokens.txt (the names ListenEngine loads). Returns out."""
+    out = Path(out)
+    listen = out / "listen"
+    tmp = out / "listen.part"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    wanted = {f"{part}-epoch-99-avg-1.int8.onnx": f"{part}.onnx" for part in LISTEN_PARTS}
+    wanted["tokens.txt"] = "tokens.txt"
+    with tarfile.open(tarball, "r:bz2") as t:
+        for m in t.getmembers():
+            name = Path(m.name).name
+            if m.isfile() and len(Path(m.name).parts) == 2 and name in wanted:
+                with t.extractfile(m) as src, open(tmp / wanted[name], "wb") as f:
+                    shutil.copyfileobj(src, f)
+    missing = sorted(set(wanted.values()) - {p.name for p in tmp.iterdir()})
+    if missing:
+        raise BuildError(f"!! {Path(tarball).name} lacks {', '.join(missing)}")
+    shutil.rmtree(listen, ignore_errors=True)
+    tmp.rename(listen)
+    return out
+
+
+def listen_model(cache=LISTEN_CACHE):
+    """Asset root holding listen/ for the pinned zipformer model."""
+    root = Path(cache)
+    if not all((root / "listen" / f"{p}.onnx").is_file() for p in LISTEN_PARTS):
+        tarball = fetch(LISTEN_MODEL_URL, root.parent / Path(LISTEN_MODEL_URL).name, LISTEN_MODEL_SHA256)
+        extract_listen_model(tarball, root)
+    return root
+
+
 def placeholder_voice(cache=SHERPA_CACHE):
     """Asset root holding voice/ for the stock placeholder voice."""
     root = Path(cache) / PLACEHOLDER_VOICE
@@ -188,6 +245,20 @@ def voice_stamp(voice_dir):
     return h.hexdigest()[:16]
 
 
+def vendor_native_libs(lib_dir=None):
+    """[(abi, so_path)] for the motor-driver library, or BuildError naming the
+    missing file and the directory searched."""
+    lib = Path(lib_dir if lib_dir is not None else VENDOR_LIB_DIR) / DRIVER_LIB
+    if not lib.is_file():
+        raise BuildError(
+            f"!! vendor motor-driver library missing: {lib}\n"
+            "   it comes from ServiceExam's APK (lib/arm64-v8a/); re-extract it into "
+            "tools/serviceexam_jadx/resources/ (jadx) before building the launcher.\n"
+            "   Without it the drive lease's DirectMotorDriver cannot load SensorModule, "
+            "and the launcher crashes when a mode takes the lease.")
+    return [(VENDOR_ABI, lib)]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Build and sign the Miko 3 custom launcher APK.")
     ap.add_argument("--sdk", help="Android SDK root (default: auto-detect)")
@@ -195,14 +266,19 @@ def main():
                     help="fail if the toolchain is missing instead of installing it")
     args = ap.parse_args()
 
+    # Checked first, so a missing library never costs toolchain work.
+    vendor_native_libs()
     sdk = bc.find_sdk(args.sdk)
     sdk, bt, android_jar, javac, keytool = bc.ensure_toolchain(sdk, not args.no_bootstrap)
     jh = bc.java_home()
     sherpa_jar, sherpa_libs = sherpa_onnx()
+    native_libs = vendor_native_libs() + sherpa_libs
     placeholder = voice_root()
     voice_dir = (placeholder or LAUNCHER_ASSETS) / "voice"
     print(f"== voice: {voice_dir.relative_to(REPO)}"
           + (" (stock placeholder until the trained voice is committed)" if placeholder else "") + " ==")
+    listen_root = listen_model()
+    print(f"== listening model: {LISTEN_MODEL} (int8) ==")
     with tempfile.TemporaryDirectory(prefix="launcher-voice-stamp-") as td:
         # The stamp goes in its own asset root, merged into assets/voice/ by
         # stage_assets, so neither voice source is ever written to.
@@ -211,6 +287,8 @@ def main():
         (stamp_root / "voice" / STAMP).write_text(voice_stamp(voice_dir) + "\n")
         # What the Settings page shows as the loaded voice (outside the stamp's hash).
         (stamp_root / "voice" / LABEL).write_text(("stock lessac medium" if placeholder else "trained") + "\n")
+        (stamp_root / "listen").mkdir()
+        (stamp_root / "listen" / STAMP).write_text(voice_stamp(listen_root / "listen") + "\n")
         bc.build_apk(
             src_dirs=[SRC, SHARED_SRC],
             manifest=MANIFEST,
@@ -220,9 +298,10 @@ def main():
             keystore_cn=KEYSTORE_CN,
             apk_out=APK,
             # stage_assets skips a source that does not exist.
-            asset_sources=[LAUNCHER_ASSETS] + ([placeholder] if placeholder else []) + [stamp_root, SHARED_ASSETS],
+            asset_sources=[LAUNCHER_ASSETS] + ([placeholder] if placeholder else [])
+            + [listen_root, stamp_root, SHARED_ASSETS],
             res_dir=RES,
-            native_libs=sherpa_libs,
+            native_libs=native_libs,
             jars=[sherpa_jar],
         )
     print(f"\n== 4/4 BUILT: {APK.relative_to(REPO)} ({APK.stat().st_size} bytes) ==")

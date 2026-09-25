@@ -27,14 +27,23 @@ import java.util.Map;
  * three token-only buttons (Refresh models, Test connection, Forget key)
  * that act on what is already saved. Then the Voice section: type a line,
  * press Say it, and the robot speaks it through the launcher's own speech
- * queue (the request returns once it is queued, not once it has played). The same page serves the robot's own
- * WebView and a LAN browser.
+ * queue (the request returns once it is queued, not once it has played).
+ * Then the People section (explore-on-claude plan U2, R15, R16): everyone
+ * the robot remembers, with their face, name or "unnamed", and when he last
+ * saw them, each with a Rename form and a Forget button. The same page serves
+ * the robot's own WebView and a LAN browser.
  *
  * Follows voice mode's SettingsPage pattern: every action is a POST that
  * answers with a redirect to "/settings?status=<message>", and the GET that
  * follows re-renders from what is actually stored. Status messages are fixed
  * text, ClaudeApi's fixed reason text, or stored model ids, never anything
- * that was typed (KTD6), so a refused URL or key never lands in a URL.
+ * that was typed (KTD6), so a refused URL or key never lands in a URL, and
+ * a person's name never does either.
+ *
+ * Faces: the page's <img> tags load SETTINGS_PEOPLE_FACE_PATH?id=<id>, the
+ * one GET besides the page itself. It is under SETTINGS_PATH, so TLS-only,
+ * and PeopleStore accepts only its own 16-hex-digit id shape before it
+ * touches a file, so the id can't name any other file.
  *
  * Secrecy (R4, R14): the page renders only from ClaudeSettings.status(), and
  * the key input is always empty. The key arrives only in a POST body, and
@@ -61,6 +70,12 @@ final class SettingsPage {
     static final String SAY_SPEAKING = "Speaking.";
     static final String SAY_UNAVAILABLE = "Nothing said: the robot's voice is not available.";
 
+    static final String PEOPLE_RENAMED = "Name changed.";
+    static final String PEOPLE_UNNAMED = "Name cleared; that person is now unnamed.";
+    static final String PEOPLE_FORGOTTEN = "Forgotten: their face and name are deleted.";
+    static final String PEOPLE_UNKNOWN = "Nothing changed: that person is not remembered.";
+    static final String PEOPLE_NOT_SAVED = "Nothing changed: the change could not be saved.";
+
     /**
      * The robot's voice, as the Voice section sees it. LauncherApp backs it
      * with SpeechEngine's queue in-process; the host harness fakes it.
@@ -82,14 +97,18 @@ final class SettingsPage {
 
     /** Every settings route. GET the page; POST an action with the page token. */
     static void handle(HttpRequest req, HttpResponse res, PageToken token, ClaudeSettings settings,
-                       ClaudeApi api, Speaker speaker) throws IOException {
+                       ClaudeApi api, Speaker speaker, PeopleStore people) throws IOException {
         if (LauncherProtocol.SETTINGS_PATH.equals(req.path)) {
             if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
                 res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
                 return;
             }
             res.sendText(200, "OK", "text/html; charset=utf-8", buildHtml(token.issue(), settings.status(),
-                    settings.models(), speaker.voiceName(), req.queryParam("status", null)));
+                    settings.models(), speaker.voiceName(), people.all(), req.queryParam("status", null)));
+            return;
+        }
+        if (LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH.equals(req.path)) {
+            sendFace(req, res, people);
             return;
         }
         // The action paths never act on a GET, so nothing in a URL (which the
@@ -98,13 +117,13 @@ final class SettingsPage {
             res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "POST only");
             return;
         }
-        String status = act(req.path, readForm(req), token, settings, api, speaker);
+        String status = act(req.path, readForm(req), token, settings, api, speaker, people);
         res.redirect(LauncherProtocol.SETTINGS_PATH + "?status=" + urlEncode(status));
     }
 
     /** Runs one action; returns the status line to show. */
     static String act(String path, Map<String, String> form, PageToken token, ClaudeSettings settings,
-                      ClaudeApi api, Speaker speaker) {
+                      ClaudeApi api, Speaker speaker, PeopleStore people) {
         if (form == null) {
             return "Nothing changed: the form was too large.";
         }
@@ -127,7 +146,43 @@ final class SettingsPage {
         if (LauncherProtocol.SETTINGS_VOICE_SAY_PATH.equals(path)) {
             return say(form.get("text"), speaker);
         }
+        if (LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH.equals(path)) {
+            return rename(form.get("id"), form.get("name"), people);
+        }
+        if (LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH.equals(path)) {
+            return forget(form.get("id"), people);
+        }
         return "Nothing changed: unknown action.";
+    }
+
+    /** The face JPEG for ?id=, or 404 for anything that isn't a remembered
+     * person's id. The id is checked by PeopleStore before any file access. */
+    private static void sendFace(HttpRequest req, HttpResponse res, PeopleStore people) throws IOException {
+        if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
+            res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
+            return;
+        }
+        byte[] face = people.face(req.queryParam("id", null));
+        if (face == null) {
+            res.sendText(404, "Not Found", "text/plain; charset=utf-8", "No such person.");
+            return;
+        }
+        res.sendBytes(200, "OK", "image/jpeg", face);
+    }
+
+    /** Fixed text only: never the name that was typed or stored. */
+    private static String rename(String id, String name, PeopleStore people) {
+        if (people.nameOf(id) == null) {
+            return PEOPLE_UNKNOWN;
+        }
+        if (!people.rename(id, name)) {
+            return PEOPLE_NOT_SAVED;
+        }
+        return people.nameOf(id).isEmpty() ? PEOPLE_UNNAMED : PEOPLE_RENAMED;
+    }
+
+    private static String forget(String id, PeopleStore people) {
+        return people.forget(id) ? PEOPLE_FORGOTTEN : PEOPLE_UNKNOWN;
     }
 
     private static String save(Map<String, String> form, ClaudeSettings settings) {
@@ -196,7 +251,7 @@ final class SettingsPage {
     }
 
     static String buildHtml(String token, ClaudeSettings.Status st, List<String> models, String voiceName,
-                            String status) {
+                            List<PeopleStore.Person> people, String status) {
         String t = escapeHtml(token);
         StringBuilder html = new StringBuilder();
         html.append("<!doctype html><html><head><meta charset=\"utf-8\">");
@@ -268,8 +323,51 @@ final class SettingsPage {
         html.append("</form>");
         html.append("</section>");
 
+        appendPeople(html, t, people);
+
         html.append("</main></body></html>");
         return html.toString();
+    }
+
+    /** R15, R16: everyone he remembers, most recently seen first. */
+    private static void appendPeople(StringBuilder html, String t, List<PeopleStore.Person> people) {
+        html.append("<section id=\"people\"><h2>People</h2>");
+        html.append("<p>The people the robot remembers. Forget deletes their face and name for good.</p>");
+        if (people.isEmpty()) {
+            html.append("<p id=\"people-empty\">He hasn't met anyone yet.</p>");
+        }
+        for (PeopleStore.Person p : people) {
+            // Ids are 16 hex digits (PeopleStore), so safe in a URL and an attribute.
+            String id = escapeHtml(p.id);
+            String name = escapeHtml(p.name);
+            html.append("<article id=\"person-").append(id).append("\">");
+            html.append("<img src=\"").append(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH).append("?id=").append(id)
+                    .append("\" alt=\"").append(p.name.isEmpty() ? "unnamed person" : name)
+                    .append("\" width=\"112\" height=\"112\">");
+            html.append("<p><strong>").append(p.name.isEmpty() ? "<em>unnamed</em>" : name).append("</strong><br>");
+            html.append("<small>Last seen ").append(escapeHtml(lastSeen(p.lastSeenMillis))).append("</small></p>");
+            html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH)
+                    .append("\">");
+            html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+            html.append("<input type=\"hidden\" name=\"id\" value=\"").append(id).append("\">");
+            html.append("<label>Name");
+            html.append("<input type=\"text\" name=\"name\" value=\"").append(name).append("\" maxlength=\"")
+                    .append(PeopleStore.MAX_NAME_CHARS).append("\" autocomplete=\"off\">");
+            html.append("<small>Leave empty to make them unnamed.</small></label>");
+            html.append("<button type=\"submit\" class=\"secondary\">Rename</button></form>");
+            html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH)
+                    .append("\">");
+            html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+            html.append("<input type=\"hidden\" name=\"id\" value=\"").append(id).append("\">");
+            html.append("<button type=\"submit\" class=\"contrast\">Forget</button></form>");
+            html.append("</article>");
+        }
+        html.append("</section>");
+    }
+
+    /** "2026-09-24 15:45", the robot's local time. */
+    static String lastSeen(long millis) {
+        return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(new Date(millis));
     }
 
     private static void tokenForm(StringBuilder html, String escapedToken, String action, String label,

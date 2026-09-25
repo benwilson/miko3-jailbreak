@@ -25,7 +25,8 @@ import javax.net.ssl.HttpsURLConnection;
  */
 public final class ClaudeHttpsTransport implements ClaudeApi.Transport {
     private static final int CONNECT_TIMEOUT_MS = 10000;
-    /** A one-token reply or a page of models; anything slower counts as unreachable. */
+    /** The default, for a one-token reply or a page of models; a Request may set its own
+     * (readTimeoutMs). Anything slower counts as unreachable. */
     private static final int READ_TIMEOUT_MS = 30000;
     /** Far above any models page; a larger body is cut off here. */
     private static final int MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -39,7 +40,7 @@ public final class ClaudeHttpsTransport implements ClaudeApi.Transport {
         HttpsURLConnection conn = (HttpsURLConnection) opened;
         try {
             conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(READ_TIMEOUT_MS);
+            conn.setReadTimeout(request.readTimeoutMs > 0 ? request.readTimeoutMs : READ_TIMEOUT_MS);
             conn.setInstanceFollowRedirects(false);
             conn.setUseCaches(false);
             conn.setRequestMethod(request.method);

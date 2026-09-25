@@ -6,7 +6,9 @@ package com.miko3.launcher;
  *
  * Defaults come from U1's measurements on the robot: 4 threads gave the
  * medium voice 1.10 s to first sound when idle, and 16 words is the longest
- * chunk it synthesizes in under 2 s. Under Explore's load 2 threads may do
+ * chunk it synthesizes in under 2 s. Explore's first live test still saw
+ * 2.2-2.8 s to first audio for 13-word lines, so the default is 10 words: a
+ * comma splits a long line sooner and the first chunk is ready faster. Under Explore's load 2 threads may do
  * better (untested), so both can be changed without a rebuild through debug
  * system properties, which the shell user may set, then a launcher restart:
  *
@@ -16,7 +18,7 @@ package com.miko3.launcher;
  */
 final class SpeechTuning {
     static final int DEFAULT_THREADS = 4;
-    static final int DEFAULT_MAX_WORDS = 16;
+    static final int DEFAULT_MAX_WORDS = 10;
     static final String THREADS_PROP = "debug.miko3.speech.threads";
     static final String MAX_WORDS_PROP = "debug.miko3.speech.max_words";
 

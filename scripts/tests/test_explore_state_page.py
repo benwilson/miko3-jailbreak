@@ -42,7 +42,7 @@ class ExploreStatePageTest(unittest.TestCase):
 
     def test_brain_facing_states_are_the_expected_set(self):
         names = [s["state"] for s in self.states[:-1]]
-        self.assertEqual(sorted(names), sorted(["idle", "look", "flinch", "eyes-only", "resting"]))
+        self.assertEqual(sorted(names), sorted(["idle", "look", "flinch", "eyes-only", "resting", "thinking"]))
 
     def test_every_non_idle_state_has_its_own_look(self):
         # idle is the other modes' look unchanged (R6); the rest need a rule keyed on #rig.

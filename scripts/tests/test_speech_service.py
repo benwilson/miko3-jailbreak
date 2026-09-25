@@ -109,7 +109,7 @@ class SpeechServiceHarnessTest(unittest.TestCase):
         "voice_failure_fails_that_line_only",
         "playback_failure_fails_that_line_only",
         # Tuning (KTD8).
-        "tuning_defaults",
+        "tuning_defaults", "default_splits_a_13_word_line_at_its_comma",
         "tuning_overrides_and_clamps",
     )
 
@@ -385,6 +385,27 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertIsNotNone(release, "client has no lineDone()")
         self.assertIn("unbindService(", release)
 
+    def test_client_close_shuts_down_its_worker_and_is_idempotent(self):
+        # ClaudeCuriosity is rebuilt on every Explore start; close() is how its
+        # release() gets this client's executor thread back (no leak per start).
+        src = _read(CLIENT)
+        body = _method_body(src, "public void close")
+        self.assertIsNotNone(body, "client has no close()")
+        self.assertIn("shutdownNow()", body)
+        self.assertIn("unbindService(", body)
+        # Idempotent: a second close() returns before doing anything.
+        self.assertRegex(body, r"if \(closed\)\s*\{?\s*return;")
+        self.assertIn("closed = true", body)
+        # Late launcher callbacks are dropped: every open call is marked ended.
+        self.assertIn("done.set(true)", body)
+
+    def test_client_drops_calls_and_callbacks_after_close(self):
+        src = _read(CLIENT)
+        for name in ("public void speak", "public void onServiceConnected", "public void onServiceDisconnected"):
+            body = _method_body(src, name)
+            self.assertIsNotNone(body, name)
+            self.assertIn("closed", body, name)
+
     def test_client_documents_speaking_after_heavy_work(self):
         raw = CLIENT.read_text() if CLIENT.exists() else ""
         self.assertRegex(raw, r"(?is)heavy work.*pause")
@@ -484,6 +505,87 @@ class BuildScriptTest(unittest.TestCase):
         for lib in ("lib/arm64-v8a/libonnxruntime.so", "lib/arm64-v8a/libsherpa-onnx-jni.so",
                     "assets/voice/model.onnx", "assets/voice/tokens.txt", "assets/voice/stamp.txt"):
             self.assertIn(lib, names)
+
+
+
+class LauncherDriverLibTest(unittest.TestCase):
+    """Live test: DriveLeaseService crashed with NoClassDefFoundError
+    SensorModule, because System.loadLibrary("miko_drivers") fell through to
+    /system/lib64, which the linker namespace hides. The launcher bundles the
+    vendor library as its own, as build-mode-explore.py does."""
+
+    VENDOR_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / "arm64-v8a"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.build = _load_build()
+
+    def test_names_the_vendor_lib_and_its_home(self):
+        self.assertEqual(self.build.DRIVER_LIB, "libmiko_drivers.so")
+        self.assertEqual(self.build.VENDOR_LIB_DIR, self.VENDOR_DIR)
+
+    def test_present_lib_is_an_arm64_entry(self):
+        if not (self.VENDOR_DIR / "libmiko_drivers.so").is_file():
+            self.skipTest("vendor library not extracted")
+        self.assertEqual(self.build.vendor_native_libs(self.VENDOR_DIR),
+                         [("arm64-v8a", self.VENDOR_DIR / "libmiko_drivers.so")])
+
+    def test_missing_lib_fails_clearly_before_any_toolchain_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(self.build.BuildError) as ctx:
+                self.build.vendor_native_libs(Path(td))
+            self.assertIn("libmiko_drivers.so", str(ctx.exception))
+            self.assertIn(td, str(ctx.exception))
+            from unittest import mock
+            with mock.patch.object(self.build, "VENDOR_LIB_DIR", Path(td)), \
+                    mock.patch.object(self.build.bc, "find_sdk") as sdk, \
+                    mock.patch.object(self.build.bc, "ensure_toolchain") as tc, \
+                    mock.patch.object(self.build.bc, "build_apk") as ba, \
+                    mock.patch.object(sys, "argv", ["build-custom-launcher.py"]):
+                with self.assertRaises(self.build.BuildError):
+                    self.build.main()
+        sdk.assert_not_called()
+        tc.assert_not_called()
+        ba.assert_not_called()
+
+    def test_main_bundles_it_with_the_sherpa_libs(self):
+        body = BUILD_PY.read_text()
+        self.assertRegex(body, r"native_libs\s*=\s*vendor_native_libs\(\)\s*\+\s*sherpa_libs")
+
+    def test_sensor_module_loads_the_bundled_copy_by_name(self):
+        sm = (SHARED_SRC / "emotix" / "com" / "drivers" / "SensorModule.java").read_text()
+        self.assertIn('System.loadLibrary("miko_drivers")', sm)
+        self.assertNotIn('System.load("/system', sm)
+
+    def test_built_apk_carries_it(self):
+        apk = REPO / "launcher" / "miko3-launcher.apk"
+        if not apk.exists() or apk.stat().st_mtime < BUILD_PY.stat().st_mtime:
+            self.skipTest("launcher not built since the build script changed")
+        import zipfile
+        self.assertIn("lib/arm64-v8a/libmiko_drivers.so", zipfile.ZipFile(apk).namelist())
+
+
+# Plan rule: never log names, transcripts, or spoken text; ids, timings,
+# lengths (x.length()), and outcomes are fine. A Log call's arguments, with string literals
+# dropped, must not name a variable that holds words.
+_WORDS_VAR = re.compile(r"\b(text|chunk|transcript|said|name|label|words)\b|\.text\b|\bline\b(?!\s*\.\s*id\b)")
+
+
+def _log_word_offenders(paths):
+    offenders = []
+    for path in paths:
+        for stmt in re.findall(r"Log\.\w\((.*?)\);", _read(path), flags=re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", stmt)
+            # A length or a null check says how much, not what: fine.
+            bare = re.sub(r"[\w.]+\.length\(\)|[\w.]+\s*==\s*null", "", bare)
+            if _WORDS_VAR.search(bare):
+                offenders.append(f"{path.name}: Log({' '.join(stmt.split())})")
+    return offenders
+
+
+class SpeechPrivacyLogTest(unittest.TestCase):
+    def test_log_calls_never_carry_spoken_or_heard_words(self):
+        self.assertEqual(_log_word_offenders((SERVICE, ENGINE, QUEUE, LAUNCHER / "LauncherApp.java")), [])
 
 
 if __name__ == "__main__":

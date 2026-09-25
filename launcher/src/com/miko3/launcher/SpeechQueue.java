@@ -133,6 +133,7 @@ final class SpeechQueue {
             if (playing != null && playing.owner.equals(owner)) {
                 playing.cancelled = true;
             }
+            notifyAll(); // awaitIdle
         }
         fireCancelled(dropped);
     }
@@ -151,6 +152,7 @@ final class SpeechQueue {
             if (playing != null && playing.id == id) {
                 playing.cancelled = true;
             }
+            notifyAll(); // awaitIdle
         }
         fireCancelled(dropped);
     }
@@ -173,6 +175,24 @@ final class SpeechQueue {
         for (Line l : dropped) {
             fireFailed(l, REFUSE_UNAVAILABLE);
         }
+    }
+
+    /**
+     * Waits until no line is playing or waiting, for up to timeoutMs; true
+     * once idle (or shut down, when nothing more will play), false on
+     * timeout. ListenService opens the microphone only after this (explore
+     * plan KTD8): the platform ducks the microphone while the robot speaks.
+     */
+    synchronized boolean awaitIdle(long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + Math.max(0, timeoutMs) * 1000000L;
+        while (!shut && (playing != null || !waiting.isEmpty())) {
+            long left = deadline - System.nanoTime();
+            if (left <= 0) {
+                return false;
+            }
+            wait(Math.max(1, left / 1000000L));
+        }
+        return true;
     }
 
     /** Lines waiting to play, not counting the one playing. */
@@ -221,6 +241,7 @@ final class SpeechQueue {
                 failure = line.failure;
             }
             playing = null;
+            notifyAll(); // awaitIdle
         }
         if (failure != null) {
             fireFailed(line, failure);
