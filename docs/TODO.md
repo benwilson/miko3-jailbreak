@@ -4,6 +4,10 @@ The running list of what is left to do on the robot's modes. Add to it when some
 
 ## Explore mode
 
+- [ ] **Measurement session gaps (meeting plan U2).** `scripts/qa-ears-probe.py --session` and `scripts/claude-chat-bench.py` cover the direction angle, decode time, phrase match, CPU and launcher RSS, the shove signature and the ten-turn conversation. What the scripts cannot yet measure, because no device route exposes it:
+  - Face-box shape at frontal, 45 degrees and profile (KTD4's width-to-height and size thresholds): Explore's `/state` answers only `state`, `lookX`, `lookY`. The face steps record the state timeline and the thresholds stay at the plan's defaults until the state page (or a probe route) carries the last face box.
+  - Per-chunk decode p95: the ears probe reports each second's decode total and worst chunk, so the CSV's `decode_p95_ms` is the p95 of per-second means and `decode_max_p95_ms` the p95 of worst chunks; the true per-chunk p95 lies between them. Fine for KTD2's 80 ms decision unless the two straddle it.
+  - Wake-word engine cost beside the recogniser, detector look time with the ears open, the capture level during a launcher-spoken line (the deaf-window tail, default 500 ms), and speech first sound at 2 and 4 threads in the CHAT_SPEAK configuration: these need the U3 session and U7/U8 states on the robot; measure them in U9's QA once those land.
 - [ ] **Low obstacles: camera check if wheels ever spin in place.** Stalls against something too low for the front sensor are now caught by the wheel encoders (PR for stall detection, 2026-09-24): on the robot the wheels stopped dead. If he's ever seen pushing with wheels *spinning* (encoders counting, robot not moving), add the owner's camera idea: compare frames during a leg, and treat "the view hasn't changed" as blocked.
 - [ ] **Floor tuning session with the owner** (camera curiosity plan U8): `python3 scripts/qa-explore-mode.py --only curiosity --curious-seconds 90`.
   - Confirm he turns *toward* an off-centre target. Steering assumes the camera frame isn't mirrored; this hasn't been checked on the robot.

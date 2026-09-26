@@ -250,5 +250,242 @@ class MainTest(unittest.TestCase):
         self.assertIsNone(args.csv)
 
 
+# ---- the measurement session (meeting plan U2) ----
+
+PROC_STAT_A = ("2249 (com.miko3.launcher) S 1 1 0 0 -1 4194560 12345 0 0 0 1200 300 0 0 20 0 45 0 5000 "
+               "900000000 24576 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0")
+PROC_STAT_B = ("2249 (com.miko3.launcher) S 1 1 0 0 -1 4194560 12345 0 0 0 1260 320 0 0 20 0 45 0 5000 "
+               "900000000 25600 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0")
+
+SHOVE_LOGCAT = "\n".join([
+    "09-25 16:20:01.100  1234  1234 D MikoDmdRaw: sent=POWER reply=POWER=0,0,07884FLBTN=0,0,0,0,00000,00000"
+    "IMUAC=-000002110,0000000295,0000023297XIMUGY=0000000062,-000000757,0000000093IMUMG=0,0,0",
+    "09-25 16:20:01.300  1234  1234 D MikoDmdRaw: sent=POWER reply=POWER=0,0,07884FLBTN=0,0,0,0,00000,00000"
+    "IMUAC=-000006400,0000001200,0000021000XIMUGY=0000000062,-000000757,0000000093IMUMG=0,0,0",
+    "09-25 16:20:01.400  1234  1234 I ExploreBrain: nothing to do with sensors",
+    "09-25 16:20:01.500  1234  1234 D MikoDmdRaw: sent=POWER reply=POWER=0,0,07884FLBTN=0,0,0,0,00000,00000"
+    "IMUAC=XXXXXXXXXX,0000000295,0000023297XIMUGY=0000000062,-000000757,0000000093IMUMG=0,0,0",
+])
+
+
+class PercentileTest(unittest.TestCase):
+    def test_nearest_rank_percentiles(self):
+        values = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        self.assertEqual(qa.percentile(values, 50), 50)
+        self.assertEqual(qa.percentile(values, 95), 100)
+        self.assertEqual(qa.percentile([7], 95), 7)
+        self.assertIsNone(qa.percentile([], 50))
+
+
+class DecodeStatsTest(unittest.TestCase):
+    def test_per_chunk_decode_and_step_percentiles_from_the_dump(self):
+        rows = qa.parse_answer(SAMPLE_DUMP).rows
+        stats = qa.decode_stats(rows)
+        # 240/13, 610/12, 580/13 ms per chunk that second.
+        self.assertAlmostEqual(stats.per_chunk_ms[0], 240 / 13, places=2)
+        self.assertAlmostEqual(stats.per_chunk_ms[1], 610 / 12, places=2)
+        self.assertAlmostEqual(stats.p50_ms, 580 / 13, places=2)
+        self.assertAlmostEqual(stats.p95_ms, 610 / 12, places=2)
+        self.assertEqual(stats.max_p95_ms, 95)
+
+    def test_a_second_with_no_chunks_has_no_per_chunk_value(self):
+        rows = qa.parse_answer(SAMPLE_DUMP).rows
+        rows[0]["chunks"] = 0
+        stats = qa.decode_stats(rows)
+        self.assertIsNone(stats.per_chunk_ms[0])
+        self.assertEqual(len([v for v in stats.per_chunk_ms if v is not None]), 2)
+
+    def test_fallback_flag_follows_ktd2_threshold(self):
+        self.assertEqual(qa.DECODE_CHUNK_BUDGET_MS, 80)
+        rows = qa.parse_answer(SAMPLE_DUMP).rows
+        self.assertFalse(qa.decode_stats(rows).over_budget)
+        rows[1]["decode_ms"] = 12 * 90
+        self.assertTrue(qa.decode_stats(rows).over_budget)
+
+
+class ProcStatTest(unittest.TestCase):
+    def test_parse_proc_stat_reads_ticks_and_rss_past_the_bracketed_name(self):
+        sample = qa.parse_proc_stat(PROC_STAT_A)
+        self.assertEqual(sample.ticks, 1500)
+        self.assertEqual(sample.rss_pages, 24576)
+
+    def test_cpu_percent_between_two_samples(self):
+        a, b = qa.parse_proc_stat(PROC_STAT_A), qa.parse_proc_stat(PROC_STAT_B)
+        # 80 ticks in 1 s at 100 Hz = 80 % of one core.
+        self.assertAlmostEqual(qa.cpu_percent(a, b, elapsed_s=1.0, clk_tck=100), 80.0)
+        self.assertAlmostEqual(qa.cpu_percent(a, b, elapsed_s=2.0, clk_tck=100), 40.0)
+        self.assertIsNone(qa.cpu_percent(None, b, elapsed_s=1.0, clk_tck=100))
+
+    def test_garbage_is_none_not_a_crash(self):
+        self.assertIsNone(qa.parse_proc_stat(""))
+        self.assertIsNone(qa.parse_proc_stat("No such file or directory"))
+
+    def test_cpu_sampler_reads_pids_and_stats_over_adb(self):
+        robot = FakeRobot()
+        answers = {("shell", "pidof", qa.LAUNCHER_PACKAGE): "2249\n",
+                   ("shell", "pidof", qa.EXPLORE_PACKAGE): "\n",
+                   ("shell", "cat", "/proc/2249/stat"): PROC_STAT_A + "\n",
+                   ("shell", "getconf", "CLK_TCK"): "100\n"}
+
+        def adb(*args, check=True):
+            robot.calls.append(args)
+            return answers.get(args, "")
+
+        robot.adb = adb
+        sampler = qa.CpuSampler(robot)
+        snap = sampler.snapshot()
+        self.assertEqual(snap[qa.LAUNCHER_PACKAGE].ticks, 1500)
+        self.assertIsNone(snap[qa.EXPLORE_PACKAGE])
+        self.assertEqual(sampler.clk_tck, 100)
+
+
+class CpuRowsTest(unittest.TestCase):
+    def test_per_second_cpu_rows_from_consecutive_snapshots(self):
+        a, b = qa.parse_proc_stat(PROC_STAT_A), qa.parse_proc_stat(PROC_STAT_B)
+        snaps = [(0.0, {qa.LAUNCHER_PACKAGE: a, qa.EXPLORE_PACKAGE: None}),
+                 (1.0, {qa.LAUNCHER_PACKAGE: b, qa.EXPLORE_PACKAGE: None})]
+        rows = qa.cpu_rows(snaps, clk_tck=100)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["cpu_launcher_pct"], 80.0)
+        self.assertIsNone(rows[0]["cpu_explore_pct"])
+        self.assertAlmostEqual(rows[0]["rss_launcher_mb"], 25600 * 4096 / 1048576, places=1)
+
+
+class StepCsvTest(unittest.TestCase):
+    def test_step_csv_has_decode_percentiles_and_cpu_columns(self):
+        rows = qa.parse_answer(SAMPLE_DUMP).rows
+        cpu = [{"cpu_launcher_pct": 80.0, "cpu_explore_pct": None, "rss_launcher_mb": 100.0}]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "left.csv"
+            qa.write_step_csv(rows, cpu, path)
+            lines = path.read_text().splitlines()
+        header = lines[0].split(",")
+        for col in ("decode_chunk_ms", "decode_p50_ms", "decode_p95_ms", "decode_max_p95_ms",
+                    "cpu_launcher_pct", "cpu_explore_pct", "rss_launcher_mb"):
+            self.assertIn(col, header)
+        self.assertEqual(header[:len(qa.ROW_FIELDS)], list(qa.ROW_FIELDS))
+        self.assertEqual(len(lines), 4)
+        first = dict(zip(header, lines[1].split(",")))
+        self.assertEqual(first["cpu_launcher_pct"], "80.0")
+        self.assertEqual(first["cpu_explore_pct"], "")
+        # The percentiles are step-level and repeat on every row.
+        second = dict(zip(header, lines[2].split(",")))
+        self.assertEqual(first["decode_p95_ms"], second["decode_p95_ms"])
+        self.assertEqual(second["cpu_launcher_pct"], "")
+
+
+class ShoveParseTest(unittest.TestCase):
+    def test_accel_records_from_logcat_skip_unreadable_sections(self):
+        recs = qa.parse_accel_log(SHOVE_LOGCAT)
+        self.assertEqual(len(recs), 2)
+        self.assertEqual(recs[0]["ax"], -2110)
+        self.assertEqual(recs[1]["az"], 21000)
+        self.assertEqual(recs[1]["t_ms"] - recs[0]["t_ms"], 200)
+        self.assertGreater(recs[1]["delta"], recs[0]["delta"])
+
+    def test_shove_csv_columns(self):
+        recs = qa.parse_accel_log(SHOVE_LOGCAT)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "shove.csv"
+            qa.write_dict_csv(recs, qa.ACCEL_FIELDS, path)
+            lines = path.read_text().splitlines()
+        self.assertEqual(lines[0], ",".join(qa.ACCEL_FIELDS))
+        self.assertEqual(len(lines), 3)
+
+
+class StateSampleTest(unittest.TestCase):
+    def test_state_samples_keep_only_the_documented_keys(self):
+        row = qa.parse_state_sample(1.5, '{"state":"meet_look","lookX":0.2,"lookY":-0.1}')
+        self.assertEqual(row, {"t_s": 1.5, "state": "meet_look", "lookX": 0.2, "lookY": -0.1})
+        self.assertIsNone(qa.parse_state_sample(0.0, "<html>"))
+
+
+class SessionStepsTest(unittest.TestCase):
+    def test_the_named_steps_cover_the_plan(self):
+        names = [s.name for s in qa.STEPS]
+        for wanted in ("left", "right", "front", "behind", "name", "shove", "face-frontal", "face-45",
+                       "face-profile", "talk-3m", "talk-5m"):
+            self.assertIn(wanted, names)
+        self.assertEqual(len(names), len(set(names)))
+        for step in qa.STEPS:
+            self.assertTrue(step.instruction, step.name)
+            self.assertIn(step.kind, ("ears", "shove", "face"))
+        by_name = {s.name: s for s in qa.STEPS}
+        self.assertEqual(by_name["left"].phrase, "hey miko")
+        self.assertEqual(by_name["name"].phrase, "miko")
+        self.assertIsNone(by_name["talk-3m"].phrase)
+        self.assertEqual(by_name["shove"].kind, "shove")
+        self.assertEqual(by_name["face-45"].kind, "face")
+
+    def test_select_steps_by_name_and_reject_unknown(self):
+        self.assertEqual([s.name for s in qa.select_steps(["front", "left"])], ["front", "left"])
+        self.assertEqual(len(qa.select_steps([])), len(qa.STEPS))
+        with self.assertRaises(ValueError):
+            qa.select_steps(["sideways"])
+
+    def test_ears_step_writes_its_csv_and_prints_the_instruction(self):
+        robot, http = FakeRobot(), FakeHttp()
+        prompts = []
+        with tempfile.TemporaryDirectory() as td:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                qa.run_session(robot, ["left"], seconds=3, out_dir=td, http=http,
+                               ask=lambda text: prompts.append(text), cpu_sampler=None)
+            csv_path = Path(td) / "left.csv"
+            self.assertTrue(csv_path.exists())
+            header = csv_path.read_text().splitlines()[0]
+        self.assertIn("decode_p95_ms", header)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("left", prompts[0])
+        self.assertEqual(robot.property_writes()[-1], '""')
+        text = out.getvalue()
+        self.assertIn("== left ==", text)
+        self.assertIn("p95", text)
+
+    def test_face_step_samples_the_state_page_and_names_the_todo(self):
+        robot = FakeRobot()
+
+        def http(method, url, body=None, headers=None, timeout=None):
+            return qa.Response(200, {}, b'{"state":"meet_look","lookX":0.1,"lookY":0.0}')
+
+        with tempfile.TemporaryDirectory() as td:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                qa.run_session(robot, ["face-frontal"], seconds=1, out_dir=td, http=http,
+                               ask=lambda text: None, cpu_sampler=None, sample_period_s=0.2)
+            lines = (Path(td) / "face-frontal.csv").read_text().splitlines()
+        self.assertEqual(lines[0], ",".join(qa.STATE_FIELDS))
+        self.assertGreaterEqual(len(lines), 3)
+        self.assertIn(("forward", qa.EXPLORE_PORT), robot.calls)
+        self.assertIn("TODO", out.getvalue())
+        # No probe property is armed for a camera step.
+        self.assertEqual(robot.property_writes(), [])
+
+    def test_shove_step_turns_the_raw_log_on_and_back_off(self):
+        robot = FakeRobot()
+        answers = {("logcat", "-d", "-s", f"{qa.RAW_TAG}:D"): SHOVE_LOGCAT}
+
+        def adb(*args, check=True):
+            robot.calls.append(args)
+            return answers.get(args, "")
+
+        robot.adb = adb
+        with tempfile.TemporaryDirectory() as td:
+            quiet(qa.run_session, robot, ["shove"], seconds=0, out_dir=td, http=FakeHttp(),
+                  ask=lambda text: None, cpu_sampler=None)
+            lines = (Path(td) / "shove.csv").read_text().splitlines()
+        self.assertEqual(len(lines), 3)
+        props = [c for c in robot.calls if c[:2] == ("shell", "setprop") and c[2] == f"log.tag.{qa.RAW_TAG}"]
+        self.assertEqual([c[3] for c in props], ["DEBUG", "INFO"])
+
+    def test_session_parser_options(self):
+        args = qa.build_parser().parse_args(["--session"])
+        self.assertEqual(args.session, [])
+        args = qa.build_parser().parse_args(["--session", "left", "right", "--out", "out/ears"])
+        self.assertEqual(args.session, ["left", "right"])
+        self.assertEqual(args.out, "out/ears")
+        self.assertIsNone(qa.build_parser().parse_args([]).session)
+
+
 if __name__ == "__main__":
     unittest.main()
