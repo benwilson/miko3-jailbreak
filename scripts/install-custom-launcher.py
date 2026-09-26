@@ -17,6 +17,12 @@ ListenService), so the install also grants it RECORD_AUDIO with
 has no activity to show a permission dialog from. After an in-place
 `adb install -r`, run that same pm grant by hand if it isn't granted yet.
 
+Once our launcher is already HOME this script refuses to guess a restore
+target and installs nothing. Update it in place with `adb install -r -t
+launcher/miko3-launcher.apk` then `am start -n` its MainActivity (the HOME
+key will not restart it), or run scripts/qa-conversation.py, which installs
+the launcher and mode-explore together and checks both carry one build id.
+
 Usage:
   python3 scripts/install-custom-launcher.py
   python3 scripts/install-custom-launcher.py --no-build   # skip rebuilding the APK first

@@ -8,6 +8,10 @@ launcher sends. Grants CAMERA before the first launch (camera curiosity), so
 the mode never shows a permission dialog; it never uses the microphone. The launcher only lists Explore once it is
 rebuilt with the updated mode registry (scripts/install-custom-launcher.py).
 
+The mode and the launcher share a Binder contract; when both changed,
+scripts/qa-conversation.py installs the pair and refuses its checks unless
+both report one build id (their versionName, from scripts/build_common.py).
+
 The robot is reached over TCP adb by default (root adbd on 5555, as the
 other scripts assume); a serial with a colon is `adb connect`ed first. When
 the device can't be reached the script stops before touching anything and
