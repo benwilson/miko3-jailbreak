@@ -31,7 +31,7 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHar
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
-              "RoamSteer.java", "EscapePlanner.java", "Coverage.java")
+              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "Ears.java", "ChatSession.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -329,6 +329,18 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "reaim_never_with_the_open_space_straight_ahead",
         "reaim_is_rate_limited",
         "reaim_never_toward_a_blocked_side",
+        # The harness surface for cues and conversations (meeting plan U6, KTD3, KTD4, KTD7, KTD8)
+        "ears_cue_at_t_is_drained_on_the_next_step_with_its_kind_tier_side_and_angle",
+        "ears_trend_and_shove_spikes_are_step_input",
+        "listen_script_answers_turns_1_to_3_then_silence_on_turn_4_each_after_its_own_delay",
+        "listen_script_never_answers_and_a_line_meanwhile_is_a_say_while_the_mic_is_open",
+        "listen_while_a_line_or_a_clip_plays_is_a_violation",
+        "turn_script_returns_the_per_turn_fields_and_cancel_drops_a_late_answer",
+        "notes_delta_forget_ears_and_clip_window_are_recorded_by_the_fake",
+        "vision_person_box_dropped_at_t_reports_no_facing_face_afterwards",
+        "vision_profile_shaped_box_from_t_reports_no_facing_face_afterwards",
+        "chat_tuning_defaults_follow_the_plans_assumptions",
+        "chat_session_skeleton_has_the_six_states_and_no_behaviour",
     )
 
     @classmethod

@@ -140,6 +140,57 @@ interface CuriosityPort {
      */
     String metId();
 
+    // ---- the conversation (meeting plan U6, KTD7, KTD9, KTD10): one turn, the notes, forget, the ears ----
+
+    /**
+     * Start one conversation turn: the persona snapshot, the notes, the
+     * transcript window and what was just heard go to Claude, and the answer
+     * is his next line with its flags (U8). timeoutMs is this try's budget
+     * (the per-turn budget, then the retry's).
+     */
+    void turn(TurnRequest request, long timeoutMs);
+
+    /** The answer to the last turn(), or null while it is still running. */
+    Turn turnAnswer();
+
+    /** Abandon the running turn(), if any; a late answer must never be returned. */
+    void cancelTurn();
+
+    /**
+     * Merge a notes delta into this person's record through the People store
+     * (KTD10, drain-on-persist). Carries no lines and no transcript.
+     */
+    void notesDelta(String personId, String notesUpdate, long timeoutMs);
+
+    /** The result of the last notesDelta(), or null while it is running. */
+    Done notesDeltaAnswer();
+
+    /** Abandon the running notesDelta(), if any. */
+    void cancelNotesDelta();
+
+    /** Forget this person entirely (R18): their record, faces and notes, by id. */
+    void forget(String personId, long timeoutMs);
+
+    /** The result of the last forget(), or null while it is running. */
+    Done forgetAnswer();
+
+    /** Abandon the running forget(), if any. */
+    void cancelForget();
+
+    /** Open the launcher's continuous listening session (KTD1); cues then arrive as Ears step input. */
+    void earsOpen();
+
+    /** Close the session and release the microphone (the charger flag, shutdown; KTD6). */
+    void earsClose();
+
+    /**
+     * A clip is about to play for this long: the session keeps the recogniser
+     * deaf for it plus the deaf-window tail, so he never hears his own clip
+     * (KTD1, KTD12). Lines said through say() need no call: the session sees
+     * the speech service itself.
+     */
+    void clipWindow(long ms);
+
     /** No Claude: every stop takes the path it took before U4. */
     CuriosityPort NONE = new CuriosityPort() {
         public boolean canAsk() {
@@ -240,6 +291,45 @@ interface CuriosityPort {
 
         public String metId() {
             return null;
+        }
+
+        public void turn(TurnRequest request, long timeoutMs) {
+        }
+
+        public Turn turnAnswer() {
+            return Turn.failed();
+        }
+
+        public void cancelTurn() {
+        }
+
+        public void notesDelta(String personId, String notesUpdate, long timeoutMs) {
+        }
+
+        public Done notesDeltaAnswer() {
+            return Done.FAILED;
+        }
+
+        public void cancelNotesDelta() {
+        }
+
+        public void forget(String personId, long timeoutMs) {
+        }
+
+        public Done forgetAnswer() {
+            return Done.FAILED;
+        }
+
+        public void cancelForget() {
+        }
+
+        public void earsOpen() {
+        }
+
+        public void earsClose() {
+        }
+
+        public void clipWindow(long ms) {
         }
     };
 
@@ -586,6 +676,117 @@ interface CuriosityPort {
         @Override
         public String toString() {
             return status == Status.SAME ? "same as person " + (index + 1) : status.toString();
+        }
+    }
+
+    /** One exchange of the transcript window (KTD9): what they said and what he answered. */
+    final class Exchange {
+        final String heard;
+        final String said;
+
+        Exchange(String heard, String said) {
+            this.heard = heard;
+            this.said = said;
+        }
+    }
+
+    /**
+     * One turn's request (KTD9): the persona snapshot taken when the conversation
+     * began (KTD11), the person's name (null for a stranger), their notes
+     * rendered as data (null when none), the transcript window, and what was
+     * just heard (null for the opener). The adapter builds the prompt from it
+     * and never logs any of it.
+     */
+    final class TurnRequest {
+        final String persona;
+        final String name;
+        final String notes;
+        final List<Exchange> transcript;
+        final String heard;
+
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard) {
+            this.persona = persona;
+            this.name = name;
+            this.notes = notes;
+            this.transcript = transcript == null ? Collections.<Exchange>emptyList() : transcript;
+            this.heard = heard;
+        }
+
+        /** The opener: nothing heard yet. */
+        static TurnRequest opener(String persona, String name, String notes) {
+            return new TurnRequest(persona, name, notes, null, null);
+        }
+    }
+
+    /**
+     * One turn's answer (KTD9): his line, the question it asks (normalised by
+     * the brain against the notes so he never repeats one), a name the person
+     * gave (validated by the brain), whether Claude thinks the conversation is
+     * over (spoken as a normal line; the brain decides), whether the line is a
+     * deflection (a task he does not take), and the notes delta to merge at the
+     * end; or a refusal (the deflection clip), unreachable (retry once, then
+     * the local sign-off) or a failure.
+     */
+    final class Turn {
+        enum Status { LINE, REFUSED, UNREACHABLE, FAILED }
+
+        final Status status;
+        final String line;
+        final String questionAsked;
+        final String nameGiven;
+        final boolean endsConversation;
+        final boolean deflected;
+        final String notesUpdate;
+
+        private Turn(Status status, String line, String questionAsked, String nameGiven, boolean endsConversation,
+                     boolean deflected, String notesUpdate) {
+            this.status = status;
+            this.line = line;
+            this.questionAsked = questionAsked;
+            this.nameGiven = nameGiven;
+            this.endsConversation = endsConversation;
+            this.deflected = deflected;
+            this.notesUpdate = notesUpdate;
+        }
+
+        static Turn line(String line, String questionAsked, String nameGiven, boolean endsConversation,
+                         boolean deflected, String notesUpdate) {
+            return new Turn(Status.LINE, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate);
+        }
+
+        /** A plain line with no question, no name, no ending, no deflection and no notes. */
+        static Turn line(String line) {
+            return line(line, null, null, false, false, null);
+        }
+
+        static Turn refused() {
+            return new Turn(Status.REFUSED, null, null, null, false, false, null);
+        }
+
+        static Turn unreachable() {
+            return new Turn(Status.UNREACHABLE, null, null, null, false, false, null);
+        }
+
+        static Turn failed() {
+            return new Turn(Status.FAILED, null, null, null, false, false, null);
+        }
+    }
+
+    /** The result of a store write (notesDelta, forget): done, or failed. */
+    final class Done {
+        enum Status { DONE, FAILED }
+
+        static final Done OK = new Done(Status.DONE);
+        static final Done FAILED = new Done(Status.FAILED);
+
+        final Status status;
+
+        private Done(Status status) {
+            this.status = status;
+        }
+
+        boolean ok() {
+            return status == Status.DONE;
         }
     }
 }

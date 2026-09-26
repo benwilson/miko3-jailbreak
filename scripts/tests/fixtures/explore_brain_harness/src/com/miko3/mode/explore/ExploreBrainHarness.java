@@ -48,6 +48,11 @@ public final class ExploreBrainHarness {
                 // mid-leg re-aim, switched on by the reaim_ scenarios.
                 .coverageOff()
                 .reaimOff()
+                // Meeting plan U6: the cue, facing-face and conversation numbers from its Assumptions,
+                // pinned here so the U7 and U8 timelines are exact.
+                .cues(10000, 4000, 45f, 10f, 3, 2)
+                .facingFace(0.65f, 0.12f)
+                .chat(4000, 5000, 5000, 3000, 2, 30, 500)
                 .calibration(calibration());
     }
 
@@ -416,11 +421,109 @@ public final class ExploreBrainHarness {
         }
     }
 
+    /** One listen's scripted outcome (meeting plan U6): what is heard, and after how long (-1: People.replyMs). */
+    static final class Hearing {
+        final CuriosityPort.Heard heard;
+        final long afterMs;
+
+        Hearing(CuriosityPort.Heard heard, long afterMs) {
+            this.heard = heard;
+            this.afterMs = afterMs;
+        }
+
+        /** The same hearing, arriving this long after the listen starts. */
+        Hearing after(long ms) {
+            return new Hearing(heard, ms);
+        }
+    }
+
+    static Hearing hearWords(String text) {
+        return new Hearing(new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, text), -1);
+    }
+
+    static Hearing hearSilence() {
+        return new Hearing(CuriosityPort.Heard.NOTHING, -1);
+    }
+
+    static Hearing hearFailed() {
+        return new Hearing(new CuriosityPort.Heard(CuriosityPort.Heard.Status.FAILED, null), -1);
+    }
+
+    /**
+     * The scripted listens (meeting plan U6), shaped like Claude: the rig's nth
+     * listen() (1-based, counted over the whole run) hears this, or null for a
+     * listen that never answers (the brain's own timer ends it).
+     */
+    interface ListenScript {
+        Hearing hear(Rig rig, int nth);
+
+        /** Never answers: the mic stays open for its maxMs and heard() stays null. */
+        ListenScript NEVER = (rig, nth) -> null;
+
+        /** Every listen hears the same thing (the old single replay). */
+        static ListenScript always(Hearing h) {
+            return (rig, nth) -> h;
+        }
+
+        /** Turn 1 hears the first, turn 2 the second, ...; every listen past the script hears silence. */
+        static ListenScript turns(Hearing... perTurn) {
+            return (rig, nth) -> nth <= perTurn.length ? perTurn[nth - 1] : hearSilence();
+        }
+    }
+
+    /** The scripted conversation turns (meeting plan U6): the nth turn()'s answer, or null for none ever. */
+    interface TurnScript {
+        CuriosityPort.Turn answer(Rig rig, CuriosityPort.TurnRequest request, int nth);
+    }
+
+    /** One turn request as the fake Claude saw it: when, in which brain state, and what it carried. */
+    static final class TurnAsk {
+        final long t;
+        final String state;
+        final CuriosityPort.TurnRequest request;
+        final long timeoutMs;
+
+        TurnAsk(long t, String state, CuriosityPort.TurnRequest request, long timeoutMs) {
+            this.t = t;
+            this.state = state;
+            this.request = request;
+            this.timeoutMs = timeoutMs;
+        }
+
+        @Override
+        public String toString() {
+            return "turn@" + t + " " + state + (request.heard == null ? " opener" : "");
+        }
+    }
+
+    /** A person standing there until leavesAt: frames captured from then on carry no box (walked off). */
+    static Vision personUntil(Detection person, long leavesAt) {
+        return (rig, t) -> t < leavesAt ? list(person) : list();
+    }
+
+    /** A facing person who turns to profile at turnsAt: frames from then on carry a profile-shaped box. */
+    static Vision profileFrom(Detection facing, long turnsAt) {
+        return (rig, t) -> list(t < turnsAt ? facing : profileOf(facing));
+    }
+
+    /** The same box seen in profile: about half as wide as it is tall, same centre and height. */
+    static Detection profileOf(Detection d) {
+        float cx = (d.x0 + d.x1) / 2;
+        float w = d.height() * 0.5f;
+        return new Detection(d.label, d.score, cx - w / 2, d.y0, cx + w / 2, d.y1);
+    }
+
+    /** "A face turned toward him" (KTD4) as the fake camera reports it: the tuning's ratio and size thresholds. */
+    static boolean facing(Detection d, ExploreTuning t) {
+        return d.height() > 0 && d.width() / d.height() >= t.facingFaceMinRatio && d.height() >= t.facingFaceMinHeight;
+    }
+
     /** What the fake launcher and Claude answer in the meet flow; a null answer never comes. */
     static final class People {
         MatchScript match = (rig, nth) -> CuriosityPort.MatchAnswer.FAILED;
         CuriosityPort.MatchAnswer lines = CuriosityPort.MatchAnswer.FAILED;
-        CuriosityPort.Heard heard = CuriosityPort.Heard.NOTHING;
+        /** What each listen hears (meeting plan U6): silence unless the scenario scripts it. */
+        ListenScript listen = ListenScript.always(hearSilence());
         long replyMs = 2000;
         /** Like the adapter: the robot's patterns first ("my name is X", "I'm X"), then Claude. */
         NameScript name = t -> {
@@ -435,7 +538,7 @@ public final class ExploreBrainHarness {
     }
 
     static final class Rig implements ExploreBrain.Clock, ExploreBrain.Motor, ExploreBrain.Eyes, ExploreBrain.Sound,
-            ExploreBrain.Camera, CuriosityPort {
+            ExploreBrain.Camera, CuriosityPort, Ears {
         final List<Event> log = new ArrayList<Event>();
         final List<Action> actions = new ArrayList<Action>();
         final List<String> violations = new ArrayList<String>();
@@ -538,6 +641,37 @@ public final class ExploreBrainHarness {
         CuriosityPort.Recently pendingMet;
         long pendingMetAt;
         int metCancels;
+        /** The fake conversation (meeting plan U6): null script means every turn never answers. */
+        TurnScript turns;
+        long turnDelayMs = 1000;
+        final List<TurnAsk> turnAsks = new ArrayList<TurnAsk>();
+        CuriosityPort.Turn pendingTurn;
+        long pendingTurnAt;
+        int turnCancels;
+        /** Every notes delta and forget the brain asked for ("id: delta"; id), and what the store answers. */
+        final List<String> notesDeltas = new ArrayList<String>();
+        CuriosityPort.Done notesResult = CuriosityPort.Done.OK;
+        CuriosityPort.Done pendingNotes;
+        long pendingNotesAt;
+        final List<String> forgotten = new ArrayList<String>();
+        CuriosityPort.Done forgetResult = CuriosityPort.Done.OK;
+        CuriosityPort.Done pendingForget;
+        long pendingForgetAt;
+        /** Every clip window the brain declared, and until when the last one keeps the recogniser deaf. */
+        final List<Long> clipWindows = new ArrayList<Long>();
+        long clipUntil = Long.MIN_VALUE;
+        /** The one-shot mic (KTD1): open from listen() for its maxMs, or until heard() drains the answer. */
+        long micOpenUntil = Long.MIN_VALUE;
+        int listens;
+        /** The fake ears (meeting plan U6): cues, the angle trend and shove spikes as step input. */
+        boolean earsPresent = true;
+        boolean earsListening;
+        int earsOpens;
+        int earsCloses;
+        private final List<Ears.Cue> cues = new ArrayList<Ears.Cue>();
+        Ears.Trend pendingTrend;
+        float lastTrendDeg = Float.NaN;
+        Ears.Shove pendingShove;
         /** metId() hands out "met-1", "met-2", ... (null while facelessMeetings: no face to compare). */
         boolean facelessMeetings;
         final List<String> metIdsGiven = new ArrayList<String>();
@@ -688,6 +822,84 @@ public final class ExploreBrainHarness {
                     openStates.add(brain.state());
                 }
             }
+        }
+
+        // ---- the fake ears (meeting plan U6, KTD3, KTD4): step input the scenarios inject ----
+
+        /** A cue the session classified at t, of this kind (its tier follows), from this side and angle. */
+        Rig cue(long t, Ears.Kind kind, Ears.Side side, float angleDeg) {
+            return at(t, () -> {
+                cues.add(Ears.Cue.of(kind, side, angleDeg, t));
+                log.add(new Event(t, "cue " + kind + " " + kind.tier + " " + side));
+            });
+        }
+
+        /** A cue of this tier: a greeting when strong, a voice burst when weak. */
+        Rig cue(long t, Ears.Tier tier, Ears.Side side, float angleDeg) {
+            return cue(t, tier == Ears.Tier.STRONG ? Ears.Kind.GREETING : Ears.Kind.VOICE, side, angleDeg);
+        }
+
+        /** A latched angle sample at t; the trend carries the previous sample with it. */
+        Rig trendAt(long t, float angleDeg) {
+            return at(t, () -> {
+                pendingTrend = new Ears.Trend(angleDeg, lastTrendDeg, t);
+                lastTrendDeg = angleDeg;
+            });
+        }
+
+        /** An accelerometer spike at t, in the controller's counts above rest. */
+        Rig shoveAt(long t, int counts) {
+            return at(t, () -> pendingShove = new Ears.Shove(counts, t));
+        }
+
+        @Override
+        public boolean present() {
+            return earsPresent;
+        }
+
+        @Override
+        public boolean listening() {
+            return earsListening;
+        }
+
+        @Override
+        public List<Ears.Cue> drain() {
+            List<Ears.Cue> out = new ArrayList<Ears.Cue>(cues);
+            cues.clear();
+            return out;
+        }
+
+        @Override
+        public Ears.Trend trend() {
+            Ears.Trend t = pendingTrend;
+            pendingTrend = null;
+            return t;
+        }
+
+        @Override
+        public Ears.Shove shove() {
+            Ears.Shove s = pendingShove;
+            pendingShove = null;
+            return s;
+        }
+
+        /** True while a listen's one-shot mic is open: a line said now would be heard as a reply. */
+        boolean micOpen() {
+            return now < micOpenUntil;
+        }
+
+        /** The facing face the fake camera would report in a frame captured at t (null: none, or no vision). */
+        Detection facingFace(long t) {
+            List<Detection> seen = vision == null ? null : vision.see(this, t);
+            if (seen == null) {
+                return null;
+            }
+            for (Detection d : seen) {
+                if (facing(d, tuning)) {
+                    return d;
+                }
+            }
+            return null;
         }
 
         @Override
@@ -906,6 +1118,10 @@ public final class ExploreBrainHarness {
             if (!quiet() && !sayWhileBusyAllowed) {
                 violations.add(now + ":say while a detector run is in flight in " + brain.state());
             }
+            // The mic is a one-shot listen (KTD1): a line said while it is open is heard as the reply.
+            if (micOpen()) {
+                violations.add(now + ":say while the mic is open in " + brain.state());
+            }
             sayingUntil = sayNeverFinishes ? Long.MAX_VALUE : now + speechMs;
             log.add(new Event(now, "say " + line));
         }
@@ -958,9 +1174,15 @@ public final class ExploreBrainHarness {
             if (!sayFinished()) {
                 violations.add(now + ":listen while still speaking");
             }
+            if (now < clipUntil) {
+                violations.add(now + ":listen while a clip plays");
+            }
             listenMaxMs = maxMs;
-            pendingHeard = people.heard;
-            pendingHeardAt = now + people.replyMs;
+            listens++;
+            Hearing h = people.listen == null ? null : people.listen.hear(this, listens);
+            pendingHeard = h == null ? null : h.heard;
+            pendingHeardAt = now + (h == null || h.afterMs < 0 ? people.replyMs : h.afterMs);
+            micOpenUntil = now + maxMs;
             log.add(new Event(now, "listen"));
         }
 
@@ -971,6 +1193,7 @@ public final class ExploreBrainHarness {
             }
             CuriosityPort.Heard h = pendingHeard;
             pendingHeard = null;
+            micOpenUntil = Long.MIN_VALUE;
             log.add(new Event(now, "heard " + h.status));
             return h;
         }
@@ -1117,6 +1340,105 @@ public final class ExploreBrainHarness {
             String id = facelessMeetings ? null : "met-" + (metIdsGiven.size() + 1);
             metIdsGiven.add(id);
             return id;
+        }
+
+        // ---- the fake conversation (meeting plan U6): scripted turns, the store and the ears session ----
+
+        @Override
+        public void turn(CuriosityPort.TurnRequest request, long timeoutMs) {
+            turnAsks.add(new TurnAsk(now, brain.state().name(), request, timeoutMs));
+            pendingTurn = turns == null ? null : turns.answer(this, request, turnAsks.size());
+            pendingTurnAt = now + turnDelayMs;
+            log.add(new Event(now, "turn"));
+        }
+
+        @Override
+        public CuriosityPort.Turn turnAnswer() {
+            if (pendingTurn == null || now < pendingTurnAt) {
+                return null;
+            }
+            CuriosityPort.Turn t = pendingTurn;
+            pendingTurn = null;
+            log.add(new Event(now, "turn " + t.status));
+            return t;
+        }
+
+        @Override
+        public void cancelTurn() {
+            pendingTurn = null;
+            turnCancels++;
+            log.add(new Event(now, "cancel turn"));
+        }
+
+        @Override
+        public void notesDelta(String personId, String notesUpdate, long timeoutMs) {
+            notesDeltas.add(personId + ": " + notesUpdate);
+            pendingNotes = notesResult;
+            pendingNotesAt = now + claudeDelayMs;
+            log.add(new Event(now, "notes " + personId));
+        }
+
+        @Override
+        public CuriosityPort.Done notesDeltaAnswer() {
+            if (pendingNotes == null || now < pendingNotesAt) {
+                return null;
+            }
+            CuriosityPort.Done d = pendingNotes;
+            pendingNotes = null;
+            log.add(new Event(now, "notes " + d.status));
+            return d;
+        }
+
+        @Override
+        public void cancelNotesDelta() {
+            pendingNotes = null;
+            log.add(new Event(now, "cancel notes"));
+        }
+
+        @Override
+        public void forget(String personId, long timeoutMs) {
+            forgotten.add(personId);
+            pendingForget = forgetResult;
+            pendingForgetAt = now + claudeDelayMs;
+            log.add(new Event(now, "forget " + personId));
+        }
+
+        @Override
+        public CuriosityPort.Done forgetAnswer() {
+            if (pendingForget == null || now < pendingForgetAt) {
+                return null;
+            }
+            CuriosityPort.Done d = pendingForget;
+            pendingForget = null;
+            log.add(new Event(now, "forgot " + d.status));
+            return d;
+        }
+
+        @Override
+        public void cancelForget() {
+            pendingForget = null;
+            log.add(new Event(now, "cancel forget"));
+        }
+
+        @Override
+        public void earsOpen() {
+            earsOpens++;
+            earsListening = earsPresent;
+            log.add(new Event(now, "ears open"));
+        }
+
+        @Override
+        public void earsClose() {
+            earsCloses++;
+            earsListening = false;
+            log.add(new Event(now, "ears close"));
+        }
+
+        @Override
+        public void clipWindow(long ms) {
+            clipWindows.add(ms);
+            clipUntil = now + ms + tuning.deafTailMs;
+            log.add(new Event(now, "clip " + ms));
         }
 
         // ---- log queries ----
@@ -1298,6 +1620,7 @@ public final class ExploreBrainHarness {
         steerWaitScenarios();
         cplHiccupScenarios();
         reaimScenarios();
+        earsAndChatScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -2869,7 +3192,7 @@ public final class ExploreBrainHarness {
         scenario("meet_ae2_new_person_who_gives_a_name_is_stored_and_remembered", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Sarah");
+            rig.people.listen = ListenScript.always(hearWords("my name is Sarah"));
             rig.people.remembered = CuriosityPort.Answer.line("Sarah, what a lovely smile! I'll remember you!");
             rig.started();
             rig.runUntil(16000);
@@ -2888,7 +3211,7 @@ public final class ExploreBrainHarness {
         scenario("meet_ae5_no_reply_says_the_friendly_line_and_stores_nothing", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = CuriosityPort.Heard.NOTHING;
+            rig.people.listen = ListenScript.always(hearSilence());
             rig.started();
             rig.runUntil(14000);
             int listen = rig.first("listen", 0);
@@ -2901,7 +3224,7 @@ public final class ExploreBrainHarness {
         scenario("meet_ae5_reply_without_a_name_is_stored_unnamed", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "hmm what");
+            rig.people.listen = ListenScript.always(hearWords("hmm what"));
             rig.people.remembered = CuriosityPort.Answer.line("Nice to meet you! I'll remember that smile!");
             rig.started();
             rig.runUntil(16000);
@@ -2914,7 +3237,7 @@ public final class ExploreBrainHarness {
         scenario("meet_reply_without_a_pattern_waits_for_claude_to_find_the_name", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "oh hi it is priya");
+            rig.people.listen = ListenScript.always(hearWords("oh hi it is priya"));
             rig.people.name = t -> CuriosityPort.Named.of("Priya");
             rig.people.nameAsksClaude = true;
             rig.started();
@@ -3005,7 +3328,7 @@ public final class ExploreBrainHarness {
         scenario("meet_listen_failure_resumes_within_the_budget", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.FAILED, null);
+            rig.people.listen = ListenScript.always(hearFailed());
             rig.started();
             rig.runUntil(14000);
             int failed = rig.first("heard FAILED", 0);
@@ -3016,7 +3339,7 @@ public final class ExploreBrainHarness {
         scenario("meet_listen_that_never_answers_ends_at_its_deadline", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = null;
+            rig.people.listen = ListenScript.NEVER;
             rig.started();
             rig.runUntil(20000);
             int listen = rig.first("listen", 0);
@@ -3029,7 +3352,7 @@ public final class ExploreBrainHarness {
         scenario("meet_remember_failure_resumes_within_the_budget", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            rig.people.listen = ListenScript.always(hearWords("i'm Sam"));
             rig.people.remembered = null;
             rig.started();
             rig.runUntil(22000);
@@ -3064,7 +3387,7 @@ public final class ExploreBrainHarness {
             rig.brain.setTrace(notes::add);
             rig.people.match = (r, k) -> k == 1 ? STRANGER
                     : CuriosityPort.MatchAnswer.known("Sarah", "Welcome back, {name}!", "Hi again!");
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Sarah");
+            rig.people.listen = ListenScript.always(hearWords("my name is Sarah"));
             // Each recently-met check says someone new, so she is met again (explore nav plan U7).
             rig.metChecks = (r, req, k) -> CuriosityPort.Recently.different();
             rig.started();
@@ -3087,7 +3410,7 @@ public final class ExploreBrainHarness {
         scenario("meet_camera_stays_closed_and_eyes_think_while_matching", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            rig.people.listen = ListenScript.always(hearWords("i'm Sam"));
             rig.started();
             rig.runUntil(16000);
             int match = rig.first("match", 0);
@@ -3164,7 +3487,7 @@ public final class ExploreBrainHarness {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless("Hello! What's your name?",
                     "No worries, shy friend!");
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Sam");
+            rig.people.listen = ListenScript.always(hearWords("my name is Sam"));
             rig.people.welcomed = CuriosityPort.Answer.line("So nice to meet you, Sam!");
             rig.started();
             rig.runUntil(16000);
@@ -3180,7 +3503,7 @@ public final class ExploreBrainHarness {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless("Hello! What's your name?",
                     "No worries, shy friend!");
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            rig.people.listen = ListenScript.always(hearWords("i'm Sam"));
             rig.people.welcomed = CuriosityPort.Answer.failed();
             rig.started();
             rig.runUntil(16000);
@@ -4130,7 +4453,7 @@ public final class ExploreBrainHarness {
         scenario("roam_camera_closed_through_meet_ask_name_listen_name_remember_and_name_clip", n -> {
             Rig named = meetRig();
             named.people.match = (r, k) -> STRANGER;
-            named.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            named.people.listen = ListenScript.always(hearWords("i'm Sam"));
             named.started();
             named.runUntil(16000);
             Rig clip = meetRig();
@@ -5909,7 +6232,7 @@ public final class ExploreBrainHarness {
             // Asks due every 2 s: none goes out, or is answered, outside roaming.
             Rig meet = meetRig(claudeTuning().gyro(robotGyro()).doorwayAsk(2000, 15000));
             meet.people.match = (r, k) -> STRANGER;
-            meet.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "i'm Sam");
+            meet.people.listen = ListenScript.always(hearWords("i'm Sam"));
             meet.doorways = (r, k) -> CuriosityPort.Doorway.none();
             meet.doorwayDelayMs = 1500;
             meet.started();
@@ -6336,7 +6659,7 @@ public final class ExploreBrainHarness {
         scenario("people_camera_closed_through_a_roaming_meetings_talking_states", n -> {
             Rig rig = peopleRig(peopleTuning(), personWhen(t -> t < 15000));
             rig.people.match = (r, k) -> STRANGER;
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Priya");
+            rig.people.listen = ListenScript.always(hearWords("my name is Priya"));
             rig.started();
             rig.runUntil(30000);
             boolean talked = rig.statesSeen.containsAll(java.util.Arrays.asList(ExploreBrain.State.MEET,
@@ -6356,7 +6679,7 @@ public final class ExploreBrainHarness {
             Rig rig = peopleRig(peopleTuning(), personWhen(t -> t < 15000 || (t >= 100000 && t < 115000)));
             rig.people.match = (r, k) -> k == 1 ? STRANGER
                     : CuriosityPort.MatchAnswer.known("Sarah", "Hi {name}!", "Hello again!");
-            rig.people.heard = new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, "my name is Priya");
+            rig.people.listen = ListenScript.always(hearWords("my name is Priya"));
             rig.metChecks = (r, req, k) -> r.now >= 100000 ? CuriosityPort.Recently.different()
                     : CuriosityPort.Recently.same(0);
             List<String> notes = traced(rig);
@@ -6412,6 +6735,308 @@ public final class ExploreBrainHarness {
                             && t.peopleCooldownMs == 120000,
                     t.metLeaveAloneMs + " " + t.metCheckIntervalMs + " " + t.metCheckTimeoutMs + " " + t.metClearedMs
                             + " " + t.politeHeight);
+        });
+    }
+
+    // ---- the harness surface for cues and conversations (meeting plan U6, KTD3, KTD4, KTD7, KTD8) ----
+
+    /**
+     * The brain does not consume these fakes yet (U7 and U8 do), so each scenario
+     * asserts the fake's own behaviour: what U7 and U8 will build on.
+     */
+    private static void earsAndChatScenarios() {
+        scenario("ears_cue_at_t_is_drained_on_the_next_step_with_its_kind_tier_side_and_angle", n -> {
+            Rig rig = new Rig(tuning().build(), CLEAR);
+            rig.cue(3000, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
+            rig.cue(3000, Ears.Tier.WEAK, Ears.Side.RIGHT, Float.NaN);
+            rig.started();
+            rig.runUntil(2990);
+            List<Ears.Cue> before = rig.drain();
+            rig.runUntil(3000);
+            List<Ears.Cue> at = rig.drain();
+            List<Ears.Cue> again = rig.drain();
+            rig.runUntil(4000);
+            List<Ears.Cue> after = rig.drain();
+            Ears.Cue name = at.size() == 2 ? at.get(0) : null;
+            Ears.Cue burst = at.size() == 2 ? at.get(1) : null;
+            check(n, before.isEmpty() && at.size() == 2 && again.isEmpty() && after.isEmpty()
+                            && name.kind == Ears.Kind.NAME && name.tier == Ears.Tier.STRONG && name.strong()
+                            && name.side == Ears.Side.LEFT && name.hasAngle() && name.angleDeg == -60f && name.at == 3000
+                            && burst.kind == Ears.Kind.VOICE && burst.tier == Ears.Tier.WEAK && !burst.strong()
+                            && burst.side == Ears.Side.RIGHT && !burst.hasAngle() && burst.at == 3000
+                            && rig.present() && !rig.listening()
+                            && rig.count("cue NAME STRONG LEFT") == 1 && rig.count("cue VOICE WEAK RIGHT") == 1
+                            && rig.violations.isEmpty(),
+                    "before=" + before + " at=" + at + " after=" + after + " " + rig.tail());
+        });
+        scenario("ears_trend_and_shove_spikes_are_step_input", n -> {
+            Rig rig = new Rig(tuning().build(), CLEAR);
+            rig.trendAt(1000, -40f).trendAt(1100, -25f).trendAt(1200, -30f);
+            rig.shoveAt(2000, 900);
+            rig.started();
+            rig.runUntil(990);
+            Ears.Trend none = rig.trend();
+            rig.runUntil(1000);
+            Ears.Trend first = rig.trend();
+            rig.runUntil(1100);
+            Ears.Trend closing = rig.trend();
+            rig.runUntil(1200);
+            Ears.Trend growing = rig.trend();
+            Ears.Trend consumed = rig.trend();
+            rig.runUntil(1990);
+            Ears.Shove early = rig.shove();
+            rig.runUntil(2000);
+            Ears.Shove shove = rig.shove();
+            Ears.Shove gone = rig.shove();
+            check(n, none == null && first != null && first.angleDeg == -40f && Float.isNaN(first.previousDeg)
+                            && !first.growing() && first.at == 1000
+                            && closing != null && closing.angleDeg == -25f && closing.previousDeg == -40f
+                            && !closing.growing()
+                            && growing != null && growing.angleDeg == -30f && growing.previousDeg == -25f
+                            && growing.growing() && consumed == null
+                            && early == null && shove != null && shove.counts == 900 && shove.at == 2000 && gone == null
+                            && rig.violations.isEmpty(),
+                    "first=" + first + " closing=" + closing + " growing=" + growing + " shove=" + shove + " "
+                            + rig.tail());
+        });
+        scenario("listen_script_answers_turns_1_to_3_then_silence_on_turn_4_each_after_its_own_delay", n -> {
+            Rig rig = new Rig(tuning().build(), CLEAR);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300), hearWords("good thanks").after(1200),
+                    hearWords("catch you later"), hearSilence());
+            rig.listen(6000);
+            rig.runUntil(290);
+            CuriosityPort.Heard early = rig.heard();
+            boolean openEarly = rig.micOpen();
+            rig.runUntil(300);
+            CuriosityPort.Heard one = rig.heard();
+            boolean openAfter = rig.micOpen();
+            rig.listen(6000);
+            rig.runUntil(1490);
+            CuriosityPort.Heard early2 = rig.heard();
+            rig.runUntil(1500);
+            CuriosityPort.Heard two = rig.heard();
+            rig.listen(6000);
+            rig.runUntil(3500);
+            CuriosityPort.Heard three = rig.heard();
+            rig.listen(6000);
+            rig.runUntil(5500);
+            CuriosityPort.Heard four = rig.heard();
+            rig.listen(6000);
+            rig.runUntil(7500);
+            CuriosityPort.Heard five = rig.heard();
+            check(n, early == null && openEarly && one != null && one.status == CuriosityPort.Heard.Status.WORDS
+                            && one.text.equals("hi") && !openAfter
+                            && early2 == null && two != null && two.text.equals("good thanks")
+                            && three != null && three.text.equals("catch you later")
+                            && four == CuriosityPort.Heard.NOTHING && five == CuriosityPort.Heard.NOTHING
+                            && rig.listens == 5 && rig.count("listen") == 5 && rig.count("heard WORDS") == 3
+                            && rig.count("heard SILENCE") == 2 && rig.violations.isEmpty(),
+                    "one=" + one + " two=" + two + " three=" + three + " four=" + four + " five=" + five + " "
+                            + rig.tail());
+        });
+        scenario("listen_script_never_answers_and_a_line_meanwhile_is_a_say_while_the_mic_is_open", n -> {
+            Rig rig = new Rig(tuning().build(), CLEAR);
+            rig.people.listen = ListenScript.NEVER;
+            rig.listen(4000);
+            rig.runUntil(3000);
+            CuriosityPort.Heard none = rig.heard();
+            boolean open = rig.micOpen();
+            rig.say("hello?");
+            int flagged = rig.violations.size();
+            rig.runUntil(6000);
+            CuriosityPort.Heard still = rig.heard();
+            boolean closed = !rig.micOpen();
+            rig.say("still there?");
+            check(n, none == null && open && flagged == 1 && rig.violations.get(0).endsWith(":say while the mic is open in EYES_ONLY")
+                            && still == null && closed && rig.violations.size() == 1,
+                    "open=" + open + " closed=" + closed + " " + rig.tail());
+        });
+        scenario("listen_while_a_line_or_a_clip_plays_is_a_violation", n -> {
+            Rig rig = new Rig(tuning().build(), CLEAR);
+            rig.say("one sec");
+            rig.listen(4000);
+            int whileSpeaking = rig.violations.size();
+            rig.runUntil(2000);
+            CuriosityPort.Heard one = rig.heard();
+            rig.clipWindow(800);
+            rig.listen(4000);
+            int whileClip = rig.violations.size();
+            rig.runUntil(4000);
+            CuriosityPort.Heard two = rig.heard();
+            rig.listen(4000);
+            check(n, whileSpeaking == 1 && rig.violations.get(0).endsWith(":listen while still speaking")
+                            && one == CuriosityPort.Heard.NOTHING
+                            && whileClip == 2 && rig.violations.get(1).endsWith(":listen while a clip plays")
+                            && two == CuriosityPort.Heard.NOTHING && rig.violations.size() == 2
+                            && rig.clipWindows.equals(java.util.Arrays.asList(800L)) && rig.clipUntil == 2000 + 800 + 500
+                            && rig.count("clip 800") == 1,
+                    rig.tail());
+        });
+        scenario("turn_script_returns_the_per_turn_fields_and_cancel_drops_a_late_answer", n -> {
+            Rig rig = new Rig(tuning().build(), CLEAR);
+            rig.turns = (r, req, k) -> k == 1
+                    ? CuriosityPort.Turn.line("Hey. How was the weekend?", "how was the weekend", null, false, false,
+                            "weekend: asked")
+                    : k == 2 ? CuriosityPort.Turn.line("Ha. I don't do timers.", null, "Sarah", false, true, null)
+                    : k == 3 ? CuriosityPort.Turn.line("Later then.", null, null, true, false, "left at three")
+                    : k == 4 ? CuriosityPort.Turn.refused()
+                    : k == 5 ? CuriosityPort.Turn.line("never returned")
+                    : CuriosityPort.Turn.unreachable();
+            CuriosityPort.TurnRequest opener = CuriosityPort.TurnRequest.opener("persona", "Sarah", "notes");
+            List<CuriosityPort.Exchange> window = new ArrayList<CuriosityPort.Exchange>();
+            window.add(new CuriosityPort.Exchange("fine", "Hey. How was the weekend?"));
+            CuriosityPort.TurnRequest reply = new CuriosityPort.TurnRequest("persona", "Sarah", "notes", window,
+                    "set a timer");
+            rig.turn(opener, 5000);
+            rig.runUntil(990);
+            CuriosityPort.Turn early = rig.turnAnswer();
+            rig.runUntil(1000);
+            CuriosityPort.Turn one = rig.turnAnswer();
+            rig.turn(reply, 5000);
+            rig.runUntil(2000);
+            CuriosityPort.Turn two = rig.turnAnswer();
+            rig.turn(reply, 5000);
+            rig.runUntil(3000);
+            CuriosityPort.Turn three = rig.turnAnswer();
+            rig.turn(reply, 3000);
+            rig.runUntil(4000);
+            CuriosityPort.Turn four = rig.turnAnswer();
+            rig.turn(reply, 5000);
+            rig.runUntil(4500);
+            rig.cancelTurn();
+            rig.runUntil(6000);
+            CuriosityPort.Turn cancelled = rig.turnAnswer();
+            rig.turn(reply, 5000);
+            rig.runUntil(7000);
+            CuriosityPort.Turn six = rig.turnAnswer();
+            rig.turns = null;
+            rig.turn(reply, 5000);
+            rig.runUntil(9000);
+            CuriosityPort.Turn never = rig.turnAnswer();
+            boolean opened = rig.turnAsks.size() == 7 && rig.turnAsks.get(0).request == opener
+                    && rig.turnAsks.get(0).request.heard == null && rig.turnAsks.get(0).request.transcript.isEmpty()
+                    && rig.turnAsks.get(1).request.heard.equals("set a timer")
+                    && rig.turnAsks.get(1).request.transcript.get(0).heard.equals("fine")
+                    && rig.turnAsks.get(3).timeoutMs == 3000 && rig.turnAsks.get(0).timeoutMs == 5000;
+            check(n, opened && early == null && one != null && one.status == CuriosityPort.Turn.Status.LINE
+                            && one.line.equals("Hey. How was the weekend?") && one.questionAsked.equals("how was the weekend")
+                            && one.nameGiven == null && !one.endsConversation && !one.deflected
+                            && one.notesUpdate.equals("weekend: asked")
+                            && two != null && two.nameGiven.equals("Sarah") && two.deflected && two.questionAsked == null
+                            && two.notesUpdate == null
+                            && three != null && three.endsConversation && three.notesUpdate.equals("left at three")
+                            && four != null && four.status == CuriosityPort.Turn.Status.REFUSED && four.line == null
+                            && cancelled == null && rig.turnCancels == 1
+                            && six != null && six.status == CuriosityPort.Turn.Status.UNREACHABLE
+                            && never == null && rig.count("turn LINE") == 3 && rig.count("cancel turn") == 1
+                            && rig.violations.isEmpty(),
+                    "asks=" + rig.turnAsks + " one=" + one + " cancelled=" + cancelled + " " + rig.tail());
+        });
+        scenario("notes_delta_forget_ears_and_clip_window_are_recorded_by_the_fake", n -> {
+            Rig rig = new Rig(tuning().build(), CLEAR);
+            rig.notesDelta("p-1", "likes tea; asked about the weekend", 5000);
+            rig.runUntil(990);
+            CuriosityPort.Done early = rig.notesDeltaAnswer();
+            rig.runUntil(1000);
+            CuriosityPort.Done merged = rig.notesDeltaAnswer();
+            rig.notesResult = CuriosityPort.Done.FAILED;
+            rig.notesDelta("p-1", "again", 5000);
+            rig.runUntil(2000);
+            CuriosityPort.Done failed = rig.notesDeltaAnswer();
+            rig.notesDelta("p-1", "dropped", 5000);
+            rig.cancelNotesDelta();
+            rig.runUntil(3000);
+            CuriosityPort.Done cancelled = rig.notesDeltaAnswer();
+            rig.forget("p-1", 5000);
+            rig.runUntil(4000);
+            CuriosityPort.Done forgot = rig.forgetAnswer();
+            rig.forget("p-2", 5000);
+            rig.cancelForget();
+            rig.runUntil(5000);
+            CuriosityPort.Done forgetCancelled = rig.forgetAnswer();
+            boolean closedAtStart = !rig.listening();
+            rig.earsOpen();
+            boolean openNow = rig.listening();
+            rig.earsClose();
+            boolean closedAgain = !rig.listening();
+            rig.earsPresent = false;
+            rig.earsOpen();
+            boolean absentStaysClosed = !rig.listening() && !rig.present();
+            rig.clipWindow(700);
+            check(n, early == null && merged == CuriosityPort.Done.OK && merged.ok()
+                            && failed == CuriosityPort.Done.FAILED && !failed.ok() && cancelled == null
+                            && rig.notesDeltas.equals(java.util.Arrays.asList("p-1: likes tea; asked about the weekend",
+                                    "p-1: again", "p-1: dropped"))
+                            && forgot == CuriosityPort.Done.OK && forgetCancelled == null
+                            && rig.forgotten.equals(java.util.Arrays.asList("p-1", "p-2"))
+                            && closedAtStart && openNow && closedAgain && absentStaysClosed
+                            && rig.earsOpens == 2 && rig.earsCloses == 1
+                            && rig.clipWindows.equals(java.util.Arrays.asList(700L))
+                            && rig.count("notes p-1") == 3 && rig.count("notes DONE") == 1 && rig.count("notes FAILED") == 1
+                            && rig.count("cancel notes") == 1 && rig.count("forget p-1") == 1 && rig.count("forgot DONE") == 1
+                            && rig.count("cancel forget") == 1 && rig.count("ears open") == 2 && rig.count("ears close") == 1
+                            && rig.count("clip 700") == 1 && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("vision_person_box_dropped_at_t_reports_no_facing_face_afterwards", n -> {
+            Detection them = box("person", 0.9f, 0.5f, 0.55f, 0.6f, 0.8f);
+            Vision v = personUntil(them, 4000);
+            Rig rig = new Rig(tuning().build(), CLEAR, v, true);
+            Detection before = rig.facingFace(3990);
+            Detection gone = rig.facingFace(4000);
+            Detection later = rig.facingFace(9000);
+            check(n, before == them && v.see(rig, 3990).size() == 1 && gone == null && v.see(rig, 4000).isEmpty()
+                            && later == null && v.see(rig, 9000).isEmpty(),
+                    "before=" + before + " gone=" + gone + " later=" + later);
+        });
+        scenario("vision_profile_shaped_box_from_t_reports_no_facing_face_afterwards", n -> {
+            Detection them = box("person", 0.9f, 0.5f, 0.55f, 0.6f, 0.8f);
+            Vision v = profileFrom(them, 4000);
+            Rig rig = new Rig(tuning().build(), CLEAR, v, true);
+            Detection before = rig.facingFace(3990);
+            List<Detection> turned = v.see(rig, 4000);
+            Detection profile = turned.size() == 1 ? turned.get(0) : null;
+            Detection none = rig.facingFace(4000);
+            // A facing shape too small to be 1.5 m away is not a facing face either.
+            Detection far = box("person", 0.9f, 0.5f, 0.55f, 0.08f, 0.1f);
+            boolean farRejected = !facing(far, rig.tuning);
+            check(n, before == them && Math.abs(them.width() / them.height() - 0.75f) < 1e-5
+                            && profile != null && profile.label.equals("person")
+                            && Math.abs(profile.width() / profile.height() - 0.5f) < 1e-5
+                            && Math.abs(profile.height() - them.height()) < 1e-6
+                            && Math.abs((profile.x0 + profile.x1) - (them.x0 + them.x1)) < 1e-6
+                            && none == null && rig.facingFace(9000) == null && farRejected,
+                    "before=" + before + " profile=" + profile + " none=" + none);
+        });
+        scenario("chat_tuning_defaults_follow_the_plans_assumptions", n -> {
+            ExploreTuning t = new ExploreTuning.Builder().build();
+            check(n, t.cueHoldMs == 10000 && t.leanInMs == 4000 && t.newcomerAngleDeg == 45f && t.cueStopBandDeg == 10f
+                            && t.strongCueLooks == 3 && t.weakCueLooks == 2
+                            && t.facingFaceMinRatio == 0.65f && t.facingFaceMinHeight == 0.12f
+                            && t.unansweredListenMs == 4000 && t.chatStallGraceMs == 5000
+                            && t.turnBudgetMs == 5000 && t.turnRetryMs == 3000 && t.sentenceCap == 2
+                            && t.transcriptWindow == 30 && t.deafTailMs == 500,
+                    t.cueHoldMs + " " + t.leanInMs + " " + t.newcomerAngleDeg + " " + t.cueStopBandDeg + " "
+                            + t.strongCueLooks + " " + t.weakCueLooks + " " + t.facingFaceMinRatio + " "
+                            + t.facingFaceMinHeight + " " + t.unansweredListenMs + " " + t.chatStallGraceMs + " "
+                            + t.turnBudgetMs + " " + t.turnRetryMs + " " + t.sentenceCap + " " + t.transcriptWindow
+                            + " " + t.deafTailMs);
+        });
+        scenario("chat_session_skeleton_has_the_six_states_and_no_behaviour", n -> {
+            ExploreTuning t = tuning().build();
+            ChatSession s = new ChatSession(t, CuriosityPort.NONE, Ears.NONE, ChatSession.State.CUE_TURN);
+            ChatSession.State[] states = ChatSession.State.values();
+            boolean named = states.length == 6 && states[0] == ChatSession.State.CUE_TURN
+                    && states[1] == ChatSession.State.CUE_LOOK && states[2] == ChatSession.State.CHAT_THINK
+                    && states[3] == ChatSession.State.CHAT_SPEAK && states[4] == ChatSession.State.CHAT_LISTEN
+                    && states[5] == ChatSession.State.CHAT_NOTES;
+            check(n, named && s.state() == ChatSession.State.CUE_TURN && s.tuning() == t && s.port() == CuriosityPort.NONE
+                            && s.ears() == Ears.NONE && !Ears.NONE.present() && !Ears.NONE.listening()
+                            && Ears.NONE.drain().isEmpty() && Ears.NONE.trend() == null && Ears.NONE.shove() == null
+                            && CuriosityPort.NONE.turnAnswer().status == CuriosityPort.Turn.Status.FAILED
+                            && CuriosityPort.NONE.notesDeltaAnswer() == CuriosityPort.Done.FAILED
+                            && CuriosityPort.NONE.forgetAnswer() == CuriosityPort.Done.FAILED,
+                    java.util.Arrays.toString(states) + " state=" + s.state());
         });
     }
 }

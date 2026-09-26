@@ -366,6 +366,60 @@ final class ClaudeCuriosity implements CuriosityPort {
         recents.cancel();
     }
 
+    // ---- the conversation (meeting plan U6): the port has it; U8 wires it. Until then every
+    // request fails at once, as CuriosityPort.NONE answers, and the meeting runs as it does today. ----
+
+    @Override
+    public void turn(TurnRequest request, long timeoutMs) {
+    }
+
+    @Override
+    public Turn turnAnswer() {
+        return Turn.failed();
+    }
+
+    @Override
+    public void cancelTurn() {
+    }
+
+    @Override
+    public void notesDelta(String personId, String notesUpdate, long timeoutMs) {
+    }
+
+    @Override
+    public Done notesDeltaAnswer() {
+        return Done.FAILED;
+    }
+
+    @Override
+    public void cancelNotesDelta() {
+    }
+
+    @Override
+    public void forget(String personId, long timeoutMs) {
+    }
+
+    @Override
+    public Done forgetAnswer() {
+        return Done.FAILED;
+    }
+
+    @Override
+    public void cancelForget() {
+    }
+
+    @Override
+    public void earsOpen() {
+    }
+
+    @Override
+    public void earsClose() {
+    }
+
+    @Override
+    public void clipWindow(long ms) {
+    }
+
     /**
      * Modelled on the person request: the face cut from the roaming frame's person
      * box, against the faces of everyone met recently, labelled by number only.
