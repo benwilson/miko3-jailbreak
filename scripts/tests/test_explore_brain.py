@@ -341,7 +341,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "vision_person_box_dropped_at_t_reports_no_facing_face_afterwards",
         "vision_profile_shaped_box_from_t_reports_no_facing_face_afterwards",
         "chat_tuning_defaults_follow_the_plans_assumptions",
-        "chat_session_skeleton_has_the_six_states_and_no_behaviour",
+        "chat_session_starts_thinking_with_the_four_chat_states_and_no_behaviour",
         # Cues, the lean-in and the turn to the voice (meeting plan U7; R1-R3, R6-R9, R15; KTD3-KTD6, KTD8)
         "cue_strong_from_the_left_mid_hop_stops_within_one_step_and_turns_left",
         "cue_weak_with_no_face_after_the_look_and_its_opposite_resumes_quietly_within_the_budget",

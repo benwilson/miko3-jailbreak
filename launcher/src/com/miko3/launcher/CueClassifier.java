@@ -1,6 +1,6 @@
 package com.miko3.launcher;
 
-import java.util.Locale;
+import com.miko3.shared.CueWords;
 
 /**
  * Tiers for one heard utterance (meeting plan U3; R2, R3, R5, KTD3, KTD11).
@@ -17,7 +17,8 @@ import java.util.Locale;
  * switch, because the person in front of him is answering, not addressing.
  *
  * This is the one class that sees every utterance's words, so it logs nothing
- * at all; the session logs counters.
+ * at all; the session logs counters. The name and apology vocabulary and the
+ * normalisation live in the shared CueWords.
  */
 final class CueClassifier {
     static final int TIER_NONE = 0;
@@ -34,8 +35,6 @@ final class CueClassifier {
      * how are you"); "this morning the build broke" is office talk, not a greeting. */
     static final int GREETING_MAX_WORDS = 6;
 
-    /** His name as the recogniser tends to spell it (KTD2's hotwords bias toward these). */
-    static final String[] NAMES = {"miko", "mika", "mikey", "mikko", "meeko", "mico", "niko"};
     /** Greetings aimed at him: the buddy, time-of-day and robot forms. A bare
      * "hello" or "hey" is a weak cue: it may be for a phone. */
     static final String[] GREETINGS = {
@@ -43,8 +42,6 @@ final class CueClassifier {
             "morning", "good morning", "afternoon", "good afternoon", "evening", "good evening",
             "hey robot", "hi robot", "hello robot", "hey little guy", "hey little robot", "howdy",
     };
-    static final String[] SORRY_WORDS = {"sorry", "oops", "whoops", "oop"};
-    static final String[] SORRY_PHRASES = {"my bad", "excuse me"};
 
     /** The Settings page's "answers when spoken to" switch (KTD11). */
     interface Switch {
@@ -85,10 +82,11 @@ final class CueClassifier {
         if (norm.isEmpty()) {
             return TIER_WEAK;
         }
-        if (namesHim(norm) || isGreeting(norm)) {
+        String[] words = norm.split(" ");
+        if (namesHim(words) || isGreeting(norm, words.length)) {
             return TIER_STRONG;
         }
-        if (isSorry(norm)) {
+        if (isSorry(norm, words)) {
             long shove = shovedAtMs;
             if (shove != NEVER && atMs >= shove && atMs - shove <= SORRY_WINDOW_MS) {
                 return TIER_STRONG;
@@ -106,40 +104,27 @@ final class CueClassifier {
         return angle < 0f ? SIDE_LEFT : SIDE_RIGHT;
     }
 
-    /** Lower case, letters and apostrophes only, single spaces, trimmed. */
+    /** Lower case, letters, digits and apostrophes only, single spaces, trimmed. */
     static String normalize(String text) {
-        if (text == null) {
-            return "";
-        }
-        StringBuilder b = new StringBuilder(text.length());
-        boolean space = true;
-        for (int i = 0; i < text.length(); i++) {
-            char c = Character.toLowerCase(text.charAt(i));
-            if (Character.isLetterOrDigit(c) || c == '\'') {
-                b.append(c);
-                space = false;
-            } else if (!space) {
-                b.append(' ');
-                space = true;
-            }
-        }
-        return b.toString().trim().toLowerCase(Locale.ROOT);
+        return CueWords.normalize(text);
     }
 
     static boolean namesHim(String norm) {
-        for (String word : norm.split(" ")) {
-            for (String name : NAMES) {
-                if (word.equals(name)) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        return namesHim(norm.split(" "));
+    }
+
+    /** words: the normalised text split on " ". */
+    static boolean namesHim(String[] words) {
+        return CueWords.hasWord(words, CueWords.NAMES);
     }
 
     static boolean isGreeting(String norm) {
-        int words = norm.split(" ").length;
-        if (words > GREETING_MAX_WORDS) {
+        return isGreeting(norm, norm.split(" ").length);
+    }
+
+    /** wordCount: how many words the normalised text split into. */
+    static boolean isGreeting(String norm, int wordCount) {
+        if (wordCount > GREETING_MAX_WORDS) {
             return false;
         }
         for (String g : GREETINGS) {
@@ -151,18 +136,11 @@ final class CueClassifier {
     }
 
     static boolean isSorry(String norm) {
-        for (String word : norm.split(" ")) {
-            for (String s : SORRY_WORDS) {
-                if (word.equals(s)) {
-                    return true;
-                }
-            }
-        }
-        for (String p : SORRY_PHRASES) {
-            if (norm.equals(p) || norm.startsWith(p + " ") || norm.endsWith(" " + p) || norm.contains(" " + p + " ")) {
-                return true;
-            }
-        }
-        return false;
+        return isSorry(norm, norm.split(" "));
+    }
+
+    /** words: the normalised text split on " ". */
+    static boolean isSorry(String norm, String[] words) {
+        return CueWords.hasWord(words, CueWords.SORRY_WORDS) || CueWords.hasPhrase(norm, CueWords.SORRY_PHRASES);
     }
 }

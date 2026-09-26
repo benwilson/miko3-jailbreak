@@ -644,8 +644,10 @@ final class ExploreBrain {
     private long meetDeadline;
     /** A new person's lines: the ask line was said, the no-reply line may be. */
     private CuriosityPort.MatchAnswer stranger;
+    /** A clock field's "never": far enough below any tick that now - NEVER cannot overflow. */
+    static final long NEVER = Long.MIN_VALUE / 4;
     /** When the camera last closed, for its reopen gap (tuning.reopenGapMs). */
-    private long cameraClosedAt = Long.MIN_VALUE / 4;
+    private long cameraClosedAt = NEVER;
 
     // ---- the camera while roaming (explore nav plan U4) ----
     /** The last look seen (by identity: a real frame arrived), and when the next must come by. */
@@ -654,7 +656,7 @@ final class ExploreBrain {
     /** The last look checked during the current leg for a blocked way ahead. */
     private Look legLook;
     /** When the last turn stopped: a look captured before that faced another way. */
-    private long headingSettledAt = Long.MIN_VALUE / 4;
+    private long headingSettledAt = NEVER;
     /** The next leg's forward ticks as the steer chose them (0: its bend is the whole move; -1: none). */
     private int plannedTicks = -1;
     /** Look-then-go (KTD7): in PAUSE, waiting for the leg decision's look, captured at or after legLookAfter. */
@@ -667,9 +669,9 @@ final class ExploreBrain {
     /** A timed orient shorter than this is already facing it. */
     private static final long MIN_ORIENT_MS = 50;
     /** A CPL hiccup's retry (cplRetryPauseMs): CPL again before this is a hazard. */
-    private long cplRetryUntil = Long.MIN_VALUE / 4;
+    private long cplRetryUntil = NEVER;
     /** The last mid-leg re-aim, and the last look it weighed (one decision per look). */
-    private long reaimedAt = Long.MIN_VALUE / 4;
+    private long reaimedAt = NEVER;
     private Look reaimLook;
     private long legLookAfter;
     private long legLookDeadline;
@@ -723,7 +725,7 @@ final class ExploreBrain {
      */
     private int failedLadders;
     /** When the last cornered rest ended (its first move after is the pinned check). */
-    private long restEndedAt = Long.MIN_VALUE / 4;
+    private long restEndedAt = NEVER;
     /** This rest is the still-pinned one: when it ends, the ladder, not the wider turn. */
     private boolean ladderAfterRest;
     private boolean ladderTurnBlocked;
@@ -804,14 +806,14 @@ final class ExploreBrain {
     private long metCheckAt;
     private CuriosityPort.Answer gatedPick;
     /** The next check may go at this time; a roaming person is cleared until metClearedUntil. */
-    private long metNextCheckAt = Long.MIN_VALUE / 4;
-    private long metClearedUntil = Long.MIN_VALUE / 4;
+    private long metNextCheckAt = NEVER;
+    private long metClearedUntil = NEVER;
 
     /** The newest reading, where a drive's counts start from. */
     private SensorReading lastReading;
     // ---- cues, the turn to the voice and the look that decides (meeting plan U7) ----
     /** When the last motor command went out (TimedMotor): the shove cue's blanking window. */
-    private long lastMotorCommandAt = Long.MIN_VALUE / 4;
+    private long lastMotorCommandAt = NEVER;
     /** Whether the launcher's ears session is open (follows the charger latch, KTD6). */
     private boolean earsOpen;
     /** The cue waiting for a state that can take it (KTD3's replacement rule), or null. */
@@ -834,8 +836,8 @@ final class ExploreBrain {
     private Ears.Trend latestTrend;
     private boolean trendSeenInStep;
     /** The last shove while stopped and the last collision stop while driving (KTD5): "sorry" within 2 s is strong. */
-    private long lastShoveAt = Long.MIN_VALUE / 4;
-    private long bumpAt = Long.MIN_VALUE / 4;
+    private long lastShoveAt = NEVER;
+    private long bumpAt = NEVER;
     /** A meeting entered from EYES_ONLY on the wake word (KTD8): the lease and sensor guards let it finish. */
     private boolean wheellessMeeting;
     /** The port's stand-in box for a person he cannot see (the wheelless meeting): straight ahead. */
@@ -849,7 +851,7 @@ final class ExploreBrain {
     /** The lease was lost during the conversation (KTD7): no wheels and no look until it ends. */
     private boolean chatNoWheels;
     /** When the sensors went unavailable during the conversation, or MIN while they are fine. */
-    private long chatStallSince = Long.MIN_VALUE / 4;
+    private long chatStallSince = NEVER;
     /** The detector is parked (CHAT states), and whether the conversation wants one look. */
     private boolean parked;
     private boolean chatLookWanted;
@@ -857,7 +859,7 @@ final class ExploreBrain {
     private Direction awayLeg;
     /** An unnamed conversation's side-and-time leave-alone (KTD10). */
     private Direction leaveAloneSide;
-    private long leaveAloneUntil = Long.MIN_VALUE / 4;
+    private long leaveAloneUntil = NEVER;
 
     ExploreBrain(ExploreTuning tuning, Clock clock, Motor motor, Eyes eyes, Sound sound, Random random) {
         this(tuning, clock, motor, eyes, sound, NO_CAMERA, random);
@@ -1066,14 +1068,14 @@ final class ExploreBrain {
                 enterEyesOnly("sensors unavailable: " + classifier.reason());
                 return;
             }
-            if (chatStallSince == Long.MIN_VALUE / 4) {
+            if (chatStallSince == NEVER) {
                 chatStallSince = now;
                 note("sensors unavailable during the conversation: " + tuning.chatStallGraceMs + " ms grace");
             } else if (now - chatStallSince >= tuning.chatStallGraceMs && chat != null) {
                 chat.endWithSignOff(now, "sensors unavailable for " + (now - chatStallSince) + " ms");
             }
         } else if (state.chats()) {
-            chatStallSince = Long.MIN_VALUE / 4;
+            chatStallSince = NEVER;
         }
         boolean hazard = s == HazardClassifier.Status.HAZARD;
         watchLooks(now);
@@ -2186,7 +2188,7 @@ final class ExploreBrain {
         chat = null;
         chatCueSide = null;
         chatNoWheels = false;
-        chatStallSince = Long.MIN_VALUE / 4;
+        chatStallSince = NEVER;
         chatLookWanted = false;
         syncPark();
     }
@@ -3150,7 +3152,7 @@ final class ExploreBrain {
         if (failedLadders > 0 && now - restEndedAt <= tuning.pinnedWindowMs) {
             // The first move after the rest is blocked too: still pinned. The ladder (and
             // its two Claude asks) waits out a longer rest instead of running again now.
-            restEndedAt = Long.MIN_VALUE / 4;
+            restEndedAt = NEVER;
             long rest = pinnedRestMs();
             note("still pinned after the rest: " + why + " (" + failedLadders + " failed escapes in a row); resting "
                     + rest + " ms before the next escape");
@@ -4214,7 +4216,7 @@ final class ExploreBrain {
             startMetCheck(now, look.jpeg, p);
             return false;
         }
-        metClearedUntil = Long.MIN_VALUE / 4;
+        metClearedUntil = NEVER;
         approachPerson(now, look, p);
         return true;
     }
@@ -4236,24 +4238,34 @@ final class ExploreBrain {
      * pick, so FACE, APPROACH (to the polite distance), MEET_LOOK and the meeting run
      * as for Claude's person pick at a stop. Started on a fresh reading (decide).
      */
+    /**
+     * Opens a Claude stop on one person: the held pick and the scan cleared, this
+     * look (when there is one) the only one scanned, and the person the pick.
+     */
+    private void beginPersonStop(long now, Look lookOrNull, Detection person) {
+        claudeStop = true;
+        heldPick = null;
+        scanned.clear();
+        scanHeadings.clear();
+        askedFrames.clear();
+        if (lookOrNull != null) {
+            scanned.add(lookOrNull);
+            scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
+            askedFrames.add(new CuriosityPort.Frame(0, lookOrNull.jpeg));
+        }
+        pick = CuriosityPort.Answer.pick(0, person, CuriosityPort.Kind.PERSON, null);
+        pickAt = now;
+        pickRecentred = false;
+        remarkOnly = false;
+    }
+
     private void approachPerson(long now, Look look, Detection p) {
         note("a person while roaming: going over to meet them");
         lookForLeg = false;
         hopNext = false;
         plannedTicks = -1;
         doorwayLeg = false;
-        claudeStop = true;
-        heldPick = null;
-        scanned.clear();
-        scanHeadings.clear();
-        askedFrames.clear();
-        scanned.add(look);
-        scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
-        askedFrames.add(new CuriosityPort.Frame(0, look.jpeg));
-        pick = CuriosityPort.Answer.pick(0, p, CuriosityPort.Kind.PERSON, null);
-        pickAt = now;
-        pickRecentred = false;
-        remarkOnly = false;
+        beginPersonStop(now, look, p);
         remember(p.label, CuriosityPort.Kind.PERSON, now);
         target = p;
         state = State.FACE;
@@ -4684,21 +4696,36 @@ final class ExploreBrain {
         }
     }
 
-    /** The look headings (KTD4): strong, that side, behind, the other side; weak, that side and the opposite. */
+    /**
+     * The look headings (KTD4): a strong cue cycles that side, behind, the other side
+     * for strongCueLooks looks; a weak cue that side and the opposite for weakCueLooks.
+     */
     private double[] lookPlan(double first, boolean strong) {
         double side = first;
+        double[] cycle;
         if (Math.abs(side) < 1) {
             // No side to go by: ahead, behind, then a quarter turn.
-            return strong ? new double[]{0, 180, 90} : new double[]{0, 180};
+            cycle = strong ? new double[]{0, 180, 90} : new double[]{0, 180};
+        } else {
+            double behind = side < 0 ? -180 : 180;
+            cycle = strong ? new double[]{side, behind, -side} : new double[]{side, -side};
         }
-        double behind = side < 0 ? -180 : 180;
-        return strong ? new double[]{side, behind, -side} : new double[]{side, -side};
+        int looks = strong ? tuning.strongCueLooks : tuning.weakCueLooks;
+        double[] plan = new double[looks];
+        for (int i = 0; i < looks; i++) {
+            plan[i] = cycle[i % cycle.length];
+        }
+        return plan;
     }
 
     /** One bounded step of the first turn: at most cueTurnStepDeg, after leadMs, on a fresh reading (LEAD). */
     private void startCueTurnStep(long now, long leadMs) {
-        double deg = Math.min(searchRemainingDeg, tuning.cueTurnStepDeg);
-        heading = searchTurnLeft ? Direction.LEFT : Direction.RIGHT;
+        startCueTurn(now, Math.min(searchRemainingDeg, tuning.cueTurnStepDeg), searchTurnLeft, leadMs);
+    }
+
+    /** One turn of the search: deg to the left or the right, after leadMs, on a fresh reading (LEAD). */
+    private void startCueTurn(long now, double deg, boolean left, long leadMs) {
+        heading = left ? Direction.LEFT : Direction.RIGHT;
         turnDeg = deg;
         turnMs = timedMs(deg);
         trendSeenInStep = false;
@@ -4809,18 +4836,7 @@ final class ExploreBrain {
         chatCueSide = c == null ? null : sideOf(c);
         searchCue = null;
         searchPlan = null;
-        claudeStop = true;
-        heldPick = null;
-        scanned.clear();
-        scanHeadings.clear();
-        askedFrames.clear();
-        scanned.add(look);
-        scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
-        askedFrames.add(new CuriosityPort.Frame(0, look.jpeg));
-        pick = CuriosityPort.Answer.pick(0, face, CuriosityPort.Kind.PERSON, null);
-        pickAt = now;
-        pickRecentred = false;
-        remarkOnly = false;
+        beginPersonStop(now, look, face);
         target = face;
         remember(face.label, CuriosityPort.Kind.PERSON, now);
         if (!port.canAsk()) {
@@ -4855,12 +4871,7 @@ final class ExploreBrain {
         searchTurnLeft = delta < 0;
         note("nobody facing him here: turning " + (searchTurnLeft ? "left" : "right") + " " + Math.round(Math.abs(delta))
                 + " deg for the next look");
-        heading = searchTurnLeft ? Direction.LEFT : Direction.RIGHT;
-        turnDeg = Math.abs(delta);
-        turnMs = timedMs(turnDeg);
-        step = Step.LEAD;
-        phaseUntil = now;
-        show(EyeState.LOOK, heading);
+        startCueTurn(now, Math.abs(delta), searchTurnLeft, 0);
     }
 
     /** Nothing found (R3): back to wandering, nothing remembered, nothing sent. */
@@ -4888,15 +4899,7 @@ final class ExploreBrain {
         }
         chatCueSide = sideOf(c);
         wheellessMeeting = true;
-        claudeStop = true;
-        heldPick = null;
-        scanned.clear();
-        scanHeadings.clear();
-        askedFrames.clear();
-        pick = CuriosityPort.Answer.pick(0, UNSEEN_PERSON, CuriosityPort.Kind.PERSON, null);
-        pickAt = now;
-        pickRecentred = false;
-        remarkOnly = false;
+        beginPersonStop(now, null, UNSEEN_PERSON);
         target = null;
         state = State.MEET;
         meetingHeld = true;
@@ -4930,12 +4933,12 @@ final class ExploreBrain {
         boolean faceless = wheellessMeeting || a.faceless;
         chatSide = chatCueSide != null ? chatCueSide : sideOfPick();
         chatNoWheels = !leaseHeld;
-        chatStallSince = Long.MIN_VALUE / 4;
+        chatStallSince = NEVER;
         if (a.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
             port.touch();
         }
         note("the meeting becomes a conversation" + (faceless ? " with nobody in view" : "") + " (" + a.status + ")");
-        chat = new ChatSession(tuning, port, ears, chatHost);
+        chat = new ChatSession(tuning, port, chatHost);
         state = State.CHAT_THINK;
         syncPark();
         chat.start(now, a, faceless);
@@ -5142,7 +5145,7 @@ final class ExploreBrain {
         chat = null;
         chatCueSide = null;
         chatNoWheels = false;
-        chatStallSince = Long.MIN_VALUE / 4;
+        chatStallSince = NEVER;
         chatLookWanted = false;
         awayLeg = null;
         if (state != State.EYES_ONLY || shownState == null) {

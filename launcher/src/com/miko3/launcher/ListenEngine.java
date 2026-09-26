@@ -2,13 +2,11 @@ package com.miko3.launcher;
 
 import android.Manifest;
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
-import android.os.IBinder;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
@@ -39,7 +37,6 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -82,9 +79,6 @@ final class ListenEngine implements ListenSession.Ears {
     /** KTD2: at the asset root, outside the staged model directory. */
     private static final String HOTWORDS_ASSET = "hotwords.txt";
     private static final String WAKE_MODEL_ASSET = "miko_wakeword_model.tflite";
-    /** KTD11: the Settings page's "answers when spoken to" switch, in the
-     * launcher's preferences file (ClaudeSettings.PREFS_NAME); absent means on. */
-    static final String PREF_ANSWERS_WHEN_SPOKEN_TO = "answers_when_spoken_to";
     /** How long a listen waits for the robot to finish speaking. */
     static final long IDLE_TIMEOUT_MS = 20000;
     /** KTD2: threads and active paths for the one recogniser. */
@@ -137,7 +131,7 @@ final class ListenEngine implements ListenSession.Ears {
         };
     }
 
-    ListenEngine(Context context, final SpeechQueue speech) {
+    ListenEngine(Context context, final SpeechQueue speech, final ClaudeSettings settings) {
         this.context = context.getApplicationContext();
         this.session = new ListenSession(new ListenSession.Idle() {
             @Override
@@ -151,6 +145,14 @@ final class ListenEngine implements ListenSession.Ears {
                 return SpeechEngine.systemProperty(key);
             }
         });
+        // KTD11: the Settings page's "answers when spoken to" switch, read through
+        // the launcher's settings (its one parser of the stored value) at classify time.
+        CueClassifier.Switch earsSwitch = new CueClassifier.Switch() {
+            @Override
+            public boolean answersWhenSpokenTo() {
+                return settings.conversation().answersWhenSpokenTo;
+            }
+        };
         this.ears = new EarsSession(new EarsSession.Clock() {
             @Override
             public long nowMs() {
@@ -226,35 +228,7 @@ final class ListenEngine implements ListenSession.Ears {
     /** Opens the ears session for uid, delivering to callback until its binder
      * dies, it closes, or it misses three renews (EarsSession). */
     void openEars(int uid, final RobotEars.Callback callback, boolean chargerLatched) {
-        final IBinder binder = callback.asBinder();
-        LeaseKeeper.Token token = new LeaseKeeper.Token() {
-            private IBinder.DeathRecipient recipient;
-
-            @Override
-            public void linkToDeath(final Runnable onDeath) throws RemoteException {
-                IBinder.DeathRecipient r = new IBinder.DeathRecipient() {
-                    @Override
-                    public void binderDied() {
-                        onDeath.run();
-                    }
-                };
-                binder.linkToDeath(r, 0);
-                recipient = r;
-            }
-
-            @Override
-            public void unlinkToDeath(Runnable onDeath) {
-                if (recipient == null) {
-                    return;
-                }
-                try {
-                    binder.unlinkToDeath(recipient, 0);
-                } catch (java.util.NoSuchElementException ignored) {
-                    // Already unlinked.
-                }
-                recipient = null;
-            }
-        };
+        LeaseKeeper.Token token = new BinderToken(callback.asBinder());
         EarsSession.Client client = new EarsSession.Client() {
             @Override
             public void heard(final EarsSession.Utterance u) {
@@ -719,24 +693,6 @@ final class ListenEngine implements ListenSession.Ears {
                     sampler.stop();
                 }
             };
-        }
-    };
-
-    /** KTD11: read from the launcher's preferences at classify time. */
-    private final CueClassifier.Switch earsSwitch = new CueClassifier.Switch() {
-        @Override
-        public boolean answersWhenSpokenTo() {
-            SharedPreferences prefs = context.getSharedPreferences(ClaudeSettings.PREFS_NAME, Context.MODE_PRIVATE);
-            Map<String, ?> all = prefs.getAll();
-            Object v = all == null ? null : all.get(PREF_ANSWERS_WHEN_SPOKEN_TO);
-            if (v instanceof Boolean) {
-                return (Boolean) v;
-            }
-            if (v instanceof String) {
-                String s = ((String) v).trim();
-                return !(s.equalsIgnoreCase("false") || s.equals("0") || s.equalsIgnoreCase("off"));
-            }
-            return true;
         }
     };
 

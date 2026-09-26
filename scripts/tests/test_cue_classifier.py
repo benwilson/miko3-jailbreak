@@ -3,9 +3,9 @@ R5, KTD3, KTD11).
 
 The plain-Java CueClassifier (tiers for the wake word, name forms, greetings,
 shove-plus-sorry timing, the "answers when spoken to" switch, and the side of a
-direction angle) runs under a JVM harness; source checks keep it free of
-android.* and of any logging at all, since it is the one class that sees every
-utterance's words.
+direction angle) runs under a JVM harness; source checks keep it and the shared
+CueWords (the name and apology vocabulary and the normalisation) free of
+android.* and of any logging at all, since they see every utterance's words.
 """
 import re
 import subprocess
@@ -23,6 +23,7 @@ REPO = Path(__file__).resolve().parents[2]
 LAUNCHER_SRC = REPO / "launcher" / "src"
 SHARED_SRC = REPO / "shared" / "src"
 CLASSIFIER = LAUNCHER_SRC / "com" / "miko3" / "launcher" / "CueClassifier.java"
+WORDS = SHARED_SRC / "com" / "miko3" / "shared" / "CueWords.java"
 HOTWORDS = REPO / "launcher" / "assets" / "hotwords.txt"
 HARNESS = TESTS / "fixtures" / "cue_classifier_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "launcher" / "CueClassifierHarness.java"
@@ -89,15 +90,19 @@ class ClassifierSourceTest(unittest.TestCase):
     def setUpClass(cls):
         cls.raw = CLASSIFIER.read_text() if CLASSIFIER.exists() else ""
         cls.src = _strip_comments(cls.raw)
+        cls.words_raw = WORDS.read_text() if WORDS.exists() else ""
 
     def test_is_plain_java(self):
         self.assertTrue(self.raw, "CueClassifier.java missing")
-        self.assertEqual([ln for ln in self.raw.splitlines() if ln.startswith("import android")], [])
+        self.assertTrue(self.words_raw, "CueWords.java missing")
+        for raw in (self.raw, self.words_raw):
+            self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
 
     def test_never_logs_anything(self):
-        """It sees every utterance's words, so it has no log line at all (KTD1: counters, never words)."""
-        for needle in ("Log.", "System.out", "System.err", "printStackTrace"):
-            self.assertNotIn(needle, self.src)
+        """They see every utterance's words, so they have no log line at all (KTD1: counters, never words)."""
+        for src in (self.src, _strip_comments(self.words_raw)):
+            for needle in ("Log.", "System.out", "System.err", "printStackTrace"):
+                self.assertNotIn(needle, src)
 
     def test_shove_window_is_the_plans_two_seconds(self):
         self.assertRegex(self.src, r"SORRY_WINDOW_MS\s*=\s*2000")
@@ -125,9 +130,11 @@ class HotwordsFileTest(unittest.TestCase):
             self.assertEqual(ln, ln.upper(), ln)
 
     def test_every_hotword_name_form_is_one_the_classifier_knows(self):
-        src = _strip_comments(CLASSIFIER.read_text()) if CLASSIFIER.exists() else ""
+        # The classifier matches names against the shared CueWords.NAMES.
+        src = _strip_comments(WORDS.read_text()) if WORDS.exists() else ""
         names = re.search(r"NAMES\s*=\s*\{([^}]*)\}", src)
-        self.assertIsNotNone(names, "CueClassifier declares no NAMES")
+        self.assertIsNotNone(names, "CueWords declares no NAMES")
+        self.assertIn("CueWords.NAMES", _strip_comments(CLASSIFIER.read_text()))
         known = set(re.findall(r'"([^"]+)"', names.group(1)))
         for phrase in ("miko", "mika", "mikey"):
             self.assertIn(phrase, known)

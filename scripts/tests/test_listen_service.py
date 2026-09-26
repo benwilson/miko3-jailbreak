@@ -343,8 +343,9 @@ class EngineWiringTest(unittest.TestCase):
                        "VoiceDirection.open()", ".sample(EarsSession.DIRECTION_PERIOD_MS)", "setSpeaking(",
                        "new EarsSession("):
             self.assertIn(needle, self.src)
-        # The switch (KTD11) is read from the launcher's preferences at classify time.
-        self.assertIn("answers_when_spoken_to", self.src)
+        # The switch (KTD11) is read at classify time through ClaudeSettings, the
+        # launcher's one parser of the stored value.
+        self.assertIn("conversation().answersWhenSpokenTo", self.src)
 
     def test_no_logging_of_secrets(self):
         for path in (SERVICE, ENGINE, SESSION, INTERFACE, CLIENT):

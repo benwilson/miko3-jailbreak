@@ -6,7 +6,6 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
-import android.os.RemoteException;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -86,34 +85,7 @@ public class DriveLeaseService extends Service {
                 return false;
             }
             boolean fresh = keeper.holder() == null;
-            boolean got = keeper.acquire(clientId, new LeaseKeeper.Token() {
-                private IBinder.DeathRecipient recipient;
-
-                @Override
-                public void linkToDeath(final Runnable onDeath) throws RemoteException {
-                    IBinder.DeathRecipient r = new IBinder.DeathRecipient() {
-                        @Override
-                        public void binderDied() {
-                            onDeath.run();
-                        }
-                    };
-                    deathToken.linkToDeath(r, 0);
-                    recipient = r;
-                }
-
-                @Override
-                public void unlinkToDeath(Runnable onDeath) {
-                    if (recipient == null) {
-                        return;
-                    }
-                    try {
-                        deathToken.unlinkToDeath(recipient, 0);
-                    } catch (java.util.NoSuchElementException ignored) {
-                        // already unlinked (e.g. binderDied fired concurrently)
-                    }
-                    recipient = null;
-                }
-            }, SystemClock.elapsedRealtime());
+            boolean got = keeper.acquire(clientId, new BinderToken(deathToken), SystemClock.elapsedRealtime());
             if (got && fresh) {
                 Log.i(TAG, "lease acquired by '" + clientId + "'");
             }

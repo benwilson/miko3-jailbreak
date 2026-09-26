@@ -233,7 +233,7 @@ public class LauncherApp extends Application {
         speech.start();
         // The robot's ears (explore-on-claude plan U3): the recognizer loads on
         // the listen thread; each listen waits for the speech queue to go idle.
-        listen = new ListenEngine(this, speech.queue());
+        listen = new ListenEngine(this, speech.queue(), claudeSettings);
         listen.start();
         wifi = new WifiHttpHandler(this);
         startServer();

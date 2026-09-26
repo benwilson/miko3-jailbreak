@@ -148,42 +148,45 @@ public final class RobotEarsClient {
 
     /** A conversation listen for up to maxMs (KTD1); the reply arrives through onHeard. */
     public void listen(final long maxMs) {
-        post(new Runnable() {
+        send("listen failed: ", new Op() {
             @Override
-            public void run() {
-                RobotEars s = serviceOrNull();
-                if (s == null) {
-                    return;
-                }
-                try {
-                    s.listen(maxMs);
-                } catch (RemoteException | RuntimeException e) {
-                    lostCurrent("listen failed: " + e.getClass().getSimpleName());
-                }
+            public void run(RobotEars s) throws RemoteException {
+                s.listen(maxMs);
             }
         });
     }
 
     /** Opens the launcher's deaf window for durationMs before a local clip plays. */
     public void clipWindow(final long durationMs) {
-        post(new Runnable() {
+        send("clip window failed: ", new Op() {
             @Override
-            public void run() {
-                RobotEars s = serviceOrNull();
-                if (s == null) {
-                    return;
-                }
-                try {
-                    s.clipWindow(durationMs);
-                } catch (RemoteException | RuntimeException e) {
-                    lostCurrent("clip window failed: " + e.getClass().getSimpleName());
-                }
+            public void run(RobotEars s) throws RemoteException {
+                s.clipWindow(durationMs);
             }
         });
     }
 
     /** A shove or a collision stop at atElapsedMs (SystemClock.elapsedRealtime), for the classifier. */
     public void shoved(final long atElapsedMs) {
+        send("shove failed: ", new Op() {
+            @Override
+            public void run(RobotEars s) throws RemoteException {
+                s.shoved(atElapsedMs);
+            }
+        });
+    }
+
+    /** One call on the connected RobotEars. */
+    private interface Op {
+        void run(RobotEars s) throws RemoteException;
+    }
+
+    /**
+     * Runs op on the worker against the connected service, or does nothing
+     * when there isn't one; a failure loses the current session labelled
+     * what + the exception's class name.
+     */
+    private void send(final String what, final Op op) {
         post(new Runnable() {
             @Override
             public void run() {
@@ -192,9 +195,9 @@ public final class RobotEarsClient {
                     return;
                 }
                 try {
-                    s.shoved(atElapsedMs);
+                    op.run(s);
                 } catch (RemoteException | RuntimeException e) {
-                    lostCurrent("shove failed: " + e.getClass().getSimpleName());
+                    lostCurrent(what + e.getClass().getSimpleName());
                 }
             }
         });

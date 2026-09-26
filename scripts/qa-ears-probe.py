@@ -334,6 +334,10 @@ class CpuSampler:
     per-second rows. pidof is re-read each sample: a mode may restart mid-session."""
 
     PACKAGES = (LAUNCHER_PACKAGE, EXPLORE_PACKAGE)
+    # One adb round trip per sample (Wi-Fi adb costs 100-300 ms a spawn): for each package
+    # a "<package> <pid>" line, then that pid's stat line when it has one.
+    STAT_SCRIPT = (f"for p in {' '.join(PACKAGES)}; do set -- $(pidof $p); echo \"$p $1\"; "
+                   '[ -n "$1" ] && cat /proc/$1/stat; done')
 
     def __init__(self, robot, period_s=CPU_SAMPLE_S, clock=time.monotonic):
         self.robot, self.period_s, self.clock = robot, period_s, clock
@@ -350,11 +354,18 @@ class CpuSampler:
         return self._clk_tck
 
     def snapshot(self):
-        sample = {}
-        for pkg in self.PACKAGES:
-            pid = self.robot.adb("shell", "pidof", pkg, check=False).split()
-            sample[pkg] = parse_proc_stat(self.robot.adb("shell", "cat", f"/proc/{pid[0]}/stat", check=False)) \
-                if pid and pid[0].isdigit() else None
+        """{package: ProcSample or None} from one run of STAT_SCRIPT."""
+        sample = {pkg: None for pkg in self.PACKAGES}
+        awaiting_stat = None
+        for line in self.robot.adb("shell", self.STAT_SCRIPT, check=False).splitlines():
+            head = line.split(None, 1)
+            if head and head[0] in self.PACKAGES:
+                # A "<package> <pid>" line; a stat line never starts with a package name.
+                pid = head[1].strip() if len(head) > 1 else ""
+                awaiting_stat = head[0] if pid.isdigit() else None
+            elif awaiting_stat is not None:
+                sample[awaiting_stat] = parse_proc_stat(line)
+                awaiting_stat = None
         return sample
 
     def _run(self):

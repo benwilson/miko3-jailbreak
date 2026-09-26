@@ -1264,8 +1264,7 @@ public final class SettingsPageHarness {
         scenario("conversation_section_shows_stored_persona_escaped_and_never_the_key", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = withKey();
-                f.settings.savePersona("<script>alert(1)</script> & \"quotes\"\nline two");
-                f.settings.setAnswersWhenSpokenTo(false);
+                f.settings.saveConversation("<script>alert(1)</script> & \"quotes\"\nline two", false);
                 String html = get(f);
                 String box = textarea(section(html, "conversation"), "persona");
                 check(n, box.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;\nline two")
@@ -1313,7 +1312,7 @@ public final class SettingsPageHarness {
         scenario("conversation_save_over_cap_refused_and_unchanged", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
-                f.settings.savePersona("Keep me.");
+                f.settings.saveConversation("Keep me.", true);
                 Resp r = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
                         "t=" + token(f) + "&persona=" + repeat('x', ConversationSettings.MAX_PERSONA_CHARS + 1)
                                 + "&answers=on");
@@ -1327,7 +1326,7 @@ public final class SettingsPageHarness {
         scenario("conversation_save_blank_resets_to_default", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
-                f.settings.savePersona("Custom.");
+                f.settings.saveConversation("Custom.", true);
                 Resp r = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
                         "t=" + token(f) + "&persona=" + enc("  \r\n ") + "&answers=on");
                 ConversationSettings c = f.settings.conversation();

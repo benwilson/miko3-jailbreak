@@ -7155,16 +7155,15 @@ public final class ExploreBrainHarness {
                             + t.turnBudgetMs + " " + t.turnRetryMs + " " + t.sentenceCap + " " + t.transcriptWindow
                             + " " + t.deafTailMs);
         });
-        scenario("chat_session_skeleton_has_the_six_states_and_no_behaviour", n -> {
+        scenario("chat_session_starts_thinking_with_the_four_chat_states_and_no_behaviour", n -> {
             ExploreTuning t = tuning().build();
-            ChatSession s = new ChatSession(t, CuriosityPort.NONE, Ears.NONE, ChatSession.State.CUE_TURN);
+            ChatSession s = new ChatSession(t, CuriosityPort.NONE, null);
             ChatSession.State[] states = ChatSession.State.values();
-            boolean named = states.length == 6 && states[0] == ChatSession.State.CUE_TURN
-                    && states[1] == ChatSession.State.CUE_LOOK && states[2] == ChatSession.State.CHAT_THINK
-                    && states[3] == ChatSession.State.CHAT_SPEAK && states[4] == ChatSession.State.CHAT_LISTEN
-                    && states[5] == ChatSession.State.CHAT_NOTES;
-            check(n, named && s.state() == ChatSession.State.CUE_TURN && s.tuning() == t && s.port() == CuriosityPort.NONE
-                            && s.ears() == Ears.NONE && !Ears.NONE.present() && !Ears.NONE.listening()
+            boolean named = states.length == 4 && states[0] == ChatSession.State.CHAT_THINK
+                    && states[1] == ChatSession.State.CHAT_SPEAK && states[2] == ChatSession.State.CHAT_LISTEN
+                    && states[3] == ChatSession.State.CHAT_NOTES;
+            check(n, named && s.state() == ChatSession.State.CHAT_THINK && !s.finished() && !s.signedOff()
+                            && !Ears.NONE.present() && !Ears.NONE.listening()
                             && Ears.NONE.drain().isEmpty() && Ears.NONE.trend() == null && Ears.NONE.shove() == null
                             && CuriosityPort.NONE.turnAnswer().status == CuriosityPort.Turn.Status.FAILED
                             && CuriosityPort.NONE.notesDeltaAnswer() == CuriosityPort.Done.FAILED

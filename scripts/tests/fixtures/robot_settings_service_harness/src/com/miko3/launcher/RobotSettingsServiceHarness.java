@@ -263,8 +263,7 @@ public final class RobotSettingsServiceHarness {
         scenario("conversation_answer_carries_persona_and_switch", new Scenario() {
             public void run(String n) throws Exception {
                 ClaudeSettings settings = newSettings();
-                settings.savePersona("Edgy but kind.");
-                settings.setAnswersWhenSpokenTo(false);
+                settings.saveConversation("Edgy but kind.", false);
                 ConversationSettings c = conversation(settings);
                 check(n, "Edgy but kind.".equals(c.persona) && c.personaSet && !c.answersWhenSpokenTo, "got=" + c);
             }
@@ -282,9 +281,9 @@ public final class RobotSettingsServiceHarness {
         scenario("conversation_edit_shows_on_next_call", new Scenario() {
             public void run(String n) throws Exception {
                 ClaudeSettings settings = newSettings();
-                settings.savePersona("First.");
+                settings.saveConversation("First.", true);
                 String first = conversation(settings).persona;
-                settings.savePersona("Second.");
+                settings.saveConversation("Second.", true);
                 check(n, "First.".equals(first) && "Second.".equals(conversation(settings).persona),
                         "first=" + first + " second=" + conversation(settings).persona);
             }

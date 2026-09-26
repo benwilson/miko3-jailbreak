@@ -6,6 +6,11 @@ import com.example.conexantapi.NCDsp;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The direction a voice comes from, read in our own process from the vendor's
@@ -145,39 +150,43 @@ public final class VoiceDirection {
         return n % 2 == 1 ? sorted.get(n / 2) : (sorted.get(n / 2 - 1) + sorted.get(n / 2)) / 2;
     }
 
+    /** The one daemon thread every Sampler reads on; an ears session starts a
+     * Sampler per utterance, so each one must not cost a thread. */
+    private static final ScheduledExecutorService SCHEDULER = Executors.newSingleThreadScheduledExecutor(
+            new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "voice-direction");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+
     /** A running angle sampler; readings that failed are kept as null so a
      * drain says how often the backend answered. */
-    public static final class Sampler implements Runnable {
+    public static final class Sampler {
         /** Readings kept between drains; a stuck caller never grows this without bound. */
         static final int CAP = 600;
 
         private final VoiceDirection source;
-        private final long periodMs;
         private final List<Float> samples = new ArrayList<Float>();
-        private final Thread thread;
-        private volatile boolean running = true;
+        private final ScheduledFuture<?> ticks;
 
         Sampler(VoiceDirection source, long periodMs) {
             this.source = source;
-            this.periodMs = periodMs;
-            thread = new Thread(this, "voice-direction");
-            thread.setDaemon(true);
-            thread.start();
+            ticks = SCHEDULER.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    sampleOnce();
+                }
+            }, 0, periodMs, TimeUnit.MILLISECONDS);
         }
 
-        @Override
-        public void run() {
-            while (running) {
-                Float a = source.angle();
-                synchronized (samples) {
-                    if (samples.size() < CAP) {
-                        samples.add(a);
-                    }
-                }
-                try {
-                    Thread.sleep(periodMs);
-                } catch (InterruptedException e) {
-                    return;
+        private void sampleOnce() {
+            Float a = source.angle();
+            synchronized (samples) {
+                if (samples.size() < CAP) {
+                    samples.add(a);
                 }
             }
         }
@@ -191,9 +200,9 @@ public final class VoiceDirection {
             }
         }
 
+        /** Stops the readings; one already under way finishes and is kept for the next drain. */
         public void stop() {
-            running = false;
-            thread.interrupt();
+            ticks.cancel(false);
         }
     }
 }

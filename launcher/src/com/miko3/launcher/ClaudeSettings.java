@@ -219,21 +219,13 @@ final class ClaudeSettings {
     }
 
     /**
-     * Stores the persona box (KTD11, R20): CRLF becomes LF, surrounding
-     * whitespace goes, and a blank box stores "" (unset, so the default is
-     * used). Text over ConversationSettings.MAX_PERSONA_CHARS is refused with
-     * a fixed message and nothing is stored.
+     * The Conversation form's save (KTD11, R5, R20): the persona box and the
+     * "answers when spoken to" switch in one commit, or neither. The persona's
+     * CRLF becomes LF, surrounding whitespace goes, and a blank box stores ""
+     * (unset, so the default is used). Text over
+     * ConversationSettings.MAX_PERSONA_CHARS is refused with a fixed message
+     * and nothing is stored.
      */
-    synchronized void savePersona(String text) throws InvalidException {
-        store.putStrings(Collections.singletonMap(KEY_PERSONA, checkPersona(text)));
-    }
-
-    /** The "answers when spoken to" switch (R5). */
-    synchronized void setAnswersWhenSpokenTo(boolean on) {
-        store.putStrings(Collections.singletonMap(KEY_ANSWERS_WHEN_SPOKEN_TO, on ? "1" : "0"));
-    }
-
-    /** The Conversation form's save: both values in one commit, or neither. */
     synchronized void saveConversation(String personaText, boolean answersWhenSpokenTo) throws InvalidException {
         Map<String, String> entries = new HashMap<String, String>();
         entries.put(KEY_PERSONA, checkPersona(personaText));

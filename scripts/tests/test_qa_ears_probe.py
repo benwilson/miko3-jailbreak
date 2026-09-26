@@ -322,9 +322,9 @@ class ProcStatTest(unittest.TestCase):
 
     def test_cpu_sampler_reads_pids_and_stats_over_adb(self):
         robot = FakeRobot()
-        answers = {("shell", "pidof", qa.LAUNCHER_PACKAGE): "2249\n",
-                   ("shell", "pidof", qa.EXPLORE_PACKAGE): "\n",
-                   ("shell", "cat", "/proc/2249/stat"): PROC_STAT_A + "\n",
+        # One shell round trip per sample: "<package> <pid>" then its stat line, per package.
+        answers = {("shell", qa.CpuSampler.STAT_SCRIPT):
+                   f"{qa.LAUNCHER_PACKAGE} 2249\n{PROC_STAT_A}\n{qa.EXPLORE_PACKAGE} \n",
                    ("shell", "getconf", "CLK_TCK"): "100\n"}
 
         def adb(*args, check=True):
@@ -336,7 +336,21 @@ class ProcStatTest(unittest.TestCase):
         snap = sampler.snapshot()
         self.assertEqual(snap[qa.LAUNCHER_PACKAGE].ticks, 1500)
         self.assertIsNone(snap[qa.EXPLORE_PACKAGE])
+        self.assertEqual(len(robot.calls), 1, "one adb round trip per sample")
         self.assertEqual(sampler.clk_tck, 100)
+        self.assertIn("pidof", qa.CpuSampler.STAT_SCRIPT)
+        for pkg in qa.CpuSampler.PACKAGES:
+            self.assertIn(pkg, qa.CpuSampler.STAT_SCRIPT)
+
+    def test_cpu_sampler_reads_a_restarted_or_missing_process(self):
+        robot = FakeRobot()
+        # Explore has come back under a new pid; the launcher's stat is garbage this second.
+        robot.adb = lambda *args, check=True: (
+            f"{qa.LAUNCHER_PACKAGE} 2249\nNo such file or directory\n{qa.EXPLORE_PACKAGE} 3000\n{PROC_STAT_B}\n"
+            if args[0] == "shell" and args[1] == qa.CpuSampler.STAT_SCRIPT else "")
+        snap = qa.CpuSampler(robot).snapshot()
+        self.assertIsNone(snap[qa.LAUNCHER_PACKAGE])
+        self.assertEqual(snap[qa.EXPLORE_PACKAGE].ticks, qa.parse_proc_stat(PROC_STAT_B).ticks)
 
 
 class CpuRowsTest(unittest.TestCase):

@@ -43,7 +43,7 @@ public class ListenService extends Service {
                 throw new IllegalArgumentException("no callback");
             }
             final int uid = Binder.getCallingUid();
-            ListenEngine engine = ears();
+            ListenEngine engine = engine();
             try {
                 engine.refuseOneShot();
                 engine.session().claim();
@@ -86,7 +86,7 @@ public class ListenService extends Service {
             }
             int uid = Binder.getCallingUid();
             try {
-                ears().openEars(uid, callback, chargerLatched);
+                engine().openEars(uid, callback, chargerLatched);
             } catch (IllegalStateException e) {
                 Log.i(TAG, "uid " + uid + " ears refused: " + e.getMessage());
                 throw e;
@@ -98,14 +98,14 @@ public class ListenService extends Service {
         public boolean renew(boolean chargerLatched) {
             enforceCaller();
             int uid = Binder.getCallingUid();
-            return ears().ears().renew(String.valueOf(uid), chargerLatched);
+            return engine().ears().renew(String.valueOf(uid), chargerLatched);
         }
 
         @Override
         public void close() {
             enforceCaller();
             int uid = Binder.getCallingUid();
-            if (ears().ears().close(String.valueOf(uid))) {
+            if (engine().ears().close(String.valueOf(uid))) {
                 Log.i(TAG, "uid " + uid + " closed the ears");
             }
         }
@@ -114,7 +114,7 @@ public class ListenService extends Service {
         public void listen(long maxMs) {
             enforceCaller();
             int uid = Binder.getCallingUid();
-            boolean ok = ears().ears().listen(String.valueOf(uid), maxMs);
+            boolean ok = engine().ears().listen(String.valueOf(uid), maxMs);
             Log.i(TAG, "uid " + uid + " conversation listen " + (ok ? "for up to " + ListenSession.clampCap(maxMs)
                     + " ms" : "refused"));
         }
@@ -123,14 +123,14 @@ public class ListenService extends Service {
         public void clipWindow(long durationMs) {
             enforceCaller();
             int uid = Binder.getCallingUid();
-            ears().ears().clipWindow(String.valueOf(uid), durationMs);
+            engine().ears().clipWindow(String.valueOf(uid), durationMs);
         }
 
         @Override
         public void shoved(long atElapsedMs) {
             enforceCaller();
             int uid = Binder.getCallingUid();
-            ears().ears().shoved(String.valueOf(uid), atElapsedMs);
+            engine().ears().shoved(String.valueOf(uid), atElapsedMs);
         }
     };
 
@@ -142,7 +142,7 @@ public class ListenService extends Service {
         return binder;
     }
 
-    private ListenEngine ears() {
+    private ListenEngine engine() {
         return ((LauncherApp) getApplication()).listen();
     }
 

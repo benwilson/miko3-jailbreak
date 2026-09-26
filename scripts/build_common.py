@@ -256,7 +256,7 @@ def build_id(repo=None):
     tree is dirty. Two builds from the same tree get the same id, so a QA script can
     tell whether the launcher and a mode came from one build by comparing their
     version names. Without git (or a commit) it is a UTC timestamp, still an id."""
-    root = Path(repo) if repo is not None else Path(__file__).resolve().parent.parent
+    root = Path(repo) if repo is not None else REPO
 
     def git(*args):
         r = subprocess.run(["git", *args], cwd=str(root), capture_output=True)

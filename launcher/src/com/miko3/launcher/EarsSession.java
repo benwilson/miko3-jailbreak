@@ -284,11 +284,15 @@ final class EarsSession {
             diag.log("clip window refused from uid " + holder);
             return false;
         }
-        long until = clock.nowMs() + Math.max(0, durationMs) + deafTailMs;
+        extendDeaf(clock.nowMs() + Math.max(0, durationMs) + deafTailMs);
+        return true;
+    }
+
+    /** Raises the deaf window to until; an earlier until never shortens it. */
+    private void extendDeaf(long until) {
         if (until > deafUntil) {
             deafUntil = until;
         }
-        return true;
     }
 
     /** The brain's shove or collision stamp (KTD3, KTD5), for the classifier. */
@@ -352,10 +356,7 @@ final class EarsSession {
 
     /** Nothing plays or waits any more: deaf for the tail, then a stream reset. */
     void playbackIdle() {
-        long until = clock.nowMs() + deafTailMs;
-        if (until > deafUntil) {
-            deafUntil = until;
-        }
+        extendDeaf(clock.nowMs() + deafTailMs);
         lineOpen = false;
     }
 

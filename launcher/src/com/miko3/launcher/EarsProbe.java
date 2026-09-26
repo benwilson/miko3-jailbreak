@@ -4,12 +4,12 @@ import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.Json;
 import com.miko3.shared.PageToken;
+import com.miko3.shared.VoiceDirection;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -211,7 +211,7 @@ final class EarsProbe {
             Set<String> heard = words(text);
             boolean matched = !phrase.isEmpty() && heard.containsAll(phrase);
             int rms = samples == 0 ? 0 : (int) Math.round(Math.sqrt(sumSquares / samples) * 32768);
-            rows.add(new Row(++second, median(direction.drain()), rms, decodeNs / 1000000L,
+            rows.add(new Row(++second, VoiceDirection.median(direction.drain()), rms, decodeNs / 1000000L,
                     decodeMaxNs / 1000000L, chunks, heard.isEmpty() ? 0 : wordCount(text), matched));
             sumSquares = 0;
             samples = 0;
@@ -340,22 +340,5 @@ final class EarsProbe {
             }
         }
         return n;
-    }
-
-    /** The median of the non-null values, or null with none. */
-    static Float median(List<Float> values) {
-        List<Float> sorted = new ArrayList<Float>();
-        for (Float v : values) {
-            if (v != null && !v.isNaN()) {
-                sorted.add(v);
-            }
-        }
-        if (sorted.isEmpty()) {
-            return null;
-        }
-        Float[] a = sorted.toArray(new Float[0]);
-        Arrays.sort(a);
-        int n = a.length;
-        return n % 2 == 1 ? a[n / 2] : (a[n / 2 - 1] + a[n / 2]) / 2;
     }
 }

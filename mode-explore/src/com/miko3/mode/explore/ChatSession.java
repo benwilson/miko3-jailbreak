@@ -10,7 +10,7 @@ import java.util.Set;
  * The conversation beside the brain (meeting plan U8; R4, R10-R21; KTD7-KTD12,
  * KTD14): the CHAT states, driven by the brain's tick inside inStop() with the
  * camera open and the detector parked. Plain Java with no android.* imports and
- * no clock of its own: the brain hands it the time, the port, the ears and a
+ * no clock of its own: the brain hands it the time, the port and a
  * Host for the eyes, clips, gauges, trace and looks, and it answers with its
  * state. It keeps every word it hears and says out of the trace.
  *
@@ -35,11 +35,12 @@ import java.util.Set;
 final class ChatSession {
 
     /**
-     * The states (KTD7): turning toward the voice, the look that decides
-     * (KTD4), then thinking (the turn request), speaking (the deaf window),
+     * The states (KTD7): thinking (the turn request), speaking (the deaf window),
      * listening (the only state where looks run) and the notes merge at the end.
+     * The turn toward the voice and the look that decides (KTD4) are the brain's
+     * own CUE states, before the session exists.
      */
-    enum State { CUE_TURN, CUE_LOOK, CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES }
+    enum State { CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES }
 
     /** What the session needs from the brain: eyes, clips, gauges, the trace and the camera. */
     interface Host {
@@ -99,7 +100,6 @@ final class ChatSession {
 
     private final ExploreTuning tuning;
     private final CuriosityPort port;
-    private final Ears ears;
     private final Host host;
     private State state;
     private Phase phase = Phase.NONE;
@@ -128,7 +128,7 @@ final class ChatSession {
     // ---- the line and the clips ----
     private String pendingLine;
     private long sayUntil;
-    private long clipUntil = Long.MIN_VALUE / 4;
+    private long clipUntil = ExploreBrain.NEVER;
     private boolean endAfterLine;
     /** The pending line is a turn's (it joins the transcript), not a forget template. */
     private boolean lineIsTurn;
@@ -151,7 +151,6 @@ final class ChatSession {
     private long deltaDeadline;
     private long forgetDeadline;
     private int persisted;
-    private int persistRounds;
 
     // ---- how it ends ----
     private boolean endOnCharger;
@@ -160,37 +159,15 @@ final class ChatSession {
     private boolean walkedOff;
     private boolean ending;
 
-    /** The U6 skeleton's constructor: constructed in a state, with no host and no behaviour. */
-    ChatSession(ExploreTuning tuning, CuriosityPort port, Ears ears, State from) {
-        this(tuning, port, ears, null, from);
-    }
-
-    ChatSession(ExploreTuning tuning, CuriosityPort port, Ears ears, Host host) {
-        this(tuning, port, ears, host, State.CHAT_THINK);
-    }
-
-    private ChatSession(ExploreTuning tuning, CuriosityPort port, Ears ears, Host host, State from) {
+    ChatSession(ExploreTuning tuning, CuriosityPort port, Host host) {
         this.tuning = tuning;
         this.port = port;
-        this.ears = ears;
         this.host = host;
-        this.state = from;
+        this.state = State.CHAT_THINK;
     }
 
     State state() {
         return state;
-    }
-
-    ExploreTuning tuning() {
-        return tuning;
-    }
-
-    CuriosityPort port() {
-        return port;
-    }
-
-    Ears ears() {
-        return ears;
     }
 
     boolean finished() {
@@ -389,9 +366,6 @@ final class ChatSession {
             host.count(ExploreBrain.Gauges.Counter.REPEATS);
             host.note("the question was repeated again: stripped from the line (" + repeats + " so far)");
             line = stripQuestion(line, t.questionAsked);
-            if (line.isEmpty()) {
-                line = CANNED_NO_QUESTION;
-            }
         } else if (!q.isEmpty()) {
             asked.add(q);
         }
@@ -474,6 +448,11 @@ final class ChatSession {
     private void playClip(long now, String group, Phase then) {
         state = State.CHAT_SPEAK;
         phase = then;
+        openClip(now, group);
+    }
+
+    /** A local clip in its deaf window (KTD12): the port's clip window, the clip, then the tail. */
+    private void openClip(long now, String group) {
         port.clipWindow(tuning.chatClipMs);
         host.playClip(group);
         clipUntil = now + tuning.chatClipMs + tuning.deafTailMs;
@@ -494,10 +473,11 @@ final class ChatSession {
                 port.say(pendingLine);
                 break;
             case SAYING:
-                if (!port.sayFinished() && now < sayUntil) {
+                boolean done = port.sayFinished();
+                if (!done && now < sayUntil) {
                     return;
                 }
-                if (now >= sayUntil && !port.sayFinished()) {
+                if (!done) {
                     host.note("speech never reported finished; moving on");
                 }
                 lineDone(now);
@@ -670,9 +650,7 @@ final class ChatSession {
         newcomerPending = false;
         host.note("the newcomer gets a glance and one sec");
         host.eyes(ExploreBrain.EyeState.GLANCE, newcomerSide);
-        port.clipWindow(tuning.chatClipMs);
-        host.playClip(CLIP_ONE_SEC);
-        clipUntil = now + tuning.chatClipMs + tuning.deafTailMs;
+        openClip(now, CLIP_ONE_SEC);
     }
 
     private void forgetStep(long now) {
@@ -746,7 +724,6 @@ final class ChatSession {
         if (!persistWanted || personId == null || buffer.isEmpty()) {
             if (persistWanted && buffer.isEmpty()) {
                 persistWanted = false;
-                persistRounds++;
                 host.note("notes persisted (" + persisted + " delta(s) so far)");
             }
             return;

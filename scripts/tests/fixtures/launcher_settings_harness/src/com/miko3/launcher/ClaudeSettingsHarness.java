@@ -495,7 +495,7 @@ public final class ClaudeSettingsHarness {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
                 String text = "You are Miko.\n\nDry wit; \u00e9\u00e8 \"quotes\" & <tags>.";
-                f.settings.savePersona(text);
+                f.settings.saveConversation(text, true);
                 ConversationSettings c = f.settings.conversation();
                 ConversationSettings again = new ClaudeSettings(f.store, f.clock).conversation();
                 check(n, text.equals(c.persona) && c.personaSet && text.equals(again.persona) && again.personaSet,
@@ -507,11 +507,11 @@ public final class ClaudeSettingsHarness {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
                 ConversationSettings fresh = f.settings.conversation();
-                f.settings.savePersona("Custom.");
-                f.settings.savePersona("  \n\t ");
+                f.settings.saveConversation("Custom.", true);
+                f.settings.saveConversation("  \n\t ", true);
                 ConversationSettings blank = f.settings.conversation();
-                f.settings.savePersona("Custom.");
-                f.settings.savePersona(null);
+                f.settings.saveConversation("Custom.", true);
+                f.settings.saveConversation(null, true);
                 ConversationSettings nul = f.settings.conversation();
                 check(n, !fresh.personaSet && ClaudeSettings.DEFAULT_PERSONA.equals(fresh.persona)
                                 && !blank.personaSet && ClaudeSettings.DEFAULT_PERSONA.equals(blank.persona)
@@ -524,11 +524,11 @@ public final class ClaudeSettingsHarness {
         scenario("persona_over_cap_rejected_with_message", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
-                f.settings.savePersona("Keep me.");
+                f.settings.saveConversation("Keep me.", true);
                 int commits = f.store.commits;
                 String why = null;
                 try {
-                    f.settings.savePersona(repeat('x', ConversationSettings.MAX_PERSONA_CHARS + 1));
+                    f.settings.saveConversation(repeat('x', ConversationSettings.MAX_PERSONA_CHARS + 1), true);
                 } catch (ClaudeSettings.InvalidException e) {
                     why = e.getMessage();
                 }
@@ -543,7 +543,7 @@ public final class ClaudeSettingsHarness {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
                 String text = repeat('y', ConversationSettings.MAX_PERSONA_CHARS);
-                f.settings.savePersona(text);
+                f.settings.saveConversation(text, true);
                 check(n, text.equals(f.settings.conversation().persona), "length="
                         + f.settings.conversation().persona.length());
             }
@@ -553,7 +553,7 @@ public final class ClaudeSettingsHarness {
             public void run(String n) throws Exception {
                 // A browser textarea posts CRLF; the prompt (and the cap) see LF.
                 Fixture f = new Fixture();
-                f.settings.savePersona("one\r\ntwo\r\n");
+                f.settings.saveConversation("one\r\ntwo\r\n", true);
                 check(n, "one\ntwo".equals(f.settings.conversation().persona),
                         "got=" + f.settings.conversation().persona.replace("\r", "\\r").replace("\n", "\\n"));
             }
@@ -563,10 +563,10 @@ public final class ClaudeSettingsHarness {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
                 boolean fresh = f.settings.conversation().answersWhenSpokenTo;
-                f.settings.setAnswersWhenSpokenTo(false);
+                f.settings.saveConversation("", false);
                 boolean off = f.settings.conversation().answersWhenSpokenTo;
                 boolean offAgain = new ClaudeSettings(f.store, f.clock).conversation().answersWhenSpokenTo;
-                f.settings.setAnswersWhenSpokenTo(true);
+                f.settings.saveConversation("", true);
                 boolean on = f.settings.conversation().answersWhenSpokenTo;
                 check(n, fresh && !off && !offAgain && on, "fresh=" + fresh + " off=" + off + " on=" + on);
             }
@@ -575,8 +575,7 @@ public final class ClaudeSettingsHarness {
         scenario("persona_and_switch_leave_the_key_alone", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = withKey();
-                f.settings.savePersona("Custom.");
-                f.settings.setAnswersWhenSpokenTo(false);
+                f.settings.saveConversation("Custom.", false);
                 ClaudeSettings.Credentials c = f.settings.credentialsForRequests();
                 check(n, KEY_A.equals(c.apiKey) && "m1".equals(c.model)
                         && !f.settings.conversation().toString().contains(KEY_A), "creds=" + c);
