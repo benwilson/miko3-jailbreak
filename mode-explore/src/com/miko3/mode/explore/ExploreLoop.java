@@ -108,6 +108,14 @@ final class ExploreLoop {
     ExploreLoop(ExploreTuning tuning, ExploreBrain.Clock clock, Wheels wheels, Sensors sensors, Lease lease,
                 ExploreBrain.Eyes eyes, ExploreBrain.Sound sound, ExploreBrain.Camera camera, CuriosityPort port,
                 Hooks hooks, ExploreBrain.Trace trace, long tickMs, long stopTimerMs) {
+        this(tuning, clock, wheels, sensors, lease, eyes, sound, camera, port, Ears.NONE, hooks, trace, tickMs,
+                stopTimerMs);
+    }
+
+    /** With the launcher's ears as step input (meeting plan U7, KTD1): cues, the angle trend and shoves. */
+    ExploreLoop(ExploreTuning tuning, ExploreBrain.Clock clock, Wheels wheels, Sensors sensors, Lease lease,
+                ExploreBrain.Eyes eyes, ExploreBrain.Sound sound, ExploreBrain.Camera camera, CuriosityPort port,
+                Ears ears, Hooks hooks, ExploreBrain.Trace trace, long tickMs, long stopTimerMs) {
         this.clock = clock;
         this.wheels = wheels;
         this.sensors = sensors;
@@ -116,7 +124,7 @@ final class ExploreLoop {
         this.trace = trace;
         this.tickMs = tickMs;
         DriveGate gate = new DriveGate(wheels, lease, trace);
-        this.brain = new ExploreBrain(tuning, clock, gate, eyes, sound, camera, port, new Random());
+        this.brain = new ExploreBrain(tuning, clock, gate, eyes, sound, camera, port, ears, new Random());
         this.spin = new ExploreSpin(gate, trace, tuning);
         if (trace != null) {
             brain.setTrace(trace);
@@ -169,6 +177,11 @@ final class ExploreLoop {
 
     boolean isRunning() {
         return running;
+    }
+
+    /** Where the brain's cue counters and stage stamps go (meeting plan U7, KTD14): the state page. */
+    void setGauges(ExploreBrain.Gauges gauges) {
+        brain.setGauges(gauges);
     }
 
     private void runBrain() {

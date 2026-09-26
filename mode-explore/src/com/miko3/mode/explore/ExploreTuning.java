@@ -200,6 +200,22 @@ final class ExploreTuning {
     final float facingFaceMinRatio;
     final float facingFaceMinHeight;
     /**
+     * The turn to the voice and the shove cue (meeting plan U7; KTD4, KTD5,
+     * KTD14). CUE_TURN turns toward the side in steps of at most cueTurnStepDeg,
+     * re-reading the latched angle's trend between them; with no angle it turns
+     * cueTurnDefaultDeg toward the side the mics gave. A shove arms a weak cue
+     * only while the wheels are commanded stopped and at least shoveBlankingMs
+     * after the last motor command; "sorry" or "oops" within bumpApologyMs of a
+     * shove or a collision stop is a strong cue. The acknowledgement clip that
+     * plays when a facing face is found lasts about ackClipMs, the deaf window
+     * the port opens for it.
+     */
+    final double cueTurnStepDeg;
+    final double cueTurnDefaultDeg;
+    final long shoveBlankingMs;
+    final long bumpApologyMs;
+    final long ackClipMs;
+    /**
      * The conversation (meeting plan Assumptions, KTD7, KTD9; U8 uses them). An
      * unanswered listen is unansweredListenMs with no utterance, kept by the
      * brain; two of them end the conversation. A sensor stall that persists
@@ -575,6 +591,11 @@ final class ExploreTuning {
         weakCueLooks = Math.max(1, b.weakCueLooks);
         facingFaceMinRatio = Math.max(0f, b.facingFaceMinRatio);
         facingFaceMinHeight = Math.max(0f, b.facingFaceMinHeight);
+        cueTurnStepDeg = Math.max(1, b.cueTurnStepDeg);
+        cueTurnDefaultDeg = Math.max(0, b.cueTurnDefaultDeg);
+        shoveBlankingMs = Math.max(0, b.shoveBlankingMs);
+        bumpApologyMs = Math.max(0, b.bumpApologyMs);
+        ackClipMs = Math.max(0, b.ackClipMs);
         unansweredListenMs = Math.max(1, b.unansweredListenMs);
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
@@ -831,6 +852,14 @@ final class ExploreTuning {
         // (0.75 to 0.85), a profile one narrower (about 0.55); 1.5 m fills about an eighth of the frame.
         private float facingFaceMinRatio = 0.65f;
         private float facingFaceMinHeight = 0.12f;
+        // Meeting plan U7: 45-degree steps toward the voice, a quarter turn when the mics only gave
+        // a side, half a second of blanking after a motor command, KTD3's 2 s apology window, and
+        // a short "hm?" (the asset is U8's; the window is opened either way).
+        private double cueTurnStepDeg = 45;
+        private double cueTurnDefaultDeg = 90;
+        private long shoveBlankingMs = 500;
+        private long bumpApologyMs = 2000;
+        private long ackClipMs = 600;
         // Meeting plan Assumptions: an unanswered listen is 4 s; the chat sensor-stall grace 5 s;
         // a turn has 5 s plus a 3 s retry; two sentences; a window of 30 exchanges; a 500 ms deaf tail.
         private long unansweredListenMs = 4000;
@@ -1262,6 +1291,14 @@ final class ExploreTuning {
         Builder facingFace(float minRatio, float minHeight) {
             this.facingFaceMinRatio = minRatio;
             this.facingFaceMinHeight = minHeight;
+            return this;
+        }
+        Builder cueTurn(double stepDeg, double defaultDeg, long shoveBlankingMs, long bumpApologyMs, long ackClipMs) {
+            this.cueTurnStepDeg = stepDeg;
+            this.cueTurnDefaultDeg = defaultDeg;
+            this.shoveBlankingMs = shoveBlankingMs;
+            this.bumpApologyMs = bumpApologyMs;
+            this.ackClipMs = ackClipMs;
             return this;
         }
         Builder chat(long unansweredListenMs, long stallGraceMs, long turnBudgetMs, long turnRetryMs, int sentenceCap,

@@ -1,0 +1,295 @@
+package com.miko3.mode.explore;
+
+import android.content.Context;
+import android.util.Log;
+
+import com.miko3.shared.RobotEars;
+import com.miko3.shared.RobotEarsClient;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * The launcher's continuous ears as the brain's step input (meeting plan U7;
+ * KTD1, KTD3, KTD5, KTD6). One RobotEarsClient per open: ClaudeCuriosity's
+ * earsOpen() and earsClose() come from the brain as the charger latch clears
+ * and sets, so a fresh client is bound each time (close() is terminal on the
+ * client). Every heard utterance {text, side, angle, tier, at, partial} is
+ * mapped onto an Ears.Cue on the client's thread and enqueued in a small
+ * bounded queue the brain drains once per tick; nothing is decided here.
+ *
+ * Partial utterances (the deaf window clipped them) are held rather than
+ * enqueued: the next whole utterance within PARTIAL_JOIN_MS takes the stronger
+ * of the two tiers, and a partial with nothing after it is dropped.
+ *
+ * The accelerometer arrives on the drive's readings (ExploreDrive.ReadingListener):
+ * a magnitude step above the resting level is a shove spike for the brain, which
+ * arms it only while stopped and past its blanking window (KTD5). The charger
+ * latch on each reading goes to the client's renews. A conversation listen
+ * (the meeting's name reply) routes through the session while it is open, so
+ * the one microphone capture is never contended (KTD1).
+ *
+ * Privacy (R21): the text is classified into a kind and forgotten; nothing here
+ * logs an utterance, only counts and fixed reasons.
+ */
+final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.ReadingListener {
+    private static final String TAG = "ExploreEars";
+    /** Cues waiting for the brain's next tick; older ones are dropped when it fills. */
+    static final int QUEUE_MAX = 8;
+    /** A whole utterance this soon after a clipped one is the same address. */
+    static final long PARTIAL_JOIN_MS = 1500;
+    /**
+     * Accelerometer magnitude above the resting level that counts as a shove, in
+     * the controller's counts; a placeholder until U2's measurement session sets it.
+     */
+    static final int SHOVE_MIN_COUNTS = 300;
+    /** Two spikes closer than this are one shove. */
+    static final long SHOVE_GAP_MS = 500;
+    /** The resting magnitude follows readings slowly (one part in twenty per reading). */
+    private static final double REST_ALPHA = 0.05;
+
+    /** A conversation listen's answer (KTD1), delivered on the client's thread. */
+    interface Reply {
+        void heard(String transcript);
+    }
+
+    private final Context app;
+    private final Object lock = new Object();
+    private RobotEarsClient client;
+    private boolean open;
+    private final ArrayDeque<Ears.Cue> queue = new ArrayDeque<Ears.Cue>();
+    /**
+     * The angle's trend during the turn (KTD4). The ears Binder (U3) carries only
+     * the angle latched over an utterance, not samples, so live it stays null and
+     * the turn goes by the latched angle alone; the brain's trend rule is proven in
+     * the harness. Fed here when the session streams samples.
+     */
+    private Ears.Trend trend;
+    private Ears.Shove shove;
+    private Ears.Cue partial;
+    private Reply reply;
+    private volatile boolean charger;
+    private long heardCount;
+    private long droppedCount;
+    private long partialCount;
+    // The accelerometer's resting magnitude and the last spike, on the brain's thread only.
+    private double restMagnitude = Double.NaN;
+    private long lastSpikeAt = Long.MIN_VALUE / 4;
+
+    EarsAdapter(Context context) {
+        app = context.getApplicationContext();
+    }
+
+    // ---- the port's ears calls (ClaudeCuriosity) ----
+
+    /** Opens the session with the current charger latch; a session already open is kept. */
+    void open() {
+        RobotEarsClient c;
+        synchronized (lock) {
+            if (open) {
+                return;
+            }
+            open = true;
+            c = new RobotEarsClient(app);
+            client = c;
+        }
+        Log.i(TAG, "ears open" + (charger ? " (charger latched)" : ""));
+        c.open(charger, this);
+    }
+
+    /** Closes the session and releases the microphone; idempotent. */
+    void close() {
+        RobotEarsClient c;
+        synchronized (lock) {
+            if (!open) {
+                return;
+            }
+            open = false;
+            c = client;
+            client = null;
+            queue.clear();
+            partial = null;
+            reply = null;
+        }
+        Log.i(TAG, "ears closed: heard " + heardCount + ", dropped " + droppedCount + ", partial " + partialCount);
+        if (c != null) {
+            c.close();
+        }
+    }
+
+    boolean isOpen() {
+        synchronized (lock) {
+            return open;
+        }
+    }
+
+    /** ModeApp, as Explore stops: nothing reaches the brain after this. */
+    void release() {
+        close();
+    }
+
+    /** The deaf window for a local clip (KTD1, KTD12). */
+    void clipWindow(long ms) {
+        RobotEarsClient c = current();
+        if (c != null) {
+            c.clipWindow(ms);
+        }
+    }
+
+    /** A shove while stopped or a collision stop while driving, at brain time (KTD5). */
+    void shoved(long atMs) {
+        RobotEarsClient c = current();
+        if (c != null) {
+            c.shoved(atMs);
+        }
+    }
+
+    /** A conversation listen through the session: the next whole utterance with words is the reply. */
+    void listen(long maxMs, Reply r) {
+        RobotEarsClient c;
+        synchronized (lock) {
+            reply = r;
+            c = client;
+        }
+        if (c != null) {
+            c.listen(maxMs);
+        }
+    }
+
+    private RobotEarsClient current() {
+        synchronized (lock) {
+            return open ? client : null;
+        }
+    }
+
+    // ---- RobotEarsClient.Listener: the launcher's thread ----
+
+    @Override
+    public void onHeard(String text, int side, float angle, int tier, long at, boolean partialUtterance) {
+        Ears.Tier t = tier == RobotEars.TIER_STRONG ? Ears.Tier.STRONG : Ears.Tier.WEAK;
+        Ears.Side s = side == RobotEars.SIDE_LEFT ? Ears.Side.LEFT
+                : side == RobotEars.SIDE_RIGHT ? Ears.Side.RIGHT : Ears.Side.UNKNOWN;
+        // The DSP's angle is already signed the brain's way (VoiceDirection: negative left); NaN passes through.
+        Ears.Cue cue = new Ears.Cue(CueKinds.of(text, t), t, s, angle, at);
+        boolean words = text != null && !text.trim().isEmpty();
+        Reply r = null;
+        synchronized (lock) {
+            if (!open) {
+                return;
+            }
+            heardCount++;
+            if (partialUtterance) {
+                partialCount++;
+                partial = cue;
+                return;
+            }
+            if (reply != null && words) {
+                r = reply;
+                reply = null;
+            } else {
+                if (partial != null && at - partial.at <= PARTIAL_JOIN_MS && partial.strong() && !cue.strong()) {
+                    cue = new Ears.Cue(partial.kind, Ears.Tier.STRONG, s, angle, at);
+                }
+                partial = null;
+                if (queue.size() >= QUEUE_MAX) {
+                    queue.pollFirst();
+                    droppedCount++;
+                }
+                queue.addLast(cue);
+            }
+        }
+        if (r != null) {
+            r.heard(text);
+        }
+    }
+
+    @Override
+    public void onLost(String reason) {
+        Log.w(TAG, "ears lost: " + reason);
+        synchronized (lock) {
+            // The brain re-opens on its own terms (the next charger clear or start); until then no cues come.
+            open = false;
+            client = null;
+            queue.clear();
+            partial = null;
+            reply = null;
+        }
+    }
+
+    // ---- ExploreDrive.ReadingListener: the brain's thread ----
+
+    @Override
+    public void onReading(SensorReading r) {
+        if (charger != r.charger) {
+            charger = r.charger;
+            RobotEarsClient c = current();
+            if (c != null) {
+                c.setCharger(r.charger);
+            }
+        }
+        if (!r.hasAccel) {
+            return;
+        }
+        double m = Math.sqrt((double) r.accelX * r.accelX + (double) r.accelY * r.accelY
+                + (double) r.accelZ * r.accelZ);
+        if (Double.isNaN(restMagnitude)) {
+            restMagnitude = m;
+            return;
+        }
+        double above = Math.abs(m - restMagnitude);
+        if (above >= SHOVE_MIN_COUNTS) {
+            if (r.timestampMs - lastSpikeAt >= SHOVE_GAP_MS) {
+                lastSpikeAt = r.timestampMs;
+                synchronized (lock) {
+                    shove = new Ears.Shove((int) Math.round(above), r.timestampMs);
+                }
+            }
+            return;
+        }
+        restMagnitude += REST_ALPHA * (m - restMagnitude);
+    }
+
+    // ---- Ears: the brain's thread, once per tick ----
+
+    @Override
+    public boolean present() {
+        return true;
+    }
+
+    @Override
+    public boolean listening() {
+        return isOpen();
+    }
+
+    @Override
+    public List<Ears.Cue> drain() {
+        synchronized (lock) {
+            if (queue.isEmpty()) {
+                return Collections.emptyList();
+            }
+            List<Ears.Cue> out = new ArrayList<Ears.Cue>(queue);
+            queue.clear();
+            return out;
+        }
+    }
+
+    @Override
+    public Ears.Trend trend() {
+        synchronized (lock) {
+            Ears.Trend t = trend;
+            trend = null;
+            return t;
+        }
+    }
+
+    @Override
+    public Ears.Shove shove() {
+        synchronized (lock) {
+            Ears.Shove s = shove;
+            shove = null;
+            return s;
+        }
+    }
+}

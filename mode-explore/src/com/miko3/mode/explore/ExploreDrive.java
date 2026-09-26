@@ -87,6 +87,12 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
      * loop polls every tick but the driver publishes a new snapshot only every ~100 ms. */
     private SensorSnapshot lastSnapshot;
     private SensorReading lastReading;
+    /** Sees every new reading as it is made (meeting plan U7): the ears adapter takes the charger latch
+     * and the accelerometer from it. Called on the brain's thread, inside latest(). */
+    interface ReadingListener {
+        void onReading(SensorReading reading);
+    }
+    private volatile ReadingListener readingListener;
     private volatile DriveLease lease;
     private volatile boolean leaseHeld;
     private int leaseRetryAttempt;
@@ -322,7 +328,15 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         lastReading = new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false,
                 s.hasWheels, s.wheelLeft, s.wheelRight, s.hasGyro, s.gyroX, s.gyroY, s.gyroZ,
                 d.chargerLatched(), s.hasAccel, s.accelX, s.accelY, s.accelZ);
+        ReadingListener l = readingListener;
+        if (l != null) {
+            l.onReading(lastReading);
+        }
         return lastReading;
+    }
+
+    void setReadingListener(ReadingListener listener) {
+        readingListener = listener;
     }
 
     // ---- ExploreLoop.Hooks ----

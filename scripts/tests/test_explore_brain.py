@@ -31,7 +31,8 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHar
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
-              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "Ears.java", "ChatSession.java")
+              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "Ears.java", "ChatSession.java",
+              "CueKinds.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -341,6 +342,32 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "vision_profile_shaped_box_from_t_reports_no_facing_face_afterwards",
         "chat_tuning_defaults_follow_the_plans_assumptions",
         "chat_session_skeleton_has_the_six_states_and_no_behaviour",
+        # Cues, the lean-in and the turn to the voice (meeting plan U7; R1-R3, R6-R9, R15; KTD3-KTD6, KTD8)
+        "cue_strong_from_the_left_mid_hop_stops_within_one_step_and_turns_left",
+        "cue_weak_with_no_face_after_the_look_and_its_opposite_resumes_quietly_within_the_budget",
+        "cue_weak_that_finds_two_profile_faces_resumes_quietly",
+        "cue_strong_from_behind_is_found_on_the_third_look",
+        "cue_miko_miko_800_ms_apart_is_one_search",
+        "cue_strong_from_the_opposite_side_during_the_turn_retargets_once_not_twice",
+        "cue_during_ask_cancels_the_ask",
+        "cue_during_a_playing_line_is_held_and_taken_when_it_ends",
+        "cue_before_the_line_starts_drops_the_remark_and_turns",
+        "cue_during_orient_takes_and_drops_the_pick",
+        "cue_during_startle_is_held_until_pause",
+        "cue_during_cornered_rest_is_taken",
+        "cue_same_side_during_approach_continues_it",
+        "cue_opposite_side_during_approach_abandons_it_and_turns",
+        "cue_shove_while_stopped_arms_a_weak_cue_and_looks_ahead_then_behind",
+        "cue_shove_300_ms_after_a_motor_command_does_not_arm",
+        "cue_forward_stall_stamps_a_bump_and_sorry_within_2_s_is_strong_held_until_the_escape_ends",
+        "cue_sorry_4_s_after_the_bump_is_weak",
+        "cue_charger_latch_closes_the_ears_and_reopening_takes_the_next_cue",
+        "cue_eyes_only_wake_word_enters_the_meeting_path_without_a_turn_and_a_name_cue_is_dropped",
+        "cue_held_strong_older_than_10_s_becomes_a_lean_in",
+        "cue_facing_face_plays_the_acknowledgement_in_a_clip_window_meets_and_stamps_the_stages",
+        "cue_trend_under_the_stop_band_ends_the_turn_early",
+        "cue_trend_growing_means_the_voice_is_behind_and_ends_the_turn",
+        "cue_kinds_classify_wake_word_name_greeting_apology_and_voice",
     )
 
     @classmethod

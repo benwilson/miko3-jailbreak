@@ -191,6 +191,14 @@ interface CuriosityPort {
      */
     void clipWindow(long ms);
 
+    /**
+     * A shove while stopped, or a collision stop while driving, happened at this
+     * brain time (KTD3, KTD5): the session's classifier makes "sorry" or "oops"
+     * within its window a strong cue. The brain applies the same rule itself, so
+     * this only keeps the launcher's counters and tiers in step.
+     */
+    void earsShoved(long atMs);
+
     /** No Claude: every stop takes the path it took before U4. */
     CuriosityPort NONE = new CuriosityPort() {
         public boolean canAsk() {
@@ -330,6 +338,9 @@ interface CuriosityPort {
         }
 
         public void clipWindow(long ms) {
+        }
+
+        public void earsShoved(long atMs) {
         }
     };
 

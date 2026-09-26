@@ -81,6 +81,88 @@ class AdapterWiringTest(unittest.TestCase):
         app = code_only(src("ModeApp.java"))
         self.assertRegex(app, r"case THINKING:\s*setExploreState\(ExploreState\.of\(ExploreState\.THINKING\)\)")
 
+    def test_listening_and_glance_eyes_are_mapped(self):
+        # Meeting plan U7, KTD12: the listening look and the glance to the voice's side.
+        app = code_only(src("ModeApp.java"))
+        self.assertRegex(app, r"case LISTENING:\s*setExploreState\(ExploreState\.of\(ExploreState\.LISTENING\)\)")
+        glance = re.search(r"case GLANCE:(.*?)break;", app, re.S)
+        self.assertIsNotNone(glance)
+        for look in ("ExploreState.GLANCE_LEFT", "ExploreState.GLANCE_RIGHT", "ExploreState.LISTENING"):
+            self.assertIn(look, glance.group(1), look)
+
+
+class EarsAdapterWiringTest(unittest.TestCase):
+    """The continuous ears as step input (meeting plan U7; KTD1, KTD5, KTD6): ModeApp builds the
+    adapter and hands it to the loop and the port; the adapter maps every callback field, follows
+    the charger latch, forwards shove stamps, and never logs the words."""
+
+    def test_mode_app_builds_the_adapter_and_hands_it_to_the_loop_the_drive_and_the_port(self):
+        app = code_only(src("ModeApp.java"))
+        self.assertIn("new EarsAdapter(", app)
+        self.assertIn("drive.setReadingListener(ears)", app)
+        self.assertIn("curiosity.setEars(ears)", app)
+        self.assertRegex(app, r"new ExploreLoop\([^;]*\bears\b")
+        self.assertIn("loop.setGauges(gauges)", app)
+        stop = re.search(r"void stopExplore\(\)\s*\{(.*?)\n    \}", app, re.S)
+        self.assertIsNotNone(stop)
+        self.assertIn("ears.release()", stop.group(1))
+        loop = code_only(src("ExploreLoop.java"))
+        self.assertRegex(loop, r"new ExploreBrain\([^;]*\bears\b")
+
+    def test_the_adapter_maps_every_callback_field(self):
+        a = code_only(src("EarsAdapter.java"))
+        self.assertIn("implements Ears, RobotEarsClient.Listener, ExploreDrive.ReadingListener", a)
+        heard = re.search(r"public void onHeard\(String text, int side, float angle, int tier, long at, "
+                          r"boolean partialUtterance\)\s*\{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(heard)
+        body = heard.group(1)
+        self.assertIn("CueKinds.of(text, t)", body)
+        self.assertIn("side == RobotEars.SIDE_LEFT", body)
+        self.assertIn("side == RobotEars.SIDE_RIGHT", body)
+        self.assertIn("tier == RobotEars.TIER_STRONG", body)
+        self.assertIn("new Ears.Cue(CueKinds.of(text, t), t, s, angle, at)", body)
+        self.assertIn("if (partialUtterance)", body)
+        self.assertIn("partial = cue", body)
+        self.assertIn("queue.addLast(cue)", body)
+        self.assertIn("QUEUE_MAX", body)
+
+    def test_the_adapter_never_logs_the_text(self):
+        a = code_only(src("EarsAdapter.java"))
+        for call in re.findall(r"Log\.[diwe]\((.*?)\);", a, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"\b(text|transcript|cue|partial\b|queue)\b", call)
+        self.assertNotIn("text +", a)
+        self.assertNotIn("+ text", a)
+
+    def test_the_port_ears_calls_reach_the_session_and_the_brain_forwards_shoves(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        for method, call in (("earsOpen", "s.open()"), ("earsClose", "s.close()"), ("clipWindow", "s.clipWindow(ms)"),
+                             ("earsShoved", "s.shoved(atMs)")):
+            body = re.search(r"public void " + method + r"\((.*?)\n    \}", a, re.S)
+            self.assertIsNotNone(body, method)
+            self.assertIn(call, body.group(1), method)
+        listen = re.search(r"public void listen\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("s.isOpen()", listen)
+        self.assertIn("s.listen(maxMs,", listen)
+        port = code_only(src("CuriosityPort.java"))
+        self.assertRegex(port, r"void earsShoved\(long atMs\);")
+        brain = code_only(src("ExploreBrain.java"))
+        self.assertIn("port.earsShoved(", brain)
+
+    def test_the_ears_follow_the_charger_latch(self):
+        brain = code_only(src("ExploreBrain.java"))
+        sync = re.search(r"private void syncEars\(\)\s*\{(.*?)\n    \}", brain, re.S)
+        self.assertIsNotNone(sync)
+        self.assertIn("classifier.charger()", sync.group(1))
+        self.assertIn("port.earsOpen()", sync.group(1))
+        self.assertIn("port.earsClose()", sync.group(1))
+        a = code_only(src("EarsAdapter.java"))
+        reading = re.search(r"public void onReading\(SensorReading r\)\s*\{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(reading)
+        self.assertIn("c.setCharger(r.charger)", reading.group(1))
+        self.assertIn("new Ears.Shove(", reading.group(1))
+        self.assertIn("c.open(charger, this)", a)
+
 
 class PromptsTest(unittest.TestCase):
     def setUp(self):
@@ -264,7 +346,7 @@ class RecentlyMetCheckTest(unittest.TestCase):
 class NothingPrivateIsLoggedTest(unittest.TestCase):
     """No Log call touches images, the key, Claude's reply text, or names (ids are fine)."""
 
-    FILES = ("ClaudeCuriosity.java", "FaceCropper.java", "ModeApp.java", "ExploreLoop.java")
+    FILES = ("ClaudeCuriosity.java", "FaceCropper.java", "ModeApp.java", "ExploreLoop.java", "EarsAdapter.java")
     PRIVATE = re.compile(r"\b(jpeg|frameJpeg|face|crop|apiKey|access|json|line|text|transcript|name|named|"
                          r"heard|reply|answer|result\.json|prompt)\b", re.I)
 

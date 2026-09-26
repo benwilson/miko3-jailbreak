@@ -67,6 +67,8 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final ClaudeApi claude = new ClaudeApi(new ClaudeHttpsTransport());
     private final RobotSpeechClient speech;
     private final RobotListenClient ears;
+    /** The continuous ears session (meeting plan U7, KTD1), set by ModeApp; null means the one-shot listen only. */
+    private volatile EarsAdapter session;
     /** YuNet on ONNX Runtime; its model loads at the first MEET and is freed by release(). */
     private final FaceCropper cropper;
     private final ExecutorService worker = Executors.newCachedThreadPool(new ThreadFactory() {
@@ -122,6 +124,11 @@ final class ClaudeCuriosity implements CuriosityPort {
         ears = new RobotListenClient(app);
         cropper = new FaceCropper(app);
         refreshSettings();
+    }
+
+    /** The continuous ears session the port's ears calls and the meeting's listen go through (KTD1). */
+    void setEars(EarsAdapter ears) {
+        session = ears;
     }
 
     /** Drops any line still queued and stops answering; ModeApp calls it as Explore stops. */
@@ -410,14 +417,34 @@ final class ClaudeCuriosity implements CuriosityPort {
 
     @Override
     public void earsOpen() {
+        EarsAdapter s = session;
+        if (s != null) {
+            s.open();
+        }
     }
 
     @Override
     public void earsClose() {
+        EarsAdapter s = session;
+        if (s != null) {
+            s.close();
+        }
     }
 
     @Override
     public void clipWindow(long ms) {
+        EarsAdapter s = session;
+        if (s != null) {
+            s.clipWindow(ms);
+        }
+    }
+
+    @Override
+    public void earsShoved(long atMs) {
+        EarsAdapter s = session;
+        if (s != null) {
+            s.shoved(atMs);
+        }
     }
 
     /**
@@ -659,8 +686,33 @@ final class ClaudeCuriosity implements CuriosityPort {
     }
 
     @Override
-    public void listen(long maxMs) {
+    public void listen(final long maxMs) {
         final int g = hearings.start();
+        final EarsAdapter s = session;
+        if (s != null && s.isOpen()) {
+            // One microphone capture per device (KTD1): with the session open the reply comes
+            // through it; a listen that hears nothing in maxMs is silence, as the one-shot's is.
+            s.listen(maxMs, new EarsAdapter.Reply() {
+                @Override
+                public void heard(String transcript) {
+                    hearings.finish(g, new Heard(Heard.Status.WORDS, transcript));
+                }
+            });
+            run(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(maxMs);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    if (hearings.current(g) && hearings.poll() == null) {
+                        hearings.finish(g, Heard.NOTHING);
+                    }
+                }
+            }, null, g, null);
+            return;
+        }
         ears.listen(maxMs, new RobotListenClient.Listener() {
             @Override
             public void onHeard(String transcript) {
