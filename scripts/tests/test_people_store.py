@@ -33,6 +33,7 @@ APP = LAUNCHER / "LauncherApp.java"
 PAGE = LAUNCHER / "SettingsPage.java"
 INTERFACE = SHARED / "RobotPeople.java"
 CLIENT = SHARED / "RobotPeopleClient.java"
+NOTES = SHARED / "PersonNotes.java"
 PROTOCOL = SHARED / "LauncherProtocol.java"
 MANIFEST = REPO / "launcher" / "AndroidManifest.xml"
 
@@ -75,6 +76,20 @@ class PeopleStoreHarnessTest(unittest.TestCase):
         "add_refuses_non_jpeg_empty_and_oversized",
         "ids_are_validated_before_any_file_access",
         "unpinned_caller_is_denied",
+        "merge_adds_interests_and_closes_a_thread",
+        "merge_is_idempotent",
+        "merge_past_caps_trims_in_named_order",
+        "byte_cap_never_drops_a_question_before_an_interest",
+        "ten_conversations_of_questions_fit_under_the_cap",
+        "bad_delta_is_refused_and_document_unchanged",
+        "merge_for_unknown_id_is_refused",
+        "notes_survive_reload",
+        "forget_removes_index_notes_and_face",
+        "orphans_after_a_crash_are_deleted_on_load",
+        "notes_for_unknown_id_are_empty",
+        "malformed_notes_file_loads_as_empty",
+        "gallery_excludes_nameless_records_store_still_lists_them",
+        "entries_are_cleaned_and_matched_on_normalised_text",
     )
 
     @classmethod
@@ -130,8 +145,28 @@ class StoreSourceTest(unittest.TestCase):
         for needle in (".getFD().sync()", "renameTo("):
             self.assertIn(needle, src)
 
+    def test_forget_deletes_index_then_notes_then_face(self):
+        # KTD10: once the index no longer names them, a crash leaves only orphans.
+        body = _method_body(_read(STORE), "synchronized boolean forget")
+        self.assertIsNotNone(body)
+        index = body.find("saveIndex")
+        notes = body.find("notesFile(")
+        face = body.find("faceFile(")
+        self.assertGreaterEqual(index, 0, "forget never rewrites the index")
+        self.assertGreater(notes, index, "notes deleted before the index rewrite")
+        self.assertGreater(face, notes, "face deleted before the notes")
+        self.assertRegex(body[notes:], r"notesFile\(\s*id\s*\)\.delete\(\)")
+        self.assertRegex(body[face:], r"faceFile\(\s*id\s*\)\.delete\(\)")
+
+    def test_load_sweeps_orphans_and_the_gallery_skips_nameless(self):
+        src = _read(STORE)
+        load = _method_body(src, "private void load")
+        self.assertIn("delete()", load or "")
+        recent = _method_body(src, "synchronized List<Person> recent")
+        self.assertRegex(recent or "", r"name\.isEmpty\(\)")
+
     def test_nothing_is_logged(self):
-        for path in (STORE, SERVICE, INTERFACE, CLIENT):
+        for path in (STORE, SERVICE, INTERFACE, CLIENT, NOTES):
             src = _read(path)
             with self.subTest(file=path.name):
                 self.assertTrue(src, f"{path.name} missing")
@@ -149,7 +184,8 @@ class ServiceWiringTest(unittest.TestCase):
 
     def test_every_call_checks_the_caller_before_the_store(self):
         for method in ("public RobotPeople.Face[] recent", "public String add", "public boolean touch",
-                       "public String nameOf"):
+                       "public String nameOf", "public String notesOf", "public String mergeNotes",
+                       "public boolean forget"):
             with self.subTest(method=method):
                 body = _method_body(self.src, method)
                 self.assertIsNotNone(body, f"PeopleService does not implement {method}")
@@ -183,6 +219,51 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertRegex(body, r"String add\(byte\[\] \w+, String \w+\) throws RemoteException;")
         self.assertRegex(body, r"boolean touch\(String \w+\) throws RemoteException;")
         self.assertRegex(body, r"String nameOf\(String \w+\) throws RemoteException;")
+
+    def test_interface_declares_the_notes_and_forget_calls(self):
+        body = _read(INTERFACE).split("abstract class Stub", 1)[0]
+        self.assertRegex(body, r"String notesOf\(String \w+\) throws RemoteException;")
+        self.assertRegex(body, r"String mergeNotes\(String \w+, String \w+\) throws RemoteException;")
+        self.assertRegex(body, r"boolean forget\(String \w+\) throws RemoteException;")
+
+    def test_transaction_codes_are_appended(self):
+        # KTD10: the four existing codes are unchanged; the three new ones follow.
+        src = _read(INTERFACE)
+        for name, code in (("recent", 1), ("add", 2), ("touch", 3), ("nameOf", 4),
+                           ("notesOf", 5), ("mergeNotes", 6), ("forget", 7)):
+            self.assertRegex(src, rf"TRANSACTION_{name}\s*=\s*{code}\s*;")
+        codes = [int(c) for c in re.findall(r"TRANSACTION_\w+\s*=\s*(\d+)\s*;", src)]
+        self.assertEqual(codes, list(range(1, 8)))
+
+    def test_new_proxy_methods_check_the_transaction_result(self):
+        src = _read(INTERFACE)
+        proxy = src[src.index("class Proxy"):]
+        for name in ("notesOf", "mergeNotes", "forget"):
+            with self.subTest(method=name):
+                body = _method_body(proxy, f"public \\w+ {name}") or _method_body(proxy, f"public String {name}") \
+                    or _method_body(proxy, f"public boolean {name}")
+                self.assertIsNotNone(body, f"Proxy does not implement {name}")
+                self.assertRegex(body, rf"if\s*\(\s*!remote\.transact\(\s*TRANSACTION_{name}")
+                self.assertIn("LauncherProtocol.LAUNCHER_TOO_OLD", body)
+
+    def test_client_has_notes_and_forget_and_reports_an_old_launcher(self):
+        src = _read(CLIENT)
+        for needle in ("PersonNotes notesOf(", "PersonNotes mergeNotes(", "boolean forget(",
+                       "catch (UnsupportedOperationException", "LauncherProtocol.LAUNCHER_TOO_OLD"):
+            self.assertIn(needle, src)
+
+    def test_person_notes_is_plain_java_with_named_caps(self):
+        raw = NOTES.read_text() if NOTES.exists() else ""
+        self.assertTrue(raw, "PersonNotes.java missing")
+        self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
+        src = _strip_comments(raw)
+        for name, value in (("MAX_QUESTIONS_ASKED", 120), ("MAX_OPEN_THREADS", 6), ("MAX_INTERESTS", 8),
+                            ("MAX_TOPICS", 12), ("MAX_ENTRY_CHARS", 80)):
+            self.assertRegex(src, rf"public static final int {name}\s*=\s*{value}\s*;")
+        m = re.search(r"public static final int MAX_DOCUMENT_BYTES\s*=\s*([0-9 *]+);", src)
+        self.assertIsNotNone(m, "PersonNotes has no MAX_DOCUMENT_BYTES")
+        # The binding limit: smaller than the per-list caps could add up to.
+        self.assertLess(eval(m.group(1)), 120 * 80)
 
     def test_reply_stays_well_under_the_binder_limit(self):
         # KTD3: up to 10 faces; the store caps each face, so 10 of them stay

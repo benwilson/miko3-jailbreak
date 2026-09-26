@@ -12,7 +12,8 @@ import java.util.List;
 
 /**
  * Exported bound Service through which our mode apps use the robot's people
- * store (explore-on-claude plan U2; R13, R14, KTD1, KTD3). Every call first
+ * store (explore-on-claude plan U2; R13, R14, KTD1, KTD3; meeting plan U5,
+ * KTD10 for notes and forget). Every call first
  * checks who is calling (CallerGate, the same pinned-certificate check as
  * RobotSettingsService and SpeechService) and only then touches the store,
  * so a vendor app gets a SecurityException and never a face or a name.
@@ -63,6 +64,24 @@ public class PeopleService extends Service {
         public String nameOf(String id) {
             enforceCaller();
             return people().nameOf(id);
+        }
+
+        @Override
+        public String notesOf(String id) {
+            enforceCaller();
+            return people().notes(id).toJson();
+        }
+
+        @Override
+        public String mergeNotes(String id, String deltaJson) {
+            enforceCaller();
+            return people().mergeNotes(id, deltaJson).toJson();
+        }
+
+        @Override
+        public boolean forget(String id) {
+            enforceCaller();
+            return people().forget(id);
         }
     };
 

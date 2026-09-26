@@ -6,6 +6,7 @@ import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.PageToken;
+import com.miko3.shared.PersonNotes;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -31,10 +32,11 @@ import java.util.Map;
  * saved together. Then the Voice section: type a line,
  * press Say it, and the robot speaks it through the launcher's own speech
  * queue (the request returns once it is queued, not once it has played).
- * Then the People section (explore-on-claude plan U2, R15, R16): everyone
- * the robot remembers, with their face, name or "unnamed", and when he last
- * saw them, each with a Rename form and a Forget button. The same page serves
- * the robot's own WebView and a LAN browser.
+ * Then the People section (explore-on-claude plan U2, R15, R16; meeting plan
+ * U5, R18): everyone the robot remembers, with their face, name or "unnamed",
+ * when he last saw them and their notes, each with a Rename form and a Forget
+ * button that deletes face, name and notes. The same page serves the robot's
+ * own WebView and a LAN browser.
  *
  * Follows voice mode's SettingsPage pattern: every action is a POST that
  * answers with a redirect to "/settings?status=<message>", and the GET that
@@ -79,9 +81,14 @@ final class SettingsPage {
 
     static final String PEOPLE_RENAMED = "Name changed.";
     static final String PEOPLE_UNNAMED = "Name cleared; that person is now unnamed.";
-    static final String PEOPLE_FORGOTTEN = "Forgotten: their face and name are deleted.";
+    static final String PEOPLE_FORGOTTEN = "Forgotten: their face, name and notes are deleted.";
     static final String PEOPLE_UNKNOWN = "Nothing changed: that person is not remembered.";
     static final String PEOPLE_NOT_SAVED = "Nothing changed: the change could not be saved.";
+    static final String PEOPLE_NO_NOTES = "No notes yet.";
+    /** A record from before names were required (KTD10): out of the matching
+     * gallery, never given notes; the owner names it or deletes it. */
+    static final String PEOPLE_LEGACY = "Legacy record: no name, so he no longer matches this face or keeps notes "
+            + "on it. Give them a name, or Forget deletes it.";
 
     /**
      * The robot's voice, as the Voice section sees it. LauncherApp backs it
@@ -111,7 +118,7 @@ final class SettingsPage {
                 return;
             }
             res.sendText(200, "OK", "text/html; charset=utf-8", buildHtml(token.issue(), settings.status(),
-                    settings.models(), settings.conversation(), speaker.voiceName(), people.all(),
+                    settings.models(), settings.conversation(), speaker.voiceName(), people,
                     req.queryParam("status", null)));
             return;
         }
@@ -274,7 +281,7 @@ final class SettingsPage {
     }
 
     static String buildHtml(String token, ClaudeSettings.Status st, List<String> models,
-                            ConversationSettings conversation, String voiceName, List<PeopleStore.Person> people,
+                            ConversationSettings conversation, String voiceName, PeopleStore people,
                             String status) {
         String t = escapeHtml(token);
         StringBuilder html = new StringBuilder();
@@ -386,10 +393,13 @@ final class SettingsPage {
         html.append("</section>");
     }
 
-    /** R15, R16: everyone he remembers, most recently seen first. */
-    private static void appendPeople(StringBuilder html, String t, List<PeopleStore.Person> people) {
+    /** R15, R16, R18: everyone he remembers, most recently seen first, each
+     * with their notes (escaped: every entry came from the model or a person)
+     * or a legacy mark when the record has no name (KTD10). */
+    private static void appendPeople(StringBuilder html, String t, PeopleStore store) {
+        List<PeopleStore.Person> people = store.all();
         html.append("<section id=\"people\"><h2>People</h2>");
-        html.append("<p>The people the robot remembers. Forget deletes their face and name for good.</p>");
+        html.append("<p>The people the robot remembers. Forget deletes their face, name and notes for good.</p>");
         if (people.isEmpty()) {
             html.append("<p id=\"people-empty\">He hasn't met anyone yet.</p>");
         }
@@ -403,6 +413,11 @@ final class SettingsPage {
                     .append("\" width=\"112\" height=\"112\">");
             html.append("<p><strong>").append(p.name.isEmpty() ? "<em>unnamed</em>" : name).append("</strong><br>");
             html.append("<small>Last seen ").append(escapeHtml(lastSeen(p.lastSeenMillis))).append("</small></p>");
+            if (p.name.isEmpty()) {
+                html.append("<p class=\"legacy\"><small>").append(PEOPLE_LEGACY).append("</small></p>");
+            } else {
+                appendNotes(html, store.notes(p.id));
+            }
             html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH)
                     .append("\">");
             html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
@@ -420,6 +435,38 @@ final class SettingsPage {
             html.append("</article>");
         }
         html.append("</section>");
+    }
+
+    /** The notes as four short lists, every entry escaped. */
+    private static void appendNotes(StringBuilder html, PersonNotes notes) {
+        if (notes.isEmpty()) {
+            html.append("<p class=\"notes\"><small>").append(PEOPLE_NO_NOTES).append("</small></p>");
+            return;
+        }
+        html.append("<div class=\"notes\">");
+        notesList(html, "Interests", notes.interests);
+        if (!notes.openThreads.isEmpty()) {
+            html.append("<p><strong>Open threads</strong></p><ul>");
+            for (PersonNotes.Thread thread : notes.openThreads) {
+                html.append("<li>").append(escapeHtml(thread.text)).append(" <small>(since ")
+                        .append(escapeHtml(lastSeen(thread.sinceMillis).substring(0, 10))).append(")</small></li>");
+            }
+            html.append("</ul>");
+        }
+        notesList(html, "Topics", notes.topics);
+        notesList(html, "Questions asked", notes.questionsAsked);
+        html.append("</div>");
+    }
+
+    private static void notesList(StringBuilder html, String label, List<String> entries) {
+        if (entries.isEmpty()) {
+            return;
+        }
+        html.append("<p><strong>").append(label).append("</strong></p><ul>");
+        for (String entry : entries) {
+            html.append("<li>").append(escapeHtml(entry)).append("</li>");
+        }
+        html.append("</ul>");
     }
 
     /** "2026-09-24 15:45", the robot's local time. */

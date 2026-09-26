@@ -418,6 +418,10 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "conversation_status_never_echoes_persona",
         "get_on_conversation_path_refused",
         "conversation_path_is_tls_only",
+        "people_notes_render_escaped",
+        "people_notes_list_fields_and_thread_dates",
+        "people_nameless_record_marked_legacy",
+        "forget_removes_notes_too",
     )
 
     @classmethod

@@ -418,6 +418,14 @@ public final class SettingsPageHarness {
     }
 
 
+    /** One person's <article id="person-..."> fragment, or "". */
+    static String article(String html, String id) {
+        Matcher m = Pattern.compile("<article id=\"person-" + Pattern.quote(id) + "\">(.*?)</article>", Pattern.DOTALL)
+                .matcher(html);
+        return m.find() ? m.group(0) : "";
+    }
+
+
     private static int failures;
 
     private static void check(String name, boolean ok, String detail) {
@@ -1367,6 +1375,74 @@ public final class SettingsPageHarness {
             public void run(String n) {
                 check(n, LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_CONVERSATION_PATH),
                         "the conversation path is served on plain HTTP");
+            }
+        });
+
+        // ---- People notes (meeting plan U5; KTD10, R18) ----
+
+        scenario("people_notes_render_escaped", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(1), "Ann");
+                f.people.mergeNotes(id, "{\"interests\":[\"<script>alert(1)</script>\"],"
+                        + "\"open_threads\":[\"\\\"><img src=x onerror=alert(2)>\"],"
+                        + "\"topics\":[\"a & b\"],\"questions_asked\":[\"What's <your> name?\"]}");
+                String html = get(f);
+                String article = article(html, id);
+                check(n, article.contains("&lt;script&gt;alert(1)&lt;/script&gt;") && !html.contains("<script>")
+                                && article.contains("&quot;&gt;&lt;img src=x onerror=alert(2)&gt;") && !html.contains("<img src=x")
+                                && article.contains("a &amp; b") && article.contains("What&#39;s &lt;your&gt; name?"),
+                        article);
+            }
+        });
+
+        scenario("people_notes_list_fields_and_thread_dates", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String ann = f.people.add(jpeg(1), "Ann");
+                String bo = f.people.add(jpeg(2), "Bo");
+                f.people.mergeNotes(ann, "{\"interests\":[\"chess\"],\"open_threads\":[\"the Q3 launch\"],"
+                        + "\"topics\":[\"weather\"],\"questions_asked\":[\"How was the launch?\"]}");
+                String html = get(f);
+                String a = article(html, ann);
+                String b = article(html, bo);
+                String since = SettingsPage.lastSeen(f.peopleClock.now).substring(0, 10);
+                boolean fields = a.contains("Interests") && a.contains("chess") && a.contains("Open threads")
+                        && a.contains("the Q3 launch") && a.contains(since) && a.contains("Topics") && a.contains("weather")
+                        && a.contains("Questions asked") && a.contains("How was the launch?");
+                boolean none = b.contains(SettingsPage.PEOPLE_NO_NOTES) && !a.contains(SettingsPage.PEOPLE_NO_NOTES);
+                check(n, fields && none, "a=" + a + " b=" + b);
+            }
+        });
+
+        scenario("people_nameless_record_marked_legacy", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String ann = f.people.add(jpeg(1), "Ann");
+                String legacy = f.people.add(jpeg(2), null);
+                String html = get(f);
+                String a = article(html, ann);
+                String l = article(html, legacy);
+                check(n, l.contains(SettingsPage.PEOPLE_LEGACY) && l.contains("unnamed")
+                                && !form(l, LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH).isEmpty()
+                                && !form(l, LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH).isEmpty()
+                                && !a.contains(SettingsPage.PEOPLE_LEGACY),
+                        "legacy=" + l);
+            }
+        });
+
+        scenario("forget_removes_notes_too", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.add(jpeg(1), "Ann");
+                f.people.mergeNotes(id, "{\"interests\":[\"chess-ZQXJ\"]}");
+                boolean shown = get(f).contains("chess-ZQXJ");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + token(f) + "&id=" + id);
+                String html = get(f);
+                check(n, shown && SettingsPage.PEOPLE_FORGOTTEN.equals(r.status()) && f.people.notes(id).isEmpty()
+                                && f.people.nameOf(id) == null && !html.contains("chess-ZQXJ") && !html.contains(id),
+                        r.head + " " + html);
             }
         });
 

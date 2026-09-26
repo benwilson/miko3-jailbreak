@@ -78,6 +78,49 @@ public final class RobotPeopleClient {
         });
     }
 
+    /** The person's notes (meeting plan U5, KTD10); PersonNotes.EMPTY for an
+     * unknown id. Throws LauncherProtocol.LAUNCHER_TOO_OLD as an IOException
+     * when the launcher predates notes. */
+    public static PersonNotes notesOf(Context context, final String id) throws IOException {
+        return parseNotes(call(context, DEFAULT_TIMEOUT_MS, new Call<String>() {
+            @Override
+            public String run(RobotPeople people) throws RemoteException {
+                return people.notesOf(id);
+            }
+        }));
+    }
+
+    /** Merges a delta (a PersonNotes JSON object) into the person's notes and
+     * answers the merged document. IOException with the store's or PersonNotes'
+     * fixed reason for an unknown id or a bad delta. */
+    public static PersonNotes mergeNotes(Context context, final String id, final String deltaJson) throws IOException {
+        return parseNotes(call(context, DEFAULT_TIMEOUT_MS, new Call<String>() {
+            @Override
+            public String run(RobotPeople people) throws RemoteException {
+                return people.mergeNotes(id, deltaJson);
+            }
+        }));
+    }
+
+    /** Wipes the person's face, name and notes (R18); false if unknown. */
+    public static boolean forget(Context context, final String id) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.forget(id);
+            }
+        });
+    }
+
+    private static PersonNotes parseNotes(String json) {
+        try {
+            return PersonNotes.parse(json);
+        } catch (IllegalArgumentException e) {
+            // The launcher writes these itself; anything else reads as no notes.
+            return PersonNotes.EMPTY;
+        }
+    }
+
     private static <T> T call(Context context, long timeoutMs, Call<T> call) throws IOException {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             throw new IllegalStateException("RobotPeopleClient blocks; call it off the main thread");
@@ -119,8 +162,11 @@ public final class RobotPeopleClient {
         } catch (SecurityException e) {
             throw new IOException("launcher people service refused this app");
         } catch (IllegalArgumentException e) {
-            // PeopleStore's fixed REFUSE_* reason.
+            // PeopleStore's or PersonNotes' fixed REFUSE_* reason.
             throw new IOException(e.getMessage());
+        } catch (UnsupportedOperationException e) {
+            // The Proxy's word for a transaction the launcher did not answer.
+            throw new IOException(LauncherProtocol.LAUNCHER_TOO_OLD);
         } catch (RemoteException e) {
             throw new IOException("launcher people service died");
         } finally {
