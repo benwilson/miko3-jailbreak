@@ -24,6 +24,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -77,6 +79,15 @@ final class ClaudeCuriosity implements CuriosityPort {
         @Override
         public Thread newThread(Runnable r) {
             Thread t = new Thread(r, "explore-claude");
+            t.setDaemon(true);
+            return t;
+        }
+    });
+    /** The ears listens' silence deadlines (Heard.NOTHING after maxMs): one daemon timer, no thread parked. */
+    private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "explore-claude-timer");
             t.setDaemon(true);
             return t;
         }
@@ -148,6 +159,7 @@ final class ClaudeCuriosity implements CuriosityPort {
         speech.close();
         ears.close();
         worker.shutdownNow();
+        timer.shutdownNow();
         // Waits for a crop still running, then frees the face model.
         cropper.close();
         metFaces.clear();
@@ -551,26 +563,40 @@ final class ClaudeCuriosity implements CuriosityPort {
             listen(maxMs);
             return;
         }
+        earsListen(s, maxMs, newcomerAngleDeg);
+    }
+
+    /**
+     * A listen through the ears session: the next utterance with words finishes
+     * WORDS; with none by maxMs the timer finishes NOTHING, unless that generation
+     * was replaced or answered meanwhile. newcomerAngleDeg is NaN for a meeting listen.
+     */
+    private void earsListen(final EarsAdapter s, long maxMs, float newcomerAngleDeg) {
         final int g = hearings.start();
-        s.listen(maxMs, newcomerAngleDeg, new EarsAdapter.Reply() {
+        // A newer listen retires this reply by replacing it in the session, and the
+        // session's close or loss clears it; the silence deadline retires it below.
+        final EarsAdapter.Reply reply = new EarsAdapter.Reply() {
             @Override
             public void heard(String transcript) {
                 hearings.finish(g, new Heard(Heard.Status.WORDS, transcript));
             }
-        });
-        run(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    Thread.sleep(maxMs);
-                } catch (InterruptedException e) {
-                    return;
+        };
+        s.listen(maxMs, newcomerAngleDeg, reply);
+        try {
+            timer.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    if (hearings.current(g) && hearings.poll() == null) {
+                        // Silence: retire the reply first, or the next utterance with
+                        // words would answer this dead listen instead of queuing as a cue.
+                        s.listenOver(reply);
+                        hearings.finish(g, Heard.NOTHING);
+                    }
                 }
-                if (hearings.current(g) && hearings.poll() == null) {
-                    hearings.finish(g, Heard.NOTHING);
-                }
-            }
-        }, null, g, null);
+            }, maxMs, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException e) {
+            // The timer has shut down with Explore: no silence deadline, as the pool gave none once shut.
+        }
     }
 
     /**
@@ -925,32 +951,14 @@ final class ClaudeCuriosity implements CuriosityPort {
 
     @Override
     public void listen(final long maxMs) {
-        final int g = hearings.start();
         final EarsAdapter s = session;
         if (s != null && s.isOpen()) {
             // One microphone capture per device (KTD1): with the session open the reply comes
             // through it; a listen that hears nothing in maxMs is silence, as the one-shot's is.
-            s.listen(maxMs, new EarsAdapter.Reply() {
-                @Override
-                public void heard(String transcript) {
-                    hearings.finish(g, new Heard(Heard.Status.WORDS, transcript));
-                }
-            });
-            run(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        Thread.sleep(maxMs);
-                    } catch (InterruptedException e) {
-                        return;
-                    }
-                    if (hearings.current(g) && hearings.poll() == null) {
-                        hearings.finish(g, Heard.NOTHING);
-                    }
-                }
-            }, null, g, null);
+            earsListen(s, maxMs, Float.NaN);
             return;
         }
+        final int g = hearings.start();
         ears.listen(maxMs, new RobotListenClient.Listener() {
             @Override
             public void onHeard(String transcript) {

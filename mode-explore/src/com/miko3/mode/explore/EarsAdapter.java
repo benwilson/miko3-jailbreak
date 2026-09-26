@@ -108,17 +108,22 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
             if (!open) {
                 return;
             }
-            open = false;
             c = client;
-            client = null;
-            queue.clear();
-            partial = null;
-            reply = null;
+            resetLocked();
         }
         Log.i(TAG, "ears closed: heard " + heardCount + ", dropped " + droppedCount + ", partial " + partialCount);
         if (c != null) {
             c.close();
         }
+    }
+
+    /** Back to closed with nothing pending: no client, no cues, no partial, no reply. Under lock. */
+    private void resetLocked() {
+        open = false;
+        client = null;
+        queue.clear();
+        partial = null;
+        reply = null;
     }
 
     boolean isOpen() {
@@ -167,6 +172,21 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         }
         if (c != null) {
             c.listen(maxMs);
+        }
+    }
+
+    /**
+     * Retires r once its listen is over (silence, or the brain moving on), but
+     * only while r is still the armed reply, so a newer listen's reply stays.
+     * Without this a reply whose listen ended in silence would capture the next
+     * utterance with words, which then never reached the cue queue.
+     */
+    void listenOver(Reply r) {
+        synchronized (lock) {
+            if (reply == r) {
+                reply = null;
+                replyAngleDeg = Float.NaN;
+            }
         }
     }
 
@@ -222,13 +242,16 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     @Override
     public void onLost(String reason) {
         Log.w(TAG, "ears lost: " + reason);
+        RobotEarsClient c;
         synchronized (lock) {
             // The brain re-opens on its own terms (the next charger clear or start); until then no cues come.
-            open = false;
-            client = null;
-            queue.clear();
-            partial = null;
-            reply = null;
+            c = client;
+            resetLocked();
+        }
+        if (c != null) {
+            // Unbind and stop its worker now, not at the next open: close() is
+            // idempotent and safe from the client's own worker, which calls here.
+            c.close();
         }
     }
 

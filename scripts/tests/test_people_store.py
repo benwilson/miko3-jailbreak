@@ -90,6 +90,7 @@ class PeopleStoreHarnessTest(unittest.TestCase):
         "malformed_notes_file_loads_as_empty",
         "gallery_excludes_nameless_records_store_still_lists_them",
         "entries_are_cleaned_and_matched_on_normalised_text",
+        "index_read_failure_skips_the_orphan_sweep",
     )
 
     @classmethod
@@ -164,6 +165,19 @@ class StoreSourceTest(unittest.TestCase):
         self.assertIn("delete()", load or "")
         recent = _method_body(src, "synchronized List<Person> recent")
         self.assertRegex(recent or "", r"name\.isEmpty\(\)")
+
+    def test_a_torn_index_read_skips_the_orphan_sweep(self):
+        src = _read(STORE)
+        load = _method_body(src, "private void load")
+        self.assertIsNotNone(load)
+        self.assertIn("boolean complete = !index.isFile() || readIndex(index);", load)
+        gate = load.index("if (!complete)")
+        self.assertLess(gate, load.index("delete()"), "the sweep runs before the read is known complete")
+        self.assertRegex(load[gate:], r"if \(!complete\) \{\s*return;")
+        read = _method_body(src, "private boolean readIndex")
+        self.assertIsNotNone(read, "readIndex does not report whether it reached the end")
+        self.assertRegex(read, r"while \(\(line = in\.readLine\(\)\) != null\)")
+        self.assertRegex(read, r"\}\s*return true;\s*\} catch \(IOException e\) \{[^}]*return false;")
 
     def test_nothing_is_logged(self):
         for path in (STORE, SERVICE, INTERFACE, CLIENT, NOTES):

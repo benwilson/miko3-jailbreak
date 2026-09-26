@@ -3,8 +3,12 @@ package com.miko3.launcher;
 import com.miko3.shared.PersonNotes;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -29,6 +33,54 @@ public final class PeopleStoreHarness {
     /** A small valid-looking JPEG: SOI marker, a tag byte, EOI marker. */
     static byte[] jpeg(int tag) {
         return new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) tag, 1, 2, 3, (byte) 0xFF, (byte) 0xD9};
+    }
+
+    /** Delivers the wrapped stream's bytes through the first newline, then
+     * fails every read after it: an index read that dies partway through. */
+    static final class FailAfterFirstLine extends InputStream {
+        private final InputStream in;
+        private boolean lineDelivered;
+
+        FailAfterFirstLine(InputStream in) {
+            this.in = in;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            return read(one, 0, 1) < 0 ? -1 : one[0] & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (lineDelivered) {
+                throw new IOException("index read failed partway");
+            }
+            int n = 0;
+            while (n < len) {
+                int c = in.read();
+                if (c < 0) {
+                    break;
+                }
+                b[off + n++] = (byte) c;
+                if (c == '\n') {
+                    lineDelivered = true;
+                    break;
+                }
+            }
+            return n == 0 && len > 0 ? -1 : n;
+        }
+
+        @Override
+        public void close() throws IOException {
+            in.close();
+        }
+    }
+
+    static List<String> sortedFiles(File dir) {
+        List<String> names = new ArrayList<String>(Arrays.asList(dir.list()));
+        Collections.sort(names);
+        return names;
     }
 
     static File tempDir() throws Exception {
@@ -651,6 +703,32 @@ public final class PeopleStoreHarness {
                                 && "rock climbing".equals(PersonNotes.normalize(" Rock-Climbing! "))
                                 && more.topics.equals(Arrays.asList(at80)),
                         notes.toJson() + " " + more.topics.size());
+            }
+        });
+
+        scenario("index_read_failure_skips_the_orphan_sweep", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                PeopleStore s = new PeopleStore(dir, new FakeClock());
+                String ann = s.add(jpeg(1), "Ann");
+                s.mergeNotes(ann, "{\"interests\":[\"chess\"]}");
+                String bob = s.add(jpeg(2), "Bob");
+                s.mergeNotes(bob, "{\"interests\":[\"go\"]}");
+                List<String> before = sortedFiles(dir);
+                // The index read delivers its first line, then fails: one person is
+                // loaded while the other's face and notes sit on disk, named only by
+                // the part of the index that was never read.
+                PeopleStore torn = new PeopleStore(dir, new FakeClock(), new PeopleStore.IndexOpener() {
+                    @Override
+                    public InputStream open(File index) throws IOException {
+                        return new FailAfterFirstLine(new FileInputStream(index));
+                    }
+                });
+                List<String> after = sortedFiles(dir);
+                int wholeAgain = new PeopleStore(dir, new FakeClock()).all().size();
+                check(n, before.size() == 5 && torn.all().size() == 1 && after.equals(before) && wholeAgain == 2,
+                        "torn load saw " + torn.all().size() + ", clean reload saw " + wholeAgain
+                                + ", before=" + before + " after=" + after);
             }
         });
 

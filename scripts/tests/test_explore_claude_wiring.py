@@ -143,7 +143,9 @@ class EarsAdapterWiringTest(unittest.TestCase):
             self.assertIn(call, body.group(1), method)
         listen = re.search(r"public void listen\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn("s.isOpen()", listen)
-        self.assertIn("s.listen(maxMs,", listen)
+        self.assertIn("earsListen(s, maxMs, Float.NaN)", listen)
+        ears_listen = re.search(r"private void earsListen\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("s.listen(maxMs, newcomerAngleDeg,", ears_listen)
         port = code_only(src("CuriosityPort.java"))
         self.assertRegex(port, r"void earsShoved\(long atMs\);")
         brain = code_only(src("ExploreBrain.java"))
@@ -162,6 +164,33 @@ class EarsAdapterWiringTest(unittest.TestCase):
         self.assertIn("c.setCharger(r.charger)", reading.group(1))
         self.assertIn("new Ears.Shove(", reading.group(1))
         self.assertIn("c.open(charger, this)", a)
+
+    def test_a_listen_that_ends_in_silence_retires_its_reply(self):
+        a = code_only(src("EarsAdapter.java"))
+        over = re.search(r"void listenOver\(Reply r\) \{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(over, "EarsAdapter has no listenOver(Reply)")
+        self.assertRegex(over.group(1), r"synchronized \(lock\) \{\s*if \(reply == r\) \{\s*reply = null;\s*replyAngleDeg = Float\.NaN;")
+        # onHeard routes an utterance to a reply only while one is armed, and disarms it as it does.
+        heard = re.search(r"public void onHeard\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("if (reply != null && words && !newcomer)", heard)
+        self.assertRegex(heard, r"r = reply;\s*reply = null;")
+        c = code_only(src("ClaudeCuriosity.java"))
+        ears_listen = re.search(r"private void earsListen\((.*?)\n    \}", c, re.S).group(1)
+        self.assertIn("final EarsAdapter.Reply reply = new EarsAdapter.Reply()", ears_listen)
+        self.assertIn("s.listen(maxMs, newcomerAngleDeg, reply);", ears_listen)
+        silence = re.search(r"if \(hearings\.current\(g\) && hearings\.poll\(\) == null\) \{(.*?)\n\s*\}", ears_listen, re.S)
+        self.assertIsNotNone(silence, "no silence branch")
+        self.assertRegex(silence.group(1), r"s\.listenOver\(reply\);\s*hearings\.finish\(g, Heard\.NOTHING\);")
+        self.assertEqual(ears_listen.count("hearings.finish(g, Heard.NOTHING)"), 1)
+
+    def test_a_lost_session_closes_its_client_outside_the_lock(self):
+        a = code_only(src("EarsAdapter.java"))
+        lost = re.search(r"public void onLost\(String reason\) \{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(lost)
+        lost = lost.group(1)
+        self.assertRegex(lost, r"synchronized \(lock\) \{\s*c = client;\s*resetLocked\(\);\s*\}")
+        self.assertRegex(lost, r"\}\s*if \(c != null\) \{\s*c\.close\(\);\s*\}")
+        self.assertNotRegex(lost, r"synchronized \(lock\) \{[^}]*close\(\)")
 
 
 class PromptsTest(unittest.TestCase):
@@ -527,7 +556,9 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertIn("RobotPeopleClient.add(app, face, name)", keep)
         self.assertNotIn("debugFace", keep)
         listen = re.search(r"public void chatListen\((.*?)\n    \}", a, re.S).group(1)
-        self.assertIn("s.listen(maxMs, newcomerAngleDeg,", listen)
+        self.assertIn("earsListen(s, maxMs, newcomerAngleDeg)", listen)
+        ears_listen = re.search(r"private void earsListen\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("s.listen(maxMs, newcomerAngleDeg,", ears_listen)
         conv = re.search(r"private MatchAnswer forConversation\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn("RobotSettingsClient.fetchConversation(app).persona", conv)
         self.assertIn("RobotPeopleClient.notesOf(app, personId)", conv)

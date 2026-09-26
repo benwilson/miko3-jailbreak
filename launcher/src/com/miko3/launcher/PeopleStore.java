@@ -75,6 +75,19 @@ final class PeopleStore {
         long nowMillis();
     }
 
+    /** Opens the index for reading: the file itself, or a stream a host test
+     * makes fail partway to prove a torn read never triggers the sweep. */
+    interface IndexOpener {
+        InputStream open(File index) throws IOException;
+    }
+
+    private static final IndexOpener FILE_OPENER = new IndexOpener() {
+        @Override
+        public InputStream open(File index) throws IOException {
+            return new FileInputStream(index);
+        }
+    };
+
     /** One remembered person, as of the call that returned it. */
     static final class Person {
         final String id;
@@ -91,13 +104,19 @@ final class PeopleStore {
 
     private final File dir;
     private final Clock clock;
+    private final IndexOpener indexOpener;
     private final SecureRandom random = new SecureRandom();
     // Most recently seen first.
     private final List<Person> people = new ArrayList<Person>();
 
     PeopleStore(File dir, Clock clock) {
+        this(dir, clock, FILE_OPENER);
+    }
+
+    PeopleStore(File dir, Clock clock, IndexOpener indexOpener) {
         this.dir = dir;
         this.clock = clock;
+        this.indexOpener = indexOpener;
         load();
     }
 
@@ -322,11 +341,14 @@ final class PeopleStore {
     /** Reads the index, skipping any line that is malformed or whose face
      * file is missing (a hand edit, or a crash between writing a face and the
      * index), then deletes every face or notes file whose id the index does
-     * not name: what a crash mid-add or mid-forget leaves behind (KTD10). */
+     * not name: what a crash mid-add or mid-forget leaves behind (KTD10). The
+     * sweep needs the whole index: after a read that failed partway, the
+     * people it never reached would look like orphans. */
     private void load() {
         File index = new File(dir, INDEX_FILE);
-        if (index.isFile()) {
-            readIndex(index);
+        boolean complete = !index.isFile() || readIndex(index);
+        if (!complete) {
+            return;
         }
         String[] names = dir.list();
         if (names == null) {
@@ -340,10 +362,12 @@ final class PeopleStore {
         }
     }
 
-    private void readIndex(File index) {
+    /** True when the index was read to its end; false when a read failed
+     * partway, so the index may name people that were never loaded. */
+    private boolean readIndex(File index) {
         BufferedReader in = null;
         try {
-            in = new BufferedReader(new InputStreamReader(new FileInputStream(index), StandardCharsets.UTF_8));
+            in = new BufferedReader(new InputStreamReader(indexOpener.open(index), StandardCharsets.UTF_8));
             String line;
             while ((line = in.readLine()) != null) {
                 String[] f = line.split("\t", -1);
@@ -358,8 +382,10 @@ final class PeopleStore {
                 }
                 people.add(new Person(f[0], cleanName(f[2]), seen));
             }
+            return true;
         } catch (IOException e) {
             // Keep whatever was read; the next write replaces the index whole.
+            return false;
         } finally {
             closeQuietly(in);
         }
