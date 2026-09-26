@@ -70,9 +70,13 @@ BUILD = APP_DIR / "build"
 # System.loadLibrary()s it, and the /system/lib64 copy is out of reach behind
 # linker namespace isolation (live test: NoClassDefFoundError SensorModule).
 # Same source as build-mode-explore.py and build-mode-remote-control.py.
+# libconexant_dsp_lib.so rides the same way (meeting plan U1, KTD4): the
+# voice-direction stubs under shared/src/com/example/conexantapi/ load it for
+# VoiceDirection, which only the launcher uses (it holds the microphone).
 VENDOR_ABI = "arm64-v8a"
 VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / VENDOR_ABI
 DRIVER_LIB = "libmiko_drivers.so"
+DSP_LIB = "libconexant_dsp_lib.so"
 
 KEYSTORE_ALIAS = "miko3launcher"
 KEYSTORE_PASS = "miko3launcher"
@@ -246,17 +250,26 @@ def voice_stamp(voice_dir):
 
 
 def vendor_native_libs(lib_dir=None):
-    """[(abi, so_path)] for the motor-driver library, or BuildError naming the
-    missing file and the directory searched."""
-    lib = Path(lib_dir if lib_dir is not None else VENDOR_LIB_DIR) / DRIVER_LIB
-    if not lib.is_file():
+    """[(abi, so_path)] for the motor-driver and voice-direction libraries, or
+    BuildError naming the missing file and the directory searched."""
+    lib_dir = Path(lib_dir if lib_dir is not None else VENDOR_LIB_DIR)
+    driver = lib_dir / DRIVER_LIB
+    if not driver.is_file():
         raise BuildError(
-            f"!! vendor motor-driver library missing: {lib}\n"
+            f"!! vendor motor-driver library missing: {driver}\n"
             "   it comes from ServiceExam's APK (lib/arm64-v8a/); re-extract it into "
             "tools/serviceexam_jadx/resources/ (jadx) before building the launcher.\n"
             "   Without it the drive lease's DirectMotorDriver cannot load SensorModule, "
             "and the launcher crashes when a mode takes the lease.")
-    return [(VENDOR_ABI, lib)]
+    dsp = lib_dir / DSP_LIB
+    if not dsp.is_file():
+        raise BuildError(
+            f"!! vendor voice-direction library missing: {dsp}\n"
+            "   it comes from ServiceExam's APK (lib/arm64-v8a/), next to libmiko_drivers.so; "
+            "re-extract it into tools/serviceexam_jadx/resources/ (jadx) before building the launcher.\n"
+            "   Without it VoiceDirection has no backend and the ears probe reports no angle "
+            "(meeting plan U1, KTD4).")
+    return [(VENDOR_ABI, driver), (VENDOR_ABI, dsp)]
 
 
 def main():
@@ -303,8 +316,11 @@ def main():
             res_dir=RES,
             native_libs=native_libs,
             jars=[sherpa_jar],
+            # One id with build-mode-explore.py (meeting plan U1): the QA scripts compare
+            # the two APKs' version names to know they came from the same tree.
+            version_name=bc.build_id(),
         )
-    print(f"\n== 4/4 BUILT: {APK.relative_to(REPO)} ({APK.stat().st_size} bytes) ==")
+    print(f"\n== 4/4 BUILT: {APK.relative_to(REPO)} ({APK.stat().st_size} bytes, build {bc.build_id()}) ==")
     return 0
 
 

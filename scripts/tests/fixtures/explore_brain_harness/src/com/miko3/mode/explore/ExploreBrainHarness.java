@@ -93,6 +93,12 @@ public final class ExploreBrainHarness {
         return new SensorReading(t, 300 + jitter(t), 100, 100, 2, false);
     }
 
+    /** Clear floor with the charger latch set (meeting plan U1, KTD6). */
+    static SensorReading charger(long t) {
+        return new SensorReading(t, 300 + jitter(t), 100, 100, null, false, false, 0, 0, false, 0, 0, 0,
+                true, false, 0, 0, 0);
+    }
+
     interface Feed {
         SensorReading at(long t);
     }
@@ -1412,6 +1418,33 @@ public final class ExploreBrainHarness {
             check(n, s == HazardClassifier.Status.HAZARD && h != null && h.kind == HazardClassifier.Kind.CPL
                             && cpl1 == HazardClassifier.Status.CLEAR,
                     "cpl2=" + s + " hazard=" + (h == null ? null : h.kind) + " cpl1=" + cpl1);
+        });
+        scenario("classifier_charger_flag_is_motion_refused", n -> {
+            // Docked (meeting plan U1, KTD6): the latched CPL=3 flag arrives on an
+            // otherwise clear reading and reads as motion refused, like CPL=2.
+            HazardClassifier c = new HazardClassifier(tuning().build());
+            feedClassifier(c, CLEAR, 100, 300);
+            c.offer(charger(400));
+            HazardClassifier.Status s = c.status(400);
+            HazardClassifier.Hazard h = c.hazard();
+            boolean docked = c.charger();
+            c.offer(clear(500));
+            boolean undocked = c.charger();
+            HazardClassifier c2 = ownerClassifier();
+            c2.offer(new SensorReading(100, 166, -1, 0, null, false, false, 0, 0, false, 0, 0, 0, true, false, 0, 0, 0));
+            HazardClassifier.ApproachVerdict v = c2.approach(100);
+            check(n, s == HazardClassifier.Status.HAZARD && h != null && h.kind == HazardClassifier.Kind.CPL
+                            && docked && !undocked && v == HazardClassifier.ApproachVerdict.CLOSE_REFUSED,
+                    "status=" + s + " hazard=" + (h == null ? null : h.kind) + " docked=" + docked
+                            + " undocked=" + undocked + " approach=" + v);
+        });
+        scenario("classifier_cpl2_is_forward_refused_never_charging", n -> {
+            HazardClassifier c = new HazardClassifier(tuning().build());
+            feedClassifier(c, CLEAR, 100, 300);
+            c.offer(cpl2(400));
+            HazardClassifier.Hazard h = c.hazard();
+            check(n, h != null && h.kind == HazardClassifier.Kind.CPL && !c.charger(),
+                    "hazard=" + (h == null ? null : h.kind) + " charger=" + c.charger());
         });
         scenario("classifier_absent_ir_is_never_an_edge", n -> {
             // Live records carry ir1 as all-'X' padding (absent, -1); with a "below"

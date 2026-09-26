@@ -34,6 +34,11 @@ SESSION = LAUNCHER / "ListenSession.java"
 SERVICE = LAUNCHER / "ListenService.java"
 ENGINE = LAUNCHER / "ListenEngine.java"
 APP = LAUNCHER / "LauncherApp.java"
+PROBE = LAUNCHER / "EarsProbe.java"
+DIRECTION = SHARED / "VoiceDirection.java"
+JNI_STUBS = REPO / "shared" / "src" / "com" / "example" / "conexantapi"
+VENDOR_JNI = REPO / "tools" / "serviceexam_jadx" / "sources" / "com" / "example" / "conexantapi"
+VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / "arm64-v8a"
 INTERFACE = SHARED / "RobotListen.java"
 CLIENT = SHARED / "RobotListenClient.java"
 PROTOCOL = SHARED / "LauncherProtocol.java"
@@ -186,6 +191,16 @@ class EngineWiringTest(unittest.TestCase):
     def test_checks_the_record_permission(self):
         self.assertIn("Manifest.permission.RECORD_AUDIO", self.src)
 
+    def test_probe_runs_on_the_listen_thread_with_the_session_claimed(self):
+        """Meeting plan U1: the ears probe borrows the one microphone through the
+        same claim a listen takes, so it can never record over a mode's listen."""
+        body = _method_body(self.src, "probe")
+        self.assertIsNotNone(body, "ListenEngine has no probe()")
+        claim, run = body.find("session.claim()"), body.find("thread.submit(")
+        self.assertGreaterEqual(claim, 0, "probe never claims the session")
+        self.assertGreater(run, claim, "probe runs before the claim")
+        self.assertIn("session.run(", body)
+
     def test_engine_made_once_by_the_app(self):
         app = _read(APP)
         self.assertEqual(app.count("new ListenEngine("), 1)
@@ -325,6 +340,48 @@ class BuildScriptTest(unittest.TestCase):
         self.assertIn('"listen"', self.src)
         self.assertRegex(self.src, r"listen_model\(\)")
 
+    def test_stages_the_dsp_direction_library_and_fails_without_it(self):
+        """Meeting plan U1, KTD4: libconexant_dsp_lib.so rides with libmiko_drivers.so;
+        a missing copy fails the build naming the file and the directory searched."""
+        b = self.build
+        self.assertEqual(b.DSP_LIB, "libconexant_dsp_lib.so")
+        libs = b.vendor_native_libs(VENDOR_LIB_DIR)
+        self.assertEqual(sorted(Path(p).name for _, p in libs), ["libconexant_dsp_lib.so", "libmiko_drivers.so"])
+        self.assertTrue(all(abi == "arm64-v8a" and Path(p).is_file() for abi, p in libs), libs)
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "libmiko_drivers.so").write_bytes(b"so")
+            with self.assertRaises(b.BuildError) as ctx:
+                b.vendor_native_libs(Path(td))
+        msg = str(ctx.exception)
+        self.assertIn("libconexant_dsp_lib.so", msg)
+        self.assertIn(td, msg)
+
+    def test_jni_stubs_match_the_vendor_symbols(self):
+        """The library resolves natives by package, class and method name, so the
+        stubs must carry the vendor's declarations exactly (docs/hardware/voice-mic.md section 3)."""
+        for name in ("ConexantDSP.java", "NCDsp.java"):
+            with self.subTest(file=name):
+                ours = _read(JNI_STUBS / name)
+                theirs = _read(VENDOR_JNI / name)
+                self.assertTrue(ours, f"{name} stub missing")
+                self.assertIn("package com.example.conexantapi;", ours)
+                self.assertIn('System.loadLibrary("conexant_dsp_lib")', ours)
+                natives = re.findall(r"public native [^;]+;", theirs)
+                self.assertTrue(natives, f"vendor {name} declares no natives")
+                for decl in natives:
+                    self.assertIn(" ".join(decl.split()), " ".join(ours.split()), decl)
+
+    def test_voice_direction_is_plain_java_and_names_its_backend(self):
+        raw = DIRECTION.read_text() if DIRECTION.exists() else ""
+        self.assertTrue(raw, "VoiceDirection.java missing")
+        self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
+        src = _strip_comments(raw)
+        for needle in ("enum Backend", "NONE", "CONEXANT", "NC", "getDSPRawDOA(", "getCurrentDOAStatus(",
+                       "initDSPComm(", "createUART(", "initNCUART("):
+            self.assertIn(needle, src)
+        # KTD4: the angle is sampled on its own thread at a caller-set cadence.
+        self.assertRegex(src, r"sample\(\s*(final\s+)?long\s+\w+")
+
     def test_built_apk_bundles_the_listen_model_when_present(self):
         apk = REPO / "launcher" / "miko3-launcher.apk"
         if not apk.exists() or apk.stat().st_mtime < BUILD_PY.stat().st_mtime:
@@ -356,7 +413,8 @@ def _log_word_offenders(paths):
 
 class ListenPrivacyLogTest(unittest.TestCase):
     def test_log_calls_never_carry_spoken_or_heard_words(self):
-        self.assertEqual(_log_word_offenders((SERVICE, ENGINE, SESSION, APP, LAUNCHER / "PeopleService.java", LAUNCHER / "PeopleStore.java")), [])
+        self.assertEqual(_log_word_offenders((SERVICE, ENGINE, SESSION, APP, PROBE, LAUNCHER / "PeopleService.java",
+                                              LAUNCHER / "PeopleStore.java")), [])
 
 
 if __name__ == "__main__":

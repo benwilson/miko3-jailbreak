@@ -20,11 +20,15 @@ import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.ModeRegistry;
 import com.miko3.shared.PageToken;
 import com.miko3.shared.RoutingHttpServer;
+import com.miko3.shared.VoiceDirection;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
 
 /**
  * Starts the launcher's HTTP server and the drive-lease coordinator once
@@ -74,6 +78,77 @@ public class LauncherApp extends Application {
     // engine's queue (no binding to our own SpeechService). Its lines are owned
     // by this object, so a mode's cancel() never drops them.
     private final SettingsPage.Speaker settingsSpeaker = new SettingsSpeaker();
+
+    // The ears probe (meeting plan U1, step 4): an owner-run dump of direction
+    // angles, capture level and recogniser timings, answering only while
+    // scripts/qa-ears-probe.py holds its nonce in a debug property. It borrows the
+    // microphone through the listen engine's own claim and never carries words.
+    private final EarsProbe.Props systemProps = new EarsProbe.Props() {
+        @Override
+        public String get(String key) {
+            return SpeechEngine.systemProperty(key);
+        }
+    };
+    private final EarsProbe.Clock probeClock = new EarsProbe.Clock() {
+        @Override
+        public long nowMs() {
+            return SystemClock.elapsedRealtime();
+        }
+    };
+    private final ProbeDirection probeDirection = new ProbeDirection();
+    private final EarsProbe.Runner probeRunner = new EarsProbe.Runner() {
+        @Override
+        public List<EarsProbe.Row> capture(EarsProbe.Tap tap, int seconds) throws Exception {
+            probeDirection.start();
+            try {
+                List<EarsProbe.Row> rows;
+                try {
+                    rows = listen.probe(tap, seconds).get();
+                } catch (ExecutionException e) {
+                    // A refused or failed listen (fixed reasons) is a 503, not a 500.
+                    if (e.getCause() instanceof IllegalStateException) {
+                        throw (IllegalStateException) e.getCause();
+                    }
+                    throw e;
+                }
+                Log.i(TAG, "ears probe: " + seconds + " s, " + rows.size() + " rows, direction "
+                        + VoiceDirection.open().backend() + " (" + VoiceDirection.open().detail() + ")");
+                return rows;
+            } finally {
+                probeDirection.stop();
+            }
+        }
+    };
+    private final EarsProbe earsProbe = new EarsProbe(systemProps, probeClock, settingsToken, probeDirection, probeRunner);
+
+    /** The vendor DSP's angle, sampled at 10 Hz (KTD4) on its own thread for the
+     * length of one probe capture. */
+    private static final class ProbeDirection implements EarsProbe.Direction {
+        static final long PERIOD_MS = 100;
+        private VoiceDirection.Sampler sampler;
+
+        @Override
+        public String backend() {
+            return VoiceDirection.open().backend().name().toLowerCase(Locale.ROOT);
+        }
+
+        synchronized void start() {
+            stop();
+            sampler = VoiceDirection.open().sample(PERIOD_MS);
+        }
+
+        @Override
+        public synchronized List<Float> drain() {
+            return sampler == null ? new ArrayList<Float>() : sampler.drain();
+        }
+
+        synchronized void stop() {
+            if (sampler != null) {
+                sampler.stop();
+                sampler = null;
+            }
+        }
+    }
 
     private final class SettingsSpeaker implements SettingsPage.Speaker {
         private volatile String voiceName;
@@ -305,6 +380,12 @@ public class LauncherApp extends Application {
         server.route(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_EARS_PROBE_PATH, new RoutingHttpServer.RouteHandler() {
+            @Override
+            public void handle(HttpRequest req, HttpResponse res) throws IOException {
+                earsProbe.handle(req, res);
+            }
+        });
         server.route(LauncherProtocol.LAUNCH_MODE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {

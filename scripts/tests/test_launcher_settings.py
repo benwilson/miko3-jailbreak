@@ -42,6 +42,8 @@ SETTINGS_PATHS = (
     "SETTINGS_PEOPLE_FORGET_PATH",
     "SETTINGS_PEOPLE_FACE_PATH",
 )
+PROBE = LAUNCHER / "EarsProbe.java"
+PROBE_SCRIPT = REPO / "scripts" / "qa-ears-probe.py"
 
 
 def _strip_comments(text):
@@ -195,6 +197,7 @@ class SettingsPageSourceTest(unittest.TestCase):
             "SETTINGS_CLAUDE_TEST_PATH": "/settings/claude/test",
             "SETTINGS_CLAUDE_FORGET_PATH": "/settings/claude/forget",
             "SETTINGS_VOICE_SAY_PATH": "/settings/voice/say",
+            "SETTINGS_EARS_PROBE_PATH": "/settings/ears-probe",
         }
         for name, path in expected.items():
             self.assertRegex(src, rf'public static final String {name} = "{re.escape(path)}";')
@@ -208,6 +211,35 @@ class SettingsPageSourceTest(unittest.TestCase):
         self.assertIn("speech.queue().speak(", self.app)
         self.assertRegex(self.app, r"new\s+PageToken\(\s*4\s*\)")
         self.assertRegex(self.app, r"new\s+ClaudeApi\(\s*new\s+ClaudeHttpsTransport\(\s*\)\s*\)")
+
+    def test_launcher_registers_the_ears_probe_route(self):
+        """Meeting plan U1: the probe is its own handler on the TLS settings path,
+        gated by the debug property and the page token, never by the URL."""
+        self.assertRegex(self.app, r"server\.route\(\s*LauncherProtocol\.SETTINGS_EARS_PROBE_PATH\s*,")
+        self.assertIn("earsProbe.handle(", self.app)
+        self.assertRegex(self.app, r"new\s+EarsProbe\(")
+        self.assertIn("settingsToken", self.app.split("new EarsProbe(", 1)[1].split(";", 1)[0])
+
+    def test_ears_probe_is_plain_java_and_never_logs(self):
+        raw = PROBE.read_text() if PROBE.exists() else ""
+        self.assertTrue(raw, "EarsProbe.java missing")
+        self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
+        stripped = _strip_comments(raw)
+        self.assertNotRegex(stripped, r"\bLog\.\w\(")
+        for needle in ("System.out", "System.err", "printStackTrace"):
+            self.assertNotIn(needle, stripped)
+        # No query parameter is read: the nonce and the token travel in the body only.
+        self.assertNotIn("queryParam(", stripped)
+        self.assertNotIn("req.query", stripped)
+
+    def test_ears_probe_property_matches_the_script(self):
+        java = re.search(r'PROPERTY\s*=\s*"([^"]+)"', PROBE.read_text() if PROBE.exists() else "")
+        py = re.search(r'^PROPERTY\s*=\s*"([^"]+)"', PROBE_SCRIPT.read_text() if PROBE_SCRIPT.exists() else "",
+                       flags=re.M)
+        self.assertIsNotNone(java, "EarsProbe declares no PROPERTY")
+        self.assertIsNotNone(py, "qa-ears-probe.py declares no PROPERTY")
+        self.assertEqual(java.group(1), py.group(1))
+        self.assertTrue(java.group(1).startswith("debug."), "apps may only set/read debug.* properties over adb")
 
     def test_page_reads_no_query_parameter_but_status(self):
         # No settings path takes the key (or anything else) from the URL, which
@@ -339,6 +371,13 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "face_get_serves_the_jpeg",
         "face_get_refuses_unknown_and_bad_ids",
         "people_paths_are_tls_only",
+        "ears_probe_is_404_without_the_property",
+        "ears_probe_is_404_on_a_get",
+        "ears_probe_is_404_with_a_wrong_nonce_or_no_token",
+        "ears_probe_is_404_fifteen_minutes_after_the_property_was_first_read",
+        "ears_probe_rows_carry_counts_and_match_flags_never_text",
+        "ears_probe_clamps_seconds_and_reports_a_busy_microphone",
+        "ears_probe_path_is_tls_only",
     )
 
     @classmethod

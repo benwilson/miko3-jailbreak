@@ -3,6 +3,7 @@ package com.miko3.launcher;
 import com.miko3.shared.ClaudeApi;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
+import com.miko3.shared.Json;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.PageToken;
 
@@ -132,6 +133,141 @@ public final class SettingsPageHarness {
 
     static byte[] jpeg(int tag) {
         return new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) tag, 1, 2, 3, (byte) 0xFF, (byte) 0xD9};
+    }
+
+
+    // ---- ears probe (meeting plan U1): fakes for the property, the clock, the direction and the capture ----
+
+    static final class FakeProps implements EarsProbe.Props {
+        final Map<String, String> values = new HashMap<String, String>();
+
+        public String get(String key) {
+            String v = values.get(key);
+            return v == null ? "" : v;
+        }
+    }
+
+    static final class FakeClock implements EarsProbe.Clock {
+        long now = 1_700_000_000_000L;
+
+        public long nowMs() {
+            return now;
+        }
+    }
+
+    /** Answers the scripted sample lists, one per drain, then nothing. */
+    static final class FakeDirection implements EarsProbe.Direction {
+        final List<List<Float>> drains = new ArrayList<List<Float>>();
+
+        public String backend() {
+            return "fake";
+        }
+
+        public List<Float> drain() {
+            return drains.isEmpty() ? new ArrayList<Float>() : drains.remove(0);
+        }
+    }
+
+    /** A microphone of steady 0.25 amplitude (RMS 8192 in 16-bit terms), in 80 ms chunks. */
+    static final class FakeMic implements ListenSession.Mic {
+        boolean closed;
+
+        public int read(float[] buf) {
+            for (int i = 0; i < buf.length; i++) {
+                buf[i] = (i % 2 == 0) ? 0.25f : -0.25f;
+            }
+            return buf.length;
+        }
+
+        public void close() {
+            closed = true;
+        }
+    }
+
+    /** Hears "hello" through the first row (which closes on the 13th chunk, 16640
+     * samples) and "hello robot friend" from the second row on. */
+    static final class FakeRecognizer implements ListenSession.Recognizer {
+        long samples;
+        boolean closed;
+
+        public void accept(float[] s, int n) {
+            samples += n;
+        }
+
+        public boolean isEndpoint() {
+            return true; // the tap must ignore this and run to the cap
+        }
+
+        public String text() {
+            return samples < 20000 ? "hello" : "hello robot friend";
+        }
+
+        public void finish() {
+        }
+
+        public void close() {
+            closed = true;
+        }
+    }
+
+    /** The launcher's capture, minus the thread and the claim: the tapped fakes through
+     * ListenSession.capture, the very loop the real listen uses. */
+    static final class FakeRunner implements EarsProbe.Runner {
+        final FakeMic mic = new FakeMic();
+        final FakeRecognizer rec = new FakeRecognizer();
+        int seconds = -1;
+        RuntimeException fail;
+
+        public List<EarsProbe.Row> capture(EarsProbe.Tap tap, int seconds) {
+            this.seconds = seconds;
+            if (fail != null) {
+                throw fail;
+            }
+            ListenSession.Mic m = tap.mic(mic);
+            ListenSession.Recognizer r = tap.recognizer(rec);
+            ListenSession.capture(m, r, seconds * 1000L);
+            m.close();
+            r.close();
+            return tap.rows();
+        }
+    }
+
+    static final class Probe {
+        final FakeProps props = new FakeProps();
+        final FakeClock clock = new FakeClock();
+        final FakeDirection direction = new FakeDirection();
+        final FakeRunner runner = new FakeRunner();
+        final PageToken token = new PageToken(4);
+        final EarsProbe probe = new EarsProbe(props, clock, token, direction, runner);
+
+        /** The property set the way scripts/qa-ears-probe.py sets it. */
+        Probe armed(String nonce) {
+            props.values.put(EarsProbe.PROPERTY, nonce);
+            return this;
+        }
+    }
+
+    static Resp probeRequest(Probe p, String method, String form) throws Exception {
+        Map<String, String> headers = new HashMap<String, String>();
+        headers.put("host", "192.168.19.74:8443");
+        byte[] body = form == null ? new byte[0] : form.getBytes(StandardCharsets.UTF_8);
+        HttpRequest req = new HttpRequest(method, LauncherProtocol.SETTINGS_EARS_PROBE_PATH,
+                HttpRequest.parseQuery(""), headers, new ByteArrayInputStream(body));
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        p.probe.handle(req, new HttpResponse(out));
+        String raw = new String(out.toByteArray(), StandardCharsets.UTF_8);
+        int split = raw.indexOf("\r\n\r\n");
+        Resp r = new Resp();
+        r.head = split < 0 ? raw : raw.substring(0, split);
+        r.body = split < 0 ? "" : raw.substring(split + 4);
+        r.bytes = new byte[0];
+        return r;
+    }
+
+    static Resp probePost(Probe p, String nonce, int seconds, String phrase) throws Exception {
+        String form = "t=" + p.token.issue() + "&nonce=" + nonce + "&seconds=" + seconds
+                + (phrase == null ? "" : "&phrase=" + enc(phrase));
+        return probeRequest(p, "POST", form);
     }
 
     static final class Resp {
@@ -984,6 +1120,98 @@ public final class SettingsPageHarness {
                                 && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH)
                                 && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH),
                         "a people path is served on plain HTTP");
+            }
+        });
+
+        // ---- ears probe (meeting plan U1, step 4) ----
+        scenario("ears_probe_is_404_without_the_property", new Scenario() {
+            public void run(String n) throws Exception {
+                Probe p = new Probe();
+                Resp r = probePost(p, "abc", 2, null);
+                check(n, r.code() == 404 && p.runner.seconds == -1, "code=" + r.code() + " ran=" + p.runner.seconds);
+            }
+        });
+        scenario("ears_probe_is_404_on_a_get", new Scenario() {
+            public void run(String n) throws Exception {
+                Probe p = new Probe().armed("abc");
+                Resp r = probeRequest(p, "GET", null);
+                check(n, r.code() == 404 && p.runner.seconds == -1, "code=" + r.code() + " ran=" + p.runner.seconds);
+            }
+        });
+        scenario("ears_probe_is_404_with_a_wrong_nonce_or_no_token", new Scenario() {
+            public void run(String n) throws Exception {
+                Probe p = new Probe().armed("abc");
+                Resp wrong = probePost(p, "abd", 2, null);
+                Resp noToken = probeRequest(p, "POST", "nonce=abc&seconds=2");
+                Resp staleToken = probeRequest(p, "POST", "t=0123456789abcdef&nonce=abc&seconds=2");
+                check(n, wrong.code() == 404 && noToken.code() == 404 && staleToken.code() == 404
+                                && p.runner.seconds == -1,
+                        "wrong=" + wrong.code() + " noToken=" + noToken.code() + " stale=" + staleToken.code()
+                                + " ran=" + p.runner.seconds);
+            }
+        });
+        scenario("ears_probe_is_404_fifteen_minutes_after_the_property_was_first_read", new Scenario() {
+            public void run(String n) throws Exception {
+                Probe p = new Probe().armed("abc");
+                Resp first = probePost(p, "abc", 1, null);
+                p.clock.now += EarsProbe.WINDOW_MS - 1;
+                Resp inside = probePost(p, "abc", 1, null);
+                p.clock.now += 1;
+                Resp after = probePost(p, "abc", 1, null);
+                // A fresh run (a new nonce in the property) opens a new window.
+                p.armed("def");
+                Resp fresh = probePost(p, "def", 1, null);
+                check(n, first.code() == 200 && inside.code() == 200 && after.code() == 404 && fresh.code() == 200,
+                        "first=" + first.code() + " inside=" + inside.code() + " after=" + after.code()
+                                + " fresh=" + fresh.code());
+            }
+        });
+        scenario("ears_probe_rows_carry_counts_and_match_flags_never_text", new Scenario() {
+            public void run(String n) throws Exception {
+                Probe p = new Probe().armed("abc");
+                p.direction.drains.add(new ArrayList<Float>(java.util.Arrays.asList(10f, 30f, 12f, 9f, 11f)));
+                Resp r = probePost(p, "abc", 2, "Hello, robot!");
+                Object parsed = r.code() == 200 ? Json.parse(r.body) : null;
+                List<?> rows = parsed instanceof Map ? (List<?>) ((Map<?, ?>) parsed).get("rows") : null;
+                Map<?, ?> row1 = rows != null && rows.size() == 2 ? (Map<?, ?>) rows.get(0) : null;
+                Map<?, ?> row2 = rows != null && rows.size() == 2 ? (Map<?, ?>) rows.get(1) : null;
+                boolean shape = row1 != null && row2 != null
+                        && Long.valueOf(1).equals(row1.get("second")) && Long.valueOf(2).equals(row2.get("second"))
+                        && Double.valueOf(11.0).equals(row1.get("angle")) && row2.get("angle") == null
+                        && row2.containsKey("angle")
+                        && Long.valueOf(8192).equals(row1.get("rms"))
+                        && ((Long) row1.get("decode_ms")) >= 0 && ((Long) row1.get("chunks")) > 0
+                        && Long.valueOf(1).equals(row1.get("words")) && Boolean.FALSE.equals(row1.get("matched"))
+                        && Long.valueOf(3).equals(row2.get("words")) && Boolean.TRUE.equals(row2.get("matched"));
+                String lower = (r.head + r.body).toLowerCase();
+                boolean noWords = !lower.contains("hello") && !lower.contains("robot") && !lower.contains("friend")
+                        && !lower.contains("\"text\"");
+                check(n, r.code() == 200 && shape && noWords && p.runner.seconds == 2
+                                && "fake".equals(((Map<?, ?>) parsed).get("backend"))
+                                && p.runner.mic.closed && p.runner.rec.closed,
+                        "code=" + r.code() + " body=" + r.body);
+            }
+        });
+        scenario("ears_probe_clamps_seconds_and_reports_a_busy_microphone", new Scenario() {
+            public void run(String n) throws Exception {
+                Probe p = new Probe().armed("abc");
+                Resp big = probePost(p, "abc", 999, null);
+                int clamped = p.runner.seconds;
+                Resp none = probeRequest(p, "POST", "t=" + p.token.issue() + "&nonce=abc");
+                int defaulted = p.runner.seconds;
+                p.runner.fail = new IllegalStateException(ListenSession.REFUSE_BUSY);
+                Resp busy = probePost(p, "abc", 2, null);
+                check(n, big.code() == 200 && clamped == EarsProbe.MAX_SECONDS && none.code() == 200
+                                && defaulted == EarsProbe.DEFAULT_SECONDS && busy.code() == 503
+                                && busy.body.contains(ListenSession.REFUSE_BUSY),
+                        "big=" + big.code() + " clamped=" + clamped + " defaulted=" + defaulted
+                                + " busy=" + busy.code() + " " + busy.body);
+            }
+        });
+        scenario("ears_probe_path_is_tls_only", new Scenario() {
+            public void run(String n) {
+                check(n, LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_EARS_PROBE_PATH),
+                        "the probe path is served on plain HTTP");
             }
         });
 

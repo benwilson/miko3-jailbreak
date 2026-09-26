@@ -134,6 +134,9 @@ public final class DirectMotorDriver {
     private volatile SensorSnapshot latestSensors;
     /** When a reply last carried CPL=2 (the MCU refusing forward motion), or 0 if never. */
     private volatile long lastRefusalMs;
+    /** The charger latch (meeting plan U1, KTD6): set by a reply carrying CPL=3, cleared by a
+     * later motion acknowledgement with another value (SensorReply.chargerLatch). */
+    private volatile boolean chargerLatched;
 
     /** How long the keepalive waits before retrying after a failed write, doubling to the cap. */
     private static final int RECONNECT_BACKOFF_MS = 200;
@@ -255,6 +258,13 @@ public final class DirectMotorDriver {
         return lastRefusalMs;
     }
 
+    /** True from the last reply carrying CPL=3 (charger connected, motion stopped) until a
+     * later motion acknowledgement carries another value; POWER replies, which carry no
+     * CPL, leave it as it is. False before any reply. */
+    public boolean chargerLatched() {
+        return chargerLatched;
+    }
+
     /** The literal 10-byte reply SocialInteraction_SpeechChat.SendData() checks for
      * (confirmed from source) that signals the UART itself needs resetting — a
      * condition a write-only FileOutputStream had no way to ever detect at all. */
@@ -320,6 +330,7 @@ public final class DirectMotorDriver {
             if (SensorReply.parseCpl(text) == 2) {
                 lastRefusalMs = now;
             }
+            chargerLatched = SensorReply.chargerLatch(chargerLatched, text);
         }
         if (reply != null && reply.length == ERROR_UART.length()
                 && new String(reply, StandardCharsets.US_ASCII).equals(ERROR_UART)) {

@@ -70,6 +70,10 @@ public final class LauncherProtocol {
      * so it is TLS-only like the rest (isTlsOnlyPath): a face never crosses the
      * network in cleartext. */
     public static final String SETTINGS_PEOPLE_FACE_PATH = "/settings/people/face";
+    /** The ears probe (meeting plan U1): POST with the page token and the nonce held by
+     * the launcher's debug property answers per-second direction and recogniser rows;
+     * 404 otherwise. Under SETTINGS_PATH, so TLS-only. Owner tooling: scripts/qa-ears-probe.py. */
+    public static final String SETTINGS_EARS_PROBE_PATH = "/settings/ears-probe";
 
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;

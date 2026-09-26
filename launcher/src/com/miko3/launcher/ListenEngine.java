@@ -27,7 +27,10 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 
@@ -65,6 +68,9 @@ final class ListenEngine implements ListenSession.Ears {
     private final Context context;
     private final ListenSession session;
     private volatile OnlineRecognizer recognizer;
+    /** The ears probe's tap on the running listen (meeting plan U1), or null. Set and
+     * cleared on the listen thread around the one session.run() it wraps. */
+    private volatile EarsProbe.Tap tap;
     private final ExecutorService thread = Executors.newSingleThreadExecutor(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
@@ -105,6 +111,35 @@ final class ListenEngine implements ListenSession.Ears {
             public void run() {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
                 answer.answer(session.run(maxMs));
+            }
+        });
+    }
+
+    /**
+     * The ears probe (meeting plan U1, step 4): claims the microphone exactly as a
+     * listen does (IllegalStateException with REFUSE_BUSY or REFUSE_UNAVAILABLE at
+     * once when it cannot), then runs one capped listen on the listen thread with
+     * the probe's tap on the microphone and the recogniser. The listen's own
+     * transcript is dropped; the Future carries the tap's per-second rows, or an
+     * IllegalStateException with the listen's fixed failure reason (FAIL_*).
+     */
+    Future<List<EarsProbe.Row>> probe(final EarsProbe.Tap probeTap, final int seconds) {
+        session.claim();
+        return thread.submit(new Callable<List<EarsProbe.Row>>() {
+            @Override
+            public List<EarsProbe.Row> call() {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+                tap = probeTap;
+                ListenSession.Result r;
+                try {
+                    r = session.run(seconds * 1000L);
+                } finally {
+                    tap = null;
+                }
+                if (r.outcome == ListenSession.Outcome.FAILED) {
+                    throw new IllegalStateException(r.reason);
+                }
+                return probeTap.rows();
             }
         });
     }
@@ -207,7 +242,8 @@ final class ListenEngine implements ListenSession.Ears {
             throw new IOException("microphone did not start recording");
         }
         Log.i(TAG, "microphone open (VOICE_COMMUNICATION, 16 kHz mono, buffer " + minBuf + ")");
-        return new ListenSession.Mic() {
+        EarsProbe.Tap t = tap;
+        ListenSession.Mic mic = new ListenSession.Mic() {
             private final short[] pcm = new short[ListenSession.CHUNK_SAMPLES];
             private double sumSquares;
             private long count;
@@ -242,13 +278,15 @@ final class ListenEngine implements ListenSession.Ears {
                 Log.i(TAG, "microphone closed after " + count + " samples, RMS " + rms + ", peak " + peak);
             }
         };
+        return t == null ? mic : t.mic(mic);
     }
 
     @Override
     public ListenSession.Recognizer newRecognizer() {
         final OnlineRecognizer r = recognizer;
         final OnlineStream stream = r.createStream();
-        return new ListenSession.Recognizer() {
+        EarsProbe.Tap t = tap;
+        ListenSession.Recognizer rec = new ListenSession.Recognizer() {
             @Override
             public void accept(float[] samples, int n) {
                 stream.acceptWaveform(n == samples.length ? samples : Arrays.copyOf(samples, n),
@@ -284,6 +322,7 @@ final class ListenEngine implements ListenSession.Ears {
                 }
             }
         };
+        return t == null ? rec : t.recognizer(rec);
     }
 
     // ---- model files ----

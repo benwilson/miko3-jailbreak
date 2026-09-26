@@ -38,6 +38,15 @@ public final class SensorSnapshot {
     public final int gyroX;
     public final int gyroY;
     public final int gyroZ;
+    /** True when the record carried a whole IMUAC= section (meeting plan U1, KTD5).
+     * The fields are signed, so -1 is a real value there: check this, not ABSENT. */
+    public final boolean hasAccel;
+    /** The raw accelerometer values from IMUAC=, in the controller's counts; ABSENT
+     * when !hasAccel. Which axis points where, and what a shove looks like, come from
+     * the owner-run measurement (meeting plan U2), never from here. */
+    public final int accelX;
+    public final int accelY;
+    public final int accelZ;
 
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2) {
         this(timestampMs, tof, ir1, ir2, ABSENT, ABSENT);
@@ -56,9 +65,19 @@ public final class SensorSnapshot {
                 true, gyroX, gyroY, gyroZ);
     }
 
-    /** Every field, with explicit presence for the signed wheel counts and gyro rates. */
+    /** Every field but the accelerometer, with explicit presence for the signed wheel
+     * counts and gyro rates. */
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, boolean hasWheels, long wheelLeft,
                           long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ) {
+        this(timestampMs, tof, ir1, ir2, hasWheels, wheelLeft, wheelRight, hasGyro, gyroX, gyroY, gyroZ,
+                false, ABSENT, ABSENT, ABSENT);
+    }
+
+    /** Every field, with explicit presence for the signed wheel counts, gyro rates and
+     * accelerometer values. */
+    public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, boolean hasWheels, long wheelLeft,
+                          long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ,
+                          boolean hasAccel, int accelX, int accelY, int accelZ) {
         this.timestampMs = timestampMs;
         this.tof = tof;
         this.ir1 = ir1;
@@ -71,12 +90,18 @@ public final class SensorSnapshot {
         this.gyroX = gyroX;
         this.gyroY = gyroY;
         this.gyroZ = gyroZ;
+        this.hasAccel = hasAccel;
+        this.accelX = hasAccel ? accelX : ABSENT;
+        this.accelY = hasAccel ? accelY : ABSENT;
+        this.accelZ = hasAccel ? accelZ : ABSENT;
     }
 
     @Override
     public String toString() {
         return "SensorSnapshot{t=" + timestampMs + " tof=" + tof + " ir1=" + ir1 + " ir2=" + ir2
                 + (hasWheels ? " wheels=" + wheelLeft + "/" + wheelRight : "")
-                + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "") + (fault ? " FAULT" : "") + "}";
+                + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "")
+                + (hasAccel ? " accel=" + accelX + "," + accelY + "," + accelZ : "")
+                + (fault ? " FAULT" : "") + "}";
     }
 }

@@ -527,8 +527,10 @@ class LauncherDriverLibTest(unittest.TestCase):
     def test_present_lib_is_an_arm64_entry(self):
         if not (self.VENDOR_DIR / "libmiko_drivers.so").is_file():
             self.skipTest("vendor library not extracted")
-        self.assertEqual(self.build.vendor_native_libs(self.VENDOR_DIR),
-                         [("arm64-v8a", self.VENDOR_DIR / "libmiko_drivers.so")])
+        # The voice-direction library rides along (meeting plan U1; test_listen_service.py).
+        libs = self.build.vendor_native_libs(self.VENDOR_DIR)
+        self.assertIn(("arm64-v8a", self.VENDOR_DIR / "libmiko_drivers.so"), libs)
+        self.assertTrue(all(abi == "arm64-v8a" for abi, _ in libs), libs)
 
     def test_missing_lib_fails_clearly_before_any_toolchain_work(self):
         with tempfile.TemporaryDirectory() as td:

@@ -405,8 +405,8 @@ final class SpeechEngine implements SpeechQueue.Voice, Runnable {
     }
 
     /** android.os.SystemProperties.get(key), which apps may read; "" if unset
-     * or unreadable. */
-    private static String systemProperty(String key) {
+     * or unreadable. Also the ears probe's gate (LauncherApp, meeting plan U1). */
+    static String systemProperty(String key) {
         try {
             Class<?> c = Class.forName("android.os.SystemProperties");
             Method get = c.getMethod("get", String.class, String.class);

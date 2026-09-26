@@ -68,6 +68,8 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "classifier_flapping_needs_a_new_streak",
         "classifier_thresholds_report_edge_and_obstacle_sides",
         "classifier_cpl2_is_a_hazard",
+        "classifier_charger_flag_is_motion_refused",
+        "classifier_cpl2_is_forward_refused_never_charging",
         "classifier_absent_ir_is_never_an_edge",
         "classifier_one_ir_channel_gives_no_side",
         "classifier_edge_held_past_frozen_window_stays_a_hazard",

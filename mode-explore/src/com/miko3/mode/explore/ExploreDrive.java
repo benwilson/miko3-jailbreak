@@ -317,8 +317,11 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         // keepalive shows up as the readings going stale.
         lastSnapshot = s;
         // The wheel counts are signed (reverse counts down past 0): presence is its own flag.
+        // The charger latch (meeting plan U1, KTD6) is the driver's, not the reply's:
+        // it rides on the next reading after the acknowledgement that set or cleared it.
         lastReading = new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false,
-                s.hasWheels, s.wheelLeft, s.wheelRight, s.hasGyro, s.gyroX, s.gyroY, s.gyroZ);
+                s.hasWheels, s.wheelLeft, s.wheelRight, s.hasGyro, s.gyroX, s.gyroY, s.gyroZ,
+                d.chargerLatched(), s.hasAccel, s.accelX, s.accelY, s.accelZ);
         return lastReading;
     }
 

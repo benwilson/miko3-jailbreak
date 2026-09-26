@@ -15,10 +15,12 @@ scripts/build-bootagent.py is intentionally NOT ported onto this module —
 its native-neuterd-compile and base64-injection steps are unique to that
 app and out of this refactor's scope.
 """
+import hashlib
 import os
 import shutil
 import subprocess
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 BUILD_TOOLS = "35.0.0"
@@ -217,11 +219,41 @@ def compile_resources(bt, res_dir, build_dir):
     return compiled
 
 
-def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None, res_zip=None, native_libs=None):
+def build_id(repo=None):
+    """One id for the tree an APK is built from (meeting plan U1): the short commit,
+    plus "+<8 hex>" over the working-tree diff and the untracked file names when the
+    tree is dirty. Two builds from the same tree get the same id, so a QA script can
+    tell whether the launcher and a mode came from one build by comparing their
+    version names. Without git (or a commit) it is a UTC timestamp, still an id."""
+    root = Path(repo) if repo is not None else Path(__file__).resolve().parent.parent
+
+    def git(*args):
+        r = subprocess.run(["git", *args], cwd=str(root), capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode(errors="replace").strip())
+        return r.stdout
+
+    try:
+        head = git("rev-parse", "--short=12", "HEAD").decode().strip()
+        diff = git("diff", "HEAD", "--binary", "--no-ext-diff")
+        untracked = git("ls-files", "--others", "--exclude-standard", "-z")
+    except (OSError, RuntimeError):
+        return "nogit-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if not diff and not untracked:
+        return head
+    return f"{head}+{hashlib.sha256(diff + b'\0' + untracked).hexdigest()[:8]}"
+
+
+def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None, res_zip=None, native_libs=None,
+                  version_name=None):
     print("== 2/4 aapt2 link + add dex ==")
     unsigned = build_dir / "unsigned.apk"
     cmd = [bt / "aapt2", "link", "-I", str(android_jar), "--manifest", str(manifest),
            "--min-sdk-version", "28", "--target-sdk-version", "28", "-o", str(unsigned)]
+    if version_name is not None:
+        # The manifests carry a placeholder versionName; --replace-version makes the
+        # build id win over it (build_id() above).
+        cmd += ["--version-name", str(version_name), "--replace-version"]
     if assets_dir is not None:
         cmd += ["-A", str(assets_dir)]
     if res_zip is not None:
@@ -286,11 +318,13 @@ def sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore
 def build_apk(src_dirs, manifest, android_jar, javac, bt, keytool, java_home_dir,
               build_dir, keystore, keystore_alias, keystore_pass, keystore_cn,
               apk_out, asset_sources=None, res_dir=None, native_libs=None, asset_exclude=(),
-              jars=()):
-    """Full pipeline: compile_java -> stage_assets -> compile_resources -> link_and_pack -> sign."""
+              jars=(), version_name=None):
+    """Full pipeline: compile_java -> stage_assets -> compile_resources -> link_and_pack -> sign.
+    version_name, when given, replaces the manifest's versionName (see build_id())."""
     compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir, jars)
     assets_dir = stage_assets(asset_sources, build_dir, asset_exclude) if asset_sources else None
     res_zip = compile_resources(bt, res_dir, build_dir) if res_dir else None
-    withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip, native_libs)
+    withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip, native_libs,
+                            version_name=version_name)
     sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore_pass,
          keystore_cn, build_dir, apk_out)
