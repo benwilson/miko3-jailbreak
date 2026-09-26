@@ -503,6 +503,78 @@ conditions. On the plant test frame it still found both pots and a plant (vase 0
 succulent 0.47 and 0.27; the false "table" dropped out). 288x384 was barely faster and
 scored the plants lower. Small or distant things are what a smaller input loses.
 
+## 11. Explore's camera while roaming — MEASURED (2026-09-25)
+
+Explore camera navigation (`docs/plans/2026-09-25-1030-feat-explore-camera-navigation-plan.md`,
+KTD2, U3, U4, U9) changed the camera rule. **The camera now stays open while he
+roams**, not only during a curiosity stop and an approach. This replaces the
+camera-curiosity plan's R2 ("off while he simply wanders"). Each look gives the
+detector's boxes and an openness profile, and the brain steers by it. The floor
+sensor, stall sensing and the controller's `CPL=2` refusal still stop him; the
+camera never stops him on its own.
+
+**Cost and fallback.** An open camera costs most of a CPU core. If running it while
+roaming makes him run hot, drains the battery noticeably faster, makes the driver
+fail repeatedly, or makes him visibly lag, the plan falls back to stopping to look
+before each leg: `setprop log.tag.MikoExploreLookThenGo DEBUG`, then restart the
+mode. `qa-explore-mode.py --only nav` samples CPU temperature
+(`/sys/class/thermal/thermal_zone*/temp`) and the battery level at the start and end
+of a 10-minute roam for that call.
+
+**Self-adjusting exposure (U9, `Brightness`).** The camera sets its own manual
+exposure (`CONTROL_AE_MODE_OFF`, the path remote-control already proved safe). It
+steers exposure time x sensitivity toward a mid-grey mean luma in small steps with
+hysteresis, so it does not hunt. The exposure cap is one 15 fps frame while he
+drives (motion blur) and longer while he stands still. **It never touches the
+frame-rate range:** on this HAL a variable fps range trips the "pixel rate should
+not be zero" bug (`camerahalserver` spins a core, and stream configuration then
+fails). The same bug can follow a cold power-up; restarting `cameraserver` and
+`camerahalserver` as root (`setprop ctl.restart`, never `kill -9`) clears that one
+(`docs/TODO.md`, "Recover a wedged camera at boot").
+
+**Openness horizon at 0.8 of frame height (`Openness.HORIZON`).** The camera sits
+about 10 cm up and tilts upward, so its horizon is well below the middle of the
+frame. In the U3 gate frames the far floor seen through a doorway ends at about
+0.85, and a wall 2-3 ft away meets the floor at about 0.98. Floor never shows above
+the horizon. Whatever crosses it and reaches down into the lower frame is standing
+in the way, and the further down it reaches, the nearer it is. Colour never
+overrules the horizon: a grey wall can match a grey carpet.
+
+**Steering and re-aim.** The drive cannot curve, so steering happens between and
+within legs:
+- At each leg decision the brain waits up to `steerWaitMs` (2 s) for a fresh look
+  taken since the last turn settled; with none in time it chooses as before.
+  `RoamSteer` then bends toward the most open band, shortens the leg in proportion
+  when the way is partly blocked, and prefers a remembered open doorway and fresh
+  ground (U10).
+- Mid-leg, a fresh look whose best open band lies 15° or more off centre stops the
+  leg, turns toward it by the gyro (at most 30°), and drives the leg's remaining
+  ticks. At most one re-aim every 2 s, none with fewer than 2 ticks left, and never
+  toward a side a turn has just failed to turn.
+- A look is only used if it was taken after the last turn ended. A stop that wrongly
+  marked every leg end as a turn once discarded every look, so nothing steered
+  (`docs/solutions/logic-errors/miko3-explore-stop-reset-discarded-steer-looks.md`).
+
+**Other numbers from the same live session.** Measured on office carpet:
+- He turns at about 40°/s on carpet, not the ~60°/s the timed turns assumed.
+  Escape budgets use the rate learned from recent measured turns.
+- A turn is counted as blocked when it makes less than 5° in 1.5 s.
+- The escape ladder (retrace, circle of looks, Claude's way out, drive off) freed him
+  in 9-36 s, many times over.
+- Encoder counts are signed: they count down in reverse (`SensorReply`,
+  `SensorSnapshot`).
+- The controller's `CPL=2` refusal fires on carpet about 3 times in 6 minutes, as
+  the nose dips at a start or stop. A refusal while his own floor sensor reads plain
+  floor gets one retry (owner-approved); a second refusal soon after is a hazard.
+  Floor-sensor calibration on carpet is covered in
+  `docs/solutions/best-practices/miko3-tof-is-a-downward-cliff-sensor-inside-mcu-safe-band.md`,
+  point 7.
+
+**Checking it on the robot.** `python3 scripts/qa-explore-mode.py --only nav` runs the
+owner-attended checks. `--only roam-summary` summarises a logcat capture: steers,
+re-aims, CPL hiccups, wedges and their free-after times, coverage cells, blocked
+turns, camera timings and speech first audio, all as counts and timings only.
+
 ## Open questions
 
 - Where/how are `assets/*.tflite` copied out to `/sdcard/klug/vision/` on
