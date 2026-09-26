@@ -380,6 +380,7 @@ public class LauncherApp extends Application {
         server.route(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_CONVERSATION_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_EARS_PROBE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {

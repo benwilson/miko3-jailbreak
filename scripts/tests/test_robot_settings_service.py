@@ -31,6 +31,7 @@ SERVICE = LAUNCHER / "RobotSettingsService.java"
 INTERFACE = SHARED / "RobotSettings.java"
 ACCESS = SHARED / "ClaudeAccess.java"
 CLIENT = SHARED / "RobotSettingsClient.java"
+CONVERSATION = SHARED / "ConversationSettings.java"
 PROTOCOL = SHARED / "LauncherProtocol.java"
 MANIFEST = REPO / "launcher" / "AndroidManifest.xml"
 
@@ -54,6 +55,10 @@ def _read(path):
     return _strip_comments(path.read_text()) if path.exists() else ""
 
 
+# The store accessors a service method may call, one per transaction.
+STORE_READS = ("credentialsForRequests(", ".conversation(")
+
+
 class RobotSettingsServiceHarnessTest(unittest.TestCase):
     SCENARIOS = (
         "each_miko3_app_with_its_pinned_digest_is_allowed",
@@ -71,6 +76,10 @@ class RobotSettingsServiceHarnessTest(unittest.TestCase):
         "set_up_answer_carries_current_values",
         "model_change_shows_on_next_call",
         "access_to_string_never_shows_key",
+        "conversation_answer_carries_persona_and_switch",
+        "conversation_answer_blank_persona_is_unset_with_default",
+        "conversation_edit_shows_on_next_call",
+        "conversation_answer_never_carries_the_key",
     )
 
     @classmethod
@@ -171,14 +180,44 @@ class ServiceWiringTest(unittest.TestCase):
                 self.assertIsNotNone(m, f"service does not implement {name}")
                 body = m.group(1)
                 check = body.find("enforceCaller(")
-                read = body.find("credentialsForRequests(")
+                read = max(body.find(accessor) for accessor in STORE_READS)
                 self.assertGreaterEqual(check, 0, f"{name} never checks the caller")
                 self.assertGreater(read, check, f"{name} reads the store before the caller check")
 
     def test_settings_read_only_inside_checked_methods(self):
         # R13: read on every call, no cached copy that a Save would leave stale.
-        self.assertEqual(self.src.count("credentialsForRequests("), len(self._interface_methods()))
+        reads = sum(self.src.count(accessor) for accessor in STORE_READS)
+        self.assertEqual(reads, len(self._interface_methods()))
         self.assertNotRegex(self.src, r"private\s+(final\s+)?ClaudeSettings\.Credentials\s+\w+\s*;")
+        self.assertNotRegex(self.src, r"private\s+(final\s+)?ConversationSettings\s+\w+\s*;")
+
+    def test_transaction_codes_are_appended(self):
+        # KTD11: the existing code is unchanged and the new one is appended.
+        self.assertRegex(self.iface, r"TRANSACTION_getClaudeAccess\s*=\s*1\s*;")
+        self.assertRegex(self.iface, r"TRANSACTION_getConversationSettings\s*=\s*2\s*;")
+        codes = [int(c) for c in re.findall(r"TRANSACTION_\w+\s*=\s*(\d+)\s*;", self.iface)]
+        self.assertEqual(codes, list(range(1, len(codes) + 1)))
+
+    def test_new_proxy_method_checks_the_transaction_result(self):
+        # An older launcher answers an unknown code with false; that must be detected.
+        proxy = self.iface[self.iface.index("class Proxy"):]
+        m = re.search(r"public ConversationSettings getConversationSettings\(\)[^{]*\{(.*?)\n            \}",
+                      proxy, flags=re.S)
+        self.assertIsNotNone(m, "Proxy does not implement getConversationSettings")
+        self.assertRegex(m.group(1), r"if\s*\(\s*!remote\.transact\(\s*TRANSACTION_getConversationSettings")
+        self.assertIn("LauncherProtocol.LAUNCHER_TOO_OLD", m.group(1))
+
+    def test_client_reports_an_old_launcher(self):
+        src = _read(CLIENT)
+        self.assertIn("fetchConversation(", src)
+        self.assertIn("getConversationSettings()", src)
+        self.assertIn("catch (UnsupportedOperationException", src)
+        self.assertIn("LauncherProtocol.LAUNCHER_TOO_OLD", src)
+
+    def test_conversation_settings_is_plain_java(self):
+        raw = CONVERSATION.read_text() if CONVERSATION.exists() else ""
+        self.assertTrue(raw, "ConversationSettings.java missing")
+        self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
 
     def test_caller_identity_comes_from_binder_and_package_manager(self):
         # The Android lookups live in CallerGate, shared with SpeechService.

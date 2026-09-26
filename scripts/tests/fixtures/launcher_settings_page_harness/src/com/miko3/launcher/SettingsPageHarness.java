@@ -1,6 +1,7 @@
 package com.miko3.launcher;
 
 import com.miko3.shared.ClaudeApi;
+import com.miko3.shared.ConversationSettings;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.Json;
@@ -395,6 +396,27 @@ public final class SettingsPageHarness {
         f.settings.save(ClaudeSettings.DEFAULT_BASE_URL, KEY_A, "m1");
         return f;
     }
+
+    /** The <section id="..."> ... </section> fragment, or "" when there is none. */
+    static String section(String html, String id) {
+        Matcher m = Pattern.compile("<section id=\"" + Pattern.quote(id) + "\">(.*?)</section>", Pattern.DOTALL)
+                .matcher(html);
+        return m.find() ? m.group(0) : "";
+    }
+
+    /** The whole <textarea name="..."> element including its content, or "". */
+    static String textarea(String fragment, String name) {
+        Matcher m = Pattern.compile("<textarea[^>]*\\bname=\"" + Pattern.quote(name) + "\"[^>]*>.*?</textarea>",
+                Pattern.DOTALL).matcher(fragment);
+        return m.find() ? m.group(0) : "";
+    }
+
+    /** The <input name="..."> tag, or "". */
+    static String input(String fragment, String name) {
+        Matcher m = Pattern.compile("<input[^>]*\\bname=\"" + Pattern.quote(name) + "\"[^>]*>").matcher(fragment);
+        return m.find() ? m.group(0) : "";
+    }
+
 
     private static int failures;
 
@@ -1212,6 +1234,139 @@ public final class SettingsPageHarness {
             public void run(String n) {
                 check(n, LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_EARS_PROBE_PATH),
                         "the probe path is served on plain HTTP");
+            }
+        });
+
+        // ---- Conversation section (meeting plan U4; KTD11, R5, R20) ----
+
+        scenario("conversation_section_shows_default_persona_and_switch_on", new Scenario() {
+            public void run(String n) throws Exception {
+                String html = get(new Fixture());
+                String section = section(html, "conversation");
+                String box = textarea(section, "persona");
+                String sw = input(section, "answers");
+                check(n, box.contains(SettingsPage.escapeHtml(ClaudeSettings.DEFAULT_PERSONA))
+                                && sw.contains("type=\"checkbox\"") && sw.contains(" checked")
+                                && section.contains(String.valueOf(ConversationSettings.MAX_PERSONA_CHARS))
+                                && html.indexOf("<section id=\"conversation\">") > html.indexOf("<section id=\"claude\">"),
+                        "box=" + box + " switch=" + sw);
+            }
+        });
+
+        scenario("conversation_section_shows_stored_persona_escaped_and_never_the_key", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = withKey();
+                f.settings.savePersona("<script>alert(1)</script> & \"quotes\"\nline two");
+                f.settings.setAnswersWhenSpokenTo(false);
+                String html = get(f);
+                String box = textarea(section(html, "conversation"), "persona");
+                check(n, box.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;\nline two")
+                                && !html.contains("<script>") && !html.contains(KEY_A)
+                                && !input(section(html, "conversation"), "answers").contains(" checked"),
+                        "box=" + box);
+            }
+        });
+
+        scenario("conversation_form_carries_token_persona_and_switch", new Scenario() {
+            public void run(String n) throws Exception {
+                String html = get(new Fixture());
+                List<String> names = fieldNames(form(html, LauncherProtocol.SETTINGS_CONVERSATION_PATH));
+                check(n, names.equals(Arrays.asList("t", "persona", "answers")), names.toString());
+            }
+        });
+
+        scenario("conversation_save_stores_persona_and_switch", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "t=" + token(f) + "&persona=" + enc("Dry wit.\r\nKind.") + "&answers=on");
+                ConversationSettings c = f.settings.conversation();
+                check(n, r.code() == 302 && SettingsPage.CONVERSATION_SAVED.equals(r.status())
+                                && "Dry wit.\nKind.".equals(c.persona) && c.personaSet && c.answersWhenSpokenTo
+                                && get(f).contains("Dry wit.\nKind."),
+                        r.head + " " + c);
+            }
+        });
+
+        scenario("conversation_save_switch_off_when_box_unchecked", new Scenario() {
+            public void run(String n) throws Exception {
+                // An unchecked checkbox is absent from the post: that is "off".
+                Fixture f = new Fixture();
+                request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "t=" + token(f) + "&persona=" + enc("Dry wit."));
+                boolean off = !f.settings.conversation().answersWhenSpokenTo;
+                request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "t=" + token(f) + "&persona=" + enc("Dry wit.") + "&answers=on");
+                boolean on = f.settings.conversation().answersWhenSpokenTo;
+                check(n, off && on, "off=" + off + " on=" + on);
+            }
+        });
+
+        scenario("conversation_save_over_cap_refused_and_unchanged", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.settings.savePersona("Keep me.");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "t=" + token(f) + "&persona=" + repeat('x', ConversationSettings.MAX_PERSONA_CHARS + 1)
+                                + "&answers=on");
+                String status = r.status();
+                check(n, status != null && status.startsWith("Not saved") && !status.contains("xxxx")
+                                && "Keep me.".equals(f.settings.conversation().persona),
+                        "status=" + status + " persona=" + f.settings.conversation().persona);
+            }
+        });
+
+        scenario("conversation_save_blank_resets_to_default", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.settings.savePersona("Custom.");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "t=" + token(f) + "&persona=" + enc("  \r\n ") + "&answers=on");
+                ConversationSettings c = f.settings.conversation();
+                check(n, SettingsPage.CONVERSATION_DEFAULT.equals(r.status()) && !c.personaSet
+                                && ClaudeSettings.DEFAULT_PERSONA.equals(c.persona),
+                        "status=" + r.status() + " " + c);
+            }
+        });
+
+        scenario("conversation_save_with_stale_token_rejected", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp none = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "persona=" + enc("Nope.") + "&answers=on");
+                Resp stale = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "t=0000&persona=" + enc("Nope.") + "&answers=on");
+                ConversationSettings c = f.settings.conversation();
+                check(n, none.code() == 302 && stale.code() == 302 && !c.personaSet
+                                && none.status().startsWith("Nothing changed") && stale.status().startsWith("Nothing changed"),
+                        none.head + " " + stale.head + " " + c);
+            }
+        });
+
+        scenario("conversation_status_never_echoes_persona", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String marker = "ZQXJK-marker";
+                Resp ok = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "t=" + token(f) + "&persona=" + enc(marker) + "&answers=on");
+                Resp big = request(f, "POST", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "",
+                        "t=" + token(f) + "&persona=" + marker + repeat('x', ConversationSettings.MAX_PERSONA_CHARS));
+                check(n, !ok.head.contains(marker) && !big.head.contains(marker), ok.head + " " + big.head);
+            }
+        });
+
+        scenario("get_on_conversation_path_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = request(f, "GET", LauncherProtocol.SETTINGS_CONVERSATION_PATH, "persona=Nope&answers=on", null);
+                check(n, r.code() == 405 && !f.settings.conversation().personaSet, r.head);
+            }
+        });
+
+        scenario("conversation_path_is_tls_only", new Scenario() {
+            public void run(String n) {
+                check(n, LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_CONVERSATION_PATH),
+                        "the conversation path is served on plain HTTP");
             }
         });
 

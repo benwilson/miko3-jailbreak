@@ -1,6 +1,7 @@
 package com.miko3.launcher;
 
 import com.miko3.shared.ClaudeAccess;
+import com.miko3.shared.ConversationSettings;
 
 import java.util.Arrays;
 import java.util.HashMap;
@@ -66,6 +67,11 @@ public final class RobotSettingsServiceHarness {
     /** The service's answer rule, as RobotSettingsService applies it after the check. */
     static ClaudeAccess answer(ClaudeSettings settings) {
         return CallerCheck.accessFor(settings.credentialsForRequests());
+    }
+
+    /** The second transaction's answer rule, as RobotSettingsService applies it after the check. */
+    static ConversationSettings conversation(ClaudeSettings settings) {
+        return settings.conversation();
     }
 
     private static int failures;
@@ -250,6 +256,46 @@ public final class RobotSettingsServiceHarness {
                 check(n, !s.contains(KEY_A) && !s.contains("wxyz") && !s.contains("sk-ant")
                                 && !ClaudeAccess.notSetUp().toString().isEmpty(),
                         "toString=" + s);
+            }
+        });
+
+        // Meeting plan U4 (KTD11): the second transaction's answer rule.
+        scenario("conversation_answer_carries_persona_and_switch", new Scenario() {
+            public void run(String n) throws Exception {
+                ClaudeSettings settings = newSettings();
+                settings.savePersona("Edgy but kind.");
+                settings.setAnswersWhenSpokenTo(false);
+                ConversationSettings c = conversation(settings);
+                check(n, "Edgy but kind.".equals(c.persona) && c.personaSet && !c.answersWhenSpokenTo, "got=" + c);
+            }
+        });
+
+        scenario("conversation_answer_blank_persona_is_unset_with_default", new Scenario() {
+            public void run(String n) throws Exception {
+                ClaudeSettings settings = newSettings();
+                ConversationSettings c = conversation(settings);
+                check(n, !c.personaSet && ClaudeSettings.DEFAULT_PERSONA.equals(c.persona) && c.answersWhenSpokenTo,
+                        "got=" + c);
+            }
+        });
+
+        scenario("conversation_edit_shows_on_next_call", new Scenario() {
+            public void run(String n) throws Exception {
+                ClaudeSettings settings = newSettings();
+                settings.savePersona("First.");
+                String first = conversation(settings).persona;
+                settings.savePersona("Second.");
+                check(n, "First.".equals(first) && "Second.".equals(conversation(settings).persona),
+                        "first=" + first + " second=" + conversation(settings).persona);
+            }
+        });
+
+        scenario("conversation_answer_never_carries_the_key", new Scenario() {
+            public void run(String n) throws Exception {
+                ClaudeSettings settings = newSettings();
+                settings.save(ClaudeSettings.DEFAULT_BASE_URL, KEY_A, "claude-opus-5-5");
+                ConversationSettings c = conversation(settings);
+                check(n, !c.persona.contains(KEY_A) && !c.toString().contains(KEY_A), "got=" + c);
             }
         });
 

@@ -41,8 +41,10 @@ SETTINGS_PATHS = (
     "SETTINGS_PEOPLE_RENAME_PATH",
     "SETTINGS_PEOPLE_FORGET_PATH",
     "SETTINGS_PEOPLE_FACE_PATH",
+    "SETTINGS_CONVERSATION_PATH",
 )
 PROBE = LAUNCHER / "EarsProbe.java"
+CONVERSATION = SHARED_SRC / "com" / "miko3" / "shared" / "ConversationSettings.java"
 PROBE_SCRIPT = REPO / "scripts" / "qa-ears-probe.py"
 
 
@@ -65,6 +67,25 @@ class ClaudeSettingsSourceTest(unittest.TestCase):
         src = _strip_comments(SETTINGS.read_text())
         for needle in ("System.out", "System.err", "Log.", "printStackTrace"):
             self.assertNotIn(needle, src)
+
+    def test_default_persona_is_a_launcher_constant_with_the_workplace_test(self):
+        """Meeting plan U4 (KTD11, R13, R20): the built-in persona is the launcher's
+        constant, and it carries the workplace test with a concrete list under it."""
+        raw = SETTINGS.read_text()
+        m = re.search(r"static final String DEFAULT_PERSONA\s*=", raw)
+        self.assertIsNotNone(m, "ClaudeSettings has no DEFAULT_PERSONA")
+        body = raw[m.end():]
+        body = body[:body.index(";\n")]
+        self.assertRegex(body, r"(?i)fired")
+        # A concrete list, not just the rule: several distinct "never" items.
+        self.assertGreaterEqual(len(re.findall(r'"- ', body)), 4, body)
+
+    def test_persona_cap_is_the_shared_constant(self):
+        src = _strip_comments(SETTINGS.read_text())
+        self.assertIn("ConversationSettings.MAX_PERSONA_CHARS", src)
+        conv = CONVERSATION.read_text() if CONVERSATION.exists() else ""
+        self.assertRegex(conv, r"MAX_PERSONA_CHARS\s*=\s*2500\s*;")
+        self.assertEqual([ln for ln in conv.splitlines() if ln.startswith("import android")], [])
 
     def test_only_one_accessor_returns_the_full_key(self):
         # R4: the page renders from status(); only credentialsForRequests() carries the key.
@@ -132,6 +153,13 @@ class ClaudeSettingsHarnessTest(unittest.TestCase):
         "model_list_round_trips",
         "model_list_drops_invalid_ids",
         "url_change_clears_model_list",
+        "persona_round_trips_same_bytes",
+        "blank_persona_reads_as_unset_and_default",
+        "persona_over_cap_rejected_with_message",
+        "persona_at_cap_accepted",
+        "persona_crlf_saved_as_lf",
+        "answers_switch_defaults_on_and_round_trips",
+        "persona_and_switch_leave_the_key_alone",
     )
 
     @classmethod
@@ -198,6 +226,7 @@ class SettingsPageSourceTest(unittest.TestCase):
             "SETTINGS_CLAUDE_FORGET_PATH": "/settings/claude/forget",
             "SETTINGS_VOICE_SAY_PATH": "/settings/voice/say",
             "SETTINGS_EARS_PROBE_PATH": "/settings/ears-probe",
+            "SETTINGS_CONVERSATION_PATH": "/settings/conversation",
         }
         for name, path in expected.items():
             self.assertRegex(src, rf'public static final String {name} = "{re.escape(path)}";')
@@ -378,6 +407,17 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "ears_probe_rows_carry_counts_and_match_flags_never_text",
         "ears_probe_clamps_seconds_and_reports_a_busy_microphone",
         "ears_probe_path_is_tls_only",
+        "conversation_section_shows_default_persona_and_switch_on",
+        "conversation_section_shows_stored_persona_escaped_and_never_the_key",
+        "conversation_form_carries_token_persona_and_switch",
+        "conversation_save_stores_persona_and_switch",
+        "conversation_save_switch_off_when_box_unchecked",
+        "conversation_save_over_cap_refused_and_unchanged",
+        "conversation_save_blank_resets_to_default",
+        "conversation_save_with_stale_token_rejected",
+        "conversation_status_never_echoes_persona",
+        "get_on_conversation_path_refused",
+        "conversation_path_is_tls_only",
     )
 
     @classmethod
