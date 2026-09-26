@@ -87,6 +87,59 @@ interface CuriosityPort {
     /** What findName() found, or null while it is running. */
     Named foundName();
 
+    // ---- the way out of a wedge (explore nav plan U5, KTD4) ----
+
+    /**
+     * Ask which way is out: the circle's frames (with their look indices), or, for the
+     * second ask, the one frame he sees now. One schema serves both. The frames leave
+     * the robot only inside this request (R15).
+     */
+    void wayOut(WayOutRequest request, long timeoutMs);
+
+    /** The answer to the last wayOut(), or null while it is running. */
+    WayOut wayOutAnswer();
+
+    /** Abandon the running wayOut(), if any: its late answer must never be returned. */
+    void cancelWayOut();
+
+    // ---- open doorways (explore nav plan U6, KTD4) ----
+
+    /**
+     * Ask whether an open doorway is in this one roaming frame, and where across it.
+     * The frame leaves the robot only inside this request (R15).
+     */
+    void doorway(byte[] jpeg, long timeoutMs);
+
+    /** The answer to the last doorway(), or null while it is running. */
+    Doorway doorwayAnswer();
+
+    /** Abandon the running doorway(), if any: its late answer must never be returned. */
+    void cancelDoorway();
+
+    // ---- people while roaming: the recently-met check (explore nav plan U7, KTD4, KTD8) ----
+
+    /**
+     * Ask whether the person in this frame's person box is one of the people met in
+     * the last 10 minutes (request.met: the handles metId() gave for them, oldest
+     * first). The adapter crops the face from the frame and sends it with the stored
+     * faces of those people, like match(). Never carries names, and nothing is
+     * written anywhere (R15): not even the face debug switch sees this crop.
+     */
+    void recentlyMet(RecentlyMetRequest request, long timeoutMs);
+
+    /** The answer to the last recentlyMet(), or null while it is running. */
+    Recently recentlyMetAnswer();
+
+    /** Abandon the running recentlyMet(), if any: its late answer must never be returned. */
+    void cancelRecentlyMet();
+
+    /**
+     * A meeting just ended: an opaque handle for the person the last match() met,
+     * for later recentlyMet() requests, or null when there is no face of them to
+     * compare against (no face was found). Never a name.
+     */
+    String metId();
+
     /** No Claude: every stop takes the path it took before U4. */
     CuriosityPort NONE = new CuriosityPort() {
         public boolean canAsk() {
@@ -153,6 +206,40 @@ interface CuriosityPort {
 
         public Named foundName() {
             return Named.FAILED;
+        }
+
+        public void wayOut(WayOutRequest request, long timeoutMs) {
+        }
+
+        public WayOut wayOutAnswer() {
+            return WayOut.failed();
+        }
+
+        public void cancelWayOut() {
+        }
+
+        public void doorway(byte[] jpeg, long timeoutMs) {
+        }
+
+        public Doorway doorwayAnswer() {
+            return Doorway.failed();
+        }
+
+        public void cancelDoorway() {
+        }
+
+        public void recentlyMet(RecentlyMetRequest request, long timeoutMs) {
+        }
+
+        public Recently recentlyMetAnswer() {
+            return Recently.failed();
+        }
+
+        public void cancelRecentlyMet() {
+        }
+
+        public String metId() {
+            return null;
         }
     };
 
@@ -354,6 +441,151 @@ interface CuriosityPort {
 
         static Named of(String nameOrNull) {
             return nameOrNull == null || nameOrNull.trim().isEmpty() ? NONE : new Named(Status.NAME, nameOrNull.trim());
+        }
+    }
+
+    /** The way-out request: the frames in order, and whether this is the second ask (one frame, now). */
+    final class WayOutRequest {
+        final List<Frame> frames;
+        final boolean second;
+
+        WayOutRequest(List<Frame> frames, boolean second) {
+            this.frames = Collections.unmodifiableList(frames);
+            this.second = second;
+        }
+    }
+
+    /**
+     * Claude's way out. WAY carries the frame (an index into WayOutRequest.frames) and
+     * where across it the way out is (x, -1 at the frame's left edge .. 1 at its right);
+     * the brain turns it into a heading at once. NONE: nothing looks open. FAILED: a
+     * refused, malformed, out-of-range or failed request.
+     */
+    final class WayOut {
+        enum Status { WAY, NONE, FAILED }
+
+        final Status status;
+        final int frame;
+        final float x;
+
+        private WayOut(Status status, int frame, float x) {
+            this.status = status;
+            this.frame = frame;
+            this.x = x;
+        }
+
+        static WayOut way(int frame, float x) {
+            return new WayOut(Status.WAY, frame, x);
+        }
+
+        static WayOut none() {
+            return new WayOut(Status.NONE, -1, 0f);
+        }
+
+        static WayOut failed() {
+            return new WayOut(Status.FAILED, -1, 0f);
+        }
+
+        /** Numbers only, for the trace. */
+        @Override
+        public String toString() {
+            return status == Status.WAY
+                    ? String.format(java.util.Locale.US, "way out in frame %d at x %.2f", frame, x)
+                    : status.toString();
+        }
+    }
+
+    /**
+     * Claude's doorway answer. DOOR carries where across the frame the open doorway
+     * is (x, -1 at the frame's left edge .. 1 at its right); the brain turns it into a
+     * heading at once. NONE: no open doorway in view (a closed door is not one).
+     * FAILED: a refused, malformed, out-of-range or failed request.
+     */
+    final class Doorway {
+        enum Status { DOOR, NONE, FAILED }
+
+        final Status status;
+        final float x;
+
+        private Doorway(Status status, float x) {
+            this.status = status;
+            this.x = x;
+        }
+
+        static Doorway door(float x) {
+            return new Doorway(Status.DOOR, x);
+        }
+
+        static Doorway none() {
+            return new Doorway(Status.NONE, 0f);
+        }
+
+        static Doorway failed() {
+            return new Doorway(Status.FAILED, 0f);
+        }
+
+        /** Numbers only, for the trace. */
+        @Override
+        public String toString() {
+            return status == Status.DOOR ? String.format(java.util.Locale.US, "open doorway at x %.2f", x)
+                    : status.toString();
+        }
+    }
+
+    /**
+     * The recently-met check: the frame and the person box in it (frame fractions)
+     * to crop the face from, and the handles of everyone met in the last 10 minutes,
+     * oldest first.
+     */
+    final class RecentlyMetRequest {
+        final byte[] frameJpeg;
+        final Detection personBox;
+        final List<String> met;
+
+        RecentlyMetRequest(byte[] frameJpeg, Detection personBox, List<String> met) {
+            this.frameJpeg = frameJpeg;
+            this.personBox = personBox;
+            this.met = Collections.unmodifiableList(met);
+        }
+    }
+
+    /**
+     * Claude's recently-met answer. SAME carries which of the request's people it is
+     * (index into RecentlyMetRequest.met); DIFFERENT: none of them; UNSURE: can't
+     * tell (no face found, too small, turned away); FAILED: a refused, malformed or
+     * failed request. Only DIFFERENT lets him approach (KTD8).
+     */
+    final class Recently {
+        enum Status { SAME, DIFFERENT, UNSURE, FAILED }
+
+        final Status status;
+        final int index;
+
+        private Recently(Status status, int index) {
+            this.status = status;
+            this.index = index;
+        }
+
+        static Recently same(int index) {
+            return new Recently(Status.SAME, index);
+        }
+
+        static Recently different() {
+            return new Recently(Status.DIFFERENT, -1);
+        }
+
+        static Recently unsure() {
+            return new Recently(Status.UNSURE, -1);
+        }
+
+        static Recently failed() {
+            return new Recently(Status.FAILED, -1);
+        }
+
+        /** Numbers only, for the trace. */
+        @Override
+        public String toString() {
+            return status == Status.SAME ? "same as person " + (index + 1) : status.toString();
         }
     }
 }

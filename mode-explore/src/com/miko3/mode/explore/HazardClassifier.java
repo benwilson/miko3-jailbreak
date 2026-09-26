@@ -161,6 +161,28 @@ final class HazardClassifier {
     }
 
     /**
+     * The latest reading is ordinary floor by our own sensor: no fault, tof at or
+     * above obstacleTofBelow and not above edgeTofAbove, no ir edge flag (with at
+     * least one edge threshold calibrated). The brain
+     * retries a CPL=2 refusal once only then (owner-approved 2026-09-25); false with
+     * no calibration or no reading.
+     */
+    boolean plainFloor() {
+        SensorReading r = latest;
+        if (r == null || cal == null || r.fault || r.tof == tuning.tofFault || cal.obstacleTofBelow < 0
+                || (cal.edgeTofAbove < 0 && cal.edgeIr < 0)) {
+            return false;
+        }
+        if (cal.edgeIr >= 0 && (irEdge(r.ir1) || irEdge(r.ir2))) {
+            return false;
+        }
+        if (cal.edgeTofAbove >= 0 && r.tof > cal.edgeTofAbove) {
+            return false;
+        }
+        return r.tof >= cal.obstacleTofBelow;
+    }
+
+    /**
      * The approach-mode verdict at nowMs (KTD4). Unavailable exactly when status()
      * is. Otherwise, from the latest reading:
      *  - tof at its fault value, or above a calibrated edgeTofAbove: EDGE;

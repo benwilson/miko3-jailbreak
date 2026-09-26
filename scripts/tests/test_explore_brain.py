@@ -30,7 +30,8 @@ HARNESS = TESTS / "fixtures" / "explore_brain_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHarness.java"
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
-              "ExplorePrompts.java")
+              "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
+              "RoamSteer.java", "EscapePlanner.java", "Coverage.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -114,7 +115,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "ae3_edge_during_approach_stops_startles_and_abandons",
         "ae4_person_greeted_then_ignored_during_cooldown",
         "ae5_camera_unavailable_wanders_as_before",
-        "ae6_camera_open_only_while_curious",
+        "ae6_camera_follows_the_camera_rule_through_stops_and_lease_loss",
         "target_lost_during_approach_gives_up",
         "renamed_target_is_kept_by_overlap",
         "different_thing_elsewhere_is_not_the_target",
@@ -190,6 +191,142 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "meet_hazard_on_the_way_to_a_person_drops_the_meet",
         "claude_line_older_than_the_freshness_window_is_not_spoken",
         "claude_hazard_mid_speak_neither_cuts_nor_repeats_the_line",
+        # Heading, measured turns and the leg log (explore nav plan U2, KTD1)
+        "heading_turn_takes_the_shorter_way_across_0_360",
+        "heading_bias_drift_is_re_estimated_at_each_stop",
+        "heading_motion_during_a_stop_leaves_the_bias_alone",
+        "measured_90_degree_turn_without_bias_error_ends_within_tolerance",
+        "measured_turn_overshoot_is_learned_and_the_next_turn_is_closer",
+        "stalled_leg_logs_no_distance_for_the_stalled_time",
+        "clean_drive_off_restarts_the_leg_log",
+        "uncalibrated_turns_stay_timed_even_with_gyro_readings",
+        "calibrated_without_gyro_in_the_readings_turns_stay_timed",
+        "measured_escape_turn_turns_its_angle_not_its_time",
+        "measured_orient_turns_to_the_picked_looks_heading_plus_its_offset",
+        # The camera while roaming, steering by openness, look-then-go (explore nav plan U4, KTD2, KTD7, KTD9)
+        "roam_camera_open_in_every_roaming_state",
+        "roam_speak_stops_closes_the_camera_then_reopens_after_the_gap_and_roams",
+        "roam_camera_closed_through_meet_ask_name_listen_name_remember_and_name_clip",
+        "roam_steer_blocked_left_open_right_bends_right",
+        "roam_steer_bend_is_a_measured_turn_when_the_heading_is_usable",
+        "roam_steer_all_blocked_gives_a_short_leg_or_a_turn_never_a_full_leg",
+        "roam_floor_hazard_mid_leg_aborts_even_when_the_camera_reads_open",
+        "roam_no_looks_backs_off_roams_on_the_floor_sensor_and_retries",
+        "roam_look_then_go_opens_the_camera_only_at_leg_decisions",
+        "roam_lease_loss_closes_the_camera_and_goes_eyes_only",
+        "roam_invariant_flags_a_camera_open_while_talking_or_without_the_lease",
+        "roam_steer_low_confidence_keeps_todays_legs",
+        "roam_blocked_look_mid_leg_ends_the_leg_at_the_next_tick",
+        "roam_floor_is_taught_after_driving_over_it_and_motion_is_reported",
+        # Wedged escapes: retrace, measured circle, Claude's way out, rest (explore nav plan U5, AE1, AE7)
+        "escape_ae1_wall_and_plant_retraces_the_way_in_and_roams_again",
+        "escape_retrace_hazard_partway_moves_on_to_the_circle",
+        "escape_three_short_legs_retrace_newest_first_up_to_the_retrace_distance",
+        "escape_claude_frame_5_centre_turns_to_that_frames_heading_and_drives_off",
+        "escape_ae7_offline_uses_the_most_open_heading_on_the_robot",
+        "escape_on_robot_heading_penalises_headings_already_tried",
+        "escape_late_claude_answer_is_dropped_and_the_robot_heading_used",
+        "escape_frame_7_of_6_is_rejected_and_the_robot_heading_used",
+        "replies_way_out_reads_frame_and_x_and_rejects_bad_answers",
+        "escape_full_budgets_drive_off_within_30_s_of_wedged",
+        "escape_second_ask_is_sent_once_per_escape",
+        "escape_all_steps_fail_rests_cornered_then_roams",
+        "escape_lease_loss_during_the_circle_goes_eyes_only_stopped",
+        "escape_way_out_carries_only_the_circles_frames_and_notes_carry_counts",
+        "escape_uncalibrated_keeps_todays_escape",
+        # A measured turn the gyro says isn't turning is blocked (live: wedged under a desk)
+        "turn_flat_yaw_in_the_circle_is_blocked_within_1_5_s_and_the_escape_advances",
+        "turn_flat_yaw_while_roaming_is_blocked_and_counts_as_wedged",
+        "turn_slow_but_moving_is_not_blocked",
+        # Turns blocked: back out straight along the last leg first (live: under a desk)
+        "escape_blocked_turns_back_out_along_the_last_leg_then_turn_and_drive_off",
+        "escape_back_out_stops_at_the_logged_distance_and_the_retrace_distance",
+        "escape_back_out_needs_a_logged_leg",
+        "escape_stall_during_back_out_stops_it",
+        # Pinned: one ladder, then longer rests while still pinned, reset by a clean drive-off
+        "pinned_runs_the_ladder_once_with_two_asks_then_rests",
+        "pinned_after_the_rest_waits_longer_before_the_next_ladder",
+        "pinned_backoff_resets_after_a_clean_drive_off",
+        # A step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, drive-off cut mid-turn)
+        "budget_drive_off_turn_at_40_deg_s_completes_and_drives_off",
+        "budget_slow_but_progressing_turn_is_never_cut_by_the_step_budget",
+        "budget_blocked_drive_off_turn_still_fails_the_step_within_1_5_s",
+        "budget_turn_rate_defaults_35_deg_s_floor_15_and_the_rate_is_learned",
+        # Forward first: after a rest, and when a step ends, facing clear floor (live 2026-09-25)
+        "forward_first_after_a_rest_facing_open_floor_drives_forward_instead_of_turning",
+        "forward_first_after_a_rest_facing_a_blocked_way_still_turns_and_rests_longer",
+        "forward_first_when_an_escape_step_runs_out_of_time_facing_clear_floor",
+        # The avoided side, at the motor (live 2026-09-25: "he only tries turning left")
+        "side_left_blocked_roaming_retry_commands_right_every_time",
+        "side_left_blocked_escape_ladder_commands_no_left_turn_until_free",
+        "side_left_blocked_the_turn_after_a_rest_and_the_next_ladder_go_right",
+        "side_both_blocked_alternates_instead_of_one_side_for_ever",
+        # Wedged: a straight back-up first, then the free way round (live 2026-09-25: nose to a wall)
+        "wedged_nose_to_wall_backs_up_first_then_turns_the_free_way_and_drives_off",
+        "wedged_back_up_blocked_behind_goes_on_with_the_ladder",
+        "wedged_retrace_long_way_round_past_a_blocked_side_is_skipped",
+        # The learned turn rate: completed turns only (live 2026-09-25: collapsed to the floor)
+        "turn_rate_learns_only_from_completed_turns",
+        # A blocked side: the retry and later turns go the other way (live 2026-09-25)
+        "blocked_side_backs_up_then_turns_the_other_way_and_drives_off",
+        "blocked_side_escape_turns_go_the_unblocked_way_even_the_long_way_round",
+        "blocked_turn_back_up_default_is_about_2_s",
+        # Signed wheel counters (live 2026-09-25: reverse counts down, from 0 at power-up)
+        "wheels_negative_counts_back_out_reports_the_real_distance",
+        "wheels_stall_is_detected_below_and_across_zero",
+        # A blocked turn backs up a little first, then tries again once (live: pinned after a CPL stop)
+        "blocked_turn_backs_up_a_little_then_the_retried_turn_succeeds",
+        "blocked_turn_after_a_cpl_stop_still_backs_up_a_little_before_the_retry",
+        "blocked_turn_backs_up_at_most_once_per_turn_and_stops_on_a_stall",
+        # Open doorways through Claude (explore nav plan U6, AE2, AE3, AE7)
+        "doorway_right_third_sets_a_heading_20_deg_right_and_legs_bend_that_way",
+        "doorway_none_leaves_the_steering_unchanged",
+        "doorway_second_ask_waits_the_60_s_interval",
+        "doorway_never_asked_during_a_stop_an_approach_a_meeting_or_an_escape",
+        "doorway_ae7_offline_ask_fails_quietly_and_roaming_continues",
+        "doorway_ae3_floor_edge_at_the_doorway_stops_and_escapes_as_today",
+        "doorway_heading_expires_by_time_or_distance_and_steering_returns_to_openness",
+        "doorway_closed_since_reads_blocked_when_faced_and_is_dropped",
+        "doorway_passed_through_after_a_leg_toward_it_is_forgotten",
+        "doorway_ask_carries_one_roaming_frame_and_notes_carry_numbers_only",
+        "roam_steer_doorway_weights_open_bands_and_turns_to_face_one_out_of_view",
+        "replies_doorway_reads_x_and_rejects_bad_answers",
+        # People while roaming, with a per-person leave-alone (explore nav plan U7, R9, R10, AE4)
+        "people_roaming_person_is_approached_to_the_polite_distance_and_greeted_by_name",
+        "people_ae4_same_person_5_min_later_is_checked_and_left_alone",
+        "people_different_person_5_min_later_is_approached",
+        "people_check_timeout_or_offline_never_approaches",
+        "people_after_10_min_no_check_and_approached",
+        "people_a_then_b_then_a_check_covers_both_and_a_is_left_alone",
+        "people_curiosity_pick_of_the_owner_5_min_later_is_a_remark",
+        "people_owner_in_view_3_min_gets_at_most_3_checks",
+        "people_hazard_during_a_roaming_approach_drops_the_meeting",
+        "people_camera_closed_through_a_roaming_meetings_talking_states",
+        "people_trace_notes_never_carry_a_name",
+        "replies_recently_met_reads_same_none_unsure_and_rejects_bad_answers",
+        "people_tuning_defaults_10_min_leave_alone_one_check_a_minute",
+        # Going somewhere new (explore nav plan U10, R18)
+        "coverage_open_room_covers_more_cells_than_with_novelty_off",
+        "coverage_two_equally_open_ways_picks_the_unvisited_one",
+        "coverage_open_floor_gives_a_longer_leg_and_a_blocked_view_still_shortens",
+        "coverage_floor_sensor_still_ends_a_long_leg",
+        "coverage_visited_cells_fade_so_an_old_area_is_eligible_again",
+        "coverage_no_look_turns_less_while_the_way_ahead_is_new",
+        "coverage_uncalibrated_roams_exactly_as_before",
+        "coverage_trace_notes_carry_counts_only_and_are_forgotten_at_shutdown",
+        # The leg decision waits for a look to steer by (explore nav plan KTD9, live 2026-09-25)
+        "steer_waits_for_a_look_after_a_turn_and_uses_the_legs_own_looks",
+        "steer_wait_times_out_to_todays_leg_and_never_waits_with_the_camera_backed_off",
+        # CPL hiccups on plain floor (owner-approved 2026-09-25)
+        "cpl_on_plain_floor_is_retried_once_and_the_leg_drives_on",
+        "cpl_again_at_the_same_spot_after_the_retry_is_a_hazard",
+        "cpl_with_our_sensor_at_an_edge_is_a_hazard_at_once",
+        "cpl_hiccups_spread_over_a_leg_do_not_make_him_wedged",
+        # Mid-leg re-aim (owner-approved 2026-09-25, KTD9)
+        "reaim_open_space_drifting_right_mid_leg_turns_a_little_toward_it_and_drives_on",
+        "reaim_never_with_the_open_space_straight_ahead",
+        "reaim_is_rate_limited",
+        "reaim_never_toward_a_blocked_side",
     )
 
     @classmethod

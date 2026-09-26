@@ -87,9 +87,27 @@ public final class ExploreDriveHarness {
     static final class Hooks implements ExploreLoop.Hooks {
         volatile boolean stale;
         volatile boolean frozen;
+        volatile boolean spin;
         @Override public boolean staleSensors() { return stale; }
         @Override public boolean freezeBrain() { return frozen; }
         @Override public boolean curiousNow() { return false; }
+        @Override public boolean spinInPlace() { return spin; }
+    }
+
+    /** Records trace notes, for the spin phases the QA script segments by. */
+    static final class Notes implements ExploreBrain.Trace {
+        final List<String> notes = Collections.synchronizedList(new ArrayList<String>());
+        @Override public void note(String message) { notes.add(message); }
+    }
+
+    /** A reading stamped {@code t}, for driving ExploreSpin on a made-up clock. */
+    static SensorReading readingAt(long t) {
+        return new SensorReading(t, 250, SensorSnapshotAbsent.ABSENT, 0, null, false);
+    }
+
+    /** Spin timings short enough for a loop run; null calibration = uncalibrated floor sensors. */
+    static ExploreTuning spinTuning(ExploreTuning.Calibration calibration) {
+        return new ExploreTuning.Builder().calibration(calibration).spinMs(100, 500).staleMs(300).build();
     }
 
     static final ExploreBrain.Clock REAL = new ExploreBrain.Clock() {
@@ -237,9 +255,120 @@ public final class ExploreDriveHarness {
 
             writeText(f, "obstacleTofBelow=60\nedgeTofAbove=420\nedgeIrAbove=maybe\n");
             check("calibration_bad_boolean_is_uncalibrated", ExploreCalibration.read(f) == null, "expected null");
+
+            // ---- gyro keys (explore nav plan U1) ----
+            writeText(f, "obstacleTofBelow=60\nedgeTofAbove=420\nedgeIr=-1\nedgeIrAbove=true\n");
+            check("calibration_without_gyro_keys_reads_gyro_uncalibrated",
+                    ExploreCalibration.read(f) != null && ExploreCalibration.readGyro(f) == null,
+                    "floor=" + ExploreCalibration.read(f) + " gyro=" + ExploreCalibration.readGyro(f));
+
+            ExploreCalibration.writeGyro(f, new ExploreCalibration.Gyro(2, -1, 1234.5));
+            ExploreCalibration.Gyro g = ExploreCalibration.readGyro(f);
+            check("calibration_gyro_round_trips",
+                    g != null && g.axis == 2 && g.sign == -1 && g.countSecondsPer360 == 1234.5, "got " + g);
+
+            ExploreTuning.Calibration floorAfterGyro = ExploreCalibration.read(f);
+            ExploreCalibration.write(f, new ExploreTuning.Calibration(70, 500, 3, false));
+            ExploreCalibration.Gyro gyroAfterFloor = ExploreCalibration.readGyro(f);
+            ExploreTuning.Calibration floorBack = ExploreCalibration.read(f);
+            check("calibration_writes_keep_each_others_keys",
+                    floorAfterGyro != null && floorAfterGyro.obstacleTofBelow == 60 && floorAfterGyro.edgeTofAbove == 420
+                            && gyroAfterFloor != null && gyroAfterFloor.axis == 2
+                            && gyroAfterFloor.countSecondsPer360 == 1234.5
+                            && floorBack != null && floorBack.obstacleTofBelow == 70 && !floorBack.edgeIrAbove,
+                    "floor after gyro write=" + floorAfterGyro + " gyro after floor write=" + gyroAfterFloor
+                            + " floor=" + floorBack);
+
+            String floor = "obstacleTofBelow=60\nedgeTofAbove=420\n";
+            boolean badAll = true;
+            for (String bad : new String[] {
+                    "gyroAxis=w\ngyroSign=1\ngyroCountSecondsPer360=100\n",
+                    "gyroAxis=x\ngyroSign=0\ngyroCountSecondsPer360=100\n",
+                    "gyroAxis=x\ngyroSign=1\ngyroCountSecondsPer360=-5\n",
+                    "gyroAxis=x\ngyroSign=1\ngyroCountSecondsPer360=NaN\n",
+                    "gyroAxis=x\ngyroSign=1\ngyroCountSecondsPer360=lots\n",
+                    "gyroAxis=x\ngyroCountSecondsPer360=100\n"}) {
+                writeText(f, floor + bad);
+                badAll &= ExploreCalibration.readGyro(f) == null && ExploreCalibration.read(f) != null;
+            }
+            check("calibration_bad_gyro_keys_are_gyro_uncalibrated_but_floor_loads", badAll,
+                    "a malformed or partial gyro entry must read as uncalibrated, and not cost the floor rules");
         } catch (IOException e) {
             check("calibration_round_trips", false, e.toString());
         }
+
+        // ---- spin hook (explore nav plan U1): ExploreSpin on a made-up clock ----
+        ExploreTuning.Calibration floorCal = new ExploreTuning.Calibration(60, -1, 5, true);
+        FakeWheels spw = new FakeWheels();
+        FakeLease spl = new FakeLease();
+        spl.held = true;
+        Notes spn = new Notes();
+        ExploreSpin spin = new ExploreSpin(new DriveGate(spw, spl, null), spn, spinTuning(floorCal));
+        for (long now = 0; now <= 1300; now += 50) {
+            spin.onTick(now, readingAt(now), true);
+        }
+        spin.end();
+        List<String> spinCalls = new ArrayList<String>(spw.calls);
+        int firstLeft = spinCalls.indexOf("turn-LEFT");
+        int firstRight = spinCalls.indexOf("turn-RIGHT");
+        check("spin_turns_left_then_right_with_still_spells",
+                firstLeft > 0 && firstRight > firstLeft && spinCalls.get(0).equals("stop")
+                        && spinCalls.subList(firstLeft, firstRight).contains("stop")
+                        && spw.count("forward") == 0 && spw.count("back") == 0
+                        && spinCalls.get(spinCalls.size() - 1).equals("stop")
+                        && spn.notes.contains("spin still") && spn.notes.contains("spin LEFT")
+                        && spn.notes.contains("spin RIGHT") && spn.notes.contains("spin off")
+                        && !spin.active(),
+                "calls=" + spinCalls + " notes=" + spn.notes);
+
+        FakeWheels hw = new FakeWheels();
+        FakeLease hl = new FakeLease();
+        hl.held = true;
+        Notes hn = new Notes();
+        ExploreSpin halting = new ExploreSpin(new DriveGate(hw, hl, null), hn, spinTuning(floorCal));
+        long now = 0;
+        for (; now <= 200; now += 50) {
+            halting.onTick(now, readingAt(now), true);
+        }
+        int turnsBeforeStale = hw.motion();
+        // Readings stop arriving: the newest one goes stale while he is turning.
+        for (; now <= 1000; now += 50) {
+            halting.onTick(now, readingAt(150), true);
+        }
+        int turnsWhileStale = hw.motion() - turnsBeforeStale;
+        String lastWhileStale = hw.calls.get(hw.calls.size() - 1);
+        for (; now <= 2000; now += 50) {
+            hl.held = false;
+            halting.onTick(now, readingAt(now), false);
+        }
+        int turnsWithoutLease = hw.motion() - turnsBeforeStale - turnsWhileStale;
+        check("spin_halts_without_lease_or_fresh_readings",
+                turnsBeforeStale == 1 && turnsWhileStale == 0 && turnsWithoutLease == 0
+                        && lastWhileStale.equals("stop")
+                        && hn.notes.contains("spin halted: readings stale")
+                        && hn.notes.contains("spin halted: no lease"),
+                "before=" + turnsBeforeStale + " stale=" + turnsWhileStale + " noLease=" + turnsWithoutLease
+                        + " calls=" + hw.calls + " notes=" + hn.notes);
+
+        FakeWheels uw = new FakeWheels();
+        FakeLease ul = new FakeLease();
+        ul.held = true;
+        Notes un = new Notes();
+        ExploreSpin uncalibrated = new ExploreSpin(new DriveGate(uw, ul, null), un, spinTuning(null));
+        for (long u = 0; u <= 2000; u += 50) {
+            uncalibrated.onTick(u, readingAt(u), true);
+        }
+        check("spin_needs_calibrated_floor_sensors",
+                uw.motion() == 0 && un.notes.contains("spin halted: sensors uncalibrated"),
+                "calls=" + uw.calls + " notes=" + un.notes);
+
+        // ---- reading carries the gyro ----
+        SensorReading withGyro = new SensorReading(5, 250, -1, 0, null, false, 10, 20, 62, -757, 93);
+        SensorReading noGyro = new SensorReading(5, 250, -1, 0, null, false, 10, 20);
+        check("reading_carries_the_gyro",
+                withGyro.hasGyro && withGyro.gyroX == 62 && withGyro.gyroY == -757 && withGyro.gyroZ == 93
+                        && withGyro.wheelLeft == 10 && !noGyro.hasGyro,
+                "with=" + withGyro + " without=" + noGyro);
 
         // ---- loop ----
         FakeWheels lw = new FakeWheels();
@@ -314,5 +443,26 @@ public final class ExploreDriveHarness {
         retrying.stop();
         check("loop_stop_timer_retries_a_failed_stop", attempts >= 3 && succeeded,
                 "stop attempts after freeze=" + attempts + " failuresLeft=" + rw.failStops);
+
+        FakeWheels pw = new FakeWheels();
+        FakeLease pl = new FakeLease();
+        pl.held = true;
+        Hooks spinHooks = new Hooks();
+        spinHooks.spin = true;
+        ExploreLoop spinning = new ExploreLoop(spinTuning(new ExploreTuning.Calibration(60, -1, 5, true)), REAL, pw,
+                new ClearSensors(REAL), pl, NO_EYES, NO_SOUND, spinHooks, null, 10, 600);
+        spinning.start();
+        sleep(400);
+        int spinForward = pw.count("forward") + pw.count("back");
+        int spinLefts = pw.count("turn-LEFT");
+        int atSpinOff = pw.calls.size();
+        spinHooks.spin = false;
+        sleep(100);
+        spinning.stop();
+        String afterSpinOff = pw.calls.size() > atSpinOff ? pw.calls.get(atSpinOff) : "";
+        check("loop_spin_hook_turns_in_place_and_ends_in_stop",
+                spinForward == 0 && spinLefts >= 1 && afterSpinOff.equals("stop"),
+                "forward/back=" + spinForward + " lefts=" + spinLefts + " first after off=" + afterSpinOff
+                        + " calls=" + pw.calls);
     }
 }

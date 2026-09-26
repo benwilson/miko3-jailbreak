@@ -22,8 +22,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The real CuriosityPort (explore on Claude plan U6): Claude through
@@ -87,10 +89,32 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Named> names = new Slot<Named>();
     private final Slot<Answer> remembers = new Slot<Answer>();
     private final Slot<Answer> welcomes = new Slot<Answer>();
+    private final Slot<WayOut> wayOuts = new Slot<WayOut>();
+    private final Slot<Doorway> doorways = new Slot<Doorway>();
+    private final Slot<Recently> recents = new Slot<Recently>();
 
     /** The face cut out by the last match(), for remember(); and the id it matched, for touch(). */
     private volatile byte[] meetFace;
     private volatile String matchedId;
+
+    /**
+     * Someone met (explore nav plan U7): the face their meeting's match cut out, in
+     * memory only and never written anywhere, and their people-store id once known
+     * (matched, or stored by remember()). The recently-met check compares against the
+     * stored face, else this crop (someone who didn't reply is never stored).
+     */
+    private static final class MetFace {
+        final long at = System.currentTimeMillis();
+        volatile byte[] crop;
+        volatile String storeId;
+    }
+
+    /** The current meeting's, from match(); and everyone metId() handed out a handle for. */
+    private volatile MetFace meeting;
+    private final Map<String, MetFace> metFaces = new ConcurrentHashMap<String, MetFace>();
+    private final AtomicInteger metHandles = new AtomicInteger();
+    /** Past the brain's 10-minute leave-alone (with a margin): the crop is dropped. */
+    private static final long MET_KEEP_MS = 15 * 60 * 1000L;
 
     ClaudeCuriosity(Context context) {
         app = context.getApplicationContext();
@@ -110,6 +134,7 @@ final class ClaudeCuriosity implements CuriosityPort {
         worker.shutdownNow();
         // Waits for a crop still running, then frees the face model.
         cropper.close();
+        metFaces.clear();
     }
 
     // ---- settings ----
@@ -204,6 +229,213 @@ final class ClaudeCuriosity implements CuriosityPort {
         return a;
     }
 
+    // ---- the way out of a wedge (explore nav plan U5, KTD4) ----
+
+    @Override
+    public void wayOut(final WayOutRequest request, final long timeoutMs) {
+        final int g = wayOuts.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                wayOuts.finish(g, findWayOut(request, timeoutMs));
+            }
+        }, wayOuts, g, WayOut.failed());
+    }
+
+    @Override
+    public WayOut wayOutAnswer() {
+        return wayOuts.poll();
+    }
+
+    @Override
+    public void cancelWayOut() {
+        wayOuts.cancel();
+    }
+
+    /** The frames go only into this request (R15): nothing is kept, written or logged but counts. */
+    private WayOut findWayOut(WayOutRequest request, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        int n = request.frames.size();
+        if (n == 0) {
+            return WayOut.failed();
+        }
+        int[] w = new int[n];
+        int firstHeight = 0;
+        for (int i = 0; i < n; i++) {
+            int[] size = jpegSize(request.frames.get(i).jpeg);
+            w[i] = size[0];
+            if (i == 0) {
+                firstHeight = size[1];
+            }
+        }
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        content.add(ClaudeApi.textBlock(ExplorePrompts.wayOutIntro(n, w[0], firstHeight, request.second)));
+        for (int i = 0; i < n; i++) {
+            content.add(ClaudeApi.textBlock("Frame " + (i + 1) + ":"));
+            content.add(ClaudeApi.jpegBlock(request.frames.get(i).jpeg));
+        }
+        content.add(ClaudeApi.textBlock(ExplorePrompts.wayOutAsk(n, request.second)));
+        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.NAV_SYSTEM, content,
+                ExplorePrompts.WAY_OUT_SCHEMA, (int) timeoutMs);
+        WayOut a = r.ok() ? ClaudeReplies.wayOut(r.json, w) : WayOut.failed();
+        String outcome = r.ok() ? a.status.toString() : r.describe();
+        Log.i(TAG, (request.second ? "second " : "") + "way-out request with " + n + " frames: " + outcome + " in "
+                + (System.currentTimeMillis() - t0) + " ms");
+        return a;
+    }
+
+    // ---- open doorways (explore nav plan U6, KTD4) ----
+
+    @Override
+    public void doorway(final byte[] jpeg, final long timeoutMs) {
+        final int g = doorways.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                doorways.finish(g, findDoorway(jpeg, timeoutMs));
+            }
+        }, doorways, g, Doorway.failed());
+    }
+
+    @Override
+    public Doorway doorwayAnswer() {
+        return doorways.poll();
+    }
+
+    @Override
+    public void cancelDoorway() {
+        doorways.cancel();
+    }
+
+    /** The one frame goes only into this request (R15): nothing is kept, written or logged but numbers. */
+    private Doorway findDoorway(byte[] jpeg, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        if (jpeg == null) {
+            return Doorway.failed();
+        }
+        int[] size = jpegSize(jpeg);
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        content.add(ClaudeApi.textBlock(ExplorePrompts.doorwayIntro(size[0], size[1])));
+        content.add(ClaudeApi.jpegBlock(jpeg));
+        content.add(ClaudeApi.textBlock(ExplorePrompts.doorwayAsk()));
+        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.NAV_SYSTEM, content,
+                ExplorePrompts.DOORWAY_SCHEMA, (int) timeoutMs);
+        Doorway a = r.ok() ? ClaudeReplies.doorway(r.json, size[0]) : Doorway.failed();
+        String outcome = r.ok() ? a.status.toString() : r.describe();
+        Log.i(TAG, "doorway request: " + outcome + " in " + (System.currentTimeMillis() - t0) + " ms");
+        return a;
+    }
+
+    // ---- people while roaming: the recently-met check (explore nav plan U7, KTD4, KTD8) ----
+
+    @Override
+    public String metId() {
+        long now = System.currentTimeMillis();
+        for (Map.Entry<String, MetFace> e : metFaces.entrySet()) {
+            if (now - e.getValue().at > MET_KEEP_MS) {
+                metFaces.remove(e.getKey());
+            }
+        }
+        MetFace mf = meeting;
+        if (mf == null || mf.crop == null) {
+            return null;
+        }
+        String id = "met-" + metHandles.incrementAndGet();
+        metFaces.put(id, mf);
+        return id;
+    }
+
+    @Override
+    public void recentlyMet(final RecentlyMetRequest request, final long timeoutMs) {
+        final int g = recents.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                recents.finish(g, checkRecentlyMet(g, request, timeoutMs));
+            }
+        }, recents, g, Recently.failed());
+    }
+
+    @Override
+    public Recently recentlyMetAnswer() {
+        return recents.poll();
+    }
+
+    @Override
+    public void cancelRecentlyMet() {
+        recents.cancel();
+    }
+
+    /**
+     * Modelled on the person request: the face cut from the roaming frame's person
+     * box, against the faces of everyone met recently, labelled by number only.
+     * Never debugFace: no roaming frame or crop is written anywhere, even with the
+     * face debug switch on, and nothing is logged but counts, statuses and handles (R15).
+     */
+    private Recently checkRecentlyMet(int g, RecentlyMetRequest request, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        int n = request.met.size();
+        if (n == 0 || request.frameJpeg == null || request.personBox == null) {
+            return Recently.failed();
+        }
+        FaceCrop.Result crop = cropper.crop(request.frameJpeg, request.personBox);
+        if (!crop.found()) {
+            Log.i(TAG, "recently-met check: no face found in the person box; unsure");
+            return Recently.unsure();
+        }
+        RobotPeople.Face[] gallery = null;
+        try {
+            gallery = RobotPeopleClient.recent(app, RobotPeople.MAX_RECENT);
+        } catch (IOException e) {
+            Log.w(TAG, "recently-met check: people store unavailable, comparing with this session's crops: "
+                    + e.getMessage());
+        }
+        if (!recents.current(g)) {
+            return Recently.failed();
+        }
+        List<byte[]> refs = new ArrayList<byte[]>();
+        for (String id : request.met) {
+            MetFace mf = metFaces.get(id);
+            byte[] ref = mf == null ? null : storedFace(gallery, mf.storeId);
+            if (ref == null && mf != null) {
+                ref = mf.crop;
+            }
+            if (ref == null) {
+                Log.w(TAG, "recently-met check: nothing to compare for handle " + id + "; unsure");
+                return Recently.unsure();
+            }
+            refs.add(ref);
+        }
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        content.add(ClaudeApi.textBlock(ExplorePrompts.recentlyMetIntro(n)));
+        content.add(ClaudeApi.textBlock("Query:"));
+        content.add(ClaudeApi.jpegBlock(crop.face));
+        for (int i = 0; i < n; i++) {
+            content.add(ClaudeApi.textBlock("Person " + (i + 1) + ":"));
+            content.add(ClaudeApi.jpegBlock(refs.get(i)));
+        }
+        content.add(ClaudeApi.textBlock(ExplorePrompts.recentlyMetAsk(n)));
+        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM, content,
+                ExplorePrompts.RECENTLY_MET_SCHEMA, (int) timeoutMs);
+        Recently a = r.ok() ? ClaudeReplies.recentlyMet(r.json, n) : Recently.failed();
+        Log.i(TAG, "recently-met check against " + n + " people: " + (r.ok() ? a.toString() : r.describe())
+                + " in " + (System.currentTimeMillis() - t0) + " ms");
+        return a;
+    }
+
+    /** The people store's face for this id, from a recent() gallery, or null. */
+    private static byte[] storedFace(RobotPeople.Face[] gallery, String storeId) {
+        if (gallery == null || storeId == null) {
+            return null;
+        }
+        for (RobotPeople.Face f : gallery) {
+            if (storeId.equals(f.id)) {
+                return f.jpeg;
+            }
+        }
+        return null;
+    }
+
     // ---- speaking (KTD8) ----
 
     @Override
@@ -240,10 +472,12 @@ final class ClaudeCuriosity implements CuriosityPort {
         final int g = matches.start();
         meetFace = null;
         matchedId = null;
+        final MetFace mf = new MetFace();
+        meeting = mf;
         run(new Runnable() {
             @Override
             public void run() {
-                matches.finish(g, person(g, frameJpeg, personBox, timeoutMs));
+                matches.finish(g, person(g, frameJpeg, personBox, timeoutMs, mf));
             }
         }, matches, g, MatchAnswer.FAILED);
     }
@@ -254,7 +488,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     }
 
     /** The person request: the new face and up to MAX_RECENT stored ones, labelled by number only. */
-    private MatchAnswer person(int g, byte[] frameJpeg, Detection personBox, long timeoutMs) {
+    private MatchAnswer person(int g, byte[] frameJpeg, Detection personBox, long timeoutMs, MetFace mf) {
         long t0 = System.currentTimeMillis();
         FaceCrop.Result crop = cropper.crop(frameJpeg, personBox);
         debugFace(frameJpeg, personBox, crop);
@@ -271,6 +505,9 @@ final class ClaudeCuriosity implements CuriosityPort {
                     ? MatchAnswer.faceless(lines.askLine, lines.noReplyLine) : MatchAnswer.FAILED;
         }
         byte[] face = crop.face;
+        if (matches.current(g)) {
+            mf.crop = face;
+        }
         RobotPeople.Face[] gallery;
         try {
             gallery = RobotPeopleClient.recent(app, RobotPeople.MAX_RECENT);
@@ -314,6 +551,7 @@ final class ClaudeCuriosity implements CuriosityPort {
             }
             if (stored != null) {
                 matchedId = id;
+                mf.storeId = id;
                 Log.i(TAG, "person request against " + n + " references: known, reference " + (m.reference + 1)
                         + ", id " + id + " in " + ms + " ms");
                 return MatchAnswer.known(stored.isEmpty() ? null : stored, m.namedLine, m.unnamedLine);
@@ -427,16 +665,17 @@ final class ClaudeCuriosity implements CuriosityPort {
     public void remember(final String nameOrNull, final long timeoutMs) {
         final int g = remembers.start();
         final byte[] face = meetFace;
+        final MetFace mf = meeting;
         run(new Runnable() {
             @Override
             public void run() {
-                remembers.finish(g, keep(face, nameOrNull, timeoutMs));
+                remembers.finish(g, keep(face, nameOrNull, timeoutMs, mf));
             }
         }, remembers, g, Answer.failed());
     }
 
     /** Store the face (a reply is the consent, R12), then ask for the "I'll remember you" line. */
-    private Answer keep(byte[] face, String nameOrNull, long timeoutMs) {
+    private Answer keep(byte[] face, String nameOrNull, long timeoutMs, MetFace mf) {
         if (face == null) {
             // Nothing to store: never promise to remember them.
             Log.w(TAG, "remember: no face from the match to store; a hello without the promise");
@@ -445,6 +684,9 @@ final class ClaudeCuriosity implements CuriosityPort {
         String how = nameOrNull == null ? "unnamed" : "with a name";
         try {
             String id = RobotPeopleClient.add(app, face, nameOrNull);
+            if (mf != null) {
+                mf.storeId = id;
+            }
             Log.i(TAG, "remembered a new person " + how + ", id " + id);
         } catch (IOException e) {
             Log.w(TAG, "remember: the people store refused or is unavailable: " + e.getMessage());

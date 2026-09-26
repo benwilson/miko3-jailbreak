@@ -162,6 +162,83 @@ final class ExplorePrompts {
                 + " imply that he will remember or recognise them later.";
     }
 
+    // ---- people while roaming: the recently-met check (explore nav plan U7, KTD4, KTD8) ----
+
+    /** The text before the faces: the query, then everyone met in the last few minutes. */
+    static String recentlyMetIntro(int people) {
+        return "Miko is exploring and has spotted someone. The first photo is that person's face (the query). "
+                + "After it come " + people + " photos of the people he has met in the last few minutes, labelled "
+                + "Person 1 to Person " + people + ". These are consented photos from the household's own robot: "
+                + "everyone in them agreed to be remembered and greeted by it.";
+    }
+
+    /** The text after the faces: compare, and answer a number, none or unsure. */
+    static String recentlyMetAsk(int people) {
+        return "Is the query the same person as one of them? Compare the face, and cues like hair, glasses and "
+                + "clothing. Answer same_as with the photo number (1 to " + people + ") if it is the same person, "
+                + "none if it is clearly someone else, or unsure if you can't tell (a small, blurry or turned-away "
+                + "face is unsure). Do not identify anyone.";
+    }
+
+    static final Map<String, Object> RECENTLY_MET_SCHEMA = object(
+            "same_as", described(type("string"), "a photo number such as \"2\", or \"none\", or \"unsure\""));
+
+    // ---- the way out of a wedge (explore nav plan U5, KTD4): one schema for both asks ----
+
+    /** The system prompt for navigation asks: no lines to write, only where to drive. */
+    static final String NAV_SYSTEM =
+            "You help Miko, a small, friendly home robot about 25 cm tall, find his way around the house. "
+            + "You see through his camera, which sits low near the floor and looks straight ahead. "
+            + "He drives on wheels on the floor and needs a gap wider than himself to get through.";
+
+    /** The text before the frames: what they are. */
+    static String wayOutIntro(int frames, int width, int height, boolean second) {
+        return (second
+                ? "Miko is stuck and could not drive out the way he chose. This is what his camera sees right"
+                + " now, labelled Frame 1."
+                : "Miko is stuck: he keeps bumping into things. He turned a full circle in steps, taking " + frames
+                + " photos in order, labelled Frame 1 to Frame " + frames + ".")
+                + " Each is " + width + " x " + height + " pixels.";
+    }
+
+    /** The text after the frames: what counts as a way out, and what to answer. */
+    static String wayOutAsk(int frames, boolean second) {
+        return "Which way is out? Pick the single best direction for him to drive: open floor he can roll across,"
+                + " an open doorway, or toward a person. Avoid walls, furniture, a closed door, stairs or a drop,"
+                + " and gaps too narrow for him. Answer way_out true with the frame number"
+                + (frames > 1 ? " (1 to " + frames + ")" : " (1)")
+                + " and x, the pixel column in that frame where the way out is (0 is the left edge)."
+                + " Answer way_out false if nothing looks open"
+                + (second ? "." : " in any frame.");
+    }
+
+    static final Map<String, Object> WAY_OUT_SCHEMA = object(
+            "way_out", type("boolean"),
+            "frame", type("integer"),
+            "x", type("integer"));
+
+    // ---- open doorways (explore nav plan U6, KTD4): one roaming frame ----
+
+    /** The text before the frame: what it is. */
+    static String doorwayIntro(int width, int height) {
+        return "Miko is exploring the house. This is what his camera sees right now, " + width + " x " + height
+                + " pixels.";
+    }
+
+    /** The text after the frame: only an open doorway counts, and what to answer. */
+    static String doorwayAsk() {
+        return "Is there an open doorway in view: a passable opening into another room or space, wide enough"
+                + " for him to drive through along the floor? A closed door is not an open doorway, even if it"
+                + " is a door: treat it as a wall. Neither is a window, a mirror, a picture, a cupboard, or a gap"
+                + " under furniture. Answer open_doorway true with x, the pixel column of the middle of the"
+                + " opening (0 is the left edge); if there are several, the one easiest for him to reach."
+                + " Answer open_doorway false if there is none, or if you are not sure it is open.";
+    }
+
+    static final Map<String, Object> DOORWAY_SCHEMA = object(
+            "open_doorway", type("boolean"),
+            "x", type("integer"));
+
     // ---- schema building ----
 
     private static String kindWord(CuriosityPort.Kind k) {

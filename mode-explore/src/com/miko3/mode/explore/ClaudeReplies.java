@@ -61,6 +61,99 @@ final class ClaudeReplies {
     }
 
     /**
+     * The way-out reply (explore nav plan U5): "frame" 1-based among the frames sent
+     * (widths[i] pixels wide each), "x" the pixel column of the way out (or, as a
+     * fraction, 0..1). A frame out of range (frame 7 of 6), a column outside its frame,
+     * or anything missing is a failure; way_out false is NONE.
+     */
+    static CuriosityPort.WayOut wayOut(Map<String, Object> json, int[] widths) {
+        Object way = json.get("way_out");
+        if (Boolean.FALSE.equals(way)) {
+            return CuriosityPort.WayOut.none();
+        }
+        if (!Boolean.TRUE.equals(way)) {
+            return CuriosityPort.WayOut.failed();
+        }
+        Long frame = integer(json.get("frame"));
+        Object xv = json.get("x");
+        if (frame == null || frame < 1 || frame > widths.length) {
+            return CuriosityPort.WayOut.failed();
+        }
+        int f = (int) (frame - 1);
+        double at = columnAt(xv, widths[f]);
+        if (Double.isNaN(at)) {
+            return CuriosityPort.WayOut.failed();
+        }
+        return CuriosityPort.WayOut.way(f, (float) (at * 2 - 1));
+    }
+
+    /**
+     * The doorway reply (explore nav plan U6): "x" the pixel column of the open
+     * doorway in a frame width pixels wide (or, as a fraction, 0..1). A column outside
+     * the frame, a non-number, or anything missing is a failure; open_doorway false is NONE.
+     */
+    static CuriosityPort.Doorway doorway(Map<String, Object> json, int width) {
+        Object door = json.get("open_doorway");
+        if (Boolean.FALSE.equals(door)) {
+            return CuriosityPort.Doorway.none();
+        }
+        if (!Boolean.TRUE.equals(door)) {
+            return CuriosityPort.Doorway.failed();
+        }
+        double at = columnAt(json.get("x"), width);
+        if (Double.isNaN(at)) {
+            return CuriosityPort.Doorway.failed();
+        }
+        return CuriosityPort.Doorway.door((float) (at * 2 - 1));
+    }
+
+    /**
+     * A reply's "x" across a frame width pixels wide, 0..1: a whole number is a
+     * pixel column, anything else a fraction of the width. NaN when it is not a
+     * number, the width is not positive, or the column falls outside the frame.
+     */
+    private static double columnAt(Object xv, double width) {
+        if (!(xv instanceof Number) || width <= 0) {
+            return Double.NaN;
+        }
+        Long px = integer(xv);
+        double at = px != null ? px / width : ((Number) xv).doubleValue();
+        return Double.isNaN(at) || at < 0 || at > 1 ? Double.NaN : at;
+    }
+
+    /**
+     * The recently-met reply (explore nav plan U7) against people photos: "same_as"
+     * is a 1-based photo number (as a number, "2" or "Person 2"), "none" or
+     * "unsure". A number outside 1..people, or anything else, is a failure, which
+     * the brain treats like unsure: he leaves the person alone (KTD8).
+     */
+    static CuriosityPort.Recently recentlyMet(Map<String, Object> json, int people) {
+        Object v = json.get("same_as");
+        Long n = integer(v);
+        if (n == null && v instanceof String) {
+            String s = ((String) v).trim().toLowerCase(java.util.Locale.US);
+            if (s.equals("none")) {
+                return CuriosityPort.Recently.different();
+            }
+            if (s.equals("unsure")) {
+                return CuriosityPort.Recently.unsure();
+            }
+            if (s.startsWith("person ")) {
+                s = s.substring("person ".length()).trim();
+            }
+            try {
+                n = Long.parseLong(s);
+            } catch (NumberFormatException e) {
+                n = null;
+            }
+        }
+        if (n == null || n < 1 || n > people) {
+            return CuriosityPort.Recently.failed();
+        }
+        return CuriosityPort.Recently.same((int) (n - 1));
+    }
+
+    /**
      * The person reply against a gallery of galleryCount references. Returns
      * the 0-based reference matched, or -1 for "none", "unsure", a number
      * beyond the gallery, or anything else (all a new person, KTD3), plus the

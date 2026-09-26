@@ -21,6 +21,7 @@ public final class SensorReply {
     private static final String CPL = "CPL=";
     private static final String LEFT = "Left=";
     private static final String RIGHT = "Right=";
+    private static final String IMUGY = "IMUGY=";
 
     private SensorReply() {
     }
@@ -50,28 +51,86 @@ public final class SensorReply {
         if (tof == SensorSnapshot.ABSENT) {
             return null;
         }
-        return new SensorSnapshot(timestampMs, tof, number(fields[1]),
-                fields.length > 2 ? number(fields[2]) : SensorSnapshot.ABSENT,
-                count(text, LEFT), count(text, RIGHT));
+        int ir1 = number(fields[1]);
+        int ir2 = fields.length > 2 ? number(fields[2]) : SensorSnapshot.ABSENT;
+        Long left = count(text, LEFT);
+        Long right = count(text, RIGHT);
+        boolean wheels = left != null && right != null;
+        int[] gyro = gyro(text);
+        boolean hasGyro = gyro != null;
+        if (!hasGyro) {
+            gyro = new int[] {SensorSnapshot.ABSENT, SensorSnapshot.ABSENT, SensorSnapshot.ABSENT};
+        }
+        return new SensorSnapshot(timestampMs, tof, ir1, ir2, wheels, wheels ? left : SensorSnapshot.ABSENT,
+                wheels ? right : SensorSnapshot.ABSENT, hasGyro, gyro[0], gyro[1], gyro[2]);
     }
 
-    /** The wheel encoder count after {@code key} ("Left=0000068312,"): 1-10 digits ended
-     * by a comma (both counts always have one), else ABSENT. A count cut off mid-field
-     * is ABSENT, never a smaller number. */
-    private static long count(String text, String key) {
+    /** The three signed gyro rates after IMUGY= ("0000000062,-000000757,0000000093"), or
+     * null unless all three read cleanly (explore nav plan U1). The section must end at
+     * the next section key: one running into the end of the reply may be cut off
+     * mid-field, and a partial rate would read as a smaller one. */
+    private static int[] gyro(String text) {
+        int start = text.indexOf(IMUGY);
+        if (start < 0) {
+            return null;
+        }
+        int from = start + IMUGY.length();
+        String body = sectionBody(text, from);
+        if (from + body.length() >= text.length()) {
+            return null;
+        }
+        String[] fields = body.split(",", -1);
+        if (fields.length != 3) {
+            return null;
+        }
+        int[] out = new int[3];
+        for (int i = 0; i < 3; i++) {
+            Integer v = signed(fields[i]);
+            if (v == null) {
+                return null;
+            }
+            out[i] = v;
+        }
+        return out;
+    }
+
+    /** An optional '-' then 1-10 ASCII digits, as its value; anything else (padding,
+     * empty, a stray sign, out of int range) is null. Beside number(), which reads only
+     * unsigned fields of up to 5 digits. */
+    private static Integer signed(String field) {
+        int i = field.startsWith("-") ? 1 : 0;
+        int digits = field.length() - i;
+        if (digits < 1 || digits > 10) {
+            return null;
+        }
+        for (int k = i; k < field.length(); k++) {
+            if (field.charAt(k) < '0' || field.charAt(k) > '9') {
+                return null;
+            }
+        }
+        long v = Long.parseLong(field);
+        return v < Integer.MIN_VALUE || v > Integer.MAX_VALUE ? null : Integer.valueOf((int) v);
+    }
+
+    /** The wheel encoder count after {@code key} ("Left=0000068312," or, reversing past
+     * zero, "Left=-000002764,"): an optional '-' then 1-10 digits, ended by a comma (both
+     * counts always have one), else null. A count cut off mid-field is null, never a
+     * smaller number. Signed: -1 is a real count (live 2026-09-25). */
+    private static Long count(String text, String key) {
         int start = text.indexOf(key);
         if (start < 0) {
-            return SensorSnapshot.ABSENT;
+            return null;
         }
-        int i = start + key.length();
+        int sign = start + key.length();
+        int i = sign < text.length() && text.charAt(sign) == '-' ? sign + 1 : sign;
         int end = i;
-        while (end < text.length() && Character.isDigit(text.charAt(end))) {
+        while (end < text.length() && text.charAt(end) >= '0' && text.charAt(end) <= '9') {
             end++;
         }
         if (end == i || end - i > 10 || end >= text.length() || text.charAt(end) != ',') {
-            return SensorSnapshot.ABSENT;
+            return null;
         }
-        return Long.parseLong(text.substring(i, end));
+        return Long.parseLong(text.substring(sign, end));
     }
 
     /** The CPL motion-ack value in {@code reply} (2 = the MCU refused forward motion for an

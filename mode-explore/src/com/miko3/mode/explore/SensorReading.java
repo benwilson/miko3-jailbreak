@@ -26,35 +26,68 @@ final class SensorReading {
     /** Nothing in this reading can be trusted. The device side currently never sets it
      * (a dead keepalive shows up as staleness instead); it stays for a future producer. */
     final boolean fault;
-    /** Wheel encoder counts, or -1 when the reply carried none. They stand still while
-     * the wheels are stalled, e.g. against something too low for the front sensor. */
+    /** True when the reply carried both wheel counts. The counters are signed and
+     * cumulative (live 2026-09-25: forward counts up, reverse counts down, from 0 at
+     * power-up), so a negative count is real: check this, never the counts' sign. */
+    private final boolean wheels;
+    /** Wheel encoder counts (0 when !hasWheels()). They stand still while the wheels
+     * are stalled, e.g. against something too low for the front sensor; use their
+     * differences, with Math.abs where direction doesn't matter. */
     final long wheelLeft;
     final long wheelRight;
+    /** True when the reply carried the gyro (explore nav plan U1, KTD1). The rates are
+     * signed, so -1 is a real value: check this rather than the fields. */
+    final boolean hasGyro;
+    /** Raw gyroscope rates, in the controller's counts; which one is yaw, its sign and its
+     * scale are in the calibration file (ExploreCalibration.Gyro). 0 when !hasGyro. */
+    final int gyroX;
+    final int gyroY;
+    final int gyroZ;
 
+    /** No wheel counts and no gyro. */
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault) {
-        this(timestampMs, tof, ir1, ir2, cpl, fault, -1, -1);
+        this(timestampMs, tof, ir1, ir2, cpl, fault, false, 0, 0, false, 0, 0, 0);
     }
 
+    /** With both wheel counts (any sign). */
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault,
                   long wheelLeft, long wheelRight) {
+        this(timestampMs, tof, ir1, ir2, cpl, fault, true, wheelLeft, wheelRight, false, 0, 0, 0);
+    }
+
+    /** With both wheel counts and the gyro's three raw rates. */
+    SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault,
+                  long wheelLeft, long wheelRight, int gyroX, int gyroY, int gyroZ) {
+        this(timestampMs, tof, ir1, ir2, cpl, fault, true, wheelLeft, wheelRight, true, gyroX, gyroY, gyroZ);
+    }
+
+    /** Every field, with the wheels' and the gyro's presence explicit. */
+    SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault, boolean hasWheels,
+                  long wheelLeft, long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ) {
+        this.hasGyro = hasGyro;
+        this.gyroX = gyroX;
+        this.gyroY = gyroY;
+        this.gyroZ = gyroZ;
         this.timestampMs = timestampMs;
         this.tof = tof;
         this.ir1 = ir1;
         this.ir2 = ir2;
         this.cpl = cpl;
         this.fault = fault;
-        this.wheelLeft = wheelLeft;
-        this.wheelRight = wheelRight;
+        this.wheels = hasWheels;
+        this.wheelLeft = hasWheels ? wheelLeft : 0;
+        this.wheelRight = hasWheels ? wheelRight : 0;
     }
 
     boolean hasWheels() {
-        return wheelLeft >= 0 && wheelRight >= 0;
+        return wheels;
     }
 
     @Override
     public String toString() {
         return "t=" + timestampMs + " tof=" + tof + " ir1=" + ir1 + " ir2=" + ir2
                 + " cpl=" + cpl + (hasWheels() ? " wheels=" + wheelLeft + "/" + wheelRight : "")
+                + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "")
                 + (fault ? " FAULT" : "");
     }
 }

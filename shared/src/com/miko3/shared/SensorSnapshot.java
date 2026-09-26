@@ -20,28 +20,63 @@ public final class SensorSnapshot {
     public final int ir2;
     /** True when tof is DEAD_TOF: the sensor is reporting, but nothing it says is usable. */
     public final boolean fault;
-    /** The wheel encoder counts from the record's Left=/Right= fields, or ABSENT. They
-     * climb while a wheel turns and stand still while it is stalled. */
+    /** True when the record carried both wheel counts (Left=/Right=). The counts are
+     * signed (live 2026-09-25: reverse counts down, from 0 at power-up), so -1 is a
+     * real count: check this, never ABSENT. */
+    public final boolean hasWheels;
+    /** The wheel encoder counts from the record's Left=/Right= fields; ABSENT when
+     * !hasWheels. Signed and cumulative: forward counts up, reverse counts down, and
+     * they stand still while a wheel is stalled. */
     public final long wheelLeft;
     public final long wheelRight;
+    /** True when the record carried a whole IMUGY= section (explore nav plan U1, KTD1).
+     * The gyro fields are signed rates, so -1 is a real value there: check this, not ABSENT. */
+    public final boolean hasGyro;
+    /** The raw gyroscope rates from IMUGY=, in the controller's counts; ABSENT when
+     * !hasGyro. Which axis is yaw, its sign and its scale come from the owner-guided
+     * capture (scripts/qa-explore-sensors.py --gyro-circle), never from here. */
+    public final int gyroX;
+    public final int gyroY;
+    public final int gyroZ;
 
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2) {
         this(timestampMs, tof, ir1, ir2, ABSENT, ABSENT);
     }
 
+    /** Wheel counts given as values (ABSENT for none): a count of -1 can't be carried this way. */
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, long wheelLeft, long wheelRight) {
+        this(timestampMs, tof, ir1, ir2, wheelLeft != ABSENT && wheelRight != ABSENT, wheelLeft, wheelRight,
+                false, ABSENT, ABSENT, ABSENT);
+    }
+
+    /** A reading that carried the gyro: its three raw rates (wheel counts as above). */
+    public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, long wheelLeft, long wheelRight,
+                          int gyroX, int gyroY, int gyroZ) {
+        this(timestampMs, tof, ir1, ir2, wheelLeft != ABSENT && wheelRight != ABSENT, wheelLeft, wheelRight,
+                true, gyroX, gyroY, gyroZ);
+    }
+
+    /** Every field, with explicit presence for the signed wheel counts and gyro rates. */
+    public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, boolean hasWheels, long wheelLeft,
+                          long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ) {
         this.timestampMs = timestampMs;
         this.tof = tof;
         this.ir1 = ir1;
         this.ir2 = ir2;
         this.fault = tof == DEAD_TOF;
-        this.wheelLeft = wheelLeft;
-        this.wheelRight = wheelRight;
+        this.hasWheels = hasWheels;
+        this.wheelLeft = hasWheels ? wheelLeft : ABSENT;
+        this.wheelRight = hasWheels ? wheelRight : ABSENT;
+        this.hasGyro = hasGyro;
+        this.gyroX = gyroX;
+        this.gyroY = gyroY;
+        this.gyroZ = gyroZ;
     }
 
     @Override
     public String toString() {
         return "SensorSnapshot{t=" + timestampMs + " tof=" + tof + " ir1=" + ir1 + " ir2=" + ir2
-                + " wheels=" + wheelLeft + "/" + wheelRight + (fault ? " FAULT" : "") + "}";
+                + (hasWheels ? " wheels=" + wheelLeft + "/" + wheelRight : "")
+                + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "") + (fault ? " FAULT" : "") + "}";
     }
 }

@@ -21,7 +21,9 @@ REPO = Path(__file__).resolve().parents[2]
 PKG = REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "explore_sighting_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "SightingHarness.java"
-PLAIN_JAVA = [PKG / n for n in ("Sighting.java", "Detection.java", "ExploreTuning.java")]
+# ExploreTuning carries the gyro calibration (explore nav plan U2), which reads SensorReading.
+PLAIN_JAVA = [PKG / n for n in ("Sighting.java", "Detection.java", "ExploreTuning.java", "ExploreCalibration.java",
+                                 "SensorReading.java")]
 VOCABULARY = REPO / "mode-explore" / "assets" / "vocabulary.txt"
 
 

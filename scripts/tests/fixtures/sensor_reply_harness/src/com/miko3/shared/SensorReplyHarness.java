@@ -97,12 +97,68 @@ public final class SensorReplyHarness {
                 w != null && w.wheelLeft == 68312 && w.wheelRight == 59810, "got " + w);
 
         check("missing_or_cut_off_wheel_counts_are_absent",
-                SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXX"), T).wheelLeft == SensorSnapshot.ABSENT
-                        && SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=00000683"), T).wheelLeft
-                        == SensorSnapshot.ABSENT
-                        && SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=XXXX,Right=1,"), T).wheelLeft
-                        == SensorSnapshot.ABSENT,
-                "expected ABSENT");
+                w.hasWheels && !SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXX"), T).hasWheels
+                        && !SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=00000683"), T).hasWheels
+                        && !SensorReply.parse(bytes("TOFIR=00209,XXXX,0,XXXXLeft=XXXX,Right=1,"), T).hasWheels,
+                "expected no wheel counts");
+
+        // Live 2026-09-25: the counters are signed and cumulative, reverse counts down
+        // and they start at 0 after a power cycle ("Left=-000002764,Right=-000001789,").
+        String head = "POWER=0,0TOFIR=00209,XXXX,0,XXXXHEADTM=0";
+        SensorSnapshot back = SensorReply.parse(bytes(head + "Left=-000002764,Right=-000001789,00,00,0"), T);
+        SensorSnapshot mixed = SensorReply.parse(bytes(head + "Left=0000001963,Right=-000000012,00,00,0"), T);
+        check("negative_wheel_counts_are_read",
+                back != null && back.hasWheels && back.wheelLeft == -2764 && back.wheelRight == -1789
+                        && mixed != null && mixed.hasWheels && mixed.wheelLeft == 1963 && mixed.wheelRight == -12,
+                "got " + back + " / " + mixed);
+        check("a_stray_or_cut_off_minus_is_absent",
+                !SensorReply.parse(bytes(head + "Left=-,Right=5,00"), T).hasWheels
+                        && !SensorReply.parse(bytes(head + "Left=--5,Right=5,00"), T).hasWheels
+                        && !SensorReply.parse(bytes(head + "Left=5,Right=-"), T).hasWheels
+                        && !SensorReply.parse(bytes(head + "Left=5,Right=-00000"), T).hasWheels
+                        && !SensorReply.parse(bytes(head + "Left=-00000000001,Right=5,00"), T).hasWheels,
+                "expected no wheel counts");
+        SensorSnapshot minusOne = SensorReply.parse(bytes(head + "Left=-000000001,Right=0000000000,00"), T);
+        check("a_count_of_minus_one_is_present",
+                minusOne != null && minusOne.hasWheels && minusOne.wheelLeft == -1 && minusOne.wheelRight == 0,
+                "got " + minusOne);
+
+        // ---- gyro (explore nav plan U1): IMUGY= is three signed rate fields ----
+        check("captured_record_carries_the_gyro",
+                s != null && s.hasGyro && s.gyroX == 62 && s.gyroY == -757 && s.gyroZ == 93, "got " + s);
+
+        boolean allGyro = true;
+        for (String line : lines) {
+            SensorSnapshot each = SensorReply.parse(padded(replyOf(line)), T);
+            allGyro &= each != null && each.hasGyro && each.gyroY < 0;
+        }
+        check("every_captured_record_carries_the_gyro", allGyro, "a baseline record lost its gyro");
+
+        SensorSnapshot neg = SensorReply.parse(bytes(
+                "IMUGY=-000001234,0000000005,-000000001IMUMG=0TOFIR=00209,XXXX,0,XXXX"), T);
+        check("gyro_sign_and_leading_zeros_are_read",
+                neg != null && neg.hasGyro && neg.gyroX == -1234 && neg.gyroY == 5 && neg.gyroZ == -1,
+                "got " + neg);
+
+        SensorSnapshot allX = SensorReply.parse(bytes("IMUGY=XXXXXXXXXX,XXXXXXXXXX,XXXXXXXXXXIMUMG=0"
+                + "TOFIR=00209,XXXX,0,XXXXLeft=0000068312,Right=0000059810,00"), T);
+        SensorSnapshot none = SensorReply.parse(bytes(
+                "POWER=0,0TOFIR=00209,XXXX,0,XXXXLeft=0000068312,Right=0000059810,00"), T);
+        check("absent_gyro_leaves_the_rest_of_the_record",
+                allX != null && !allX.hasGyro && allX.tof == 209 && allX.wheelLeft == 68312
+                        && none != null && !none.hasGyro && none.tof == 209 && none.wheelRight == 59810,
+                "all-X " + allX + " / missing " + none);
+
+        String tail = "TOFIR=00209,XXXX,0,XXXX";
+        check("cut_off_or_malformed_gyro_is_absent",
+                !SensorReply.parse(bytes(tail + "IMUGY=0000000062,-000000757,00000"), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=0000000062,-000000757IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=00000000X2,1,2IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=1,--2,3IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=1,,3IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=1,2,3,4IMUMG=0" + tail), T).hasGyro
+                        && !SensorReply.parse(bytes("IMUGY=1,2,00000000001IMUMG=0" + tail), T).hasGyro,
+                "a partial or malformed gyro must not read as a smaller rate");
 
         check("malformed_cpl_is_unknown",
                 SensorReply.parseCpl(bytes("CPL=X,")) == SensorSnapshot.ABSENT
