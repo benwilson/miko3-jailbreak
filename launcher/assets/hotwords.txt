@@ -1,0 +1,19 @@
+# Hotwords for the launcher's one recogniser (meeting plan U3, KTD2): his name
+# as the model tends to spell it, and the greetings the classifier treats as
+# strong. One phrase per line, upper case like the model's tokens; an optional
+# ":score" after a phrase overrides the recogniser's hotwords score. Read from
+# the APK asset root at start, outside the staged model directory.
+MIKO
+MIKA
+MIKEY
+HEY MIKO
+HEY MIKEY
+HEY BUDDY
+HI BUDDY
+MORNING
+GOOD MORNING
+AFTERNOON
+EVENING
+HEY ROBOT
+SORRY
+OOPS

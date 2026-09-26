@@ -48,17 +48,13 @@ KEYSTORE_ALIAS = "miko3modevoice"
 KEYSTORE_PASS = "miko3modevoice"
 KEYSTORE_CN = "Miko3 Voice Mode"
 
-VENDOR_ABI = "arm64-v8a"
-VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / VENDOR_ABI
+VENDOR_ABI = bc.VENDOR_ABI
+VENDOR_LIB_DIR = bc.VENDOR_LIB_DIR
 
-# libnative_wakeword_vad_lib.so is what recognizer.WakeWord loads; it links
-# libncnn.so directly (readelf NEEDED) and the TFLite GPU delegate is dlopen'd
-# by the engine at init, so all three ship together.
-WAKEWORD_LIBS = (
-    "libnative_wakeword_vad_lib.so",
-    "libncnn.so",
-    "libtensorflowlite_gpu_delegate.so",
-)
+# The wake-word library list and its missing-library check live in build_common
+# (meeting plan U3): the launcher's ears session stages the same three files, and
+# recognizer.WakeWord itself now lives in shared/src.
+WAKEWORD_LIBS = bc.WAKEWORD_LIBS
 
 # The remote-control mode's 3.6 MB song has no use in this APK. Everything else
 # in shared/assets is needed: pico.min.css styles the settings page and
@@ -69,15 +65,7 @@ SHARED_ASSETS_EXCLUDED = ("danger-zone.mp3",)
 def vendor_native_libs(lib_dir=VENDOR_LIB_DIR):
     """Return [(abi, so_path), ...] for build_common's native_libs, or raise
     BuildError naming every missing library and the directory searched."""
-    lib_dir = Path(lib_dir)
-    missing = [name for name in WAKEWORD_LIBS if not (lib_dir / name).is_file()]
-    if missing:
-        raise BuildError(
-            f"!! vendor wake-word librar{'y' if len(missing) == 1 else 'ies'} missing from "
-            f"{lib_dir}: {', '.join(missing)}\n"
-            "   these come from ServiceExam's APK (lib/arm64-v8a/); re-extract it into "
-            "tools/serviceexam_jadx/resources/ (jadx) before building mode-voice")
-    return [(VENDOR_ABI, lib_dir / name) for name in WAKEWORD_LIBS]
+    return bc.wakeword_native_libs(lib_dir, "mode-voice")
 
 
 def build(sdk=None, bootstrap=True, apk_out=APK, build_dir=BUILD, keystore=KEYSTORE,

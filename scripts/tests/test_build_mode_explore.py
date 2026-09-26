@@ -94,6 +94,15 @@ class VendorLibsTest(unittest.TestCase):
     def test_declares_the_motor_driver_lib(self):
         self.assertEqual(build.DRIVER_LIB, "libmiko_drivers.so")
 
+    def test_does_not_stage_the_wake_word_libraries(self):
+        """Meeting plan U3: the shared wake-word list serves the launcher and
+        mode-voice; explore never dexes a use of it and never stages the libs."""
+        names = {Path(p).name for _, p in build.vendor_native_libs(VENDOR_LIB_DIR)}
+        self.assertTrue(names.isdisjoint(build.bc.WAKEWORD_LIBS), names)
+        src = BUILD_PY.read_text()
+        self.assertNotIn("wakeword_native_libs", src)
+        self.assertNotIn("WAKEWORD", src)
+
     def test_present_returns_arm64_entry(self):
         libs = build.vendor_native_libs(VENDOR_LIB_DIR)
         self.assertEqual(len(libs), 1)

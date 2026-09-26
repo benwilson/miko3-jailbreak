@@ -8,25 +8,32 @@ import android.os.RemoteException;
 import android.util.Log;
 
 import com.miko3.shared.LauncherProtocol;
+import com.miko3.shared.RobotEars;
 import com.miko3.shared.RobotListen;
 
 /**
- * Exported bound Service through which our mode apps hear one short spoken
- * reply (explore-on-claude plan U3; R11, R12, KTD1, KTD4, KTD8). Built like
- * SpeechService: every call first checks who is calling (CallerGate, the
- * pinned-certificate check), and only then claims the microphone, so a
- * vendor app gets a SecurityException and never records anything.
+ * Exported bound Service through which our mode apps hear (explore-on-claude
+ * plan U3; meeting plan U3). Two Binders, picked by the bind action:
  *
- * The listen itself runs on the launcher's ListenEngine thread
- * (LauncherApp.listen()): it waits for the speech queue to go idle, records
- * until the speaker stops or the cap, and answers over the caller's one-way
- * callback. One listen at a time; a second caller gets IllegalStateException
- * ("already listening"). A caller that dies mid-listen just loses its
- * answer; the listen ends at its cap anyway.
+ * ROBOT_LISTEN, the one-shot RobotListen: one short spoken reply, for callers
+ * with no ears session open (a second one gets IllegalStateException
+ * "already listening"; any caller gets "ears session open" while a session
+ * is held, KTD1). The listen runs on the launcher's ListenEngine thread: it
+ * waits for the speech queue to go idle, records until the speaker stops or
+ * the cap, and answers over the caller's one-way callback.
+ *
+ * ROBOT_EARS, the continuous RobotEars session (KTD1, KTD6): open, renew,
+ * close, a conversation listen, a clip window and the shove stamp, bound to
+ * the uid that opened it; utterances stream back one-way through the
+ * callback. Built like SpeechService: every call first checks who is calling
+ * (CallerGate, the pinned-certificate check), so a vendor app gets a
+ * SecurityException and never records anything. Logs uids and counters,
+ * never words.
  */
 public class ListenService extends Service {
     private static final String TAG = "ListenService";
     public static final String ACTION_BIND = LauncherProtocol.ROBOT_LISTEN_ACTION;
+    public static final String ACTION_BIND_EARS = LauncherProtocol.ROBOT_EARS_ACTION;
 
     private final RobotListen.Stub binder = new RobotListen.Stub() {
         @Override
@@ -38,6 +45,7 @@ public class ListenService extends Service {
             final int uid = Binder.getCallingUid();
             ListenEngine engine = ears();
             try {
+                engine.refuseOneShot();
                 engine.session().claim();
             } catch (IllegalStateException e) {
                 Log.i(TAG, "uid " + uid + " refused: " + e.getMessage());
@@ -69,8 +77,68 @@ public class ListenService extends Service {
         }
     };
 
+    private final RobotEars.Stub earsBinder = new RobotEars.Stub() {
+        @Override
+        public void open(RobotEars.Callback callback, boolean chargerLatched) {
+            enforceCaller();
+            if (callback == null) {
+                throw new IllegalArgumentException("no callback");
+            }
+            int uid = Binder.getCallingUid();
+            try {
+                ears().openEars(uid, callback, chargerLatched);
+            } catch (IllegalStateException e) {
+                Log.i(TAG, "uid " + uid + " ears refused: " + e.getMessage());
+                throw e;
+            }
+            Log.i(TAG, "uid " + uid + " opened the ears" + (chargerLatched ? " (charger latched)" : ""));
+        }
+
+        @Override
+        public boolean renew(boolean chargerLatched) {
+            enforceCaller();
+            int uid = Binder.getCallingUid();
+            return ears().ears().renew(String.valueOf(uid), chargerLatched);
+        }
+
+        @Override
+        public void close() {
+            enforceCaller();
+            int uid = Binder.getCallingUid();
+            if (ears().ears().close(String.valueOf(uid))) {
+                Log.i(TAG, "uid " + uid + " closed the ears");
+            }
+        }
+
+        @Override
+        public void listen(long maxMs) {
+            enforceCaller();
+            int uid = Binder.getCallingUid();
+            boolean ok = ears().ears().listen(String.valueOf(uid), maxMs);
+            Log.i(TAG, "uid " + uid + " conversation listen " + (ok ? "for up to " + ListenSession.clampCap(maxMs)
+                    + " ms" : "refused"));
+        }
+
+        @Override
+        public void clipWindow(long durationMs) {
+            enforceCaller();
+            int uid = Binder.getCallingUid();
+            ears().ears().clipWindow(String.valueOf(uid), durationMs);
+        }
+
+        @Override
+        public void shoved(long atElapsedMs) {
+            enforceCaller();
+            int uid = Binder.getCallingUid();
+            ears().ears().shoved(String.valueOf(uid), atElapsedMs);
+        }
+    };
+
     @Override
     public IBinder onBind(Intent intent) {
+        if (intent != null && ACTION_BIND_EARS.equals(intent.getAction())) {
+            return earsBinder;
+        }
         return binder;
     }
 

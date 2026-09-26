@@ -45,6 +45,17 @@ PROTOCOL = SHARED / "LauncherProtocol.java"
 MANIFEST = REPO / "launcher" / "AndroidManifest.xml"
 BUILD_PY = REPO / "scripts" / "build-custom-launcher.py"
 INSTALL_PY = REPO / "scripts" / "install-custom-launcher.py"
+# Meeting plan U3: the continuous ears session.
+EARS = LAUNCHER / "EarsSession.java"
+CLASSIFIER = LAUNCHER / "CueClassifier.java"
+KEEPER = LAUNCHER / "LeaseKeeper.java"
+DRIVE_LEASE = LAUNCHER / "DriveLeaseService.java"
+QUEUE = LAUNCHER / "SpeechQueue.java"
+TUNING = LAUNCHER / "SpeechTuning.java"
+EARS_INTERFACE = SHARED / "RobotEars.java"
+EARS_CLIENT = SHARED / "RobotEarsClient.java"
+HOTWORDS = REPO / "launcher" / "assets" / "hotwords.txt"
+WAKEWORD_LIBS = ("libnative_wakeword_vad_lib.so", "libncnn.so", "libtensorflowlite_gpu_delegate.so")
 
 
 def _strip_comments(text):
@@ -89,6 +100,32 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "second_concurrent_listen_refused",
         "refused_when_recognizer_not_ready",
         "unpinned_caller_is_denied",
+        # Meeting plan U3: the continuous ears session (KTD1, KTD2, KTD6) and the
+        # keeper extracted from the drive lease service.
+        "ears_deaf_window_drops_utterance_inside",
+        "ears_utterance_after_window_delivered",
+        "ears_straddling_utterance_is_partial",
+        "ears_line_start_mid_utterance_delivers_partial",
+        "ears_clip_window_matches_a_spoken_line",
+        "ears_second_open_refused",
+        "ears_one_shot_refused_while_open",
+        "ears_renew_and_close_from_other_uid_refused",
+        "ears_three_missed_renews_release_capture",
+        "ears_client_death_releases_capture",
+        "ears_close_releases_capture",
+        "ears_capture_that_will_not_open_retries_on_tick",
+        "ears_charger_closes_idle_session_keeps_conversation_listen",
+        "ears_opens_closed_while_docked",
+        "ears_wake_word_is_strong_with_the_switch_off",
+        "ears_direction_sampled_only_while_speech",
+        "ears_burst_without_words_or_side_is_dropped",
+        "ears_shove_then_sorry_is_strong",
+        "ears_listen_expires_at_its_cap",
+        "ears_logs_counters_not_words",
+        "keeper_acquire_renew_release",
+        "keeper_ttl_expiry",
+        "keeper_death_and_stale_death_ignored",
+        "keeper_dead_token_never_acquires",
     )
 
     @classmethod
@@ -137,6 +174,56 @@ class PlainJavaTest(unittest.TestCase):
         self.assertTrue(raw, "ListenSession.java missing")
         self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
 
+    def test_ears_session_classifier_and_keeper_are_plain_java(self):
+        """Meeting plan U3: the session state machine, the classifier and the
+        keeper are proven in the host harness, so none may touch android.*."""
+        for path in (EARS, CLASSIFIER, KEEPER):
+            with self.subTest(file=path.name):
+                raw = path.read_text() if path.exists() else ""
+                self.assertTrue(raw, f"{path.name} missing")
+                self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
+
+    def test_ears_session_pins_the_plans_timings(self):
+        src = _read(EARS)
+        self.assertRegex(src, r"RENEW_PERIOD_MS\s*=\s*1000")
+        self.assertRegex(src, r"MISSED_RENEWS\s*=\s*3")
+        self.assertRegex(src, r"DIRECTION_PERIOD_MS\s*=\s*100")
+        # KTD4: the angle is the median over the utterance, from the shared library.
+        self.assertIn("VoiceDirection.median(", src)
+
+    def test_deaf_tail_is_a_speech_tuning_with_the_plans_default(self):
+        src = _read(TUNING)
+        self.assertRegex(src, r"DEFAULT_DEAF_TAIL_MS\s*=\s*500")
+        self.assertIn("deafTailMs", src)
+        self.assertRegex(src, r'DEAF_TAIL_PROP\s*=\s*"debug\.miko3\.speech\.deaf_tail_ms"')
+
+
+class SpeechQueueHookTest(unittest.TestCase):
+    """KTD1: the deaf window runs from a line's start to playback idle, so the
+    queue tells the ears both, from the thread that plays the line."""
+
+    def test_queue_signals_line_start_and_idle(self):
+        src = _read(QUEUE)
+        self.assertRegex(src, r"interface Speaking\s*\{[^}]*void started\(\);[^}]*void idle\(\);")
+        self.assertIn("setSpeaking(", src)
+        body = _method_body(src, "boolean playNext")
+        self.assertIsNotNone(body)
+        self.assertLess(body.find(".started()"), body.find("voice.startLine("))
+        self.assertIn(".idle()", body)
+
+
+class DriveLeaseKeeperTest(unittest.TestCase):
+    """The renew, death and TTL bookkeeping moved into LeaseKeeper; the drive
+    lease service keeps its stop-motors behaviour on every release path."""
+
+    def test_drive_lease_delegates_to_the_keeper(self):
+        src = _read(DRIVE_LEASE)
+        self.assertIn("new LeaseKeeper(", src)
+        self.assertNotIn("holderDeathRecipient", src)
+        for reason in ("ttl_expired", "binder_died", "clean_release"):
+            self.assertIn(reason, _read(KEEPER), reason)
+        self.assertIn("issueStop(", _method_body(src, "released") or "")
+
 
 class ServiceWiringTest(unittest.TestCase):
     @classmethod
@@ -163,6 +250,39 @@ class ServiceWiringTest(unittest.TestCase):
         self.assertIn("LauncherProtocol.ROBOT_LISTEN_ACTION", self.src)
         self.assertIn("(LauncherApp) getApplication()", self.src)
         self.assertIn("listen()", self.src)
+
+    def test_one_shot_listen_refused_while_ears_are_open(self):
+        """Meeting plan U3, KTD1: the one-shot stays only for callers with no
+        session open; the check runs after the caller gate and before the claim."""
+        body = _method_body(self.src, "public void listen") or ""
+        check, refuse, claim = body.find("enforceCaller("), body.find("refuseOneShot("), body.find(".claim(")
+        self.assertGreater(refuse, check, "the ears check runs before the caller gate")
+        self.assertGreater(claim, refuse, "the microphone is claimed before the ears check")
+
+    EARS_METHODS = (r"public void open\(", r"public boolean renew\(", r"public void close\(",
+                    r"public void listen\(long \w+\)", r"public void clipWindow\(", r"public void shoved\(")
+
+    def test_every_ears_transaction_passes_the_gate_and_reads_the_uid(self):
+        """Every ears transaction passes the caller gate, and renew, close, listen,
+        clip and shove are bound to the uid that opened the session."""
+        ears = self.src.split("RobotEars.Stub", 1)
+        self.assertEqual(len(ears), 2, "ListenService serves no RobotEars.Stub")
+        for pattern in self.EARS_METHODS:
+            with self.subTest(method=pattern):
+                m = re.search(pattern + r"[^{;]*\{", ears[1])
+                self.assertIsNotNone(m, f"no {pattern}")
+                depth, i = 1, m.end()
+                while depth and i < len(ears[1]):
+                    depth += {"{": 1, "}": -1}.get(ears[1][i], 0)
+                    i += 1
+                body = ears[1][m.end():i - 1]
+                self.assertIn("enforceCaller(", body)
+                self.assertIn("Binder.getCallingUid()", body)
+
+    def test_binds_ears_by_their_own_action(self):
+        self.assertIn("LauncherProtocol.ROBOT_EARS_ACTION", self.src)
+        body = _method_body(self.src, "public IBinder onBind") or ""
+        self.assertIn("getAction()", body)
 
 
 class EngineWiringTest(unittest.TestCase):
@@ -206,6 +326,26 @@ class EngineWiringTest(unittest.TestCase):
         self.assertEqual(app.count("new ListenEngine("), 1)
         self.assertIn("ListenEngine listen()", app)
 
+    def test_one_recogniser_configured_per_ktd2(self):
+        """Meeting plan KTD2: modified_beam_search with the hotwords file at the
+        asset root, bpe modelling unit with the vocabulary beside tokens.txt, 2
+        threads, 2 active paths, endpoints 0.8 s after words and 2 s of nothing."""
+        for needle in ('"modified_beam_search"', "setMaxActivePaths(MAX_ACTIVE_PATHS)", "setHotwordsFile(",
+                       'setModelingUnit("bpe")', "setBpeVocab(", '"bpe.vocab"', '"hotwords.txt"',
+                       "setMinTrailingSilence(0.8f)", "setMinTrailingSilence(2.0f)", "setNumThreads(THREADS)"):
+            self.assertIn(needle, self.src)
+        self.assertRegex(self.src, r"\bTHREADS\s*=\s*2;")
+        self.assertRegex(self.src, r"MAX_ACTIVE_PATHS\s*=\s*2;")
+        self.assertEqual(self.src.count("new OnlineRecognizer("), 1, "one recogniser serves both listens")
+
+    def test_ears_feed_the_wake_word_engine_a_silero_gate_and_the_direction_sampler(self):
+        for needle in ("new WakeWord(", "processChunk(", "SileroVadModelConfig", "new Vad(", "isSpeechDetected()",
+                       "VoiceDirection.open()", ".sample(EarsSession.DIRECTION_PERIOD_MS)", "setSpeaking(",
+                       "new EarsSession("):
+            self.assertIn(needle, self.src)
+        # The switch (KTD11) is read from the launcher's preferences at classify time.
+        self.assertIn("answers_when_spoken_to", self.src)
+
     def test_no_logging_of_secrets(self):
         for path in (SERVICE, ENGINE, SESSION, INTERFACE, CLIENT):
             src = _read(path)
@@ -231,6 +371,12 @@ class ProtocolAndManifestTest(unittest.TestCase):
     def test_manifest_asks_for_the_microphone(self):
         self.assertIn('<uses-permission android:name="android.permission.RECORD_AUDIO"/>',
                       MANIFEST.read_text())
+
+    def test_ears_action_declared_and_served_by_the_listen_service(self):
+        self.assertRegex(_read(PROTOCOL), r'ROBOT_EARS_ACTION\s*=\s*"com\.miko3\.launcher\.ROBOT_EARS"')
+        m = re.search(r'<service android:name="\.ListenService"([^>]*)>(.*?)</service>', MANIFEST.read_text(), flags=re.S)
+        self.assertIsNotNone(m)
+        self.assertIn('<action android:name="com.miko3.launcher.ROBOT_EARS"/>', m.group(2))
 
     def test_installer_grants_the_microphone(self):
         src = INSTALL_PY.read_text()
@@ -290,6 +436,58 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertIn("TIMEOUT_MARGIN_MS", src)
         self.assertIn("schedule(", src)
 
+    # ---- meeting plan U3: the ears Binder ----
+
+    def test_ears_binder_shape(self):
+        src = _read(EARS_INTERFACE)
+        for needle in ("extends IInterface", "abstract class Stub extends Binder", "class Proxy",
+                       '"com.miko3.shared.RobotEars"', '"com.miko3.shared.RobotEars.Callback"',
+                       "enforceInterface(", "writeInterfaceToken(", "reply.readException()",
+                       "writeStrongBinder(", "readStrongBinder()", "FLAG_ONEWAY"):
+            self.assertIn(needle, src)
+        head = src.split("abstract class Stub", 1)[0]
+        for m in (r"void open\(Callback \w+, boolean \w+\) throws RemoteException;",
+                  r"boolean renew\(boolean \w+\) throws RemoteException;",
+                  r"void close\(\) throws RemoteException;",
+                  r"void listen\(long \w+\) throws RemoteException;",
+                  r"void clipWindow\(long \w+\) throws RemoteException;",
+                  r"void shoved\(long \w+\) throws RemoteException;",
+                  r"void heard\(String \w+, int \w+, float \w+, int \w+, long \w+, boolean \w+\)"):
+            self.assertRegex(head, m)
+
+    def test_ears_proxy_detects_an_older_launcher(self):
+        """KTD11: every new proxy method checks the transaction result."""
+        proxy = _read(EARS_INTERFACE).split("abstract class Stub extends Binder", 1)[1]
+        proxy = proxy.split("class Proxy implements RobotEars", 1)[1]
+        # Every transact() in the proxy is checked: none is a bare call.
+        self.assertGreaterEqual(proxy.count("remote.transact("), 4)
+        self.assertEqual(proxy.count("remote.transact("), proxy.count("if (!remote.transact("))
+        self.assertIn("throw new RemoteException(", proxy)
+
+    def test_listen_transaction_codes_unchanged_and_ears_codes_appended(self):
+        """Existing codes in the listen Binder stay; the ears Binder's own codes
+        count up from 1 in declaration order, so a later method is appended."""
+        listen = _read(INTERFACE)
+        self.assertRegex(listen, r"TRANSACTION_listen\s*=\s*1;")
+        for name, code in (("heard", 1), ("noSpeech", 2), ("failed", 3)):
+            self.assertRegex(listen, rf"TRANSACTION_{name}\s*=\s*{code};")
+        callback, ears = _read(EARS_INTERFACE).split("implements RobotEars {", 1)
+        codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", ears)]
+        self.assertEqual([n for n, _ in codes], ["open", "renew", "close", "listen", "clipWindow", "shoved"])
+        self.assertEqual([c for _, c in codes], list(range(1, 7)))
+        self.assertRegex(callback, r"TRANSACTION_heard\s*=\s*1;")
+
+    def test_ears_client_binds_renews_and_closes(self):
+        src = _read(EARS_CLIENT)
+        for needle in ("new Intent(LauncherProtocol.ROBOT_EARS_ACTION)", "setPackage(LauncherProtocol.LAUNCHER_PACKAGE)",
+                       "bindService(", "unbindService(", "RobotEars.Stub.asInterface(", "RENEW_PERIOD_MS",
+                       "scheduleAtFixedRate(", "shutdownNow()", "extends RobotEars.Callback.Stub"):
+            self.assertIn(needle, src)
+        body = _method_body(src, "public void close")
+        self.assertIsNotNone(body, "client has no close()")
+        self.assertIn("unbindService(", body)
+        self.assertRegex(body, r"if \(closed\)\s*\{?\s*return;")
+
 
 def _load_build():
     spec = importlib.util.spec_from_file_location("build_custom_launcher", BUILD_PY)
@@ -346,7 +544,8 @@ class BuildScriptTest(unittest.TestCase):
         b = self.build
         self.assertEqual(b.DSP_LIB, "libconexant_dsp_lib.so")
         libs = b.vendor_native_libs(VENDOR_LIB_DIR)
-        self.assertEqual(sorted(Path(p).name for _, p in libs), ["libconexant_dsp_lib.so", "libmiko_drivers.so"])
+        self.assertEqual(sorted(Path(p).name for _, p in libs),
+                         sorted(["libconexant_dsp_lib.so", "libmiko_drivers.so", *WAKEWORD_LIBS]))
         self.assertTrue(all(abi == "arm64-v8a" and Path(p).is_file() for abi, p in libs), libs)
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / "libmiko_drivers.so").write_bytes(b"so")
@@ -355,6 +554,80 @@ class BuildScriptTest(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("libconexant_dsp_lib.so", msg)
         self.assertIn(td, msg)
+
+    def test_wake_word_libraries_come_from_the_shared_list(self):
+        """Meeting plan U3: the launcher and mode-voice stage the same three
+        wake-word libraries from build_common; a missing one names them all."""
+        b = self.build
+        self.assertEqual(b.bc.WAKEWORD_LIBS, WAKEWORD_LIBS)
+        self.assertNotIn("WAKEWORD_LIBS = (", self.src, "the launcher build keeps its own list")
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "libmiko_drivers.so").write_bytes(b"so")
+            (Path(td) / "libconexant_dsp_lib.so").write_bytes(b"so")
+            with self.assertRaises(b.BuildError) as ctx:
+                b.vendor_native_libs(Path(td))
+        msg = str(ctx.exception)
+        for name in WAKEWORD_LIBS:
+            self.assertIn(name, msg)
+        self.assertIn(td, msg)
+        self.assertTrue(b.bc.WAKEWORD_MODEL.is_file(), b.bc.WAKEWORD_MODEL)
+        self.assertIn("WAKEWORD_MODEL", self.src)
+
+    def test_bpe_vocab_is_derived_from_the_models_bpe_model(self):
+        """KTD2: hotwords bias nothing without the bpe vocabulary. The sherpa
+        tarball ships none, so the build fetches the package's own bpe.model
+        (the source its README names, pinned) and writes bpe.vocab beside
+        tokens.txt the way sherpa's export_bpe_vocab.py does: piece, tab, score."""
+        b = self.build
+        self.assertTrue(b.BPE_MODEL_URL.startswith("https://huggingface.co/desh2608/"), b.BPE_MODEL_URL)
+        self.assertRegex(b.BPE_MODEL_SHA256, r"^[0-9a-f]{64}$")
+        # A two-piece sentencepiece ModelProto: pieces {piece="<blk>", score=0} and {piece="▁HEY", score=-1.5}.
+        piece1 = b"\x0a\x05<blk>\x15\x00\x00\x00\x00\x18\x04"
+        piece2 = b"\x0a\x06\xe2\x96\x81HEY\x15\x00\x00\xc0\xbf"
+        model = b"\x0a" + bytes([len(piece1)]) + piece1 + b"\x0a" + bytes([len(piece2)]) + piece2
+        # An unrelated top-level field (trainer_spec, wire type 2) is skipped.
+        model += b"\x12\x02\x08\x01"
+        self.assertEqual(b.bpe_vocab(model), "<blk>\t0.0\n▁HEY\t-1.5\n")
+        with self.assertRaises(b.BuildError):
+            b.bpe_vocab(b"")
+
+    def test_listen_extras_land_beside_tokens_and_fail_when_absent(self):
+        b = self.build
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "listen").mkdir()
+            (root / "listen" / "tokens.txt").write_text("<blk> 0\n")
+            fake_model = root / "bpe.model"
+            fake_model.write_bytes(b"\x0a\x0c\x0a\x05<blk>\x15\x00\x00\x00\x00")
+            fake_vad = root / "silero_vad.onnx"
+            fake_vad.write_bytes(b"onnx")
+
+            def fetch(url, dest, sha256):
+                return fake_model if url == b.BPE_MODEL_URL else fake_vad
+
+            b.listen_extras(root, fetch=fetch)
+            self.assertEqual((root / "listen" / "bpe.vocab").read_text(), "<blk>\t0.0\n")
+            self.assertEqual((root / "listen" / "silero_vad.onnx").read_bytes(), b"onnx")
+            self.assertEqual(sorted(p.name for p in (root / "listen").iterdir()),
+                             ["bpe.vocab", "silero_vad.onnx", "tokens.txt"])
+
+            def broken(url, dest, sha256):
+                raise b.BuildError(f"!! cannot fetch {url}")
+
+            (root / "listen" / "bpe.vocab").unlink()
+            with self.assertRaises(b.BuildError) as ctx:
+                b.listen_extras(root, fetch=broken)
+            self.assertIn("bpe.model", str(ctx.exception))
+        self.assertIn("listen_extras(", self.src)
+
+    def test_hotwords_file_is_a_build_precondition_at_the_asset_root(self):
+        b = self.build
+        self.assertEqual(b.HOTWORDS, REPO / "launcher" / "assets" / "hotwords.txt")
+        self.assertTrue(HOTWORDS.is_file())
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(b.BuildError) as ctx:
+                b.check_hotwords(Path(td) / "hotwords.txt")
+        self.assertIn("hotwords.txt", str(ctx.exception))
 
     def test_jni_stubs_match_the_vendor_symbols(self):
         """The library resolves natives by package, class and method name, so the
@@ -414,7 +687,15 @@ def _log_word_offenders(paths):
 class ListenPrivacyLogTest(unittest.TestCase):
     def test_log_calls_never_carry_spoken_or_heard_words(self):
         self.assertEqual(_log_word_offenders((SERVICE, ENGINE, SESSION, APP, PROBE, LAUNCHER / "PeopleService.java",
-                                              LAUNCHER / "PeopleStore.java")), [])
+                                              LAUNCHER / "PeopleStore.java", EARS, CLASSIFIER, KEEPER,
+                                              EARS_INTERFACE, EARS_CLIENT)), [])
+
+    def test_ears_session_and_classifier_never_print(self):
+        for path in (EARS, CLASSIFIER, KEEPER):
+            src = _read(path)
+            with self.subTest(file=path.name):
+                for needle in ("System.out", "System.err", "printStackTrace"):
+                    self.assertNotIn(needle, src)
 
 
 if __name__ == "__main__":

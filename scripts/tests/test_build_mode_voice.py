@@ -39,7 +39,9 @@ VENDOR_ROOT = REPO / "tools" / "serviceexam_jadx"
 VENDOR_LIB_DIR = VENDOR_ROOT / "resources" / "lib" / "arm64-v8a"
 VENDOR_WAKEWORD = VENDOR_ROOT / "sources" / "recognizer" / "WakeWord.java"
 VENDOR_MODEL = VENDOR_ROOT / "resources" / "assets" / "miko_wakeword_model.tflite"
-OUR_WAKEWORD = REPO / "mode-voice" / "src" / "recognizer" / "WakeWord.java"
+# Meeting plan U3: the wrapper moved to the shared module (package unchanged: JNI
+# binds by class name) so the launcher's ears session and the voice mode share it.
+OUR_WAKEWORD = REPO / "shared" / "src" / "recognizer" / "WakeWord.java"
 OUR_MODEL = REPO / "mode-voice" / "assets" / "miko_wakeword_model.tflite"
 VOICE_SRC = REPO / "mode-voice" / "src"
 SHARED_SRC = REPO / "shared" / "src"
@@ -72,6 +74,22 @@ def _sha256(path):
 class VendorLibsTest(unittest.TestCase):
     def test_declares_exactly_the_three_wakeword_libs(self):
         self.assertEqual(sorted(build.WAKEWORD_LIBS), sorted(WAKEWORD_LIBS))
+
+    def test_library_list_and_check_are_the_shared_ones(self):
+        """Meeting plan U3: one list in build_common, so the launcher's ears and
+        the voice mode stage the same files; the missing-library check lives there."""
+        self.assertIs(build.WAKEWORD_LIBS, build.bc.WAKEWORD_LIBS)
+        self.assertNotIn("WAKEWORD_LIBS = (", BUILD_PY.read_text())
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(build.BuildError) as ours:
+                build.vendor_native_libs(Path(td))
+            with self.assertRaises(build.BuildError) as shared:
+                build.bc.wakeword_native_libs(Path(td), "mode-voice")
+        self.assertEqual(str(ours.exception), str(shared.exception))
+
+    def test_wrapper_left_mode_voice_for_the_shared_module(self):
+        self.assertFalse((REPO / "mode-voice" / "src" / "recognizer" / "WakeWord.java").exists())
+        self.assertTrue(OUR_WAKEWORD.is_file())
 
     def test_all_present_returns_arm64_entries(self):
         libs = build.vendor_native_libs(VENDOR_LIB_DIR)

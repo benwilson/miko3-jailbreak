@@ -24,6 +24,16 @@ import java.io.IOException;
  * stop-motors command as part of releasing the lock (R14) — never only a
  * software-lock release.
  *
+ * The holder, renew, death and TTL bookkeeping lives in LeaseKeeper (meeting
+ * plan U3 extracted it so the ears session shares it); this service adds the
+ * Binder, the TTL clock and the stop-motors on every release. The keeper's
+ * one lock replaces the service monitor the Binder methods and the TTL check
+ * used to share, so a main-thread TTL read can never race a Binder-thread
+ * acquire()/renew()/release() (confirmed live as a real race risk on this
+ * hardware's weaker ARM memory ordering). The keeper also keeps the per-
+ * acquisition death recipient: a late death notification for a since-
+ * superseded holder is ignored rather than clearing the new holder's session.
+ *
  * Started alongside InfoHttpServer in LauncherApp.onCreate so it survives
  * independent of any Activity, and exists for the whole launcher process
  * lifetime — exactly the lifetime a mode's own crash or exit must not
@@ -40,138 +50,91 @@ public class DriveLeaseService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     // issueStop() below does blocking UART IO (DirectMotorDriver.connect()/stop()/
-    // disconnect()) and can be reached from releaseInternal() while the caller holds
-    // this service's own monitor, including from ttlCheck on the main Looper — doing
-    // that IO inline there would risk blocking the main thread for as long as
-    // disconnect()'s keepalive-thread join takes. A dedicated thread keeps that IO off
-    // both the main thread and whichever Binder thread called acquire()/release().
+    // disconnect()) and is reached from the keeper's release callback, inside the
+    // keeper's lock, from the main Looper's TTL check as well as from Binder
+    // threads. A dedicated thread keeps that IO off both the main thread and
+    // whichever Binder thread called acquire()/release().
     private final HandlerThread stopThread = new HandlerThread("drive-lease-stop");
     private Handler stopHandler;
 
-    private String holderId;
-    private IBinder holderDeathToken;
-    private IBinder.DeathRecipient holderDeathRecipient;
-    private long lastRenewElapsedMs;
+    private final LeaseKeeper keeper = new LeaseKeeper(TTL_MS, new LeaseKeeper.Released() {
+        @Override
+        public void released(String holder, String reason) {
+            if (LeaseKeeper.RELEASE_TTL.equals(reason)) {
+                Log.w(TAG, "holder '" + holder + "' TTL expired — releasing lease and stopping");
+            } else if (LeaseKeeper.RELEASE_DIED.equals(reason)) {
+                Log.w(TAG, "holder '" + holder + "' died — releasing lease and stopping");
+            } else {
+                Log.i(TAG, "lease released cleanly by '" + holder + "'");
+            }
+            issueStop(reason);
+        }
+    });
 
     private final Runnable ttlCheck = new Runnable() {
         @Override
         public void run() {
-            // Locks on DriveLeaseService.this — the same monitor every method below
-            // uses — so this main-thread read of holderId/lastRenewElapsedMs can't
-            // race a Binder-thread acquire()/renew()/release() call. Binder methods
-            // used to be `synchronized` (locking the anonymous Stub instance instead
-            // of the enclosing service) while this read held no lock at all: two
-            // different monitors for one critical section, confirmed live as a real
-            // race risk on this hardware's weaker ARM memory ordering, not just a
-            // theoretical JMM violation.
-            synchronized (DriveLeaseService.this) {
-                if (holderId != null
-                        && SystemClock.elapsedRealtime() - lastRenewElapsedMs > TTL_MS) {
-                    Log.w(TAG, "holder '" + holderId + "' TTL expired — releasing lease and stopping");
-                    releaseInternal("ttl_expired");
-                }
-            }
+            keeper.check(SystemClock.elapsedRealtime());
             handler.postDelayed(this, TTL_CHECK_INTERVAL_MS);
         }
     };
 
     private final DriveLease.Stub binder = new DriveLease.Stub() {
         @Override
-        public boolean acquire(IBinder deathToken, final String clientId) {
-            synchronized (DriveLeaseService.this) {
-                if (holderId != null && !holderId.equals(clientId)) {
-                    return false;
-                }
-                if (holderId == null) {
-                    // A DeathRecipient created fresh per acquisition, capturing this
-                    // specific clientId, rather than one shared instance reused across
-                    // every holder: binderDied() carries no argument identifying which
-                    // IBinder died, so a single shared recipient can't tell "the holder
-                    // that just died" from "a different, already-superseded holder" if
-                    // its death notification was merely delayed. Confirmed live-reviewable
-                    // race: holder A crashes, its death notification is still queued when
-                    // holder B legitimately acquires, and the stale callback would clear
-                    // B's session and stop B's robot mid-drive. Checking clientId against
-                    // the *current* holderId before acting closes that window.
-                    final IBinder.DeathRecipient recipient = new IBinder.DeathRecipient() {
+        public boolean acquire(final IBinder deathToken, String clientId) {
+            if (clientId == null) {
+                return false;
+            }
+            boolean fresh = keeper.holder() == null;
+            boolean got = keeper.acquire(clientId, new LeaseKeeper.Token() {
+                private IBinder.DeathRecipient recipient;
+
+                @Override
+                public void linkToDeath(final Runnable onDeath) throws RemoteException {
+                    IBinder.DeathRecipient r = new IBinder.DeathRecipient() {
                         @Override
                         public void binderDied() {
-                            synchronized (DriveLeaseService.this) {
-                                if (!clientId.equals(holderId)) {
-                                    return; // stale notification for a since-superseded holder
-                                }
-                                Log.w(TAG, "holder '" + clientId + "' died — releasing lease and stopping");
-                                releaseInternal("binder_died");
-                            }
+                            onDeath.run();
                         }
                     };
-                    holderId = clientId;
-                    holderDeathToken = deathToken;
-                    holderDeathRecipient = recipient;
-                    try {
-                        deathToken.linkToDeath(recipient, 0);
-                    } catch (RemoteException e) {
-                        // Caller was already dead by the time we tried to link — treat as
-                        // never having acquired it.
-                        holderId = null;
-                        holderDeathToken = null;
-                        holderDeathRecipient = null;
-                        return false;
-                    }
-                    Log.i(TAG, "lease acquired by '" + clientId + "'");
+                    deathToken.linkToDeath(r, 0);
+                    recipient = r;
                 }
-                lastRenewElapsedMs = SystemClock.elapsedRealtime();
-                return true;
+
+                @Override
+                public void unlinkToDeath(Runnable onDeath) {
+                    if (recipient == null) {
+                        return;
+                    }
+                    try {
+                        deathToken.unlinkToDeath(recipient, 0);
+                    } catch (java.util.NoSuchElementException ignored) {
+                        // already unlinked (e.g. binderDied fired concurrently)
+                    }
+                    recipient = null;
+                }
+            }, SystemClock.elapsedRealtime());
+            if (got && fresh) {
+                Log.i(TAG, "lease acquired by '" + clientId + "'");
             }
+            return got;
         }
 
         @Override
         public boolean renew(String clientId) {
-            synchronized (DriveLeaseService.this) {
-                if (clientId != null && clientId.equals(holderId)) {
-                    lastRenewElapsedMs = SystemClock.elapsedRealtime();
-                    return true;
-                }
-                return false;
-            }
+            return keeper.renew(clientId, SystemClock.elapsedRealtime());
         }
 
         @Override
         public void release(String clientId) {
-            synchronized (DriveLeaseService.this) {
-                if (clientId != null && clientId.equals(holderId)) {
-                    Log.i(TAG, "lease released cleanly by '" + clientId + "'");
-                    releaseInternal("clean_release");
-                }
-            }
+            keeper.release(clientId);
         }
 
         @Override
         public String getHolder() {
-            synchronized (DriveLeaseService.this) {
-                return holderId;
-            }
+            return keeper.holder();
         }
     };
-
-    /** Caller must hold the DriveLeaseService.this monitor (see call sites above and
-     * the DeathRecipient below — the one exception, documented at its call site). */
-    private void releaseInternal(String reason) {
-        if (holderId == null) {
-            return;
-        }
-        if (holderDeathToken != null && holderDeathRecipient != null) {
-            try {
-                holderDeathToken.unlinkToDeath(holderDeathRecipient, 0);
-            } catch (java.util.NoSuchElementException ignored) {
-                // already unlinked (e.g. binderDied fired concurrently)
-            }
-        }
-        holderId = null;
-        holderDeathToken = null;
-        holderDeathRecipient = null;
-        issueStop(reason);
-    }
 
     /**
      * Own DirectMotorDriver connection, independent of any mode's — this coordinator

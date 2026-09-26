@@ -29,6 +29,10 @@ public final class LauncherProtocol {
      * (explore-on-claude plan U3). Modes go through RobotListenClient, not this directly. */
     public static final String ROBOT_LISTEN_ACTION = "com.miko3.launcher.ROBOT_LISTEN";
 
+    /** The launcher's continuous ears session (meeting plan U3, RobotEars):
+     * served by the same ListenService, picked by this bind action. */
+    public static final String ROBOT_EARS_ACTION = "com.miko3.launcher.ROBOT_EARS";
+
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 
     /** Boolean extra on a launch Intent the launcher sends a mode's Activity, asking

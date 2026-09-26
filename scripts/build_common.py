@@ -30,9 +30,40 @@ SDK_CANDIDATES = [
     Path.home() / "Library" / "Android" / "sdk",
 ]
 
+REPO = Path(__file__).resolve().parent.parent
+VENDOR_ABI = "arm64-v8a"
+VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / VENDOR_ABI
+
+# The vendor's wake-word engine (voice plan KTD7; meeting plan U3 shares it between
+# the voice mode and the launcher's ears session). libnative_wakeword_vad_lib.so is
+# what recognizer.WakeWord (shared/src) loads; it links libncnn.so directly (readelf
+# NEEDED) and the TFLite GPU delegate is dlopen'd by the engine at init, so all
+# three ship together, and the model asset rides beside them.
+WAKEWORD_LIBS = (
+    "libnative_wakeword_vad_lib.so",
+    "libncnn.so",
+    "libtensorflowlite_gpu_delegate.so",
+)
+WAKEWORD_MODEL = REPO / "mode-voice" / "assets" / "miko_wakeword_model.tflite"
+
 
 class BuildError(SystemExit):
     """A build precondition or step failed; message is actionable."""
+
+
+def wakeword_native_libs(lib_dir=VENDOR_LIB_DIR, app="the app"):
+    """[(abi, so_path), ...] for the three wake-word libraries, or BuildError
+    naming every missing one and the directory searched. The launcher and
+    mode-voice both stage exactly this list; mode-explore never calls it."""
+    lib_dir = Path(lib_dir)
+    missing = [name for name in WAKEWORD_LIBS if not (lib_dir / name).is_file()]
+    if missing:
+        raise BuildError(
+            f"!! vendor wake-word librar{'y' if len(missing) == 1 else 'ies'} missing from "
+            f"{lib_dir}: {', '.join(missing)}\n"
+            "   these come from ServiceExam's APK (lib/arm64-v8a/); re-extract it into "
+            f"tools/serviceexam_jadx/resources/ (jadx) before building {app}")
+    return [(VENDOR_ABI, lib_dir / name) for name in WAKEWORD_LIBS]
 
 
 def run(cmd, **kw):
