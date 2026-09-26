@@ -45,6 +45,9 @@ final class Heading {
     private static final long STILL_WHEEL_SLACK = 2;
     /** Below this the coast after a turn is over (deg/s). */
     private static final double COAST_DONE_DEG_S = 3.0;
+    /** The least turn (degrees, in at least this long) that teaches the turn rate. */
+    private static final double RATE_MIN_DEG = 20;
+    private static final long RATE_MIN_MS = 300;
 
     /** One straight stretch he drove. */
     static final class Leg {
@@ -256,9 +259,6 @@ final class Heading {
         return rateDegS;
     }
 
-    private static final double RATE_MIN_DEG = 20;
-    private static final long RATE_MIN_MS = 300;
-
     private void learnRate(long nowMs) {
         long ms = nowMs - turnStartMs;
         if (turnStartMs < 0 || ms < RATE_MIN_MS || turned < RATE_MIN_DEG) {
@@ -321,11 +321,6 @@ final class Heading {
             // No leg was being logged (the heading was not usable when it began).
             legs.clear();
         }
-    }
-
-    void clearLegs() {
-        legs.clear();
-        cleanPending = false;
     }
 
     /** The legs since he last drove off cleanly, oldest first (a leg closes on the reading after its stop). */

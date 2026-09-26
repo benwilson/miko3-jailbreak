@@ -121,25 +121,41 @@ final class Openness {
     private static final float UNTAUGHT_CONFIDENCE = 0.3f;
     /** Merging stops weighting history beyond this many samples, so a patch follows the light. */
     private static final int MERGE_WEIGHT_CAP = 20;
+    /**
+     * Relative margin around a squared threshold within which apartAtMost() falls
+     * back to apart()'s exact float arithmetic (float rounding is ~1e-7 of it).
+     */
+    private static final double SQUARED_GUARD = 1e-5;
 
-    /** Part of a frame, full width: 0xRRGGBB pixels row-major, covering rows top..bottom (fractions). */
+    /**
+     * Part of a frame, full width: 0xRRGGBB pixels row-major, covering rows
+     * top..bottom (fractions). Its rows start at rgb's row firstRow, so a band
+     * can be a view into a whole frame's pixels.
+     */
     static final class Frame {
         final int[] rgb;
         final int width;
         final int height;
         final float top;
         final float bottom;
+        final int firstRow;
 
         Frame(int[] rgb, int width, int height, float top, float bottom) {
+            this(rgb, width, height, top, bottom, 0);
+        }
+
+        Frame(int[] rgb, int width, int height, float top, float bottom, int firstRow) {
             this.rgb = rgb;
             this.width = width;
             this.height = height;
             this.top = top;
             this.bottom = bottom;
+            this.firstRow = firstRow;
         }
 
         boolean usable() {
-            return rgb != null && width > 0 && height > 0 && (long) width * height <= rgb.length
+            return rgb != null && width > 0 && height > 0 && firstRow >= 0
+                    && (long) width * ((long) firstRow + height) <= rgb.length
                     && top >= 0f && bottom <= 1f && top < bottom;
         }
 
@@ -152,7 +168,7 @@ final class Openness {
         }
 
         int at(int x, int y) {
-            return rgb[y * width + x];
+            return rgb[(firstRow + y) * width + x];
         }
     }
 
@@ -210,6 +226,11 @@ final class Openness {
     private final List<Sample> pending = new ArrayList<>();
     private long hazardMs = Long.MIN_VALUE;
     private long seq;
+    /** Scoring buffers, kept between frames (score() is synchronized); resized when the frame size changes. */
+    private boolean[] floorMask = new boolean[0];
+    /** All false, never written: the mask when no floor is taught. */
+    private boolean[] noFloor = new boolean[0];
+    private float[] reference = new float[0];
 
     /**
      * Scores one frame. whole covers the full frame at low resolution; band, when
@@ -218,8 +239,7 @@ final class Openness {
      * so its bottom patch may become a pending sample. Never throws.
      */
     synchronized Profile score(Frame whole, Frame band, List<Detection> detections, long frameMs, boolean teachable) {
-        float[] boxes = new float[BINS];
-        Arrays.fill(boxes, 1f);
+        float[] boxes = null;
         try {
             boxes = boxOpenness(detections);
             if (whole == null || !whole.usable()) {
@@ -272,11 +292,11 @@ final class Openness {
 
     // ---- scoring ----
 
-    /** No usable image: the boxes, capped at unsure, and no confidence. */
+    /** No usable image: the boxes (null: none), capped at unsure, and no confidence. */
     private static Profile blind(float[] boxes) {
         float[] bins = new float[BINS];
         for (int i = 0; i < BINS; i++) {
-            bins[i] = Math.min(UNSURE, boxes[i]);
+            bins[i] = boxes == null ? UNSURE : Math.min(UNSURE, boxes[i]);
         }
         return new Profile(bins, 0f);
     }
@@ -315,12 +335,7 @@ final class Openness {
         if (rows <= 0) {
             return blind(boxes).bins;
         }
-        boolean[] floor = new boolean[rows * w];
-        for (int y = 0; y < rows; y++) {
-            for (int x = 0; x < w; x++) {
-                floor[y * w + x] = isFloor(lower.at(x, first + y));
-            }
-        }
+        boolean[] floor = floorMask(lower, first, rows);
         float[] reference = referenceAboveHorizon(whole, w);
         float[] reachSum = new float[BINS];
         int[] columns = new int[BINS];
@@ -377,7 +392,7 @@ final class Openness {
      * is the floor's: a grey wall over a grey carpet (the camera brightened by
      * U9) matched the carpet and was waved through as open floor.
      */
-    private static float[] referenceAboveHorizon(Frame whole, int w) {
+    private float[] referenceAboveHorizon(Frame whole, int w) {
         int from = -1;
         int to = -1;
         for (int y = 0; y < whole.height; y++) {
@@ -389,7 +404,10 @@ final class Openness {
                 }
             }
         }
-        float[] ref = new float[w * 3];
+        if (reference.length != w * 3) {
+            reference = new float[w * 3];
+        }
+        float[] ref = reference;
         if (to < 0) {
             Arrays.fill(ref, Float.NaN);
             return ref;
@@ -437,9 +455,11 @@ final class Openness {
         }
         float g = ref[x * 3 + 1];
         float b = ref[x * 3 + 2];
+        float refLuma = luma(r, g, b);
         float pr = r;
         float pg = g;
         float pb = b;
+        float pl = refLuma;
         int last = -1;
         int xl = Math.max(0, x - 1);
         int xr = Math.min(lower.width - 1, x + 1);
@@ -457,14 +477,25 @@ final class Openness {
             cr /= n;
             cg /= n;
             cb /= n;
-            float step = apart(cr, cg, cb, pr, pg, pb);
-            if (step > SAME_SURFACE || apart(cr, cg, cb, r, g, b) > SURFACE_DRIFT
-                    || (floor[y * lower.width + x] && step > FLOOR_EDGE)) {
+            float cl = luma(cr, cg, cb);
+            float sr = cr - pr;
+            float sg = cg - pg;
+            float sb = cb - pb;
+            float stepSq = sr * sr + sg * sg + sb * sb;
+            float stepScale = dimScale((cl + pl) / 2f);
+            float dr = cr - r;
+            float dg = cg - g;
+            float db = cb - b;
+            // apart(c, previous) > SAME_SURFACE, apart(c, reference) > SURFACE_DRIFT, apart(c, previous) > FLOOR_EDGE
+            if (!apartAtMost(stepSq, stepScale, SAME_SURFACE)
+                    || !apartAtMost(dr * dr + dg * dg + db * db, dimScale((cl + refLuma) / 2f), SURFACE_DRIFT)
+                    || (floor[y * lower.width + x] && !apartAtMost(stepSq, stepScale, FLOOR_EDGE))) {
                 break;
             }
             pr = cr;
             pg = cg;
             pb = cb;
+            pl = cl;
             last = y;
         }
         if (last < 0) {
@@ -473,18 +504,52 @@ final class Openness {
         return clamp01((lower.rowBottom(first + last) - HORIZON) / (1f - HORIZON));
     }
 
-    private boolean isFloor(int p) {
-        return matchesFloor((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
-    }
-
-    private boolean matchesFloor(float r, float g, float b) {
-        for (int i = 0; i < patches.size(); i++) {
+    /**
+     * Which of the lower frame's rows below the horizon match a taught floor
+     * colour: apart(pixel, patch) within the patch's tolerance, for any patch.
+     * The same shared all-false mask when nothing is taught.
+     */
+    private boolean[] floorMask(Frame lower, int first, int rows) {
+        int w = lower.width;
+        if (floorMask.length != rows * w) {
+            floorMask = new boolean[rows * w];
+            noFloor = new boolean[rows * w];
+        }
+        int k = patches.size();
+        if (k == 0) {
+            return noFloor;
+        }
+        float[] fr = new float[k];
+        float[] fg = new float[k];
+        float[] fb = new float[k];
+        float[] fl = new float[k];
+        float[] tolerance = new float[k];
+        for (int i = 0; i < k; i++) {
             Patch f = patches.get(i);
-            if (apart(r, g, b, f.r, f.g, f.b) <= f.tolerance()) {
-                return true;
+            fr[i] = f.r;
+            fg[i] = f.g;
+            fb[i] = f.b;
+            fl[i] = luma(f.r, f.g, f.b);
+            tolerance[i] = f.tolerance();
+        }
+        for (int y = 0; y < rows; y++) {
+            for (int x = 0; x < w; x++) {
+                int p = lower.at(x, first + y);
+                float r = (p >> 16) & 0xff;
+                float g = (p >> 8) & 0xff;
+                float b = p & 0xff;
+                float l = luma(r, g, b);
+                boolean hit = false;
+                for (int i = 0; i < k && !hit; i++) {
+                    float dr = r - fr[i];
+                    float dg = g - fg[i];
+                    float db = b - fb[i];
+                    hit = apartAtMost(dr * dr + dg * dg + db * db, dimScale((l + fl[i]) / 2f), tolerance[i]);
+                }
+                floorMask[y * w + x] = hit;
             }
         }
-        return false;
+        return floorMask;
     }
 
     // ---- teaching ----
@@ -582,8 +647,9 @@ final class Openness {
     private static float meanLuma(Frame f) {
         double sum = 0;
         int n = f.width * f.height;
+        int from = f.firstRow * f.width;
         for (int i = 0; i < n; i++) {
-            int p = f.rgb[i];
+            int p = f.rgb[from + i];
             sum += luma((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
         }
         return (float) (sum / n);
@@ -600,6 +666,25 @@ final class Openness {
         float db = b1 - b2;
         float level = (luma(r1, g1, b1) + luma(r2, g2, b2)) / 2f;
         return (float) Math.sqrt(dr * dr + dg * dg + db * db) * dimScale(level);
+    }
+
+    /**
+     * Whether apart()'s value for a colour pair, (float) Math.sqrt(sq) * scale
+     * (sq its float sum of squared differences, scale its dimScale), is at most
+     * limit (limit > 0). Compared squared in double away from the limit; within
+     * SQUARED_GUARD of it, apart()'s own float arithmetic decides, so every
+     * decision matches apart()'s exactly.
+     */
+    private static boolean apartAtMost(float sq, float scale, float limit) {
+        double v = (double) sq * scale * scale;
+        double t = (double) limit * limit;
+        if (v < t * (1 - SQUARED_GUARD)) {
+            return true;
+        }
+        if (v > t * (1 + SQUARED_GUARD)) {
+            return false;
+        }
+        return (float) Math.sqrt(sq) * scale <= limit;
     }
 
     private static float dimScale(float luma) {

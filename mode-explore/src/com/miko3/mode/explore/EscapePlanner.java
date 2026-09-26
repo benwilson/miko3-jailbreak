@@ -42,7 +42,7 @@ import java.util.List;
  * Plain Java, no android.* or shared imports; brain thread only.
  */
 final class EscapePlanner {
-    enum Phase { IDLE, RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF, SECOND_ASK, SECOND_DRIVE_OFF, FREED, REST }
+    enum Phase { IDLE, RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF, SECOND_ASK, SECOND_DRIVE_OFF, REST }
 
     /** One retrace move: face heading, drive counts forward. */
     static final class Move {
@@ -146,10 +146,6 @@ final class EscapePlanner {
         return driveHeading;
     }
 
-    void freed() {
-        phase = Phase.FREED;
-    }
-
     private void to(Phase p, long now) {
         phase = p;
         stepUntil = now + budget(p);
@@ -247,7 +243,7 @@ final class EscapePlanner {
      * the retrace that already drove it back) cancels as far as they overlap, like
      * brackets. Moves under escapeRetraceMinCounts are slack and dropped.
      */
-    List<Move> retracePath(List<Heading.Leg> legs) {
+    private List<Move> retracePath(List<Heading.Leg> legs) {
         List<Move> stack = new ArrayList<Move>();
         for (int i = legs.size() - 1; i >= 0; i--) {
             Heading.Leg l = legs.get(i);
@@ -381,13 +377,13 @@ final class EscapePlanner {
         double bestOffset = 0;
         for (int k = 0; k < profiles.size(); k++) {
             Openness.Profile p = profiles.get(k);
-            if (p == null || p.bins == null || p.bins.length == 0 || p.confidence < tuning.steerMinConfidence) {
+            if (!RoamSteer.confident(p, tuning.steerMinConfidence)) {
                 continue;
             }
             int n = p.bins.length;
             int w = Math.min(tuning.steerBandBins, n);
             for (int i = 0; i + w <= n; i++) {
-                double offset = (i + w / 2.0) / n * 2.0 - 1.0;
+                double offset = RoamSteer.offset(i, w, n);
                 double h = aim(lookHeadings.get(k), (float) offset, tuning.cameraHalfFovDeg);
                 double score = mean(p.bins, i, w) - (nearTried(h) ? tuning.escapeTriedPenalty : 0);
                 if (score > bestScore + 1e-6 || (Math.abs(score - bestScore) <= 1e-6

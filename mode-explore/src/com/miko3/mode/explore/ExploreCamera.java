@@ -126,6 +126,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private final BitmapFactory.Options decode = new BitmapFactory.Options();
     private final BitmapFactory.Options small = new BitmapFactory.Options();
     private int[] smallPixels = new int[0];
+    /** halve()'s output, reused frame to frame (Openness keeps no pixels). */
+    private int[] halfPixels = new int[0];
     /** Holds the floor model; used on the detect thread (the brain's calls are posted there). */
     private final Openness openness = new Openness();
     /** The brain's latest "floor clear and wheels free" (U3), stamped on each captured frame. */
@@ -601,8 +603,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
             bmp.getPixels(smallPixels, 0, w, 0, 0, w, h);
             decodedLuma = Brightness.meanLuma(smallPixels, w * h);
             int first = Math.min(h - 1, (int) (Openness.HORIZON * h));
-            Openness.Frame floorBand = new Openness.Frame(Arrays.copyOfRange(smallPixels, first * w, h * w),
-                    w, h - first, (float) first / h, 1f);
+            Openness.Frame floorBand = new Openness.Frame(smallPixels, w, h - first, (float) first / h, 1f, first);
             return openness.score(halve(smallPixels, w, h), floorBand, found, frameMs, teachable);
         } catch (RuntimeException | OutOfMemoryError e) {
             Log.w(TAG, "openness decode failed: " + e.getClass().getSimpleName());
@@ -626,11 +627,14 @@ final class ExploreCamera implements ExploreBrain.Camera {
         }
     }
 
-    /** The whole frame at half the given scale, each pixel the mean of a 2x2 block. */
-    private static Openness.Frame halve(int[] px, int w, int h) {
+    /** The whole frame at half the given scale, each pixel the mean of a 2x2 block (detect thread). */
+    private Openness.Frame halve(int[] px, int w, int h) {
         int hw = Math.max(1, w / 2);
         int hh = Math.max(1, h / 2);
-        int[] out = new int[hw * hh];
+        if (halfPixels.length != hw * hh) {
+            halfPixels = new int[hw * hh];
+        }
+        int[] out = halfPixels;
         for (int y = 0; y < hh; y++) {
             for (int x = 0; x < hw; x++) {
                 int r = 0;

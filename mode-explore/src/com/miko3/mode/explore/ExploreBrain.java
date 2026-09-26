@@ -566,6 +566,10 @@ final class ExploreBrain {
     /** Continuous mode, in PAUSE: a leg decision waiting for a look to steer by, until then (steerWaitMs). */
     private long steerWaitUntil = NO_WAIT;
     private static final long NO_WAIT = Long.MIN_VALUE;
+    /** Frames awaiting the floor-teach distance (teachQueue); the oldest is dropped first. */
+    private static final int TEACH_QUEUE_MAX = 8;
+    /** A timed orient shorter than this is already facing it. */
+    private static final long MIN_ORIENT_MS = 50;
     /** A CPL hiccup's retry (cplRetryPauseMs): CPL again before this is a hazard. */
     private long cplRetryUntil = Long.MIN_VALUE / 4;
     /** The last mid-leg re-aim, and the last look it weighed (one decision per look). */
@@ -1512,10 +1516,7 @@ final class ExploreBrain {
      * went quiet mid-turn). Measured progress moves only on readings.
      */
     private boolean turnDone(long now) {
-        if (!measured) {
-            return now >= phaseUntil;
-        }
-        if (!compass.usable(now)) {
+        if (!measured || !compass.usable(now)) {
             return now >= phaseUntil;
         }
         return compass.turnReached() || now - turnStartedAt >= tuning.turnBackstopMs;
@@ -2041,8 +2042,6 @@ final class ExploreBrain {
         }
     }
 
-    private static final int TEACH_QUEUE_MAX = 8;
-
     /** The newest look to steer the next leg by: fresh, and taken since he last turned; else null. */
     private Look roamLook(long now) {
         Look look = camera.latest();
@@ -2411,8 +2410,6 @@ final class ExploreBrain {
         show(EyeState.LOOK, d);
         startCuriosityTurn(now, d, Math.abs(ms), 0, true);
     }
-
-    private static final long MIN_ORIENT_MS = 50;
 
     private void oriented(long now) {
         Then then = afterOrient;

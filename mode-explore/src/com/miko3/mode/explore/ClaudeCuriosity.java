@@ -260,14 +260,16 @@ final class ClaudeCuriosity implements CuriosityPort {
             return WayOut.failed();
         }
         int[] w = new int[n];
-        int[] h = new int[n];
+        int firstHeight = 0;
         for (int i = 0; i < n; i++) {
             int[] size = jpegSize(request.frames.get(i).jpeg);
             w[i] = size[0];
-            h[i] = size[1];
+            if (i == 0) {
+                firstHeight = size[1];
+            }
         }
         List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
-        content.add(ClaudeApi.textBlock(ExplorePrompts.wayOutIntro(n, w[0], h[0], request.second)));
+        content.add(ClaudeApi.textBlock(ExplorePrompts.wayOutIntro(n, w[0], firstHeight, request.second)));
         for (int i = 0; i < n; i++) {
             content.add(ClaudeApi.textBlock("Frame " + (i + 1) + ":"));
             content.add(ClaudeApi.jpegBlock(request.frames.get(i).jpeg));

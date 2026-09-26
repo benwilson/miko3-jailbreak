@@ -99,7 +99,12 @@ final class RoamSteer {
 
     /** Whether this profile is trusted at all. */
     boolean confident(Openness.Profile p) {
-        return p != null && p.bins != null && p.bins.length > 0 && p.confidence >= tuning.steerMinConfidence;
+        return confident(p, tuning.steerMinConfidence);
+    }
+
+    /** Whether p is trusted at all at this least confidence (EscapePlanner reads looks the same way). */
+    static boolean confident(Openness.Profile p, float minConfidence) {
+        return p != null && p.bins != null && p.bins.length > 0 && p.confidence >= minConfidence;
     }
 
     /** The next leg from p, or null when p is missing or not confident (choose as before). */
@@ -137,16 +142,13 @@ final class RoamSteer {
             // Out of view: face it, then look again (the next look must read it open).
             return new Plan(doorwayDeg > 0 ? LEFT : RIGHT, Math.abs(doorwayDeg), ahead, true, false, 0f, true);
         }
-        double doorX = door ? -doorwayDeg / tuning.cameraHalfFovDeg : 0;
+        double doorX = door ? offsetOf(doorwayDeg) : 0;
         Best b = best(p, door, doorX, nov);
-        float bestScore = b.score;
-        float bestWeighted = b.weighted;
-        double bestOffset = b.offset;
-        if (bestScore <= tuning.steerBlocked) {
-            int side = bestOffset < 0 ? LEFT : bestOffset > 0 ? RIGHT : LEFT;
+        if (b.score <= tuning.steerBlocked) {
+            int side = b.offset > 0 ? RIGHT : LEFT;
             if (turnsOnly < tuning.steerTurnsOnlyMax) {
                 turnsOnly++;
-                double deg = Math.max(tuning.steerBlockedTurnDeg, Math.abs(bestOffset) * tuning.cameraHalfFovDeg);
+                double deg = Math.max(tuning.steerBlockedTurnDeg, Math.abs(b.offset) * tuning.cameraHalfFovDeg);
                 double turnNew = novelty(nov, side == LEFT ? deg : -deg);
                 if (!Double.isNaN(turnNew)) {
                     // Nothing open in view: of the turns at least this big, the one facing
@@ -160,7 +162,7 @@ final class RoamSteer {
                         }
                     }
                 }
-                Plan plan = new Plan(side, deg, bestScore, true, false, 0f);
+                Plan plan = new Plan(side, deg, b.score, true, false, 0f);
                 plan.novelty = turnNew;
                 return plan;
             }
@@ -174,15 +176,13 @@ final class RoamSteer {
         int side = STRAIGHT;
         double deg = 0;
         float open = ahead;
-        double aheadOffset = offset((n - w) / 2, w, n);
-        float aheadWeighted = aheadWeighted(p, door, doorX, nov);
-        double goOffset = aheadOffset;
-        if (bestWeighted - aheadWeighted >= tuning.steerMinGain) {
-            deg = Math.abs(bestOffset) * tuning.cameraHalfFovDeg;
+        double goOffset = offset((n - w) / 2, w, n);
+        if (b.weighted - weighted(ahead, goOffset, door, doorX, nov, w, n) >= tuning.steerMinGain) {
+            deg = Math.abs(b.offset) * tuning.cameraHalfFovDeg;
             if (deg >= tuning.turnToleranceDeg) {
-                side = bestOffset < 0 ? LEFT : RIGHT;
-                open = bestScore;
-                goOffset = bestOffset;
+                side = b.offset < 0 ? LEFT : RIGHT;
+                open = b.score;
+                goOffset = b.offset;
             } else {
                 deg = 0;
             }
@@ -231,12 +231,12 @@ final class RoamSteer {
         }
         Novelty nov = tuning.coverageWeight > 0 ? novelty : null;
         boolean door = !Double.isNaN(doorwayDeg) && Math.abs(doorwayDeg) <= tuning.cameraHalfFovDeg;
-        double doorX = door ? -doorwayDeg / tuning.cameraHalfFovDeg : 0;
+        double doorX = door ? offsetOf(doorwayDeg) : 0;
         Best b = best(p, door, doorX, nov);
         if (b.score <= tuning.steerBlocked || b.weighted - aheadWeighted(p, door, doorX, nov) < tuning.steerMinGain) {
             return 0;
         }
-        return -b.offset * tuning.cameraHalfFovDeg;
+        return bearing(b.offset);
     }
 
     /** The best band by weighted openness: its raw openness, weighted score and offset. */
@@ -253,8 +253,7 @@ final class RoamSteer {
         for (int i = 0; i + w <= n; i++) {
             float score = mean(p.bins, i, w);
             double offset = offset(i, w, n);
-            float weighted = score + (door ? doorwayBonus(score, offset, doorX, w, n) : 0f)
-                    + noveltyBonus(nov, score, offset);
+            float weighted = weighted(score, offset, door, doorX, nov, w, n);
             // Ties go to the band nearest straight ahead.
             if (weighted > b.weighted + 1e-6f || (Math.abs(weighted - b.weighted) <= 1e-6f
                     && Math.abs(offset) < Math.abs(b.offset))) {
@@ -270,9 +269,12 @@ final class RoamSteer {
     private float aheadWeighted(Openness.Profile p, boolean door, double doorX, Novelty nov) {
         int n = p.bins.length;
         int w = Math.min(tuning.steerBandBins, n);
-        float ahead = aheadOpen(p);
-        double aheadOffset = offset((n - w) / 2, w, n);
-        return ahead + (door ? doorwayBonus(ahead, aheadOffset, doorX, w, n) : 0f) + noveltyBonus(nov, ahead, aheadOffset);
+        return weighted(aheadOpen(p), offset((n - w) / 2, w, n), door, doorX, nov, w, n);
+    }
+
+    /** A band's openness plus its pulls toward the doorway (when one is in view) and new ground. */
+    private float weighted(float score, double offset, boolean door, double doorX, Novelty nov, int w, int n) {
+        return score + (door ? doorwayBonus(score, offset, doorX, w, n) : 0f) + noveltyBonus(nov, score, offset);
     }
 
     /** A band's pull toward new ground: coverageWeight x its novelty, none on a blocked band. */
@@ -298,6 +300,11 @@ final class RoamSteer {
         return -offset * tuning.cameraHalfFovDeg;
     }
 
+    /** A bearing off his facing (left positive) as a band offset (-1 frame left .. 1 frame right). */
+    private double offsetOf(double bearingDeg) {
+        return -bearingDeg / tuning.cameraHalfFovDeg;
+    }
+
     /**
      * Facing within doorwayFacingDeg of a remembered doorway (doorwayDeg off his
      * facing), a confident look reads the band there blocked: it is closed now.
@@ -308,7 +315,7 @@ final class RoamSteer {
         }
         int n = p.bins.length;
         int w = Math.min(tuning.steerBandBins, n);
-        double x = -doorwayDeg / tuning.cameraHalfFovDeg;
+        double x = offsetOf(doorwayDeg);
         int start = (int) Math.round((x + 1) / 2 * n - w / 2.0);
         start = Math.max(0, Math.min(n - w, start));
         return mean(p.bins, start, w) <= tuning.steerBlocked;
@@ -355,7 +362,7 @@ final class RoamSteer {
     }
 
     /** A band's centre, -1 (frame left) .. 1 (frame right). */
-    private static double offset(int start, int w, int n) {
+    static double offset(int start, int w, int n) {
         return (start + w / 2.0) / n * 2.0 - 1.0;
     }
 

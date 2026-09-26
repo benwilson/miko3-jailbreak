@@ -57,9 +57,12 @@ public final class SensorReply {
         Long right = count(text, RIGHT);
         boolean wheels = left != null && right != null;
         int[] gyro = gyro(text);
+        boolean hasGyro = gyro != null;
+        if (!hasGyro) {
+            gyro = new int[] {SensorSnapshot.ABSENT, SensorSnapshot.ABSENT, SensorSnapshot.ABSENT};
+        }
         return new SensorSnapshot(timestampMs, tof, ir1, ir2, wheels, wheels ? left : SensorSnapshot.ABSENT,
-                wheels ? right : SensorSnapshot.ABSENT, gyro != null, gyro == null ? SensorSnapshot.ABSENT : gyro[0],
-                gyro == null ? SensorSnapshot.ABSENT : gyro[1], gyro == null ? SensorSnapshot.ABSENT : gyro[2]);
+                wheels ? right : SensorSnapshot.ABSENT, hasGyro, gyro[0], gyro[1], gyro[2]);
     }
 
     /** The three signed gyro rates after IMUGY= ("0000000062,-000000757,0000000093"), or

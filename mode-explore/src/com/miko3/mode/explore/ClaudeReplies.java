@@ -76,20 +76,12 @@ final class ClaudeReplies {
         }
         Long frame = integer(json.get("frame"));
         Object xv = json.get("x");
-        if (frame == null || frame < 1 || frame > widths.length || !(xv instanceof Number)) {
+        if (frame == null || frame < 1 || frame > widths.length) {
             return CuriosityPort.WayOut.failed();
         }
         int f = (int) (frame - 1);
-        double width = widths[f];
-        Long px = integer(xv);
-        double at;
-        if (px != null) {
-            at = px / width;
-        } else {
-            // Not a whole number: a fraction of the frame's width.
-            at = ((Number) xv).doubleValue();
-        }
-        if (width <= 0 || Double.isNaN(at) || at < 0 || at > 1) {
+        double at = columnAt(xv, widths[f]);
+        if (Double.isNaN(at)) {
             return CuriosityPort.WayOut.failed();
         }
         return CuriosityPort.WayOut.way(f, (float) (at * 2 - 1));
@@ -105,16 +97,28 @@ final class ClaudeReplies {
         if (Boolean.FALSE.equals(door)) {
             return CuriosityPort.Doorway.none();
         }
-        Object xv = json.get("x");
-        if (!Boolean.TRUE.equals(door) || !(xv instanceof Number) || width <= 0) {
+        if (!Boolean.TRUE.equals(door)) {
             return CuriosityPort.Doorway.failed();
         }
-        Long px = integer(xv);
-        double at = px != null ? px / (double) width : ((Number) xv).doubleValue();
-        if (Double.isNaN(at) || at < 0 || at > 1) {
+        double at = columnAt(json.get("x"), width);
+        if (Double.isNaN(at)) {
             return CuriosityPort.Doorway.failed();
         }
         return CuriosityPort.Doorway.door((float) (at * 2 - 1));
+    }
+
+    /**
+     * A reply's "x" across a frame width pixels wide, 0..1: a whole number is a
+     * pixel column, anything else a fraction of the width. NaN when it is not a
+     * number, the width is not positive, or the column falls outside the frame.
+     */
+    private static double columnAt(Object xv, double width) {
+        if (!(xv instanceof Number) || width <= 0) {
+            return Double.NaN;
+        }
+        Long px = integer(xv);
+        double at = px != null ? px / width : ((Number) xv).doubleValue();
+        return Double.isNaN(at) || at < 0 || at > 1 ? Double.NaN : at;
     }
 
     /**
