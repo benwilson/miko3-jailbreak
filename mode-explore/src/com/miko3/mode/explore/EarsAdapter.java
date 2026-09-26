@@ -70,6 +70,8 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     private Ears.Shove shove;
     private Ears.Cue partial;
     private Reply reply;
+    /** The conversation listen's newcomer angle (KTD8), or NaN for a meeting listen. */
+    private float replyAngleDeg = Float.NaN;
     private volatile boolean charger;
     private long heardCount;
     private long droppedCount;
@@ -146,11 +148,21 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         }
     }
 
-    /** A conversation listen through the session: the next whole utterance with words is the reply. */
+    /** A listen through the session: the next whole utterance with words is the reply. */
     void listen(long maxMs, Reply r) {
+        listen(maxMs, Float.NaN, r);
+    }
+
+    /**
+     * A conversation listen (meeting plan U8, KTD8): the next whole utterance with
+     * words is the reply, except a strong one whose latched angle magnitude exceeds
+     * newcomerAngleDeg (NaN: none does), which is queued as a newcomer cue instead.
+     */
+    void listen(long maxMs, float newcomerAngleDeg, Reply r) {
         RobotEarsClient c;
         synchronized (lock) {
             reply = r;
+            replyAngleDeg = newcomerAngleDeg;
             c = client;
         }
         if (c != null) {
@@ -185,7 +197,9 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
                 partial = cue;
                 return;
             }
-            if (reply != null && words) {
+            boolean newcomer = cue.strong() && !Float.isNaN(replyAngleDeg) && cue.hasAngle()
+                    && Math.abs(angle) > replyAngleDeg;
+            if (reply != null && words && !newcomer) {
                 r = reply;
                 reply = null;
             } else {

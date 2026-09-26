@@ -232,6 +232,15 @@ final class ExploreTuning {
     final int sentenceCap;
     final int transcriptWindow;
     final long deafTailMs;
+    /**
+     * The conversation's line clips (U8, KTD12: the sign-off, "one sec", the
+     * deflection, "nothing kept") each get a clip window of chatClipMs, and an
+     * unnamed conversation leaves that side alone for unnamedLeaveAloneMs (KTD10).
+     */
+    final long chatClipMs;
+    final long unnamedLeaveAloneMs;
+    /** The first leg after a conversation turns this far away from the person (R16). */
+    final double chatAwayDeg;
     /** Claude's box and a detector box are the same thing at this overlap (KTD7). */
     final float pickMatchIou;
     /**
@@ -603,6 +612,9 @@ final class ExploreTuning {
         sentenceCap = Math.max(1, b.sentenceCap);
         transcriptWindow = Math.max(1, b.transcriptWindow);
         deafTailMs = Math.max(0, b.deafTailMs);
+        chatClipMs = Math.max(0, b.chatClipMs);
+        unnamedLeaveAloneMs = Math.max(0, b.unnamedLeaveAloneMs);
+        chatAwayDeg = Math.max(1, b.chatAwayDeg);
         pickMatchIou = b.pickMatchIou;
         reopenGapMs = b.reopenGapMs;
         calibration = b.calibration;
@@ -869,6 +881,9 @@ final class ExploreTuning {
         private int sentenceCap = 2;
         private int transcriptWindow = 30;
         private long deafTailMs = 500;
+        private long chatClipMs = 1500;
+        private long unnamedLeaveAloneMs = 120000;
+        private double chatAwayDeg = 120;
         private float pickMatchIou = 0.3f;
         private long reopenGapMs = 3000;
         private Calibration calibration;
@@ -1310,6 +1325,13 @@ final class ExploreTuning {
             this.sentenceCap = sentenceCap;
             this.transcriptWindow = transcriptWindow;
             this.deafTailMs = deafTailMs;
+            return this;
+        }
+
+        Builder chatClips(long chatClipMs, long unnamedLeaveAloneMs, double chatAwayDeg) {
+            this.chatClipMs = chatClipMs;
+            this.unnamedLeaveAloneMs = unnamedLeaveAloneMs;
+            this.chatAwayDeg = chatAwayDeg;
             return this;
         }
 

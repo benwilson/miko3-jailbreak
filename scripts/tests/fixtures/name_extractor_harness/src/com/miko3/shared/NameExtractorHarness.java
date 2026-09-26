@@ -51,19 +51,45 @@ public final class NameExtractorHarness {
         {"hello_alone_is_null", "hello", null},
         {"yes_is_null", "yes", null},
         {"digits_is_null", "123", null},
+        // Mid-conversation phrasing (meeting plan U8): a name given in passing.
+        {"im_sarah_by_the_way", "I'm Sarah, by the way", "Sarah"},
+        {"its_priya_actually", "it's Priya actually", "Priya"},
+        {"call_me_sam_then", "you can call me Sam then", "Sam"},
+    };
+
+    /** validName (meeting plan U8, KTD9): the model's name_given, checked the same way. */
+    static final String[][] VALID_CASES = {
+        {"valid_plain_name", "Sarah", "Sarah"},
+        {"valid_two_words", "mary jane", "Mary Jane"},
+        {"valid_hyphenated", "Anne-Marie", "Anne-Marie"},
+        {"valid_digits_is_null", "x9 lol", null},
+        {"valid_three_words_is_null", "Sarah from accounts", null},
+        {"valid_stop_word_is_null", "thanks", null},
+        {"valid_filler_is_null", "hello", null},
+        {"valid_not_a_name_is_null", "nobody", null},
+        {"valid_empty_is_null", "", null},
+        {"valid_null_is_null", null, null},
+        {"valid_punctuation_is_null", "Sarah!", "Sarah"},
+        {"valid_long_word_is_null", "abcdefghijklmnopqrstuvwxyz", null},
     };
 
     public static void main(String[] args) {
         for (String[] c : CASES) {
-            String name = c[0];
-            try {
-                String got = NameExtractor.extract(c[1]);
-                boolean ok = c[2] == null ? got == null : c[2].equals(got);
-                System.out.println(ok ? "PASS " + name
-                        : "FAIL " + name + ": \"" + c[1] + "\" gave " + got + ", expected " + c[2]);
-            } catch (Throwable t) {
-                System.out.println("FAIL " + name + ": threw " + t);
-            }
+            report(c, NameExtractor.extract(c[1]));
+        }
+        for (String[] c : VALID_CASES) {
+            report(c, NameExtractor.validName(c[1]));
+        }
+    }
+
+    private static void report(String[] c, String got) {
+        String name = c[0];
+        try {
+            boolean ok = c[2] == null ? got == null : c[2].equals(got);
+            System.out.println(ok ? "PASS " + name
+                    : "FAIL " + name + ": \"" + c[1] + "\" gave " + got + ", expected " + c[2]);
+        } catch (Throwable t) {
+            System.out.println("FAIL " + name + ": threw " + t);
         }
     }
 }

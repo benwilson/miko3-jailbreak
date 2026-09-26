@@ -466,5 +466,114 @@ class BrainTraceIsPrivateTest(unittest.TestCase):
     def test_the_trace_is_what_reaches_logcat(self):
         self.assertIn('Log.i("ExploreBrain", message)', src("ModeApp.java"))
 
+
+class ConversationWiringTest(unittest.TestCase):
+    """Meeting plan U8: the live adapter binds every new port method, the prompt
+    wording is the one source the chat bench copies byte for byte, the ears route
+    a newcomer past the reply, the camera parks its detector, the state page
+    counts repeats, and nothing heard or said reaches the trace."""
+
+    BENCH = REPO / "scripts" / "claude-chat-bench.py"
+
+    @staticmethod
+    def java_string(src, name):
+        """A static final String constant's value: its concatenated literals, unescaped."""
+        m = re.search(r"static final String " + name + r"\s*=\s*(.*?);\n", src, re.S)
+        assert m, name
+        parts = re.findall(r'"((?:\\.|[^"\\])*)"', m.group(1))
+        return "".join(parts).encode("utf-8").decode("unicode_escape")
+
+    def bench(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("claude_chat_bench", self.BENCH)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_the_prompt_wording_is_the_one_the_bench_uses_byte_for_byte(self):
+        prompts = src("ExplorePrompts.java")
+        bench = self.bench()
+        for name in ("GUARD", "REMINDER", "NOTES_HEADING", "SCHEMA_PREAMBLE"):
+            self.assertEqual(self.java_string(prompts, name), getattr(bench, name), name)
+        self.assertIn("never say anything a coworker would be fired for saying", self.java_string(prompts, "GUARD"))
+        java_props = re.findall(r'"(\w+)", (?:type|object|arrayOf)\(', prompts.split("REPLY_SCHEMA = object(")[1].split(";")[0])
+        bench_props = list(bench.REPLY_SCHEMA["properties"]) + list(bench.REPLY_SCHEMA["properties"]["notes_update"]["properties"])
+        self.assertEqual(java_props, bench_props)
+        self.assertIn("closed_threads", java_props)
+        # The prefix order the bench renders: guard, quoted persona, reminder, notes heading, preamble.
+        prefix = re.search(r"static String systemPrefix\((.*?)\n    \}", prompts, re.S).group(1)
+        for a, b in (("GUARD", "PERSONA_HEADING"), ("PERSONA_HEADING", "REMINDER"), ("REMINDER", "NOTES_HEADING"),
+                     ("NOTES_HEADING", "SCHEMA_PREAMBLE")):
+            self.assertLess(prefix.index(a), prefix.index(b), (a, b))
+        self.assertIn('"\\n\\"\\"\\"\\n"', prefix)
+
+    def test_the_adapter_binds_every_new_port_method(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        for method in ("turn", "turnAnswer", "cancelTurn", "notesDelta", "notesDeltaAnswer", "cancelNotesDelta", "forget",
+                       "forgetAnswer", "cancelForget", "chatListen", "keep", "keptAnswer", "cancelKeep"):
+            self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
+        turn = re.search(r"private Turn oneTurn\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("claude.conversation(fetchSettings(), system, messages, ExplorePrompts.REPLY_SCHEMA", turn)
+        self.assertIn("TURN_EFFORT", turn)
+        self.assertIn("ExplorePrompts.systemPrefix(request.persona, request.notes)", turn)
+        self.assertIn("ExplorePrompts.openerAsk(request.name)", turn)
+        self.assertIn("ExplorePrompts.avoidQuestion(request.avoidQuestion)", turn)
+        self.assertIn("ClaudeApi.jpegBlock(face)", turn)
+        self.assertIn("request.heard == null && request.transcript.isEmpty() ? meetFace : null", a)
+        self.assertIn("NameExtractor.validName(t.nameGiven)", a)
+        self.assertIn("RobotPeopleClient.mergeNotes(app, personId, notesUpdate)", a)
+        self.assertIn("RobotPeopleClient.forget(app, personId)", a)
+        keep = re.search(r"public void keep\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("RobotPeopleClient.add(app, face, name)", keep)
+        self.assertNotIn("debugFace", keep)
+        listen = re.search(r"public void chatListen\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("s.listen(maxMs, newcomerAngleDeg,", listen)
+        conv = re.search(r"private MatchAnswer forConversation\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("RobotSettingsClient.fetchConversation(app).persona", conv)
+        self.assertIn("RobotPeopleClient.notesOf(app, personId)", conv)
+        self.assertIn("a.withConversation(persona, personId, notesJson, asked)", conv)
+        self.assertEqual(a.count("forConversation("), 5)
+        port = code_only(src("CuriosityPort.java"))
+        for sig in ("void chatListen(long maxMs, float newcomerAngleDeg);", "void keep(String name, long timeoutMs);",
+                    "Kept keptAnswer();", "final String avoidQuestion;"):
+            self.assertIn(sig, port, sig)
+        api = code_only((REPO / "shared" / "src" / "com" / "miko3" / "shared" / "ClaudeApi.java").read_text())
+        self.assertIn("public MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,", api)
+        self.assertIn("private volatile boolean effortUnsupported;", api)
+
+    def test_the_ears_route_a_newcomer_past_the_reply(self):
+        a = code_only(src("EarsAdapter.java"))
+        self.assertIn("void listen(long maxMs, float newcomerAngleDeg, Reply r)", a)
+        heard = re.search(r"public void onHeard\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("Math.abs(angle) > replyAngleDeg", heard)
+        self.assertIn("if (reply != null && words && !newcomer)", heard)
+
+    def test_the_camera_parks_the_detector_through_the_conversation(self):
+        cam = code_only(src("ExploreCamera.java"))
+        self.assertIn("public void park(boolean p)", cam)
+        self.assertIn("if (busy || !wanted || parked)", cam)
+        brain = code_only(src("ExploreBrain.java"))
+        self.assertIn("camera.park(parked)", brain)
+        self.assertIn("state.chats() || state == State.MEET && chatLikely()", brain)
+
+    def test_the_state_page_counts_repeats_and_the_clips_are_reactions(self):
+        self.assertIn('"repeats"', src("ExploreState.java"))
+        self.assertIn('REPEATS("repeats")', src("ExploreBrain.java"))
+        self.assertIn('name.endsWith(".webm")', src("ClipPlayer.java"))
+
+    PRIVATE = re.compile(r"\b(\w*[lL]ine|text|transcript|name|named|heard|given|question)\b|\.text\b")
+
+    def test_the_conversation_notes_carry_no_words_heard_or_said(self):
+        offenders = []
+        for call in re.findall(r"\bhost\.note\((.*?)\);", code_only(src("ChatSession.java")), re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            bare = re.sub(r"[\w.]+\s*[!=]=\s*null", "", bare)
+            if self.PRIVATE.search(bare):
+                offenders.append(" ".join(call.split()))
+        self.assertEqual(offenders, [])
+        session = code_only(src("ChatSession.java"))
+        self.assertNotIn("import android", session)
+        self.assertNotIn("System.out", session)
+
 if __name__ == "__main__":
     unittest.main()

@@ -193,6 +193,12 @@ public final class ClaudeApi {
     private final Transport transport;
     /** Set once the endpoint has rejected output_config; later calls put the schema in the prompt. */
     private volatile boolean schemaInPrompt;
+    /**
+     * conversation(): the endpoint answered 400 naming effort, so this ClaudeApi
+     * sends no effort from then on (meeting plan U8, KTD9). Separate from the
+     * schema-in-prompt gate above, which a 400 naming the output format alone sets.
+     */
+    private volatile boolean effortUnsupported;
 
     public ClaudeApi(Transport transport) {
         this.transport = transport;
@@ -404,6 +410,108 @@ public final class ClaudeApi {
             return MessageResult.failure(forStatus(resp, false), resp.status);
         }
         return readReply(resp);
+    }
+
+    /** One message of a conversation: role "user" or "assistant" with text, or "user" with content blocks. */
+    public static Map<String, Object> message(String role, Object content) {
+        Map<String, Object> m = new LinkedHashMap<String, Object>();
+        m.put("role", role);
+        m.put("content", content);
+        return m;
+    }
+
+    /**
+     * Sends one multi-turn Messages request (meeting plan U8, KTD9): the frozen
+     * system prefix, the message list as given, max_tokens 1024, the JSON schema
+     * as output_config.format, effort (null: none) beside it, and the top-level
+     * automatic cache breakpoint. Two gates, each remembered for this ClaudeApi
+     * and each retrying once: a 400 naming effort drops effort and keeps the
+     * JSON-schema format; a 400 naming output_config without naming effort moves
+     * the schema into the system prompt. Everything else is as messages().
+     */
+    public MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
+            Map<String, ?> schema, String effort, int timeoutMs) {
+        if (access == null || !access.isSetUp()) {
+            return MessageResult.failure(Reason.NOT_SET_UP, 0);
+        }
+        String base = normalizeBaseUrl(access.baseUrl);
+        Result bad = checkSetup(base, access.apiKey);
+        if (bad != null) {
+            return MessageResult.failure(bad.reason, 0);
+        }
+        if (hasControlChar(access.model)) {
+            return MessageResult.failure(Reason.BAD_MODEL_NAME, 0);
+        }
+        Response resp;
+        try {
+            boolean useOutputConfig = schema != null && !schemaInPrompt;
+            String sendEffort = effortUnsupported ? null : effort;
+            resp = transport.send(conversationRequest(base, access, system, messages, schema, useOutputConfig,
+                    sendEffort, timeoutMs));
+            if (sendEffort != null && rejectsEffort(resp)) {
+                effortUnsupported = true;
+                sendEffort = null;
+                resp = transport.send(conversationRequest(base, access, system, messages, schema, useOutputConfig,
+                        null, timeoutMs));
+            }
+            if (useOutputConfig && rejectsOutputConfig(resp) && !rejectsEffort(resp)) {
+                schemaInPrompt = true;
+                resp = transport.send(conversationRequest(base, access, system, messages, schema, false, sendEffort,
+                        timeoutMs));
+            }
+        } catch (IOException e) {
+            return MessageResult.failure(forException(e), 0);
+        }
+        if (resp.status < 200 || resp.status > 299) {
+            return MessageResult.failure(forStatus(resp, false), resp.status);
+        }
+        return readReply(resp);
+    }
+
+    private static Request conversationRequest(String base, ClaudeAccess access, String system,
+            List<Map<String, Object>> messages, Map<String, ?> schema, boolean useOutputConfig, String effort,
+            int timeoutMs) {
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("model", access.model);
+        body.put("max_tokens", MESSAGES_MAX_TOKENS);
+        String sys = system;
+        if (schema != null && !useOutputConfig) {
+            String ask = "Reply with only a JSON object that matches this JSON schema, and no other text: "
+                    + Json.write(schema);
+            sys = sys == null || sys.isEmpty() ? ask : sys + "\n\n" + ask;
+        }
+        if (sys != null && !sys.isEmpty()) {
+            body.put("system", sys);
+        }
+        body.put("messages", messages == null ? new ArrayList<Object>() : messages);
+        Map<String, Object> outputConfig = new LinkedHashMap<String, Object>();
+        if (useOutputConfig) {
+            Map<String, Object> format = new LinkedHashMap<String, Object>();
+            format.put("type", "json_schema");
+            format.put("schema", schema);
+            outputConfig.put("format", format);
+        }
+        if (effort != null && !effort.isEmpty()) {
+            outputConfig.put("effort", effort);
+        }
+        if (!outputConfig.isEmpty()) {
+            body.put("output_config", outputConfig);
+        }
+        // The automatic cache breakpoint (KTD9): the prefix may sit under a model's silent minimum.
+        body.put("cache_control", Collections.singletonMap("type", "ephemeral"));
+        return new Request("POST", base + "/v1/messages", headers(access.apiKey, true), Json.write(body),
+                timeoutMs);
+    }
+
+    /** A 400 whose error message names effort: the effort gate (read only to choose; never shown). */
+    private static boolean rejectsEffort(Response resp) {
+        if (resp.status != 400) {
+            return false;
+        }
+        Map<?, ?> body = parseObject(resp.body);
+        Object error = body == null ? null : body.get("error");
+        Object message = error instanceof Map ? ((Map<?, ?>) error).get("message") : null;
+        return message instanceof String && ((String) message).contains("effort");
     }
 
     private static Request messagesRequest(String base, ClaudeAccess access, String system,

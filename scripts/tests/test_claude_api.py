@@ -148,6 +148,17 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "messages_refusal_stop_reason_is_refused",
         "messages_not_set_up_makes_no_request",
         "jpeg_block_base64_has_no_newlines",
+        "conversation_sends_the_message_list_in_order_with_its_roles",
+        "conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_1024",
+        "conversation_sends_effort_beside_the_json_schema_format",
+        "conversation_effort_400_retries_once_without_effort_keeping_the_schema_format",
+        "conversation_later_calls_send_no_effort_and_keep_the_format",
+        "conversation_output_config_400_without_effort_moves_the_schema_into_the_prompt_and_keeps_effort",
+        "conversation_effort_400_then_output_config_400_fires_each_gate_once",
+        "conversation_gates_retry_at_most_once_each_and_another_400_is_invalid_request",
+        "conversation_without_effort_sends_only_the_format_and_the_retry_budget",
+        "conversation_timeout_overload_rate_limit_and_refusal_map_to_their_reasons",
+        "conversation_error_output_carries_no_transcript_prefix_or_key",
     )
 
     @classmethod

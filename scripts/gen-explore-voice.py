@@ -79,6 +79,37 @@ NO_ARTICLE = {
 A_NOT_AN = {"ukulele", "usb stick"}
 
 
+# The conversation's line clips in the same cloned voice (meeting plan U8, KTD12):
+# ClipPlayer plays a random variant of react-<group>-<n>.webm, so each group is a
+# list of phrasings. "acknowledge" plays when a facing face is found (KTD14),
+# "sign-off" ends a conversation in one line (R11), "one-sec" is what a newcomer
+# hears mid-conversation (R15), "deflect" answers a refused turn (KTD9) and
+# "nothing-kept" is the forget reply to someone unnamed (R18). The forget
+# confirmation itself is not a clip: it carries the stored name, so the
+# on-device voice says it from ChatSession's template.
+LINE_CLIPS = {
+    "acknowledge": ["hm?", "yes?"],
+    "sign-off": ["catch you later.", "see you around."],
+    "one-sec": ["one sec.", "hang on a sec."],
+    "deflect": ["nice try, but no.", "not my department."],
+    "nothing-kept": ["nothing to forget; I keep nothing on you.", "I have nothing on you to forget."],
+}
+
+
+def line_clip_name(group, n):
+    """Line clip group and 1-based variant -> asset name, the way ClipPlayer indexes reactions."""
+    return f"react-{group}-{n}.webm"
+
+
+def line_clips():
+    """Every (asset name, phrase) the conversation needs, in a fixed order."""
+    out = []
+    for group, phrases in LINE_CLIPS.items():
+        for i, phrase in enumerate(phrases, start=1):
+            out.append((line_clip_name(group, i), phrase))
+    return out
+
+
 def slug(label):
     """Vocabulary name -> asset slug: lowercase, every run of other characters
     becomes one dash ("guinea pig" -> "guinea-pig", "rubik's cube" -> "rubik-s-cube").
@@ -177,9 +208,14 @@ def clip_seconds(path):
 
 def render(label, tts):
     """One label's finished clip, speeding the voice up if it would run too long."""
+    return render_phrase(phrase(label), tts)
+
+
+def render_phrase(text, tts):
+    """One phrase's finished clip, speeding the voice up if it would run too long."""
     speed = SPEED
     while True:
-        samples = finish(speak(phrase(label), tts, round(speed, 2)))
+        samples = finish(speak(text, tts, round(speed, 2)))
         if len(samples) / RATE <= MAX_SECONDS or speed >= MAX_SPEED - 1e-9:
             return samples
         speed += SPEED_STEP
@@ -195,6 +231,10 @@ def generate(out_dir, voice_dir=VOICE_DIR):
     for label in VOCABULARY:
         path = out_dir / clip_name(label)
         write_clip(path, render(label, tts))
+        paths.append(path)
+    for name, text in line_clips():
+        path = out_dir / name
+        write_clip(path, render_phrase(text, tts))
         paths.append(path)
     return paths
 

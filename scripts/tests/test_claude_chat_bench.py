@@ -147,7 +147,9 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual(sorted(s["required"]), sorted(s["properties"]))
         self.assertIs(s["additionalProperties"], False)
         notes = s["properties"]["notes_update"]
-        self.assertEqual(sorted(notes["properties"]), ["interests", "open_threads", "questions_asked", "topics"])
+        # closed_threads joined in U8 (KTD10: a closed thread moves from open threads to topics in one merge).
+        self.assertEqual(sorted(notes["properties"]),
+                         ["closed_threads", "interests", "open_threads", "questions_asked", "topics"])
 
 
 class SystemPrefixTest(unittest.TestCase):

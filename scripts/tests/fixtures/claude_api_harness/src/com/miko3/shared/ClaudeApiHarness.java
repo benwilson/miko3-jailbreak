@@ -90,6 +90,7 @@ public final class ClaudeApiHarness {
         noRequestWhenNotSetUp();
         secrecy();
         messages();
+        conversation();
     }
 
     private static void normalization() {
@@ -600,5 +601,137 @@ public final class ClaudeApiHarness {
             sb.append(q.method).append(' ').append(q.url).append(' ');
         }
         return sb.toString();
+    }
+
+    // ---- the conversation overload (meeting plan U8, KTD9) ----
+
+    private static List<Map<String, Object>> chat() {
+        List<Map<String, Object>> m = new ArrayList<Map<String, Object>>();
+        List<Map<String, Object>> opener = new ArrayList<Map<String, Object>>();
+        opener.add(ClaudeApi.textBlock("Write the opener."));
+        opener.add(ClaudeApi.jpegBlock(new byte[] {(byte) 0xFF, (byte) 0xD8, 1, 2, 3}));
+        m.add(ClaudeApi.message("user", opener));
+        m.add(ClaudeApi.message("assistant", "{\"line\":\"Hi Sam.\"}"));
+        m.add(ClaudeApi.message("user", "not bad, just back from a long weekend"));
+        return m;
+    }
+
+    private static String turnReply() {
+        return reply("{\"line\":\"Camping?\",\"question_asked\":\"Camping?\",\"name_given\":\"\","
+                + "\"ends_conversation\":false,\"deflected\":false,\"notes_update\":{}}", "end_turn");
+    }
+
+    private static void conversation() {
+        FakeTransport t = new FakeTransport().reply(200, turnReply());
+        ClaudeApi.MessageResult r = new ClaudeApi(t).conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        Map<?, ?> b = t.requests.isEmpty() ? Collections.emptyMap() : body(t.requests.get(0));
+        Object msgs = b.get("messages");
+        String order = "";
+        boolean roles = false;
+        if (msgs instanceof List && ((List<?>) msgs).size() == 3) {
+            List<?> l = (List<?>) msgs;
+            roles = "user".equals(((Map<?, ?>) l.get(0)).get("role")) && "assistant".equals(((Map<?, ?>) l.get(1)).get("role"))
+                    && "user".equals(((Map<?, ?>) l.get(2)).get("role"))
+                    && "not bad, just back from a long weekend".equals(((Map<?, ?>) l.get(2)).get("content"))
+                    && ((Map<?, ?>) l.get(0)).get("content") instanceof List
+                    && ((List<?>) ((Map<?, ?>) l.get(0)).get("content")).size() == 2;
+            order = String.valueOf(l);
+        }
+        check("conversation_sends_the_message_list_in_order_with_its_roles",
+                r.ok() && "Camping?".equals(r.json.get("line")) && roles && t.requests.size() == 1
+                        && "PREFIX".equals(b.get("system")) && t.requests.get(0).url.equals(BASE + "/v1/messages"),
+                describe(r) + " " + order);
+        Object cc = b.get("cache_control");
+        check("conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_1024",
+                cc instanceof Map && "ephemeral".equals(((Map<?, ?>) cc).get("type"))
+                        && Long.valueOf(1024).equals(b.get("max_tokens")) && t.requests.get(0).readTimeoutMs == 5000,
+                "cache_control=" + cc + " max_tokens=" + b.get("max_tokens") + " timeout=" + t.requests.get(0).readTimeoutMs);
+        Object oc = b.get("output_config");
+        Object fmt = oc instanceof Map ? ((Map<?, ?>) oc).get("format") : null;
+        check("conversation_sends_effort_beside_the_json_schema_format",
+                fmt instanceof Map && "json_schema".equals(((Map<?, ?>) fmt).get("type"))
+                        && Json.write(schema()).equals(Json.write(((Map<?, ?>) fmt).get("schema")))
+                        && oc instanceof Map && "low".equals(((Map<?, ?>) oc).get("effort")),
+                String.valueOf(oc));
+        // The effort gate: a 400 naming effort retries once without it, keeping the format, and is remembered.
+        FakeTransport e = new FakeTransport()
+                .reply(400, error("invalid_request_error", "output_config.effort: Extra inputs are not permitted"))
+                .reply(200, turnReply())
+                .reply(200, turnReply());
+        ClaudeApi eapi = new ClaudeApi(e);
+        ClaudeApi.MessageResult e1 = eapi.conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        Map<?, ?> second = e.requests.size() >= 2 ? body(e.requests.get(1)) : Collections.emptyMap();
+        Object oc2 = second.get("output_config");
+        boolean keptFormat = oc2 instanceof Map && ((Map<?, ?>) oc2).get("format") instanceof Map
+                && !((Map<?, ?>) oc2).containsKey("effort");
+        check("conversation_effort_400_retries_once_without_effort_keeping_the_schema_format",
+                e1.ok() && e.requests.size() == 2 && keptFormat && !String.valueOf(second.get("system")).contains("JSON schema")
+                        && e.requests.get(1).readTimeoutMs == 5000,
+                describe(e1) + " requests=" + e.requests.size() + " second=" + oc2);
+        ClaudeApi.MessageResult e2 = eapi.conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        Map<?, ?> third = e.requests.size() >= 3 ? body(e.requests.get(2)) : Collections.emptyMap();
+        Object oc3 = third.get("output_config");
+        check("conversation_later_calls_send_no_effort_and_keep_the_format",
+                e2.ok() && e.requests.size() == 3 && oc3 instanceof Map && !((Map<?, ?>) oc3).containsKey("effort")
+                        && ((Map<?, ?>) oc3).get("format") instanceof Map,
+                describe(e2) + " requests=" + e.requests.size() + " third=" + oc3);
+        // The schema gate alone: a 400 naming output_config without effort moves the schema into the prompt, effort kept.
+        FakeTransport f = new FakeTransport()
+                .reply(400, error("invalid_request_error", "output_config: Extra inputs are not permitted"))
+                .reply(200, turnReply());
+        ClaudeApi.MessageResult f1 = new ClaudeApi(f).conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        Map<?, ?> f2 = f.requests.size() >= 2 ? body(f.requests.get(1)) : Collections.emptyMap();
+        Object ocf = f2.get("output_config");
+        check("conversation_output_config_400_without_effort_moves_the_schema_into_the_prompt_and_keeps_effort",
+                f1.ok() && f.requests.size() == 2 && String.valueOf(f2.get("system")).startsWith("PREFIX")
+                        && String.valueOf(f2.get("system")).contains("\"additionalProperties\":false")
+                        && ocf instanceof Map && "low".equals(((Map<?, ?>) ocf).get("effort"))
+                        && !((Map<?, ?>) ocf).containsKey("format"),
+                describe(f1) + " requests=" + f.requests.size() + " second=" + ocf + " system=" + f2.get("system"));
+        // Both gates in one call: the effort 400 first, then the format 400: three requests, each gate once.
+        FakeTransport g = new FakeTransport()
+                .reply(400, error("invalid_request_error", "output_config.effort: Extra inputs are not permitted"))
+                .reply(400, error("invalid_request_error", "output_config: Extra inputs are not permitted"))
+                .reply(200, turnReply());
+        ClaudeApi.MessageResult g1 = new ClaudeApi(g).conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        Map<?, ?> g3 = g.requests.size() >= 3 ? body(g.requests.get(2)) : Collections.emptyMap();
+        check("conversation_effort_400_then_output_config_400_fires_each_gate_once",
+                g1.ok() && g.requests.size() == 3 && !g3.containsKey("output_config")
+                        && String.valueOf(g3.get("system")).contains("additionalProperties"),
+                describe(g1) + " requests=" + g.requests.size() + " third=" + g3.get("output_config"));
+        // A 400 naming both is the effort gate only; a second, unrelated 400 does not retry.
+        FakeTransport h = new FakeTransport()
+                .reply(400, error("invalid_request_error", "output_config.effort: not permitted"))
+                .reply(400, error("invalid_request_error", "messages: something else"));
+        ClaudeApi.MessageResult h1 = new ClaudeApi(h).conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        check("conversation_gates_retry_at_most_once_each_and_another_400_is_invalid_request",
+                !h1.ok() && h1.reason == ClaudeApi.Reason.INVALID_REQUEST && h.requests.size() == 2,
+                describe(h1) + " requests=" + h.requests.size());
+        // Without effort, no output_config.effort is sent and no gate can fire on it.
+        FakeTransport n = new FakeTransport().reply(200, turnReply());
+        new ClaudeApi(n).conversation(ACCESS, "PREFIX", chat(), schema(), null, 3000);
+        Object ocn = body(n.requests.get(0)).get("output_config");
+        check("conversation_without_effort_sends_only_the_format_and_the_retry_budget",
+                ocn instanceof Map && !((Map<?, ?>) ocn).containsKey("effort") && n.requests.get(0).readTimeoutMs == 3000,
+                String.valueOf(ocn));
+        // Budgets: a timeout is UNREACHABLE, overload and rate limits map as before, a refusal is REFUSED.
+        ClaudeApi.MessageResult to = new ClaudeApi(new FakeTransport().fail(new java.net.SocketTimeoutException("read")))
+                .conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        ClaudeApi.MessageResult ov = new ClaudeApi(new FakeTransport().reply(529, error("overloaded_error", "Overloaded")))
+                .conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        ClaudeApi.MessageResult rl = new ClaudeApi(new FakeTransport().reply(429, error("rate_limit_error", "slow down")))
+                .conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        ClaudeApi.MessageResult rf = new ClaudeApi(new FakeTransport().reply(200, reply("I'd rather not.", "refusal")))
+                .conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        check("conversation_timeout_overload_rate_limit_and_refusal_map_to_their_reasons",
+                to.reason == ClaudeApi.Reason.UNREACHABLE && ov.reason == ClaudeApi.Reason.OVERLOADED
+                        && rl.reason == ClaudeApi.Reason.RATE_LIMITED && rf.reason == ClaudeApi.Reason.REFUSED,
+                to.reason + " " + ov.reason + " " + rl.reason + " " + rf.reason);
+        // The error output never carries the messages, the prefix or the key.
+        String shown = to.describe() + ov.describe() + rl.describe() + rf.describe() + h1.describe() + to + ov;
+        check("conversation_error_output_carries_no_transcript_prefix_or_key",
+                !shown.contains("long weekend") && !shown.contains("PREFIX") && !shown.contains("Hi Sam")
+                        && !shown.contains(KEY) && !shown.contains("something else"),
+                shown);
     }
 }

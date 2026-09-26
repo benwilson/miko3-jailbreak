@@ -7,6 +7,8 @@ import android.util.Log;
 import com.miko3.shared.ClaudeAccess;
 import com.miko3.shared.ClaudeApi;
 import com.miko3.shared.ClaudeHttpsTransport;
+import com.miko3.shared.PersonNotes;
+import com.miko3.shared.Json;
 import com.miko3.shared.NameExtractor;
 import com.miko3.shared.RobotListenClient;
 import com.miko3.shared.RobotPeople;
@@ -94,6 +96,13 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<WayOut> wayOuts = new Slot<WayOut>();
     private final Slot<Doorway> doorways = new Slot<Doorway>();
     private final Slot<Recently> recents = new Slot<Recently>();
+    /** The conversation (meeting plan U8): one turn, a notes delta, a forget and a keep at a time. */
+    private final Slot<Turn> turns = new Slot<Turn>();
+    private final Slot<Done> notes = new Slot<Done>();
+    private final Slot<Done> forgets = new Slot<Done>();
+    private final Slot<Kept> keeps = new Slot<Kept>();
+    /** The recommended effort for a turn (KTD9); the client's gate drops it where a model refuses it. */
+    private static final String TURN_EFFORT = "low";
 
     /** The face cut out by the last match(), for remember(); and the id it matched, for touch(). */
     private volatile byte[] meetFace;
@@ -373,46 +382,273 @@ final class ClaudeCuriosity implements CuriosityPort {
         recents.cancel();
     }
 
-    // ---- the conversation (meeting plan U6): the port has it; U8 wires it. Until then every
-    // request fails at once, as CuriosityPort.NONE answers, and the meeting runs as it does today. ----
+    // ---- the conversation (meeting plan U8; KTD9, KTD10): one multi-turn request per turn, the store, the ears ----
 
+    /**
+     * One turn (KTD9): the frozen system prefix from the request's persona snapshot
+     * and notes, the transcript window as user and assistant messages, what was just
+     * heard as the last user message (the opener ask instead for turn 1, with the
+     * face crop sent that once), the reply schema, effort low behind the client's
+     * gate, and this try's budget as the read timeout. Nothing said or heard is logged.
+     */
     @Override
-    public void turn(TurnRequest request, long timeoutMs) {
+    public void turn(final TurnRequest request, final long timeoutMs) {
+        final int g = turns.start();
+        final byte[] face = request.heard == null && request.transcript.isEmpty() ? meetFace : null;
+        run(new Runnable() {
+            @Override
+            public void run() {
+                turns.finish(g, oneTurn(request, face, timeoutMs));
+            }
+        }, turns, g, Turn.failed());
+    }
+
+    private Turn oneTurn(TurnRequest request, byte[] face, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        String system = ExplorePrompts.systemPrefix(request.persona, request.notes);
+        List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
+        for (Exchange e : request.transcript) {
+            messages.add(ClaudeApi.message("user", e.heard == null ? ExplorePrompts.openerAsk(request.name) : e.heard));
+            messages.add(ClaudeApi.message("assistant", ExplorePrompts.saidAsJson(e.said == null ? "" : e.said)));
+        }
+        String ask = request.heard == null ? ExplorePrompts.openerAsk(request.name) : request.heard;
+        if (request.avoidQuestion != null) {
+            ask = ask + "\n\n" + ExplorePrompts.avoidQuestion(request.avoidQuestion);
+        }
+        if (face != null) {
+            List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+            content.add(ClaudeApi.jpegBlock(face));
+            content.add(ClaudeApi.textBlock(ask));
+            messages.add(ClaudeApi.message("user", content));
+        } else {
+            messages.add(ClaudeApi.message("user", ask));
+        }
+        ClaudeApi.MessageResult r = claude.conversation(fetchSettings(), system, messages, ExplorePrompts.REPLY_SCHEMA,
+                TURN_EFFORT, (int) timeoutMs);
+        long ms = System.currentTimeMillis() - t0;
+        Turn t = turnOf(r);
+        String opener = messages.size() == 1 ? " (the opener)" : "";
+        Log.i(TAG, "turn request with " + messages.size() + " message(s)" + opener + ": "
+                + (r.ok() ? t.status.toString() : r.describe()) + " in " + ms + " ms");
+        return t;
+    }
+
+    /** The client's reason as the brain's turn status; a name given passes NameExtractor's word list first. */
+    private static Turn turnOf(ClaudeApi.MessageResult r) {
+        if (r.ok()) {
+            Object delta = r.json.get("notes_update");
+            Turn t = ClaudeReplies.turn(r.json, delta instanceof Map ? Json.write(delta) : null);
+            if (t.status != Turn.Status.LINE || t.nameGiven == null) {
+                return t;
+            }
+            return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), t.endsConversation,
+                    t.deflected, t.notesUpdate);
+        }
+        switch (r.reason) {
+            case REFUSED:
+                return Turn.refused();
+            case UNREACHABLE:
+            case OVERLOADED:
+            case RATE_LIMITED:
+            case ENDPOINT_ERROR:
+                return Turn.unreachable();
+            default:
+                return Turn.failed();
+        }
     }
 
     @Override
     public Turn turnAnswer() {
-        return Turn.failed();
+        return turns.poll();
     }
 
     @Override
     public void cancelTurn() {
+        turns.cancel();
     }
 
+    /** A notes delta merged through the People store (KTD10); the store's fixed refusal reason is all that is logged. */
     @Override
-    public void notesDelta(String personId, String notesUpdate, long timeoutMs) {
+    public void notesDelta(final String personId, final String notesUpdate, final long timeoutMs) {
+        final int g = notes.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                long t0 = System.currentTimeMillis();
+                Done d;
+                try {
+                    RobotPeopleClient.mergeNotes(app, personId, notesUpdate);
+                    d = Done.OK;
+                } catch (IOException e) {
+                    Log.w(TAG, "notes delta refused or the store is unavailable: " + e.getMessage());
+                    d = Done.FAILED;
+                }
+                Log.i(TAG, "notes delta: " + d.status + " in " + (System.currentTimeMillis() - t0) + " ms");
+                notes.finish(g, d);
+            }
+        }, notes, g, Done.FAILED);
     }
 
     @Override
     public Done notesDeltaAnswer() {
-        return Done.FAILED;
+        return notes.poll();
     }
 
     @Override
     public void cancelNotesDelta() {
+        notes.cancel();
     }
 
+    /** Forget by id (R18, KTD10): the store wipes index, notes and face; the meeting's handle forgets the id too. */
     @Override
-    public void forget(String personId, long timeoutMs) {
+    public void forget(final String personId, final long timeoutMs) {
+        final int g = forgets.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                Done d;
+                try {
+                    d = RobotPeopleClient.forget(app, personId) ? Done.OK : Done.FAILED;
+                } catch (IOException e) {
+                    Log.w(TAG, "forget failed or the store is unavailable: " + e.getMessage());
+                    d = Done.FAILED;
+                }
+                if (d.ok()) {
+                    if (personId.equals(matchedId)) {
+                        matchedId = null;
+                    }
+                    for (MetFace mf : metFaces.values()) {
+                        if (personId.equals(mf.storeId)) {
+                            mf.storeId = null;
+                        }
+                    }
+                    MetFace mf = meeting;
+                    if (mf != null && personId.equals(mf.storeId)) {
+                        mf.storeId = null;
+                    }
+                }
+                Log.i(TAG, "forget: " + d.status);
+                forgets.finish(g, d);
+            }
+        }, forgets, g, Done.FAILED);
     }
 
     @Override
     public Done forgetAnswer() {
-        return Done.FAILED;
+        return forgets.poll();
     }
 
     @Override
     public void cancelForget() {
+        forgets.cancel();
+    }
+
+    /** A conversation listen through the session (KTD8); without one, the one-shot listen as the meeting's. */
+    @Override
+    public void chatListen(final long maxMs, final float newcomerAngleDeg) {
+        final EarsAdapter s = session;
+        if (s == null || !s.isOpen()) {
+            listen(maxMs);
+            return;
+        }
+        final int g = hearings.start();
+        s.listen(maxMs, newcomerAngleDeg, new EarsAdapter.Reply() {
+            @Override
+            public void heard(String transcript) {
+                hearings.finish(g, new Heard(Heard.Status.WORDS, transcript));
+            }
+        });
+        run(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(maxMs);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (hearings.current(g) && hearings.poll() == null) {
+                    hearings.finish(g, Heard.NOTHING);
+                }
+            }
+        }, null, g, null);
+    }
+
+    /**
+     * The retained crop stored under a new record with this name (KTD10): a name
+     * given mid-conversation or a mismatch. No line is asked for and the face debug
+     * dump never runs here (it belongs to the match, before the conversation).
+     */
+    @Override
+    public void keep(final String name, final long timeoutMs) {
+        final int g = keeps.start();
+        final byte[] face = meetFace;
+        final MetFace mf = meeting;
+        run(new Runnable() {
+            @Override
+            public void run() {
+                if (face == null) {
+                    Log.w(TAG, "keep: no face from the match to store");
+                    keeps.finish(g, Kept.FAILED);
+                    return;
+                }
+                Kept k;
+                try {
+                    String id = RobotPeopleClient.add(app, face, name);
+                    matchedId = id;
+                    if (mf != null) {
+                        mf.storeId = id;
+                    }
+                    k = Kept.done(id);
+                    Log.i(TAG, "kept a new record, id " + id);
+                } catch (IOException e) {
+                    Log.w(TAG, "keep: the people store refused or is unavailable: " + e.getMessage());
+                    k = Kept.FAILED;
+                }
+                keeps.finish(g, k);
+            }
+        }, keeps, g, Kept.FAILED);
+    }
+
+    @Override
+    public Kept keptAnswer() {
+        return keeps.poll();
+    }
+
+    @Override
+    public void cancelKeep() {
+        keeps.cancel();
+    }
+
+    /**
+     * The conversation's fields on a match or lines answer (U8, KTD9, KTD11): the
+     * persona snapshot from the Settings Binder, and for a known person their notes
+     * and the questions on record. An older launcher with no conversation settings
+     * leaves them off, and the meeting runs as it did before.
+     */
+    private MatchAnswer forConversation(MatchAnswer a, String personId) {
+        if (a.status == MatchAnswer.Status.FAILED) {
+            return a;
+        }
+        String persona;
+        try {
+            persona = RobotSettingsClient.fetchConversation(app).persona;
+        } catch (IOException e) {
+            Log.w(TAG, "conversation settings unavailable; the meeting runs as before: " + e.getMessage());
+            return a;
+        }
+        String notesJson = null;
+        List<String> asked = null;
+        if (personId != null) {
+            try {
+                PersonNotes n = RobotPeopleClient.notesOf(app, personId);
+                notesJson = n.toJson();
+                asked = n.questionsAsked;
+                Log.i(TAG, "notes for the conversation: " + n.byteLength() + " bytes, " + asked.size() + " question(s)");
+            } catch (IOException e) {
+                Log.w(TAG, "notes unavailable; the conversation runs without them: " + e.getMessage());
+            }
+        }
+        return a.withConversation(persona, personId, notesJson, asked);
     }
 
     @Override
@@ -583,7 +819,7 @@ final class ClaudeCuriosity implements CuriosityPort {
             Log.i(TAG, "faceless lines request: " + (r.ok() ? lines.status.toString() : r.describe()) + " in "
                     + (System.currentTimeMillis() - t0) + " ms");
             return lines.status == MatchAnswer.Status.NEW
-                    ? MatchAnswer.faceless(lines.askLine, lines.noReplyLine) : MatchAnswer.FAILED;
+                    ? forConversation(MatchAnswer.faceless(lines.askLine, lines.noReplyLine), null) : MatchAnswer.FAILED;
         }
         byte[] face = crop.face;
         if (matches.current(g)) {
@@ -635,12 +871,14 @@ final class ClaudeCuriosity implements CuriosityPort {
                 mf.storeId = id;
                 Log.i(TAG, "person request against " + n + " references: known, reference " + (m.reference + 1)
                         + ", id " + id + " in " + ms + " ms");
-                return MatchAnswer.known(stored.isEmpty() ? null : stored, m.namedLine, m.unnamedLine);
+                // A nameless record takes the stranger path (KTD10): no id for the conversation.
+                return forConversation(MatchAnswer.known(stored.isEmpty() ? null : stored, m.namedLine, m.unnamedLine),
+                        stored.isEmpty() ? null : id);
             }
             // Forgotten since recent() (or the store is gone): a new person, if the lines allow.
         }
         Log.i(TAG, "person request against " + n + " references: new in " + ms + " ms");
-        return m.askLine == null ? MatchAnswer.FAILED : MatchAnswer.stranger(m.askLine, m.noReplyLine);
+        return m.askLine == null ? MatchAnswer.FAILED : forConversation(MatchAnswer.stranger(m.askLine, m.noReplyLine), null);
     }
 
     @Override
@@ -675,7 +913,7 @@ final class ClaudeCuriosity implements CuriosityPort {
                 MatchAnswer a = r.ok() ? ClaudeReplies.lines(r.json) : MatchAnswer.FAILED;
                 Log.i(TAG, "lines request: " + (r.ok() ? a.status.toString() : r.describe()) + " in "
                         + (System.currentTimeMillis() - t0) + " ms");
-                strangerLines.finish(g, a);
+                strangerLines.finish(g, forConversation(a, null));
             }
         }, strangerLines, g, MatchAnswer.FAILED);
     }
