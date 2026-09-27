@@ -23,22 +23,25 @@ import ai.onnxruntime.OnnxValue;
 import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtException;
 import ai.onnxruntime.OrtSession;
-import ai.onnxruntime.TensorInfo;
 
 import com.miko3.shared.HttpUtil;
 
 /**
  * FaceCrop on the robot (explore on Claude plan KTD5): the YuNet face detector
- * (assets/face_yunet.onnx, OpenCV Zoo 2023mar, MIT) run by the ONNX Runtime the
+ * (assets/face_yunet.onnx, OpenCV Zoo 2026may, MIT) run by the ONNX Runtime the
  * mode already bundles. Android's FaceDetector replaced it: it missed an
  * obvious, well-lit frontal face in glasses ~115 px wide in a 640x480 frame.
  *
- * The whole frame goes into the model's fixed 640x640 input as it is (a 640x480
- * frame is not scaled, just padded black below), as BGR 0..255 floats, the way
- * OpenCV's FaceDetectorYN feeds it; YuNetDecoder reads the faces back, and the
- * largest one centred inside the person box is cut out 1.6x larger as a 224 px
- * JPEG. With no face there is no crop at all: nothing that isn't a detected face
- * is matched or stored. See FaceCrop for the geometry.
+ * The 2026may model takes any size, so the input is a fixed
+ * YuNetDecoder.INPUT_W x INPUT_H (320x256, on-device face recognition KTD2), not
+ * read from the model: the 640x480 frame is halved to 320x240 and padded black
+ * below, as BGR 0..255 floats, the way OpenCV's FaceDetectorYN feeds it.
+ * YuNetDecoder reads the faces and their five landmarks back, scaled to frame
+ * pixels, and the largest one centred inside the person box is cut out 1.6x
+ * larger as a 224 px JPEG. locate() also hands back that face's box and
+ * landmarks, to straighten it before matching. With no face there is no crop at
+ * all: nothing that isn't a detected face is matched or stored (R10). See
+ * FaceCrop for the geometry.
  *
  * The model loads on the first crop (MEET time only) and stays until close().
  * Called on the curiosity adapter's worker thread, never the brain's;
@@ -60,9 +63,8 @@ final class FaceCropper implements FaceCrop {
     private OrtEnvironment env;
     private OrtSession session;
     private String inputName;
-    private int inW;
-    private int inH;
-    private YuNetDecoder decoder;
+    private final int inW = YuNetDecoder.INPUT_W;
+    private final int inH = YuNetDecoder.INPUT_H;
     /** The input, CHW BGR floats, and the pixels it is filled from: reused across crops. */
     private FloatBuffer chw;
     private int[] pixels;
@@ -73,22 +75,53 @@ final class FaceCropper implements FaceCrop {
         this.context = context.getApplicationContext();
     }
 
+    /** A found face: the loose crop callers store, and the face's box and landmarks for alignment. */
+    static final class Located {
+        /** The loose SIDE_PX square crop, as crop() returns it. */
+        final Result crop;
+        /** The face in frame pixels: its box, score and five landmarks (YuNetDecoder.Face). */
+        final YuNetDecoder.Face face;
+        /** The decoded frame's size, the space the face's coordinates are in. */
+        final int frameW;
+        final int frameH;
+
+        Located(Result crop, YuNetDecoder.Face face, int frameW, int frameH) {
+            this.crop = crop;
+            this.face = face;
+            this.frameW = frameW;
+            this.frameH = frameH;
+        }
+    }
+
     @Override
     public synchronized Result crop(byte[] frameJpeg, Detection personBox) {
-        if (frameJpeg == null || personBox == null) {
+        Located found = locate(frameJpeg, personBox);
+        if (found == null) {
             return Result.NONE;
+        }
+        return found.crop;
+    }
+
+    /**
+     * The largest face centred in the person box, with its loose crop and its
+     * landmarks in frame pixels; null when there is no face (R10), so nothing
+     * is matched or stored.
+     */
+    synchronized Located locate(byte[] frameJpeg, Detection personBox) {
+        if (frameJpeg == null || personBox == null) {
+            return null;
         }
         Bitmap frame = BitmapFactory.decodeByteArray(frameJpeg, 0, frameJpeg.length);
         if (frame == null) {
-            return Result.NONE;
+            return null;
         }
         try {
             int w = frame.getWidth();
             int h = frame.getHeight();
             int[] r = FaceCrop.Square.region(personBox, w, h);
             YuNetDecoder.Face best = r == null ? null : findFace(frame, r);
-            if (best == null) {
-                return Result.NONE;
+            if (best == null || best.landmarks == null) {
+                return null;
             }
             int[] sq = FaceCrop.Square.aroundFace(best.x0, best.y0, best.x1, best.y1, w, h);
             Bitmap cut = Bitmap.createBitmap(frame, sq[0], sq[1], sq[2], sq[2]);
@@ -101,7 +134,7 @@ final class FaceCropper implements FaceCrop {
             if (cut != frame) {
                 cut.recycle();
             }
-            return new Result(out.toByteArray(), sq);
+            return new Located(new Result(out.toByteArray(), sq), best, w, h);
         } finally {
             frame.recycle();
         }
@@ -131,11 +164,13 @@ final class FaceCropper implements FaceCrop {
         int w = frame.getWidth();
         int h = frame.getHeight();
         float scale = YuNetDecoder.fitScale(w, h, inW, inH);
+        int contentW = Math.round(w * scale);
+        int contentH = Math.round(h * scale);
         Bitmap input = Bitmap.createBitmap(inW, inH, Bitmap.Config.ARGB_8888);
         try {
             Canvas canvas = new Canvas(input);
             canvas.drawColor(Color.BLACK);
-            canvas.drawBitmap(frame, null, new Rect(0, 0, Math.round(w * scale), Math.round(h * scale)), filter);
+            canvas.drawBitmap(frame, null, new Rect(0, 0, contentW, contentH), filter);
             input.getPixels(pixels, 0, inW, 0, 0, inW, inH);
         } finally {
             input.recycle();
@@ -149,7 +184,7 @@ final class FaceCropper implements FaceCrop {
         }
         List<YuNetDecoder.Face> faces;
         try {
-            faces = run();
+            faces = run(new YuNetDecoder(inW, inH, contentW, contentH));
         } catch (OrtException e) {
             Log.w(TAG, "face detector run failed: " + e.getClass().getSimpleName());
             return null;
@@ -163,11 +198,12 @@ final class FaceCropper implements FaceCrop {
         return best;
     }
 
-    private List<YuNetDecoder.Face> run() throws OrtException {
+    private List<YuNetDecoder.Face> run(YuNetDecoder decoder) throws OrtException {
         int n = YuNetDecoder.STRIDES.length;
         float[][] cls = new float[n][];
         float[][] obj = new float[n][];
         float[][] bbox = new float[n][];
+        float[][] kps = new float[n][];
         OnnxTensor tensor = OnnxTensor.createTensor(env, chw, new long[]{1, 3, inH, inW});
         try {
             OrtSession.Result result = session.run(Collections.singletonMap(inputName, tensor));
@@ -182,6 +218,8 @@ final class FaceCropper implements FaceCrop {
                             obj[s] = values(e.getValue());
                         } else if (out.equals("bbox" + suffix)) {
                             bbox[s] = values(e.getValue());
+                        } else if (out.equals("kps" + suffix)) {
+                            kps[s] = values(e.getValue());
                         }
                     }
                 }
@@ -191,7 +229,7 @@ final class FaceCropper implements FaceCrop {
         } finally {
             tensor.close();
         }
-        return decoder.decode(cls, obj, bbox, MIN_SCORE, NMS_IOU, MAX_FACES);
+        return decoder.decode(cls, obj, bbox, kps, MIN_SCORE, NMS_IOU, MAX_FACES);
     }
 
     private static float[] values(OnnxValue v) {
@@ -215,11 +253,8 @@ final class FaceCropper implements FaceCrop {
             options.setIntraOpNumThreads(THREADS);
             options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
             session = env.createSession(HttpUtil.readAssetBytes(context, MODEL), options);
+            // The model's height and width read -1 (any size): the input size is YuNetDecoder's.
             inputName = session.getInputNames().iterator().next();
-            long[] shape = ((TensorInfo) session.getInputInfo().get(inputName).getInfo()).getShape();
-            inH = (int) shape[2];
-            inW = (int) shape[3];
-            decoder = new YuNetDecoder(inW, inH);
             chw = ByteBuffer.allocateDirect(4 * 3 * inW * inH).order(ByteOrder.nativeOrder()).asFloatBuffer();
             pixels = new int[inW * inH];
             return true;
