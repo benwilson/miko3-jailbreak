@@ -49,9 +49,9 @@ public class PeopleService extends Service {
         }
 
         @Override
-        public String add(byte[] faceJpeg, String nameOrNull) {
+        public String add(byte[] faceJpeg, String name) {
             enforceCaller();
-            return people().add(faceJpeg, nameOrNull);
+            return people().add(faceJpeg, name);
         }
 
         @Override

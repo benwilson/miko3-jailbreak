@@ -48,12 +48,13 @@ public final class RobotPeopleClient {
         });
     }
 
-    /** Remembers a new person (a 224 px face JPEG, a name or null); answers their id. */
-    public static String add(Context context, final byte[] faceJpeg, final String nameOrNull) throws IOException {
+    /** Remembers a new person (a 224 px face JPEG and their name, required: R19); answers
+     * their id. IOException with the store's fixed reason when the name is missing. */
+    public static String add(Context context, final byte[] faceJpeg, final String name) throws IOException {
         return call(context, DEFAULT_TIMEOUT_MS, new Call<String>() {
             @Override
             public String run(RobotPeople people) throws RemoteException {
-                return people.add(faceJpeg, nameOrNull);
+                return people.add(faceJpeg, name);
             }
         });
     }

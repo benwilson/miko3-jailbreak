@@ -63,6 +63,8 @@ final class PeopleStore {
     static final String REFUSE_NOT_SAVED = "the face could not be saved";
     static final String REFUSE_UNKNOWN_PERSON = "that person is not remembered";
     static final String REFUSE_NOTES_NOT_SAVED = "the notes could not be saved";
+    /** Nobody is stored without a name (R19, meeting plan line 309). */
+    static final String REFUSE_NO_NAME = "a person needs a name to be remembered";
 
     /** A notes file larger than this (a hand edit) reads as empty. */
     private static final int MAX_NOTES_FILE_BYTES = 4 * PersonNotes.MAX_DOCUMENT_BYTES;
@@ -152,16 +154,20 @@ final class PeopleStore {
     /**
      * Remembers a new person, seen now, at the front of the list. Returns
      * their id. Throws IllegalArgumentException with one of the fixed
-     * REFUSE_* reasons when the face isn't a JPEG, is too large, or can't be
-     * written.
+     * REFUSE_* reasons when the face isn't a JPEG, is too large, has no name
+     * (R19: nothing is written then), or can't be written.
      */
-    synchronized String add(byte[] faceJpeg, String nameOrNull) {
+    synchronized String add(byte[] faceJpeg, String name) {
         if (faceJpeg == null || faceJpeg.length < 4 || (faceJpeg[0] & 0xff) != 0xFF
                 || (faceJpeg[1] & 0xff) != 0xD8) {
             throw new IllegalArgumentException(REFUSE_NOT_JPEG);
         }
         if (faceJpeg.length > MAX_FACE_BYTES) {
             throw new IllegalArgumentException(REFUSE_TOO_BIG);
+        }
+        String cleanName = cleanName(name);
+        if (cleanName.isEmpty()) {
+            throw new IllegalArgumentException(REFUSE_NO_NAME);
         }
         String id = newId();
         File face = faceFile(id);
@@ -170,7 +176,7 @@ final class PeopleStore {
                 throw new IOException("no people directory");
             }
             writeDurably(face, faceJpeg);
-            people.add(0, new Person(id, cleanName(nameOrNull), clock.nowMillis()));
+            people.add(0, new Person(id, cleanName, clock.nowMillis()));
             saveIndex();
         } catch (IOException e) {
             remove(id);

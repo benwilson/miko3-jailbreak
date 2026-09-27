@@ -59,15 +59,17 @@ interface CuriosityPort {
     /** What listen() heard, or null while it is listening. */
     Heard heard();
 
-    /** A faceless new person replied: ask for a text-only "nice to meet you" line that never
-     * promises to remember them. Stores nothing (R12). */
+    /** A new person replied but nothing will be kept: no face was found, or no name was heard
+     * (R19). Ask for a text-only "nice to meet you" line that never promises to remember
+     * them. Stores nothing. */
     void welcome(String name, long timeoutMs);
 
     /** The line to say after welcome(), or null while it is running. */
     Answer welcomed();
 
-    /** Store the face from the last match() with this name (null: unnamed) and ask for the
-     * "I'll remember you" line (R11, R12). */
+    /** Store the face from the last match() with this name and ask for the "I'll remember
+     * you" line (R11). The name is required: nobody is stored without one (R19), so a null
+     * or blank name gets the welcome() line instead and stores nothing. */
     void remember(String name, long timeoutMs);
 
     /** The line to say after remember(), or null while it is running. */
@@ -589,7 +591,7 @@ interface CuriosityPort {
         }
     }
 
-    /** What findName() found: a name, no clear name (the person is kept unnamed, R12), or a failure. */
+    /** What findName() found: a name, no clear name (nothing is kept and he just says hello, R19; meeting plan line 309), or a failure. */
     final class Named {
         enum Status { NAME, NO_NAME, FAILED }
 

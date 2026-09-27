@@ -132,6 +132,17 @@ public final class PeopleStoreHarness {
         }
     }
 
+    /** A record like the ones stored before R19: a face with no name. add() refuses
+     * those now, so it is made the way the People page can still make one, by
+     * blanking a name. */
+    static String legacyNameless(PeopleStore s, byte[] face) {
+        String id = s.add(face, "legacy");
+        if (!s.rename(id, "")) {
+            throw new IllegalStateException("rename failed");
+        }
+        return id;
+    }
+
     public static void main(String[] args) {
         scenario("add_then_recent_newest_first", new Scenario() {
             public void run(String n) throws Exception {
@@ -139,7 +150,7 @@ public final class PeopleStoreHarness {
                 PeopleStore s = new PeopleStore(tempDir(), clock);
                 String a = s.add(jpeg(1), "Ann");
                 clock.now += 1000;
-                String b = s.add(jpeg(2), null);
+                String b = legacyNameless(s, jpeg(2));
                 clock.now += 1000;
                 String c = s.add(jpeg(3), "Cy");
                 // The gallery skips the nameless record (KTD10); the store still lists it.
@@ -182,7 +193,7 @@ public final class PeopleStoreHarness {
         scenario("face_bytes_round_trip", new Scenario() {
             public void run(String n) throws Exception {
                 PeopleStore s = new PeopleStore(tempDir(), new FakeClock());
-                String a = s.add(jpeg(7), null);
+                String a = legacyNameless(s, jpeg(7));
                 check(n, Arrays.equals(s.face(a), jpeg(7)), Arrays.toString(s.face(a)));
             }
         });
@@ -190,7 +201,7 @@ public final class PeopleStoreHarness {
         scenario("rename_changes_name_used_next_time", new Scenario() {
             public void run(String n) throws Exception {
                 PeopleStore s = new PeopleStore(tempDir(), new FakeClock());
-                String a = s.add(jpeg(1), null);
+                String a = legacyNameless(s, jpeg(1));
                 boolean unnamedFirst = "".equals(s.nameOf(a));
                 boolean ok = s.rename(a, "  Sarah  ");
                 check(n, unnamedFirst && ok && "Sarah".equals(s.nameOf(a)), s.nameOf(a));
@@ -259,7 +270,7 @@ public final class PeopleStoreHarness {
                 PeopleStore s = new PeopleStore(dir, clock);
                 String a = s.add(jpeg(1), "Ann");
                 clock.now += 5000;
-                String b = s.add(jpeg(2), null);
+                String b = legacyNameless(s, jpeg(2));
                 clock.now += 5000;
                 s.touch(a);
                 s.rename(b, "Bo");
@@ -330,7 +341,7 @@ public final class PeopleStoreHarness {
                 out.write(jpeg(9));
                 out.close();
                 PeopleStore s = new PeopleStore(dir, new FakeClock());
-                String a = s.add(jpeg(1), null);
+                String a = legacyNameless(s, jpeg(1));
                 List<String> leaked = new ArrayList<String>();
                 for (String bad : Arrays.asList("../" + dir.getName() + "-secret", "..", "", null,
                         a.toUpperCase(), a + "0", a.substring(1), a + "/", "index", PeopleStore.INDEX_FILE)) {
@@ -675,7 +686,7 @@ public final class PeopleStoreHarness {
                 PeopleStore s = new PeopleStore(tempDir(), clock);
                 String ann = s.add(jpeg(1), "Ann");
                 clock.now += 1000;
-                String legacy = s.add(jpeg(2), null);
+                String legacy = legacyNameless(s, jpeg(2));
                 boolean excluded = ids(s.recent(10)).equals(Arrays.asList(ann))
                         && ids(s.all()).equals(Arrays.asList(legacy, ann)) && "".equals(s.nameOf(legacy))
                         && s.face(legacy) != null;
@@ -684,6 +695,53 @@ public final class PeopleStoreHarness {
                 s.rename(legacy, "");
                 boolean outAgain = ids(s.recent(1)).equals(Arrays.asList(ann));
                 check(n, excluded && backIn && outAgain, "excluded=" + excluded + " backIn=" + backIn + " out=" + outAgain);
+            }
+        });
+
+        // R19 (meeting plan line 309): a person is only stored once he has a name.
+        scenario("add_refuses_a_missing_name_and_writes_nothing", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                PeopleStore s = new PeopleStore(dir, new FakeClock());
+                String r1 = refusal(s, jpeg(1), null);
+                String r2 = refusal(s, jpeg(1), "   ");
+                String r3 = refusal(s, jpeg(1), "");
+                String r4 = refusal(s, jpeg(1), " \t\n ");
+                boolean refused = PeopleStore.REFUSE_NO_NAME.equals(r1) && PeopleStore.REFUSE_NO_NAME.equals(r2)
+                        && PeopleStore.REFUSE_NO_NAME.equals(r3) && PeopleStore.REFUSE_NO_NAME.equals(r4);
+                boolean nothingWritten = s.all().isEmpty() && dir.list().length == 0
+                        && !new File(dir, PeopleStore.INDEX_FILE).exists();
+                String sarah = s.add(jpeg(2), "  Sarah  ");
+                boolean namedStillWorks = "Sarah".equals(s.nameOf(sarah)) && ids(s.recent(10)).equals(Arrays.asList(sarah))
+                        && new File(dir, sarah + ".jpg").isFile();
+                check(n, refused && nothingWritten && namedStillWorks,
+                        r1 + "|" + r2 + "|" + r3 + "|" + r4 + " files=" + Arrays.toString(dir.list()));
+            }
+        });
+
+        // Legacy nameless rows stay: marked on the People page, never swept (plan line 322).
+        scenario("legacy_nameless_index_row_still_loads_and_stays_out_of_the_gallery", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                String legacy = "0123456789abcdef";
+                java.io.FileOutputStream face = new java.io.FileOutputStream(new File(dir, legacy + ".jpg"));
+                face.write(jpeg(5));
+                face.close();
+                java.io.FileOutputStream index = new java.io.FileOutputStream(new File(dir, PeopleStore.INDEX_FILE));
+                index.write((legacy + "\t1000\t\n").getBytes("UTF-8"));
+                index.close();
+                FakeClock clock = new FakeClock();
+                clock.now = 5000;
+                PeopleStore s = new PeopleStore(dir, clock);
+                boolean loaded = ids(s.all()).equals(Arrays.asList(legacy)) && "".equals(s.nameOf(legacy))
+                        && Arrays.equals(s.face(legacy), jpeg(5));
+                boolean hidden = s.recent(10).isEmpty();
+                String ann = s.add(jpeg(1), "Ann");
+                boolean stillThere = ids(s.recent(10)).equals(Arrays.asList(ann))
+                        && ids(s.all()).equals(Arrays.asList(ann, legacy))
+                        && new File(dir, legacy + ".jpg").isFile();
+                check(n, loaded && hidden && stillThere,
+                        "loaded=" + loaded + " hidden=" + hidden + " stillThere=" + stillThere + " all=" + ids(s.all()));
             }
         });
 

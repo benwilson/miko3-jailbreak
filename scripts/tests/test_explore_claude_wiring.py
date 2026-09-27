@@ -459,12 +459,23 @@ class FaceCropStoresOnlyFacesTest(unittest.TestCase):
         keep = a[a.index("private Answer keep("):]
         self.assertLess(keep.index("return hello("), keep.index("RobotPeopleClient.add"))
 
+    def test_a_blank_name_skips_the_store_and_gets_the_hello(self):
+        """R19: no caller can store an unnamed face, even if the brain regresses."""
+        a = code_only(src("ClaudeCuriosity.java"))
+        keep = a[a.index("private Answer keep("):]
+        keep = keep[:keep.index("RobotPeopleClient.add")]
+        self.assertRegex(keep, r"name == null \|\| name\.trim\(\)\.isEmpty\(\)")
+        self.assertEqual(keep.count("return hello("), 2)
+
     def test_the_hello_never_promises_to_remember(self):
         prompts = src("ExplorePrompts.java")
         hello = prompts[prompts.index("static String welcomeAsk("):]
         hello = hello[:hello.index("}")]
         self.assertIn("do not say or", hello)
         self.assertIn("will NOT remember", hello)
+        # The reason is the true one for each caller: no name heard, or no face found.
+        self.assertIn("no name to remember them by", hello)
+        self.assertIn("could not get a good look at their face", hello)
 
 
 class FaceDebugSwitchTest(unittest.TestCase):

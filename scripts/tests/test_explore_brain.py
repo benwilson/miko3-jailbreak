@@ -12,6 +12,7 @@ This compiles them for the host JVM and runs fixtures/explore_brain_harness,
 which scripts sensor readings against a mock clock and prints one PASS/FAIL
 line per scenario.
 """
+import re
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,21 @@ class BrainIsPlainJavaTest(unittest.TestCase):
         offenders = [name for name in PLAIN_JAVA
                      if "com.miko3.shared" in (EXPLORE_PKG / name).read_text()]
         self.assertEqual(offenders, [])
+
+
+class NamelessReplySourceTest(unittest.TestCase):
+    """R19: a reply without a name is welcomed and nothing is stored."""
+
+    def test_name_step_welcomes_a_nameless_reply_instead_of_remembering(self):
+        src = (EXPLORE_PKG / "ExploreBrain.java").read_text()
+        m = re.search(r"private void nameStep\(long now\) \{(.*?)\n    \}", src, re.S)
+        self.assertIsNotNone(m)
+        body = m.group(1)
+        self.assertIn("name == null", body)
+        self.assertLess(body.index("name == null"), body.index("port.remember("))
+        self.assertLess(body.index("port.welcome("), body.index("port.remember("))
+        self.assertNotIn("remembering them unnamed", body)
+        self.assertNotIn("(or unnamed)", src)
 
 
 class ExploreBrainHarnessTest(unittest.TestCase):
@@ -149,7 +165,9 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "meet_ae3_known_person_is_greeted_by_name_and_touched",
         "meet_ae2_new_person_who_gives_a_name_is_stored_and_remembered",
         "meet_ae5_no_reply_says_the_friendly_line_and_stores_nothing",
-        "meet_ae5_reply_without_a_name_is_stored_unnamed",
+        "meet_ae5_reply_without_a_name_is_welcomed_and_nothing_is_stored",
+        "meet_ae5_reply_without_a_name_and_no_hello_line_says_the_friendly_line",
+        "meet_ae5_name_request_that_never_answers_is_welcomed_at_the_deadline",
         "meet_reply_without_a_pattern_waits_for_claude_to_find_the_name",
         "meet_unsure_match_runs_the_new_person_flow",
         "meet_refused_match_asks_text_only_lines_then_the_name",

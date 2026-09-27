@@ -21,8 +21,8 @@ import java.util.Set;
  *
  * Returns the name in title case, or null when the reply has no clear name
  * ("what?", "no", "I don't know", "I'm fine"). null is not "no reply": the
- * caller heard something, so per R12 it may keep the person unnamed, or ask
- * Claude to find a name in the transcript (the KTD4 fallback).
+ * caller heard something, so it may ask Claude to find a name in the transcript
+ * (the KTD4 fallback); with no name found nothing is kept (R19).
  */
 public final class NameExtractor {
     /** Longest name word kept; a longer "word" is a misrecognition. */

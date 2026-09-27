@@ -132,6 +132,17 @@ public final class SettingsPageHarness {
         }
     }
 
+    /** A record like the ones stored before R19: a face with no name. The store
+     * refuses to add one now, so it is made by blanking a name, as the People
+     * page can. */
+    static String legacyNameless(PeopleStore people, byte[] face) {
+        String id = people.add(face, "legacy");
+        if (!people.rename(id, "")) {
+            throw new IllegalStateException("rename failed");
+        }
+        return id;
+    }
+
     static byte[] jpeg(int tag) {
         return new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) tag, 1, 2, 3, (byte) 0xFF, (byte) 0xD9};
     }
@@ -966,7 +977,7 @@ public final class SettingsPageHarness {
                 Fixture f = new Fixture();
                 String sarah = f.people.add(jpeg(1), "Sarah");
                 f.peopleClock.now += 60_000;
-                String anon = f.people.add(jpeg(2), null);
+                String anon = legacyNameless(f.people, jpeg(2));
                 String html = get(f);
                 String section = html.substring(html.indexOf("<section id=\"people\">"));
                 String img = "src=\"" + LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH + "?id=";
@@ -1008,7 +1019,7 @@ public final class SettingsPageHarness {
         scenario("rename_changes_name_and_redirects", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
-                String id = f.people.add(jpeg(1), null);
+                String id = legacyNameless(f.people, jpeg(1));
                 Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH, "",
                         "t=" + token(f) + "&id=" + id + "&name=" + enc("  Sarah "));
                 check(n, r.location().startsWith("/settings?status=") && "Sarah".equals(f.people.nameOf(id))
@@ -1116,7 +1127,7 @@ public final class SettingsPageHarness {
         scenario("face_get_serves_the_jpeg", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
-                String id = f.people.add(jpeg(5), null);
+                String id = f.people.add(jpeg(5), "Sam");
                 Resp r = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH, "id=" + id, null);
                 check(n, r.code() == 200 && r.head.toLowerCase().contains("content-type: image/jpeg")
                         && Arrays.equals(r.bytes, jpeg(5)), r.head);
@@ -1126,7 +1137,7 @@ public final class SettingsPageHarness {
         scenario("face_get_refuses_unknown_and_bad_ids", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
-                String id = f.people.add(jpeg(5), null);
+                String id = f.people.add(jpeg(5), "Sam");
                 List<String> wrong = new ArrayList<String>();
                 for (String q : Arrays.asList("id=0123456789abcdef", "id=" + enc("../" + id), "id=",
                         "", "id=" + enc(PeopleStore.INDEX_FILE), "id=" + id.toUpperCase())) {
@@ -1418,7 +1429,7 @@ public final class SettingsPageHarness {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
                 String ann = f.people.add(jpeg(1), "Ann");
-                String legacy = f.people.add(jpeg(2), null);
+                String legacy = legacyNameless(f.people, jpeg(2));
                 String html = get(f);
                 String a = article(html, ann);
                 String l = article(html, legacy);
