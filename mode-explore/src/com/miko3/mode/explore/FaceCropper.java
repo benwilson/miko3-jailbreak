@@ -84,12 +84,20 @@ final class FaceCropper implements FaceCrop {
         /** The decoded frame's size, the space the face's coordinates are in. */
         final int frameW;
         final int frameH;
+        /** The decoded frame's ARGB pixels, row by row, for FaceAlign (face plan U6). */
+        final int[] argb;
 
-        Located(Result crop, YuNetDecoder.Face face, int frameW, int frameH) {
+        Located(Result crop, YuNetDecoder.Face face, int frameW, int frameH, int[] argb) {
             this.crop = crop;
             this.face = face;
             this.frameW = frameW;
             this.frameH = frameH;
+            this.argb = argb;
+        }
+
+        /** The face box's width in frame pixels: the size gate's measure (KTD3). */
+        float faceWidth() {
+            return face.x1 - face.x0;
         }
     }
 
@@ -134,9 +142,52 @@ final class FaceCropper implements FaceCrop {
             if (cut != frame) {
                 cut.recycle();
             }
-            return new Located(new Result(out.toByteArray(), sq), best, w, h);
+            int[] argb = new int[w * h];
+            frame.getPixels(argb, 0, w, 0, 0, w, h);
+            return new Located(new Result(out.toByteArray(), sq), best, w, h, argb);
         } finally {
             frame.recycle();
+        }
+    }
+
+    /**
+     * True when the face model is loaded (loading it now if needed): the
+     * migration tells "no face in this photo" from "no model to look with",
+     * and never marks a photo unusable for the second (KTD11).
+     */
+    synchronized boolean loaded() {
+        return load();
+    }
+
+    /**
+     * The loose crop brightened by the gate's table (KTD3): the same luma table
+     * on all three channels, re-encoded as the stored JPEG. The crop unchanged
+     * when there is no table or it can't be decoded.
+     */
+    static byte[] brighten(byte[] jpeg, int[] table) {
+        if (jpeg == null || table == null) {
+            return jpeg;
+        }
+        Bitmap in = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
+        if (in == null) {
+            return jpeg;
+        }
+        try {
+            int w = in.getWidth();
+            int h = in.getHeight();
+            int[] px = new int[w * h];
+            in.getPixels(px, 0, w, 0, 0, w, h);
+            int[] lit = FaceQuality.apply(px, table);
+            Bitmap out = Bitmap.createBitmap(lit, w, h, Bitmap.Config.ARGB_8888);
+            try {
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                out.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, bytes);
+                return bytes.toByteArray();
+            } finally {
+                out.recycle();
+            }
+        } finally {
+            in.recycle();
         }
     }
 

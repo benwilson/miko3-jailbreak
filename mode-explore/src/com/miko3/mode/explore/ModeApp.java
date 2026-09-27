@@ -182,6 +182,10 @@ public class ModeApp extends Application {
             ears = new EarsAdapter(this);
             drive.setReadingListener(ears);
             curiosity.setEars(ears);
+            // Stored photos that predate the face model get their embeddings (face plan U6, KTD11),
+            // on the adapter's pooled worker, only while the brain says the detector is not running;
+            // the brain holds its first roam for it, at most tuning.faceHoldMs.
+            curiosity.startMigration();
             loop = new ExploreLoop(tuning, ExploreDrive.CLOCK, drive, drive, drive, eyes, sound, camera, curiosity,
                     ears, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
             loop.setGauges(gauges);

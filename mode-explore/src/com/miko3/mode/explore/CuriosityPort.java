@@ -44,14 +44,31 @@ interface CuriosityPort {
     // ---- people (U5): match, then greet, or ask the name, listen and remember ----
 
     /**
-     * Compare the face in this frame's person box with the stored faces (KTD3).
-     * Never carries names. When no face is found in the box, nothing is sent
-     * for matching: the answer is a faceless NEW person (text-only lines).
+     * Compare the face in this frame's person box with every stored photo, on
+     * the robot (face plan U6, KTD3, KTD11): nothing is sent to Claude. The
+     * answer carries no lines (KTD7): KNOWN for a confident match, NEW for a
+     * close or weak one, and a faceless NEW when no face was found, the crop was
+     * rejected, or the store is not ready (R10, R11, R18). Each carries its band,
+     * candidate, score and face-check handle.
      */
     void match(byte[] frameJpeg, Detection personBox, long timeoutMs);
 
     /** The answer to the last match(), or null while it is running. */
     MatchAnswer matchAnswer();
+
+    /**
+     * True once the start-up face migration has nothing left to do for now
+     * (done, or it cannot run): the brain holds its first roam on it, for at
+     * most tuning.faceHoldMs (face plan U6, KTD11).
+     */
+    boolean migrated();
+
+    /**
+     * Whether the face models may run now: the object detector is closed and
+     * quiet, or parked (the two-thread rule). The brain says so on every change;
+     * the migration's remaining photos run only while it is true (KTD11).
+     */
+    void faceWork(boolean allowed);
 
     /** Listen for a reply once speech is idle: up to maxMs, ending on trailing silence (KTD4). */
     void listen(long maxMs);
@@ -78,10 +95,14 @@ interface CuriosityPort {
     /** Mark the person the last match() found as seen now (R10). Fire and forget. */
     void touch();
 
-    /** A text-only request for ask_line and no_reply_line, when match() failed or was refused (KTD3). */
+    /**
+     * The text-only lines request (KTD7): named_line (with {name} for the robot
+     * to fill; names are never sent), ask_line and no_reply_line. Fetched only
+     * where they are spoken: the degraded ladder and a meeting with no look.
+     */
     void lines(long timeoutMs);
 
-    /** NEW with the two lines, FAILED, or null while it is running. */
+    /** NEW with the lines, FAILED, or null while it is running. */
     MatchAnswer linesAnswer();
 
     /** The name in a heard reply: the robot's own patterns first, then a small text-only Claude request (KTD4). */
@@ -251,6 +272,13 @@ interface CuriosityPort {
 
         public MatchAnswer matchAnswer() {
             return MatchAnswer.FAILED;
+        }
+
+        public boolean migrated() {
+            return true;
+        }
+
+        public void faceWork(boolean allowed) {
         }
 
         public void listen(long maxMs) {
@@ -499,15 +527,18 @@ interface CuriosityPort {
     }
 
     /**
-     * The person request's answer (KTD3). KNOWN carries the stored name (null when
-     * unnamed); the lines are Claude's, with {name} still in namedLine.
+     * The meeting's answer (face plan U6, KTD7). A match answer carries no lines:
+     * KNOWN carries the stored name (null when unnamed), NEW is someone to ask.
+     * A lines answer (lines()) is NEW with Claude's lines, {name} still in
+     * namedLine. The match fields say what the robot's matcher made of the face
+     * (U7 builds the confirmation on them).
      */
     final class MatchAnswer {
         enum Status { KNOWN, NEW, FAILED }
 
         static final MatchAnswer FAILED = new MatchAnswer(Status.FAILED, null, null, null, null, null);
 
-        /** NEW with no face found: asked their name, but never matched or stored (R12). */
+        /** NEW with nothing to store: no face found, a rejected crop, or the store not ready (R10, R11, R18). */
         final boolean faceless;
 
         final Status status;
@@ -528,11 +559,42 @@ interface CuriosityPort {
         final String personId;
         final String notes;
         final List<String> questionsAsked;
+        /**
+         * The on-device match (face plan U6): the band (null when no match ran: no
+         * face, a rejected crop, the store or models unavailable), the best
+         * candidate's store id (null: none), its score (NaN: none) and the face
+         * check's handle for updateCheck (-1: none recorded).
+         */
+        final FaceMatcher.Band band;
+        final String candidateId;
+        final float score;
+        final long checkHandle;
 
         /** This answer with the conversation's fields attached. */
         MatchAnswer withConversation(String persona, String personId, String notes, List<String> questionsAsked) {
             return new MatchAnswer(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, persona,
-                    personId, notes, questionsAsked);
+                    personId, notes, questionsAsked, band, candidateId, score, checkHandle);
+        }
+
+        /** This answer with the on-device match's fields attached. */
+        MatchAnswer withMatch(FaceMatcher.Band band, String candidateId, float score, long checkHandle) {
+            return new MatchAnswer(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, persona,
+                    personId, notes, questionsAsked, band, candidateId, score, checkHandle);
+        }
+
+        /** A confident match (U6): the stored name, and no lines (KTD7). */
+        static MatchAnswer known(String nameOrNull) {
+            return new MatchAnswer(Status.KNOWN, nameOrNull, null, null, null, null);
+        }
+
+        /** A close or weak match (U6): someone to ask, whose face can be stored; no lines. */
+        static MatchAnswer stranger() {
+            return new MatchAnswer(Status.NEW, null, null, null, null, null);
+        }
+
+        /** Someone to talk to with nothing to store (R10, R11, R18); no lines. */
+        static MatchAnswer faceless() {
+            return new MatchAnswer(Status.NEW, null, null, null, null, null, true);
         }
 
         static MatchAnswer known(String nameOrNull, String namedLine, String unnamedLine) {
@@ -555,12 +617,14 @@ interface CuriosityPort {
 
         MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
                     String noReplyLine, boolean faceless) {
-            this(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, null, null, null, null);
+            this(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, null, null, null, null, null,
+                    null, Float.NaN, -1L);
         }
 
         private MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
                             String noReplyLine, boolean faceless, String persona, String personId, String notes,
-                            List<String> questionsAsked) {
+                            List<String> questionsAsked, FaceMatcher.Band band, String candidateId, float score,
+                            long checkHandle) {
             this.faceless = faceless;
             this.status = status;
             this.name = name;
@@ -573,6 +637,10 @@ interface CuriosityPort {
             this.notes = notes;
             this.questionsAsked = questionsAsked == null ? Collections.<String>emptyList()
                     : Collections.unmodifiableList(new ArrayList<String>(questionsAsked));
+            this.band = band;
+            this.candidateId = candidateId;
+            this.score = score;
+            this.checkHandle = checkHandle;
         }
     }
 

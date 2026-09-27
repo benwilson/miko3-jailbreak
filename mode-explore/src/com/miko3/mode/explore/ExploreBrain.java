@@ -646,6 +646,17 @@ final class ExploreBrain {
     private long meetDeadline;
     /** A new person's lines: the ask line was said, the no-reply line may be. */
     private CuriosityPort.MatchAnswer stranger;
+    /**
+     * The match answer the degraded ladder fetched lines for (face plan U6, KTD7):
+     * a match carries no lines, so they come from port.lines() where they are
+     * spoken. Null when the match failed (or there was no look): the lines alone.
+     */
+    private CuriosityPort.MatchAnswer matched;
+    /** The first roam waits for the face migration until this time (KTD11); released once it goes. */
+    private long faceHoldUntil;
+    private boolean faceHoldReleased;
+    /** What the port was last told about face work (null: nothing yet): the two-thread rule (KTD11). */
+    private Boolean faceWorkSent;
     /** REMEMBER asked for the hello (nothing stored: no face, or no name, R19) rather than the store. */
     private boolean helloOnly;
     /** A clock field's "never": far enough below any tick that now - NEVER cannot overflow. */
@@ -947,6 +958,7 @@ final class ExploreBrain {
             return;
         }
         started = true;
+        faceHoldUntil = clock.nowMs() + tuning.faceHoldMs;
         enterEyesOnly(classifier.reason());
     }
 
@@ -1058,6 +1070,17 @@ final class ExploreBrain {
         drainEars(now);
         if (state == State.EYES_ONLY) {
             if (leaseHeld && s != HazardClassifier.Status.UNAVAILABLE) {
+                if (!faceHoldReleased) {
+                    // The first roam waits for the start-up face migration, with the
+                    // detector not yet loaded, for at most faceHoldMs (KTD11).
+                    boolean migrated = port.migrated();
+                    if (!migrated && now < faceHoldUntil) {
+                        return;
+                    }
+                    faceHoldReleased = true;
+                    note(migrated ? "faces ready: the first roam" : "face migration still running after "
+                            + tuning.faceHoldMs + " ms: the first roam, and it goes on at stops");
+                }
                 note("sensors available and lease held");
                 if (curiosityAt == Long.MAX_VALUE) {
                     scheduleCuriosity(now);
@@ -2246,6 +2269,8 @@ final class ExploreBrain {
         if (want != cameraOpen) {
             cameraOpen = want;
             if (want) {
+                // The face models stop before the detector can start (the two-thread rule).
+                faceWork(false);
                 camera.open();
                 // Nothing comes until the reopen gap has passed, then the camera starts.
                 roamLookDeadline = Math.max(now, cameraClosedAt + tuning.reopenGapMs) + tuning.firstLookTimeoutMs;
@@ -2256,6 +2281,16 @@ final class ExploreBrain {
                 cameraClosedAt = now;
                 teachQueue.clear();
             }
+        }
+        // Face work (the migration) runs only while the detector is closed and quiet, or parked (KTD11).
+        faceWork(state != State.STOPPED && (cameraOpen ? parked : camera.quiet()));
+    }
+
+    /** Tells the port whether the face models may run, on every change (KTD11). */
+    private void faceWork(boolean allowed) {
+        if (faceWorkSent == null || faceWorkSent != allowed) {
+            faceWorkSent = allowed;
+            port.faceWork(allowed);
         }
     }
 
@@ -2799,6 +2834,7 @@ final class ExploreBrain {
         state = State.MEET;
         meetingHeld = true;
         stranger = null;
+        matched = null;
         helloOnly = false;
         meetLines = false;
         syncPark();
@@ -2819,36 +2855,92 @@ final class ExploreBrain {
         } else if (!meetLines) {
             gauges.stamp(Gauges.Stage.MATCH_ANSWERED, now);
         }
-        if (chatPossible(a) && (a.status == CuriosityPort.MatchAnswer.Status.KNOWN
-                || a.status == CuriosityPort.MatchAnswer.Status.NEW)) {
+        if (!meetLines) {
+            matchAnswered(now, a);
+        } else if (matched == null) {
+            linesAlone(now, a);
+        } else {
+            linesForMatch(now, matched, a);
+        }
+    }
+
+    /**
+     * The match answered (face plan U6): the conversation when it is possible,
+     * which needs no meeting lines (KTD7); else the degraded ladder, which fetches
+     * the lines it speaks with port.lines().
+     */
+    private void matchAnswered(long now, CuriosityPort.MatchAnswer a) {
+        boolean answered = a.status == CuriosityPort.MatchAnswer.Status.KNOWN
+                || a.status == CuriosityPort.MatchAnswer.Status.NEW;
+        if (answered && chatPossible(a)) {
             // The conversation path (U8, KTD8): known and unknown alike go to CHAT_THINK,
             // where the opener asks a stranger's name; the ladder below is the degraded path.
             enterChat(now, a);
-        } else if (!meetLines && a.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
-            greet(now, a);
-        } else if (a.status == CuriosityPort.MatchAnswer.Status.NEW && usable(a.askLine)) {
+            return;
+        }
+        if (a.status == CuriosityPort.MatchAnswer.Status.KNOWN && (usable(a.namedLine) || usable(a.unnamedLine))) {
+            // An answer that already carries its lines needs no request.
+            greet(now, a, a);
+            return;
+        }
+        if (a.status == CuriosityPort.MatchAnswer.Status.NEW && usable(a.askLine)) {
             askName(now, a);
-        } else if (!meetLines) {
-            // A refusal, a failure, or a stranger with no ask line: one text-only try (KTD3).
-            note("the person request failed; asking for the lines alone");
-            meetLines = true;
-            meetDeadline = now + tuning.meetTimeoutMs;
-            port.lines(tuning.meetTimeoutMs);
+            return;
+        }
+        matched = answered ? a : null;
+        note(answered ? "matched on the robot; asking for the lines to say"
+                : "the person request failed; asking for the lines alone");
+        meetLines = true;
+        meetDeadline = now + tuning.meetTimeoutMs;
+        port.lines(tuning.meetTimeoutMs);
+    }
+
+    /** The lines with no match behind them: a failed match, or a meeting without a look. */
+    private void linesAlone(long now, CuriosityPort.MatchAnswer a) {
+        if (chatPossible(a) && a.status == CuriosityPort.MatchAnswer.Status.NEW) {
+            enterChat(now, a);
+        } else if (a.status == CuriosityPort.MatchAnswer.Status.NEW && usable(a.askLine)) {
+            // No look means no face of this person: an earlier meeting's must never be stored under the name.
+            askName(now, wheellessMeeting ? new CuriosityPort.MatchAnswer(CuriosityPort.MatchAnswer.Status.NEW, null,
+                    null, null, a.askLine, a.noReplyLine, true) : a);
         } else {
             note("no lines for the person either; just the name clip");
             nameClip(now);
         }
     }
 
-    /** Known (R10): the named line with the stored name filled in, or the unnamed line. */
-    private void greet(long now, CuriosityPort.MatchAnswer a) {
+    /** The degraded ladder's lines for a match (KTD7): the greeting with the name filled in, or the ask. */
+    private void linesForMatch(long now, CuriosityPort.MatchAnswer m, CuriosityPort.MatchAnswer lines) {
+        matched = null;
+        if (m.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
+            greet(now, m, lines.status == CuriosityPort.MatchAnswer.Status.FAILED ? null : lines);
+        } else if (lines.status == CuriosityPort.MatchAnswer.Status.NEW && usable(lines.askLine)) {
+            // The match decides what may be stored (faceless: nothing); the lines are what he says.
+            askName(now, new CuriosityPort.MatchAnswer(CuriosityPort.MatchAnswer.Status.NEW, null, null, null,
+                    lines.askLine, lines.noReplyLine, m.faceless));
+        } else {
+            note("no lines for the person; just the name clip");
+            nameClip(now);
+        }
+    }
+
+    /**
+     * Known (R10): the named line with the stored name filled in, or the unnamed
+     * line; with no line at all, a named person still hears the local greeting
+     * through the on-device voice (KTD7).
+     */
+    private void greet(long now, CuriosityPort.MatchAnswer known, CuriosityPort.MatchAnswer lines) {
+        String name = known.name == null || known.name.trim().isEmpty() ? null : known.name.trim();
         String line = null;
-        if (a.name != null && !a.name.trim().isEmpty() && usable(a.namedLine)) {
-            line = ClaudeReplies.fill(a.namedLine, a.name.trim());
+        if (name != null && lines != null && usable(lines.namedLine)) {
+            line = ClaudeReplies.fill(lines.namedLine, name);
             note("someone we've met, with a name");
-        } else if (usable(a.unnamedLine)) {
-            line = a.unnamedLine;
+        } else if (lines != null && usable(lines.unnamedLine)) {
+            line = lines.unnamedLine;
             note("someone we've met, without a name");
+        } else if (name != null) {
+            line = ChatSession.LOCAL_GREETING.replace("{name}", name);
+            note("someone we've met, with a name, and no line: the local greeting");
         }
         if (line == null) {
             note("someone we've met, but no line to greet them with");
@@ -4975,6 +5067,7 @@ final class ExploreBrain {
         state = State.MEET;
         meetingHeld = true;
         stranger = null;
+        matched = null;
         helloOnly = false;
         meetLines = true;
         show(EyeState.THINKING, null);
@@ -5087,6 +5180,10 @@ final class ExploreBrain {
         boolean want = (state.chats() || state == State.MEET && chatLikely()) && !chatLookWanted;
         if (want != parked) {
             parked = want;
+            if (!parked && cameraOpen) {
+                // The detector is about to run again: face work stops first (KTD11).
+                faceWork(false);
+            }
             camera.park(parked);
         }
     }

@@ -154,50 +154,19 @@ final class ClaudeReplies {
     }
 
     /**
-     * The person reply against a gallery of galleryCount references. Returns
-     * the 0-based reference matched, or -1 for "none", "unsure", a number
-     * beyond the gallery, or anything else (all a new person, KTD3), plus the
-     * lines; null when the lines a stranger needs are missing (a failure).
+     * The lines reply (KTD7): the named greeting (kept only with its {name}
+     * placeholder, which the robot fills), the ask line and the no-reply line.
+     * NEW when either the named greeting or the ask line is usable, else FAILED.
      */
-    static Match match(Map<String, Object> json, int galleryCount) {
-        String ask = line(json.get("ask_line"));
-        String noReply = line(json.get("no_reply_line"));
+    static CuriosityPort.MatchAnswer lines(Map<String, Object> json) {
         String named = line(json.get("named_line"));
-        String unnamed = line(json.get("unnamed_line"));
-        int ref = -1;
-        Object m = json.get("match");
-        Long n = integer(m);
-        if (n == null && m instanceof String) {
-            String s = ((String) m).trim();
-            if (s.toLowerCase(java.util.Locale.US).startsWith("reference ")) {
-                s = s.substring("reference ".length()).trim();
-            }
-            try {
-                n = Long.parseLong(s);
-            } catch (NumberFormatException e) {
-                n = null;
-            }
-        }
-        if (n != null && n >= 1 && n <= galleryCount) {
-            ref = (int) (n - 1);
-        }
         if (named != null && !named.contains("{name}")) {
             named = null;
         }
-        if (ref >= 0 && (named != null || unnamed != null)) {
-            return new Match(ref, named, unnamed, ask, noReply);
-        }
-        if (ask == null) {
-            return null;
-        }
-        return new Match(-1, named, unnamed, ask, noReply);
-    }
-
-    /** The lines-only reply (KTD3's refusal path): a new person's two lines, or FAILED. */
-    static CuriosityPort.MatchAnswer lines(Map<String, Object> json) {
         String ask = line(json.get("ask_line"));
-        return ask == null ? CuriosityPort.MatchAnswer.FAILED
-                : CuriosityPort.MatchAnswer.stranger(ask, line(json.get("no_reply_line")));
+        return ask == null && named == null ? CuriosityPort.MatchAnswer.FAILED
+                : new CuriosityPort.MatchAnswer(CuriosityPort.MatchAnswer.Status.NEW, null, named, null, ask,
+                line(json.get("no_reply_line")));
     }
 
     /** The name reply (KTD4's fallback): one or two plain words, else no name. */
@@ -236,27 +205,9 @@ final class ClaudeReplies {
                 Boolean.TRUE.equals(json.get("ends_conversation")), Boolean.TRUE.equals(json.get("deflected")), notes);
     }
 
-    /** Claude's named line with the stored name put in (the robot's side of KTD3). */
+    /** Claude's named line with the stored name put in (the robot's side of KTD7: names are never sent). */
     static String fill(String namedLine, String name) {
         return namedLine.replace("{name}", name);
-    }
-
-    /** A person reply read against the gallery. */
-    static final class Match {
-        /** 0-based reference, or -1 for a new person. */
-        final int reference;
-        final String namedLine;
-        final String unnamedLine;
-        final String askLine;
-        final String noReplyLine;
-
-        Match(int reference, String namedLine, String unnamedLine, String askLine, String noReplyLine) {
-            this.reference = reference;
-            this.namedLine = namedLine;
-            this.unnamedLine = unnamedLine;
-            this.askLine = askLine;
-            this.noReplyLine = noReplyLine;
-        }
     }
 
     private static CuriosityPort.Kind kind(Object v) {

@@ -83,6 +83,12 @@ final class ChatSession {
     static final String CANNED_NO_QUESTION = "Fair enough.";
     /** The forget confirmation, with the stored name (R18): spoken through the on-device voice. */
     static final String CONFIRM_FORGET = "Forget you, {name}?";
+    /**
+     * A known person's greeting when no line came (face plan U6, KTD7): spoken
+     * through the on-device voice like CONFIRM_FORGET, before the sign-off when
+     * turn 1 fails, and by the brain's degraded ladder when lines() fails.
+     */
+    static final String LOCAL_GREETING = "Hi, {name}!";
     static final String FORGOTTEN = "Done. I've forgotten you.";
     static final String KEPT = "Okay, keeping you.";
     static final String FORGET_FAILED = "That didn't work; I still remember you.";
@@ -122,6 +128,9 @@ final class ChatSession {
     private long turnDeadline;
     private boolean reRequested;
     private boolean opener = true;
+    /** Turn 1 failed for a known person: the local greeting is playing, then the sign-off (U6, KTD7). */
+    private boolean greetedLocally;
+    private boolean signOffAfterLine;
     private int turns;
     private int repeats;
 
@@ -328,9 +337,25 @@ final class ChatSession {
                 break;
             default:
                 host.note("the turn failed: the local sign-off ends the conversation");
-                signOff(now);
+                turnFailed(now);
                 break;
         }
+    }
+
+    /**
+     * A failed turn ends the conversation with the sign-off (KTD9). When it is
+     * turn 1 for a known person, nothing has greeted them yet: the local greeting
+     * plays first (face plan U6, KTD7).
+     */
+    private void turnFailed(long now) {
+        if (opener && name != null && !greetedLocally) {
+            greetedLocally = true;
+            host.note("turn 1 failed for someone known: the local greeting, then the sign-off");
+            signOffAfterLine = true;
+            speak(now, LOCAL_GREETING.replace("{name}", name), false);
+            return;
+        }
+        signOff(now);
     }
 
     /** One retry on a timed-out or unreachable turn (KTD9), then the local sign-off. */
@@ -343,7 +368,7 @@ final class ChatSession {
             return;
         }
         host.note("turn attempt " + attempt + " failed (" + why + "): the local sign-off ends the conversation");
-        signOff(now);
+        turnFailed(now);
     }
 
     /** The robot's side of KTD9: the name, the sentence cap, the repeat check, the notes delta, then the line. */
@@ -505,6 +530,11 @@ final class ChatSession {
         }
         if (endAfterLine) {
             enterNotes(now);
+            return;
+        }
+        if (signOffAfterLine) {
+            signOffAfterLine = false;
+            signOff(now);
             return;
         }
         if (endOnCharger && !confirmingForget) {

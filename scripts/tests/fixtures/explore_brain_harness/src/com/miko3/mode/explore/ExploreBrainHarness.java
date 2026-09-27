@@ -676,6 +676,11 @@ public final class ExploreBrainHarness {
         final List<Float> chatListenAngles = new ArrayList<Float>();
         /** The detector is parked (meeting plan U8, KTD7): no looks come while it is. */
         boolean parked;
+        /** The start-up face migration (face plan U6, KTD11) settles at this time (0: at once). */
+        long migratedAt;
+        /** Whether the brain last allowed face work (migration), and every change it made. */
+        boolean faceWorkAllowed;
+        final List<Event> faceWorkLog = new ArrayList<Event>();
         /** The brain's trace, when a scenario asked for it (traced). */
         List<String> traceNotes;
         int parks;
@@ -967,6 +972,9 @@ public final class ExploreBrainHarness {
 
         @Override
         public void open() {
+            if (faceWorkAllowed) {
+                violations.add(now + ":camera opened with face work allowed in " + brain.state());
+            }
             cameraOpen = true;
             openedAt = now;
             looksFrom = Math.max(now, closedAt + reopenGapMs) + 500;
@@ -995,6 +1003,9 @@ public final class ExploreBrainHarness {
         public void park(boolean p) {
             if (p == parked) {
                 violations.add(now + ":park(" + p + ") twice in " + brain.state());
+            }
+            if (!p && cameraOpen && faceWorkAllowed) {
+                violations.add(now + ":detector unparked with face work allowed in " + brain.state());
             }
             parked = p;
             if (p) {
@@ -1487,6 +1498,23 @@ public final class ExploreBrainHarness {
         }
 
         @Override
+        public boolean migrated() {
+            return now >= migratedAt;
+        }
+
+        @Override
+        public void faceWork(boolean allowed) {
+            if (allowed == faceWorkAllowed && !faceWorkLog.isEmpty()) {
+                violations.add(now + ":faceWork(" + allowed + ") twice in " + brain.state());
+            }
+            if (allowed && (cameraOpen ? !parked : !quiet())) {
+                violations.add(now + ":face work allowed while the detector may run in " + brain.state());
+            }
+            faceWorkAllowed = allowed;
+            faceWorkLog.add(new Event(now, allowed ? "face work on" : "face work off"));
+        }
+
+        @Override
         public CuriosityPort.Kept keptAnswer() {
             if (pendingKept == null || now < pendingKeptAt) {
                 return null;
@@ -1700,6 +1728,338 @@ public final class ExploreBrainHarness {
         }
     };
 
+    // ---- on-device matching in Explore (face plan U6; KTD7, KTD11, R11, R18) ----
+
+    /** The degraded ladder's lines (KTD7): the named greeting with {name}, and the stranger's two lines. */
+    private static final CuriosityPort.MatchAnswer LINES = new CuriosityPort.MatchAnswer(
+            CuriosityPort.MatchAnswer.Status.NEW, null, "Great to see you, {name}!", null, "Hello! What's your name?",
+            "No worries, shy friend!");
+
+    private static String localGreeting(String name) {
+        return "say " + ChatSession.LOCAL_GREETING.replace("{name}", name);
+    }
+
+    private static void faceMatchScenarios() {
+        scenario("face_confident_with_a_conversation_enters_chat_known_without_a_lines_request", n -> {
+            Rig rig = chatRig(personAt(bearingOf(-90f), 25), true);
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah")
+                    .withMatch(FaceMatcher.Band.CONFIDENT, SARAH_ID, 0.71f, 11L)
+                    .withConversation(r.people.persona, SARAH_ID, r.people.notes.get(SARAH_ID),
+                            r.people.asked.get(SARAH_ID));
+            rig.started();
+            long open = openChat(rig);
+            long say = runUntilEvent(rig, "say Line 1.", open, open + 20000);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, open > 0 && say > 0 && first != null && "Sarah".equals(first.request.name)
+                            && SARAH_NOTES.equals(first.request.notes) && rig.count("lines") == 0
+                            && rig.touches == 1 && rig.violations.isEmpty(),
+                    "open@" + open + " say@" + say + " first=" + first + " " + rig.tail());
+        });
+        scenario("face_rejected_crop_takes_the_faceless_path_and_keeps_nothing", n -> {
+            // Degraded ladder: the lines come from lines(), the name is welcomed, never remembered.
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless().withMatch(null, null, Float.NaN, 5L);
+            rig.people.lines = LINES;
+            rig.people.listen = ListenScript.always(hearWords("my name is Sam"));
+            rig.people.welcomed = CuriosityPort.Answer.line("So nice to meet you, Sam!");
+            rig.started();
+            rig.runUntil(18000);
+            int match = rig.first("match NEW", 0);
+            int lines = rig.first("lines", match);
+            int ask = rig.first("say Hello! What's your name?", lines);
+            int welcome = rig.first("welcome Sam", ask);
+            // The conversation path: a name given on turn 1 keeps nothing either.
+            Rig chat = chatRig(personAt(bearingOf(-90f), 25), false);
+            chat.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless().withMatch(null, null, Float.NaN, 6L)
+                    .withConversation(r.people.persona, null, null, null);
+            chat.turns = turnsOf(CuriosityPort.Turn.line("Hi Sam!", null, "Sam", false, false, null));
+            chat.people.listen = ListenScript.turns(hearWords("bye"));
+            chat.started();
+            long open = openChat(chat);
+            long over = chatOver(chat, open);
+            check(n, match >= 0 && lines > match && rig.timeOf(lines) == rig.timeOf(match) && ask > lines
+                            && welcome > ask && rig.stored.isEmpty() && rig.countPrefix("remember", 0, 18001) == 0
+                            && rig.violations.isEmpty()
+                            && open > 0 && over > 0 && chat.kept.isEmpty() && chat.count("keep") == 0
+                            && chat.violations.isEmpty(),
+                    "lines=" + lines + " ask=" + ask + " welcome=" + welcome + " " + rig.tail() + " chat: "
+                            + chat.tail());
+        });
+        scenario("face_not_ready_is_faceless_and_a_later_name_is_not_stored", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless()
+                    .withMatch(FaceMatcher.Band.NOT_READY, null, Float.NaN, 7L);
+            rig.people.lines = LINES;
+            rig.people.listen = ListenScript.always(hearWords("i'm Priya"));
+            rig.started();
+            rig.runUntil(18000);
+            Rig chat = chatRig(personAt(bearingOf(-90f), 25), false);
+            chat.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless()
+                    .withMatch(FaceMatcher.Band.NOT_READY, null, Float.NaN, 8L)
+                    .withConversation(r.people.persona, null, null, null);
+            chat.people.listen = ListenScript.turns(hearWords("I'm Priya"), hearWords("bye"));
+            chat.turns = turnsOf(turnLine(1), CuriosityPort.Turn.line("Nice, Priya!", null, "Priya", false, false,
+                    null));
+            chat.started();
+            long open = openChat(chat);
+            long over = chatOver(chat, open);
+            check(n, rig.count("welcome Priya") == 1 && rig.stored.isEmpty() && rig.violations.isEmpty()
+                            && open > 0 && over > 0 && chat.turnAsks.size() >= 2 && chat.kept.isEmpty()
+                            && chat.violations.isEmpty(),
+                    rig.tail() + " chat: " + chat.tail());
+        });
+        scenario("face_close_or_weak_band_meets_a_stranger_who_is_stored_under_their_name", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.stranger()
+                    .withMatch(FaceMatcher.Band.WEAK, "p-other", 0.21f, 9L);
+            rig.people.lines = LINES;
+            rig.people.listen = ListenScript.always(hearWords("my name is Priya"));
+            rig.started();
+            rig.runUntil(18000);
+            int lines = rig.first("lines", 0);
+            int ask = rig.first("say Hello! What's your name?", lines);
+            check(n, lines >= 0 && ask > lines && rig.stored.equals(java.util.Arrays.asList("Priya"))
+                            && rig.touches == 0 && rig.violations.isEmpty(),
+                    rig.tail());
+        });
+        scenario("face_degraded_known_greeting_comes_from_the_lines_request", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah")
+                    .withMatch(FaceMatcher.Band.CONFIDENT, SARAH_ID, 0.7f, 2L);
+            rig.people.lines = LINES;
+            rig.started();
+            rig.runUntil(14000);
+            int match = rig.first("match KNOWN", 0);
+            int lines = rig.first("lines", match);
+            int say = rig.first("say ", lines);
+            check(n, match >= 0 && lines > match && rig.what(say).equals("say Great to see you, Sarah!")
+                            && rig.touches == 1 && rig.count("listen") == 0 && rig.stored.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "say=" + rig.what(say) + " " + rig.tail());
+        });
+        scenario("face_degraded_known_with_failing_lines_plays_the_local_greeting", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah")
+                    .withMatch(FaceMatcher.Band.CONFIDENT, SARAH_ID, 0.7f, 2L);
+            rig.people.lines = CuriosityPort.MatchAnswer.FAILED;
+            rig.started();
+            rig.runUntil(14000);
+            int failed = rig.first("lines FAILED", 0);
+            int say = rig.first("say ", failed);
+            check(n, failed >= 0 && rig.what(say).equals(localGreeting("Sarah"))
+                            && rig.timeOf(say) >= rig.timeOf(failed) && rig.count("name person") == 0
+                            && rig.touches == 1 && rig.count("listen") == 0 && rig.violations.isEmpty(),
+                    "say=" + rig.what(say) + " " + rig.tail());
+        });
+        scenario("face_chat_known_turn_one_failure_plays_the_local_greeting_before_the_sign_off", n -> {
+            Rig rig = sarahRig(true);
+            rig.turns = turnsOf(CuriosityPort.Turn.failed());
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            int greet = rig.firstAfter(localGreeting("Sarah"), open);
+            int signOff = rig.firstAfter("react sign-off", open);
+            // A stranger's turn-1 failure has no name to greet: the sign-off alone, as before.
+            Rig stranger = sarahRig(false);
+            stranger.turns = turnsOf(CuriosityPort.Turn.failed());
+            long open2 = openChat(stranger);
+            long over2 = chatOver(stranger, open2);
+            check(n, open > 0 && over > 0 && greet >= 0 && signOff > greet && rig.count(localGreeting("Sarah")) == 1
+                            && rig.violations.isEmpty()
+                            && open2 > 0 && over2 > 0 && stranger.countPrefix("say", open2, over2 + 1) == 0
+                            && stranger.count("react sign-off") == 1 && stranger.violations.isEmpty(),
+                    "greet=" + greet + " signOff=" + signOff + " " + rig.tail() + " stranger: " + stranger.tail());
+        });
+        scenario("face_chat_known_turn_one_unreachable_twice_also_greets_before_the_sign_off", n -> {
+            Rig rig = sarahRig(true);
+            rig.turns = turnsOf(CuriosityPort.Turn.unreachable(), CuriosityPort.Turn.unreachable());
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            int greet = rig.firstAfter(localGreeting("Sarah"), open);
+            int signOff = rig.firstAfter("react sign-off", open);
+            check(n, open > 0 && over > 0 && rig.turnAsks.size() == 2 && greet >= 0 && signOff > greet
+                            && rig.violations.isEmpty(),
+                    "greet=" + greet + " signOff=" + signOff + " " + rig.tail());
+        });
+        scenario("face_first_roam_waits_for_migration_or_30_s", n -> {
+            Rig waits = meetRig();
+            waits.migratedAt = 5000;
+            waits.started();
+            waits.runUntil(8000);
+            long pause = entered(waits, ExploreBrain.State.PAUSE, 0);
+            Rig capped = meetRig();
+            capped.migratedAt = Long.MAX_VALUE;
+            capped.started();
+            capped.runUntil(33000);
+            long pause2 = entered(capped, ExploreBrain.State.PAUSE, 0);
+            Rig done = meetRig();
+            done.started();
+            done.runUntil(1000);
+            long pause3 = entered(done, ExploreBrain.State.PAUSE, 0);
+            check(n, pause >= 5000 && pause <= 5200 && waits.motions(0, 5000) == 0
+                            && waits.countPrefix("camera open", 0, 5000) == 0
+                            && pause2 >= 30000 && pause2 <= 30200 && capped.motions(0, 30000) == 0
+                            && pause3 >= 0 && pause3 <= 400
+                            && waits.violations.isEmpty() && capped.violations.isEmpty(),
+                    "pause@" + pause + " capped@" + pause2 + " done@" + pause3);
+        });
+        scenario("face_work_is_allowed_only_while_the_detector_is_quiet_or_parked", n -> {
+            // The rig flags any allow while the detector could run, and any camera open or
+            // unpark while allowed; the brain must also actually allow it at a stop.
+            Rig roam = meetRig();
+            roam.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah")
+                    .withMatch(FaceMatcher.Band.CONFIDENT, SARAH_ID, 0.7f, 2L);
+            roam.people.lines = LINES;
+            roam.started();
+            roam.runUntil(20000);
+            long firstOn = -1;
+            long offBeforeOpen = -1;
+            long onInMeet = -1;
+            for (Event e : roam.faceWorkLog) {
+                if (firstOn < 0 && e.what.equals("face work on")) {
+                    firstOn = e.t;
+                }
+                if (offBeforeOpen < 0 && e.what.equals("face work off")) {
+                    offBeforeOpen = e.t;
+                }
+                if (e.what.equals("face work on") && e.t >= 5000) {
+                    onInMeet = onInMeet < 0 ? e.t : onInMeet;
+                }
+            }
+            Rig chat = sarahRig(true);
+            long open = openChat(chat);
+            long over = chatOver(chat, open);
+            boolean onInChat = false;
+            for (Event e : chat.faceWorkLog) {
+                onInChat |= e.what.equals("face work on") && e.t >= open && e.t <= over;
+            }
+            check(n, firstOn >= 0 && offBeforeOpen >= 0 && offBeforeOpen <= roam.timeOf(roam.first("camera open", 0))
+                            && onInMeet >= 0 && roam.violations.isEmpty()
+                            && open > 0 && onInChat && chat.violations.isEmpty(),
+                    "on@" + firstOn + " off@" + offBeforeOpen + " meet@" + onInMeet + " log=" + roam.faceWorkLog
+                            + " " + roam.tail() + " chat: " + chat.faceWorkLog + " " + chat.tail());
+        });
+    }
+
+    // ---- the start-up migration's decisions (face plan U6, KTD11) ----
+
+    /** A fake people store: its photos, their JPEGs by "id/slot", and every call made on it. */
+    static final class FakeFaceStore implements FaceMigration.Store {
+        final List<FaceMigration.Photo> photos = new ArrayList<FaceMigration.Photo>();
+        final java.util.Map<String, byte[]> jpegs = new java.util.HashMap<String, byte[]>();
+        final List<String> calls = new ArrayList<String>();
+        boolean tooOld;
+
+        FakeFaceStore photo(String id, int slot, boolean pending, String content) {
+            photos.add(new FaceMigration.Photo(id, slot, 1000L + slot, pending));
+            jpegs.put(id + "/" + slot, content.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            return this;
+        }
+
+        @Override
+        public List<FaceMigration.Photo> gallery() throws java.io.IOException {
+            calls.add("gallery");
+            if (tooOld) {
+                throw new java.io.IOException("launcher too old: install the current launcher");
+            }
+            return new ArrayList<FaceMigration.Photo>(photos);
+        }
+
+        @Override
+        public byte[] photo(String id, int slot) {
+            calls.add("photo " + id + "/" + slot);
+            return jpegs.get(id + "/" + slot);
+        }
+
+        @Override
+        public boolean setEmbedding(String id, int slot, long addedAtMillis, float[] embedding) {
+            calls.add("embed " + id + "/" + slot + " " + embedding.length);
+            return settle(id, slot);
+        }
+
+        @Override
+        public boolean markUnusable(String id, int slot, long addedAtMillis) {
+            calls.add("unusable " + id + "/" + slot);
+            return settle(id, slot);
+        }
+
+        private boolean settle(String id, int slot) {
+            for (int i = 0; i < photos.size(); i++) {
+                FaceMigration.Photo p = photos.get(i);
+                if (p.id.equals(id) && p.slot == slot) {
+                    photos.set(i, new FaceMigration.Photo(id, slot, p.addedAtMillis, false));
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /** "face" embeds, "blank" has no face, anything else fails the models (try again later). */
+    private static final FaceMigration.Faces FAKE_FACES = jpeg -> {
+        String s = new String(jpeg, java.nio.charset.StandardCharsets.US_ASCII);
+        return s.equals("face") ? new float[128] : s.equals("blank") ? FaceMigration.NO_FACE : null;
+    };
+
+    private static void faceMigrationScenarios() {
+        scenario("face_migration_marks_a_faceless_photo_unusable_and_becomes_ready", n -> {
+            FakeFaceStore store = new FakeFaceStore().photo("a", 0, true, "face").photo("b", 0, true, "blank")
+                    .photo("c", 0, false, "face");
+            FaceMigration m = new FaceMigration(store, FAKE_FACES, () -> true);
+            boolean readyBefore = FaceMigration.ready(store.photos) || m.ready() || m.settled();
+            FaceMigration.Outcome o = m.pass();
+            check(n, !readyBefore && o == FaceMigration.Outcome.DONE && m.settled() && m.ready()
+                            && store.calls.equals(java.util.Arrays.asList("gallery", "photo a/0", "embed a/0 128",
+                            "photo b/0", "unusable b/0"))
+                            && FaceMigration.ready(store.photos) && m.embedded() == 1 && m.unusable() == 1,
+                    "outcome=" + o + " calls=" + store.calls);
+        });
+        scenario("face_migration_runs_only_while_the_gate_is_open_and_resumes", n -> {
+            FakeFaceStore store = new FakeFaceStore().photo("a", 0, true, "face").photo("a", 1, true, "face");
+            final boolean[] open = {true};
+            final int[] asks = {0};
+            FaceMigration m = new FaceMigration(store, FAKE_FACES, () -> {
+                asks[0]++;
+                return open[0] && asks[0] <= 1;
+            });
+            FaceMigration.Outcome first = m.pass();
+            List<String> afterFirst = new ArrayList<String>(store.calls);
+            boolean settledFirst = m.settled();
+            FaceMigration shut = new FaceMigration(new FakeFaceStore().photo("z", 0, true, "face"), FAKE_FACES,
+                    () -> false);
+            FaceMigration.Outcome closed = shut.pass();
+            FaceMigration again = new FaceMigration(store, FAKE_FACES, () -> true);
+            FaceMigration.Outcome second = again.pass();
+            check(n, first == FaceMigration.Outcome.INTERRUPTED && !settledFirst && !m.ready()
+                            && afterFirst.equals(java.util.Arrays.asList("gallery", "photo a/0", "embed a/0 128"))
+                            && closed == FaceMigration.Outcome.INTERRUPTED && !shut.settled()
+                            && second == FaceMigration.Outcome.DONE && again.ready()
+                            && store.calls.contains("embed a/1 128")
+                            && java.util.Collections.frequency(store.calls, "photo a/0") == 1,
+                    "first=" + first + " closed=" + closed + " second=" + second + " calls=" + store.calls);
+        });
+        scenario("face_migration_leaves_a_photo_waiting_when_the_models_fail", n -> {
+            FakeFaceStore store = new FakeFaceStore().photo("a", 0, true, "broken");
+            FaceMigration m = new FaceMigration(store, FAKE_FACES, () -> true);
+            FaceMigration.Outcome o = m.pass();
+            check(n, o == FaceMigration.Outcome.DONE && m.settled() && !m.ready() && m.waiting() == 1
+                            && !store.calls.contains("unusable a/0") && !FaceMigration.ready(store.photos),
+                    "outcome=" + o + " calls=" + store.calls);
+        });
+        scenario("face_migration_settles_without_readiness_when_the_launcher_is_too_old", n -> {
+            FakeFaceStore store = new FakeFaceStore().photo("a", 0, true, "face");
+            store.tooOld = true;
+            FaceMigration m = new FaceMigration(store, FAKE_FACES, () -> true);
+            FaceMigration.Outcome o = m.pass();
+            FakeFaceStore empty = new FakeFaceStore().photo("a", 0, false, "face");
+            FaceMigration none = new FaceMigration(empty, FAKE_FACES, () -> true);
+            FaceMigration.Outcome o2 = none.pass();
+            check(n, o == FaceMigration.Outcome.FAILED && m.settled() && !m.ready()
+                            && o2 == FaceMigration.Outcome.DONE && none.ready()
+                            && empty.calls.equals(java.util.Arrays.asList("gallery")),
+                    "outcome=" + o + " none=" + o2 + " calls=" + empty.calls);
+        });
+    }
+
     // ---- harness plumbing ----
 
     private static void check(String name, boolean ok, String detail) {
@@ -1752,6 +2112,8 @@ public final class ExploreBrainHarness {
         earsAndChatScenarios();
         cueScenarios();
         chatScenarios();
+        faceMatchScenarios();
+        faceMigrationScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -3428,24 +3790,6 @@ public final class ExploreBrainHarness {
                             && rig.stored.equals(java.util.Arrays.asList("Priya")) && rig.violations.isEmpty(),
                     "find=" + find + " remember=" + remember + " " + rig.tail());
         });
-        scenario("meet_unsure_match_runs_the_new_person_flow", n -> {
-            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
-            json.put("match", "unsure");
-            json.put("named_line", "Hi {name}!");
-            json.put("unnamed_line", "Hi again!");
-            json.put("ask_line", "Hello! What's your name?");
-            json.put("no_reply_line", "No worries, shy friend!");
-            ClaudeReplies.Match m = ClaudeReplies.match(json, 3);
-            Rig rig = meetRig();
-            rig.people.match = (r, k) -> m.reference < 0
-                    ? CuriosityPort.MatchAnswer.stranger(m.askLine, m.noReplyLine)
-                    : CuriosityPort.MatchAnswer.known("X", m.namedLine, m.unnamedLine);
-            rig.started();
-            rig.runUntil(12000);
-            check(n, m.reference == -1 && rig.count("say Hello! What's your name?") == 1
-                            && rig.count("listen") == 1 && rig.touches == 0 && rig.violations.isEmpty(),
-                    "ref=" + m.reference + " " + rig.tail());
-        });
         scenario("meet_refused_match_asks_text_only_lines_then_the_name", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.FAILED;
@@ -3486,25 +3830,30 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     rig.tail());
         });
-        scenario("meet_match_reference_beyond_the_gallery_is_a_new_person", n -> {
+        // Face plan U6 (KTD7): the lines request carries the named greeting with {name} for the robot to fill.
+        scenario("replies_lines_carry_the_named_greeting_with_its_placeholder", n -> {
             java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
-            json.put("match", "4");
-            json.put("named_line", "Hi {name}!");
-            json.put("unnamed_line", "Hi again!");
+            json.put("named_line", "Great to see you, {name}!");
             json.put("ask_line", "Hello! What's your name?");
             json.put("no_reply_line", "No worries!");
-            ClaudeReplies.Match beyond = ClaudeReplies.match(json, 3);
-            json.put("match", 2L);
-            ClaudeReplies.Match second = ClaudeReplies.match(json, 3);
-            json.put("match", "0");
-            ClaudeReplies.Match zero = ClaudeReplies.match(json, 3);
-            json.put("match", "none");
+            CuriosityPort.MatchAnswer all = ClaudeReplies.lines(json);
+            json.put("named_line", "Great to see you, Sarah!");
+            CuriosityPort.MatchAnswer noPlaceholder = ClaudeReplies.lines(json);
             json.remove("ask_line");
-            ClaudeReplies.Match noAsk = ClaudeReplies.match(json, 3);
-            check(n, beyond.reference == -1 && beyond.askLine != null && second.reference == 1
-                            && zero.reference == -1 && noAsk == null,
-                    "beyond=" + beyond.reference + " second=" + second.reference + " zero=" + zero.reference
-                            + " noAsk=" + noAsk);
+            CuriosityPort.MatchAnswer noAsk = ClaudeReplies.lines(json);
+            json.put("named_line", "Hi {name}!");
+            CuriosityPort.MatchAnswer namedOnly = ClaudeReplies.lines(json);
+            json.remove("named_line");
+            CuriosityPort.MatchAnswer neither = ClaudeReplies.lines(json);
+            check(n, all.status == CuriosityPort.MatchAnswer.Status.NEW
+                            && "Great to see you, {name}!".equals(all.namedLine)
+                            && "Hello! What's your name?".equals(all.askLine) && "No worries!".equals(all.noReplyLine)
+                            && noPlaceholder.namedLine == null && noPlaceholder.askLine != null
+                            && noAsk.status == CuriosityPort.MatchAnswer.Status.FAILED
+                            && namedOnly.status == CuriosityPort.MatchAnswer.Status.NEW && namedOnly.askLine == null
+                            && neither.status == CuriosityPort.MatchAnswer.Status.FAILED,
+                    "all=" + all.namedLine + " noPlaceholder=" + noPlaceholder.namedLine + " noAsk=" + noAsk.status
+                            + " namedOnly=" + namedOnly.status + " neither=" + neither.status);
         });
         scenario("meet_listen_failure_resumes_within_the_budget", n -> {
             Rig rig = meetRig();

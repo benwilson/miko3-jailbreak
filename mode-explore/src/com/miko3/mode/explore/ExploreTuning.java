@@ -172,6 +172,11 @@ final class ExploreTuning {
      * and waits listenMarginMs more for the launcher's answer before giving up.
      */
     final long meetTimeoutMs;
+    /**
+     * The first roam waits at most this long for the start-up face migration
+     * (face plan U6, KTD11), with the object detector not yet loaded.
+     */
+    final long faceHoldMs;
     final long listenMs;
     final long listenMarginMs;
     /**
@@ -590,6 +595,7 @@ final class ExploreTuning {
         heldLineFreshMs = Math.max(0, b.heldLineFreshMs);
         recentPicksMax = Math.max(0, b.recentPicksMax);
         meetTimeoutMs = b.meetTimeoutMs;
+        faceHoldMs = Math.max(0, b.faceHoldMs);
         listenMs = b.listenMs;
         listenMarginMs = b.listenMarginMs;
         cueHoldMs = Math.max(0, b.cueHoldMs);
@@ -848,6 +854,8 @@ final class ExploreTuning {
         private int recentPicksMax = 8;
         // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
         private long meetTimeoutMs = 12000;
+        // KTD11: the migration usually takes a few seconds; 30 s caps the wait for the first roam.
+        private long faceHoldMs = 30000;
         // KTD4's 6 s cap, and room for the launcher to wait out the speech queue and decode.
         private long listenMs = 6000;
         private long listenMarginMs = 6000;
@@ -1142,6 +1150,7 @@ final class ExploreTuning {
             this.listenMarginMs = listenMarginMs;
             return this;
         }
+        Builder faceHoldMs(long v) { faceHoldMs = v; return this; }
         Builder pickMatchIou(float v) { pickMatchIou = v; return this; }
         Builder reopenGapMs(long v) { reopenGapMs = v; return this; }
         Builder calibration(Calibration v) { calibration = v; return this; }
