@@ -688,7 +688,8 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertIn("RobotSettingsClient.fetchConversation(app).persona", conv)
         self.assertIn("RobotPeopleClient.notesOf(app, personId)", conv)
         self.assertIn("a.withConversation(persona, personId, notesJson, asked)", conv)
-        self.assertEqual(a.count("forConversation("), 5)
+        # Face plan U7: an added photo answers the joined person with their notes, too.
+        self.assertEqual(a.count("forConversation("), 6)
         port = code_only(src("CuriosityPort.java"))
         for sig in ("void chatListen(long maxMs, float newcomerAngleDeg);", "void keep(String name, long timeoutMs);",
                     "Kept keptAnswer();", "final String avoidQuestion;"):
@@ -710,7 +711,29 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertIn("if (busy || !wanted || parked)", cam)
         brain = code_only(src("ExploreBrain.java"))
         self.assertIn("camera.park(parked)", brain)
-        self.assertIn("state.chats() || state == State.MEET && chatLikely()", brain)
+        # Face plan U7: the close match's question keeps it open and parked on the conversation path too.
+        self.assertIn("state.chats() || (state == State.MEET || state.confirms()) && chatLikely()", brain)
+
+    def test_the_resolver_and_the_added_photo_run_on_the_robot(self):
+        """Face plan U7 (KTD6, KTD10, KTD12): names resolve by id against the store, never through Claude."""
+        a = code_only(src("ClaudeCuriosity.java"))
+        for method in ("nameIn", "resolveName", "resolveLastName", "resolved", "cancelResolve", "addPhoto",
+                       "photoAdded", "cancelAddPhoto", "checkOutcome", "meetingOver"):
+            self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
+        resolve = re.search(r"private Resolved resolveNow\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("RobotPeopleClient.idsNamed(app, name)", resolve)
+        self.assertIn("NameResolver.resolve(name, probe, ids, entries, close)", resolve)
+        self.assertNotIn("claude.", resolve)
+        last = re.search(r"private Resolved resolveLastNow\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("NameResolver.afterLastName(first, lastName, stored)", last)
+        self.assertNotIn("claude.", last)
+        photo = re.search(r"private MatchAnswer addPhotoNow\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("RobotPeopleClient.addPhoto(app, id, face, FaceMatcher.MODEL_ID, probe)", photo)
+        self.assertNotIn("addPerson", photo)
+        self.assertIn("NameExtractor.extract(transcript)", a)
+        over = re.search(r"public void meetingOver\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("closeCheck(meeting)", over)
+        self.assertIn("stranger.withConfirm(confirmName(r.bestId))", a)
 
     def test_the_state_page_counts_repeats_and_the_clips_are_reactions(self):
         self.assertIn('"repeats"', src("ExploreState.java"))

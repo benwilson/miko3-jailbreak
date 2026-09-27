@@ -211,8 +211,8 @@ interface CuriosityPort {
 
     /**
      * Store the face the last match() cut out under a new record with this
-     * name (U8, KTD10): a name given mid-conversation, or a mismatch on a known
-     * conversation. Never asks Claude for a line and never writes a debug dump.
+     * name (U8, KTD10): someone new the resolver found for a name given (face
+     * plan U7, KTD6). Never asks Claude for a line and never writes a debug dump.
      */
     void keep(String name, long timeoutMs);
 
@@ -221,6 +221,59 @@ interface CuriosityPort {
 
     /** Abandon the running keep(), if any. */
     void cancelKeep();
+
+    // ---- confirming a close match and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12) ----
+
+    /**
+     * The name in a reply by the robot's own patterns (NameExtractor), title-cased,
+     * or null. Synchronous and local: no request, nothing logged. AnswerParser
+     * reads the confirmation and last-name replies with it.
+     */
+    String nameIn(String transcript);
+
+    /**
+     * Who a spoken name belongs to (KTD10), on the robot: the store's ids for the
+     * name, scored against this meeting's face. JOIN (the id and its stored name),
+     * ASK_LAST_NAME (the port keeps the name as the pending first name) or NEW
+     * (the name to store). Stores nothing itself; names never reach Claude.
+     */
+    void resolveName(String name, long timeoutMs);
+
+    /**
+     * After "And your last name?": JOIN the id whose full stored name equals the
+     * pending first name plus this one, else NEW under the full name.
+     */
+    void resolveLastName(String lastName, long timeoutMs);
+
+    /** The answer to the last resolveName() or resolveLastName(), or null while it runs. */
+    Resolved resolved();
+
+    /** Abandon the running resolve, if any. */
+    void cancelResolve();
+
+    /**
+     * Add this meeting's crop and its embedding to this person (R5, KTD12). The
+     * answer is KNOWN with their stored name and the conversation's fields (their
+     * notes), or FAILED when the store refused (the id was forgotten meanwhile:
+     * nobody is re-created) or the meeting has nothing to store.
+     */
+    void addPhoto(String personId, long timeoutMs);
+
+    /** The answer to the last addPhoto(), or null while it runs. */
+    MatchAnswer photoAdded();
+
+    /** Abandon the running addPhoto(), if any. */
+    void cancelAddPhoto();
+
+    /**
+     * This meeting's face check gets its outcome (KTD8), with the id the crop
+     * joined (null: none). Fire and forget. A new person's outcome is recorded by
+     * keep() and remember() themselves.
+     */
+    void checkOutcome(Outcome outcome, String joinedId);
+
+    /** The meeting is over: its face check, if still waiting for an answer, ends "without an answer" (KTD8). */
+    void meetingOver();
 
     /** Open the launcher's continuous listening session (KTD1); cues then arrive as Ears step input. */
     void earsOpen();
@@ -396,6 +449,39 @@ interface CuriosityPort {
         public void cancelKeep() {
         }
 
+        public String nameIn(String transcript) {
+            return null;
+        }
+
+        public void resolveName(String name, long timeoutMs) {
+        }
+
+        public void resolveLastName(String lastName, long timeoutMs) {
+        }
+
+        public Resolved resolved() {
+            return Resolved.FAILED;
+        }
+
+        public void cancelResolve() {
+        }
+
+        public void addPhoto(String personId, long timeoutMs) {
+        }
+
+        public MatchAnswer photoAdded() {
+            return MatchAnswer.FAILED;
+        }
+
+        public void cancelAddPhoto() {
+        }
+
+        public void checkOutcome(Outcome outcome, String joinedId) {
+        }
+
+        public void meetingOver() {
+        }
+
         public void earsOpen() {
         }
 
@@ -569,17 +655,29 @@ interface CuriosityPort {
         final String candidateId;
         final float score;
         final long checkHandle;
+        /**
+         * A close match's question (face plan U7, KTD6): the name "Is that you,
+         * {name}?" asks about the candidate, the full stored name when another
+         * stored person shares its first name. Null: nothing to confirm.
+         */
+        final String confirmName;
 
         /** This answer with the conversation's fields attached. */
         MatchAnswer withConversation(String persona, String personId, String notes, List<String> questionsAsked) {
             return new MatchAnswer(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, persona,
-                    personId, notes, questionsAsked, band, candidateId, score, checkHandle);
+                    personId, notes, questionsAsked, band, candidateId, score, checkHandle, confirmName);
         }
 
         /** This answer with the on-device match's fields attached. */
         MatchAnswer withMatch(FaceMatcher.Band band, String candidateId, float score, long checkHandle) {
             return new MatchAnswer(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, persona,
-                    personId, notes, questionsAsked, band, candidateId, score, checkHandle);
+                    personId, notes, questionsAsked, band, candidateId, score, checkHandle, confirmName);
+        }
+
+        /** This answer with the close match's question name (U7, KTD6). */
+        MatchAnswer withConfirm(String confirmName) {
+            return new MatchAnswer(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, persona,
+                    personId, notes, questionsAsked, band, candidateId, score, checkHandle, confirmName);
         }
 
         /** A confident match (U6): the stored name, and no lines (KTD7). */
@@ -618,13 +716,13 @@ interface CuriosityPort {
         MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
                     String noReplyLine, boolean faceless) {
             this(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, null, null, null, null, null,
-                    null, Float.NaN, -1L);
+                    null, Float.NaN, -1L, null);
         }
 
         private MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
                             String noReplyLine, boolean faceless, String persona, String personId, String notes,
                             List<String> questionsAsked, FaceMatcher.Band band, String candidateId, float score,
-                            long checkHandle) {
+                            long checkHandle, String confirmName) {
             this.faceless = faceless;
             this.status = status;
             this.name = name;
@@ -641,6 +739,43 @@ interface CuriosityPort {
             this.candidateId = candidateId;
             this.score = score;
             this.checkHandle = checkHandle;
+            this.confirmName = confirmName;
+        }
+    }
+
+    /** A face check's answer (KTD8), as the brain and the conversation know it; the adapter maps it to FaceCheck's codes. */
+    enum Outcome { YES, NO, NAME_GIVEN, JOINED, NO_REPLY }
+
+    /**
+     * Who a spoken name belongs to (face plan U7, KTD10): JOIN a stored person
+     * (their id and stored name), ASK_LAST_NAME, or NEW (the name to store);
+     * FAILED when the store could not answer or the meeting has no face to compare.
+     */
+    final class Resolved {
+        enum Status { JOIN, ASK_LAST_NAME, NEW, FAILED }
+
+        static final Resolved FAILED = new Resolved(Status.FAILED, null, null);
+
+        final Status status;
+        final String personId;
+        final String name;
+
+        private Resolved(Status status, String personId, String name) {
+            this.status = status;
+            this.personId = personId;
+            this.name = name;
+        }
+
+        static Resolved join(String personId, String storedName) {
+            return personId == null ? FAILED : new Resolved(Status.JOIN, personId, storedName);
+        }
+
+        static Resolved askLastName(String firstName) {
+            return new Resolved(Status.ASK_LAST_NAME, null, firstName);
+        }
+
+        static Resolved newPerson(String name) {
+            return name == null || name.trim().isEmpty() ? FAILED : new Resolved(Status.NEW, null, name.trim());
         }
     }
 

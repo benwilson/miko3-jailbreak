@@ -25,6 +25,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -134,6 +136,9 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Done> notes = new Slot<Done>();
     private final Slot<Done> forgets = new Slot<Done>();
     private final Slot<Kept> keeps = new Slot<Kept>();
+    /** Confirming and resolving names (face plan U7): one resolve and one added photo at a time. */
+    private final Slot<Resolved> resolves = new Slot<Resolved>();
+    private final Slot<MatchAnswer> photoAdds = new Slot<MatchAnswer>();
     /** The recommended effort for a turn (KTD9); the client's gate drops it where a model refuses it. */
     private static final String TURN_EFFORT = "low";
 
@@ -166,6 +171,8 @@ final class ClaudeCuriosity implements CuriosityPort {
         /** The matcher's decision (null when none ran) and the face check's handle (-1: none). */
         volatile FaceMatcher.Result result;
         volatile long checkHandle = -1;
+        /** A name the resolver asked the last name for (U7, KTD10): robot-side only, never logged. */
+        volatile String pendingFirst;
     }
 
     /** The current meeting's, from match(); and everyone metId() handed out a handle for. */
@@ -651,8 +658,8 @@ final class ClaudeCuriosity implements CuriosityPort {
 
     /**
      * The retained crop stored under a new record with this name (KTD10), with its
-     * embedding in one step (face plan U6, KTD12): a name given mid-conversation or
-     * a mismatch. A faceless meeting (no face, a rejected crop, the store not
+     * embedding in one step (face plan U6, KTD12): someone new the resolver found for
+     * a name given (U7, KTD6). A faceless meeting (no face, a rejected crop, the store not
      * ready) has nothing to store (R11, R18). No line is asked for and the face
      * debug dump never runs here (it belongs to the match, before the conversation).
      */
@@ -979,8 +986,209 @@ final class ClaudeCuriosity implements CuriosityPort {
             // Forgotten since the gallery was read (or the store is gone): someone new.
             Log.i(TAG, "person match: the confident candidate is gone; meeting as someone new");
         }
-        // Close and weak alike meet as someone new for now; U7 confirms a close one aloud.
-        return forConversation(MatchAnswer.stranger().withMatch(r.band, r.bestId, r.score, h), null);
+        // Close and weak alike meet as someone new; a close one carries the name the brain
+        // confirms aloud first (U7, KTD6).
+        MatchAnswer stranger = MatchAnswer.stranger().withMatch(r.band, r.bestId, r.score, h);
+        if (r.band == FaceMatcher.Band.CLOSE && r.bestId != null) {
+            stranger = stranger.withConfirm(confirmName(r.bestId));
+        }
+        return forConversation(stranger, null);
+    }
+
+    /**
+     * The name "Is that you, {name}?" asks about this candidate (KTD6): the first
+     * word of their stored name, or the full stored name when another stored
+     * person shares that first name. Null (nothing to confirm) for a nameless
+     * record or a store that can't answer.
+     */
+    private String confirmName(String candidateId) {
+        try {
+            String stored = RobotPeopleClient.nameOf(app, candidateId);
+            if (stored == null || stored.trim().isEmpty()) {
+                return null;
+            }
+            String[] sharing = RobotPeopleClient.idsNamed(app, NameResolver.firstWord(stored.trim()));
+            return NameResolver.askedName(stored, sharing == null ? 1 : sharing.length);
+        } catch (IOException e) {
+            Log.w(TAG, "close match: the candidate's name is unavailable; meeting as someone new: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // ---- confirming and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12) ----
+
+    @Override
+    public String nameIn(String transcript) {
+        return NameExtractor.extract(transcript);
+    }
+
+    @Override
+    public void resolveName(final String name, final long timeoutMs) {
+        final int g = resolves.start();
+        final MetFace mf = meeting;
+        run(new Runnable() {
+            @Override
+            public void run() {
+                resolves.finish(g, resolveNow(mf, name));
+            }
+        }, resolves, g, Resolved.FAILED);
+    }
+
+    /** KTD10 on the robot: the store's ids for the name, scored against this meeting's face. Logs ids and counts only. */
+    private Resolved resolveNow(MetFace mf, String name) {
+        float[] probe = mf == null ? null : mf.probe;
+        if (probe == null || name == null || name.trim().isEmpty()) {
+            Log.w(TAG, "resolve: no face from the match to compare; nothing is stored");
+            return Resolved.FAILED;
+        }
+        try {
+            String[] found = RobotPeopleClient.idsNamed(app, name);
+            List<String> ids = found == null ? Collections.<String>emptyList() : Arrays.asList(found);
+            List<FaceMatcher.Entry> entries = ids.isEmpty() ? Collections.<FaceMatcher.Entry>emptyList()
+                    : entriesOf(RobotPeopleClient.gallery(app));
+            float close = RobotSettingsClient.fetchFaceSettings(app).close;
+            NameResolver.Decision d = NameResolver.resolve(name, probe, ids, entries, close);
+            Log.i(TAG, "name resolved over " + ids.size() + " stored id(s): " + d);
+            switch (d.kind) {
+                case JOIN: {
+                    String stored = RobotPeopleClient.nameOf(app, d.personId);
+                    return stored == null ? Resolved.FAILED : Resolved.join(d.personId, stored);
+                }
+                case ASK_LAST_NAME:
+                    mf.pendingFirst = name;
+                    return Resolved.askLastName(name);
+                default:
+                    return Resolved.newPerson(name);
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "resolve: the people store or the face settings are unavailable: " + e.getMessage());
+            return Resolved.FAILED;
+        }
+    }
+
+    @Override
+    public void resolveLastName(final String lastName, final long timeoutMs) {
+        final int g = resolves.start();
+        final MetFace mf = meeting;
+        run(new Runnable() {
+            @Override
+            public void run() {
+                resolves.finish(g, resolveLastNow(mf, lastName));
+            }
+        }, resolves, g, Resolved.FAILED);
+    }
+
+    /** After the last name (KTD10): join the id whose full stored name equals it, else someone new under it. */
+    private Resolved resolveLastNow(MetFace mf, String lastName) {
+        String first = mf == null ? null : mf.pendingFirst;
+        if (first == null || mf.probe == null || lastName == null || lastName.trim().isEmpty()) {
+            Log.w(TAG, "resolve last name: no pending first name or face; nothing is stored");
+            return Resolved.FAILED;
+        }
+        try {
+            String[] found = RobotPeopleClient.idsNamed(app, first + " " + lastName.trim());
+            Map<String, String> stored = new LinkedHashMap<String, String>();
+            if (found != null) {
+                for (String id : found) {
+                    String n = RobotPeopleClient.nameOf(app, id);
+                    if (n != null) {
+                        stored.put(id, n);
+                    }
+                }
+            }
+            NameResolver.Decision d = NameResolver.afterLastName(first, lastName, stored);
+            Log.i(TAG, "last name resolved over " + stored.size() + " stored id(s): " + d);
+            mf.pendingFirst = null;
+            return d.kind == NameResolver.Kind.JOIN ? Resolved.join(d.personId, stored.get(d.personId))
+                    : Resolved.newPerson(d.name);
+        } catch (IOException e) {
+            Log.w(TAG, "resolve last name: the people store is unavailable: " + e.getMessage());
+            return Resolved.FAILED;
+        }
+    }
+
+    @Override
+    public Resolved resolved() {
+        return resolves.poll();
+    }
+
+    @Override
+    public void cancelResolve() {
+        resolves.cancel();
+    }
+
+    /**
+     * The meeting's crop and embedding added to this person by id (R5, KTD12): the
+     * store refuses an unknown id, so a yes racing a forget re-creates nobody.
+     */
+    @Override
+    public void addPhoto(final String personId, final long timeoutMs) {
+        final int g = photoAdds.start();
+        final MetFace mf = meeting;
+        run(new Runnable() {
+            @Override
+            public void run() {
+                photoAdds.finish(g, addPhotoNow(mf, personId));
+            }
+        }, photoAdds, g, MatchAnswer.FAILED);
+    }
+
+    private MatchAnswer addPhotoNow(MetFace mf, String id) {
+        byte[] face = mf == null ? null : mf.storeCrop;
+        float[] probe = mf == null ? null : mf.probe;
+        if (face == null || probe == null || id == null) {
+            Log.w(TAG, "add photo: nothing storable from the match");
+            return MatchAnswer.FAILED;
+        }
+        try {
+            int slot = RobotPeopleClient.addPhoto(app, id, face, FaceMatcher.MODEL_ID, probe);
+            String stored = RobotPeopleClient.nameOf(app, id);
+            matchedId = id;
+            mf.storeId = id;
+            Log.i(TAG, "photo added to id " + id + " in slot " + slot);
+            FaceMatcher.Result r = mf.result;
+            return forConversation(MatchAnswer.known(stored == null || stored.isEmpty() ? null : stored)
+                    .withMatch(r == null ? null : r.band, id, r == null ? Float.NaN : r.score, mf.checkHandle),
+                    stored == null || stored.isEmpty() ? null : id);
+        } catch (IOException e) {
+            Log.w(TAG, "add photo: the store refused (forgotten meanwhile?) or is unavailable: " + e.getMessage());
+            return MatchAnswer.FAILED;
+        }
+    }
+
+    @Override
+    public MatchAnswer photoAdded() {
+        return photoAdds.poll();
+    }
+
+    @Override
+    public void cancelAddPhoto() {
+        photoAdds.cancel();
+    }
+
+    @Override
+    public void checkOutcome(Outcome outcome, String joinedId) {
+        checkOutcome(meeting, outcomeCode(outcome), joinedId);
+    }
+
+    private static int outcomeCode(Outcome outcome) {
+        switch (outcome) {
+            case YES:
+                return FaceCheck.YES;
+            case NO:
+                return FaceCheck.NO;
+            case JOINED:
+                return FaceCheck.JOINED;
+            case NO_REPLY:
+                return FaceCheck.NO_REPLY;
+            default:
+                return FaceCheck.NAME_GIVEN;
+        }
+    }
+
+    @Override
+    public void meetingOver() {
+        closeCheck(meeting);
     }
 
     /**

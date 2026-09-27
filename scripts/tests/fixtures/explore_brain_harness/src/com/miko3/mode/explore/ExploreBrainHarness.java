@@ -544,6 +544,18 @@ public final class ExploreBrainHarness {
         /** What keep() answers (null: never), and the ids it hands out. */
         boolean keepFails;
         boolean keepNeverAnswers;
+        /**
+         * The fake store's named people (face plan U7): id -> stored name, in the
+         * store's order. keep() adds its new records here too.
+         */
+        final java.util.Map<String, String> named = new java.util.LinkedHashMap<String, String>();
+        /** How close this meeting's face is to each stored person (unset: 0.1, weak), and the close threshold. */
+        final java.util.Map<String, Float> faceScore = new java.util.HashMap<String, Float>();
+        float close = 0.363f;
+        /** Ids whose addPhoto the store refuses: forgotten meanwhile (KTD12). */
+        final java.util.Set<String> refusePhoto = new java.util.HashSet<String>();
+        /** The store's answer time for a resolve or an added photo. */
+        long storeDelayMs = 300;
     }
 
     static final class Rig implements ExploreBrain.Clock, ExploreBrain.Motor, ExploreBrain.Eyes, ExploreBrain.Sound,
@@ -671,6 +683,16 @@ public final class ExploreBrainHarness {
         CuriosityPort.Kept pendingKept;
         long pendingKeptAt;
         int keepCancels;
+        /** The fake resolver (face plan U7): every name resolved, photo added, outcome and meeting end. */
+        final List<String> resolves = new ArrayList<String>();
+        final List<String> photos = new ArrayList<String>();
+        final List<String> outcomes = new ArrayList<String>();
+        int meetingOvers;
+        String pendingFirst;
+        CuriosityPort.Resolved pendingResolved;
+        long pendingResolvedAt;
+        CuriosityPort.MatchAnswer pendingPhoto;
+        long pendingPhotoAt;
         /** The conversation listens (chatListen) and the newcomer angle each carried. */
         int chatListens;
         final List<Float> chatListenAngles = new ArrayList<Float>();
@@ -1169,7 +1191,8 @@ public final class ExploreBrainHarness {
         public void say(String line) {
             // Speech starts only once the camera and detector are closed (R6, KTD6), except in
             // the conversation, where the camera stays open with the detector parked (KTD7).
-            boolean chatting = brain.state().chats();
+            // The close match's question (face plan U7) runs the same way on the conversation path.
+            boolean chatting = brain.state().chats() || (brain.state().confirms() && cameraOpen && parked);
             if (cameraOpen && !chatting) {
                 violations.add(now + ":say with the camera open in " + brain.state());
             }
@@ -1493,6 +1516,9 @@ public final class ExploreBrainHarness {
             kept.add(name);
             pendingKept = people.keepNeverAnswers ? null
                     : people.keepFails ? CuriosityPort.Kept.FAILED : CuriosityPort.Kept.done("kept-" + kept.size());
+            if (pendingKept != null && pendingKept.ok()) {
+                people.named.put(pendingKept.personId, name);
+            }
             pendingKeptAt = now + claudeDelayMs;
             log.add(new Event(now, "keep"));
         }
@@ -1530,6 +1556,98 @@ public final class ExploreBrainHarness {
             pendingKept = null;
             keepCancels++;
             log.add(new Event(now, "cancel keep"));
+        }
+
+        // ---- the fake resolver and photo store (face plan U7): the real NameResolver over a fake store ----
+
+        @Override
+        public String nameIn(String transcript) {
+            return fakeNameIn(transcript);
+        }
+
+        @Override
+        public void resolveName(String name, long timeoutMs) {
+            resolves.add(name);
+            List<String> ids = idsNamed(people, name);
+            NameResolver.Decision d = NameResolver.resolve(name, PROBE, ids, galleryOf(people, ids), people.close);
+            if (d.kind == NameResolver.Kind.ASK_LAST_NAME) {
+                pendingFirst = d.name;
+            }
+            pendingResolved = resolvedOf(people, d);
+            pendingResolvedAt = now + people.storeDelayMs;
+            log.add(new Event(now, "resolve " + name));
+        }
+
+        @Override
+        public void resolveLastName(String lastName, long timeoutMs) {
+            resolves.add("last " + lastName);
+            String full = pendingFirst + " " + lastName;
+            java.util.Map<String, String> stored = new java.util.LinkedHashMap<String, String>();
+            for (String id : idsNamed(people, full)) {
+                stored.put(id, people.named.get(id));
+            }
+            pendingResolved = pendingFirst == null ? CuriosityPort.Resolved.FAILED
+                    : resolvedOf(people, NameResolver.afterLastName(pendingFirst, lastName, stored));
+            pendingResolvedAt = now + people.storeDelayMs;
+            log.add(new Event(now, "resolve last " + lastName));
+        }
+
+        @Override
+        public CuriosityPort.Resolved resolved() {
+            if (pendingResolved == null || now < pendingResolvedAt) {
+                return null;
+            }
+            CuriosityPort.Resolved r = pendingResolved;
+            pendingResolved = null;
+            log.add(new Event(now, "resolved " + r.status + (r.personId == null ? "" : " " + r.personId)));
+            return r;
+        }
+
+        @Override
+        public void cancelResolve() {
+            pendingResolved = null;
+            log.add(new Event(now, "cancel resolve"));
+        }
+
+        @Override
+        public void addPhoto(String personId, long timeoutMs) {
+            photos.add(personId);
+            boolean refused = people.refusePhoto.contains(personId) || !people.named.containsKey(personId);
+            CuriosityPort.MatchAnswer a = CuriosityPort.MatchAnswer.known(people.named.get(personId));
+            pendingPhoto = refused ? CuriosityPort.MatchAnswer.FAILED : people.persona == null ? a
+                    : a.withConversation(people.persona, personId, people.notes.get(personId),
+                            people.asked.get(personId));
+            pendingPhotoAt = now + people.storeDelayMs;
+            log.add(new Event(now, "add photo " + personId));
+        }
+
+        @Override
+        public CuriosityPort.MatchAnswer photoAdded() {
+            if (pendingPhoto == null || now < pendingPhotoAt) {
+                return null;
+            }
+            CuriosityPort.MatchAnswer a = pendingPhoto;
+            pendingPhoto = null;
+            log.add(new Event(now, "photo " + a.status));
+            return a;
+        }
+
+        @Override
+        public void cancelAddPhoto() {
+            pendingPhoto = null;
+            log.add(new Event(now, "cancel photo"));
+        }
+
+        @Override
+        public void checkOutcome(CuriosityPort.Outcome outcome, String joinedId) {
+            outcomes.add(outcome + (joinedId == null ? "" : " " + joinedId));
+            log.add(new Event(now, "outcome " + outcome));
+        }
+
+        @Override
+        public void meetingOver() {
+            meetingOvers++;
+            log.add(new Event(now, "meeting over"));
         }
 
         @Override
@@ -1940,6 +2058,423 @@ public final class ExploreBrainHarness {
         });
     }
 
+    // ---- confirming a close match and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12) ----
+
+    private static final String BEN_ID = "p-ben";
+    private static final String BEN2_ID = "p-ben2";
+    private static final String BEN_NOTES = "{\"topics\":[\"cycling\"]}";
+    /** This meeting's face in the fake resolver's 2-D space: each stored person sits at its scripted score. */
+    private static final float[] PROBE = {1f, 0f};
+
+    /** The fake store's idsNamed (KTD10): by full name when two words are given, else by first word. */
+    static List<String> idsNamed(People p, String name) {
+        List<String> out = new ArrayList<String>();
+        if (name == null || name.trim().isEmpty()) {
+            return out;
+        }
+        String n = name.trim().toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", " ");
+        boolean full = n.contains(" ");
+        for (java.util.Map.Entry<String, String> e : p.named.entrySet()) {
+            String s = e.getValue() == null ? "" : e.getValue().trim().toLowerCase(java.util.Locale.ROOT)
+                    .replaceAll("\\s+", " ");
+            if (!s.isEmpty() && (full ? s : s.split(" ")[0]).equals(n)) {
+                out.add(e.getKey());
+            }
+        }
+        return out;
+    }
+
+    /** One unit embedding per candidate whose score against PROBE is the scripted face score (0.1: weak). */
+    static List<FaceMatcher.Entry> galleryOf(People p, List<String> ids) {
+        List<FaceMatcher.Entry> out = new ArrayList<FaceMatcher.Entry>();
+        for (String id : ids) {
+            float s = p.faceScore.containsKey(id) ? p.faceScore.get(id) : 0.1f;
+            out.add(new FaceMatcher.Entry(id, 0, new float[] {s, (float) Math.sqrt(Math.max(0f, 1f - s * s))}));
+        }
+        return out;
+    }
+
+    static CuriosityPort.Resolved resolvedOf(People p, NameResolver.Decision d) {
+        switch (d.kind) {
+            case JOIN:
+                return CuriosityPort.Resolved.join(d.personId, p.named.get(d.personId));
+            case ASK_LAST_NAME:
+                return CuriosityPort.Resolved.askLastName(d.name);
+            default:
+                return CuriosityPort.Resolved.newPerson(d.name);
+        }
+    }
+
+    private static final java.util.Set<String> FAKE_NOT_NAMES = new java.util.HashSet<String>(java.util.Arrays.asList(
+            "me", "no", "nope", "nah", "not", "yes", "yeah", "yep", "maybe", "who's", "whos", "what", "why", "the",
+            "bye", "ok", "okay", "sure", "thanks", "fine", "a", "b", "c", "d", "tell", "joke", "hi", "hello"));
+
+    /** Like NameExtractor for the replies the scenarios use: "I'm X", "it's X", "X", "X Y". */
+    static String fakeNameIn(String t) {
+        if (t == null) {
+            return null;
+        }
+        String s = t.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z' -]", " ").trim().replaceAll("\\s+", " ");
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "^(?:(?:my name is|i'm|im|i am|call me|it's|its|this is) )?([a-z][a-z'-]*(?: [a-z][a-z'-]*)?)$")
+                .matcher(s);
+        if (!m.matches()) {
+            return null;
+        }
+        StringBuilder out = new StringBuilder();
+        for (String w : m.group(1).split(" ")) {
+            if (FAKE_NOT_NAMES.contains(w)) {
+                return null;
+            }
+            if (out.length() > 0) {
+                out.append(' ');
+            }
+            out.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1));
+        }
+        return out.toString();
+    }
+
+    /** A close match on this stored person, with the question name the adapter would pick (KTD6). */
+    static CuriosityPort.MatchAnswer closeMatch(Rig r, String id, float score, long handle) {
+        String stored = r.people.named.get(id);
+        String asked = NameResolver.askedName(stored, idsNamed(r.people, NameResolver.firstWord(stored)).size());
+        CuriosityPort.MatchAnswer a = CuriosityPort.MatchAnswer.stranger()
+                .withMatch(FaceMatcher.Band.CLOSE, id, score, handle).withConfirm(asked);
+        return r.people.persona == null ? a : a.withConversation(r.people.persona, null, null, null);
+    }
+
+    /** Ben Wilson is stored with notes; this face scores 0.42 against him (close). */
+    private static void storeBen(Rig rig) {
+        rig.people.named.put(BEN_ID, "Ben Wilson");
+        rig.people.notes.put(BEN_ID, BEN_NOTES);
+        rig.people.asked.put(BEN_ID, new ArrayList<String>());
+        rig.people.faceScore.put(BEN_ID, 0.42f);
+    }
+
+    /** Ben Smith is stored beside Ben Wilson, and this face is weak for both: the question uses the full name. */
+    private static void twoWeakBens(Rig rig) {
+        rig.people.named.put(BEN2_ID, "Ben Smith");
+        rig.people.faceScore.put(BEN_ID, 0.1f);
+        rig.people.faceScore.put(BEN2_ID, 0.1f);
+        rig.people.match = (r, k) -> closeMatch(r, BEN_ID, 0.4f, 32L);
+    }
+
+    /** Sarah is stored; this face scores the given value against her. */
+    private static void storeSarah(Rig rig, float score) {
+        rig.people.named.put(SARAH_ID, "Sarah");
+        rig.people.faceScore.put(SARAH_ID, score);
+    }
+
+    /** The conversation path with a close match on Ben Wilson, each listen hearing the next reply. */
+    private static Rig closeChatRig(Hearing... listens) {
+        Rig rig = chatRig(personAt(bearingOf(-90f), 25), false);
+        storeBen(rig);
+        rig.people.match = (r, k) -> closeMatch(r, BEN_ID, 0.42f, 21L);
+        rig.people.listen = ListenScript.turns(listens);
+        return rig;
+    }
+
+    /** The degraded ladder (no conversation possible) with a close match on Ben Wilson. */
+    private static Rig closeLadderRig(Hearing... listens) {
+        Rig rig = meetRig();
+        storeBen(rig);
+        rig.people.match = (r, k) -> closeMatch(r, BEN_ID, 0.42f, 31L);
+        rig.people.lines = LINES;
+        rig.people.listen = ListenScript.turns(listens);
+        return rig;
+    }
+
+    /** A stranger conversation (weak match) whose turns are scripted. */
+    private static Rig strangerChatRig(TurnScript turns, Hearing... listens) {
+        Rig rig = chatRig(personAt(bearingOf(-90f), 25), false);
+        rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.stranger()
+                .withMatch(FaceMatcher.Band.WEAK, null, 0.1f, 41L).withConversation(r.people.persona, null, null, null);
+        rig.turns = turns;
+        rig.people.listen = ListenScript.turns(listens);
+        return rig;
+    }
+
+    private static CuriosityPort.Turn named(int nth, String nameGiven) {
+        return CuriosityPort.Turn.line("Line " + nth + ".", null, nameGiven, false, false,
+                "{\"topics\":[\"t" + nth + "\"]}");
+    }
+
+    private static boolean allStartWith(List<String> deltas, String prefix) {
+        for (String d : deltas) {
+            if (!d.startsWith(prefix)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static final String ASK_BEN = "say Is that you, Ben?";
+
+    private static void faceConfirmScenarios() {
+        scenario("confirm_chat_ae2_yes_adds_the_photo_and_starts_known_with_their_notes", n -> {
+            Rig rig = closeChatRig(hearWords("yeah that's me"), hearWords("bye")).started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            int ask = rig.first(ASK_BEN, 0);
+            int photo = rig.first("add photo " + BEN_ID, ask);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, ask >= 0 && photo > ask && open >= rig.timeOf(photo) && over > 0 && first != null
+                            && "Ben Wilson".equals(first.request.name) && BEN_NOTES.equals(first.request.notes)
+                            && rig.outcomes.equals(java.util.Arrays.asList("YES " + BEN_ID)) && rig.kept.isEmpty()
+                            && allStartWith(rig.notesDeltas, BEN_ID + ": ") && !rig.notesDeltas.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "ask=" + ask + " photo=" + photo + " open@" + open + " first=" + first + " outcomes="
+                            + rig.outcomes + " " + rig.tail());
+        });
+        scenario("confirm_chat_ae3_no_im_sarah_close_to_sarah_joins_her_and_starts_known_as_sarah", n -> {
+            Rig rig = closeChatRig(hearWords("No, I'm Sarah"), hearWords("bye"));
+            storeSarah(rig, 0.45f);
+            rig.people.notes.put(SARAH_ID, SARAH_NOTES);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, open > 0 && over > 0 && rig.resolves.equals(java.util.Arrays.asList("Sarah"))
+                            && rig.photos.equals(java.util.Arrays.asList(SARAH_ID)) && first != null
+                            && "Sarah".equals(first.request.name) && SARAH_NOTES.equals(first.request.notes)
+                            && rig.outcomes.equals(java.util.Arrays.asList("JOINED " + SARAH_ID)) && rig.kept.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "resolves=" + rig.resolves + " photos=" + rig.photos + " first=" + first + " outcomes="
+                            + rig.outcomes + " " + rig.tail());
+        });
+        scenario("confirm_chat_ae7_silence_starts_the_stranger_opener_with_no_photo_and_outcome_no_reply", n -> {
+            Rig rig = closeChatRig(hearSilence(), hearWords("bye")).started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, rig.first(ASK_BEN, 0) >= 0 && open > 0 && over > 0 && first != null && first.request.name == null
+                            && first.request.heard == null && rig.photos.isEmpty() && rig.kept.isEmpty()
+                            && rig.outcomes.equals(java.util.Arrays.asList("NO_REPLY")) && rig.violations.isEmpty(),
+                    "first=" + first + " outcomes=" + rig.outcomes + " " + rig.tail());
+        });
+        scenario("confirm_chat_ae8_near_tie_asks_the_full_name_and_a_bare_first_name_is_a_no", n -> {
+            Rig rig = closeChatRig(hearWords("Ben"), hearWords("bye"));
+            rig.people.named.put(BEN2_ID, "Ben Smith");
+            rig.people.faceScore.put(BEN2_ID, 0.6f);
+            rig.people.faceScore.put(BEN_ID, 0.62f);
+            rig.people.match = (r, k) -> closeMatch(r, BEN_ID, 0.62f, 22L);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, rig.count("say Is that you, Ben Wilson?") == 1 && rig.count(ASK_BEN) == 0 && open > 0 && over > 0
+                            && first != null && first.request.name == null && rig.photos.isEmpty()
+                            && rig.outcomes.equals(java.util.Arrays.asList("NO")) && rig.violations.isEmpty(),
+                    "first=" + first + " outcomes=" + rig.outcomes + " " + rig.tail());
+        });
+        scenario("confirm_chat_no_im_priya_unstored_stores_priya_and_starts_known_without_asking_again", n -> {
+            Rig rig = closeChatRig(hearWords("no I'm Priya"), hearWords("fine"), hearWords("bye"));
+            rig.turns = turnsOf(turnLine(1), named(2, "Priya"));
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, open > 0 && over > 0 && rig.kept.equals(java.util.Arrays.asList("Priya")) && first != null
+                            && "Priya".equals(first.request.name) && first.request.notes == null
+                            && rig.resolves.equals(java.util.Arrays.asList("Priya")) && rig.photos.isEmpty()
+                            && rig.timeOf(rig.first("keep", 0)) <= open && allStartWith(rig.notesDeltas, "kept-1: ")
+                            && rig.notesDeltas.size() == 2 && rig.violations.isEmpty(),
+                    "kept=" + rig.kept + " first=" + first + " deltas=" + rig.notesDeltas + " " + rig.tail());
+        });
+        scenario("confirm_chat_yes_with_the_photo_refused_starts_as_a_stranger_and_recreates_nobody", n -> {
+            Rig rig = closeChatRig(hearWords("yes"), hearWords("bye"));
+            rig.people.refusePhoto.add(BEN_ID);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, open > 0 && over > 0 && rig.photos.equals(java.util.Arrays.asList(BEN_ID)) && first != null
+                            && first.request.name == null && rig.kept.isEmpty() && rig.notesDeltas.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "first=" + first + " " + rig.tail());
+        });
+        scenario("confirm_meeting_ending_mid_confirm_closes_the_check_without_an_answer", n -> {
+            Rig rig = closeLadderRig(hearWords("yes").after(5000)).started();
+            long confirm = runUntilState(rig, ExploreBrain.State.CONFIRM, 0, 30000);
+            long listen = runUntilEvent(rig, "listen", confirm, confirm + 10000);
+            rig.brain.onLeaseChanged(false);
+            rig.runUntil(rig.now + 8000);
+            check(n, confirm > 0 && listen > 0 && rig.meetingOvers >= 1 && rig.outcomes.isEmpty() && rig.photos.isEmpty()
+                            && !rig.brain.state().confirms() && rig.violations.isEmpty(),
+                    "confirm@" + confirm + " overs=" + rig.meetingOvers + " outcomes=" + rig.outcomes + " "
+                            + rig.tail());
+        });
+        scenario("confirm_ladder_runs_the_confirm_and_last_name_branches_without_a_conversation", n -> {
+            // Yes: the photo, then the degraded greeting from the lines request with the stored name.
+            Rig yes = closeLadderRig(hearWords("yes")).started();
+            yes.runUntil(25000);
+            int ask = yes.first(ASK_BEN, 0);
+            int photo = yes.first("add photo " + BEN_ID, ask);
+            int lines = yes.first("lines", photo);
+            int greet = yes.first("say Great to see you, Ben Wilson!", lines);
+            // Two Bens: "No, I'm Ben" is weak for both, so the last name; a new full name goes through remember().
+            Rig last = closeLadderRig(hearWords("no, I'm Ben"), hearWords("Jones"));
+            twoWeakBens(last);
+            last.started();
+            last.runUntil(30000);
+            int ask2 = last.first("say Is that you, Ben Wilson?", 0);
+            int lastQ = last.first("say " + ChatSession.LAST_NAME_QUESTION, ask2);
+            // A weak stranger's name on the ladder goes through the resolver too.
+            Rig weak = meetRig();
+            storeBen(weak);
+            weak.people.faceScore.put(BEN_ID, 0.1f);
+            weak.people.match = (r, k) -> CuriosityPort.MatchAnswer.stranger()
+                    .withMatch(FaceMatcher.Band.WEAK, BEN_ID, 0.1f, 33L);
+            weak.people.lines = LINES;
+            weak.people.listen = ListenScript.turns(hearWords("I'm Ben"), hearWords("Wilson"));
+            weak.started();
+            weak.runUntil(30000);
+            int lastQ3 = weak.first("say " + ChatSession.LAST_NAME_QUESTION, 0);
+            check(n, ask >= 0 && photo > ask && lines > photo && greet > lines
+                            && yes.outcomes.equals(java.util.Arrays.asList("YES " + BEN_ID)) && yes.stored.isEmpty()
+                            && yes.turnAsks.isEmpty() && yes.violations.isEmpty()
+                            && ask2 >= 0 && lastQ > ask2 && last.stored.equals(java.util.Arrays.asList("Ben Jones"))
+                            && last.photos.isEmpty() && last.turnAsks.isEmpty() && last.violations.isEmpty()
+                            && weak.first(ASK_BEN, 0) < 0 && lastQ3 >= 0 && weak.photos.equals(java.util.Arrays.asList(BEN_ID))
+                            && weak.stored.isEmpty() && weak.outcomes.equals(java.util.Arrays.asList("JOINED " + BEN_ID))
+                            && weak.violations.isEmpty(),
+                    "yes: " + yes.tail() + " last: stored=" + last.stored + " " + last.tail() + " weak: photos="
+                            + weak.photos + " outcomes=" + weak.outcomes + " " + weak.tail());
+        });
+        scenario("confirm_ladder_last_name_unanswered_welcomes_them_and_stores_nobody", n -> {
+            Rig rig = closeLadderRig(hearWords("no I'm Ben"), hearSilence());
+            twoWeakBens(rig);
+            rig.started();
+            rig.runUntil(30000);
+            int lastQ = rig.first("say " + ChatSession.LAST_NAME_QUESTION, 0);
+            check(n, lastQ >= 0 && rig.stored.isEmpty() && rig.photos.isEmpty() && rig.first("welcome", lastQ) > lastQ
+                            && rig.outcomes.equals(java.util.Arrays.asList("NAME_GIVEN")) && rig.violations.isEmpty(),
+                    "outcomes=" + rig.outcomes + " " + rig.tail());
+        });
+        scenario("resolve_chat_ae4_weak_ben_asks_the_last_name_smith_stores_ben_smith_and_wilson_joins_ben_wilson", n -> {
+            Rig smith = strangerChatRig(turnsOf(turnLine(1), named(2, "Ben")), hearWords("I'm Ben"),
+                    hearWords("Smith"), hearWords("bye"));
+            storeBen(smith);
+            smith.people.faceScore.put(BEN_ID, 0.1f);
+            smith.started();
+            long open = openChat(smith);
+            long over = chatOver(smith, open);
+            Rig wilson = strangerChatRig(turnsOf(turnLine(1), named(2, "Ben")), hearWords("I'm Ben"),
+                    hearWords("Wilson"), hearWords("bye"));
+            storeBen(wilson);
+            wilson.people.faceScore.put(BEN_ID, 0.1f);
+            wilson.started();
+            long open2 = openChat(wilson);
+            long over2 = chatOver(wilson, open2);
+            check(n, open > 0 && over > 0 && smith.count("say " + ChatSession.LAST_NAME_QUESTION) == 1
+                            && smith.count("say Line 2.") == 0 && smith.kept.equals(java.util.Arrays.asList("Ben Smith"))
+                            && smith.photos.isEmpty() && allStartWith(smith.notesDeltas, "kept-1: ")
+                            && smith.violations.isEmpty()
+                            && open2 > 0 && over2 > 0 && wilson.kept.isEmpty()
+                            && wilson.photos.equals(java.util.Arrays.asList(BEN_ID))
+                            && wilson.outcomes.equals(java.util.Arrays.asList("JOINED " + BEN_ID))
+                            && !wilson.notesDeltas.isEmpty() && allStartWith(wilson.notesDeltas, BEN_ID + ": ")
+                            && wilson.violations.isEmpty(),
+                    "smith: kept=" + smith.kept + " " + smith.tail() + " wilson: photos=" + wilson.photos + " deltas="
+                            + wilson.notesDeltas + " " + wilson.tail());
+        });
+        scenario("resolve_chat_after_the_last_name_the_next_turn_carries_both_replies_and_an_equal_name_given_stores_nothing", n -> {
+            Rig rig = strangerChatRig(turnsOf(turnLine(1), named(2, "Ben"), named(3, "Ben Smith"), named(4, "Ben")),
+                    hearWords("I'm Ben"), hearWords("Smith"), hearWords("sure"), hearWords("bye"));
+            storeBen(rig);
+            rig.people.faceScore.put(BEN_ID, 0.1f);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk third = rig.turnAsks.size() >= 3 ? rig.turnAsks.get(2) : null;
+            CuriosityPort.Exchange lastEx = third == null || third.request.transcript.isEmpty() ? null
+                    : third.request.transcript.get(third.request.transcript.size() - 1);
+            TurnAsk fourth = rig.turnAsks.size() >= 4 ? rig.turnAsks.get(3) : null;
+            check(n, open > 0 && over > 0 && third != null && "Smith".equals(third.request.heard) && lastEx != null
+                            && "I'm Ben".equals(lastEx.heard) && ChatSession.LAST_NAME_QUESTION.equals(lastEx.said)
+                            && "Ben Smith".equals(third.request.name) && fourth != null
+                            && "Ben Smith".equals(fourth.request.name)
+                            && rig.kept.equals(java.util.Arrays.asList("Ben Smith"))
+                            && rig.resolves.equals(java.util.Arrays.asList("Ben", "last Smith"))
+                            && rig.violations.isEmpty(),
+                    "third=" + (third == null ? null : third.request.heard) + " last=" + (lastEx == null ? null
+                            : lastEx.heard + "/" + lastEx.said) + " kept=" + rig.kept + " resolves=" + rig.resolves
+                            + " " + rig.tail());
+        });
+        scenario("resolve_chat_last_name_unanswered_stores_nobody_and_the_conversation_runs_unnamed", n -> {
+            Rig rig = strangerChatRig(turnsOf(turnLine(1), named(2, "Ben")), hearWords("I'm Ben"), hearSilence(),
+                    hearWords("tell me a joke"), hearWords("bye"));
+            storeBen(rig);
+            rig.people.faceScore.put(BEN_ID, 0.1f);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk third = rig.turnAsks.size() >= 3 ? rig.turnAsks.get(2) : null;
+            check(n, open > 0 && over > 0 && rig.count("say " + ChatSession.LAST_NAME_QUESTION) == 1
+                            && rig.kept.isEmpty() && rig.photos.isEmpty() && rig.notesDeltas.isEmpty() && third != null
+                            && "tell me a joke".equals(third.request.heard) && third.request.name == null
+                            && rig.outcomes.equals(java.util.Arrays.asList("NAME_GIVEN")) && rig.violations.isEmpty(),
+                    "third=" + (third == null ? null : third.request.heard) + " outcomes=" + rig.outcomes + " "
+                            + rig.tail());
+        });
+        scenario("resolve_chat_stored_ben_without_a_last_name_and_smith_stores_a_new_ben_smith", n -> {
+            Rig rig = strangerChatRig(turnsOf(turnLine(1), named(2, "Ben")), hearWords("Ben"), hearWords("Smith"),
+                    hearWords("bye"));
+            rig.people.named.put("p-ben1", "Ben");
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.count("say " + ChatSession.LAST_NAME_QUESTION) == 1
+                            && rig.kept.equals(java.util.Arrays.asList("Ben Smith")) && rig.photos.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "kept=" + rig.kept + " " + rig.tail());
+        });
+        scenario("resolve_chat_ae9_name_on_turn_three_close_to_sarah_joins_her_and_moves_the_notes", n -> {
+            Rig rig = strangerChatRig(turnsOf(turnLine(1), turnLine(2), named(3, "Sarah")), hearWords("hi"),
+                    hearWords("fine"), hearWords("I'm Sarah"), hearWords("bye"));
+            storeSarah(rig, 0.45f);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk fourth = rig.turnAsks.size() >= 4 ? rig.turnAsks.get(3) : null;
+            check(n, open > 0 && over > 0 && rig.kept.isEmpty() && rig.photos.equals(java.util.Arrays.asList(SARAH_ID))
+                            && rig.notesDeltas.size() == 4 && allStartWith(rig.notesDeltas, SARAH_ID + ": ")
+                            && rig.outcomes.equals(java.util.Arrays.asList("JOINED " + SARAH_ID)) && fourth != null
+                            && "Sarah".equals(fourth.request.name) && rig.count("say Line 3.") == 1
+                            && rig.violations.isEmpty(),
+                    "photos=" + rig.photos + " deltas=" + rig.notesDeltas + " outcomes=" + rig.outcomes + " "
+                            + rig.tail());
+        });
+        scenario("resolve_chat_a_known_conversation_whose_name_given_is_close_to_another_stored_person_joins_them", n -> {
+            // Replaces the meeting plan's KTD10 mismatch rule: a stored name close to the face joins, no new record.
+            Rig rig = chatRig(personAt(bearingOf(-90f), 25), true);
+            rig.people.named.put("p-priya", "Priya");
+            rig.people.faceScore.put("p-priya", 0.4f);
+            rig.turns = turnsOf(turnLine(1), named(2, "Priya"));
+            rig.people.listen = ListenScript.turns(hearWords("i'm priya"), hearWords("bye"));
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.kept.isEmpty() && rig.photos.equals(java.util.Arrays.asList("p-priya"))
+                            && rig.notesDeltas.size() == 2 && allStartWith(rig.notesDeltas, "p-priya: ")
+                            && rig.countPrefix("notes " + SARAH_ID, 0, over) == 0 && rig.violations.isEmpty(),
+                    "kept=" + rig.kept + " photos=" + rig.photos + " deltas=" + rig.notesDeltas + " " + rig.tail());
+        });
+        scenario("resolve_chat_a_join_whose_photo_is_refused_continues_and_recreates_nobody", n -> {
+            Rig rig = strangerChatRig(turnsOf(turnLine(1), named(2, "Sarah")), hearWords("hi"), hearWords("I'm Sarah"),
+                    hearWords("bye"));
+            storeSarah(rig, 0.45f);
+            rig.people.refusePhoto.add(SARAH_ID);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.photos.equals(java.util.Arrays.asList(SARAH_ID)) && rig.kept.isEmpty()
+                            && rig.notesDeltas.isEmpty() && rig.count("say Line 2.") == 1 && rig.turnAsks.size() == 3
+                            && rig.violations.isEmpty(),
+                    "photos=" + rig.photos + " kept=" + rig.kept + " " + rig.tail());
+        });
+    }
+
     // ---- the start-up migration's decisions (face plan U6, KTD11) ----
 
     /** A fake people store: its photos, their JPEGs by "id/slot", and every call made on it. */
@@ -2114,6 +2649,7 @@ public final class ExploreBrainHarness {
         chatScenarios();
         faceMatchScenarios();
         faceMigrationScenarios();
+        faceConfirmScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -3785,8 +4321,10 @@ public final class ExploreBrainHarness {
             rig.runUntil(16000);
             int heard = rig.first("heard WORDS", 0);
             int find = rig.first("find name", heard);
-            int remember = rig.first("remember Priya", find);
-            check(n, find > heard && rig.timeOf(remember) == rig.timeOf(find) + 1000
+            // Face plan U7: the name found goes through the resolver before it is stored.
+            int resolve = rig.first("resolve Priya", find);
+            int remember = rig.first("remember Priya", resolve);
+            check(n, find > heard && rig.timeOf(resolve) == rig.timeOf(find) + 1000 && remember > resolve
                             && rig.stored.equals(java.util.Arrays.asList("Priya")) && rig.violations.isEmpty(),
                     "find=" + find + " remember=" + remember + " " + rig.tail());
         });

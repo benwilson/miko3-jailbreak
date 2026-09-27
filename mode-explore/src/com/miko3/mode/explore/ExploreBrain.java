@@ -73,6 +73,11 @@ import java.util.Set;
  *              "I'll remember you" line; without one (or without a face)
  *              nothing is stored and he just says hello (R19), then SPEAK
  *   NAME_CLIP  both person requests failed: the detector's name clip, no asking
+ *   CONFIRM    a close match (face plan U7, KTD6): the local "Is that you, {name}?",
+ *              one listen, AnswerParser; yes adds the photo and starts known, a
+ *              name goes to the port's resolver, anything else starts a stranger
+ *   LAST_NAME  the resolver found the name but the face is weak for them: the
+ *              local "And your last name?", one listen; no reply stores nobody
  *
  *   MEET -> known: SPEAK the named line ({name} filled in here) or the unnamed
  *                  line, and touch them
@@ -412,6 +417,7 @@ final class ExploreBrain {
         SCAN, FACE, APPROACH, INSPECT, REACT_HERE,
         ASK, ORIENT, MEET_LOOK, MEET, SPEAK,
         ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP,
+        CONFIRM, LAST_NAME,
         RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF,
         CUE_TURN, CUE_LOOK,
         CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES;
@@ -454,11 +460,20 @@ final class ExploreBrain {
             return this == CHAT_THINK || this == CHAT_SPEAK || this == CHAT_LISTEN || this == CHAT_NOTES;
         }
 
+        /**
+         * Who someone is, decided on the robot before either conversation start
+         * (face plan U7, KTD6): "Is that you, {name}?" and "And your last name?",
+         * each spoken locally and listened to once.
+         */
+        boolean confirms() {
+            return this == CONFIRM || this == LAST_NAME;
+        }
+
         /** Part of a curiosity stop, from the scan until he is back to wandering. */
         boolean inStop() {
             return curious() || cueSearch() || chats() || this == ASK || this == ORIENT || this == MEET
                     || this == SPEAK || this == ASK_NAME || this == LISTEN || this == NAME || this == REMEMBER
-                    || this == NAME_CLIP;
+                    || this == NAME_CLIP || confirms();
         }
     }
 
@@ -871,6 +886,34 @@ final class ExploreBrain {
     // ---- the conversation (meeting plan U8; KTD7, KTD8, KTD10, R16) ----
     /** The conversation running in the CHAT states, or null. */
     private ChatSession chat;
+    // ---- confirming a close match and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12) ----
+    private enum IdStep { NONE, ASKING, LISTENING, RESOLVING, ADDING, KEEPING }
+    private IdStep idStep = IdStep.NONE;
+    /** The close match being confirmed: a stranger answer with the conversation's fields (null from the ladder's NAME step). */
+    private CuriosityPort.MatchAnswer confirming;
+    /** The resolve decides a conversation start (true) or the degraded ladder's next line. */
+    private boolean idChat;
+    /** The resolve came from the ladder's NAME step, where the name was already asked. */
+    private boolean idFromName;
+    /** A yes to the question (its photo's outcome is YES, not JOINED). */
+    private boolean idYes;
+    /** The name given (waiting for its last name), the name being kept, and the id a photo is added to. */
+    private String idFirst;
+    private String idName;
+    private String idJoinId;
+    private long idDeadline;
+    /** The conversation this meeting becomes: whether its face check still waits for an outcome, and a settled first name. */
+    private boolean chatCheckOpen = true;
+    private String chatSettled;
+    /** The acknowledgement clip's window (KTD14): the local question waits for it to end. */
+    private long ackUntil = NEVER;
+    /** The names in a reply by the robot's own patterns (the port's NameExtractor). */
+    private final AnswerParser.Names names = new AnswerParser.Names() {
+        @Override
+        public String nameIn(String transcript) {
+            return port.nameIn(transcript);
+        }
+    };
     /** The side the voice that started this stop came from, or null: the resume leg turns away from it. */
     private Direction chatCueSide;
     private Direction chatSide;
@@ -1270,6 +1313,10 @@ final class ExploreBrain {
                 break;
             case NAME:
                 nameStep(now);
+                break;
+            case CONFIRM:
+            case LAST_NAME:
+                identityStep(now);
                 break;
             case REMEMBER:
                 rememberStep(now);
@@ -2203,6 +2250,7 @@ final class ExploreBrain {
 
     /** Forgets everything about the current stop (the camera closes as the state leaves curiosity). */
     private void clearStop() {
+        closeMeeting();
         cancelAsk();
         // A check the stop was waiting on runs on; its answer then only clears a roaming person.
         gatedPick = null;
@@ -2249,8 +2297,8 @@ final class ExploreBrain {
         if (state.curious() || state.cueSearch() || state.chats()) {
             return true;
         }
-        if (state == State.MEET && chatLikely()) {
-            // The meeting the conversation grows out of (KTD7): open, with the detector parked.
+        if ((state == State.MEET || state.confirms()) && chatLikely()) {
+            // The meeting the conversation grows out of (KTD7), and its question (U7): open, with the detector parked.
             return true;
         }
         if (!state.roams()) {
@@ -2870,6 +2918,19 @@ final class ExploreBrain {
      * the lines it speaks with port.lines().
      */
     private void matchAnswered(long now, CuriosityPort.MatchAnswer a) {
+        if (confirmable(a)) {
+            enterConfirm(now, a);
+            return;
+        }
+        startAs(now, a);
+    }
+
+    /**
+     * Start the meeting as the answer says (KTD6's "Start"): the conversation when
+     * it is possible, else the degraded ladder, which fetches its lines.
+     */
+    private void startAs(long now, CuriosityPort.MatchAnswer a) {
+        idStep = IdStep.NONE;
         boolean answered = a.status == CuriosityPort.MatchAnswer.Status.KNOWN
                 || a.status == CuriosityPort.MatchAnswer.Status.NEW;
         if (answered && chatPossible(a)) {
@@ -2891,6 +2952,8 @@ final class ExploreBrain {
         note(answered ? "matched on the robot; asking for the lines to say"
                 : "the person request failed; asking for the lines alone");
         meetLines = true;
+        // From CONFIRM (U7) the lines request is waited on in MEET, as after a match.
+        state = State.MEET;
         meetDeadline = now + tuning.meetTimeoutMs;
         port.lines(tuning.meetTimeoutMs);
     }
@@ -3000,6 +3063,10 @@ final class ExploreBrain {
      * promise to remember them (R19: nobody is saved until he has a name).
      */
     private void nameStep(long now) {
+        if (idStep != IdStep.NONE) {
+            identityStep(now);
+            return;
+        }
         CuriosityPort.Named n = port.foundName();
         if (n == null && now < meetDeadline) {
             return;
@@ -3019,8 +3086,13 @@ final class ExploreBrain {
             return;
         }
         helloOnly = false;
-        note("got a name; remembering them");
-        port.remember(name, tuning.meetTimeoutMs);
+        // Every spoken name goes through the resolver (KTD6, KTD10): join, the last name, or someone new.
+        note("got a name; checking it against the people stored");
+        confirming = null;
+        idChat = false;
+        idFromName = true;
+        state = State.NAME;
+        resolve(now, name);
     }
 
     private boolean faceless() {
@@ -3041,6 +3113,299 @@ final class ExploreBrain {
             note("no remember line; carrying on");
             finishPick(now);
         }
+    }
+
+    // ---- CONFIRM and LAST_NAME (face plan U7; KTD6, KTD9, KTD10, KTD12; R5-R7, R20, R21) ----
+
+    /** A close match with a stored name and a face to store is confirmed aloud first (R2). */
+    private boolean confirmable(CuriosityPort.MatchAnswer a) {
+        return a.status == CuriosityPort.MatchAnswer.Status.NEW && !a.faceless && !wheellessMeeting
+                && a.band == FaceMatcher.Band.CLOSE && a.candidateId != null && usable(a.confirmName);
+    }
+
+    /** CONFIRM: "Is that you, {name}?" through the on-device voice, then one listen (KTD6). */
+    private void enterConfirm(long now, CuriosityPort.MatchAnswer a) {
+        confirming = a;
+        idChat = chatPossible(a);
+        idFromName = false;
+        idYes = false;
+        note("a close match: asking whether it is them");
+        sayLocal(now, ChatSession.CONFIRM_QUESTION.replace("{name}", a.confirmName.trim()), State.CONFIRM);
+    }
+
+    /**
+     * A fixed local line (KTD6): with the camera open and the detector parked (the
+     * conversation path) it is said at once, like the conversation's; otherwise the
+     * camera closes first, as for any line. It waits for the acknowledgement clip.
+     */
+    private void sayLocal(long now, String line, State s) {
+        stopMotors();
+        state = s;
+        idStep = IdStep.ASKING;
+        syncCamera();
+        stareAtPick();
+        pendingLine = line;
+        quietUntil = now + tuning.quietWaitMs;
+    }
+
+    private void identityStep(long now) {
+        switch (idStep) {
+            case ASKING:
+                askingStep(now);
+                break;
+            case LISTENING:
+                answerStep(now);
+                break;
+            case RESOLVING:
+                resolveStep(now);
+                break;
+            case ADDING:
+                photoStep(now);
+                break;
+            case KEEPING:
+                keepStep(now);
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void askingStep(long now) {
+        if (pendingLine != null) {
+            if (now < ackUntil) {
+                return;
+            }
+            boolean ready = cameraOpen ? parked : camera.quiet();
+            if (!ready && now < quietUntil) {
+                return;
+            }
+            sayUntil = now + tuning.sayTimeoutMs;
+            String line = pendingLine;
+            pendingLine = null;
+            port.say(line);
+            return;
+        }
+        if (port.sayFinished() || now >= sayUntil) {
+            idStep = IdStep.LISTENING;
+            idDeadline = now + tuning.listenMs + tuning.listenMarginMs;
+            show(EyeState.LISTENING, null);
+            port.listen(tuning.listenMs);
+        }
+    }
+
+    /** The one listen: silence counts as no (R21); words go to AnswerParser (KTD9). */
+    private void answerStep(long now) {
+        CuriosityPort.Heard h = port.heard();
+        if (h == null && now < idDeadline) {
+            return;
+        }
+        String text = h != null && h.status == CuriosityPort.Heard.Status.WORDS && h.text != null
+                && !h.text.trim().isEmpty() ? h.text : null;
+        if (state == State.LAST_NAME) {
+            lastNameAnswer(now, text);
+        } else {
+            confirmAnswer(now, text);
+        }
+    }
+
+    private void confirmAnswer(long now, String text) {
+        if (text == null) {
+            note("no answer to the question: meeting them as someone new");
+            outcome(CuriosityPort.Outcome.NO_REPLY, null);
+            startAs(now, confirming);
+            return;
+        }
+        AnswerParser.Reply r = AnswerParser.parse(text, confirming.confirmName, names);
+        // The kind only: never the words or a name.
+        note("the answer to the question: " + r.kind);
+        switch (r.kind) {
+            case YES:
+                idYes = true;
+                addPhotoTo(now, confirming.candidateId);
+                break;
+            case NO_WITH_NAME:
+                resolve(now, r.name);
+                break;
+            default:
+                // No, or unclear, which counts as no (R21).
+                outcome(CuriosityPort.Outcome.NO, null);
+                startAs(now, confirming);
+                break;
+        }
+    }
+
+    private void lastNameAnswer(long now, String text) {
+        String last = text == null ? null : AnswerParser.lastName(text, idFirst, names);
+        if (last == null) {
+            note(text == null ? "no last name came: nobody is stored" : "no last name in the reply: nobody is stored");
+            settleUnnamed(now);
+            return;
+        }
+        idStep = IdStep.RESOLVING;
+        idDeadline = now + tuning.meetTimeoutMs;
+        show(EyeState.THINKING, null);
+        port.resolveLastName(last, tuning.meetTimeoutMs);
+    }
+
+    /** Every spoken name goes to one resolver on the port (KTD6, KTD10). */
+    private void resolve(long now, String name) {
+        idFirst = name;
+        idStep = IdStep.RESOLVING;
+        idDeadline = now + tuning.meetTimeoutMs;
+        show(EyeState.THINKING, null);
+        port.resolveName(name, tuning.meetTimeoutMs);
+    }
+
+    private void resolveStep(long now) {
+        CuriosityPort.Resolved r = port.resolved();
+        if (r == null) {
+            if (now < idDeadline) {
+                return;
+            }
+            port.cancelResolve();
+            note("the store did not answer about the name in time");
+            r = CuriosityPort.Resolved.FAILED;
+        }
+        switch (r.status) {
+            case JOIN:
+                note("the name belongs to someone stored whose face is close enough: adding the photo to them");
+                addPhotoTo(now, r.personId);
+                return;
+            case NEW:
+                note("nobody stored has that name: storing them");
+                storeAs(now, r.name);
+                return;
+            case ASK_LAST_NAME:
+                if (state != State.LAST_NAME) {
+                    note("the name matches someone stored but the face is weak for them: asking the last name");
+                    sayLocal(now, ChatSession.LAST_NAME_QUESTION, State.LAST_NAME);
+                    return;
+                }
+                break;
+            default:
+                break;
+        }
+        note("the name could not be settled: nobody is stored");
+        settleUnnamed(now);
+    }
+
+    private void addPhotoTo(long now, String id) {
+        idJoinId = id;
+        idStep = IdStep.ADDING;
+        idDeadline = now + tuning.meetTimeoutMs;
+        show(EyeState.THINKING, null);
+        port.addPhoto(id, tuning.meetTimeoutMs);
+    }
+
+    /** The photo joined them (R5, R6): they are met as known, with their notes; a refusal re-creates nobody (KTD12). */
+    private void photoStep(long now) {
+        CuriosityPort.MatchAnswer k = port.photoAdded();
+        if (k == null) {
+            if (now < idDeadline) {
+                return;
+            }
+            port.cancelAddPhoto();
+            k = CuriosityPort.MatchAnswer.FAILED;
+        }
+        if (k.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
+            note(idYes ? "a yes: the photo joined them; meeting them as known" : "the photo joined them; meeting them as known");
+            outcome(idYes ? CuriosityPort.Outcome.YES : CuriosityPort.Outcome.JOINED, idJoinId);
+            startAs(now, k);
+            return;
+        }
+        note("the store refused the photo (forgotten meanwhile?): nobody is re-created");
+        outcome(idYes ? CuriosityPort.Outcome.YES : CuriosityPort.Outcome.NAME_GIVEN, null);
+        if (idFromName || confirming == null) {
+            welcomeOnly(now, idFirst);
+        } else {
+            startAs(now, confirming);
+        }
+    }
+
+    /**
+     * Someone new under this name (R6, R7): on the conversation path kept at once
+     * and met as known with empty notes, never asked again; on the ladder stored
+     * by remember(), whose line promises to remember them. The store records the
+     * check's outcome itself.
+     */
+    private void storeAs(long now, String name) {
+        chatCheckOpen = false;
+        if (idChat) {
+            idName = name;
+            idStep = IdStep.KEEPING;
+            idDeadline = now + tuning.meetTimeoutMs;
+            port.keep(name, tuning.meetTimeoutMs);
+            return;
+        }
+        idStep = IdStep.NONE;
+        state = State.REMEMBER;
+        helloOnly = false;
+        meetDeadline = now + tuning.meetTimeoutMs;
+        show(EyeState.THINKING, null);
+        port.remember(name, tuning.meetTimeoutMs);
+    }
+
+    private void keepStep(long now) {
+        CuriosityPort.Kept k = port.keptAnswer();
+        if (k == null) {
+            if (now < idDeadline) {
+                return;
+            }
+            port.cancelKeep();
+            k = CuriosityPort.Kept.FAILED;
+        }
+        note(k.ok() ? "kept under a new record; meeting them as known" : "the store refused the keep; meeting them by name, unstored");
+        startAs(now, CuriosityPort.MatchAnswer.known(idName)
+                .withConversation(confirming.persona, k.ok() ? k.personId : null, null, null));
+    }
+
+    /**
+     * No last name came, or the name could not be settled (R21): nobody is stored.
+     * The conversation starts as with a stranger, the first name settled so it is
+     * not asked about again; the ladder says hello without a promise.
+     */
+    private void settleUnnamed(long now) {
+        outcome(CuriosityPort.Outcome.NAME_GIVEN, null);
+        if (idChat && confirming != null) {
+            chatSettled = idFirst;
+            startAs(now, confirming);
+        } else {
+            welcomeOnly(now, idFirst);
+        }
+    }
+
+    /** The ladder's hello with no promise to remember (R19), as for a reply without a name. */
+    private void welcomeOnly(long now, String name) {
+        idStep = IdStep.NONE;
+        state = State.REMEMBER;
+        helloOnly = true;
+        meetDeadline = now + tuning.meetTimeoutMs;
+        show(EyeState.THINKING, null);
+        port.welcome(name, tuning.meetTimeoutMs);
+    }
+
+    /** The meeting's face check gets its outcome (KTD8); the conversation then records none of its own. */
+    private void outcome(CuriosityPort.Outcome o, String joinedId) {
+        chatCheckOpen = false;
+        port.checkOutcome(o, joinedId);
+    }
+
+    /** A meeting ends: its face check, if still open, ends without an answer (KTD8); the identity state is dropped. */
+    private void closeMeeting() {
+        if (meetingHeld) {
+            port.meetingOver();
+        }
+        idStep = IdStep.NONE;
+        confirming = null;
+        idChat = false;
+        idFromName = false;
+        idYes = false;
+        idFirst = null;
+        idName = null;
+        idJoinId = null;
+        chatCheckOpen = true;
+        chatSettled = null;
+        ackUntil = NEVER;
     }
 
     /** Both person requests failed (KTD3): the detector's name clip, as before U4, and no asking. */
@@ -4676,7 +5041,7 @@ final class ExploreBrain {
             case FACE: case APPROACH: case MEET_LOOK: case MEET:
                 return sameSideAsPerson(c) ? CueVerdict.CONFIRM : CueVerdict.TAKE;
             case STARTLE: case BACK_OFF: case RETRACE: case CIRCLE: case WAY_OUT: case DRIVE_OFF:
-            case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP:
+            case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP: case CONFIRM: case LAST_NAME:
                 return CueVerdict.HOLD;
             default:
                 return CueVerdict.DROP;
@@ -4995,6 +5360,7 @@ final class ExploreBrain {
         note("a face turned toward him after the cue");
         port.clipWindow(tuning.ackClipMs);
         sound.playReaction("acknowledge");
+        ackUntil = now + tuning.ackClipMs + tuning.deafTailMs;
         Ears.Cue c = searchCue;
         chatCueSide = c == null ? null : sideOf(c);
         searchCue = null;
@@ -5106,7 +5472,7 @@ final class ExploreBrain {
         chat = new ChatSession(tuning, port, chatHost);
         state = State.CHAT_THINK;
         syncPark();
-        chat.start(now, a, faceless);
+        chat.start(now, a, faceless, chatCheckOpen, chatSettled);
         state = chatState(chat.state());
     }
 
@@ -5177,7 +5543,7 @@ final class ExploreBrain {
 
     /** The detector is parked through the CHAT states except for the one look the conversation asks for (KTD7). */
     private void syncPark() {
-        boolean want = (state.chats() || state == State.MEET && chatLikely()) && !chatLookWanted;
+        boolean want = (state.chats() || (state == State.MEET || state.confirms()) && chatLikely()) && !chatLookWanted;
         if (want != parked) {
             parked = want;
             if (!parked && cameraOpen) {
@@ -5296,6 +5662,7 @@ final class ExploreBrain {
         turnRetrying = false;
         cancelDoorway(clock.nowMs(), "lease or sensors lost");
         cancelMetCheck();
+        closeMeeting();
         gatedPick = null;
         remarkOnly = false;
         meetingHeld = false;

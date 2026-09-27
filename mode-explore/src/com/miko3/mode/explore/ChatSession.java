@@ -89,6 +89,13 @@ final class ChatSession {
      * turn 1 fails, and by the brain's degraded ladder when lines() fails.
      */
     static final String LOCAL_GREETING = "Hi, {name}!";
+    /**
+     * A close match's question and the last-name question (face plan U7, KTD6):
+     * fixed lines spoken through the on-device voice, never Claude's. {name} is
+     * the stored name the robot fills in.
+     */
+    static final String CONFIRM_QUESTION = "Is that you, {name}?";
+    static final String LAST_NAME_QUESTION = "And your last name?";
     static final String FORGOTTEN = "Done. I've forgotten you.";
     static final String KEPT = "Okay, keeping you.";
     static final String FORGET_FAILED = "That didn't work; I still remember you.";
@@ -101,12 +108,17 @@ final class ChatSession {
     private static final String[] NOT_FORGET = {"dont forget", "do not forget", "never forget", "wont forget",
             "will not forget"};
 
-    private enum Phase { NONE, WAIT_TURN, WAIT_CLIP, SAYING, CLIP_THEN_LISTEN, CLIP_THEN_END, LISTENING, LOOKING,
-        FORGETTING, PERSISTING }
+    private enum Phase { NONE, WAIT_TURN, RESOLVING, WAIT_CLIP, SAYING, CLIP_THEN_LISTEN, CLIP_THEN_END, LISTENING,
+        LOOKING, FORGETTING, PERSISTING }
+
+    /** Which answer the resolver owes (face plan U7, KTD6): a spoken name's, or the last name's. */
+    private enum Resolving { NONE, NAME, LAST_NAME }
 
     private final ExploreTuning tuning;
     private final CuriosityPort port;
     private final Host host;
+    /** The names in a reply by the robot's own patterns (the port's NameExtractor). */
+    private final AnswerParser.Names names;
     private State state;
     private Phase phase = Phase.NONE;
 
@@ -152,6 +164,26 @@ final class ChatSession {
     private boolean newcomerPending;
     private int newcomers;
 
+    // ---- who they are (face plan U7; KTD6, KTD10, R6, R7, R20, R21) ----
+    private Resolving resolving = Resolving.NONE;
+    private long resolveDeadline;
+    /** The turn's line, held while the name it came with is resolved; dropped for the last-name question. */
+    private String heldLine;
+    /** A name given on a first answer that was then re-requested for a repeat. */
+    private String heldGiven;
+    /** The first name waiting for its last name, the reply it came in, and the last-name reply. */
+    private String pendingFirst;
+    private String nameReply;
+    private String lastNameReply;
+    private boolean askingLastName;
+    /** A first name whose last name never came (R21): not resolved or asked again this conversation. */
+    private String settledName;
+    /** The meeting's face check still waits for its outcome (the brain has not recorded one). */
+    private boolean checkOpen = true;
+    private boolean photoPending;
+    private long photoDeadline;
+    private String photoFor;
+
     // ---- the store ----
     private boolean keepPending;
     private long keepDeadline;
@@ -173,6 +205,12 @@ final class ChatSession {
         this.port = port;
         this.host = host;
         this.state = State.CHAT_THINK;
+        this.names = new AnswerParser.Names() {
+            @Override
+            public String nameIn(String transcript) {
+                return ChatSession.this.port.nameIn(transcript);
+            }
+        };
     }
 
     State state() {
@@ -218,6 +256,17 @@ final class ChatSession {
      * once. faceless: no face was cut out, so nothing can ever be stored.
      */
     void start(long now, CuriosityPort.MatchAnswer a, boolean faceless) {
+        start(now, a, faceless, true, null);
+    }
+
+    /**
+     * As start(), after the brain's CONFIRM (face plan U7, KTD6): checkOpen is
+     * false when the brain already recorded the check's outcome, and settled is
+     * a first name whose last name never came, which is not asked about again.
+     */
+    void start(long now, CuriosityPort.MatchAnswer a, boolean faceless, boolean checkOpen, String settled) {
+        this.checkOpen = checkOpen;
+        this.settledName = settled;
         this.faceless = faceless;
         persona = a.persona == null ? "" : a.persona;
         String stored = a.name == null ? "" : a.name.trim();
@@ -248,6 +297,7 @@ final class ChatSession {
             host.note("charger connected: the conversation finishes and no resume leg is driven");
         }
         keepStep(now);
+        photoStep(now);
         notesStep(now);
         switch (state) {
             case CHAT_THINK:
@@ -260,7 +310,8 @@ final class ChatSession {
                 listenStep(now);
                 break;
             case CHAT_NOTES:
-                if (!deltaInFlight && (!persistWanted || buffer.isEmpty() || personId == null)) {
+                if (!deltaInFlight && !keepPending && !photoPending
+                        && (!persistWanted || buffer.isEmpty() || personId == null)) {
                     finished = true;
                     host.note("conversation over after " + turns + " turn(s), " + persisted + " note delta(s) kept");
                 }
@@ -311,6 +362,10 @@ final class ChatSession {
     }
 
     private void thinkStep(long now) {
+        if (phase == Phase.RESOLVING) {
+            resolveStep(now);
+            return;
+        }
         if (phase != Phase.WAIT_TURN) {
             return;
         }
@@ -374,15 +429,17 @@ final class ChatSession {
     /** The robot's side of KTD9: the name, the sentence cap, the repeat check, the notes delta, then the line. */
     private void onLine(long now, CuriosityPort.Turn t) {
         String given = validName(t.nameGiven);
-        if (given != null) {
-            nameGiven(now, given);
+        if (given == null) {
+            given = heldGiven;
         }
+        heldGiven = null;
         String line = capSentences(t.line);
         String q = normalize(t.questionAsked);
         if (!q.isEmpty() && asked.contains(q)) {
             long left = turnDeadline - now;
             if (!reRequested && left > 0) {
                 reRequested = true;
+                heldGiven = given;
                 host.note("the line asks a question already asked: one re-request in the " + left + " ms left");
                 port.turn(request.avoiding(t.questionAsked), left);
                 return;
@@ -404,32 +461,201 @@ final class ChatSession {
             host.note("the line deflects a task");
         }
         turns++;
+        if (given != null && nameGiven(now, given, line)) {
+            // The line waits for the resolver: the last-name question may replace it (KTD6).
+            return;
+        }
         speak(now, line, true);
     }
 
     /**
-     * A name given in the conversation (KTD10): a stranger's is kept at once under
-     * a new record with the retained crop; one that differs from a known match's
-     * stored name is a mismatch, so a new record takes the whole buffer and the
-     * old id is never written. With no face there is nothing to store (R19).
+     * A name given in the conversation (face plan U7, KTD6, R20): it goes to the
+     * resolver on the port, which joins a stored person, asks the last name or
+     * stores someone new; this replaces the meeting plan's KTD10 mismatch rule,
+     * under which a differing name always made a new record. The turn's line
+     * waits for the answer (true). A name equal to the one already resolved, or a
+     * first name whose last name never came, is a no-op; with no face nothing can
+     * be stored (R19) and the name is just used.
      */
-    private void nameGiven(long now, String given) {
-        if (name != null && name.equalsIgnoreCase(given)) {
+    private boolean nameGiven(long now, String given, String line) {
+        if (sameName(given)) {
+            return false;
+        }
+        if (faceless) {
+            host.note("a name given; no face to keep them by, so nothing is stored");
+            name = given;
+            personId = null;
+            asked.clear();
+            notes = null;
+            return false;
+        }
+        host.note(name == null ? "a name given: checking it against the people stored"
+                : "a name given that differs from the stored one: checking it against the people stored");
+        heldLine = line;
+        pendingFirst = given;
+        nameReply = heard;
+        startResolve(now, Resolving.NAME);
+        port.resolveName(given, tuning.meetTimeoutMs);
+        return true;
+    }
+
+    /** The name already in use (or its first word), or a first name settled without a last name. */
+    private boolean sameName(String given) {
+        if (name != null && (AnswerParser.same(name, given) || (given.trim().indexOf(' ') < 0
+                && given.trim().equalsIgnoreCase(NameResolver.firstWord(name))))) {
+            return true;
+        }
+        return settledName != null && AnswerParser.same(settledName, given);
+    }
+
+    private void startResolve(long now, Resolving what) {
+        state = State.CHAT_THINK;
+        phase = Phase.RESOLVING;
+        resolving = what;
+        resolveDeadline = now + tuning.meetTimeoutMs;
+        host.eyes(ExploreBrain.EyeState.THINKING, null);
+    }
+
+    /** The resolver's answer (KTD10): join, store someone new, or ask the last name. */
+    private void resolveStep(long now) {
+        CuriosityPort.Resolved r = port.resolved();
+        if (r == null) {
+            if (now < resolveDeadline) {
+                return;
+            }
+            port.cancelResolve();
+            host.note("the store did not answer about the name in time");
+            r = CuriosityPort.Resolved.FAILED;
+        }
+        Resolving from = resolving;
+        resolving = Resolving.NONE;
+        switch (r.status) {
+            case JOIN:
+                join(now, r.personId, r.name != null ? r.name : pendingFirst);
+                break;
+            case NEW:
+                storeNew(now, r.name);
+                break;
+            case ASK_LAST_NAME:
+                if (from == Resolving.NAME) {
+                    askLastName(now);
+                    return;
+                }
+                // A last name cannot ask again: nobody is stored.
+                settle(now);
+                break;
+            default:
+                host.note("the name could not be checked: nothing is stored");
+                if (from == Resolving.LAST_NAME) {
+                    settle(now);
+                }
+                break;
+        }
+        afterResolve(now, from);
+    }
+
+    /** Back to the conversation: the held line is said, or after the last name the next turn goes out with both replies. */
+    private void afterResolve(long now, Resolving from) {
+        if (from == Resolving.LAST_NAME) {
+            transcript.add(new CuriosityPort.Exchange(nameReply, LAST_NAME_QUESTION));
+            requestTurn(now, lastNameReply);
             return;
         }
-        if (name == null) {
-            host.note("a name given" + (faceless ? "; no face to keep them by, so nothing is stored" : ": keeping the face"));
-        } else {
-            host.note("the name given differs from the stored one: a new record takes the notes; the old id is never written");
-        }
-        name = given;
+        String line = heldLine;
+        heldLine = null;
+        speak(now, line == null || line.isEmpty() ? CANNED_NO_QUESTION : line, true);
+    }
+
+    /**
+     * A join (R6, R20): this conversation's notes buffer moves to the joined id
+     * once the photo is added; their older notes are not loaded mid-conversation,
+     * because the prefix is frozen.
+     */
+    private void join(long now, String id, String storedName) {
+        host.note("the name belongs to someone stored whose face is close enough: adding the photo to them");
+        name = storedName;
+        personId = null;
+        notes = null;
+        asked.clear();
+        photoPending = true;
+        photoFor = id;
+        photoDeadline = now + tuning.meetTimeoutMs;
+        port.addPhoto(id, tuning.meetTimeoutMs);
+    }
+
+    /** Someone new under this name (R7): kept with the retained crop; the conversation continues known, not asked again. */
+    private void storeNew(long now, String newName) {
+        host.note("nobody stored has that name" + (resolvingLastName() ? " and last name" : "") + ": keeping the face");
+        name = newName;
         personId = null;
         asked.clear();
         notes = null;
-        if (!faceless) {
-            keepPending = true;
-            keepDeadline = now + tuning.meetTimeoutMs;
-            port.keep(given, tuning.meetTimeoutMs);
+        checkOpen = false;
+        keepPending = true;
+        keepDeadline = now + tuning.meetTimeoutMs;
+        port.keep(newName, tuning.meetTimeoutMs);
+    }
+
+    private boolean resolvingLastName() {
+        return lastNameReply != null;
+    }
+
+    /** "And your last name?" in place of the turn's line (KTD6); the reply is listened for once. */
+    private void askLastName(long now) {
+        host.note("the name matches someone stored but the face is weak for them: asking the last name; the turn's line is dropped");
+        heldLine = null;
+        askingLastName = true;
+        speak(now, LAST_NAME_QUESTION, false);
+    }
+
+    /**
+     * No last name came (R21): nobody is stored and the conversation runs unnamed;
+     * the first name is not asked about again. The exchange joins the transcript.
+     */
+    private void declineLastName(long now) {
+        host.note("no last name came: nobody is stored and the conversation runs unnamed");
+        transcript.add(new CuriosityPort.Exchange(nameReply, LAST_NAME_QUESTION));
+        settle(now);
+    }
+
+    private void settle(long now) {
+        settledName = pendingFirst;
+        pendingFirst = null;
+        name = null;
+        personId = null;
+        notes = null;
+        asked.clear();
+        if (checkOpen) {
+            checkOpen = false;
+            port.checkOutcome(CuriosityPort.Outcome.NAME_GIVEN, null);
+        }
+    }
+
+    private void photoStep(long now) {
+        if (!photoPending) {
+            return;
+        }
+        CuriosityPort.MatchAnswer a = port.photoAdded();
+        if (a == null) {
+            if (now < photoDeadline) {
+                return;
+            }
+            port.cancelAddPhoto();
+            photoPending = false;
+            host.note("the store did not answer the photo in time; the conversation runs unnamed");
+            return;
+        }
+        photoPending = false;
+        if (a.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
+            personId = photoFor;
+            persistWanted = true;
+            host.note("the photo joined them: the notes persist to them now");
+            if (checkOpen) {
+                checkOpen = false;
+                port.checkOutcome(CuriosityPort.Outcome.JOINED, photoFor);
+            }
+        } else {
+            host.note("the store refused the photo (forgotten meanwhile): nobody is re-created and the conversation runs unnamed");
         }
     }
 
@@ -593,6 +819,18 @@ final class ChatSession {
     private void onHeard(long now, String text) {
         unanswered = 0;
         glanceIfNewcomer(now);
+        if (askingLastName) {
+            askingLastName = false;
+            String last = AnswerParser.lastName(text, pendingFirst, names);
+            if (last != null) {
+                lastNameReply = text;
+                startResolve(now, Resolving.LAST_NAME);
+                port.resolveLastName(last, tuning.meetTimeoutMs);
+                return;
+            }
+            // Not a last name: nobody is stored, and the reply is taken as any other.
+            declineLastName(now);
+        }
         if (confirmingForget) {
             confirmingForget = false;
             if (affirmative(text)) {
@@ -633,6 +871,10 @@ final class ChatSession {
     private void onUnanswered(long now) {
         unanswered++;
         confirmingForget = false;
+        if (askingLastName) {
+            askingLastName = false;
+            declineLastName(now);
+        }
         glanceIfNewcomer(now);
         if (endOnCharger) {
             signOff(now);
@@ -712,6 +954,10 @@ final class ChatSession {
     private void signOff(long now) {
         ending = true;
         port.cancelTurn();
+        if (resolving != Resolving.NONE) {
+            resolving = Resolving.NONE;
+            port.cancelResolve();
+        }
         signedOff = true;
         playClip(now, CLIP_SIGN_OFF, Phase.CLIP_THEN_END);
     }
@@ -721,7 +967,7 @@ final class ChatSession {
         state = State.CHAT_NOTES;
         phase = Phase.PERSISTING;
         host.eyes(ExploreBrain.EyeState.THINKING, null);
-        if (personId == null) {
+        if (personId == null && !keepPending && !photoPending) {
             if (!buffer.isEmpty()) {
                 host.note("unnamed: " + buffer.size() + " note delta(s) discarded (R19)");
                 buffer.clear();
