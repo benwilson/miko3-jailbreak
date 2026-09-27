@@ -2,6 +2,8 @@
 
 The running list of what is left to do on the robot's modes. Add to it when something comes up, and tick items off (or delete them) in the PR that finishes them.
 
+Everything below that needs the robot is sequenced into one session in `docs/robot-return.md`. Start there when the robot is back.
+
 ## Explore mode
 
 - [ ] **Measurement session gaps (meeting plan U2).** `scripts/qa-ears-probe.py --session` and `scripts/claude-chat-bench.py` cover the direction angle, decode time, phrase match, CPU and launcher RSS, the shove signature and the ten-turn conversation. What the scripts cannot yet measure, because no device route exposes it:
@@ -26,6 +28,7 @@ The running list of what is left to do on the robot's modes. Add to it when some
   - Bench (U9): `python3 scripts/robot-faces.py checks --save`, then `python3 scripts/face-bench.py`. Record the suggested confident and close thresholds, the margin, the dark/dim/blur/width gates and the input size, and whether any impostor (including each held-out person against everyone else's full photo set) landed in the confident band. That is stop condition 2: if no threshold keeps impostors out while greeting most genuine captures, the bands do not ship.
   - QA (U10): first `python3 scripts/qa-conversation.py --latency before` on the build already on the robot (five meetings, face found to first sound, written to `tools/face-bench/latency-before.json`), then `--latency after`, which installs both APKs and prints the median and worst case before against after. Then `python3 scripts/qa-conversation.py --owner "<name>" --helper "<name>"`. Record the greet count (at least 4 of 5), any greeting by another person's name (there must be none), the pass list of face AE1 to AE9, and for every miss the reason the face-check list gives (a rejected crop, a weak score or a close question).
   - Any threshold or gate value the QA contradicts goes here as its own item, with the face-check rows that showed it.
+- [ ] **Camera navigation: the owner's nav QA run (PR #17).** `python3 scripts/qa-explore-mode.py --only nav`: the five-try wedge protocol, the doorway, a person plus the ten-minute leave-alone, CPU temperature and battery. Everything else in the nav plan was verified live on 2026-09-25.
 - [ ] **Roaming recognition on the on-device matcher (the face plan's recorded next step).** Faces are matched on the robot only at a meeting stop. The roaming recently-met check (`ClaudeCuriosity.checkRecentlyMet`) still sends faces to Claude. Move it to the on-device matcher once the matcher and its thresholds are trusted from the QA run above.
 - [ ] **Live direction-angle trend.** KTD4 stops the turn when the angle starts growing (the voice was behind him), but the Binder carries only the angle latched over the utterance, so the turn stops on the side and the camera decides. A live 10 Hz angle feed during CUE_TURN is a launcher-side addition.
 - [ ] **Appearance remarks (the owner's direction, a later plan).** He may comment on what he sees, still bounded by the workplace rule (R13, R14). The owner chose "read and remark" over quiet tailoring and sliced it out of the meeting plan so the first slice shipped address, turning, conversation, notes and persona.
