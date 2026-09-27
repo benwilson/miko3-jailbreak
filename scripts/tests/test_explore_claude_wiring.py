@@ -153,17 +153,33 @@ class EarsAdapterWiringTest(unittest.TestCase):
 
     def test_the_ears_follow_the_charger_latch(self):
         brain = code_only(src("ExploreBrain.java"))
-        sync = re.search(r"private void syncEars\(\)\s*\{(.*?)\n    \}", brain, re.S)
+        sync = re.search(r"private void syncEars\(long now\)\s*\{(.*?)\n    \}", brain, re.S)
         self.assertIsNotNone(sync)
         self.assertIn("classifier.charger()", sync.group(1))
         self.assertIn("port.earsOpen()", sync.group(1))
         self.assertIn("port.earsClose()", sync.group(1))
+        # A session the launcher dropped is noticed here too (the reopen backoff below).
+        self.assertIn("ears.listening()", sync.group(1))
         a = code_only(src("EarsAdapter.java"))
         reading = re.search(r"public void onReading\(SensorReading r\)\s*\{(.*?)\n    \}", a, re.S)
         self.assertIsNotNone(reading)
         self.assertIn("c.setCharger(r.charger)", reading.group(1))
         self.assertIn("new Ears.Shove(", reading.group(1))
         self.assertIn("c.open(charger, this)", a)
+
+    def test_a_lost_ears_session_reopens_on_the_drive_lease_ladder(self):
+        """One ladder for both: a launcher restart brings the ears back with the wheels (meeting plan, launcher restart)."""
+        brain = code_only(src("ExploreBrain.java"))
+        drive = code_only(src("ExploreDrive.java"))
+        for ours, theirs in (("EARS_REOPEN_BASE_MS", "LEASE_RETRY_BASE_MS"), ("EARS_REOPEN_MAX_MS", "LEASE_RETRY_MAX_MS")):
+            b = re.search(r"long " + ours + r" = (\d+);", brain)
+            d = re.search(r"long " + theirs + r" = (\d+);", drive)
+            self.assertIsNotNone(b, ours)
+            self.assertIsNotNone(d, theirs)
+            self.assertEqual(b.group(1), d.group(1), ours)
+        # The same doubling, capped after the fourth step.
+        self.assertRegex(brain, r"EARS_REOPEN_BASE_MS << Math\.min\(earsReopenAttempt, 4\), EARS_REOPEN_MAX_MS")
+        self.assertRegex(drive, r"LEASE_RETRY_BASE_MS << Math\.min\(leaseRetryAttempt - 1, 4\), LEASE_RETRY_MAX_MS")
 
     def test_a_listen_that_ends_in_silence_retires_its_reply(self):
         a = code_only(src("EarsAdapter.java"))

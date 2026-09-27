@@ -646,6 +646,9 @@ final class ExploreBrain {
     private CuriosityPort.MatchAnswer stranger;
     /** A clock field's "never": far enough below any tick that now - NEVER cannot overflow. */
     static final long NEVER = Long.MIN_VALUE / 4;
+    /** A lost ears session is reopened on the drive lease's backoff (ExploreDrive.LEASE_RETRY_*): 2 s doubling to 30 s. */
+    private static final long EARS_REOPEN_BASE_MS = 2000;
+    private static final long EARS_REOPEN_MAX_MS = 30000;
     /** When the camera last closed, for its reopen gap (tuning.reopenGapMs). */
     private long cameraClosedAt = NEVER;
 
@@ -814,8 +817,16 @@ final class ExploreBrain {
     // ---- cues, the turn to the voice and the look that decides (meeting plan U7) ----
     /** When the last motor command went out (TimedMotor): the shove cue's blanking window. */
     private long lastMotorCommandAt = NEVER;
-    /** Whether the launcher's ears session is open (follows the charger latch, KTD6). */
+    /**
+     * Whether the brain wants the launcher's ears session open (follows the charger latch, KTD6).
+     * The session itself can die underneath (ears.listening() false while this is true): that
+     * is a lost session, reopened on the drive lease's backoff below.
+     */
     private boolean earsOpen;
+    /** Reopens fired since the session was lost; 0 while it holds. */
+    private int earsReopenAttempt;
+    /** When the lost session's next reopen (or the check that the last one held) is due; NEVER while it holds. */
+    private long earsReopenDueAt = NEVER;
     /** The cue waiting for a state that can take it (KTD3's replacement rule), or null. */
     private Ears.Cue cueHeld;
     /** The cue being searched for in CUE_TURN and CUE_LOOK, or null. */
@@ -986,7 +997,7 @@ final class ExploreBrain {
         state = State.STOPPED;
         syncCamera();
         syncMoving();
-        syncEars();
+        syncEars(clock.nowMs());
         note("shutdown");
     }
 
@@ -4378,26 +4389,74 @@ final class ExploreBrain {
 
     private enum CueVerdict { TAKE, HOLD, DROP, CONFIRM }
 
-    /** Opens and closes the launcher's ears with the charger latch (KTD6) and at shutdown. */
-    private void syncEars() {
+    /**
+     * Opens and closes the launcher's ears with the charger latch (KTD6) and at shutdown, and
+     * reopens a session that died while wanted (a launcher restart is a lease loss and an
+     * ears-session loss at once, meeting plan: "re-opens the ears with the same backoff the
+     * drive lease uses"). The backoff mirrors ExploreDrive.scheduleLeaseRetry: the loss is
+     * noticed, the first reopen fires 2 s later, then 4, 8, 16 and 30 s apart until one holds.
+     */
+    private void syncEars(long now) {
         // A conversation already open finishes on the charger (KTD6): the ears stay with it.
         boolean want = ears.present() && state != State.STOPPED && (!classifier.charger() || state.chats());
-        if (want == earsOpen) {
+        if (want != earsOpen) {
+            earsOpen = want;
+            earsReopenAttempt = 0;
+            earsReopenDueAt = NEVER;
+            if (want) {
+                note("ears open");
+                port.earsOpen();
+            } else {
+                note("ears closed: " + (state == State.STOPPED ? "stopping" : "on the charger"));
+                port.earsClose();
+            }
             return;
         }
-        earsOpen = want;
-        if (want) {
-            note("ears open");
-            port.earsOpen();
-        } else {
-            note("ears closed: " + (state == State.STOPPED ? "stopping" : "on the charger"));
-            port.earsClose();
+        if (!want) {
+            return;
         }
+        // Wanted and believed open: listening() false means the launcher dropped the session.
+        // A reopen reads as listening the moment it is called, before its bind completes, and
+        // a failing bind (an older launcher, a restart still coming up) reports lost again
+        // shortly after; so the attempt count is not reset on that first true. It resets only
+        // when the next due time arrives and the session is still alive, which is what keeps
+        // a flapping session backing off to the cap (one bind per interval) instead of
+        // binding every 2 s forever.
+        if (earsReopenDueAt == NEVER) {
+            if (!ears.listening()) {
+                long delay = scheduleEarsReopen(now);
+                note("ears lost: reopening in " + delay + "ms (attempt 1)");
+            }
+            return;
+        }
+        if (now < earsReopenDueAt) {
+            return;
+        }
+        if (ears.listening()) {
+            note("ears back after " + earsReopenAttempt + " attempt(s)");
+            earsReopenAttempt = 0;
+            earsReopenDueAt = NEVER;
+            return;
+        }
+        earsReopenAttempt++;
+        port.earsOpen();
+        long delay = scheduleEarsReopen(now);
+        note("ears reopen attempt " + earsReopenAttempt + ": next look in " + delay + "ms");
+    }
+
+    /**
+     * Sets when the lost session is next looked at, on the doubling delay of
+     * ExploreDrive.scheduleLeaseRetry (2, 4, 8, 16, then 30 s), and returns that delay.
+     */
+    private long scheduleEarsReopen(long now) {
+        long delay = Math.min(EARS_REOPEN_BASE_MS << Math.min(earsReopenAttempt, 4), EARS_REOPEN_MAX_MS);
+        earsReopenDueAt = now + delay;
+        return delay;
     }
 
     /** Once per step: the queue, the angle trend, a shove, then the held cue's clock. */
     private void drainEars(long now) {
-        syncEars();
+        syncEars(now);
         List<Ears.Cue> cues = ears.drain();
         Ears.Trend t = ears.trend();
         if (t != null) {
