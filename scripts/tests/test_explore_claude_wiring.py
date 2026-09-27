@@ -554,6 +554,29 @@ class OnDeviceMatchWiringTest(unittest.TestCase):
             self.assertIn(".probe", b, sig)
         self.assertNotIn("RobotPeopleClient.add(", self.a)
 
+    def test_a_late_match_cannot_reach_the_next_meeting(self):
+        # PR #23 review P1: a match that outlives its meeting must not publish into the next one.
+        # The opener's crop and touch()'s id come from the current meeting's own record,
+        # never from adapter-wide fields a stale worker could still write.
+        for gone in ("meetFace", "matchedId"):
+            self.assertNotIn(gone, self.a, gone)
+        turn = self.body("public void turn(")
+        self.assertIn("meeting", turn)
+        self.assertIn(".storeCrop", turn)
+        touch = self.body("public void touch(")
+        self.assertIn("meeting", touch)
+        self.assertIn(".storeId", touch)
+
+    def test_a_check_recorded_after_its_meeting_ended_is_closed(self):
+        # match() publishes the new meeting before closing the old one's check, and record()
+        # keeps the handle before asking whether its meeting is still current: whichever runs
+        # second sees the other's write, so a late check never stays pending.
+        match = self.body("public void match(")
+        self.assertLess(match.index("meeting = mf;"), match.index("FaceCheck.ENDED_WITHOUT_ANSWER"))
+        record = self.body("private long record(")
+        self.assertLess(record.index("mf.checkHandle = h;"), record.index("meeting != mf"))
+        self.assertIn("FaceCheck.ENDED_WITHOUT_ANSWER", record[record.index("meeting != mf"):])
+
     def test_the_embedder_is_freed_on_release(self):
         self.assertIn("embedder.close()", self.body("void release()"))
 
@@ -673,7 +696,7 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertIn("ExplorePrompts.openerAsk(request.name)", turn)
         self.assertIn("ExplorePrompts.avoidQuestion(request.avoidQuestion)", turn)
         self.assertIn("ClaudeApi.jpegBlock(face)", turn)
-        self.assertIn("request.heard == null && request.transcript.isEmpty() ? meetFace : null", a)
+        self.assertIn("request.heard == null && request.transcript.isEmpty() && met != null\n                ? met.storeCrop : null", a)
         self.assertIn("NameExtractor.validName(t.nameGiven)", a)
         self.assertIn("RobotPeopleClient.mergeNotes(app, personId, notesUpdate)", a)
         self.assertIn("RobotPeopleClient.forget(app, personId)", a)

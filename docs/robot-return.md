@@ -105,9 +105,8 @@ Decisions the results may force:
 - **A meeting stop condition fires** (step 4): build the keyword-spotter fallback, or drop the turn to the voice, or stop and rethink the speech promise. Each is named in the meeting plan's KTD13.
 - **Face stop condition 2, or any wrong name** (steps 5 and 6): the bands don't ship as they are. Decide between retuning, more photos per person, or a different model.
 - **Open face-review findings to weigh with the results**, from PR #23:
-  - P1: a match that finishes after its meeting timed out can overwrite the next meeting's face and person.
   - Face models can start while a detector frame is still in flight.
   - The name-resolution flow is duplicated in two places.
   - SFace loads cold on the first meeting after each mode start.
-  - None was seen live yet. If step 6 shows wrong people or odd timing, suspect the first two.
+  - None was seen live yet. If step 6 shows odd timing, suspect the first one. The P1 late-match finding (a match overwriting the next meeting) is fixed in PR #26.
 - **After this session**, the recorded next step for faces is roaming recognition on the on-device matcher (`docs/TODO.md`).

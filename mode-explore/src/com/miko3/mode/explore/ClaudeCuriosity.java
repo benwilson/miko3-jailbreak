@@ -145,14 +145,6 @@ final class ClaudeCuriosity implements CuriosityPort {
     private static final String TURN_EFFORT = "low";
 
     /**
-     * The storable crop of the last match() (the brightened loose crop, KTD3),
-     * sent once with the conversation's opener; null when the meeting is
-     * faceless. And the id it matched, for touch().
-     */
-    private volatile byte[] meetFace;
-    private volatile String matchedId;
-
-    /**
      * Someone met (explore nav plan U7): the face their meeting's match cut out, in
      * memory only and never written anywhere, and their people-store id once known
      * (matched, or stored by remember()). The recently-met check compares against the
@@ -469,7 +461,10 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public void turn(final TurnRequest request, final long timeoutMs) {
         final int g = turns.start();
-        final byte[] face = request.heard == null && request.transcript.isEmpty() ? meetFace : null;
+        // The opener carries the current meeting's own crop, never one a late match left behind.
+        final MetFace met = meeting;
+        final byte[] face = request.heard == null && request.transcript.isEmpty() && met != null
+                ? met.storeCrop : null;
         run(new Runnable() {
             @Override
             public void run() {
@@ -589,9 +584,6 @@ final class ClaudeCuriosity implements CuriosityPort {
                     d = Done.FAILED;
                 }
                 if (d.ok()) {
-                    if (personId.equals(matchedId)) {
-                        matchedId = null;
-                    }
                     for (MetFace mf : metFaces.values()) {
                         if (personId.equals(mf.storeId)) {
                             mf.storeId = null;
@@ -686,7 +678,6 @@ final class ClaudeCuriosity implements CuriosityPort {
                 Kept k;
                 try {
                     String id = RobotPeopleClient.addPerson(app, face, name, FaceMatcher.MODEL_ID, probe);
-                    matchedId = id;
                     mf.storeId = id;
                     checkOutcome(mf, FaceCheck.NEW_PERSON, id);
                     k = Kept.done(id);
@@ -878,12 +869,12 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public void match(final byte[] frameJpeg, final Detection personBox, final long timeoutMs) {
         final int g = matches.start();
-        meetFace = null;
-        matchedId = null;
-        // A check still waiting for an answer ends "without an answer" (KTD8).
-        checkOutcome(meeting, FaceCheck.ENDED_WITHOUT_ANSWER, null);
+        // Publish the new meeting first, then close the old one's check (KTD8): a late
+        // record() that misses this close sees the new meeting and closes its own (record()).
+        final MetFace previous = meeting;
         final MetFace mf = new MetFace();
         meeting = mf;
+        checkOutcome(previous, FaceCheck.ENDED_WITHOUT_ANSWER, null);
         run(new Runnable() {
             @Override
             public void run() {
@@ -980,7 +971,6 @@ final class ClaudeCuriosity implements CuriosityPort {
         mf.close = settings.close;
         mf.probe = probe;
         mf.storeCrop = storable;
-        meetFace = storable;
         if (r.band == FaceMatcher.Band.CONFIDENT) {
             String stored;
             try {
@@ -989,7 +979,6 @@ final class ClaudeCuriosity implements CuriosityPort {
                 stored = null;
             }
             if (stored != null) {
-                matchedId = r.bestId;
                 mf.storeId = r.bestId;
                 // A nameless record takes the stranger path (KTD10): no id for the conversation.
                 return forConversation(MatchAnswer.known(stored.isEmpty() ? null : stored)
@@ -1159,7 +1148,6 @@ final class ClaudeCuriosity implements CuriosityPort {
         try {
             int slot = RobotPeopleClient.addPhoto(app, id, face, FaceMatcher.MODEL_ID, probe);
             String stored = RobotPeopleClient.nameOf(app, id);
-            matchedId = id;
             mf.storeId = id;
             Log.i(TAG, "photo added to id " + id + " in slot " + slot);
             FaceMatcher.Result r = mf.result;
@@ -1310,6 +1298,11 @@ final class ClaudeCuriosity implements CuriosityPort {
             h = -1;
         }
         mf.checkHandle = h;
+        // A match that outlived its meeting (PR #23 review P1): match() closed that meeting's
+        // check before this handle existed, so close it here; the second close is a no-op.
+        if (h >= 0 && meeting != mf) {
+            checkOutcome(mf, FaceCheck.ENDED_WITHOUT_ANSWER, null);
+        }
         return h;
     }
 
@@ -1441,7 +1434,9 @@ final class ClaudeCuriosity implements CuriosityPort {
 
     @Override
     public void touch() {
-        final String id = matchedId;
+        // The id the current meeting matched or stored; a late match cannot set it.
+        final MetFace met = meeting;
+        final String id = met == null ? null : met.storeId;
         if (id == null) {
             return;
         }
