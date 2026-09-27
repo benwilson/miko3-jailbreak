@@ -2580,6 +2580,34 @@ public final class ExploreBrainHarness {
                             && !store.calls.contains("unusable a/0") && !FaceMigration.ready(store.photos),
                     "outcome=" + o + " calls=" + store.calls);
         });
+        scenario("face_migration_retries_a_waiting_photo_after_a_backoff", n -> {
+            FakeFaceStore store = new FakeFaceStore().photo("a", 0, true, "broken");
+            FaceMigration m = new FaceMigration(store, FAKE_FACES, () -> true);
+            boolean dueFresh = m.due(0);
+            m.pass();
+            boolean dueAtOnce = m.due(1000);
+            boolean dueEarly = m.due(60999);
+            boolean dueLater = m.due(61000);
+            m.pass();
+            boolean dueAfterSecond = m.due(62000) || m.due(62000 + 119999);
+            boolean dueDoubled = m.due(62000 + 120000);
+            store.jpegs.put("a/0", "face".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            FaceMigration.Outcome third = m.pass();
+            boolean dueWhenReady = m.due(10_000_000);
+            FakeFaceStore gone = new FakeFaceStore().photo("b", 0, true, "face");
+            gone.tooOld = true;
+            FaceMigration failed = new FaceMigration(gone, FAKE_FACES, () -> true);
+            failed.pass();
+            boolean failedEarly = failed.due(0);
+            boolean failedLater = failed.due(60000);
+            check(n, dueFresh && !dueAtOnce && !dueEarly && dueLater && !dueAfterSecond && dueDoubled
+                            && third == FaceMigration.Outcome.DONE && m.ready() && m.settled() && !dueWhenReady
+                            && store.calls.contains("embed a/0 128") && !failedEarly && failedLater,
+                    "fresh=" + dueFresh + " once=" + dueAtOnce + " early=" + dueEarly + " later=" + dueLater
+                            + " second=" + dueAfterSecond + " doubled=" + dueDoubled + " third=" + third
+                            + " ready=" + dueWhenReady + " failed=" + failedEarly + "/" + failedLater
+                            + " calls=" + store.calls);
+        });
         scenario("face_migration_settles_without_readiness_when_the_launcher_is_too_old", n -> {
             FakeFaceStore store = new FakeFaceStore().photo("a", 0, true, "face");
             store.tooOld = true;

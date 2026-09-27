@@ -427,6 +427,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "face_migration_marks_a_faceless_photo_unusable_and_becomes_ready",
         "face_migration_runs_only_while_the_gate_is_open_and_resumes",
         "face_migration_leaves_a_photo_waiting_when_the_models_fail",
+        "face_migration_retries_a_waiting_photo_after_a_backoff",
         "face_migration_settles_without_readiness_when_the_launcher_is_too_old",
         # Confirming a close match and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12; AE2-AE4, AE7-AE9)
         "confirm_chat_ae2_yes_adds_the_photo_and_starts_known_with_their_notes",

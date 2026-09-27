@@ -77,8 +77,14 @@ final class FaceMigration {
     private final Faces faces;
     private final Gate gate;
 
+    /** How long a pass that left photos waiting rests before the next try, doubling up to the cap. */
+    static final long FIRST_RETRY_MS = 60_000;
+    static final long MAX_RETRY_MS = 15 * 60_000;
+
     private volatile boolean settled;
     private volatile boolean ready;
+    private long retryAt;
+    private long backoffMs = FIRST_RETRY_MS;
     private volatile int embedded;
     private volatile int unusable;
     private volatile int waiting;
@@ -162,6 +168,31 @@ final class FaceMigration {
         } catch (IOException e) {
             return false;
         }
+    }
+
+    /**
+     * Whether a pass should start now: none has run to its end yet, or the last one
+     * left photos waiting (a failed fetch, model or gallery read) and its backoff has
+     * passed. Without the retry one transient failure would leave every meeting of the
+     * run not ready (R18). The first call after such a pass starts the backoff.
+     */
+    synchronized boolean due(long now) {
+        if (!settled) {
+            return true;
+        }
+        if (ready) {
+            return false;
+        }
+        if (retryAt == 0) {
+            retryAt = now + backoffMs;
+            backoffMs = Math.min(backoffMs * 2, MAX_RETRY_MS);
+            return false;
+        }
+        if (now < retryAt) {
+            return false;
+        }
+        retryAt = 0;
+        return true;
     }
 
     /** A pass has run to its end (done or failed); an interrupted pass leaves this false. */

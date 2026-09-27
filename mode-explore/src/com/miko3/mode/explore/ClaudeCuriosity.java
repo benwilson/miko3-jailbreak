@@ -1351,9 +1351,13 @@ final class ClaudeCuriosity implements CuriosityPort {
         }
     }
 
-    /** One pass on the worker, unless one is running or the last one finished (an interrupted pass resumes). */
+    /** One pass on the worker, unless one is running or none is due (an interrupted pass resumes, a partial one retries). */
     private void runMigration() {
-        if (released || migration.settled() || !faceWorkAllowed || !migrating.compareAndSet(false, true)) {
+        if (released || !faceWorkAllowed || !migrating.compareAndSet(false, true)) {
+            return;
+        }
+        if (!migration.due(System.currentTimeMillis())) {
+            migrating.set(false);
             return;
         }
         run(new Runnable() {
