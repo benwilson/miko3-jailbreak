@@ -89,6 +89,8 @@ class PeopleStoreHarnessTest(unittest.TestCase):
         "notes_for_unknown_id_are_empty",
         "malformed_notes_file_loads_as_empty",
         "gallery_excludes_nameless_records_store_still_lists_them",
+        "add_refuses_a_missing_name_and_writes_nothing",
+        "legacy_nameless_index_row_still_loads_and_stays_out_of_the_gallery",
         "entries_are_cleaned_and_matched_on_normalised_text",
         "index_read_failure_skips_the_orphan_sweep",
     )
@@ -165,6 +167,19 @@ class StoreSourceTest(unittest.TestCase):
         self.assertIn("delete()", load or "")
         recent = _method_body(src, "synchronized List<Person> recent")
         self.assertRegex(recent or "", r"name\.isEmpty\(\)")
+
+    def test_add_refuses_a_missing_name_before_any_write(self):
+        """R19: a person is only stored once he has a name; the refusal comes
+        before the face file or the index row is written, and the loader still
+        keeps legacy nameless rows (plan line 322)."""
+        src = _read(STORE)
+        self.assertRegex(src, r'static final String REFUSE_NO_NAME = "[^"]+";')
+        add = _method_body(src, "synchronized String add") or ""
+        self.assertIn("REFUSE_NO_NAME", add)
+        self.assertLess(add.index("REFUSE_NO_NAME"), add.index("writeDurably"))
+        read = _method_body(src, "private boolean readIndex") or ""
+        self.assertNotIn("REFUSE_NO_NAME", read)
+        self.assertNotIn("isEmpty()", read)
 
     def test_a_torn_index_read_skips_the_orphan_sweep(self):
         src = _read(STORE)

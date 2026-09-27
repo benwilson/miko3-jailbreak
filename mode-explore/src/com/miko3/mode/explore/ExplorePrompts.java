@@ -134,22 +134,23 @@ final class ExplorePrompts {
 
     static final Map<String, Object> NAME_SCHEMA = object("name", type("string"));
 
-    /** With the new person's face: the "I'll remember you" line (name null: they didn't give one). */
-    static String rememberAsk(String nameOrNull) {
+    /** With the new person's face: the "I'll remember you" line. Only ever asked with a name:
+     * nobody is stored without one (R19), so a nameless reply gets welcomeAsk() instead. */
+    static String rememberAsk(String name) {
         return "This is someone Miko has just met. "
-                + (nameOrNull == null
-                ? "They answered him but he didn't catch a name. "
-                : "They told him their name is " + nameOrNull + ". ")
+                + "They told him their name is " + name + ". "
                 + "Write the line he says next: a warm, personal, excited \"nice to meet you\""
-                + (nameOrNull == null ? "" : " that uses their name")
+                + " that uses their name"
                 + ", with a compliment about something you see, telling them he will remember them.";
     }
 
     static final Map<String, Object> REMEMBER_SCHEMA = object("line", type("string"));
 
     /**
-     * Text only: the line for someone new who replied but whose face he couldn't
-     * see well enough to keep. Nothing is stored, so it must not promise to remember them.
+     * Text only: the line for someone new he will not remember, because no name was heard
+     * or no face was found (R19). Nothing is stored, so it must not promise to remember
+     * them, and the reason it gives Claude must be the true one: a nameless reply came
+     * from a face he may have seen perfectly well.
      */
     static String welcomeAsk(String nameOrNull) {
         return "Miko has just met someone new. "
@@ -158,7 +159,11 @@ final class ExplorePrompts {
                 : "They told him their name is " + nameOrNull + ". ")
                 + "Write the line he says next: a warm, excited \"nice to meet you\""
                 + (nameOrNull == null ? "" : " that uses their name")
-                + ". He could not get a good look at their face, so he will NOT remember them: do not say or"
+                + ". "
+                + (nameOrNull == null
+                ? "He has no name to remember them by"
+                : "He could not get a good look at their face")
+                + ", so he will NOT remember them: do not say or"
                 + " imply that he will remember or recognise them later.";
     }
 

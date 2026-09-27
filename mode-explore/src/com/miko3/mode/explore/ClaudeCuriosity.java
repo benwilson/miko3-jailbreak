@@ -1014,32 +1014,38 @@ final class ClaudeCuriosity implements CuriosityPort {
     }
 
     @Override
-    public void remember(final String nameOrNull, final long timeoutMs) {
+    public void remember(final String name, final long timeoutMs) {
         final int g = remembers.start();
         final byte[] face = meetFace;
         final MetFace mf = meeting;
         run(new Runnable() {
             @Override
             public void run() {
-                remembers.finish(g, keep(face, nameOrNull, timeoutMs, mf));
+                remembers.finish(g, keep(face, name, timeoutMs, mf));
             }
         }, remembers, g, Answer.failed());
     }
 
-    /** Store the face (a reply is the consent, R12), then ask for the "I'll remember you" line. */
-    private Answer keep(byte[] face, String nameOrNull, long timeoutMs, MetFace mf) {
+    /** Store the face under the name (a reply with a name is the consent, R19), then ask for
+     * the "I'll remember you" line. Without a face or a name nothing is stored and the line
+     * makes no promise, whatever the brain asked for. */
+    private Answer keep(byte[] face, String name, long timeoutMs, MetFace mf) {
         if (face == null) {
             // Nothing to store: never promise to remember them.
             Log.w(TAG, "remember: no face from the match to store; a hello without the promise");
-            return hello(nameOrNull, timeoutMs);
+            return hello(name, timeoutMs);
         }
-        String how = nameOrNull == null ? "unnamed" : "with a name";
+        if (name == null || name.trim().isEmpty()) {
+            // The store refuses a nameless face (R19); don't even ask it.
+            Log.w(TAG, "remember: no name to store the face under; a hello without the promise");
+            return hello(null, timeoutMs);
+        }
         try {
-            String id = RobotPeopleClient.add(app, face, nameOrNull);
+            String id = RobotPeopleClient.add(app, face, name);
             if (mf != null) {
                 mf.storeId = id;
             }
-            Log.i(TAG, "remembered a new person " + how + ", id " + id);
+            Log.i(TAG, "remembered a new person with a name, id " + id);
         } catch (IOException e) {
             Log.w(TAG, "remember: the people store refused or is unavailable: " + e.getMessage());
             return Answer.failed();
@@ -1047,7 +1053,7 @@ final class ClaudeCuriosity implements CuriosityPort {
         long t0 = System.currentTimeMillis();
         List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
         content.add(ClaudeApi.jpegBlock(face));
-        content.add(ClaudeApi.textBlock(ExplorePrompts.rememberAsk(nameOrNull)));
+        content.add(ClaudeApi.textBlock(ExplorePrompts.rememberAsk(name)));
         ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM, content,
                 ExplorePrompts.REMEMBER_SCHEMA, (int) timeoutMs);
         Answer a = r.ok() ? ClaudeReplies.remembered(r.json) : Answer.failed();

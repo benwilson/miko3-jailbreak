@@ -34,7 +34,11 @@ public interface RobotPeople extends IInterface {
 
     Face[] recent(int n) throws RemoteException;
 
-    String add(byte[] faceJpeg, String nameOrNull) throws RemoteException;
+    /** Remembers a new person: a face JPEG and their name, which is required
+     * (R19: nobody is stored without one); answers their id. The launcher
+     * throws IllegalArgumentException with the store's fixed reason for a
+     * missing or blank name, as for a face it won't store. */
+    String add(byte[] faceJpeg, String name) throws RemoteException;
 
     boolean touch(String id) throws RemoteException;
 
@@ -203,13 +207,13 @@ public interface RobotPeople extends IInterface {
             }
 
             @Override
-            public String add(byte[] faceJpeg, String nameOrNull) throws RemoteException {
+            public String add(byte[] faceJpeg, String name) throws RemoteException {
                 Parcel data = Parcel.obtain();
                 Parcel reply = Parcel.obtain();
                 try {
                     data.writeInterfaceToken(DESCRIPTOR);
                     data.writeByteArray(faceJpeg);
-                    data.writeString(nameOrNull);
+                    data.writeString(name);
                     remote.transact(TRANSACTION_add, data, reply, 0);
                     reply.readException();
                     return reply.readString();

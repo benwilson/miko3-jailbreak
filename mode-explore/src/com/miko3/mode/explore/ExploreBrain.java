@@ -69,15 +69,17 @@ import java.util.Set;
  *   LISTEN     once that has finished: the launcher listens for the reply
  *              (listenMs, plus listenMarginMs for its answer)
  *   NAME       a reply was heard: the name in it (the port's patterns, then Claude)
- *   REMEMBER   the face is stored with the name (or unnamed) and Claude writes
- *              the "I'll remember you" line, then SPEAK
+ *   REMEMBER   with a name, the face is stored under it and Claude writes the
+ *              "I'll remember you" line; without one (or without a face)
+ *              nothing is stored and he just says hello (R19), then SPEAK
  *   NAME_CLIP  both person requests failed: the detector's name clip, no asking
  *
  *   MEET -> known: SPEAK the named line ({name} filled in here) or the unnamed
  *                  line, and touch them
  *        -> new:   ASK_NAME -> LISTEN -> nothing heard: SPEAK the no-reply line,
  *                  store nothing (R12)
- *                            -> words: NAME -> REMEMBER -> SPEAK
+ *                            -> words: NAME -> REMEMBER -> SPEAK (a name: stored;
+ *                               no name: nothing kept, R19)
  *        -> failed: lines request -> ASK_NAME ..., or NAME_CLIP
  *   Every failure or missed deadline ends the stop and he carries on exploring.
  *   Names and lines never go into the trace.
@@ -644,6 +646,8 @@ final class ExploreBrain {
     private long meetDeadline;
     /** A new person's lines: the ask line was said, the no-reply line may be. */
     private CuriosityPort.MatchAnswer stranger;
+    /** REMEMBER asked for the hello (nothing stored: no face, or no name, R19) rather than the store. */
+    private boolean helloOnly;
     /** A clock field's "never": far enough below any tick that now - NEVER cannot overflow. */
     static final long NEVER = Long.MIN_VALUE / 4;
     /** A lost ears session is reopened on the drive lease's backoff (ExploreDrive.LEASE_RETRY_*): 2 s doubling to 30 s. */
@@ -2185,6 +2189,7 @@ final class ExploreBrain {
         meetExpect = null;
         pick = null;
         stranger = null;
+        helloOnly = false;
         pendingLine = null;
         afterOrient = null;
         scanned.clear();
@@ -2794,6 +2799,7 @@ final class ExploreBrain {
         state = State.MEET;
         meetingHeld = true;
         stranger = null;
+        helloOnly = false;
         meetLines = false;
         syncPark();
         show(EyeState.THINKING, null);
@@ -2897,9 +2903,9 @@ final class ExploreBrain {
     }
 
     /**
-     * NAME: a reply was heard, so the face is kept either way, named or not (R12)
-     * -- unless no face was found, when nothing is stored and the line he says
-     * next makes no promise to remember them.
+     * NAME: a reply was heard. With a name the face is kept under it; without one,
+     * or without a face, nothing is stored and the line he says next makes no
+     * promise to remember them (R19: nobody is saved until he has a name).
      */
     private void nameStep(long now) {
         CuriosityPort.Named n = port.foundName();
@@ -2909,12 +2915,19 @@ final class ExploreBrain {
         String name = n != null && n.status == CuriosityPort.Named.Status.NAME ? n.name : null;
         state = State.REMEMBER;
         meetDeadline = now + tuning.meetTimeoutMs;
+        helloOnly = true;
         if (faceless()) {
             note("no face to remember them by; just saying hello");
             port.welcome(name, tuning.meetTimeoutMs);
             return;
         }
-        note(name != null ? "got a name; remembering them" : "no clear name; remembering them unnamed");
+        if (name == null) {
+            note("no clear name; nothing is kept, just saying hello");
+            port.welcome(null, tuning.meetTimeoutMs);
+            return;
+        }
+        helloOnly = false;
+        note("got a name; remembering them");
         port.remember(name, tuning.meetTimeoutMs);
     }
 
@@ -2923,14 +2936,13 @@ final class ExploreBrain {
     }
 
     private void rememberStep(long now) {
-        boolean faceless = faceless();
-        CuriosityPort.Answer a = faceless ? port.welcomed() : port.remembered();
+        CuriosityPort.Answer a = helloOnly ? port.welcomed() : port.remembered();
         if (a == null && now < meetDeadline) {
             return;
         }
         if (a != null && a.status == CuriosityPort.Answer.Status.PICK && usable(a.line)) {
             speak(now, a.line);
-        } else if (faceless && usable(stranger.noReplyLine)) {
+        } else if (helloOnly && stranger != null && usable(stranger.noReplyLine)) {
             note("no hello line; saying the friendly line instead");
             speak(now, stranger.noReplyLine);
         } else {
@@ -4963,6 +4975,7 @@ final class ExploreBrain {
         state = State.MEET;
         meetingHeld = true;
         stranger = null;
+        helloOnly = false;
         meetLines = true;
         show(EyeState.THINKING, null);
         meetDeadline = now + tuning.meetTimeoutMs;

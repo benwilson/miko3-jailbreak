@@ -3353,18 +3353,65 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     "say=" + say + " stored=" + rig.stored + " " + rig.tail());
         });
-        scenario("meet_ae5_reply_without_a_name_is_stored_unnamed", n -> {
+        // R19 (meeting plan line 309): a reply without a name gets the hello and nothing is kept.
+        scenario("meet_ae5_reply_without_a_name_is_welcomed_and_nothing_is_stored", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> STRANGER;
             rig.people.listen = ListenScript.always(hearWords("hmm what"));
             rig.people.remembered = CuriosityPort.Answer.line("Nice to meet you! I'll remember that smile!");
+            rig.people.welcomed = CuriosityPort.Answer.line("So nice to meet you!");
             rig.started();
             rig.runUntil(16000);
-            int remember = rig.first("remember", 0);
-            int say = rig.first("say Nice to meet you!", remember);
-            check(n, rig.stored.equals(java.util.Arrays.asList("(unnamed)")) && say > remember
+            int heard = rig.first("heard WORDS", 0);
+            int welcome = rig.first("welcome (unnamed)", heard);
+            int say = rig.first("say So nice to meet you!", welcome);
+            check(n, heard >= 0 && welcome > heard && say > welcome && rig.stored.isEmpty()
+                            && rig.count("welcome (unnamed)") == 1 && rig.countPrefix("remember", 0, 16001) == 0
+                            && rig.count("say Nice to meet you! I'll remember that smile!") == 0
+                            && resumedBy(rig, rig.timeOf(say), 16000) && rig.violations.isEmpty(),
+                    "stored=" + rig.stored + " welcome=" + welcome + " say=" + say + " " + rig.tail());
+        });
+        // A nameless reply falls back to the friendly no-reply line when the hello has no usable line.
+        scenario("meet_ae5_reply_without_a_name_and_no_hello_line_says_the_friendly_line", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.listen = ListenScript.always(hearWords("hmm what"));
+            rig.people.welcomed = CuriosityPort.Answer.failed();
+            rig.started();
+            rig.runUntil(16000);
+            int welcome = rig.first("welcome (unnamed)", 0);
+            int say = rig.first("say " + STRANGER.noReplyLine, welcome);
+            check(n, welcome >= 0 && say > welcome && rig.stored.isEmpty()
+                            && rig.count("say " + STRANGER.noReplyLine) == 1
+                            && rig.countPrefix("remember", 0, 16001) == 0
+                            && resumedBy(rig, rig.timeOf(say), rig.timeOf(say) + 1500)
                             && rig.violations.isEmpty(),
-                    "stored=" + rig.stored + " " + rig.tail());
+                    "welcome=" + welcome + " say=" + say + " " + rig.tail());
+        });
+        // The third way into nameStep's nameless branch: the name request never answers, so the
+        // meet deadline passes. He still just says hello and keeps nothing (R19); before the fix
+        // this was the path most likely to store an unnamed face on the robot.
+        scenario("meet_ae5_name_request_that_never_answers_is_welcomed_at_the_deadline", n -> {
+            Rig rig = meetRig();
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.listen = ListenScript.always(hearWords("hmm what"));
+            rig.people.name = null;
+            rig.people.nameAsksClaude = true;
+            rig.started();
+            rig.runUntil(18000);
+            int heard = rig.first("heard WORDS", 0);
+            int find = rig.first("find name", heard);
+            int welcome = rig.first("welcome (unnamed)", find);
+            int say = rig.first("say So nice to meet you!", welcome);
+            // 4000 ms is the meet rig's meetTimeoutMs: the name request's deadline.
+            check(n, heard >= 0 && find > heard && welcome > find && say > welcome
+                            && rig.timeOf(welcome) == rig.timeOf(heard) + 4000
+                            && rig.stored.isEmpty() && rig.countPrefix("remember", 0, 18001) == 0
+                            && rig.count("welcome (unnamed)") == 1
+                            && resumedBy(rig, rig.timeOf(say), rig.timeOf(say) + 1500)
+                            && rig.violations.isEmpty(),
+                    "heard=" + heard + " welcome=" + welcome + " say=" + say + " stored=" + rig.stored
+                            + " " + rig.tail());
         });
         scenario("meet_reply_without_a_pattern_waits_for_claude_to_find_the_name", n -> {
             Rig rig = meetRig();
@@ -3428,6 +3475,8 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     "name=" + name + " " + rig.tail());
         });
+        // Legacy defence: the gallery no longer answers nameless records (R19, KTD10), but a
+        // matched record with no name still gets the unnamed line rather than a crash.
         scenario("meet_known_person_without_a_name_is_greeted_with_the_unnamed_line", n -> {
             Rig rig = meetRig();
             rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known(null, "Hi {name}!", "Hey, I remember you!");
