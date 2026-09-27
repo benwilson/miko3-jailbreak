@@ -22,6 +22,16 @@ import android.os.RemoteException;
  * and forget() (meeting plan U5, KTD10) carry a person's notes as PersonNotes
  * JSON and wipe a person by id, never by name.
  *
+ * Face plan U4 (R1, R5, R8, R9; KTD4, KTD10-KTD12) appends transactions 8 to
+ * 14 for on-robot matching: gallery() answers every named person's stored
+ * photos as (id, slot, added-at, model id, embedding), no names and no
+ * images; photo() answers one JPEG by id and slot for the mode to embed;
+ * idsNamed() answers the ids a spoken name could mean; addPhoto() and
+ * addPerson() store a photo with the embedding the mode computed;
+ * setEmbedding() and markUnusable() write back the mode's migration result
+ * and are refused (false) once the slot's photo has been replaced or the
+ * person forgotten. Later units append from 15.
+ *
  * The launcher checks the caller on every call and throws SecurityException
  * to any app that isn't one of ours, and IllegalArgumentException with a
  * fixed reason for a face it won't store; Binder carries both back to the
@@ -31,6 +41,15 @@ public interface RobotPeople extends IInterface {
     /** The most faces one recent() answer carries (KTD3). With the store's
      * per-face cap, ten stay far below Binder's 1 MB transaction buffer. */
     int MAX_RECENT = 10;
+
+    /** The most photos one gallery() answer carries: 50 people with 5 photos
+     * each. With the store's embedding cap each entry is about 1 KB at most
+     * (0.5 KB for SFace), so the reply stays far below Binder's 1 MB buffer.
+     * The launcher answers the most recently seen people first. */
+    int MAX_GALLERY = 250;
+
+    /** The most ids one idsNamed() answer carries. */
+    int MAX_IDS_NAMED = 100;
 
     Face[] recent(int n) throws RemoteException;
 
@@ -58,6 +77,72 @@ public interface RobotPeople extends IInterface {
     /** Wipes the person's face, name and notes (R18); false if unknown. */
     boolean forget(String id) throws RemoteException;
 
+    // Face plan U4 (KTD10-KTD12). Appended: each Proxy throws
+    // UnsupportedOperationException (LauncherProtocol.LAUNCHER_TOO_OLD) when
+    // the launcher predates it.
+
+    /** Every stored photo of every named person, most recently seen first
+     * (at most MAX_GALLERY), pending and unusable ones included (R18). */
+    GalleryPhoto[] gallery() throws RemoteException;
+
+    /** One stored photo JPEG, or null for an unknown id or an empty slot. */
+    byte[] photo(String id, int slot) throws RemoteException;
+
+    /** The ids of named people a spoken name could mean (KTD10): two or more
+     * words match the full name, one word the first name, ignoring case. */
+    String[] idsNamed(String name) throws RemoteException;
+
+    /** Adds a photo and its embedding to a remembered person, filling an
+     * empty slot or replacing the oldest (R5); answers the slot.
+     * IllegalArgumentException with the store's fixed reason for an unknown
+     * id (KTD12: a forgotten person is never brought back), a bad photo or
+     * a bad embedding. */
+    int addPhoto(String id, byte[] faceJpeg, String modelId, float[] embedding) throws RemoteException;
+
+    /** Remembers a new person with their first photo and its embedding in
+     * one step (KTD12); answers their id. Refusals as add() and addPhoto(). */
+    String addPerson(byte[] faceJpeg, String name, String modelId, float[] embedding) throws RemoteException;
+
+    /** Stores the embedding for a photo the mode fetched (KTD11); false when
+     * the person is gone or the slot no longer holds the photo added at
+     * addedAtMillis. */
+    boolean setEmbedding(String id, int slot, long addedAtMillis, String modelId, float[] embedding)
+            throws RemoteException;
+
+    /** Marks a stored photo in which the mode found no face (KTD11); false
+     * as setEmbedding(). */
+    boolean markUnusable(String id, int slot, long addedAtMillis) throws RemoteException;
+
+    /** One stored photo as gallery() answers it: never a name or an image. */
+    final class GalleryPhoto {
+        public final String id;
+        public final int slot;
+        /** 0 for a photo stored before added-at times were recorded. */
+        public final long addedAtMillis;
+        /** The mode found no face in it: never a match exemplar, never pending. */
+        public final boolean unusable;
+        /** "" when there is no embedding. */
+        public final String modelId;
+        /** null when there is no embedding. */
+        public final float[] embedding;
+
+        public GalleryPhoto(String id, int slot, long addedAtMillis, boolean unusable, String modelId,
+                            float[] embedding) {
+            this.id = id;
+            this.slot = slot;
+            this.addedAtMillis = addedAtMillis;
+            this.unusable = unusable;
+            this.modelId = modelId == null ? "" : modelId;
+            this.embedding = embedding;
+        }
+
+        /** True while this photo still waits for an embedding from
+         * currentModelId (R18): no embedding, or one from another model. */
+        public boolean isPending(String currentModelId) {
+            return !unusable && (embedding == null || !modelId.equals(currentModelId));
+        }
+    }
+
     /** One remembered person's id and face, as recent() answers them. */
     final class Face {
         public final String id;
@@ -78,6 +163,13 @@ public interface RobotPeople extends IInterface {
         static final int TRANSACTION_notesOf = 5;
         static final int TRANSACTION_mergeNotes = 6;
         static final int TRANSACTION_forget = 7;
+        static final int TRANSACTION_gallery = 8;
+        static final int TRANSACTION_photo = 9;
+        static final int TRANSACTION_idsNamed = 10;
+        static final int TRANSACTION_addPhoto = 11;
+        static final int TRANSACTION_addPerson = 12;
+        static final int TRANSACTION_setEmbedding = 13;
+        static final int TRANSACTION_markUnusable = 14;
 
         public Stub() {
             attachInterface(this, DESCRIPTOR);
@@ -158,6 +250,84 @@ public interface RobotPeople extends IInterface {
                     boolean known = forget(data.readString());
                     reply.writeNoException();
                     reply.writeInt(known ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_gallery: {
+                    data.enforceInterface(DESCRIPTOR);
+                    GalleryPhoto[] photos = gallery();
+                    reply.writeNoException();
+                    int count = photos == null ? 0 : Math.min(photos.length, MAX_GALLERY);
+                    reply.writeInt(count);
+                    for (int i = 0; i < count; i++) {
+                        reply.writeString(photos[i].id);
+                        reply.writeInt(photos[i].slot);
+                        reply.writeLong(photos[i].addedAtMillis);
+                        reply.writeInt(photos[i].unusable ? 1 : 0);
+                        reply.writeString(photos[i].modelId);
+                        reply.writeFloatArray(photos[i].embedding);
+                    }
+                    return true;
+                }
+                case TRANSACTION_photo: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    byte[] jpeg = photo(id, data.readInt());
+                    reply.writeNoException();
+                    reply.writeByteArray(jpeg);
+                    return true;
+                }
+                case TRANSACTION_idsNamed: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String[] ids = idsNamed(data.readString());
+                    reply.writeNoException();
+                    int count = ids == null ? 0 : Math.min(ids.length, MAX_IDS_NAMED);
+                    reply.writeInt(count);
+                    for (int i = 0; i < count; i++) {
+                        reply.writeString(ids[i]);
+                    }
+                    return true;
+                }
+                case TRANSACTION_addPhoto: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    byte[] jpeg = data.createByteArray();
+                    String modelId = data.readString();
+                    float[] embedding = data.createFloatArray();
+                    int slot = addPhoto(id, jpeg, modelId, embedding);
+                    reply.writeNoException();
+                    reply.writeInt(slot);
+                    return true;
+                }
+                case TRANSACTION_addPerson: {
+                    data.enforceInterface(DESCRIPTOR);
+                    byte[] jpeg = data.createByteArray();
+                    String name = data.readString();
+                    String modelId = data.readString();
+                    float[] embedding = data.createFloatArray();
+                    String id = addPerson(jpeg, name, modelId, embedding);
+                    reply.writeNoException();
+                    reply.writeString(id);
+                    return true;
+                }
+                case TRANSACTION_setEmbedding: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    int slot = data.readInt();
+                    long addedAt = data.readLong();
+                    String modelId = data.readString();
+                    float[] embedding = data.createFloatArray();
+                    boolean stored = setEmbedding(id, slot, addedAt, modelId, embedding);
+                    reply.writeNoException();
+                    reply.writeInt(stored ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_markUnusable: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    int slot = data.readInt();
+                    boolean marked = markUnusable(id, slot, data.readLong());
+                    reply.writeNoException();
+                    reply.writeInt(marked ? 1 : 0);
                     return true;
                 }
                 case IBinder.INTERFACE_TRANSACTION: {
@@ -304,6 +474,170 @@ public interface RobotPeople extends IInterface {
                     data.writeInterfaceToken(DESCRIPTOR);
                     data.writeString(id);
                     if (!remote.transact(TRANSACTION_forget, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            // Face plan U4: appended, so each checks the transaction result
+            // the same way.
+
+            @Override
+            public GalleryPhoto[] gallery() throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    if (!remote.transact(TRANSACTION_gallery, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    int count = reply.readInt();
+                    if (count < 0 || count > MAX_GALLERY) {
+                        throw new RemoteException("bad people reply");
+                    }
+                    GalleryPhoto[] photos = new GalleryPhoto[count];
+                    for (int i = 0; i < count; i++) {
+                        String id = reply.readString();
+                        int slot = reply.readInt();
+                        long addedAt = reply.readLong();
+                        boolean unusable = reply.readInt() != 0;
+                        String modelId = reply.readString();
+                        photos[i] = new GalleryPhoto(id, slot, addedAt, unusable, modelId, reply.createFloatArray());
+                    }
+                    return photos;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public byte[] photo(String id, int slot) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeInt(slot);
+                    if (!remote.transact(TRANSACTION_photo, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.createByteArray();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public String[] idsNamed(String name) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(name);
+                    if (!remote.transact(TRANSACTION_idsNamed, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    int count = reply.readInt();
+                    if (count < 0 || count > MAX_IDS_NAMED) {
+                        throw new RemoteException("bad people reply");
+                    }
+                    String[] ids = new String[count];
+                    for (int i = 0; i < count; i++) {
+                        ids[i] = reply.readString();
+                    }
+                    return ids;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public int addPhoto(String id, byte[] faceJpeg, String modelId, float[] embedding) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeByteArray(faceJpeg);
+                    data.writeString(modelId);
+                    data.writeFloatArray(embedding);
+                    if (!remote.transact(TRANSACTION_addPhoto, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public String addPerson(byte[] faceJpeg, String name, String modelId, float[] embedding)
+                    throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeByteArray(faceJpeg);
+                    data.writeString(name);
+                    data.writeString(modelId);
+                    data.writeFloatArray(embedding);
+                    if (!remote.transact(TRANSACTION_addPerson, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readString();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public boolean setEmbedding(String id, int slot, long addedAtMillis, String modelId, float[] embedding)
+                    throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeInt(slot);
+                    data.writeLong(addedAtMillis);
+                    data.writeString(modelId);
+                    data.writeFloatArray(embedding);
+                    if (!remote.transact(TRANSACTION_setEmbedding, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public boolean markUnusable(String id, int slot, long addedAtMillis) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeInt(slot);
+                    data.writeLong(addedAtMillis);
+                    if (!remote.transact(TRANSACTION_markUnusable, data, reply, 0)) {
                         throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
                     }
                     reply.readException();

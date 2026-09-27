@@ -790,8 +790,471 @@ public final class PeopleStoreHarness {
             }
         });
 
+        photoScenarios();
+
         if (failures > 0) {
             System.exit(1);
         }
+    }
+    static final String SFACE = "sface-2021dec";
+
+    /** A distinct 128-float embedding per seed, with values that do not
+     * round-trip through a short decimal (so a lossy save shows). */
+    static float[] emb(int seed) {
+        float[] e = new float[128];
+        for (int i = 0; i < e.length; i++) {
+            e[i] = (float) Math.sin(seed * 131 + i) / 3.0f;
+        }
+        return e;
+    }
+
+    static PeopleStore.Photo slot(List<PeopleStore.Photo> photos, int slot) {
+        for (PeopleStore.Photo p : photos) {
+            if (p.slot == slot) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    static void write(File f, byte[] bytes) throws IOException {
+        java.io.FileOutputStream out = new java.io.FileOutputStream(f);
+        out.write(bytes);
+        out.close();
+    }
+
+    static String refusalOf(Runnable r) {
+        try {
+            r.run();
+            return null;
+        } catch (IllegalArgumentException e) {
+            return e.getMessage();
+        }
+    }
+
+    /** Face plan U4 (R1, R5, R8, R9, R18; KTD4, KTD10, KTD11, KTD12): several
+     * photos per person, their embeddings, and the calls the mode makes by id. */
+    static void photoScenarios() {
+        // R9: a person stored before photos had slots keeps working.
+        scenario("legacy_person_loads_with_one_pending_photo", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                String legacy = "0123456789abcdef";
+                write(new File(dir, legacy + ".jpg"), jpeg(5));
+                write(new File(dir, PeopleStore.INDEX_FILE), (legacy + "\t1000\tAnn Lee\n").getBytes("UTF-8"));
+                PeopleStore s = new PeopleStore(dir, new FakeClock());
+                List<PeopleStore.Photo> g = s.gallery();
+                PeopleStore.Photo p = g.size() == 1 ? g.get(0) : null;
+                boolean one = p != null && legacy.equals(p.id) && p.slot == 0 && p.embedding == null
+                        && "".equals(p.modelId) && !p.unusable && p.isPending(SFACE)
+                        && s.photos(legacy).size() == 1 && Arrays.equals(s.photo(legacy, 0), jpeg(5));
+                // Its added-at time is stable, so a migration can write back against it.
+                boolean stable = p != null && p.addedAtMillis == s.gallery().get(0).addedAtMillis
+                        && p.addedAtMillis == new PeopleStore(dir, new FakeClock()).gallery().get(0).addedAtMillis;
+                boolean set = p != null && s.setEmbedding(legacy, 0, p.addedAtMillis, SFACE, emb(1));
+                PeopleStore.Photo after = new PeopleStore(dir, new FakeClock()).gallery().get(0);
+                check(n, one && stable && set && !after.isPending(SFACE) && Arrays.equals(after.embedding, emb(1))
+                                && after.isPending("other-model"),
+                        "one=" + one + " stable=" + stable + " set=" + set + " files=" + sortedFiles(dir));
+            }
+        });
+
+        scenario("add_person_stores_photo_zero_with_its_embedding", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addPerson(jpeg(1), "  Ben   Wilson ", SFACE, emb(1));
+                List<PeopleStore.Photo> ps = s.photos(id);
+                boolean stored = "Ben Wilson".equals(s.nameOf(id)) && ps.size() == 1 && ps.get(0).slot == 0
+                        && ps.get(0).addedAtMillis == clock.now && SFACE.equals(ps.get(0).modelId)
+                        && Arrays.equals(ps.get(0).embedding, emb(1)) && ids(s.recent(10)).equals(Arrays.asList(id));
+                boolean files = sortedFiles(dir).equals(Arrays.asList(id + ".faces", id + ".jpg", PeopleStore.INDEX_FILE));
+                check(n, stored && files, "stored=" + stored + " files=" + sortedFiles(dir));
+            }
+        });
+
+        scenario("add_person_refusals_write_nothing", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                final PeopleStore s = new PeopleStore(dir, new FakeClock());
+                final float[] nan = emb(1);
+                nan[3] = Float.NaN;
+                final float[] huge = new float[PeopleStore.MAX_EMBEDDING_FLOATS + 1];
+                List<String> got = new ArrayList<String>();
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(jpeg(1), "  ", SFACE, emb(1)); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(new byte[] {1, 2, 3, 4}, "Ann", SFACE, emb(1)); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(jpeg(1), "Ann", SFACE, null); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(jpeg(1), "Ann", SFACE, new float[0]); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(jpeg(1), "Ann", SFACE, nan); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(jpeg(1), "Ann", SFACE, huge); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(jpeg(1), "Ann", "", emb(1)); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(jpeg(1), "Ann", "a\tb", emb(1)); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPerson(jpeg(1), "Ann", null, emb(1)); } }));
+                List<String> want = Arrays.asList(PeopleStore.REFUSE_NO_NAME, PeopleStore.REFUSE_NOT_JPEG,
+                        PeopleStore.REFUSE_BAD_EMBEDDING, PeopleStore.REFUSE_BAD_EMBEDDING, PeopleStore.REFUSE_BAD_EMBEDDING,
+                        PeopleStore.REFUSE_BAD_EMBEDDING, PeopleStore.REFUSE_BAD_EMBEDDING, PeopleStore.REFUSE_BAD_EMBEDDING,
+                        PeopleStore.REFUSE_BAD_EMBEDDING);
+                check(n, got.equals(want) && dir.list().length == 0 && s.all().isEmpty(),
+                        got + " files=" + Arrays.toString(dir.list()));
+            }
+        });
+
+        // R5: up to 5 photos; a sixth replaces the one added longest ago.
+        scenario("sixth_photo_replaces_the_oldest_slot", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addPerson(jpeg(0), "Ann", SFACE, emb(0));
+                List<Integer> slots = new ArrayList<Integer>();
+                for (int i = 1; i < PeopleStore.MAX_PHOTOS; i++) {
+                    clock.now += 1000;
+                    slots.add(s.addPhoto(id, jpeg(i), SFACE, emb(i)));
+                }
+                boolean filled = slots.equals(Arrays.asList(1, 2, 3, 4)) && s.photos(id).size() == 5
+                        && new File(dir, id + "-4.jpg").isFile();
+                // Refresh slot 0 so slot 1 becomes the oldest: oldest by added-at, not by slot number.
+                PeopleStore.Photo zero = slot(s.photos(id), 0);
+                clock.now += 1000;
+                int replaced0 = s.addPhoto(id, jpeg(20), SFACE, emb(20));
+                clock.now += 1000;
+                int replaced1 = s.addPhoto(id, jpeg(21), SFACE, emb(21));
+                PeopleStore r = new PeopleStore(dir, clock);
+                PeopleStore.Photo p1 = slot(r.photos(id), 1);
+                boolean rewritten = replaced0 == 0 && replaced1 == 1 && r.photos(id).size() == 5
+                        && Arrays.equals(r.photo(id, 0), jpeg(20)) && Arrays.equals(r.photo(id, 1), jpeg(21))
+                        && p1 != null && p1.addedAtMillis == clock.now && Arrays.equals(p1.embedding, emb(21))
+                        && Arrays.equals(slot(r.photos(id), 0).embedding, emb(20))
+                        && zero.addedAtMillis != slot(r.photos(id), 0).addedAtMillis
+                        && Arrays.equals(slot(r.photos(id), 2).embedding, emb(2));
+                check(n, filled && rewritten, "filled=" + filled + " slots=" + slots + " replaced=" + replaced0 + ","
+                        + replaced1 + " files=" + sortedFiles(dir));
+            }
+        });
+
+        scenario("recent_and_face_answer_the_newest_photo", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(tempDir(), clock);
+                String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                clock.now += 1000;
+                s.addPhoto(id, jpeg(2), SFACE, emb(2));
+                boolean newest = Arrays.equals(s.face(id), jpeg(2));
+                s.deletePhoto(id, 1);
+                check(n, newest && Arrays.equals(s.face(id), jpeg(1)) && ids(s.recent(10)).equals(Arrays.asList(id)),
+                        Arrays.toString(s.face(id)));
+            }
+        });
+
+        // KTD12: a "yes" racing a forget cannot resurrect the person.
+        scenario("add_photo_to_a_forgotten_id_is_refused_and_writes_nothing", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                final PeopleStore s = new PeopleStore(dir, new FakeClock());
+                final String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                s.forget(id);
+                String r1 = refusalOf(new Runnable() { public void run() { s.addPhoto(id, jpeg(2), SFACE, emb(2)); } });
+                String r2 = refusalOf(new Runnable() { public void run() { s.addPhoto("0123456789abcdef", jpeg(2), SFACE, emb(2)); } });
+                String r3 = refusalOf(new Runnable() { public void run() { s.addPhoto("../x", jpeg(2), SFACE, emb(2)); } });
+                List<String> files = sortedFiles(dir);
+                check(n, PeopleStore.REFUSE_UNKNOWN_PERSON.equals(r1) && PeopleStore.REFUSE_UNKNOWN_PERSON.equals(r2)
+                                && PeopleStore.REFUSE_UNKNOWN_PERSON.equals(r3)
+                                && files.equals(Arrays.asList(PeopleStore.INDEX_FILE)) && s.nameOf(id) == null,
+                        r1 + "|" + r2 + "|" + r3 + " files=" + files);
+            }
+        });
+
+        scenario("add_photo_refuses_a_bad_photo_or_embedding", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                final PeopleStore s = new PeopleStore(dir, new FakeClock());
+                final String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                List<String> before = sortedFiles(dir);
+                final byte[] big = new byte[PeopleStore.MAX_FACE_BYTES + 1];
+                big[0] = (byte) 0xFF;
+                big[1] = (byte) 0xD8;
+                List<String> got = new ArrayList<String>();
+                got.add(refusalOf(new Runnable() { public void run() { s.addPhoto(id, big, SFACE, emb(2)); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPhoto(id, null, SFACE, emb(2)); } }));
+                got.add(refusalOf(new Runnable() { public void run() { s.addPhoto(id, jpeg(2), SFACE, new float[] {Float.POSITIVE_INFINITY}); } }));
+                check(n, got.equals(Arrays.asList(PeopleStore.REFUSE_TOO_BIG, PeopleStore.REFUSE_NOT_JPEG,
+                                PeopleStore.REFUSE_BAD_EMBEDDING)) && sortedFiles(dir).equals(before)
+                                && s.photos(id).size() == 1,
+                        got + " files=" + sortedFiles(dir));
+            }
+        });
+
+        // R8: forget removes every photo and embedding.
+        scenario("forget_removes_every_photo_and_the_faces_file", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                String bo = s.addPerson(jpeg(9), "Bo", SFACE, emb(9));
+                s.mergeNotes(id, "{\"interests\":[\"chess\"]}");
+                for (int i = 2; i <= 5; i++) {
+                    clock.now += 1000;
+                    s.addPhoto(id, jpeg(i), SFACE, emb(i));
+                }
+                boolean before = sortedFiles(dir).size() == 1 + 7 + 2;
+                boolean forgot = s.forget(id);
+                PeopleStore r = new PeopleStore(dir, clock);
+                List<String> files = sortedFiles(dir);
+                boolean gone = r.nameOf(id) == null && r.photos(id).isEmpty() && r.photo(id, 0) == null
+                        && s.photos(id).isEmpty() && s.gallery().size() == 1;
+                check(n, before && forgot && gone
+                                && files.equals(Arrays.asList(bo + ".faces", bo + ".jpg", PeopleStore.INDEX_FILE)),
+                        "before=" + before + " gone=" + gone + " files=" + files);
+            }
+        });
+
+        scenario("load_keeps_slot_photos_and_faces_and_sweeps_the_rest", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                for (int i = 2; i <= 4; i++) {
+                    clock.now += 1000;
+                    s.addPhoto(id, jpeg(i), SFACE, emb(i));
+                }
+                String orphan = "fedcba9876543210";
+                write(new File(dir, orphan + "-3.jpg"), jpeg(7));
+                write(new File(dir, orphan + ".faces"), "junk".getBytes("UTF-8"));
+                write(new File(dir, orphan + ".jpg"), jpeg(7));
+                write(new File(dir, "notes.txt"), "keep".getBytes("UTF-8"));
+                write(new File(dir, id + "-9.jpg"), jpeg(7));
+                new PeopleStore(dir, clock);
+                List<String> files = sortedFiles(dir);
+                boolean kept = files.contains(id + "-3.jpg") && files.contains(id + ".faces")
+                        && files.contains(id + ".jpg") && files.contains(id + "-1.jpg") && files.contains(id + "-2.jpg");
+                boolean swept = !files.contains(orphan + "-3.jpg") && !files.contains(orphan + ".faces")
+                        && !files.contains(orphan + ".jpg");
+                // Names the store never issues are not its files.
+                boolean foreignKept = files.contains("notes.txt") && files.contains(id + "-9.jpg");
+                check(n, kept && swept && foreignKept, "files=" + files);
+            }
+        });
+
+        // KTD10: two words match the full name, one word the first word.
+        scenario("ids_named_matches_full_name_or_first_word", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(tempDir(), clock);
+                String wilson = s.addPerson(jpeg(1), "Ben Wilson", SFACE, emb(1));
+                clock.now += 1000;
+                String smith = s.addPerson(jpeg(2), "Ben Smith", SFACE, emb(2));
+                String benjamin = s.addPerson(jpeg(3), "Benjamin Hart", SFACE, emb(3));
+                String bare = s.addPerson(jpeg(4), "Ben", SFACE, emb(4));
+                String nameless = s.addPerson(jpeg(5), "Ben Jones", SFACE, emb(5));
+                s.rename(nameless, "");
+                List<String> ben = s.idsNamed("ben");
+                boolean first = ben.size() == 3 && ben.containsAll(Arrays.asList(wilson, smith, bare));
+                boolean full = s.idsNamed("BEN  wilson ").equals(Arrays.asList(wilson))
+                        && s.idsNamed("Ben Jones").isEmpty() && s.idsNamed("ben wil").isEmpty();
+                boolean none = s.idsNamed("Benjamin").equals(Arrays.asList(benjamin)) && s.idsNamed("be").isEmpty()
+                        && s.idsNamed("").isEmpty() && s.idsNamed(null).isEmpty() && s.idsNamed("  ").isEmpty();
+                check(n, first && full && none, "ben=" + ben + " full=" + full + " none=" + none);
+            }
+        });
+
+        scenario("gallery_skips_nameless_records_and_carries_no_names", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(tempDir(), clock);
+                String ann = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                clock.now += 1000;
+                s.addPhoto(ann, jpeg(2), SFACE, emb(2));
+                String legacy = legacyNameless(s, jpeg(3));
+                List<PeopleStore.Photo> g = s.gallery();
+                boolean onlyAnn = g.size() == 2 && ann.equals(g.get(0).id) && ann.equals(g.get(1).id);
+                boolean noNames = true;
+                for (java.lang.reflect.Field f : PeopleStore.Photo.class.getDeclaredFields()) {
+                    noNames &= !f.getName().toLowerCase().contains("name");
+                }
+                boolean legacyListed = s.photos(legacy).size() == 1;
+                check(n, onlyAnn && noNames && legacyListed, "gallery=" + g.size() + " noNames=" + noNames);
+            }
+        });
+
+        scenario("deleting_the_only_photo_is_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                final PeopleStore s = new PeopleStore(dir, clock);
+                final String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                String only = refusalOf(new Runnable() { public void run() { s.deletePhoto(id, 0); } });
+                boolean kept = new File(dir, id + ".jpg").isFile() && s.photos(id).size() == 1;
+                clock.now += 1000;
+                s.addPhoto(id, jpeg(2), SFACE, emb(2));
+                // With two, slot 0 may go; the person still loads from slot 1 alone.
+                boolean deleted = s.deletePhoto(id, 0) && !new File(dir, id + ".jpg").exists();
+                PeopleStore r = new PeopleStore(dir, clock);
+                boolean reloads = "Ann".equals(r.nameOf(id)) && r.photos(id).size() == 1
+                        && slot(r.photos(id), 1) != null && Arrays.equals(slot(r.photos(id), 1).embedding, emb(2));
+                String last = refusalOf(new Runnable() { public void run() { s.deletePhoto(id, 1); } });
+                boolean unknown = !s.deletePhoto(id, 3) && !s.deletePhoto(id, 7) && !s.deletePhoto("0123456789abcdef", 0);
+                // The emptied slot 0 is filled before any occupied slot is replaced.
+                clock.now += 1000;
+                int refill = s.addPhoto(id, jpeg(3), SFACE, emb(3));
+                check(n, PeopleStore.REFUSE_LAST_PHOTO.equals(only) && kept && deleted && reloads
+                                && PeopleStore.REFUSE_LAST_PHOTO.equals(last) && unknown && refill == 0,
+                        only + "|" + last + " kept=" + kept + " deleted=" + deleted + " reloads=" + reloads
+                                + " unknown=" + unknown + " refill=" + refill);
+            }
+        });
+
+        // KTD11: a migration write-back never lands on a replaced slot or a forgotten person.
+        scenario("set_embedding_is_refused_for_a_replaced_slot_or_a_forgotten_id", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.add(jpeg(1), "Ann");
+                PeopleStore.Photo old = s.photos(id).get(0);
+                boolean pending = old.embedding == null && old.isPending(SFACE);
+                // Four more photos, then a sixth that replaces slot 0 (the oldest).
+                for (int i = 2; i <= 6; i++) {
+                    clock.now += 1000;
+                    s.addPhoto(id, jpeg(i), SFACE, emb(i));
+                }
+                byte[] facesBefore = java.nio.file.Files.readAllBytes(new File(dir, id + ".faces").toPath());
+                boolean stale = !s.setEmbedding(id, 0, old.addedAtMillis, SFACE, emb(99));
+                boolean untouched = Arrays.equals(slot(s.photos(id), 0).embedding, emb(6))
+                        && Arrays.equals(facesBefore, java.nio.file.Files.readAllBytes(new File(dir, id + ".faces").toPath()));
+                long now0 = slot(s.photos(id), 0).addedAtMillis;
+                boolean empty = !s.setEmbedding(id, 4, 123L, SFACE, emb(99));
+                s.forget(id);
+                boolean gone = !s.setEmbedding(id, 0, now0, SFACE, emb(99)) && !new File(dir, id + ".faces").exists()
+                        && !s.setEmbedding("../etc", 0, now0, SFACE, emb(99)) && !s.setEmbedding(id, 9, now0, SFACE, emb(99));
+                check(n, pending && stale && untouched && empty && gone,
+                        "pending=" + pending + " stale=" + stale + " untouched=" + untouched + " gone=" + gone
+                                + " files=" + sortedFiles(dir));
+            }
+        });
+
+        // KTD11: a stored crop with no findable face stops counting as waiting.
+        scenario("mark_unusable_clears_pending_and_is_refused_once_replaced", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.add(jpeg(1), "Ann");
+                PeopleStore.Photo p = s.photos(id).get(0);
+                boolean marked = s.markUnusable(id, 0, p.addedAtMillis);
+                PeopleStore.Photo q = new PeopleStore(dir, clock).photos(id).get(0);
+                boolean flagged = q.unusable && q.embedding == null && !q.isPending(SFACE) && !q.isPending("other");
+                boolean wrongTime = !s.markUnusable(id, 0, p.addedAtMillis + 1) && !s.markUnusable(id, 2, p.addedAtMillis);
+                // A good embedding later (say a new model finds the face) clears the flag.
+                boolean cleared = s.setEmbedding(id, 0, p.addedAtMillis, SFACE, emb(1))
+                        && !s.photos(id).get(0).unusable && !s.photos(id).get(0).isPending(SFACE);
+                s.forget(id);
+                boolean gone = !s.markUnusable(id, 0, p.addedAtMillis);
+                check(n, marked && flagged && wrongTime && cleared && gone,
+                        "marked=" + marked + " flagged=" + flagged + " wrongTime=" + wrongTime + " cleared=" + cleared
+                                + " gone=" + gone);
+            }
+        });
+
+        scenario("embeddings_survive_reload_exactly", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                clock.now += 1000;
+                float[] odd = new float[] {Float.MIN_VALUE, -0.0f, 1e-30f, -Float.MAX_VALUE, 0.1f};
+                s.addPhoto(id, jpeg(2), "another-model_v2", odd);
+                PeopleStore r = new PeopleStore(dir, clock);
+                PeopleStore.Photo a = slot(r.photos(id), 0);
+                PeopleStore.Photo b = slot(r.photos(id), 1);
+                boolean temp = false;
+                for (String f : dir.list()) {
+                    temp |= f.endsWith(".tmp");
+                }
+                check(n, a != null && b != null && Arrays.equals(a.embedding, emb(1)) && Arrays.equals(b.embedding, odd)
+                                && "another-model_v2".equals(b.modelId) && b.isPending(SFACE) && !a.isPending(SFACE)
+                                && !temp,
+                        "files=" + sortedFiles(dir));
+            }
+        });
+
+        scenario("a_corrupt_faces_file_reads_as_pending", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                StringBuilder wrong = new StringBuilder();
+                for (String junk : Arrays.asList("garbage", "", "faces1\n0\tx\t0\tm\t1,2\n", "faces1\n0\t1\t0\tm\tnope\n",
+                        "faces1\n7\t1\t0\tm\t1.0\n")) {
+                    write(new File(dir, id + ".faces"), junk.getBytes("UTF-8"));
+                    PeopleStore r = new PeopleStore(dir, clock);
+                    List<PeopleStore.Photo> ps = r.photos(id);
+                    if (ps.size() != 1 || !ps.get(0).isPending(SFACE) || !"Ann".equals(r.nameOf(id))) {
+                        wrong.append(junk.replace('\n', '/')).append("; ");
+                    }
+                }
+                check(n, wrong.length() == 0, "wrong=" + wrong);
+            }
+        });
+
+        scenario("photo_by_slot_validates_id_and_slot", new Scenario() {
+            public void run(String n) throws Exception {
+                PeopleStore s = new PeopleStore(tempDir(), new FakeClock());
+                String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                check(n, Arrays.equals(s.photo(id, 0), jpeg(1)) && s.photo(id, 1) == null && s.photo(id, -1) == null
+                                && s.photo(id, PeopleStore.MAX_PHOTOS) == null && s.photo("../" + id, 0) == null
+                                && s.photo(null, 0) == null && s.photos("nope").isEmpty(),
+                        "slot reads leaked");
+            }
+        });
+
+        // A forget from the page racing the mode's add-photo and write-back
+        // calls on Binder threads: whatever interleaving, nothing of her is left.
+        scenario("forget_racing_photo_writes_leaves_nothing_behind", new Scenario() {
+            public void run(String n) throws Exception {
+                StringBuilder wrong = new StringBuilder();
+                for (int round = 0; round < 20; round++) {
+                    File dir = tempDir();
+                    final FakeClock clock = new FakeClock();
+                    final PeopleStore s = new PeopleStore(dir, clock);
+                    final String id = s.addPerson(jpeg(1), "Ann", SFACE, emb(1));
+                    final long added = s.photos(id).get(0).addedAtMillis;
+                    final java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+                    Thread writer = new Thread(new Runnable() {
+                        public void run() {
+                            try {
+                                go.await();
+                            } catch (InterruptedException e) {
+                                return;
+                            }
+                            for (int i = 0; i < 30; i++) {
+                                try {
+                                    s.addPhoto(id, jpeg(i), SFACE, emb(i));
+                                } catch (IllegalArgumentException refused) {
+                                    // Expected once the forget lands.
+                                }
+                                s.setEmbedding(id, 0, added, SFACE, emb(i));
+                                s.markUnusable(id, 0, added);
+                            }
+                        }
+                    });
+                    writer.start();
+                    go.countDown();
+                    Thread.sleep(round % 3);
+                    s.forget(id);
+                    writer.join();
+                    List<String> files = sortedFiles(dir);
+                    PeopleStore r = new PeopleStore(dir, clock);
+                    if (!files.equals(Arrays.asList(PeopleStore.INDEX_FILE)) || !r.all().isEmpty()) {
+                        wrong.append("round ").append(round).append(": ").append(files).append("; ");
+                    }
+                }
+                check(n, wrong.length() == 0, wrong.toString());
+            }
+        });
     }
 }

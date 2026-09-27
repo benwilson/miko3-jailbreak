@@ -14,8 +14,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -47,6 +49,20 @@ import java.util.regex.Pattern;
  * an id checks it against that shape before touching the file system, so an
  * id from a URL (the Settings page's face GET) can never name another file.
  *
+ * Photos and embeddings (face plan U4; R1, R5, R8, R9, KTD4, KTD10-KTD12):
+ * each person keeps up to MAX_PHOTOS photos. Slot 0 is the "<id>.jpg" every
+ * person already has (R9); slots 1 to 4 are "<id>-<n>.jpg". One "<id>.faces"
+ * file holds, per slot, when the photo was added, whether the mode found it
+ * unusable (no face in it, KTD11), and the embedding the mode computed with
+ * the id of the model that computed it. The launcher never runs a model: it
+ * stores what the mode sends and serves it back by id, never with a name. A
+ * photo with no .faces entry (a legacy one, or one a crash left behind) is
+ * pending, added at 0, which also makes it the first to be replaced. The
+ * .faces file never keeps an entry for a photo that is gone: a replacement
+ * drops the slot's entry, writes the photo, then writes the new entry, and
+ * a delete drops the entry before the photo, so a crash leaves at worst a
+ * pending photo, never one paired with another photo's embedding.
+ *
  * Plain Java (no android.*), so scripts/tests runs it on the host JVM over a
  * temp directory. Thread-safe: every public method is synchronized, since the
  * Binder service and the web server call it from their own threads.
@@ -65,13 +81,29 @@ final class PeopleStore {
     static final String REFUSE_NOTES_NOT_SAVED = "the notes could not be saved";
     /** Nobody is stored without a name (R19, meeting plan line 309). */
     static final String REFUSE_NO_NAME = "a person needs a name to be remembered";
+    static final String REFUSE_BAD_EMBEDDING = "that face embedding is not usable";
+    static final String REFUSE_LAST_PHOTO = "a person keeps at least one photo";
+
+    /** Photo slots per person (R5); slot 0 is the legacy "<id>.jpg". */
+    static final int MAX_PHOTOS = 5;
+    /** SFace answers 128; the cap is for any model and keeps the gallery reply
+     * (RobotPeople.MAX_GALLERY entries) far below Binder's 1 MB buffer. */
+    static final int MAX_EMBEDDING_FLOATS = 256;
+    static final String FACES_SUFFIX = ".faces";
 
     /** A notes file larger than this (a hand edit) reads as empty. */
     private static final int MAX_NOTES_FILE_BYTES = 4 * PersonNotes.MAX_DOCUMENT_BYTES;
 
+    /** First line of a .faces file; anything else reads as all pending. */
+    private static final String FACES_HEADER = "faces1";
+    private static final int MAX_FACES_FILE_BYTES = 64 * 1024;
+
     private static final Pattern ID = Pattern.compile("[0-9a-f]{16}");
-    /** The files this store owns: a face or a notes file named by an id. */
-    private static final Pattern OWNED_FILE = Pattern.compile("([0-9a-f]{16})\\.(jpg|json)");
+    /** A model id is a short token: it is stored on a tab-separated line. */
+    private static final Pattern MODEL_ID = Pattern.compile("[A-Za-z0-9._:-]{1,64}");
+    /** The files this store owns, named by an id: slot 0's photo, slots 1-4
+     * (MAX_PHOTOS - 1), the notes, and the .faces file. */
+    private static final Pattern OWNED_FILE = Pattern.compile("([0-9a-f]{16})(?:(?:-[1-4])?\\.jpg|\\.json|\\.faces)");
 
     interface Clock {
         long nowMillis();
@@ -104,12 +136,63 @@ final class PeopleStore {
         }
     }
 
+    /**
+     * One stored photo of a person, as of the call that returned it: its id
+     * and slot, never a name (KTD10). A photo is pending (R18) until it has
+     * an embedding from the current model or is marked unusable.
+     */
+    static final class Photo {
+        final String id;
+        final int slot;
+        /** 0 for a photo whose added-at time was never recorded (R9). */
+        final long addedAtMillis;
+        /** The mode found no face in it (KTD11): never a match exemplar. */
+        final boolean unusable;
+        /** "" when there is no embedding. */
+        final String modelId;
+        /** null when there is no embedding. */
+        final float[] embedding;
+
+        Photo(String id, int slot, long addedAtMillis, boolean unusable, String modelId, float[] embedding) {
+            this.id = id;
+            this.slot = slot;
+            this.addedAtMillis = addedAtMillis;
+            this.unusable = unusable;
+            this.modelId = modelId;
+            this.embedding = embedding;
+        }
+
+        /** True while this photo still waits for an embedding from currentModelId. */
+        boolean isPending(String currentModelId) {
+            return !unusable && (embedding == null || !modelId.equals(currentModelId));
+        }
+    }
+
+    /** A slot's .faces entry in memory; null in a slot array means no photo. */
+    private static final class Entry {
+        final long addedAtMillis;
+        final boolean unusable;
+        final String modelId;
+        final float[] embedding;
+
+        Entry(long addedAtMillis, boolean unusable, String modelId, float[] embedding) {
+            this.addedAtMillis = addedAtMillis;
+            this.unusable = unusable;
+            this.modelId = modelId;
+            this.embedding = embedding;
+        }
+    }
+
+    private static final Entry PENDING_LEGACY = new Entry(0, false, "", null);
+
     private final File dir;
     private final Clock clock;
     private final IndexOpener indexOpener;
     private final SecureRandom random = new SecureRandom();
     // Most recently seen first.
     private final List<Person> people = new ArrayList<Person>();
+    // Each person's MAX_PHOTOS slots; a null slot has no photo.
+    private final Map<String, Entry[]> slots = new HashMap<String, Entry[]>();
 
     PeopleStore(File dir, Clock clock) {
         this(dir, clock, FILE_OPENER);
@@ -176,6 +259,10 @@ final class PeopleStore {
                 throw new IOException("no people directory");
             }
             writeDurably(face, faceJpeg);
+            // No .faces file: the photo waits for the mode's embedding (R18).
+            Entry[] e = new Entry[MAX_PHOTOS];
+            e[0] = PENDING_LEGACY;
+            slots.put(id, e);
             people.add(0, new Person(id, cleanName, clock.nowMillis()));
             saveIndex();
         } catch (IOException e) {
@@ -184,6 +271,159 @@ final class PeopleStore {
             throw new IllegalArgumentException(REFUSE_NOT_SAVED);
         }
         return id;
+    }
+
+    /**
+     * Remembers a new person, seen now, with their first photo in slot 0 and
+     * its embedding (KTD12), and answers their id. The photo and the .faces
+     * file are written before the index names the person, so a crash leaves
+     * only orphans that load() sweeps. Throws IllegalArgumentException with a
+     * fixed REFUSE_* reason, having written nothing, for a bad photo, a
+     * missing name, or a bad model id or embedding.
+     */
+    synchronized String addPerson(byte[] faceJpeg, String name, String modelId, float[] embedding) {
+        checkJpeg(faceJpeg);
+        String cleanName = cleanName(name);
+        if (cleanName.isEmpty()) {
+            throw new IllegalArgumentException(REFUSE_NO_NAME);
+        }
+        checkEmbedding(modelId, embedding);
+        String id = newId();
+        Entry[] e = new Entry[MAX_PHOTOS];
+        e[0] = new Entry(clock.nowMillis(), false, modelId, embedding.clone());
+        try {
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                throw new IOException("no people directory");
+            }
+            writeDurably(faceFile(id), faceJpeg);
+            writeFaces(id, e);
+            slots.put(id, e);
+            people.add(0, new Person(id, cleanName, clock.nowMillis()));
+            saveIndex();
+        } catch (IOException ex) {
+            remove(id);
+            facesFile(id).delete();
+            faceFile(id).delete();
+            throw new IllegalArgumentException(REFUSE_NOT_SAVED);
+        }
+        return id;
+    }
+
+    /**
+     * Adds a photo and its embedding to a remembered person (R5) and answers
+     * the slot it took: the lowest empty slot, or else the one added longest
+     * ago (slot 0 gets no protection). Refuses an id the index does not name
+     * with REFUSE_UNKNOWN_PERSON, writing nothing, so a "yes" that races a
+     * forget cannot bring the person back (KTD12). Other refusals as addPerson.
+     */
+    synchronized int addPhoto(String id, byte[] faceJpeg, String modelId, float[] embedding) {
+        if (indexOf(id) < 0) {
+            throw new IllegalArgumentException(REFUSE_UNKNOWN_PERSON);
+        }
+        checkJpeg(faceJpeg);
+        checkEmbedding(modelId, embedding);
+        Entry[] e = slots.get(id).clone();
+        int slot = -1;
+        for (int i = 0; i < MAX_PHOTOS && slot < 0; i++) {
+            if (e[i] == null) {
+                slot = i;
+            }
+        }
+        if (slot < 0) {
+            slot = 0;
+            for (int i = 1; i < MAX_PHOTOS; i++) {
+                if (e[i].addedAtMillis < e[slot].addedAtMillis) {
+                    slot = i;
+                }
+            }
+        }
+        try {
+            if (e[slot] != null) {
+                // Drop the old entry first: a crash below must not pair the
+                // new photo with the old photo's embedding.
+                e[slot] = null;
+                writeFaces(id, e);
+            }
+            writeDurably(photoFile(id, slot), faceJpeg);
+            e[slot] = new Entry(clock.nowMillis(), false, modelId, embedding.clone());
+            writeFaces(id, e);
+            slots.put(id, e);
+        } catch (IOException ex) {
+            // Whatever reached the disk is what the store now holds.
+            slots.put(id, readSlots(id));
+            throw new IllegalArgumentException(REFUSE_NOT_SAVED);
+        }
+        return slot;
+    }
+
+    /**
+     * Stores the embedding the mode computed for a photo it fetched (KTD11
+     * migration) and clears any unusable mark. False, writing nothing, when
+     * the person is gone or the slot no longer holds the photo added at
+     * addedAtMillis (replaced or deleted since the mode fetched it), or the
+     * .faces file can't be written. IllegalArgumentException with
+     * REFUSE_BAD_EMBEDDING for a bad model id or embedding.
+     */
+    synchronized boolean setEmbedding(String id, int slot, long addedAtMillis, String modelId, float[] embedding) {
+        checkEmbedding(modelId, embedding);
+        return replaceEntry(id, slot, addedAtMillis, new Entry(addedAtMillis, false, modelId, embedding.clone()));
+    }
+
+    /** Marks a photo in which the mode found no face (KTD11): it gets no
+     * embedding and stops counting as pending. Refused as setEmbedding. */
+    synchronized boolean markUnusable(String id, int slot, long addedAtMillis) {
+        return replaceEntry(id, slot, addedAtMillis, new Entry(addedAtMillis, true, "", null));
+    }
+
+    private boolean replaceEntry(String id, int slot, long addedAtMillis, Entry entry) {
+        if (indexOf(id) < 0 || slot < 0 || slot >= MAX_PHOTOS) {
+            return false;
+        }
+        Entry[] e = slots.get(id).clone();
+        if (e[slot] == null || e[slot].addedAtMillis != addedAtMillis) {
+            return false;
+        }
+        e[slot] = entry;
+        try {
+            writeFaces(id, e);
+        } catch (IOException ex) {
+            return false;
+        }
+        slots.put(id, e);
+        return true;
+    }
+
+    /**
+     * Deletes one photo and its embedding (the People page). False for an
+     * unknown id or an empty slot; IllegalArgumentException with
+     * REFUSE_LAST_PHOTO for the person's only photo, since a person with no
+     * photo would not load again. The entry goes before the photo, so a
+     * crash leaves the photo back as pending, not an entry with no photo.
+     */
+    synchronized boolean deletePhoto(String id, int slot) {
+        if (indexOf(id) < 0 || slot < 0 || slot >= MAX_PHOTOS) {
+            return false;
+        }
+        Entry[] e = slots.get(id).clone();
+        if (e[slot] == null) {
+            return false;
+        }
+        int count = 0;
+        for (Entry x : e) {
+            count += x == null ? 0 : 1;
+        }
+        if (count <= 1) {
+            throw new IllegalArgumentException(REFUSE_LAST_PHOTO);
+        }
+        e[slot] = null;
+        try {
+            writeFaces(id, e);
+        } catch (IOException ex) {
+            return false;
+        }
+        slots.put(id, e);
+        photoFile(id, slot).delete();
+        return true;
     }
 
     /** Marks a person seen now and moves them to the front. False if unknown. */
@@ -209,8 +449,8 @@ final class PeopleStore {
         return saveIndexQuietly();
     }
 
-    /** Deletes a person's face, name and notes for good (R16, R18, AE6).
-     * False if unknown. */
+    /** Deletes a person's photos, embeddings, name and notes for good (R16,
+     * R18, AE6; face plan R8). False if unknown. */
     synchronized boolean forget(String id) {
         if (indexOf(id) < 0) {
             return false;
@@ -220,7 +460,11 @@ final class PeopleStore {
         // only orphan files, which load() never reads and sweeps away (KTD10).
         saveIndexQuietly();
         notesFile(id).delete();
+        facesFile(id).delete();
         faceFile(id).delete();
+        for (int slot = 1; slot < MAX_PHOTOS; slot++) {
+            photoFile(id, slot).delete();
+        }
         return true;
     }
 
@@ -274,16 +518,98 @@ final class PeopleStore {
         return i < 0 ? null : people.get(i).name;
     }
 
-    /** The face JPEG, or null for an unknown or malformed id. */
+    /** The person's newest photo (the one recent() and the People page
+     * show), or null for an unknown or malformed id. */
     synchronized byte[] face(String id) {
         if (indexOf(id) < 0) {
             return null;
         }
+        Entry[] e = slots.get(id);
+        int newest = -1;
+        for (int i = 0; i < MAX_PHOTOS; i++) {
+            if (e[i] != null && (newest < 0 || e[i].addedAtMillis > e[newest].addedAtMillis)) {
+                newest = i;
+            }
+        }
+        return newest < 0 ? null : photo(id, newest);
+    }
+
+    /** One photo JPEG by slot, or null for an unknown or malformed id or an
+     * empty or out-of-range slot. */
+    synchronized byte[] photo(String id, int slot) {
+        if (indexOf(id) < 0 || slot < 0 || slot >= MAX_PHOTOS || slots.get(id)[slot] == null) {
+            return null;
+        }
         try {
-            return readAll(faceFile(id), MAX_FACE_BYTES);
+            return readAll(photoFile(id, slot), MAX_FACE_BYTES);
         } catch (IOException e) {
             return null;
         }
+    }
+
+    /** One person's photos in slot order, named or not (the People page);
+     * empty for an unknown id. */
+    synchronized List<Photo> photos(String id) {
+        List<Photo> out = new ArrayList<Photo>();
+        if (indexOf(id) >= 0) {
+            addPhotos(id, out);
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    /**
+     * Every photo of every named person, most recently seen person first,
+     * slots in order (KTD11): what the mode matches against and migrates.
+     * Pending and unusable photos are included so the mode can tell whether
+     * the store is ready (R18). Nameless records are skipped, and no record
+     * carries a name.
+     */
+    synchronized List<Photo> gallery() {
+        List<Photo> out = new ArrayList<Photo>();
+        for (Person p : people) {
+            if (!p.name.isEmpty()) {
+                addPhotos(p.id, out);
+            }
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    private void addPhotos(String id, List<Photo> out) {
+        Entry[] e = slots.get(id);
+        for (int i = 0; i < MAX_PHOTOS; i++) {
+            if (e[i] != null) {
+                out.add(new Photo(id, i, e[i].addedAtMillis, e[i].unusable, e[i].modelId,
+                        e[i].embedding == null ? null : e[i].embedding.clone()));
+            }
+        }
+    }
+
+    /**
+     * The ids of named people a spoken name could mean (KTD10), most recently
+     * seen first: two or more words match the full stored name, one word
+     * matches the stored first word; case-insensitive, so "ben" matches
+     * "Ben Wilson" and "Ben Smith" but never "Benjamin". Empty for a blank
+     * name. Answers ids only: names still leave only through nameOf().
+     */
+    synchronized List<String> idsNamed(String name) {
+        List<String> out = new ArrayList<String>();
+        String query = cleanName(name).toLowerCase(Locale.ROOT);
+        if (query.isEmpty()) {
+            return out;
+        }
+        boolean full = query.indexOf(' ') >= 0;
+        for (Person p : people) {
+            if (p.name.isEmpty()) {
+                continue;
+            }
+            String stored = p.name.toLowerCase(Locale.ROOT);
+            int space = stored.indexOf(' ');
+            String compared = full || space < 0 ? stored : stored.substring(0, space);
+            if (compared.equals(query)) {
+                out.add(p.id);
+            }
+        }
+        return out;
     }
 
     /** Everyone, most recently seen first. */
@@ -324,13 +650,47 @@ final class PeopleStore {
         if (i >= 0) {
             people.remove(i);
         }
+        slots.remove(id);
+    }
+
+    private static void checkJpeg(byte[] faceJpeg) {
+        if (faceJpeg == null || faceJpeg.length < 4 || (faceJpeg[0] & 0xff) != 0xFF
+                || (faceJpeg[1] & 0xff) != 0xD8) {
+            throw new IllegalArgumentException(REFUSE_NOT_JPEG);
+        }
+        if (faceJpeg.length > MAX_FACE_BYTES) {
+            throw new IllegalArgumentException(REFUSE_TOO_BIG);
+        }
+    }
+
+    /** A model id token and 1 to MAX_EMBEDDING_FLOATS finite floats. */
+    private static void checkEmbedding(String modelId, float[] embedding) {
+        if (!isValidModelId(modelId) || !isValidEmbedding(embedding)) {
+            throw new IllegalArgumentException(REFUSE_BAD_EMBEDDING);
+        }
+    }
+
+    private static boolean isValidModelId(String modelId) {
+        return modelId != null && MODEL_ID.matcher(modelId).matches();
+    }
+
+    private static boolean isValidEmbedding(float[] embedding) {
+        if (embedding == null || embedding.length == 0 || embedding.length > MAX_EMBEDDING_FLOATS) {
+            return false;
+        }
+        for (float f : embedding) {
+            if (Float.isNaN(f) || Float.isInfinite(f)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private String newId() {
         while (true) {
             long v = random.nextLong();
             String id = String.format(Locale.ROOT, "%016x", v);
-            if (indexOf(id) < 0 && !faceFile(id).exists()) {
+            if (indexOf(id) < 0 && !faceFile(id).exists() && !facesFile(id).exists()) {
                 return id;
             }
         }
@@ -344,15 +704,118 @@ final class PeopleStore {
         return new File(dir, id + ".json");
     }
 
-    /** Reads the index, skipping any line that is malformed or whose face
-     * file is missing (a hand edit, or a crash between writing a face and the
-     * index), then deletes every face or notes file whose id the index does
-     * not name: what a crash mid-add or mid-forget leaves behind (KTD10). The
+    /** Slot 0 is the legacy "<id>.jpg" (R9); slots 1 to 4 are "<id>-<n>.jpg". */
+    private File photoFile(String id, int slot) {
+        return slot == 0 ? faceFile(id) : new File(dir, id + "-" + slot + ".jpg");
+    }
+
+    private File facesFile(String id) {
+        return new File(dir, id + FACES_SUFFIX);
+    }
+
+    private boolean hasPhoto(String id) {
+        for (int slot = 0; slot < MAX_PHOTOS; slot++) {
+            if (photoFile(id, slot).isFile()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A person's slots from disk: one entry per photo file present, from the
+     * .faces file when it has a well-formed line for that slot, else pending
+     * and added at 0. A missing, oversized or malformed .faces file reads as
+     * every photo pending; the next write replaces it whole. */
+    private Entry[] readSlots(String id) {
+        Entry[] e = new Entry[MAX_PHOTOS];
+        for (int slot = 0; slot < MAX_PHOTOS; slot++) {
+            if (photoFile(id, slot).isFile()) {
+                e[slot] = PENDING_LEGACY;
+            }
+        }
+        File f = facesFile(id);
+        if (!f.isFile()) {
+            return e;
+        }
+        String[] lines;
+        try {
+            lines = new String(readAll(f, MAX_FACES_FILE_BYTES), StandardCharsets.UTF_8).split("\n");
+        } catch (IOException ex) {
+            return e;
+        }
+        if (lines.length == 0 || !FACES_HEADER.equals(lines[0])) {
+            return e;
+        }
+        for (int i = 1; i < lines.length; i++) {
+            String[] fields = lines[i].split("\t", -1);
+            if (fields.length != 5 || !("0".equals(fields[2]) || "1".equals(fields[2]))) {
+                continue;
+            }
+            try {
+                int slot = Integer.parseInt(fields[0]);
+                if (slot < 0 || slot >= MAX_PHOTOS || e[slot] == null) {
+                    continue;
+                }
+                long addedAt = Long.parseLong(fields[1]);
+                boolean unusable = "1".equals(fields[2]);
+                String modelId = fields[3];
+                float[] embedding = null;
+                if (!fields[4].isEmpty()) {
+                    String[] parts = fields[4].split(",", -1);
+                    embedding = new float[parts.length];
+                    for (int j = 0; j < parts.length; j++) {
+                        embedding[j] = Float.parseFloat(parts[j]);
+                    }
+                }
+                // Pending or unusable: no embedding. Embedded: a valid pair.
+                boolean none = modelId.isEmpty() && embedding == null;
+                boolean embedded = !unusable && isValidModelId(modelId) && isValidEmbedding(embedding);
+                if (none || embedded) {
+                    e[slot] = new Entry(addedAt, unusable, modelId, embedding);
+                }
+            } catch (NumberFormatException ex) {
+                // A torn or hand-edited line: that photo stays pending.
+            }
+        }
+        return e;
+    }
+
+    /** Rewrites the person's .faces file whole from e, durably. */
+    private void writeFaces(String id, Entry[] e) throws IOException {
+        StringBuilder out = new StringBuilder(FACES_HEADER).append('\n');
+        for (int slot = 0; slot < MAX_PHOTOS; slot++) {
+            Entry x = e[slot];
+            if (x == null) {
+                continue;
+            }
+            out.append(slot).append('\t').append(x.addedAtMillis).append('\t').append(x.unusable ? '1' : '0')
+                    .append('\t').append(x.modelId).append('\t');
+            if (x.embedding != null) {
+                for (int i = 0; i < x.embedding.length; i++) {
+                    if (i > 0) {
+                        out.append(',');
+                    }
+                    // Float.toString round-trips exactly through parseFloat.
+                    out.append(Float.toString(x.embedding[i]));
+                }
+            }
+            out.append('\n');
+        }
+        writeDurably(facesFile(id), out.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Reads the index, skipping any line that is malformed or that has no
+     * photo in any slot (a hand edit, or a crash between writing a face and
+     * the index), then deletes every photo, notes or .faces file whose id the
+     * index does not name: what a crash mid-add or mid-forget leaves behind (KTD10). The
      * sweep needs the whole index: after a read that failed partway, the
      * people it never reached would look like orphans. */
     private void load() {
         File index = new File(dir, INDEX_FILE);
         boolean complete = !index.isFile() || readIndex(index);
+        for (Person p : people) {
+            slots.put(p.id, readSlots(p.id));
+        }
         if (!complete) {
             return;
         }
@@ -377,7 +840,7 @@ final class PeopleStore {
             String line;
             while ((line = in.readLine()) != null) {
                 String[] f = line.split("\t", -1);
-                if (f.length != 3 || !isValidId(f[0]) || indexOf(f[0]) >= 0 || !faceFile(f[0]).isFile()) {
+                if (f.length != 3 || !isValidId(f[0]) || indexOf(f[0]) >= 0 || !hasPhoto(f[0])) {
                     continue;
                 }
                 long seen;

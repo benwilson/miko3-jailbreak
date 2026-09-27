@@ -113,6 +113,88 @@ public final class RobotPeopleClient {
         });
     }
 
+    // Face plan U4 (KTD10-KTD12). Each throws LauncherProtocol.LAUNCHER_TOO_OLD
+    // as an IOException when the launcher predates it.
+
+    /** Every stored photo of every named person as (id, slot, added-at,
+     * model id, embedding), no names and no images (KTD11). */
+    public static RobotPeople.GalleryPhoto[] gallery(Context context) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<RobotPeople.GalleryPhoto[]>() {
+            @Override
+            public RobotPeople.GalleryPhoto[] run(RobotPeople people) throws RemoteException {
+                return people.gallery();
+            }
+        });
+    }
+
+    /** One stored photo JPEG, or null for an unknown id or an empty slot. */
+    public static byte[] photo(Context context, final String id, final int slot) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<byte[]>() {
+            @Override
+            public byte[] run(RobotPeople people) throws RemoteException {
+                return people.photo(id, slot);
+            }
+        });
+    }
+
+    /** The ids of named people a spoken name could mean (KTD10). */
+    public static String[] idsNamed(Context context, final String name) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<String[]>() {
+            @Override
+            public String[] run(RobotPeople people) throws RemoteException {
+                return people.idsNamed(name);
+            }
+        });
+    }
+
+    /** Adds a photo and its embedding to a remembered person (R5); answers the
+     * slot. IOException with the store's fixed reason for an unknown id
+     * (KTD12), a bad photo or a bad embedding. */
+    public static int addPhoto(Context context, final String id, final byte[] faceJpeg, final String modelId,
+                               final float[] embedding) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Integer>() {
+            @Override
+            public Integer run(RobotPeople people) throws RemoteException {
+                return people.addPhoto(id, faceJpeg, modelId, embedding);
+            }
+        });
+    }
+
+    /** Remembers a new person with their first photo and its embedding in one
+     * step (KTD12); answers their id. */
+    public static String addPerson(Context context, final byte[] faceJpeg, final String name, final String modelId,
+                                   final float[] embedding) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<String>() {
+            @Override
+            public String run(RobotPeople people) throws RemoteException {
+                return people.addPerson(faceJpeg, name, modelId, embedding);
+            }
+        });
+    }
+
+    /** Writes back a migrated embedding (KTD11); false when the person is gone
+     * or the slot's photo has been replaced since it was fetched. */
+    public static boolean setEmbedding(Context context, final String id, final int slot, final long addedAtMillis,
+                                       final String modelId, final float[] embedding) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.setEmbedding(id, slot, addedAtMillis, modelId, embedding);
+            }
+        });
+    }
+
+    /** Marks a stored photo with no findable face (KTD11); false as setEmbedding. */
+    public static boolean markUnusable(Context context, final String id, final int slot, final long addedAtMillis)
+            throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.markUnusable(id, slot, addedAtMillis);
+            }
+        });
+    }
+
     private static PersonNotes parseNotes(String json) {
         try {
             return PersonNotes.parse(json);
