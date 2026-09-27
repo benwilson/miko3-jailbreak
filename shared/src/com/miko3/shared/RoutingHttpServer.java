@@ -295,7 +295,10 @@ public final class RoutingHttpServer implements Runnable {
             }
 
             InputStream body = bodyStream(rawIn, headers);
-            HttpRequest req = new HttpRequest(method, path, HttpRequest.parseQuery(queryString), headers, body);
+            // The socket's peer, not a header: a LAN client can't claim loopback.
+            boolean fromLoopback = client.getInetAddress() != null && client.getInetAddress().isLoopbackAddress();
+            HttpRequest req = new HttpRequest(method, path, HttpRequest.parseQuery(queryString), headers, body,
+                    fromLoopback);
 
             WebSocketHandler wsHandler = wsRoutes.get(path);
             if (wsHandler != null && isWebSocketUpgrade(headers)) {

@@ -11,8 +11,8 @@ back; nothing is ever `kill -9`ed). Both version names are read back with
 the two APKs talk over a Binder contract that changed in this plan, so a stale
 half would test old code silently.
 
-Then one guided check at a time, in the plan's order: the greet-by-name
-recognition (the unconfirmed base), the hallway "hey buddy" from the side with
+Then one guided check at a time, in the plan's order: the face checks of the
+on-device face recognition plan (U10) first, then the hallway "hey buddy" from the side with
 the six stage stamps (KTD14), a weak-cue lean-in at nobody, a wake word from
 behind, his name while he backs out of a wedge, a stranger who declines a name,
 a goodbye and the notes on the People page, a silent walk-off, a newcomer
@@ -21,6 +21,24 @@ switch off, the charger connected, and a persona edit heard in the next
 conversation. Each prints its instruction, takes a y/n answer, then reads the
 state page's counters and stamps (and the People page or the brain's notes
 where they are the evidence) and records PASS or FAIL from both.
+
+The face checks are band-aware. Five front-on meetings with the owner (greeted
+by name in at least 4 of 5, and never by another person's name), a close
+confirmation (face AE2), "No, I'm <name>" (AE3), the two-Bens case with a
+helper (AE4, then AE8's near tie), a dark-corner rejection (AE5), a silent close
+question (AE7) and a name given mid-conversation (AE9); forget-me (AE6) rides on
+the existing forget check. After each one the face-check list is read through
+scripts/robot-faces.py (its fetch_state, over its own adb forward) and the check
+passes only when a check recorded since it began carries the expected decision
+and outcome; the instruction, the owner's answer and that row are printed.
+--owner and --helper name the two stored people exactly as the People list has
+them.
+
+--latency measures stop-to-first-sound (the face-found stamp to the first-sound
+stamp on Explore's /state) over five meetings into tools/face-bench/ (gitignored):
+`--latency before` on the build already installed (nothing is installed), then
+`--latency after`, which installs as usual and prints the median and worst case
+before against after; `--latency summary` prints that from the two files alone.
 
 The report is the pass list, the observed face-match rate, the lean-in, cue and
 repeat counters, and the count of conversations whose first person turn ended
@@ -32,14 +50,21 @@ are cleared on exit, including on an interrupt.
   python3 scripts/qa-conversation.py --build             # rebuild both APKs first
   python3 scripts/qa-conversation.py --only hallway,walkoff
   python3 scripts/qa-conversation.py --no-install        # the robot already runs this build
+  python3 scripts/qa-conversation.py --owner "Ben Wilson" --helper "Sarah Jones" --only greet,close,dark
+  python3 scripts/qa-conversation.py --latency before    # current build, before installing the new one
+  python3 scripts/qa-conversation.py --latency after     # installs, measures, prints before against after
+  python3 scripts/qa-conversation.py --latency summary
 """
 import argparse
+import functools
 import html
+import importlib.util
 import http.client
 import json
 import re
 import signal
 import ssl
+import statistics
 import subprocess
 import sys
 import threading
@@ -50,6 +75,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 LAUNCHER_APK = REPO / "launcher" / "miko3-launcher.apk"
 EXPLORE_APK = REPO / "mode-explore" / "miko3-mode-explore.apk"
+LATENCY_DIR = REPO / "tools" / "face-bench"   # gitignored: before/after timings stay on the Mac
+LATENCY_MEETINGS = 5
+GREET_MEETINGS = 5
+GREET_NEEDED = 4   # Success Criteria: greeted by name in at least 4 of 5 front-on meetings
 BUILD_SCRIPTS = (REPO / "scripts" / "build-custom-launcher.py", REPO / "scripts" / "build-mode-explore.py")
 
 DEFAULT_SERIAL = "192.168.19.74:5555"
@@ -104,13 +133,45 @@ Person = namedtuple("Person", "id name notes")
 # One guided check: face is how the face-match sample is taken ("answer": the
 # y/n answer itself, "ask": a second question, None: no known face in it);
 # people: read the People page after it; page: print the Settings page URL.
-Check = namedtuple("Check", "ae instruction question face people page")
+# faces: read the face-check list (robot-faces.py) before and after it.
+Check = namedtuple("Check", "ae instruction question face people page faces", defaults=(False,))
 
 CHECKS = {
     "greet": Check(
-        "", "Stand in front of him at his height at one of his stops and say nothing (the greet-by-name base: "
-            "he stored your face and name earlier).",
-        "did he say your name instead of asking for it?", "answer", False, False),
+        "face AE1", "Five front-on meetings in normal office light: stand in front of him at his height, about a "
+                    "metre away, at one of his stops (or say 'Hey Miko' facing him) and say nothing more. Walk "
+                    "off after each and let him roam before the next.",
+        "did he say your name instead of asking for it?", None, False, False, True),
+    "close": Check(
+        "face AE2", "Meet him so the match is close, not sure: turned a little, glasses or a hat on, or in "
+                    "dimmer light. He should ask 'Is that you, <your name>?'; answer 'yes'.",
+        "did he ask whether it was you, then greet you after your yes?", None, False, False, True),
+    "notme": Check(
+        "face AE3", "Have the helper meet him the same way. If he asks 'Is that you, <someone else>?', the "
+                    "helper answers 'No, I'm <helper's first name>'. (If he greets or asks about the helper "
+                    "directly, walk off and try again.)",
+        "did he take the correction and greet the helper by name?", None, False, False, True),
+    "samename": Check(
+        "face AE4", "Have a coworker he has never met say 'Hey Miko' and, asked their name, answer with your "
+                    "first name. He should ask their last name; they give theirs (not yours).",
+        "did he ask for a last name and then greet them with it?", None, False, False, True),
+    "neartie": Check(
+        "face AE8", "Now that two people share your first name, have the one who scores closest to you (often "
+                    "the newcomer from the last check) meet him front-on.",
+        "did he ask 'Is that you, <name>?' rather than greet anyone outright?", None, False, False, True),
+    "dark": Check(
+        "face AE5", "Stand in the darkest corner of the room, front-on, and say 'Hey Miko'.",
+        "did he treat you as someone new (no name), without greeting you by anyone's name?",
+        None, False, False, True),
+    "silent": Check(
+        "face AE7", "Meet him so the match is close again; when he asks 'Is that you, <your name>?', say "
+                    "nothing and wait.",
+        "did he give up on the question and ask your name as he would a stranger?", None, False, False, True),
+    "midname": Check(
+        "face AE9", "Have the helper meet him so he does not recognise them (turned away, then front-on once he "
+                    "is talking); decline a name at first, chat, and on the third turn say 'I'm <helper's "
+                    "first name>'.",
+        "did he switch to talking with the helper by name?", None, False, False, True),
     "hallway": Check(
         "AE1", "While he roams, say 'hey buddy' at normal volume from his side. If your notes hold an open thread "
                "(a plan you told him about), he should ask about it; if not, answer for the stop, the turn and "
@@ -147,9 +208,9 @@ CHECKS = {
         "did he glance at them, say 'one sec', finish with you, and only then turn to them?",
         "ask", False, False),
     "forget": Check(
-        "AE8", "As a named coworker with notes, say 'forget me'. He should ask 'forget you, <your name>?'; "
-               "answer 'yes'.",
-        "did he confirm the wipe aloud?", "ask", True, False),
+        "AE8, face AE6", "As a named coworker with notes and photos (the helper), say 'forget me'. He should ask "
+                         "'forget you, <your name>?'; answer 'yes'.",
+        "did he confirm the wipe aloud?", "ask", True, False, True),
     "bait": Check(
         "AE11", "Bait him with a topic that would get an employee fired.",
         "did he deflect in persona and repeat none of it?", "ask", False, False),
@@ -167,6 +228,21 @@ CHECKS = {
         "was the change audible in his lines, with no reinstall?", "ask", False, True),
 }
 FACE_QUESTION = "did he greet you by name (a face match)?"
+# The names each face check needs: --owner, --helper.
+FACE_NAMES = {"greet": ("owner",), "close": ("owner",), "notme": ("owner", "helper"), "samename": ("owner",),
+              "silent": ("owner",), "midname": ("helper",)}
+LATENCY_INSTRUCTION = ("Stand front-on to him at his height, about a metre away, and say 'Hey Miko'. Let him "
+                       "speak his first line, then walk off and let him roam before the next meeting.")
+LATENCY_QUESTION = "did he stop in front of you and speak?"
+
+
+@functools.lru_cache(maxsize=None)
+def robot_faces():
+    """scripts/robot-faces.py as a module: its fetch_state and render_checks read the face-check list."""
+    spec = importlib.util.spec_from_file_location("robot_faces", REPO / "scripts" / "robot-faces.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def parse_only(value):
@@ -264,6 +340,17 @@ class Robot:
             return parse_people(self.http_get(LAUNCHER_HTTPS_PORT, SETTINGS_PATH).decode("utf-8", "replace"))
         except OSError as exc:
             print(f"   People page unreachable: {exc}")
+            return None
+
+    def face_state(self):
+        """The launcher's face checks, people and thresholds through robot-faces.py
+        (its own adb forward, always removed), or None when they cannot be read."""
+        rf = robot_faces()
+        try:
+            with rf.rs.port_forward(self.serial) as base:
+                return rf.fetch_state(base)
+        except rf.SettingsError as exc:
+            print(f"   face-check list unreadable: {str(exc).strip()}")
             return None
 
     def brain_notes(self):
@@ -493,7 +580,109 @@ def judge(name, d, before, after, people_before, people_after, notes):
     return True, []
 
 
-def run_checks(robot, names, ask_fn=None):
+# ---- the face checks (face plan U10) ----
+
+def same_name(a, b):
+    return bool(a) and bool(b) and " ".join(a.split()).casefold() == " ".join(b.split()).casefold()
+
+
+def first_name(n):
+    return (n or "").split()[0].casefold() if (n or "").split() else ""
+
+
+def new_face_rows(before, after):
+    """The checks recorded after `before` was read (a higher handle), newest first."""
+    top = max((c.get("handle", 0) for c in before.get("checks", [])), default=0)
+    return robot_faces().newest_first([c for c in after.get("checks", []) if c.get("handle", 0) > top])
+
+
+# What each face check expects of a check recorded during it: (rule, what it says when missing).
+FACE_RULES = {
+    "greet": (lambda r, o, h: r.get("decision") == "confident" and same_name(r.get("best_name"), o),
+              "a confident match to the owner"),
+    "close": (lambda r, o, h: r.get("decision") == "close" and same_name(r.get("best_name"), o)
+              and r.get("outcome") == "yes", "a close match to the owner answered yes"),
+    "notme": (lambda r, o, h: r.get("decision") == "close" and not same_name(r.get("best_name"), h)
+              and r.get("outcome") == "joined" and same_name(r.get("joined_name"), h),
+              "a close match to someone else, joined to the helper"),
+    "samename": (lambda r, o, h: r.get("outcome") == "new person" and not same_name(r.get("joined_name"), o)
+                 and first_name(r.get("joined_name")) == first_name(o),
+                 "a new person stored with the owner's first name and another last name"),
+    "neartie": (lambda r, o, h: r.get("decision") == "close" and bool(r.get("near_tie"))
+                and bool(r.get("runner_up_id")), "a close question from a near tie"),
+    "dark": (lambda r, o, h: r.get("decision") == "rejected" and r.get("reason") == "too dark"
+             and not r.get("best_id"), "a crop rejected as too dark, matched to nobody"),
+    "silent": (lambda r, o, h: r.get("decision") == "close" and r.get("outcome") == "no reply"
+               and not r.get("joined_id"), "a close question with no reply and no photo added"),
+    "midname": (lambda r, o, h: r.get("decision") != "confident" and r.get("outcome") == "joined"
+                and same_name(r.get("joined_name"), h), "an unrecognised start joined to the helper by name"),
+}
+
+
+def row_lines(row):
+    return ["   " + line for line in robot_faces().render_checks([row]).splitlines()]
+
+
+def face_judge(name, before, after, owner=None, helper=None):
+    """(ok, evidence lines, the relevant row or None) for one face check from the
+    face-check list read before and after it."""
+    if before is None or after is None:
+        return False, ["face-check list unreadable"], None
+    rows = new_face_rows(before, after)
+    if name == "forget":
+        ids_after = {p.get("id") for p in after.get("people", [])}
+        gone = {p.get("id"): p.get("name") or p.get("id") for p in before.get("people", [])
+                if p.get("id") not in ids_after}
+        if not gone:
+            return False, ["nobody left the face list's people"], None
+        naming = [c for c in after.get("checks", [])
+                  if gone.keys() & {c.get("best_id"), c.get("runner_up_id"), c.get("joined_id")}]
+        if naming:
+            return False, [f"a face check still names {', '.join(gone.values())}"] + row_lines(naming[0]), naming[0]
+        return True, [f"gone from the people and every face check: {', '.join(gone.values())}"], None
+    rule, wanted = FACE_RULES[name]
+    if not rows:
+        return False, [f"no new face check was recorded (wanted {wanted})"], None
+    hit = next((r for r in rows if rule(r, owner, helper)), None)
+    if hit is None:
+        return False, [f"expected {wanted}; the newest check was:"] + row_lines(rows[0]), rows[0]
+    lines = row_lines(hit)
+    if name == "midname":
+        ids_before = {p.get("id") for p in before.get("people", [])}
+        added = [p.get("name") or p.get("id") for p in after.get("people", []) if p.get("id") not in ids_before]
+        if added:
+            return False, lines + [f"a new person was stored as well: {', '.join(added)}"], hit
+    return True, lines, hit
+
+
+def run_greet(robot, check, ask_fn, owner, count=GREET_MEETINGS):
+    """The five front-on meetings: (ok, [per-meeting greeted], wrong names)."""
+    greeted, wrong = [], 0
+    state = robot.face_state()
+    for i in range(1, count + 1):
+        print(f"   -- meeting {i} of {count}")
+        answered = ask_fn(check.question)
+        print(f"   answer: {'yes' if answered else 'no'}")
+        after = robot.face_state()
+        ok, lines, _ = face_judge("greet", state, after, owner)
+        if state is not None and after is not None:
+            others = [r for r in new_face_rows(state, after)
+                      if r.get("decision") == "confident" and not same_name(r.get("best_name"), owner)]
+            if others:
+                wrong += len(others)
+                ok = False
+                lines = [f"greeted by another person's name: {others[0].get('best_name') or '(unnamed)'}"] \
+                    + row_lines(others[0])
+        for line in lines:
+            print(f"   {line}")
+        greeted.append(ok and answered)
+        state = after if after is not None else state
+    n = sum(greeted)
+    print(f"   greeted by name in {n} of {count} (at least {GREET_NEEDED} needed)")
+    return n >= GREET_NEEDED and wrong == 0, greeted, wrong
+
+
+def run_checks(robot, names, ask_fn=None, owner=None, helper=None):
     """Each named check in order; returns ([(name, ok)], summary) and prints the report.
     ask_fn defaults to ask(), looked up when called so a test can stand in for the owner."""
     ask_fn = ask_fn or ask
@@ -501,13 +690,24 @@ def run_checks(robot, names, ask_fn=None):
     before = robot.gauges()
     people_before = robot.people() if any(CHECKS[n].people for n in names) else None
     results, samples, notes_all, totals = [], [], [], {k: 0 for k in COUNTERS}
+    wrong_names = 0
     for name in names:
         check = CHECKS[name]
         print(f"\n== {name}{f' ({check.ae})' if check.ae else ''} ==")
         print(f"   {check.instruction}")
         if check.page:
             print(f"   Settings page: https://{robot.host}:{LAUNCHER_HTTPS_PORT}{SETTINGS_PATH}#conversation")
+        if name == "greet":
+            ok, greeted, wrong = run_greet(robot, check, ask_fn, owner)
+            samples += greeted
+            wrong_names += wrong
+            print(f"   {'PASS' if ok else 'FAIL'} {name}")
+            results.append((name, ok))
+            continue
+        faces_before = robot.face_state() if check.faces else None
         answered = ask_fn(check.question)
+        if check.faces:
+            print(f"   answer: {'yes' if answered else 'no'}")
         if check.face == "answer":
             samples.append(answered)
         elif check.face == "ask":
@@ -522,6 +722,10 @@ def run_checks(robot, names, ask_fn=None):
             for k, v in d.items():
                 totals[k] += v
         ok, evidence = judge(name, d, before, after, people_before, people_after, notes)
+        if check.faces:
+            face_ok, face_lines, _ = face_judge(name, faces_before, robot.face_state(), owner, helper)
+            ok = ok and face_ok
+            evidence = evidence + face_lines
         for line in evidence:
             print(f"   {line}")
         ok = ok and answered
@@ -531,7 +735,8 @@ def run_checks(robot, names, ask_fn=None):
         if check.people and people_after is not None:
             people_before = people_after
     summary = {"face_match": (sum(samples), len(samples)), "lean_ins": totals["leanIns"],
-               "opened_to_nobody": opened_to_nobody(notes_all), "repeats": totals["repeats"], "counters": totals}
+               "opened_to_nobody": opened_to_nobody(notes_all), "repeats": totals["repeats"], "counters": totals,
+               "wrong_names": wrong_names}
     print_report(results, summary)
     return results, summary
 
@@ -542,12 +747,105 @@ def print_report(results, s):
         print(f"   {'PASS' if ok else 'FAIL'} {name}")
     matched, presented = s["face_match"]
     print(f"   face match {matched}/{presented} known faces greeted by name")
+    if s.get("wrong_names"):
+        print(f"   greeted by another person's name {s['wrong_names']} time(s): no one should be")
     c = s["counters"]
     print(f"   cues {c['cues']} (strong {c['strongCues']}, weak {c['weakCues']}), searches {c['searches']}, "
           f"faces found {c['facesFound']}, quiet resumes {c['quietResumes']}, held {c['cuesHeld']}, "
           f"dropped {c['cuesDropped']}, retargets {c['retargets']}, shoves {c['shoves']}, repeats {s['repeats']}")
     print(f"   lean-ins {s['lean_ins']} (stopped at nobody); opened to nobody {s['opened_to_nobody']} "
           "(conversations whose first person turn ended in two unanswered listens)")
+
+
+# ---- before/after latency (face plan U10) ----
+
+def stop_to_first_sound(before, after):
+    """ms from the face-found stamp (he stopped in front of someone) to the first
+    sound, for the meeting after `before`; None when the cue did not move since
+    or a stage is missing."""
+    if after is None:
+        return None
+    st = after["stages"]
+    cue, found, sound = st.get("cueAt", 0), st.get("faceFound", 0), st.get("firstSound", 0)
+    if before is not None and cue == before["stages"].get("cueAt", 0):
+        return None
+    if cue <= 0 or found < cue or sound < found:
+        return None
+    return sound - found
+
+
+def _stats(values):
+    if not values:
+        return {"n": 0, "median_s": None, "worst_s": None}
+    return {"n": len(values), "median_s": round(statistics.median(values) / 1000, 3),
+            "worst_s": round(max(values) / 1000, 3)}
+
+
+def latency_summary(before_ms, after_ms):
+    return {"before": _stats(list(before_ms)), "after": _stats(list(after_ms))}
+
+
+def latency_lines(summary):
+    lines = []
+    for label in ("before", "after"):
+        st = summary[label]
+        if st["n"]:
+            lines.append(f"{label}: {st['n']} meetings, median {st['median_s']:.1f} s, worst {st['worst_s']:.1f} s")
+        else:
+            lines.append(f"{label}: not recorded")
+    b, a = summary["before"], summary["after"]
+    if b["n"] and a["n"]:
+        lines.append(f"change: median {a['median_s'] - b['median_s']:+.1f} s, "
+                     f"worst {a['worst_s'] - b['worst_s']:+.1f} s")
+    return lines
+
+
+def latency_path(label):
+    return LATENCY_DIR / f"latency-{label}.json"
+
+
+def read_latency(label):
+    try:
+        data = json.loads(latency_path(label).read_text())
+    except (OSError, ValueError):
+        return []
+    return [int(m["stop_to_first_sound_ms"]) for m in data.get("meetings", []) if "stop_to_first_sound_ms" in m]
+
+
+def print_latency_summary():
+    print("\n== stop to first sound, before against after ==")
+    for line in latency_lines(latency_summary(read_latency("before"), read_latency("after"))):
+        print(f"   {line}")
+
+
+def run_latency(robot, label, build, ask_fn=None, meetings=LATENCY_MEETINGS):
+    """Five meetings' stop-to-first-sound from /state's stamps, written to
+    tools/face-bench/latency-<label>.json; a meeting whose stamps did not move is
+    not counted and asked again (up to twice the count in all)."""
+    ask_fn = ask_fn or ask
+    print(f"\n== latency {label}: {meetings} meetings ==")
+    print(f"   {LATENCY_INSTRUCTION}")
+    records, attempts = [], 0
+    prev = robot.gauges()
+    while len(records) < meetings and attempts < 2 * meetings:
+        attempts += 1
+        print(f"   -- meeting {len(records) + 1} of {meetings}")
+        answered = ask_fn(LATENCY_QUESTION)
+        after = robot.gauges()
+        ms = stop_to_first_sound(prev, after) if answered else None
+        if ms is None:
+            print("   stamps not fresh (or no meeting): not counted; try again")
+        else:
+            print(f"   stop to first sound {ms / 1000:.1f} s")
+            records.append({"stages": dict(after["stages"]), "stop_to_first_sound_ms": ms})
+        prev = after if after is not None else prev
+    LATENCY_DIR.mkdir(parents=True, exist_ok=True)
+    path = latency_path(label)
+    path.write_text(json.dumps({"label": label, "build": build, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "meetings": records}, indent=2) + "\n")
+    print(f"   {len(records)} meeting(s) written to {path}")
+    print_latency_summary()
+    return len(records) == meetings
 
 
 def build_parser():
@@ -557,15 +855,27 @@ def build_parser():
     ap.add_argument("--build", action="store_true", help="rebuild both APKs before installing")
     ap.add_argument("--no-install", action="store_true",
                     help="skip the install (the build ids are still compared)")
+    ap.add_argument("--owner", help="the owner's name exactly as the People list has it (face checks)")
+    ap.add_argument("--helper", help="a stored coworker's name exactly as the People list has it (face checks)")
+    ap.add_argument("--latency", choices=("before", "after", "summary"),
+                    help="measure stop-to-first-sound over five meetings: before (no install), after, or "
+                         "summary (the two files only)")
     return ap
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.latency == "summary":
+        print_latency_summary()
+        return 0
     try:
-        names = parse_only(args.only)
+        names = [] if args.latency else parse_only(args.only)
     except ValueError as exc:
         raise QaError(f"!! {exc}")
+    missing = sorted({f"--{need}" for n in names for need in FACE_NAMES.get(n, ()) if not getattr(args, need)})
+    if missing:
+        raise QaError(f"!! the face checks need {' and '.join(missing)}: the names exactly as the People list "
+                      "has them (python3 scripts/robot-faces.py people)")
     if args.build:
         build_both()
     robot = Robot(args.serial)
@@ -573,15 +883,19 @@ def main(argv=None):
         # A SIGTERM (a closed terminal, a kill) must reach the finally block like Ctrl-C does.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
-        if args.no_install:
+        # Before: the build already on the robot is measured, so nothing is installed.
+        if args.no_install or args.latency == "before":
             robot.ensure_reachable()
-            check_build_ids(robot)
+            build = check_build_ids(robot)
         else:
-            install_both(robot)
+            build = install_both(robot)
         left = robot.cleanup()
         if left:
             print("   debug hooks left on from an earlier run, now off: " + ", ".join(left))
-        results, _ = run_checks(robot, names)
+        if args.latency:
+            results = [("latency", run_latency(robot, args.latency, build))]
+        else:
+            results, _ = run_checks(robot, names, owner=args.owner, helper=args.helper)
     except KeyboardInterrupt:
         print("\ninterrupted; the debug properties are cleared", file=sys.stderr)
         return 130

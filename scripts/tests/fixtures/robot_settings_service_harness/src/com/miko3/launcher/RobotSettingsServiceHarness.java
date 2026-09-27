@@ -2,6 +2,7 @@ package com.miko3.launcher;
 
 import com.miko3.shared.ClaudeAccess;
 import com.miko3.shared.ConversationSettings;
+import com.miko3.shared.FaceSettings;
 
 import java.util.Arrays;
 import java.util.HashMap;
@@ -72,6 +73,11 @@ public final class RobotSettingsServiceHarness {
     /** The second transaction's answer rule, as RobotSettingsService applies it after the check. */
     static ConversationSettings conversation(ClaudeSettings settings) {
         return settings.conversation();
+    }
+
+    /** The third transaction's answer rule (face plan U5, KTD5), as RobotSettingsService applies it. */
+    static FaceSettings face(ClaudeSettings settings) {
+        return settings.faceSettings();
     }
 
     private static int failures;
@@ -295,6 +301,28 @@ public final class RobotSettingsServiceHarness {
                 settings.save(ClaudeSettings.DEFAULT_BASE_URL, KEY_A, "claude-opus-5-5");
                 ConversationSettings c = conversation(settings);
                 check(n, !c.persona.contains(KEY_A) && !c.toString().contains(KEY_A), "got=" + c);
+            }
+        });
+
+        // Face plan U5 (KTD5): the third transaction's answer rule.
+        scenario("face_settings_answer_defaults_before_any_save", new Scenario() {
+            public void run(String n) {
+                FaceSettings f = face(newSettings());
+                check(n, f.toString().equals(FaceSettings.DEFAULTS.toString()) && f.confident == 0.50f
+                        && f.close == 0.363f && f.margin == 0.05f && f.minWidth == 48 && f.darkFloor == 40
+                        && f.dimLevel == 90 && f.blurFloor == 30, "got=" + f);
+            }
+        });
+
+        scenario("face_settings_answer_carries_the_saved_values", new Scenario() {
+            public void run(String n) throws Exception {
+                ClaudeSettings settings = newSettings();
+                settings.saveFace(new FaceSettings(0.58f, 0.39f, 0.04f, 52, 36, 88, 27));
+                FaceSettings first = face(settings);
+                settings.saveFace(new FaceSettings(0.6f, 0.39f, 0.04f, 52, 36, 88, 27));
+                check(n, first.confident == 0.58f && first.close == 0.39f && first.margin == 0.04f
+                        && first.minWidth == 52 && first.darkFloor == 36 && first.dimLevel == 88
+                        && first.blurFloor == 27 && face(settings).confident == 0.6f, "got=" + first);
             }
         });
 

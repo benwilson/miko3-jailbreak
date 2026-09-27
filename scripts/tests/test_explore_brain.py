@@ -32,7 +32,8 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHar
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
-              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "Ears.java", "ChatSession.java")
+              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "Ears.java", "ChatSession.java",
+              "FaceMigration.java", "FaceMatcher.java", "AnswerParser.java", "NameResolver.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -57,13 +58,16 @@ class NamelessReplySourceTest(unittest.TestCase):
     """R19: a reply without a name is welcomed and nothing is stored."""
 
     def test_name_step_welcomes_a_nameless_reply_instead_of_remembering(self):
+        # Face plan U7 (KTD6): a name no longer goes straight to remember(); it goes to the
+        # resolver, which may join, ask the last name, or store through remember() later.
         src = (EXPLORE_PKG / "ExploreBrain.java").read_text()
         m = re.search(r"private void nameStep\(long now\) \{(.*?)\n    \}", src, re.S)
         self.assertIsNotNone(m)
         body = m.group(1)
         self.assertIn("name == null", body)
-        self.assertLess(body.index("name == null"), body.index("port.remember("))
-        self.assertLess(body.index("port.welcome("), body.index("port.remember("))
+        self.assertLess(body.index("name == null"), body.index("resolve(now, name)"))
+        self.assertLess(body.index("port.welcome("), body.index("resolve(now, name)"))
+        self.assertNotIn("port.remember(", body)
         self.assertNotIn("remembering them unnamed", body)
         self.assertNotIn("(or unnamed)", src)
 
@@ -168,11 +172,9 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "meet_ae5_reply_without_a_name_and_no_hello_line_says_the_friendly_line",
         "meet_ae5_name_request_that_never_answers_is_welcomed_at_the_deadline",
         "meet_reply_without_a_pattern_waits_for_claude_to_find_the_name",
-        "meet_unsure_match_runs_the_new_person_flow",
         "meet_refused_match_asks_text_only_lines_then_the_name",
         "meet_refused_match_and_failed_lines_play_the_name_clip_without_asking",
         "meet_known_person_without_a_name_is_greeted_with_the_unnamed_line",
-        "meet_match_reference_beyond_the_gallery_is_a_new_person",
         "meet_listen_failure_resumes_within_the_budget",
         "meet_listen_that_never_answers_ends_at_its_deadline",
         "meet_remember_failure_resumes_within_the_budget",
@@ -410,6 +412,40 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "chat_lease_lost_mid_conversation_continues_without_the_look_and_a_6_s_sensor_stall_ends_it",
         "chat_eyes_only_wake_word_opens_a_stranger_conversation_without_a_turn_or_a_match_and_stores_nothing",
         "chat_the_transcript_never_appears_in_the_trace",
+        # On-device matching in Explore (face plan U6; KTD7, KTD11, R11, R18)
+        "replies_lines_carry_the_named_greeting_with_its_placeholder",
+        "face_confident_with_a_conversation_enters_chat_known_without_a_lines_request",
+        "face_rejected_crop_takes_the_faceless_path_and_keeps_nothing",
+        "face_not_ready_is_faceless_and_a_later_name_is_not_stored",
+        "face_close_or_weak_band_meets_a_stranger_who_is_stored_under_their_name",
+        "face_degraded_known_greeting_comes_from_the_lines_request",
+        "face_degraded_known_with_failing_lines_plays_the_local_greeting",
+        "face_chat_known_turn_one_failure_plays_the_local_greeting_before_the_sign_off",
+        "face_chat_known_turn_one_unreachable_twice_also_greets_before_the_sign_off",
+        "face_first_roam_waits_for_migration_or_30_s",
+        "face_work_is_allowed_only_while_the_detector_is_quiet_or_parked",
+        "face_migration_marks_a_faceless_photo_unusable_and_becomes_ready",
+        "face_migration_runs_only_while_the_gate_is_open_and_resumes",
+        "face_migration_leaves_a_photo_waiting_when_the_models_fail",
+        "face_migration_retries_a_waiting_photo_after_a_backoff",
+        "face_migration_settles_without_readiness_when_the_launcher_is_too_old",
+        # Confirming a close match and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12; AE2-AE4, AE7-AE9)
+        "confirm_chat_ae2_yes_adds_the_photo_and_starts_known_with_their_notes",
+        "confirm_chat_ae3_no_im_sarah_close_to_sarah_joins_her_and_starts_known_as_sarah",
+        "confirm_chat_ae7_silence_starts_the_stranger_opener_with_no_photo_and_outcome_no_reply",
+        "confirm_chat_ae8_near_tie_asks_the_full_name_and_a_bare_first_name_is_a_no",
+        "confirm_chat_no_im_priya_unstored_stores_priya_and_starts_known_without_asking_again",
+        "confirm_chat_yes_with_the_photo_refused_starts_as_a_stranger_and_recreates_nobody",
+        "confirm_meeting_ending_mid_confirm_closes_the_check_without_an_answer",
+        "confirm_ladder_runs_the_confirm_and_last_name_branches_without_a_conversation",
+        "confirm_ladder_last_name_unanswered_welcomes_them_and_stores_nobody",
+        "resolve_chat_ae4_weak_ben_asks_the_last_name_smith_stores_ben_smith_and_wilson_joins_ben_wilson",
+        "resolve_chat_after_the_last_name_the_next_turn_carries_both_replies_and_an_equal_name_given_stores_nothing",
+        "resolve_chat_last_name_unanswered_stores_nobody_and_the_conversation_runs_unnamed",
+        "resolve_chat_stored_ben_without_a_last_name_and_smith_stores_a_new_ben_smith",
+        "resolve_chat_ae9_name_on_turn_three_close_to_sarah_joins_her_and_moves_the_notes",
+        "resolve_chat_a_known_conversation_whose_name_given_is_close_to_another_stored_person_joins_them",
+        "resolve_chat_a_join_whose_photo_is_refused_continues_and_recreates_nobody",
     )
 
     @classmethod

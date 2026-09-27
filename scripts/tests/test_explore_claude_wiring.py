@@ -36,8 +36,11 @@ class AdapterWiringTest(unittest.TestCase):
         for client in ("ClaudeApi", "RobotSettingsClient.fetch", "RobotSpeechClient", "RobotPeopleClient",
                        "RobotListenClient"):
             self.assertIn(client, a, client)
-        for call in ("RobotPeopleClient.recent", "RobotPeopleClient.add", "RobotPeopleClient.touch",
-                     "RobotPeopleClient.nameOf", "NameExtractor.extract", "new FaceCropper(app)"):
+        for call in ("RobotPeopleClient.recent", "RobotPeopleClient.addPerson(", "RobotPeopleClient.touch",
+                     "RobotPeopleClient.nameOf", "NameExtractor.extract", "new FaceCropper(app)",
+                     "new FaceEmbedder(app)", "RobotPeopleClient.gallery(", "RobotSettingsClient.fetchFaceSettings(",
+                     "RobotPeopleClient.recordCheck(", "RobotPeopleClient.photo(", "RobotPeopleClient.setEmbedding(",
+                     "RobotPeopleClient.markUnusable("):
             self.assertIn(call, a, call)
 
     def test_release_closes_both_clients(self):
@@ -238,14 +241,23 @@ class PromptsTest(unittest.TestCase):
         self.assertIn("joke", self.p)
         self.assertIn("Never guess who anyone is, never guess or invent anyone's name", self.p)
 
-    def test_the_match_prompt_is_consented_references_and_names_nobody(self):
-        self.assertIn("consented enrolment photos from the household's own robot", self.p)
-        self.assertRegex(self.p, r"static String matchIntro\(int references\)")
-        self.assertRegex(self.p, r"static String matchAsk\(int references\)")
-        body = self.p[self.p.index("static String matchIntro"):self.p.index("static final Map<String, Object> MATCH_SCHEMA")]
-        self.assertIn("none", body)
-        self.assertIn("unsure", body)
-        self.assertIn("{name}", body)
+    def test_no_image_match_prompt_or_schema_remains(self):
+        """Face plan U6 (R3, R4): matching is on the robot; no match prompt, schema or reply parser."""
+        for gone in ("matchIntro", "matchAsk", "MATCH_SCHEMA"):
+            self.assertNotIn(gone, code_only(self.p), gone)
+        replies = code_only(src("ClaudeReplies.java"))
+        self.assertNotIn("static Match match(", replies)
+        self.assertNotIn("class Match ", replies)
+
+    def test_the_lines_request_carries_the_named_greeting_with_a_placeholder(self):
+        """KTD7: the text-only lines gain the named greeting; the robot fills {name}, so names never leave."""
+        ask = self.p[self.p.index("static final String LINES_ASK"):self.p.index("static final Map<String, Object> LINES_SCHEMA")]
+        self.assertIn("named_line", ask)
+        self.assertIn("{name}", ask)
+        schema = self.p[self.p.index("LINES_SCHEMA = object("):]
+        schema = schema[:schema.index(");")]
+        for field in ("named_line", "ask_line", "no_reply_line"):
+            self.assertIn('"' + field + '"', schema)
 
     def test_the_schemas_follow_ktd2_and_ktd3(self):
         look = self.p[self.p.index("LOOK_SCHEMA = object("):]
@@ -253,10 +265,6 @@ class PromptsTest(unittest.TestCase):
         for field in ("interesting", "frame", "box", "kind", "label", "line"):
             self.assertIn('"' + field + '"', look)
         self.assertIn('enumOf("person", "animal", "technology", "other")', look)
-        match = self.p[self.p.index("MATCH_SCHEMA = object("):]
-        match = match[:match.index(");")]
-        for field in ("match", "named_line", "unnamed_line", "ask_line", "no_reply_line"):
-            self.assertIn('"' + field + '"', match)
 
 
 class WayOutRequestTest(unittest.TestCase):
@@ -431,7 +439,7 @@ class ClaudeLatencyIsLoggedTest(unittest.TestCase):
     def test_every_claude_call_logs_its_latency(self):
         body = code_only(src("ClaudeCuriosity.java"))
         calls = body.split("claude.messages(")[1:]
-        self.assertEqual(len(calls), 10)
+        self.assertEqual(len(calls), 8)
         for i, after in enumerate(calls):
             window = after[:900]
             logs = re.findall(r"Log\.[diwe]\((.*?)\);", window, re.S)
@@ -471,16 +479,18 @@ class FaceCropStoresOnlyFacesTest(unittest.TestCase):
     def test_no_face_skips_the_match_and_stores_nothing(self):
         a = code_only(src("ClaudeCuriosity.java"))
         person = a[a.index("private MatchAnswer person("):]
-        self.assertLess(person.index("if (!crop.found())"), person.index("RobotPeopleClient.recent"))
-        self.assertIn("MatchAnswer.faceless(", person[:person.index("RobotPeopleClient.recent")])
+        person = person[:person.index("\n    }\n")]
+        self.assertLess(person.index("if (found == null)"), person.index("RobotPeopleClient.gallery("))
+        self.assertIn("return facelessMeeting(", person[:person.index("RobotPeopleClient.gallery(")])
+        self.assertIn("MatchAnswer.faceless()", a[a.index("private MatchAnswer facelessMeeting("):])
         keep = a[a.index("private Answer keep("):]
-        self.assertLess(keep.index("return hello("), keep.index("RobotPeopleClient.add"))
+        self.assertLess(keep.index("return hello("), keep.index("RobotPeopleClient.addPerson("))
 
     def test_a_blank_name_skips_the_store_and_gets_the_hello(self):
         """R19: no caller can store an unnamed face, even if the brain regresses."""
         a = code_only(src("ClaudeCuriosity.java"))
         keep = a[a.index("private Answer keep("):]
-        keep = keep[:keep.index("RobotPeopleClient.add")]
+        keep = keep[:keep.index("RobotPeopleClient.addPerson(")]
         self.assertRegex(keep, r"name == null \|\| name\.trim\(\)\.isEmpty\(\)")
         self.assertEqual(keep.count("return hello("), 2)
 
@@ -493,6 +503,77 @@ class FaceCropStoresOnlyFacesTest(unittest.TestCase):
         # The reason is the true one for each caller: no name heard, or no face found.
         self.assertIn("no name to remember them by", hello)
         self.assertIn("could not get a good look at their face", hello)
+
+
+class OnDeviceMatchWiringTest(unittest.TestCase):
+    """Face plan U6: the match is made on the robot (KTD3, KTD5, KTD7, KTD8, KTD11, KTD12)."""
+
+    def setUp(self):
+        self.a = code_only(src("ClaudeCuriosity.java"))
+        person = self.a[self.a.index("private MatchAnswer person("):]
+        self.person = person[:person.index("\n    }\n")]
+
+    def body(self, signature):
+        b = self.a[self.a.index(signature):]
+        return b[:b.index("\n    }\n")]
+
+    def test_person_sends_no_image_request_and_calls_the_gallery_settings_and_checks(self):
+        for gone in ("claude.messages(", "ClaudeApi.jpegBlock(", "RobotPeopleClient.recent("):
+            self.assertNotIn(gone, self.person, gone)
+        for call in ("cropper.locate(", "RobotSettingsClient.fetchFaceSettings(", "FaceAlign.align(",
+                     "FaceQuality.check(", "embedder.embed(", "RobotPeopleClient.gallery(", "FaceMigration.ready(",
+                     "FaceMatcher.match(", "record("):
+            self.assertIn(call, self.person, call)
+        record = self.body("private long record(")
+        self.assertIn("RobotPeopleClient.recordCheck(", record)
+        # Every outcome is recorded: no face, rejected with its reason, not ready and the bands.
+        for code in ("FaceCheck.NO_FACE", "FaceCheck.REJECTED", "FaceCheck.NOT_READY", "FaceCheck.CONFIDENT",
+                     "FaceCheck.CLOSE", "FaceCheck.WEAK", "FaceCheck.TOO_DARK", "FaceCheck.TOO_BLURRY",
+                     "FaceCheck.TOO_SMALL"):
+            self.assertIn(code, self.a, code)
+
+    def test_the_answer_carries_no_lines(self):
+        for lines in ("ExplorePrompts.LINES_ASK", "ClaudeReplies.lines(", "textOnly("):
+            self.assertNotIn(lines, self.person, lines)
+        self.assertIn(".withMatch(", self.person)
+
+    def test_the_recently_met_check_still_uses_recent(self):
+        self.assertIn("RobotPeopleClient.recent(", self.body("private Recently checkRecentlyMet("))
+
+    def test_an_old_launcher_meets_facelessly_with_a_fixed_reason(self):
+        self.assertIn("LauncherProtocol.LAUNCHER_TOO_OLD", self.a)
+        self.assertIn("private MatchAnswer facelessBecause(", self.a)
+        too_old = self.body("private MatchAnswer facelessBecause(")
+        self.assertIn("return facelessMeeting(", too_old)
+
+    def test_storing_needs_the_probe_and_uses_add_person_with_the_embedding(self):
+        for sig in ("private Answer keep(", "public void keep("):
+            b = self.body(sig)
+            self.assertIn("RobotPeopleClient.addPerson(", b, sig)
+            self.assertIn("FaceMatcher.MODEL_ID", b, sig)
+            self.assertIn(".probe", b, sig)
+        self.assertNotIn("RobotPeopleClient.add(", self.a)
+
+    def test_the_embedder_is_freed_on_release(self):
+        self.assertIn("embedder.close()", self.body("void release()"))
+
+    def test_migration_starts_with_explore_and_runs_only_when_the_brain_allows(self):
+        app = code_only(src("ModeApp.java"))
+        start = app[app.index("void startExplore()"):]
+        self.assertIn("curiosity.startMigration()", start[:start.index("\n    }\n")])
+        work = self.body("public void faceWork(")
+        self.assertIn("runMigration()", work)
+        self.assertIn("new FaceMigration(", self.a)
+        brain = code_only(src("ExploreBrain.java"))
+        self.assertIn("port.faceWork(", brain)
+        self.assertIn("port.migrated()", brain)
+
+    def test_debug_frames_roll_fifty_in_private_storage(self):
+        debug = self.body("private void debugFace(")
+        self.assertIn("FACE_FRAMES", debug)
+        self.assertIn('FACE_FRAMES = "face-frames"', self.a)
+        self.assertIn("FACE_FRAMES_KEPT = 50", self.a)
+        self.assertIn("app.getFilesDir()", debug)
 
 
 class FaceDebugSwitchTest(unittest.TestCase):
@@ -597,7 +678,7 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertIn("RobotPeopleClient.mergeNotes(app, personId, notesUpdate)", a)
         self.assertIn("RobotPeopleClient.forget(app, personId)", a)
         keep = re.search(r"public void keep\((.*?)\n    \}", a, re.S).group(1)
-        self.assertIn("RobotPeopleClient.add(app, face, name)", keep)
+        self.assertIn("RobotPeopleClient.addPerson(app, face, name, FaceMatcher.MODEL_ID, probe)", keep)
         self.assertNotIn("debugFace", keep)
         listen = re.search(r"public void chatListen\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn("earsListen(s, maxMs, newcomerAngleDeg)", listen)
@@ -607,7 +688,8 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertIn("RobotSettingsClient.fetchConversation(app).persona", conv)
         self.assertIn("RobotPeopleClient.notesOf(app, personId)", conv)
         self.assertIn("a.withConversation(persona, personId, notesJson, asked)", conv)
-        self.assertEqual(a.count("forConversation("), 5)
+        # Face plan U7: an added photo answers the joined person with their notes, too.
+        self.assertEqual(a.count("forConversation("), 6)
         port = code_only(src("CuriosityPort.java"))
         for sig in ("void chatListen(long maxMs, float newcomerAngleDeg);", "void keep(String name, long timeoutMs);",
                     "Kept keptAnswer();", "final String avoidQuestion;"):
@@ -629,7 +711,29 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertIn("if (busy || !wanted || parked)", cam)
         brain = code_only(src("ExploreBrain.java"))
         self.assertIn("camera.park(parked)", brain)
-        self.assertIn("state.chats() || state == State.MEET && chatLikely()", brain)
+        # Face plan U7: the close match's question keeps it open and parked on the conversation path too.
+        self.assertIn("state.chats() || (state == State.MEET || state.confirms()) && chatLikely()", brain)
+
+    def test_the_resolver_and_the_added_photo_run_on_the_robot(self):
+        """Face plan U7 (KTD6, KTD10, KTD12): names resolve by id against the store, never through Claude."""
+        a = code_only(src("ClaudeCuriosity.java"))
+        for method in ("nameIn", "resolveName", "resolveLastName", "resolved", "cancelResolve", "addPhoto",
+                       "photoAdded", "cancelAddPhoto", "checkOutcome", "meetingOver"):
+            self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
+        resolve = re.search(r"private Resolved resolveNow\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("RobotPeopleClient.idsNamed(app, name)", resolve)
+        self.assertIn("NameResolver.resolve(name, probe, ids, entries, close)", resolve)
+        self.assertNotIn("claude.", resolve)
+        last = re.search(r"private Resolved resolveLastNow\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("NameResolver.afterLastName(first, lastName, stored)", last)
+        self.assertNotIn("claude.", last)
+        photo = re.search(r"private MatchAnswer addPhotoNow\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("RobotPeopleClient.addPhoto(app, id, face, FaceMatcher.MODEL_ID, probe)", photo)
+        self.assertNotIn("addPerson", photo)
+        self.assertIn("NameExtractor.extract(transcript)", a)
+        over = re.search(r"public void meetingOver\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("checkOutcome(meeting, FaceCheck.ENDED_WITHOUT_ANSWER, null)", over)
+        self.assertIn("stranger.withConfirm(confirmName(r.bestId))", a)
 
     def test_the_state_page_counts_repeats_and_the_clips_are_reactions(self):
         self.assertIn('"repeats"', src("ExploreState.java"))

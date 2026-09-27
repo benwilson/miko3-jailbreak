@@ -34,6 +34,7 @@ PAGE = LAUNCHER / "SettingsPage.java"
 INTERFACE = SHARED / "RobotPeople.java"
 CLIENT = SHARED / "RobotPeopleClient.java"
 NOTES = SHARED / "PersonNotes.java"
+FACE_CHECK = SHARED / "FaceCheck.java"
 PROTOCOL = SHARED / "LauncherProtocol.java"
 MANIFEST = REPO / "launcher" / "AndroidManifest.xml"
 
@@ -93,6 +94,25 @@ class PeopleStoreHarnessTest(unittest.TestCase):
         "legacy_nameless_index_row_still_loads_and_stays_out_of_the_gallery",
         "entries_are_cleaned_and_matched_on_normalised_text",
         "index_read_failure_skips_the_orphan_sweep",
+        # Face plan U4: several photos, embeddings, and calls by id.
+        "legacy_person_loads_with_one_pending_photo",
+        "add_person_stores_photo_zero_with_its_embedding",
+        "add_person_refusals_write_nothing",
+        "sixth_photo_replaces_the_oldest_slot",
+        "recent_and_face_answer_the_newest_photo",
+        "add_photo_to_a_forgotten_id_is_refused_and_writes_nothing",
+        "add_photo_refuses_a_bad_photo_or_embedding",
+        "forget_removes_every_photo_and_the_faces_file",
+        "load_keeps_slot_photos_and_faces_and_sweeps_the_rest",
+        "ids_named_matches_full_name_or_first_word",
+        "gallery_skips_nameless_records_and_carries_no_names",
+        "deleting_the_only_photo_is_refused",
+        "set_embedding_is_refused_for_a_replaced_slot_or_a_forgotten_id",
+        "mark_unusable_clears_pending_and_is_refused_once_replaced",
+        "embeddings_survive_reload_exactly",
+        "a_corrupt_faces_file_reads_as_pending",
+        "photo_by_slot_validates_id_and_slot",
+        "forget_racing_photo_writes_leaves_nothing_behind",
     )
 
     @classmethod
@@ -148,18 +168,37 @@ class StoreSourceTest(unittest.TestCase):
         for needle in (".getFD().sync()", "renameTo("):
             self.assertIn(needle, src)
 
-    def test_forget_deletes_index_then_notes_then_face(self):
-        # KTD10: once the index no longer names them, a crash leaves only orphans.
+    def test_forget_deletes_index_then_notes_then_faces_then_photos(self):
+        # KTD10, face plan KTD4: once the index no longer names them, a crash
+        # leaves only orphans; then notes, the .faces file, every photo slot.
         body = _method_body(_read(STORE), "synchronized boolean forget")
         self.assertIsNotNone(body)
         index = body.find("saveIndex")
         notes = body.find("notesFile(")
+        faces = body.find("facesFile(")
         face = body.find("faceFile(")
+        slots = body.find("photoFile(")
         self.assertGreaterEqual(index, 0, "forget never rewrites the index")
         self.assertGreater(notes, index, "notes deleted before the index rewrite")
-        self.assertGreater(face, notes, "face deleted before the notes")
+        self.assertGreater(faces, notes, ".faces deleted before the notes")
+        self.assertGreater(face, faces, "face deleted before the .faces file")
+        self.assertGreater(slots, face, "slot photos never deleted, or deleted before slot 0")
         self.assertRegex(body[notes:], r"notesFile\(\s*id\s*\)\.delete\(\)")
+        self.assertRegex(body[faces:], r"facesFile\(\s*id\s*\)\.delete\(\)")
         self.assertRegex(body[face:], r"faceFile\(\s*id\s*\)\.delete\(\)")
+        self.assertRegex(body[face:], r"for \(int slot = 1; slot < MAX_PHOTOS; slot\+\+\)[^}]*photoFile\(\s*id,\s*slot\s*\)\.delete\(\)")
+
+    def test_owned_file_pattern_covers_slots_and_faces(self):
+        # KTD4: the orphan sweep must recognise every per-person file name.
+        m = re.search(r'OWNED_FILE = Pattern\.compile\("((?:[^"\\]|\\.)*)"\)', _read(STORE))
+        self.assertIsNotNone(m, "PeopleStore has no OWNED_FILE")
+        owned = re.compile(m.group(1).encode().decode("unicode_escape"))
+        pid = "0123456789abcdef"
+        for name in (f"{pid}.jpg", f"{pid}-1.jpg", f"{pid}-4.jpg", f"{pid}.json", f"{pid}.faces"):
+            self.assertTrue(owned.fullmatch(name), name)
+            self.assertEqual(owned.fullmatch(name).group(1), pid)
+        for name in (f"{pid}-0.jpg", f"{pid}-5.jpg", f"{pid}.faces.tmp", "people.index", "x.jpg"):
+            self.assertIsNone(owned.fullmatch(name), name)
 
     def test_load_sweeps_orphans_and_the_gallery_skips_nameless(self):
         src = _read(STORE)
@@ -214,7 +253,9 @@ class ServiceWiringTest(unittest.TestCase):
     def test_every_call_checks_the_caller_before_the_store(self):
         for method in ("public RobotPeople.Face[] recent", "public String add", "public boolean touch",
                        "public String nameOf", "public String notesOf", "public String mergeNotes",
-                       "public boolean forget"):
+                       "public boolean forget", "public RobotPeople.GalleryPhoto[] gallery",
+                       "public byte[] photo", "public String[] idsNamed", "public int addPhoto",
+                       "public String addPerson", "public boolean setEmbedding", "public boolean markUnusable"):
             with self.subTest(method=method):
                 body = _method_body(self.src, method)
                 self.assertIsNotNone(body, f"PeopleService does not implement {method}")
@@ -222,8 +263,38 @@ class ServiceWiringTest(unittest.TestCase):
                 self.assertGreaterEqual(check, 0, f"{method} never checks the caller")
                 self.assertGreater(store, check, f"{method} touches the store before the caller check")
 
+    def test_check_calls_check_the_caller_before_the_ring(self):
+        # Face plan U5 (KTD8): the face-check ring is reached only after the caller check.
+        for method in ("public long recordCheck", "public boolean updateCheck"):
+            with self.subTest(method=method):
+                body = _method_body(self.src, method)
+                self.assertIsNotNone(body, f"PeopleService does not implement {method}")
+                check, ring = body.find("enforceCaller("), body.find("checks()")
+                self.assertGreaterEqual(check, 0, f"{method} never checks the caller")
+                self.assertGreater(ring, check, f"{method} touches the ring before the caller check")
+
+    def test_update_check_closes_as_ended_only_through_the_ring_rule(self):
+        body = _method_body(self.src, "public boolean updateCheck") or ""
+        self.assertIn("FaceCheck.ENDED_WITHOUT_ANSWER", body)
+        self.assertIn(".closeAsEnded(", body)
+        self.assertIn(".updateOutcome(", body)
+
+    def test_forget_purges_the_face_checks(self):
+        # R19: forgetting a person removes every check that matched or joined them.
+        body = _method_body(self.src, "public boolean forget") or ""
+        self.assertIn("FaceChecks.forget(people(), checks(), id)", body)
+        shared = _method_body((LAUNCHER / "FaceChecks.java").read_text(), "static boolean forget") or ""
+        self.assertLess(shared.find("people.forget("), shared.find(".purgePerson("))
+        self.assertGreaterEqual(shared.find("people.forget("), 0)
+
     def test_caller_gate_is_reused(self):
         self.assertIn("CallerGate.enforce(", self.src)
+
+    def test_gallery_and_ids_are_capped_by_the_interface_limits(self):
+        gallery = _method_body(self.src, "public RobotPeople.GalleryPhoto[] gallery") or ""
+        self.assertIn("RobotPeople.MAX_GALLERY", gallery)
+        named = _method_body(self.src, "public String[] idsNamed") or ""
+        self.assertIn("RobotPeople.MAX_IDS_NAMED", named)
 
     def test_recent_is_capped_by_the_interface_limit(self):
         body = _method_body(self.src, "public RobotPeople.Face[] recent")
@@ -255,22 +326,66 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertRegex(body, r"String mergeNotes\(String \w+, String \w+\) throws RemoteException;")
         self.assertRegex(body, r"boolean forget\(String \w+\) throws RemoteException;")
 
+    # Face plan U4 (KTD10-KTD12) appends 8-14; later units append after them.
+    FACE_TRANSACTIONS = (("gallery", 8), ("photo", 9), ("idsNamed", 10), ("addPhoto", 11),
+                         ("addPerson", 12), ("setEmbedding", 13), ("markUnusable", 14),
+                         # Face plan U5 (KTD8): the face-check ring.
+                         ("recordCheck", 15), ("updateCheck", 16))
+
     def test_transaction_codes_are_appended(self):
-        # KTD10: the four existing codes are unchanged; the three new ones follow.
+        # KTD10: the existing codes are unchanged; new ones only ever follow.
         src = _read(INTERFACE)
         for name, code in (("recent", 1), ("add", 2), ("touch", 3), ("nameOf", 4),
-                           ("notesOf", 5), ("mergeNotes", 6), ("forget", 7)):
+                           ("notesOf", 5), ("mergeNotes", 6), ("forget", 7)) + self.FACE_TRANSACTIONS:
             self.assertRegex(src, rf"TRANSACTION_{name}\s*=\s*{code}\s*;")
         codes = [int(c) for c in re.findall(r"TRANSACTION_\w+\s*=\s*(\d+)\s*;", src)]
-        self.assertEqual(codes, list(range(1, 8)))
+        self.assertEqual(codes, list(range(1, len(codes) + 1)))
+
+    def test_interface_declares_the_face_calls(self):
+        body = _read(INTERFACE).split("abstract class Stub", 1)[0]
+        for pattern in (r"GalleryPhoto\[\] gallery\(\) throws RemoteException;",
+                        r"byte\[\] photo\(String \w+, int \w+\) throws RemoteException;",
+                        r"String\[\] idsNamed\(String \w+\) throws RemoteException;",
+                        r"int addPhoto\(String \w+, byte\[\] \w+, String \w+, float\[\] \w+\) throws RemoteException;",
+                        r"String addPerson\(byte\[\] \w+, String \w+, String \w+, float\[\] \w+\) throws RemoteException;",
+                        r"boolean setEmbedding\(String \w+, int \w+, long \w+, String \w+, float\[\] \w+\)\s+throws RemoteException;",
+                        r"boolean markUnusable\(String \w+, int \w+, long \w+\) throws RemoteException;",
+                        r"long recordCheck\(FaceCheck \w+\) throws RemoteException;",
+                        r"boolean updateCheck\(long \w+, int \w+, String \w+\) throws RemoteException;"):
+            self.assertRegex(body, pattern)
+        # KTD10: names leave only through nameOf; the gallery record has no name.
+        gallery = body[body.index("class GalleryPhoto"):]
+        gallery = gallery[:gallery.index("\n    }\n")]
+        self.assertNotRegex(gallery, r"(?i)\bString\s+\w*name")
+
+    def test_every_new_stub_case_reads_its_interface_token(self):
+        src = _read(INTERFACE)
+        stub = src[src.index("public boolean onTransact"):src.index("class Proxy")]
+        for name, _ in self.FACE_TRANSACTIONS:
+            with self.subTest(transaction=name):
+                m = re.search(rf"case TRANSACTION_{name}: \{{\s*data\.enforceInterface\(DESCRIPTOR\);", stub)
+                self.assertIsNotNone(m, f"Stub has no guarded case for {name}")
+
+    def test_gallery_reply_stays_well_under_the_binder_limit(self):
+        src = _read(INTERFACE)
+        cap = re.search(r"MAX_GALLERY\s*=\s*([0-9 *]+);", src)
+        floats = re.search(r"MAX_EMBEDDING_FLOATS\s*=\s*([0-9 *]+);", _read(STORE))
+        self.assertIsNotNone(cap)
+        self.assertIsNotNone(floats)
+        # Each entry: floats, a 16-char id and a short model id as UTF-16, a few ints.
+        self.assertLessEqual(eval(cap.group(1)) * (4 * eval(floats.group(1)) + 2 * (16 + 64) + 64), 512 * 1024)
+        self.assertRegex(src, r"MAX_IDS_NAMED\s*=\s*\d+\s*;")
+        proxy = src[src.index("class Proxy"):]
+        self.assertIn("MAX_GALLERY", _method_body(proxy, "public GalleryPhoto[] gallery") or "")
+        self.assertIn("MAX_IDS_NAMED", _method_body(proxy, "public String[] idsNamed") or "")
 
     def test_new_proxy_methods_check_the_transaction_result(self):
         src = _read(INTERFACE)
         proxy = src[src.index("class Proxy"):]
-        for name in ("notesOf", "mergeNotes", "forget"):
+        for name in ("notesOf", "mergeNotes", "forget") + tuple(n for n, _ in self.FACE_TRANSACTIONS):
             with self.subTest(method=name):
-                body = _method_body(proxy, f"public \\w+ {name}") or _method_body(proxy, f"public String {name}") \
-                    or _method_body(proxy, f"public boolean {name}")
+                decl = re.search(rf"public [\w\[\]]+ {name}\(", proxy)
+                body = _method_body(proxy[decl.start():], decl.group(0)[:-1]) if decl else None
                 self.assertIsNotNone(body, f"Proxy does not implement {name}")
                 self.assertRegex(body, rf"if\s*\(\s*!remote\.transact\(\s*TRANSACTION_{name}")
                 self.assertIn("LauncherProtocol.LAUNCHER_TOO_OLD", body)
@@ -280,6 +395,27 @@ class InterfaceAndClientTest(unittest.TestCase):
         for needle in ("PersonNotes notesOf(", "PersonNotes mergeNotes(", "boolean forget(",
                        "catch (UnsupportedOperationException", "LauncherProtocol.LAUNCHER_TOO_OLD"):
             self.assertIn(needle, src)
+
+    def test_client_has_the_face_calls(self):
+        src = _read(CLIENT)
+        for needle in ("RobotPeople.GalleryPhoto[] gallery(Context", "byte[] photo(Context", "String[] idsNamed(Context",
+                       "int addPhoto(Context", "String addPerson(Context", "boolean setEmbedding(Context",
+                       "boolean markUnusable(Context", "long recordCheck(Context", "boolean updateCheck(Context"):
+            self.assertIn(needle, src)
+
+    def test_face_check_is_plain_java_and_carries_ids_not_names(self):
+        raw = FACE_CHECK.read_text() if FACE_CHECK.exists() else ""
+        self.assertTrue(raw, "FaceCheck.java missing")
+        self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
+        self.assertNotRegex(_strip_comments(raw), r"(?i)\bString\s+\w*name")
+        # KTD8: the crop's cap is the stored photo's cap.
+        self.assertRegex(_strip_comments(raw), r"MAX_CROP_BYTES\s*=\s*40\s*\*\s*1024\s*;")
+
+    def test_record_check_reads_the_crop_bytes(self):
+        src = _read(INTERFACE)
+        stub = src[src.index("case TRANSACTION_recordCheck"):]
+        stub = stub[:stub.index("return true;")]
+        self.assertIn("createByteArray()", stub)
 
     def test_person_notes_is_plain_java_with_named_caps(self):
         raw = NOTES.read_text() if NOTES.exists() else ""

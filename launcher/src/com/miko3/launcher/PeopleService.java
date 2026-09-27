@@ -4,6 +4,7 @@ import android.app.Service;
 import android.content.Intent;
 import android.os.IBinder;
 
+import com.miko3.shared.FaceCheck;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotPeople;
 
@@ -13,7 +14,8 @@ import java.util.List;
 /**
  * Exported bound Service through which our mode apps use the robot's people
  * store (explore-on-claude plan U2; R13, R14, KTD1, KTD3; meeting plan U5,
- * KTD10 for notes and forget). Every call first
+ * KTD10 for notes and forget; face plan U4, KTD10-KTD12 for photos and
+ * embeddings by id; face plan U5, KTD8 for the face-check ring). Every call first
  * checks who is calling (CallerGate, the same pinned-certificate check as
  * RobotSettingsService and SpeechService) and only then touches the store,
  * so a vendor app gets a SecurityException and never a face or a name.
@@ -81,7 +83,74 @@ public class PeopleService extends Service {
         @Override
         public boolean forget(String id) {
             enforceCaller();
-            return people().forget(id);
+            return FaceChecks.forget(people(), checks(), id);
+        }
+
+        @Override
+        public RobotPeople.GalleryPhoto[] gallery() {
+            enforceCaller();
+            List<PeopleStore.Photo> photos = people().gallery();
+            // Most recently seen people come first, so a cap keeps the regulars.
+            int count = Math.min(photos.size(), RobotPeople.MAX_GALLERY);
+            RobotPeople.GalleryPhoto[] out = new RobotPeople.GalleryPhoto[count];
+            for (int i = 0; i < count; i++) {
+                PeopleStore.Photo p = photos.get(i);
+                out[i] = new RobotPeople.GalleryPhoto(p.id, p.slot, p.addedAtMillis, p.unusable, p.modelId,
+                        p.embedding);
+            }
+            return out;
+        }
+
+        @Override
+        public byte[] photo(String id, int slot) {
+            enforceCaller();
+            return people().photo(id, slot);
+        }
+
+        @Override
+        public String[] idsNamed(String name) {
+            enforceCaller();
+            List<String> ids = people().idsNamed(name);
+            return ids.subList(0, Math.min(ids.size(), RobotPeople.MAX_IDS_NAMED)).toArray(new String[0]);
+        }
+
+        @Override
+        public int addPhoto(String id, byte[] faceJpeg, String modelId, float[] embedding) {
+            enforceCaller();
+            return people().addPhoto(id, faceJpeg, modelId, embedding);
+        }
+
+        @Override
+        public String addPerson(byte[] faceJpeg, String name, String modelId, float[] embedding) {
+            enforceCaller();
+            return people().addPerson(faceJpeg, name, modelId, embedding);
+        }
+
+        @Override
+        public boolean setEmbedding(String id, int slot, long addedAtMillis, String modelId, float[] embedding) {
+            enforceCaller();
+            return people().setEmbedding(id, slot, addedAtMillis, modelId, embedding);
+        }
+
+        @Override
+        public boolean markUnusable(String id, int slot, long addedAtMillis) {
+            enforceCaller();
+            return people().markUnusable(id, slot, addedAtMillis);
+        }
+
+        @Override
+        public long recordCheck(FaceCheck check) {
+            enforceCaller();
+            return checks().record(check);
+        }
+
+        @Override
+        public boolean updateCheck(long handle, int outcome, String joinedId) {
+            enforceCaller();
+            if (outcome == FaceCheck.ENDED_WITHOUT_ANSWER) {
+                return checks().closeAsEnded(handle);
+            }
+            return checks().updateOutcome(handle, outcome, joinedId);
         }
     };
 
@@ -92,6 +161,10 @@ public class PeopleService extends Service {
 
     private PeopleStore people() {
         return ((LauncherApp) getApplication()).people();
+    }
+
+    private FaceChecks checks() {
+        return ((LauncherApp) getApplication()).faceChecks();
     }
 
     /** Throws SecurityException unless the calling uid owns a pinned Miko 3

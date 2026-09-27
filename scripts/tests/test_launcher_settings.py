@@ -42,10 +42,21 @@ SETTINGS_PATHS = (
     "SETTINGS_PEOPLE_FORGET_PATH",
     "SETTINGS_PEOPLE_FACE_PATH",
     "SETTINGS_CONVERSATION_PATH",
+    "SETTINGS_FACE_CHECK_CROP_PATH",
+    "SETTINGS_PEOPLE_PHOTO_PATH",
+    "SETTINGS_PEOPLE_PHOTO_DELETE_PATH",
+    "SETTINGS_FACE_THRESHOLDS_PATH",
+    "SETTINGS_FACE_STATE_PATH",
 )
 PROBE = LAUNCHER / "EarsProbe.java"
 CONVERSATION = SHARED_SRC / "com" / "miko3" / "shared" / "ConversationSettings.java"
 PROBE_SCRIPT = REPO / "scripts" / "qa-ears-probe.py"
+FACE_CHECKS = LAUNCHER / "FaceChecks.java"
+FACE_CHECK = SHARED_SRC / "com" / "miko3" / "shared" / "FaceCheck.java"
+FACE_SETTINGS = SHARED_SRC / "com" / "miko3" / "shared" / "FaceSettings.java"
+REQUEST = SHARED_SRC / "com" / "miko3" / "shared" / "HttpRequest.java"
+CHECKS_HARNESS = TESTS / "fixtures" / "face_checks_harness" / "src"
+CHECKS_HARNESS_MAIN = CHECKS_HARNESS / "com" / "miko3" / "launcher" / "FaceChecksHarness.java"
 
 
 def _strip_comments(text):
@@ -160,6 +171,16 @@ class ClaudeSettingsHarnessTest(unittest.TestCase):
         "persona_crlf_saved_as_lf",
         "answers_switch_defaults_on_and_round_trips",
         "persona_and_switch_leave_the_key_alone",
+        # Face plan U5 (KTD5): band and gate thresholds.
+        "face_settings_default_to_the_starting_values",
+        "face_settings_round_trip_and_survive_a_new_instance",
+        "face_save_close_above_confident_refused_and_unchanged",
+        "face_save_dark_floor_above_dim_level_refused_and_unchanged",
+        "face_save_out_of_range_values_refused",
+        "face_save_edges_accepted",
+        "face_refusals_are_fixed_text",
+        "corrupt_stored_face_value_reads_as_defaults",
+        "face_settings_leave_the_key_alone",
     )
 
     @classmethod
@@ -227,6 +248,11 @@ class SettingsPageSourceTest(unittest.TestCase):
             "SETTINGS_VOICE_SAY_PATH": "/settings/voice/say",
             "SETTINGS_EARS_PROBE_PATH": "/settings/ears-probe",
             "SETTINGS_CONVERSATION_PATH": "/settings/conversation",
+            "SETTINGS_FACE_CHECK_CROP_PATH": "/settings/face/check-crop",
+            "SETTINGS_PEOPLE_PHOTO_PATH": "/settings/people/photo",
+            "SETTINGS_PEOPLE_PHOTO_DELETE_PATH": "/settings/people/photo/delete",
+            "SETTINGS_FACE_THRESHOLDS_PATH": "/settings/face/thresholds",
+            "SETTINGS_FACE_STATE_PATH": "/settings/face/state",
         }
         for name, path in expected.items():
             self.assertRegex(src, rf'public static final String {name} = "{re.escape(path)}";')
@@ -272,9 +298,10 @@ class SettingsPageSourceTest(unittest.TestCase):
 
     def test_page_reads_no_query_parameter_but_status(self):
         # No settings path takes the key (or anything else) from the URL, which
-        # RoutingHttpServer logs. The face image GET takes only a person's id.
+        # RoutingHttpServer logs. The image GETs take only an id (a person's or
+        # a check's handle), a photo slot and its recorded added-at time.
         params = re.findall(r"queryParam\(\s*\"([^\"]*)\"", self.page)
-        self.assertEqual(set(params), {"status", "id"})
+        self.assertEqual(set(params), {"status", "id", "slot", "at"})
         self.assertNotIn("req.query.", self.page)
 
     def test_no_logging_near_the_key(self):
@@ -422,6 +449,29 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "people_notes_list_fields_and_thread_dates",
         "people_nameless_record_marked_legacy",
         "forget_removes_notes_too",
+        # Face plan U5 (KTD5, KTD8): face checks, thresholds, photo strips, the CLI routes.
+        "face_checks_section_empty",
+        "face_check_renders_crop_photo_name_score_band_and_outcome_escaped",
+        "rejected_check_shows_reason_and_no_best_match_photo",
+        "not_ready_and_no_face_checks_render_decision_and_no_face_has_no_crop",
+        "near_tie_check_shows_runner_up_name_and_score",
+        "replaced_best_match_slot_shows_marker_not_new_photo",
+        "photo_route_serves_the_photo_only_while_added_at_matches",
+        "check_crop_route_serves_jpeg_and_404s_unknown",
+        "forget_on_page_purges_face_checks",
+        "thresholds_block_is_read_only_with_current_values",
+        "threshold_save_from_loopback_stores_values",
+        "threshold_save_from_non_loopback_refused",
+        "threshold_save_invalid_refused_and_unchanged",
+        "threshold_save_needs_the_page_token",
+        "photo_strip_shows_every_photo_and_marks_unusable",
+        "delete_photo_removes_slot_and_embedding",
+        "delete_last_photo_refused",
+        "delete_photo_unknown_or_stale_token_changes_nothing",
+        "face_state_refuses_missing_or_wrong_token",
+        "face_state_carries_checks_people_and_thresholds_without_images",
+        "face_paths_are_tls_only",
+        "get_on_face_action_paths_refused",
     )
 
     @classmethod
@@ -463,6 +513,113 @@ class SettingsPageHarnessTest(unittest.TestCase):
 
 
 jvm_harness.add_scenario_tests(SettingsPageHarnessTest)
+
+
+class FaceChecksHarnessTest(unittest.TestCase):
+    """Face plan U5 (KTD8; R13, R14, R19): the in-memory ring of recent face checks."""
+    SCENARIOS = (
+        "record_answers_distinct_handles_newest_first",
+        "eleventh_check_evicts_the_oldest_and_its_handle_updates_nothing",
+        "update_outcome_sets_outcome_and_joined_id",
+        "update_unknown_handle_is_a_no_op",
+        "close_as_ended_closes_only_pending_checks",
+        "purge_removes_checks_matching_or_joining_the_person",
+        "crop_is_served_by_handle",
+        "oversized_or_non_jpeg_crop_refused",
+        "no_face_check_keeps_no_crop",
+        "bad_ids_and_codes_refused",
+        "list_is_a_snapshot",
+        "to_string_carries_no_crop_bytes",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        jdk = jvm_harness.find_jdk()
+        if jdk is None:
+            raise unittest.SkipTest("no JDK (javac + java) found")
+        cls._td = tempfile.TemporaryDirectory(prefix="face_checks_harness_")
+        out = cls._td.name
+        c = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, [CHECKS_HARNESS_MAIN],
+                                                 [CHECKS_HARNESS, LAUNCHER_SRC, SHARED_SRC]),
+                           capture_output=True, text=True)
+        cls.compiled = c.returncode == 0
+        cls.compile_output = (c.stdout + c.stderr)[-3000:]
+        cls.results = {}
+        cls.run_output = ""
+        if c.returncode == 0:
+            r = subprocess.run([jdk[1], "-cp", out, "com.miko3.launcher.FaceChecksHarness"],
+                               capture_output=True, text=True, timeout=60)
+            cls.run_output = (r.stdout + r.stderr)[-6000:]
+            cls.results = jvm_harness.parse_verdicts(r.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def setUp(self):
+        self.assertTrue(self.compiled, f"harness failed to compile:\n{self.compile_output}")
+
+    def _assert_pass(self, name):
+        self.assertIn(name, self.results, f"scenario {name} never reported:\n{self.run_output}")
+        verdict, detail = self.results[name]
+        self.assertEqual(verdict, "PASS", f"{name}: {detail}")
+
+    def test_harness_reports_exactly_the_expected_scenarios(self):
+        self.assertEqual(sorted(self.results), sorted(self.SCENARIOS), self.run_output)
+
+
+jvm_harness.add_scenario_tests(FaceChecksHarnessTest)
+
+
+class FaceWiringTest(unittest.TestCase):
+    """Face plan U5: what the harnesses can't reach, and the quality gates."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = _strip_comments(PAGE.read_text())
+        cls.app = _strip_comments(APP.read_text())
+
+    def test_new_classes_are_plain_java_and_never_log(self):
+        for path in (FACE_CHECKS, FACE_CHECK, FACE_SETTINGS):
+            with self.subTest(file=path.name):
+                raw = path.read_text() if path.exists() else ""
+                self.assertTrue(raw, f"{path.name} missing")
+                self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
+                stripped = _strip_comments(raw)
+                self.assertNotRegex(stripped, r"\bLog\.\w\(")
+                for needle in ("System.out", "System.err", "printStackTrace"):
+                    self.assertNotIn(needle, stripped)
+
+    def test_launcher_owns_one_ring_and_passes_it_to_the_page(self):
+        self.assertEqual(self.app.count("new FaceChecks("), 1)
+        self.assertIn("FaceChecks faceChecks()", self.app)
+        m = re.search(r"SettingsPage\.handle\(([^;]*)\);", self.app)
+        self.assertIsNotNone(m)
+        self.assertIn("faceChecks", m.group(1))
+
+    def test_page_forget_purges_the_checks(self):
+        m = re.search(r"private static String forget\([^)]*\)\s*\{(.*?)\n    \}", self.page, flags=re.S)
+        self.assertIsNotNone(m, "SettingsPage has no forget()")
+        # The page and PeopleService share one forget path: the person, then their checks.
+        self.assertIn("FaceChecks.forget(", m.group(1))
+        checks = _strip_comments(FACE_CHECKS.read_text())
+        f = re.search(r"static boolean forget\([^)]*\)\s*\{(.*?)\n    \}", checks, flags=re.S)
+        self.assertIsNotNone(f, "FaceChecks has no forget()")
+        self.assertGreaterEqual(f.group(1).find(".forget("), 0)
+        self.assertLess(f.group(1).find(".forget("), f.group(1).find(".purgePerson("))
+
+    def test_threshold_save_checks_loopback_first(self):
+        m = re.search(r"static void handle\([^)]*\)[^{]*\{(.*?)\n    \}", self.page, flags=re.S)
+        self.assertIsNotNone(m, "SettingsPage has no handle()")
+        body = m.group(1)
+        self.assertRegex(body, r"SETTINGS_FACE_THRESHOLDS_PATH\.equals\(req\.path\) && !req\.fromLoopback")
+        self.assertGreaterEqual(body.find("fromLoopback"), 0)
+        self.assertLess(body.find("fromLoopback"), body.find("readForm("))
+
+    def test_router_records_whether_the_caller_is_loopback(self):
+        router = _strip_comments(ROUTER.read_text())
+        self.assertIn("isLoopbackAddress()", router)
+        self.assertIn("public final boolean fromLoopback", _strip_comments(REQUEST.read_text()))
 
 
 if __name__ == "__main__":

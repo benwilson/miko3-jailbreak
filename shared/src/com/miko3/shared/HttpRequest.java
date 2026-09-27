@@ -15,14 +15,24 @@ public final class HttpRequest {
     public final Map<String, String> query;
     public final Map<String, String> headers;
     public final InputStream body;
+    /** True when the connection came from this device's own loopback address
+     * (RoutingHttpServer checks the socket's peer), which is how a host script
+     * arrives over `adb forward`. False when unknown. */
+    public final boolean fromLoopback;
 
     public HttpRequest(String method, String path, Map<String, String> query,
                 Map<String, String> headers, InputStream body) {
+        this(method, path, query, headers, body, false);
+    }
+
+    public HttpRequest(String method, String path, Map<String, String> query,
+                Map<String, String> headers, InputStream body, boolean fromLoopback) {
         this.method = method;
         this.path = path;
         this.query = query;
         this.headers = headers;
         this.body = body;
+        this.fromLoopback = fromLoopback;
     }
 
     public String queryParam(String name, String fallback) {

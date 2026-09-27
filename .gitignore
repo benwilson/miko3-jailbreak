@@ -72,6 +72,8 @@ hooks/sd-free/miko3-test/
 scripts/route-a-cache/
 tools/third_party/
 tools/detector-export/
+# face-bench.py's venv, pulled office captures and summary — captures must never be committed
+tools/face-bench/
 
 # Private voice training material (clips, transcripts, references, venv) — never commit
 voice-work/

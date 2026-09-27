@@ -575,6 +575,41 @@ owner-attended checks. `--only roam-summary` summarises a logcat capture: steers
 re-aims, CPL hiccups, wedges and their free-after times, coverage cells, blocked
 turns, camera timings and speech first audio, all as counts and timings only.
 
+## 12. Explore's face-check bench — TOOL READY, NOT YET RUN
+
+On-device face recognition (`docs/plans/2026-09-26-2239-feat-explore-on-device-face-recognition-plan.md`,
+U9, KTD2, KTD3, KTD5). `scripts/face-bench.py` fits the face-check thresholds and
+the YuNet input size from real robot captures, on the Mac. It keeps its own venv
+(`tools/face-bench/venv`, onnxruntime 1.30, numpy, pillow) and builds it on first use.
+
+**Capturing.** `adb shell setprop log.tag.MikoExploreFaceDebug DEBUG`, restart
+Explore, and let him meet people. He keeps the last 50 meeting source frames in
+his private `files/face-frames/`. `face-bench.py pull` copies them over root adb
+into `tools/face-bench/captures/_unsorted/`. The owner sorts them into one folder
+per person, named by initials.
+
+**Running.** `face-bench.py run` mirrors the robot's pipeline in numpy with the
+same constants: YuNet at 320x256, 480x384 and 640x480, the five-point alignment,
+the size, dark and blur gate, the brighten, then SFace.
+`test_face_bench.py` holds the mirror to the Java for alignment, luma, blur and
+the brighten table. The run reports:
+
+- detection counts per input size, and the smallest size that keeps every face;
+- gate percentiles, with gate values that are never stricter than the defaults;
+- genuine and impostor score ranges;
+- a pass that holds out each person and scores them against everyone else;
+- suggested confident, close and margin values, printed as the
+  `robot-faces.py thresholds` command.
+
+If no confident value keeps every impostor out while at least 80% of genuine
+pairs reach it, it prints **STOP CONDITION 2** instead.
+
+**Where results go.** The summary holds numbers and folder labels only. It goes
+to stdout and `tools/face-bench/summary.md`, which is gitignored. Paste it into the
+pull request and record the chosen values here. Then run `face-bench.py clean`
+(`--robot` also clears the robot's frames and turns capture off). Office captures
+are never committed.
+
 ## Open questions
 
 - Where/how are `assets/*.tflite` copied out to `/sdcard/klug/vision/` on

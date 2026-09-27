@@ -2,6 +2,8 @@ package com.miko3.launcher;
 
 import com.miko3.shared.ClaudeApi;
 import com.miko3.shared.ConversationSettings;
+import com.miko3.shared.FaceCheck;
+import com.miko3.shared.FaceSettings;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.Json;
@@ -108,6 +110,12 @@ public final class SettingsPageHarness {
         final FakeSpeaker speaker = new FakeSpeaker();
         final PeopleClock peopleClock = new PeopleClock();
         final PeopleStore people = new PeopleStore(tempDir(), peopleClock);
+        final FaceChecks checks = new FaceChecks(new PeopleStore.Clock() {
+            @Override
+            public long nowMillis() {
+                return 1_700_000_000_000L;
+            }
+        });
     }
 
     static final class PeopleClock implements PeopleStore.Clock {
@@ -310,13 +318,20 @@ public final class SettingsPageHarness {
     }
 
     static Resp request(Fixture f, String method, String path, String query, String form) throws Exception {
+        return request(f, method, path, query, form, false);
+    }
+
+    /** As request(), from a loopback caller when loopback is true (how the CLI
+     * arrives over adb forward). */
+    static Resp request(Fixture f, String method, String path, String query, String form, boolean loopback)
+            throws Exception {
         Map<String, String> headers = new HashMap<String, String>();
         headers.put("host", "192.168.19.74:8443");
         byte[] body = form == null ? new byte[0] : form.getBytes(StandardCharsets.UTF_8);
         HttpRequest req = new HttpRequest(method, path, HttpRequest.parseQuery(query), headers,
-                new ByteArrayInputStream(body));
+                new ByteArrayInputStream(body), loopback);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        SettingsPage.handle(req, new HttpResponse(out), f.token, f.settings, f.api, f.speaker, f.people);
+        SettingsPage.handle(req, new HttpResponse(out), f.token, f.settings, f.api, f.speaker, f.people, f.checks);
         String raw = new String(out.toByteArray(), StandardCharsets.UTF_8);
         int split = raw.indexOf("\r\n\r\n");
         Resp r = new Resp();
@@ -436,6 +451,54 @@ public final class SettingsPageHarness {
         return m.find() ? m.group(0) : "";
     }
 
+
+    // ---- face plan U5: face checks and photos ----
+
+    static final String MODEL = "sface-2021dec";
+
+    static float[] emb(float v) {
+        return new float[] {v, 0.5f, 0.25f};
+    }
+
+    /** A named person with n photos, each added a minute after the last. */
+    static String personWithPhotos(Fixture f, String name, int n) {
+        String id = f.people.addPerson(jpeg(10), name, MODEL, emb(0.1f));
+        for (int i = 1; i < n; i++) {
+            f.peopleClock.now += 60_000;
+            f.people.addPhoto(id, jpeg(10 + i), MODEL, emb(0.1f * (i + 1)));
+        }
+        return id;
+    }
+
+    static long addedAt(Fixture f, String id, int slot) {
+        for (PeopleStore.Photo p : f.people.photos(id)) {
+            if (p.slot == slot) {
+                return p.addedAtMillis;
+            }
+        }
+        return -1;
+    }
+
+    static FaceCheck matchCheck(Fixture f, int decision, String id, int slot, float score) {
+        return new FaceCheck(decision, FaceCheck.REASON_NONE, jpeg(40), id, slot, addedAt(f, id, slot), score,
+                "", 0f, false);
+    }
+
+    /** The <article id="check-..."> fragment for a handle, or "". */
+    static String checkArticle(String html, long handle) {
+        Matcher m = Pattern.compile("<article id=\"check-" + handle + "\">(.*?)</article>", Pattern.DOTALL)
+                .matcher(html);
+        return m.find() ? m.group(0) : "";
+    }
+
+    static Resp thresholds(Fixture f, String fields, boolean loopback) throws Exception {
+        return request(f, "POST", LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH, "", "t=" + token(f) + fields,
+                loopback);
+    }
+
+    static String photoQuery(String id, int slot, long at) {
+        return "id=" + id + "&slot=" + slot + "&at=" + at;
+    }
 
     private static int failures;
 
@@ -1453,6 +1516,377 @@ public final class SettingsPageHarness {
                 check(n, shown && SettingsPage.PEOPLE_FORGOTTEN.equals(r.status()) && f.people.notes(id).isEmpty()
                                 && f.people.nameOf(id) == null && !html.contains("chess-ZQXJ") && !html.contains(id),
                         r.head + " " + html);
+            }
+        });
+
+        // ---- face plan U5 (KTD5, KTD8; R2, R13-R15, R17, R19) ----
+        scenario("face_checks_section_empty", new Scenario() {
+            public void run(String n) throws Exception {
+                String sec = section(get(new Fixture()), "face-checks");
+                check(n, sec.contains("Face checks") && sec.contains(SettingsPage.CHECKS_EMPTY), sec);
+            }
+        });
+
+        scenario("face_check_renders_crop_photo_name_score_band_and_outcome_escaped", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = personWithPhotos(f, "<b>Sam & Co</b>", 2);
+                long h = f.checks.record(matchCheck(f, FaceCheck.CONFIDENT, id, 1, 0.6149f));
+                f.checks.updateOutcome(h, FaceCheck.YES, null);
+                String a = checkArticle(get(f), h);
+                check(n, a.contains(LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH + "?id=" + h)
+                                && a.contains(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH + "?"
+                                        + photoQuery(id, 1, addedAt(f, id, 1)).replace("&", "&amp;"))
+                                && a.contains("&lt;b&gt;Sam &amp; Co&lt;/b&gt;") && !a.contains("<b>Sam")
+                                && a.contains("0.61") && !a.contains("0.6149")
+                                && a.contains(SettingsPage.decisionText(FaceCheck.CONFIDENT, 0))
+                                && a.contains(SettingsPage.outcomeText(FaceCheck.YES)),
+                        a);
+            }
+        });
+
+        scenario("rejected_check_shows_reason_and_no_best_match_photo", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                personWithPhotos(f, "Sarah", 1);
+                long h = f.checks.record(new FaceCheck(FaceCheck.REJECTED, FaceCheck.TOO_DARK, jpeg(41), "", -1, 0,
+                        0f, "", 0f, false));
+                String a = checkArticle(get(f), h);
+                check(n, a.contains("too dark") && a.contains(LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH)
+                        && !a.contains(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH) && !a.contains("Sarah"), a);
+            }
+        });
+
+        scenario("not_ready_and_no_face_checks_render_decision_and_no_face_has_no_crop", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                long notReady = f.checks.record(new FaceCheck(FaceCheck.NOT_READY, 0, jpeg(42), "", -1, 0, 0f, "",
+                        0f, false));
+                long noFace = f.checks.record(new FaceCheck(FaceCheck.NO_FACE, 0, null, "", -1, 0, 0f, "", 0f,
+                        false));
+                String html = get(f);
+                String a = checkArticle(html, notReady);
+                String b = checkArticle(html, noFace);
+                check(n, a.contains(SettingsPage.decisionText(FaceCheck.NOT_READY, 0))
+                                && a.contains(LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH)
+                                && b.contains(SettingsPage.decisionText(FaceCheck.NO_FACE, 0))
+                                && !b.contains(LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH)
+                                && !b.contains("<img") && html.indexOf("check-" + noFace) < html.indexOf("check-" + notReady),
+                        a + "\n" + b);
+            }
+        });
+
+        scenario("near_tie_check_shows_runner_up_name_and_score", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sarah = personWithPhotos(f, "Sarah", 1);
+                String sara = personWithPhotos(f, "Sara <i>", 1);
+                long h = f.checks.record(new FaceCheck(FaceCheck.CLOSE, 0, jpeg(43), sarah, 0,
+                        addedAt(f, sarah, 0), 0.55f, sara, 0.53f, true));
+                String a = checkArticle(get(f), h);
+                check(n, a.contains("Sarah") && a.contains("Sara &lt;i&gt;") && a.contains("0.53")
+                        && a.contains(SettingsPage.NEAR_TIE), a);
+            }
+        });
+
+        scenario("replaced_best_match_slot_shows_marker_not_new_photo", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = personWithPhotos(f, "Sarah", PeopleStore.MAX_PHOTOS);
+                long oldAt = addedAt(f, id, 0);
+                long h = f.checks.record(matchCheck(f, FaceCheck.CLOSE, id, 0, 0.4f));
+                f.peopleClock.now += 60_000;
+                int slot = f.people.addPhoto(id, jpeg(99), MODEL, emb(0.9f));
+                String a = checkArticle(get(f), h);
+                Resp r = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH, photoQuery(id, 0, oldAt), null);
+                check(n, slot == 0 && a.contains(SettingsPage.CHECK_PHOTO_REPLACED)
+                                && !a.contains(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH) && r.code() == 200
+                                && r.head.toLowerCase().contains("image/svg+xml") && !Arrays.equals(r.bytes, jpeg(99))
+                                && r.body.contains("replaced"),
+                        a + " " + r.head);
+            }
+        });
+
+        scenario("photo_route_serves_the_photo_only_while_added_at_matches", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = personWithPhotos(f, "Sam", 2);
+                long at = addedAt(f, id, 1);
+                Resp ok = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH, photoQuery(id, 1, at), null);
+                Resp wrongAt = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH,
+                        photoQuery(id, 1, at + 1), null);
+                Resp noAt = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH, "id=" + id + "&slot=1",
+                        null);
+                Resp gone = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH, photoQuery(id, 4, 0), null);
+                Resp badId = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH,
+                        photoQuery("../people.index", 1, at), null);
+                Resp post = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH, photoQuery(id, 1, at),
+                        "t=" + token(f));
+                check(n, ok.code() == 200 && Arrays.equals(ok.bytes, jpeg(11))
+                                && wrongAt.head.contains("svg") && !Arrays.equals(wrongAt.bytes, jpeg(11))
+                                && noAt.code() == 404 && gone.head.contains("svg") && badId.code() == 404
+                                && post.code() == 405,
+                        ok.head + "|" + wrongAt.head + "|" + noAt.head + "|" + gone.head + "|" + badId.head);
+            }
+        });
+
+        scenario("check_crop_route_serves_jpeg_and_404s_unknown", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                long h = f.checks.record(new FaceCheck(FaceCheck.WEAK, 0, jpeg(44), "", -1, 0, 0.1f, "", 0f, false));
+                Resp ok = request(f, "GET", LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH, "id=" + h, null);
+                Resp unknown = request(f, "GET", LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH, "id=" + (h + 7), null);
+                Resp bad = request(f, "GET", LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH, "id=abc", null);
+                Resp none = request(f, "GET", LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH, "", null);
+                check(n, ok.code() == 200 && ok.head.toLowerCase().contains("image/jpeg")
+                                && Arrays.equals(ok.bytes, jpeg(44)) && unknown.code() == 404 && bad.code() == 404
+                                && none.code() == 404,
+                        ok.head + "|" + unknown.head + "|" + bad.head);
+            }
+        });
+
+        scenario("forget_on_page_purges_face_checks", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sarah = personWithPhotos(f, "Sarah", 1);
+                String tom = personWithPhotos(f, "Tom", 1);
+                long matched = f.checks.record(matchCheck(f, FaceCheck.CONFIDENT, sarah, 0, 0.7f));
+                long joined = f.checks.record(matchCheck(f, FaceCheck.CLOSE, tom, 0, 0.4f));
+                f.checks.updateOutcome(joined, FaceCheck.JOINED, sarah);
+                long kept = f.checks.record(matchCheck(f, FaceCheck.CONFIDENT, tom, 0, 0.8f));
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + token(f) + "&id=" + sarah);
+                String html = get(f);
+                Resp crop = request(f, "GET", LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH, "id=" + matched, null);
+                check(n, SettingsPage.PEOPLE_FORGOTTEN.equals(r.status()) && f.checks.list().size() == 1
+                                && f.checks.list().get(0).handle == kept && checkArticle(html, matched).isEmpty()
+                                && checkArticle(html, joined).isEmpty() && !html.contains("Sarah")
+                                && crop.code() == 404,
+                        r.head + " " + f.checks.list());
+            }
+        });
+
+        scenario("thresholds_block_is_read_only_with_current_values", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.settings.saveFace(new FaceSettings(0.55f, 0.4f, 0.06f, 50, 38, 95, 31.5));
+                String sec = section(get(f), "face-thresholds");
+                check(n, sec.contains("0.55") && sec.contains("0.4") && sec.contains("0.06") && sec.contains("50")
+                                && sec.contains("38") && sec.contains("95") && sec.contains("31.5")
+                                && !sec.contains("<form") && !sec.contains("<input"),
+                        sec);
+            }
+        });
+
+        scenario("threshold_save_from_loopback_stores_values", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = thresholds(f, "&confident=0.6&close=0.41&margin=0.04&min_width=56&dark_floor=35"
+                        + "&dim_level=100&blur_floor=25.5", true);
+                FaceSettings s = f.settings.faceSettings();
+                // A partial save keeps the fields it leaves out.
+                Resp partial = thresholds(f, "&confident=0.65", true);
+                FaceSettings s2 = f.settings.faceSettings();
+                check(n, SettingsPage.FACE_THRESHOLDS_SAVED.equals(r.status()) && s.confident == 0.6f
+                                && s.close == 0.41f && s.margin == 0.04f && s.minWidth == 56 && s.darkFloor == 35
+                                && s.dimLevel == 100 && s.blurFloor == 25.5
+                                && SettingsPage.FACE_THRESHOLDS_SAVED.equals(partial.status())
+                                && s2.confident == 0.65f && s2.close == 0.41f && s2.minWidth == 56,
+                        r.head + " " + s + " " + s2);
+            }
+        });
+
+        scenario("threshold_save_from_non_loopback_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = thresholds(f, "&confident=0&close=0", false);
+                check(n, r.code() == 403 && r.body.contains(SettingsPage.FACE_THRESHOLDS_LOOPBACK_ONLY)
+                        && snapshot(f).equals(snapshot(new Fixture()))
+                        && f.settings.faceSettings().confident == 0.5f, r.head + " " + r.body);
+            }
+        });
+
+        scenario("threshold_save_invalid_refused_and_unchanged", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String before = snapshot(f);
+                Resp bands = thresholds(f, "&confident=0.5&close=0.6", true);
+                Resp luma = thresholds(f, "&dark_floor=95&dim_level=90", true);
+                Resp word = thresholds(f, "&margin=%3Cscript%3E", true);
+                check(n, ("Not saved: " + ClaudeSettings.FACE_REFUSE_BANDS).equals(bands.status())
+                                && ("Not saved: " + ClaudeSettings.FACE_REFUSE_LUMA).equals(luma.status())
+                                && SettingsPage.FACE_NOT_A_NUMBER.equals(word.status())
+                                && before.equals(snapshot(f)),
+                        bands.status() + " | " + luma.status() + " | " + word.status());
+            }
+        });
+
+        scenario("threshold_save_needs_the_page_token", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String before = snapshot(f);
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH, "", "confident=0.7", true);
+                check(n, r.status() != null && r.status().contains("expired") && before.equals(snapshot(f)),
+                        r.head);
+            }
+        });
+
+        scenario("photo_strip_shows_every_photo_and_marks_unusable", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = personWithPhotos(f, "Sam", 3);
+                f.people.markUnusable(id, 2, addedAt(f, id, 2));
+                String a = article(get(f), id);
+                int imgs = 0;
+                Matcher m = Pattern.compile(Pattern.quote(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH + "?id=" + id))
+                        .matcher(a);
+                while (m.find()) {
+                    imgs++;
+                }
+                String del = form(a, LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH);
+                check(n, imgs == 3 && a.contains(SettingsPage.PHOTO_UNUSABLE)
+                                && a.indexOf(SettingsPage.PHOTO_UNUSABLE) > a.indexOf("slot=2")
+                                && fieldNames(del).equals(Arrays.asList("t", "id", "slot")),
+                        a);
+            }
+        });
+
+        scenario("delete_photo_removes_slot_and_embedding", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = personWithPhotos(f, "Sam", 3);
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=" + id + "&slot=1");
+                List<Integer> slots = new ArrayList<Integer>();
+                for (PeopleStore.Photo p : f.people.photos(id)) {
+                    slots.add(p.slot);
+                }
+                boolean inGallery = false;
+                for (PeopleStore.Photo p : f.people.gallery()) {
+                    inGallery |= p.id.equals(id) && p.slot == 1;
+                }
+                check(n, SettingsPage.PHOTO_DELETED.equals(r.status()) && slots.equals(Arrays.asList(0, 2))
+                        && f.people.photo(id, 1) == null && !inGallery, r.head + " slots=" + slots);
+            }
+        });
+
+        scenario("delete_last_photo_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = personWithPhotos(f, "Sam", 1);
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=" + id + "&slot=0");
+                check(n, SettingsPage.PHOTO_LAST.equals(r.status()) && f.people.photo(id, 0) != null
+                        && form(article(get(f), id), LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH).isEmpty(),
+                        r.head);
+            }
+        });
+
+        scenario("delete_photo_unknown_or_stale_token_changes_nothing", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = personWithPhotos(f, "Sam", 2);
+                Resp stale = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH, "",
+                        "t=deadbeef&id=" + id + "&slot=1");
+                Resp empty = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=" + id + "&slot=3");
+                Resp junk = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=" + id + "&slot=%3Cx%3E");
+                Resp who = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=0123456789abcdef&slot=0");
+                check(n, stale.status().contains("expired") && SettingsPage.PHOTO_UNKNOWN.equals(empty.status())
+                                && SettingsPage.PHOTO_UNKNOWN.equals(junk.status())
+                                && SettingsPage.PHOTO_UNKNOWN.equals(who.status()) && f.people.photos(id).size() == 2,
+                        stale.status() + "|" + empty.status() + "|" + junk.status() + "|" + who.status());
+            }
+        });
+
+        scenario("face_state_refuses_missing_or_wrong_token", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                personWithPhotos(f, "Sarah", 1);
+                Resp none = request(f, "POST", LauncherProtocol.SETTINGS_FACE_STATE_PATH, "", "", true);
+                Resp wrong = request(f, "POST", LauncherProtocol.SETTINGS_FACE_STATE_PATH, "", "t=deadbeef", true);
+                Resp viaGet = request(f, "GET", LauncherProtocol.SETTINGS_FACE_STATE_PATH, "t=" + token(f), null, true);
+                check(n, none.code() == 403 && wrong.code() == 403 && viaGet.code() == 405
+                                && !none.body.contains("Sarah") && !wrong.body.contains("Sarah"),
+                        none.head + "|" + wrong.head + "|" + viaGet.head);
+            }
+        });
+
+        scenario("face_state_carries_checks_people_and_thresholds_without_images", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sarah = personWithPhotos(f, "Sarah \"S\"", 3);
+                String tom = personWithPhotos(f, "Tom", 1);
+                f.people.markUnusable(sarah, 2, addedAt(f, sarah, 2));
+                long h = f.checks.record(new FaceCheck(FaceCheck.CLOSE, 0, jpeg(45), sarah, 1, addedAt(f, sarah, 1),
+                        0.45f, tom, 0.43f, true));
+                f.checks.updateOutcome(h, FaceCheck.NAME_GIVEN, null);
+                f.checks.record(new FaceCheck(FaceCheck.REJECTED, FaceCheck.TOO_SMALL, jpeg(46), "", -1, 0, 0f, "", 0f,
+                        false));
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_FACE_STATE_PATH, "", "t=" + token(f));
+                @SuppressWarnings("unchecked")
+                Map<String, Object> root = (Map<String, Object>) Json.parse(r.body);
+                @SuppressWarnings("unchecked")
+                List<Object> checks = (List<Object>) root.get("checks");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> rejected = (Map<String, Object>) checks.get(0);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> close = (Map<String, Object>) checks.get(1);
+                @SuppressWarnings("unchecked")
+                List<Object> people = (List<Object>) root.get("people");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> th = (Map<String, Object>) root.get("thresholds");
+                Map<String, Object> sarahRow = null;
+                for (Object o : people) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> p = (Map<String, Object>) o;
+                    if (sarah.equals(p.get("id"))) {
+                        sarahRow = p;
+                    }
+                }
+                boolean noImages = !r.body.contains("\u00ff\u00d8") && !r.body.toLowerCase().contains("jpeg")
+                        && r.body.length() < 4000;
+                check(n, r.code() == 200 && r.head.toLowerCase().contains("application/json") && noImages
+                                && checks.size() == 2 && "rejected".equals(rejected.get("decision"))
+                                && "too small".equals(rejected.get("reason"))
+                                && "close".equals(close.get("decision")) && "Sarah \"S\"".equals(close.get("best_name"))
+                                && sarah.equals(close.get("best_id")) && "Tom".equals(close.get("runner_up_name"))
+                                && Boolean.TRUE.equals(close.get("near_tie"))
+                                && "name given".equals(close.get("outcome"))
+                                && Math.abs(((Number) close.get("score")).doubleValue() - 0.45) < 1e-6
+                                && people.size() == 2 && sarahRow != null && "Sarah \"S\"".equals(sarahRow.get("name"))
+                                && ((Number) sarahRow.get("photos")).intValue() == 3
+                                && ((Number) sarahRow.get("unusable")).intValue() == 1
+                                && ((Number) th.get("confident")).doubleValue() == 0.5
+                                && ((Number) th.get("close")).doubleValue() == 0.363
+                                && ((Number) th.get("min_width")).intValue() == 48,
+                        r.head + "\n" + r.body);
+            }
+        });
+
+        scenario("face_paths_are_tls_only", new Scenario() {
+            public void run(String n) {
+                check(n, LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH)
+                                && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH)
+                                && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH)
+                                && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH)
+                                && LauncherProtocol.isTlsOnlyPath(LauncherProtocol.SETTINGS_FACE_STATE_PATH),
+                        "a face path is served on plain HTTP");
+            }
+        });
+
+        scenario("get_on_face_action_paths_refused", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = personWithPhotos(f, "Sam", 2);
+                Resp del = request(f, "GET", LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH,
+                        "t=" + token(f) + "&id=" + id + "&slot=1", null);
+                Resp th = request(f, "GET", LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH,
+                        "t=" + token(f) + "&confident=0.9", null, true);
+                check(n, del.code() == 405 && th.code() == 405 && f.people.photos(id).size() == 2
+                        && f.settings.faceSettings().confident == 0.5f, del.head + "|" + th.head);
             }
         });
 

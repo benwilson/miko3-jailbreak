@@ -27,10 +27,17 @@ public interface RobotSettings extends IInterface {
      * (LauncherProtocol.LAUNCHER_TOO_OLD) when the launcher predates it. */
     ConversationSettings getConversationSettings() throws RemoteException;
 
+    /** The face band and gate thresholds (face plan U5, KTD5), read from the
+     * launcher's store on this call, or FaceSettings.DEFAULTS until the owner
+     * sets them. Appended; its Proxy throws UnsupportedOperationException
+     * (LauncherProtocol.LAUNCHER_TOO_OLD) when the launcher predates it. */
+    FaceSettings getFaceSettings() throws RemoteException;
+
     abstract class Stub extends Binder implements RobotSettings {
         private static final String DESCRIPTOR = "com.miko3.shared.RobotSettings";
         static final int TRANSACTION_getClaudeAccess = 1;
         static final int TRANSACTION_getConversationSettings = 2;
+        static final int TRANSACTION_getFaceSettings = 3;
 
         public Stub() {
             attachInterface(this, DESCRIPTOR);
@@ -75,6 +82,19 @@ public interface RobotSettings extends IInterface {
                     reply.writeString(c.persona);
                     reply.writeInt(c.personaSet ? 1 : 0);
                     reply.writeInt(c.answersWhenSpokenTo ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_getFaceSettings: {
+                    data.enforceInterface(DESCRIPTOR);
+                    FaceSettings f = getFaceSettings();
+                    reply.writeNoException();
+                    reply.writeFloat(f.confident);
+                    reply.writeFloat(f.close);
+                    reply.writeFloat(f.margin);
+                    reply.writeInt(f.minWidth);
+                    reply.writeDouble(f.darkFloor);
+                    reply.writeDouble(f.dimLevel);
+                    reply.writeDouble(f.blurFloor);
                     return true;
                 }
                 case IBinder.INTERFACE_TRANSACTION: {
@@ -135,6 +155,30 @@ public interface RobotSettings extends IInterface {
                     boolean personaSet = reply.readInt() != 0;
                     boolean answers = reply.readInt() != 0;
                     return new ConversationSettings(persona, personaSet, answers);
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public FaceSettings getFaceSettings() throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    if (!remote.transact(TRANSACTION_getFaceSettings, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    float confident = reply.readFloat();
+                    float close = reply.readFloat();
+                    float margin = reply.readFloat();
+                    int minWidth = reply.readInt();
+                    double darkFloor = reply.readDouble();
+                    double dimLevel = reply.readDouble();
+                    double blurFloor = reply.readDouble();
+                    return new FaceSettings(confident, close, margin, minWidth, darkFloor, dimLevel, blurFloor);
                 } finally {
                     reply.recycle();
                     data.recycle();

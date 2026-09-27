@@ -7,6 +7,9 @@ import android.util.Log;
 import com.miko3.shared.ClaudeAccess;
 import com.miko3.shared.ClaudeApi;
 import com.miko3.shared.ClaudeHttpsTransport;
+import com.miko3.shared.FaceCheck;
+import com.miko3.shared.FaceSettings;
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.PersonNotes;
 import com.miko3.shared.Json;
 import com.miko3.shared.NameExtractor;
@@ -20,7 +23,11 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -48,8 +55,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Settings page applies from the next stop, and with none set up every stop
  * runs as it did before Claude.
  *
+ * Meeting someone is matched on the robot (on-device face recognition plan
+ * U6): the face is found, gated, straightened and embedded here and compared
+ * with every stored photo's embedding; no face or name goes to Claude for it.
+ * A start-up migration embeds stored photos that predate the current model.
+ *
  * Privacy (R13): face crops and frames leave the robot only inside requests to
- * the configured endpoint. Nothing here logs an image, the key, a reply's
+ * the configured endpoint (the conversation's opener and the recently-met
+ * check). Nothing here logs an image, the key, a reply's
  * text, a transcript or a name: only statuses, fixed reasons, counts and ids.
  */
 final class ClaudeCuriosity implements CuriosityPort {
@@ -63,6 +76,11 @@ final class ClaudeCuriosity implements CuriosityPort {
     static final String FACE_DEBUG_TAG = "MikoExploreFaceDebug";
     static final String LAST_FACE = "last-face.jpg";
     static final String LAST_FACE_SRC = "last-face-src.jpg";
+    /** With the switch on, each meeting's source frame is also kept here, newest FACE_FRAMES_KEPT (U9's bench). */
+    static final String FACE_FRAMES = "face-frames";
+    static final int FACE_FRAMES_KEPT = 50;
+    /** A stored photo is a face crop already: the whole of it is the person box (KTD11). */
+    private static final Detection WHOLE_PHOTO = new Detection("person", 1f, 0f, 0f, 1f, 1f);
     /** Assumed when a frame's size can't be read: the camera's own (ExploreCamera). */
     private static final int FRAME_W = 640;
     private static final int FRAME_H = 480;
@@ -75,6 +93,14 @@ final class ClaudeCuriosity implements CuriosityPort {
     private volatile EarsAdapter session;
     /** YuNet on ONNX Runtime; its model loads at the first MEET and is freed by release(). */
     private final FaceCropper cropper;
+    /** SFace (face plan U3): loads on the first embedding, freed by release(). */
+    private final FaceEmbedder embedder;
+    /** The start-up migration (KTD11), run on the worker while the brain allows face work. */
+    private final FaceMigration migration;
+    private volatile boolean faceWorkAllowed;
+    private final AtomicBoolean migrating = new AtomicBoolean();
+    /** The current migration pass's gate; null until the pass first needs it. */
+    private FaceQuality.Thresholds passGate;
     private final ExecutorService worker = Executors.newCachedThreadPool(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
@@ -112,10 +138,17 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Done> notes = new Slot<Done>();
     private final Slot<Done> forgets = new Slot<Done>();
     private final Slot<Kept> keeps = new Slot<Kept>();
+    /** Confirming and resolving names (face plan U7): one resolve and one added photo at a time. */
+    private final Slot<Resolved> resolves = new Slot<Resolved>();
+    private final Slot<MatchAnswer> photoAdds = new Slot<MatchAnswer>();
     /** The recommended effort for a turn (KTD9); the client's gate drops it where a model refuses it. */
     private static final String TURN_EFFORT = "low";
 
-    /** The face cut out by the last match(), for remember(); and the id it matched, for touch(). */
+    /**
+     * The storable crop of the last match() (the brightened loose crop, KTD3),
+     * sent once with the conversation's opener; null when the meeting is
+     * faceless. And the id it matched, for touch().
+     */
     private volatile byte[] meetFace;
     private volatile String matchedId;
 
@@ -129,6 +162,23 @@ final class ClaudeCuriosity implements CuriosityPort {
         final long at = System.currentTimeMillis();
         volatile byte[] crop;
         volatile String storeId;
+        /**
+         * What the meeting may store (face plan U6, R18): the probe embedding and
+         * the brightened loose crop, both null when the meeting is faceless (no
+         * face, a rejected crop, the store not ready). U7's resolver adds the crop
+         * to a person by id with these (addPhoto).
+         */
+        volatile float[] probe;
+        volatile byte[] storeCrop;
+        /** The gallery and close threshold the match ran with (KTD11: the gallery
+         * once per meeting); the resolver scores against these. Set before probe. */
+        volatile List<FaceMatcher.Entry> entries;
+        volatile float close;
+        /** The matcher's decision (null when none ran) and the face check's handle (-1: none). */
+        volatile FaceMatcher.Result result;
+        volatile long checkHandle = -1;
+        /** A name the resolver asked the last name for (U7, KTD10): robot-side only, never logged. */
+        volatile String pendingFirst;
     }
 
     /** The current meeting's, from match(); and everyone metId() handed out a handle for. */
@@ -143,6 +193,18 @@ final class ClaudeCuriosity implements CuriosityPort {
         speech = new RobotSpeechClient(app);
         ears = new RobotListenClient(app);
         cropper = new FaceCropper(app);
+        embedder = new FaceEmbedder(app);
+        migration = new FaceMigration(new MigrationStore(), new FaceMigration.Faces() {
+            @Override
+            public float[] embed(byte[] jpeg) {
+                return embedStored(jpeg);
+            }
+        }, new FaceMigration.Gate() {
+            @Override
+            public boolean open() {
+                return faceWorkAllowed && !released;
+            }
+        });
         refreshSettings();
     }
 
@@ -160,8 +222,9 @@ final class ClaudeCuriosity implements CuriosityPort {
         ears.close();
         worker.shutdownNow();
         timer.shutdownNow();
-        // Waits for a crop still running, then frees the face model.
+        // Waits for a crop or an embedding still running, then frees the face models.
         cropper.close();
+        embedder.close();
         metFaces.clear();
     }
 
@@ -600,30 +663,32 @@ final class ClaudeCuriosity implements CuriosityPort {
     }
 
     /**
-     * The retained crop stored under a new record with this name (KTD10): a name
-     * given mid-conversation or a mismatch. No line is asked for and the face debug
-     * dump never runs here (it belongs to the match, before the conversation).
+     * The retained crop stored under a new record with this name (KTD10), with its
+     * embedding in one step (face plan U6, KTD12): someone new the resolver found for
+     * a name given (U7, KTD6). A faceless meeting (no face, a rejected crop, the store not
+     * ready) has nothing to store (R11, R18). No line is asked for and the face
+     * debug dump never runs here (it belongs to the match, before the conversation).
      */
     @Override
     public void keep(final String name, final long timeoutMs) {
         final int g = keeps.start();
-        final byte[] face = meetFace;
         final MetFace mf = meeting;
+        final byte[] face = mf == null ? null : mf.storeCrop;
+        final float[] probe = mf == null ? null : mf.probe;
         run(new Runnable() {
             @Override
             public void run() {
-                if (face == null) {
-                    Log.w(TAG, "keep: no face from the match to store");
+                if (face == null || probe == null) {
+                    Log.w(TAG, "keep: nothing storable from the match (faceless, rejected or not ready)");
                     keeps.finish(g, Kept.FAILED);
                     return;
                 }
                 Kept k;
                 try {
-                    String id = RobotPeopleClient.add(app, face, name);
+                    String id = RobotPeopleClient.addPerson(app, face, name, FaceMatcher.MODEL_ID, probe);
                     matchedId = id;
-                    if (mf != null) {
-                        mf.storeId = id;
-                    }
+                    mf.storeId = id;
+                    checkOutcome(mf, FaceCheck.NEW_PERSON, id);
                     k = Kept.done(id);
                     Log.i(TAG, "kept a new record, id " + id);
                 } catch (IOException e) {
@@ -808,19 +873,21 @@ final class ClaudeCuriosity implements CuriosityPort {
         return says.poll() != null;
     }
 
-    // ---- people (U5; KTD3, KTD4) ----
+    // ---- people (U5; on-device matching, face plan U6: KTD3, KTD7, KTD8, KTD11) ----
 
     @Override
     public void match(final byte[] frameJpeg, final Detection personBox, final long timeoutMs) {
         final int g = matches.start();
         meetFace = null;
         matchedId = null;
+        // A check still waiting for an answer ends "without an answer" (KTD8).
+        checkOutcome(meeting, FaceCheck.ENDED_WITHOUT_ANSWER, null);
         final MetFace mf = new MetFace();
         meeting = mf;
         run(new Runnable() {
             @Override
             public void run() {
-                matches.finish(g, person(g, frameJpeg, personBox, timeoutMs, mf));
+                matches.finish(g, person(g, frameJpeg, personBox, mf));
             }
         }, matches, g, MatchAnswer.FAILED);
     }
@@ -830,81 +897,546 @@ final class ClaudeCuriosity implements CuriosityPort {
         return matches.poll();
     }
 
-    /** The person request: the new face and up to MAX_RECENT stored ones, labelled by number only. */
-    private MatchAnswer person(int g, byte[] frameJpeg, Detection personBox, long timeoutMs, MetFace mf) {
+    /**
+     * The meeting's match, on the robot (KTD3): find the face, check its size,
+     * straighten it, check darkness and blur, brighten it when dim, embed it, and
+     * compare it with every stored photo of every named person. Every outcome is
+     * recorded as a face check (KTD8). The answer carries no lines (KTD7) and
+     * nothing is sent to Claude. Only a confident, close or weak match leaves
+     * something to store (R10, R11, R18); the rest meet facelessly.
+     */
+    private MatchAnswer person(int g, byte[] frameJpeg, Detection personBox, MetFace mf) {
         long t0 = System.currentTimeMillis();
-        FaceCrop.Result crop = cropper.crop(frameJpeg, personBox);
-        debugFace(frameJpeg, personBox, crop);
-        if (!crop.found()) {
-            // No face in the person box: nothing to match or store (R12). A new person
-            // to talk to, with the text-only lines; the brain promises nothing.
-            Log.i(TAG, "person request: no face found in the person box; asking as a new person, storing nothing");
-            ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM,
-                    textOnly(ExplorePrompts.LINES_ASK), ExplorePrompts.LINES_SCHEMA, (int) timeoutMs);
-            MatchAnswer lines = r.ok() ? ClaudeReplies.lines(r.json) : MatchAnswer.FAILED;
-            Log.i(TAG, "faceless lines request: " + (r.ok() ? lines.status.toString() : r.describe()) + " in "
-                    + (System.currentTimeMillis() - t0) + " ms");
-            return lines.status == MatchAnswer.Status.NEW
-                    ? forConversation(MatchAnswer.faceless(lines.askLine, lines.noReplyLine), null) : MatchAnswer.FAILED;
+        FaceCropper.Located found = cropper.locate(frameJpeg, personBox);
+        debugFace(frameJpeg, personBox, found);
+        if (found == null) {
+            // No face in the person box: nothing to match or store (R10).
+            Log.i(TAG, "person match: no face found in the person box; meeting without storing anything");
+            long h = record(mf, check(FaceCheck.NO_FACE, FaceCheck.REASON_NONE, null, null, null));
+            return facelessMeeting(null, h);
         }
-        byte[] face = crop.face;
+        byte[] loose = found.crop.face;
         if (matches.current(g)) {
-            mf.crop = face;
+            // In memory only, for the recently-met check (explore nav plan U7).
+            mf.crop = loose;
         }
-        RobotPeople.Face[] gallery;
+        FaceSettings settings;
         try {
-            gallery = RobotPeopleClient.recent(app, RobotPeople.MAX_RECENT);
+            settings = RobotSettingsClient.fetchFaceSettings(app);
         } catch (IOException e) {
-            Log.w(TAG, "person request: people store unavailable: " + e.getMessage());
+            return facelessBecause("the face settings", e);
+        }
+        FaceQuality.Thresholds gate = FaceQuality.Thresholds.of(settings);
+        int[] aligned = FaceAlign.align(found.argb, found.frameW, found.frameH, found.face.landmarks);
+        if (aligned == null) {
+            Log.w(TAG, "person match: the face could not be straightened; meeting without storing anything");
+            long h = record(mf, check(FaceCheck.NO_FACE, FaceCheck.REASON_NONE, null, null, null));
+            return facelessMeeting(null, h);
+        }
+        FaceQuality.Verdict v = FaceQuality.check(found.faceWidth(), aligned, FaceAlign.SIDE, FaceAlign.SIDE, gate,
+                false);
+        if (!v.ok()) {
+            // Too small, dark or blurry: neither matched nor stored (R11, R14).
+            Log.i(TAG, "person match: rejected as " + v.reason + "; meeting without storing anything");
+            long h = record(mf, check(FaceCheck.REJECTED, reasonCode(v.reason), loose, null, null));
+            return facelessMeeting(null, h);
+        }
+        // A dim crop is brightened before it is matched or stored, once (R12).
+        byte[] storable = v.dim ? FaceCropper.brighten(loose, v.table) : loose;
+        if (!matches.current(g)) {
             return MatchAnswer.FAILED;
+        }
+        float[] probe = embedder.embed(v.brighten(aligned));
+        if (probe == null) {
+            Log.w(TAG, "person match: no embedding, the face model is unavailable; meeting without storing anything");
+            long h = record(mf, check(FaceCheck.NOT_READY, FaceCheck.REASON_NONE, storable, null, null));
+            return facelessMeeting(null, h);
+        }
+        RobotPeople.GalleryPhoto[] gallery;
+        try {
+            gallery = RobotPeopleClient.gallery(app);
+        } catch (IOException e) {
+            return facelessBecause("the people store", e);
         }
         if (!matches.current(g)) {
             return MatchAnswer.FAILED;
         }
-        meetFace = face;
-        int n = gallery == null ? 0 : gallery.length;
-        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
-        content.add(ClaudeApi.textBlock(ExplorePrompts.matchIntro(n)));
-        content.add(ClaudeApi.textBlock("Query:"));
-        content.add(ClaudeApi.jpegBlock(face));
-        for (int i = 0; i < n; i++) {
-            content.add(ClaudeApi.textBlock("Reference " + (i + 1) + ":"));
-            content.add(ClaudeApi.jpegBlock(gallery[i].jpeg));
-        }
-        content.add(ClaudeApi.textBlock(ExplorePrompts.matchAsk(n)));
-        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM, content,
-                ExplorePrompts.MATCH_SCHEMA, (int) timeoutMs);
+        boolean ready = FaceMigration.ready(photosOf(gallery));
+        List<FaceMatcher.Entry> entries = entriesOf(gallery);
+        FaceMatcher.Result r = FaceMatcher.match(probe, entries,
+                new FaceMatcher.Thresholds(settings.confident, settings.close, settings.margin), ready);
         long ms = System.currentTimeMillis() - t0;
-        if (!r.ok()) {
-            Log.w(TAG, "person request against " + n + " references: " + r.describe() + " in " + ms + " ms");
-            return MatchAnswer.FAILED;
+        int photos = gallery == null ? 0 : gallery.length;
+        Log.i(TAG, "person match against " + photos + " stored photos" + (v.dim ? " (brightened)" : "") + ": " + r
+                + " in " + ms + " ms");
+        mf.result = r;
+        if (r.band == FaceMatcher.Band.NOT_READY) {
+            // A named person's photo still waits for its embedding: store nobody (R18).
+            long h = record(mf, check(FaceCheck.NOT_READY, FaceCheck.REASON_NONE, storable, null, null));
+            return facelessMeeting(r.band, h);
         }
-        ClaudeReplies.Match m = ClaudeReplies.match(r.json, n);
-        if (m == null) {
-            Log.w(TAG, "person request against " + n + " references: unusable reply in " + ms + " ms");
-            return MatchAnswer.FAILED;
-        }
-        if (m.reference >= 0) {
-            String id = gallery[m.reference].id;
+        long h = record(mf, check(decisionOf(r.band), FaceCheck.REASON_NONE, storable, r, gallery));
+        mf.entries = entries;
+        mf.close = settings.close;
+        mf.probe = probe;
+        mf.storeCrop = storable;
+        meetFace = storable;
+        if (r.band == FaceMatcher.Band.CONFIDENT) {
             String stored;
             try {
-                stored = RobotPeopleClient.nameOf(app, id);
+                stored = RobotPeopleClient.nameOf(app, r.bestId);
             } catch (IOException e) {
                 stored = null;
             }
             if (stored != null) {
-                matchedId = id;
-                mf.storeId = id;
-                Log.i(TAG, "person request against " + n + " references: known, reference " + (m.reference + 1)
-                        + ", id " + id + " in " + ms + " ms");
+                matchedId = r.bestId;
+                mf.storeId = r.bestId;
                 // A nameless record takes the stranger path (KTD10): no id for the conversation.
-                return forConversation(MatchAnswer.known(stored.isEmpty() ? null : stored, m.namedLine, m.unnamedLine),
-                        stored.isEmpty() ? null : id);
+                return forConversation(MatchAnswer.known(stored.isEmpty() ? null : stored)
+                        .withMatch(r.band, r.bestId, r.score, h), stored.isEmpty() ? null : r.bestId);
             }
-            // Forgotten since recent() (or the store is gone): a new person, if the lines allow.
+            // Forgotten since the gallery was read (or the store is gone): someone new.
+            Log.i(TAG, "person match: the confident candidate is gone; meeting as someone new");
         }
-        Log.i(TAG, "person request against " + n + " references: new in " + ms + " ms");
-        return m.askLine == null ? MatchAnswer.FAILED : forConversation(MatchAnswer.stranger(m.askLine, m.noReplyLine), null);
+        // Close and weak alike meet as someone new; a close one carries the name the brain
+        // confirms aloud first (U7, KTD6).
+        MatchAnswer stranger = MatchAnswer.stranger().withMatch(r.band, r.bestId, r.score, h);
+        if (r.band == FaceMatcher.Band.CLOSE && r.bestId != null) {
+            stranger = stranger.withConfirm(confirmName(r.bestId));
+        }
+        return forConversation(stranger, null);
+    }
+
+    /**
+     * The name "Is that you, {name}?" asks about this candidate (KTD6): the first
+     * word of their stored name, or the full stored name when another stored
+     * person shares that first name. Null (nothing to confirm) for a nameless
+     * record or a store that can't answer.
+     */
+    private String confirmName(String candidateId) {
+        try {
+            String stored = RobotPeopleClient.nameOf(app, candidateId);
+            if (stored == null || stored.trim().isEmpty()) {
+                return null;
+            }
+            String[] sharing = RobotPeopleClient.idsNamed(app, NameResolver.firstWord(stored.trim()));
+            return NameResolver.askedName(stored, sharing == null ? 1 : sharing.length);
+        } catch (IOException e) {
+            Log.w(TAG, "close match: the candidate's name is unavailable; meeting as someone new: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // ---- confirming and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12) ----
+
+    @Override
+    public String nameIn(String transcript) {
+        return NameExtractor.extract(transcript);
+    }
+
+    @Override
+    public void resolveName(final String name, final long timeoutMs) {
+        final int g = resolves.start();
+        final MetFace mf = meeting;
+        run(new Runnable() {
+            @Override
+            public void run() {
+                resolves.finish(g, resolveNow(mf, name));
+            }
+        }, resolves, g, Resolved.FAILED);
+    }
+
+    /** KTD10 on the robot: the store's ids for the name, scored against this meeting's face. Logs ids and counts only. */
+    private Resolved resolveNow(MetFace mf, String name) {
+        float[] probe = mf == null ? null : mf.probe;
+        if (probe == null || name == null || name.trim().isEmpty()) {
+            Log.w(TAG, "resolve: no face from the match to compare; nothing is stored");
+            return Resolved.FAILED;
+        }
+        try {
+            String[] found = RobotPeopleClient.idsNamed(app, name);
+            List<String> ids = found == null ? Collections.<String>emptyList() : Arrays.asList(found);
+            List<FaceMatcher.Entry> entries = mf.entries;
+            float close = mf.close;
+            NameResolver.Decision d = NameResolver.resolve(name, probe, ids, entries, close);
+            Log.i(TAG, "name resolved over " + ids.size() + " stored id(s): " + d);
+            switch (d.kind) {
+                case JOIN: {
+                    String stored = RobotPeopleClient.nameOf(app, d.personId);
+                    return stored == null ? Resolved.FAILED : Resolved.join(d.personId, stored);
+                }
+                case ASK_LAST_NAME:
+                    mf.pendingFirst = name;
+                    return Resolved.askLastName(name);
+                default:
+                    return Resolved.newPerson(name);
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "resolve: the people store or the face settings are unavailable: " + e.getMessage());
+            return Resolved.FAILED;
+        }
+    }
+
+    @Override
+    public void resolveLastName(final String lastName, final long timeoutMs) {
+        final int g = resolves.start();
+        final MetFace mf = meeting;
+        run(new Runnable() {
+            @Override
+            public void run() {
+                resolves.finish(g, resolveLastNow(mf, lastName));
+            }
+        }, resolves, g, Resolved.FAILED);
+    }
+
+    /** After the last name (KTD10): join the id whose full stored name equals it, else someone new under it. */
+    private Resolved resolveLastNow(MetFace mf, String lastName) {
+        String first = mf == null ? null : mf.pendingFirst;
+        if (first == null || mf.probe == null || lastName == null || lastName.trim().isEmpty()) {
+            Log.w(TAG, "resolve last name: no pending first name or face; nothing is stored");
+            return Resolved.FAILED;
+        }
+        try {
+            String[] found = RobotPeopleClient.idsNamed(app, first + " " + lastName.trim());
+            String full = NameResolver.fullName(first, lastName);
+            Map<String, String> stored = new LinkedHashMap<String, String>();
+            if (found != null) {
+                for (String id : found) {
+                    String n = RobotPeopleClient.nameOf(app, id);
+                    if (n != null) {
+                        stored.put(id, n);
+                        if (AnswerParser.same(n, full)) {
+                            // afterLastName joins the first match: later names are not needed.
+                            break;
+                        }
+                    }
+                }
+            }
+            NameResolver.Decision d = NameResolver.afterLastName(first, lastName, stored);
+            Log.i(TAG, "last name resolved over " + stored.size() + " stored id(s): " + d);
+            mf.pendingFirst = null;
+            return d.kind == NameResolver.Kind.JOIN ? Resolved.join(d.personId, stored.get(d.personId))
+                    : Resolved.newPerson(d.name);
+        } catch (IOException e) {
+            Log.w(TAG, "resolve last name: the people store is unavailable: " + e.getMessage());
+            return Resolved.FAILED;
+        }
+    }
+
+    @Override
+    public Resolved resolved() {
+        return resolves.poll();
+    }
+
+    @Override
+    public void cancelResolve() {
+        resolves.cancel();
+    }
+
+    /**
+     * The meeting's crop and embedding added to this person by id (R5, KTD12): the
+     * store refuses an unknown id, so a yes racing a forget re-creates nobody.
+     */
+    @Override
+    public void addPhoto(final String personId, final long timeoutMs) {
+        final int g = photoAdds.start();
+        final MetFace mf = meeting;
+        run(new Runnable() {
+            @Override
+            public void run() {
+                photoAdds.finish(g, addPhotoNow(mf, personId));
+            }
+        }, photoAdds, g, MatchAnswer.FAILED);
+    }
+
+    private MatchAnswer addPhotoNow(MetFace mf, String id) {
+        byte[] face = mf == null ? null : mf.storeCrop;
+        float[] probe = mf == null ? null : mf.probe;
+        if (face == null || probe == null || id == null) {
+            Log.w(TAG, "add photo: nothing storable from the match");
+            return MatchAnswer.FAILED;
+        }
+        try {
+            int slot = RobotPeopleClient.addPhoto(app, id, face, FaceMatcher.MODEL_ID, probe);
+            String stored = RobotPeopleClient.nameOf(app, id);
+            matchedId = id;
+            mf.storeId = id;
+            Log.i(TAG, "photo added to id " + id + " in slot " + slot);
+            FaceMatcher.Result r = mf.result;
+            return forConversation(MatchAnswer.known(stored == null || stored.isEmpty() ? null : stored)
+                    .withMatch(r == null ? null : r.band, id, r == null ? Float.NaN : r.score, mf.checkHandle),
+                    stored == null || stored.isEmpty() ? null : id);
+        } catch (IOException e) {
+            Log.w(TAG, "add photo: the store refused (forgotten meanwhile?) or is unavailable: " + e.getMessage());
+            return MatchAnswer.FAILED;
+        }
+    }
+
+    @Override
+    public MatchAnswer photoAdded() {
+        return photoAdds.poll();
+    }
+
+    @Override
+    public void cancelAddPhoto() {
+        photoAdds.cancel();
+    }
+
+    @Override
+    public void checkOutcome(Outcome outcome, String joinedId) {
+        checkOutcome(meeting, outcomeCode(outcome), joinedId);
+    }
+
+    private static int outcomeCode(Outcome outcome) {
+        switch (outcome) {
+            case YES:
+                return FaceCheck.YES;
+            case NO:
+                return FaceCheck.NO;
+            case JOINED:
+                return FaceCheck.JOINED;
+            case NO_REPLY:
+                return FaceCheck.NO_REPLY;
+            default:
+                return FaceCheck.NAME_GIVEN;
+        }
+    }
+
+    @Override
+    public void meetingOver() {
+        // A check still waiting for an answer ends "without an answer" (KTD8).
+        checkOutcome(meeting, FaceCheck.ENDED_WITHOUT_ANSWER, null);
+    }
+
+    /**
+     * The gallery or the face settings could not be read: an old launcher (its
+     * fixed reason, KTD12) or none. Nothing can be matched or stored, so the
+     * meeting runs as with no face found.
+     */
+    private MatchAnswer facelessBecause(String what, IOException e) {
+        if (LauncherProtocol.LAUNCHER_TOO_OLD.equals(e.getMessage())) {
+            Log.w(TAG, "person match: the launcher predates on-device matching; meeting without storing anything");
+        } else {
+            Log.w(TAG, "person match: " + what + " unavailable, " + e.getClass().getSimpleName()
+                    + "; meeting without storing anything");
+        }
+        return facelessMeeting(null, -1L);
+    }
+
+    /**
+     * A meeting with nothing to match or store (R10, R11, R18): someone to talk
+     * to as with no face found, carrying the band (NOT_READY, or null) and the
+     * face check's handle.
+     */
+    private MatchAnswer facelessMeeting(FaceMatcher.Band band, long checkHandle) {
+        return forConversation(MatchAnswer.faceless().withMatch(band, null, Float.NaN, checkHandle), null);
+    }
+
+    /** The gallery as the migration and readiness see it: ids, slots and whether each waits. */
+    private static List<FaceMigration.Photo> photosOf(RobotPeople.GalleryPhoto[] gallery) {
+        List<FaceMigration.Photo> out = new ArrayList<FaceMigration.Photo>();
+        if (gallery != null) {
+            for (RobotPeople.GalleryPhoto p : gallery) {
+                out.add(new FaceMigration.Photo(p.id, p.slot, p.addedAtMillis, p.isPending(FaceMatcher.MODEL_ID)));
+            }
+        }
+        return out;
+    }
+
+    /** Every usable exemplar for the current model: unusable and stale photos never match (KTD11). */
+    private static List<FaceMatcher.Entry> entriesOf(RobotPeople.GalleryPhoto[] gallery) {
+        List<FaceMatcher.Entry> out = new ArrayList<FaceMatcher.Entry>();
+        if (gallery != null) {
+            for (RobotPeople.GalleryPhoto p : gallery) {
+                if (!p.unusable && p.embedding != null && FaceMatcher.MODEL_ID.equals(p.modelId)) {
+                    out.add(new FaceMatcher.Entry(p.id, p.slot, p.embedding));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** One face check (KTD8): the crop only when the launcher will keep it, the best and runner-up when matched. */
+    private static FaceCheck check(int decision, int reason, byte[] cropJpeg, FaceMatcher.Result r,
+                                   RobotPeople.GalleryPhoto[] gallery) {
+        byte[] kept = cropJpeg != null && cropJpeg.length <= FaceCheck.MAX_CROP_BYTES ? cropJpeg : null;
+        if (r == null || !r.hasBest()) {
+            return new FaceCheck(decision, reason, kept, "", -1, 0L, r == null ? Float.NaN : r.score, "", Float.NaN,
+                    false);
+        }
+        long addedAt = 0L;
+        if (gallery != null) {
+            for (RobotPeople.GalleryPhoto p : gallery) {
+                if (p.id.equals(r.bestId) && p.slot == r.bestSlot) {
+                    addedAt = p.addedAtMillis;
+                }
+            }
+        }
+        return new FaceCheck(decision, reason, kept, r.bestId, r.bestSlot, addedAt, r.score, r.runnerUpId,
+                r.runnerUpScore, r.nearTie);
+    }
+
+    private static int decisionOf(FaceMatcher.Band band) {
+        switch (band) {
+            case CONFIDENT:
+                return FaceCheck.CONFIDENT;
+            case CLOSE:
+                return FaceCheck.CLOSE;
+            case WEAK:
+                return FaceCheck.WEAK;
+            default:
+                return FaceCheck.NOT_READY;
+        }
+    }
+
+    private static int reasonCode(FaceQuality.Reason reason) {
+        switch (reason) {
+            case TOO_DARK:
+                return FaceCheck.TOO_DARK;
+            case TOO_BLURRY:
+                return FaceCheck.TOO_BLURRY;
+            default:
+                return FaceCheck.TOO_SMALL;
+        }
+    }
+
+    /** Records the check for the Settings page and keeps its handle on the meeting; -1 when it can't. */
+    private long record(MetFace mf, FaceCheck check) {
+        long h;
+        try {
+            h = RobotPeopleClient.recordCheck(app, check);
+        } catch (IOException e) {
+            Log.w(TAG, "face check not recorded: " + e.getMessage());
+            h = -1;
+        }
+        mf.checkHandle = h;
+        return h;
+    }
+
+    /** A face check's outcome (KTD8), fire and forget; nothing when the meeting recorded none. */
+    private void checkOutcome(final MetFace mf, final int outcome, final String joinedId) {
+        final long h = mf == null ? -1 : mf.checkHandle;
+        if (h < 0) {
+            return;
+        }
+        run(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    RobotPeopleClient.updateCheck(app, h, outcome, joinedId);
+                } catch (IOException e) {
+                    Log.w(TAG, "face check outcome not recorded: " + e.getMessage());
+                }
+            }
+        }, null, 0, null);
+    }
+
+    // ---- the start-up migration (face plan U6, KTD11) ----
+
+    /** ModeApp.startExplore: embed the stored photos that predate the current model, while the brain allows. */
+    void startMigration() {
+        runMigration();
+    }
+
+    @Override
+    public boolean migrated() {
+        return migration.settled();
+    }
+
+    @Override
+    public void faceWork(boolean allowed) {
+        faceWorkAllowed = allowed;
+        if (allowed) {
+            runMigration();
+        }
+    }
+
+    /** One pass on the worker, unless one is running or none is due (an interrupted pass resumes, a partial one retries). */
+    private void runMigration() {
+        if (released || !faceWorkAllowed || !migrating.compareAndSet(false, true)) {
+            return;
+        }
+        if (!migration.due(System.currentTimeMillis())) {
+            migrating.set(false);
+            return;
+        }
+        run(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    long t0 = System.currentTimeMillis();
+                    passGate = null;
+                    FaceMigration.Outcome o = migration.pass();
+                    Log.i(TAG, "face migration " + o + ": " + migration.embedded() + " embedded, "
+                            + migration.unusable() + " marked unusable, " + migration.waiting() + " waiting, in "
+                            + (System.currentTimeMillis() - t0) + " ms");
+                } finally {
+                    migrating.set(false);
+                }
+            }
+        }, null, 0, null);
+    }
+
+    /**
+     * A stored crop through the pipeline in migration mode (KTD11): detect, align,
+     * brighten when dim, never reject, embed. NO_FACE when the finder sees no face
+     * in it; null when a model is unavailable, so the photo waits rather than being
+     * marked unusable.
+     */
+    private float[] embedStored(byte[] jpeg) {
+        FaceCropper.Located found = cropper.locate(jpeg, WHOLE_PHOTO);
+        if (found == null) {
+            return cropper.loaded() ? FaceMigration.NO_FACE : null;
+        }
+        int[] aligned = FaceAlign.align(found.argb, found.frameW, found.frameH, found.face.landmarks);
+        if (aligned == null) {
+            return FaceMigration.NO_FACE;
+        }
+        FaceQuality.Verdict v = FaceQuality.check(found.faceWidth(), aligned, FaceAlign.SIDE, FaceAlign.SIDE,
+                passGate(), true);
+        return embedder.embed(v.brighten(aligned));
+    }
+
+    /** migrationGate(), fetched once per migration pass (on the pass's first
+     * found face), not once per photo. Migration worker only. */
+    private FaceQuality.Thresholds passGate() {
+        if (passGate == null) {
+            passGate = migrationGate();
+        }
+        return passGate;
+    }
+
+    /** The dim level from the launcher's face settings, else the defaults (nothing is rejected here). */
+    private FaceQuality.Thresholds migrationGate() {
+        try {
+            FaceSettings s = RobotSettingsClient.fetchFaceSettings(app);
+            return FaceQuality.Thresholds.of(s);
+        } catch (IOException e) {
+            return FaceQuality.Thresholds.DEFAULTS;
+        }
+    }
+
+    /** The people store's migration calls (KTD11): one photo per call, embeddings tagged with the model. */
+    private final class MigrationStore implements FaceMigration.Store {
+        @Override
+        public List<FaceMigration.Photo> gallery() throws IOException {
+            return photosOf(RobotPeopleClient.gallery(app));
+        }
+
+        @Override
+        public byte[] photo(String id, int slot) throws IOException {
+            return RobotPeopleClient.photo(app, id, slot);
+        }
+
+        @Override
+        public boolean setEmbedding(String id, int slot, long addedAtMillis, float[] embedding) throws IOException {
+            return RobotPeopleClient.setEmbedding(app, id, slot, addedAtMillis, FaceMatcher.MODEL_ID, embedding);
+        }
+
+        @Override
+        public boolean markUnusable(String id, int slot, long addedAtMillis) throws IOException {
+            return RobotPeopleClient.markUnusable(app, id, slot, addedAtMillis);
+        }
     }
 
     @Override
@@ -1016,23 +1548,25 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public void remember(final String name, final long timeoutMs) {
         final int g = remembers.start();
-        final byte[] face = meetFace;
         final MetFace mf = meeting;
         run(new Runnable() {
             @Override
             public void run() {
-                remembers.finish(g, keep(face, name, timeoutMs, mf));
+                remembers.finish(g, keep(mf, name, timeoutMs));
             }
         }, remembers, g, Answer.failed());
     }
 
-    /** Store the face under the name (a reply with a name is the consent, R19), then ask for
-     * the "I'll remember you" line. Without a face or a name nothing is stored and the line
+    /** Store the face and its embedding under the name (a reply with a name is the consent,
+     * R19), then ask for the text-only "I'll remember you" line. Without a storable face
+     * (faceless, rejected, not ready: R11, R18) or a name nothing is stored and the line
      * makes no promise, whatever the brain asked for. */
-    private Answer keep(byte[] face, String name, long timeoutMs, MetFace mf) {
-        if (face == null) {
+    private Answer keep(MetFace mf, String name, long timeoutMs) {
+        byte[] face = mf == null ? null : mf.storeCrop;
+        float[] probe = mf == null ? null : mf.probe;
+        if (face == null || probe == null) {
             // Nothing to store: never promise to remember them.
-            Log.w(TAG, "remember: no face from the match to store; a hello without the promise");
+            Log.w(TAG, "remember: nothing storable from the match; a hello without the promise");
             return hello(name, timeoutMs);
         }
         if (name == null || name.trim().isEmpty()) {
@@ -1041,21 +1575,19 @@ final class ClaudeCuriosity implements CuriosityPort {
             return hello(null, timeoutMs);
         }
         try {
-            String id = RobotPeopleClient.add(app, face, name);
-            if (mf != null) {
-                mf.storeId = id;
-            }
+            String id = RobotPeopleClient.addPerson(app, face, name, FaceMatcher.MODEL_ID, probe);
+            mf.storeId = id;
+            checkOutcome(mf, FaceCheck.NEW_PERSON, id);
             Log.i(TAG, "remembered a new person with a name, id " + id);
         } catch (IOException e) {
             Log.w(TAG, "remember: the people store refused or is unavailable: " + e.getMessage());
             return Answer.failed();
         }
         long t0 = System.currentTimeMillis();
-        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
-        content.add(ClaudeApi.jpegBlock(face));
-        content.add(ClaudeApi.textBlock(ExplorePrompts.rememberAsk(name)));
-        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM, content,
-                ExplorePrompts.REMEMBER_SCHEMA, (int) timeoutMs);
+        // Text only (face plan U6): no face leaves the robot outside the conversation's opener
+        // and the recently-met check.
+        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.SYSTEM,
+                textOnly(ExplorePrompts.rememberAsk(name)), ExplorePrompts.REMEMBER_SCHEMA, (int) timeoutMs);
         Answer a = r.ok() ? ClaudeReplies.remembered(r.json) : Answer.failed();
         Log.i(TAG, "remember request: " + (r.ok() ? a.status.toString() : r.describe()) + " in "
                 + (System.currentTimeMillis() - t0) + " ms");
@@ -1104,25 +1636,50 @@ final class ClaudeCuriosity implements CuriosityPort {
      * The owner's crop check (FACE_DEBUG_TAG): the source frame and the crop, in
      * this app's private files directory, overwritten each time. No crop (no
      * face found) deletes last-face.jpg, so a stale one is never mistaken for it.
+     * Each meeting's source frame is also kept under face-frames/ with a
+     * timestamped name, the newest FACE_FRAMES_KEPT, for the bench (face plan U9).
      */
-    private void debugFace(byte[] frameJpeg, Detection personBox, FaceCrop.Result crop) {
+    private void debugFace(byte[] frameJpeg, Detection personBox, FaceCropper.Located found) {
         if (!Log.isLoggable(FACE_DEBUG_TAG, Log.DEBUG)) {
             return;
         }
         File dir = app.getFilesDir();
         write(new File(dir, LAST_FACE_SRC), frameJpeg);
+        keepFrame(new File(dir, FACE_FRAMES), frameJpeg);
         File face = new File(dir, LAST_FACE);
-        if (crop.found()) {
-            write(face, crop.face);
+        if (found != null) {
+            write(face, found.crop.face);
         } else if (face.exists() && !face.delete()) {
             Log.w(FACE_DEBUG_TAG, "could not delete the previous " + LAST_FACE);
         }
         // Geometry only: never image data, and never the box's label (Claude's description of a person).
-        int[] square = crop.square;
-        Log.d(FACE_DEBUG_TAG, String.format(java.util.Locale.US, "person box [%.2f,%.2f,%.2f,%.2f]",
+        int[] square = found == null ? null : found.crop.square;
+        Log.d(FACE_DEBUG_TAG, String.format(Locale.US, "person box [%.2f,%.2f,%.2f,%.2f]",
                 personBox.x0, personBox.y0, personBox.x1, personBox.y1) + (square != null
-                ? ": face at " + java.util.Arrays.toString(square) + " (left, top, side px)"
+                ? ": face at " + Arrays.toString(square) + " (left, top, side px)"
                 : ": no face found"));
+    }
+
+    /** One source frame into the rolling set: a timestamped name, and the oldest beyond FACE_FRAMES_KEPT deleted. */
+    private static void keepFrame(File frames, byte[] frameJpeg) {
+        if (!frames.isDirectory() && !frames.mkdirs()) {
+            Log.w(FACE_DEBUG_TAG, "could not make " + FACE_FRAMES);
+            return;
+        }
+        String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US)
+                .format(new java.util.Date());
+        write(new File(frames, stamp + ".jpg"), frameJpeg);
+        File[] all = frames.listFiles();
+        if (all == null || all.length <= FACE_FRAMES_KEPT) {
+            return;
+        }
+        // The timestamped names sort oldest first.
+        Arrays.sort(all);
+        for (int i = 0; i < all.length - FACE_FRAMES_KEPT; i++) {
+            if (!all[i].delete()) {
+                Log.w(FACE_DEBUG_TAG, "could not delete an old frame in " + FACE_FRAMES);
+            }
+        }
     }
 
     private static void write(File f, byte[] bytes) {

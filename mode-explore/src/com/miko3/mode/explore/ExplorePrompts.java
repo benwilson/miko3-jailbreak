@@ -80,45 +80,21 @@ final class ExplorePrompts {
             "label", type("string"),
             "line", type("string"));
 
-    // ---- the person request (KTD3): faces only, never names ----
+    // ---- the meeting's lines (face plan U6, KTD7): text only, never a face or a name ----
 
-    /** The text before the new face. */
-    static String matchIntro(int references) {
-        return "Miko is meeting someone. The first photo is the person in front of him now (the query). "
-                + (references == 0
-                ? "He has no enrolment photos yet, so this is someone new: answer match none."
-                : "After it come " + references + " reference photos, labelled Reference 1 to Reference "
-                + references + ". These are consented enrolment photos from the household's own robot: everyone"
-                + " in them agreed to be remembered and greeted by it.");
-    }
-
-    /** The text after the references: compare, and write the four lines. */
-    static String matchAsk(int references) {
-        return (references == 0 ? "" : "Which reference, if any, appears to show the same person as the query? "
-                + "Compare the face, and cues like hair, glasses and clothing. Answer the reference number, "
-                + "or none if nobody matches, or unsure if you can't tell. Do not identify anyone. ")
-                + "Then write four lines Miko might say to the person in the query photo. "
-                + "named_line greets someone he knows and remembers, using the placeholder {name} exactly once "
-                + "where their name goes. unnamed_line greets someone he has seen before whose name he doesn't know. "
-                + "ask_line excitedly greets someone new and asks their name. "
-                + "no_reply_line is a friendly, easygoing line for when they don't answer. "
-                + "Make them personal to what you see (a compliment on a smile, glasses or a colourful top is great).";
-    }
-
-    static final Map<String, Object> MATCH_SCHEMA = object(
-            "match", described(type("string"), "a reference number such as \"2\", or \"none\", or \"unsure\""),
-            "named_line", type("string"),
-            "unnamed_line", type("string"),
-            "ask_line", type("string"),
-            "no_reply_line", type("string"));
-
-    /** Text only, when the person request failed or was refused: the two lines for a new person. */
+    /**
+     * Text only: the lines the degraded ladder speaks, fetched where they are
+     * spoken. The matching happens on the robot; the robot fills {name}.
+     */
     static final String LINES_ASK =
-            "Miko has just spotted someone he hasn't met. Write two lines he says to them. "
-            + "ask_line excitedly greets them and asks their name. "
+            "Miko has just spotted someone. Write three lines he might say to them. "
+            + "named_line greets someone he knows and remembers, using the placeholder {name} exactly once "
+            + "where their name goes. "
+            + "ask_line excitedly greets someone new and asks their name. "
             + "no_reply_line is a friendly, easygoing line for when they don't answer.";
 
     static final Map<String, Object> LINES_SCHEMA = object(
+            "named_line", type("string"),
             "ask_line", type("string"),
             "no_reply_line", type("string"));
 
@@ -141,7 +117,7 @@ final class ExplorePrompts {
                 + "They told him their name is " + name + ". "
                 + "Write the line he says next: a warm, personal, excited \"nice to meet you\""
                 + " that uses their name"
-                + ", with a compliment about something you see, telling them he will remember them.";
+                + ", telling them he will remember them.";
     }
 
     static final Map<String, Object> REMEMBER_SCHEMA = object("line", type("string"));
