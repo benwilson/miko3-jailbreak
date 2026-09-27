@@ -7738,21 +7738,6 @@ public final class ExploreBrainHarness {
             check(n, turn > 0 && rig.timeOf(stop) == turn + 500 && look == turn + 500 && rig.violations.isEmpty(),
                     "turn@" + turn + " stop@" + rig.timeOf(stop) + " look@" + look + " " + rig.tail());
         });
-        scenario("cue_kinds_classify_wake_word_name_greeting_apology_and_voice", n -> {
-            Ears.Tier s = Ears.Tier.STRONG;
-            Ears.Tier w = Ears.Tier.WEAK;
-            check(n, CueKinds.of("Hey Miko", s) == Ears.Kind.WAKE_WORD && CueKinds.of("", s) == Ears.Kind.WAKE_WORD
-                            && CueKinds.of("hey miko, come here", s) == Ears.Kind.WAKE_WORD
-                            && CueKinds.of("Miko!", s) == Ears.Kind.NAME && CueKinds.of("hi mikey", s) == Ears.Kind.NAME
-                            && CueKinds.of("hey buddy", s) == Ears.Kind.GREETING && CueKinds.of("morning", s) == Ears.Kind.GREETING
-                            && CueKinds.of("oops sorry", s) == Ears.Kind.APOLOGY && CueKinds.of("sorry", w) == Ears.Kind.APOLOGY
-                            && CueKinds.of("whoops!", w) == Ears.Kind.APOLOGY && CueKinds.of("", w) == Ears.Kind.VOICE
-                            && CueKinds.of("the printer again", w) == Ears.Kind.VOICE
-                            && CueKinds.of("sorry miko", s) == Ears.Kind.NAME && CueKinds.of(null, w) == Ears.Kind.VOICE
-                            && CueKinds.normalize("  Hey, MIKO! ").equals("hey miko"),
-                    "wake=" + CueKinds.of("Hey Miko", s) + " name=" + CueKinds.of("Miko!", s) + " greet="
-                            + CueKinds.of("hey buddy", s) + " sorry=" + CueKinds.of("sorry", w));
-        });
     }
 
     // ---- the conversation (meeting plan U8; R4, R10-R21; KTD7-KTD12, KTD14) ----

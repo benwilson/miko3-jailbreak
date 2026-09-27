@@ -31,8 +31,7 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHar
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
-              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "Ears.java", "ChatSession.java",
-              "CueKinds.java")
+              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "Ears.java", "ChatSession.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -370,7 +369,6 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "cue_facing_face_plays_the_acknowledgement_in_a_clip_window_meets_and_stamps_the_stages",
         "cue_trend_under_the_stop_band_ends_the_turn_early",
         "cue_trend_growing_means_the_voice_is_behind_and_ends_the_turn",
-        "cue_kinds_classify_wake_word_name_greeting_apology_and_voice",
         "chat_known_person_opener_carries_the_notes_and_persona_after_the_acknowledgement",
         "chat_three_turns_then_catch_you_later_signs_off_persists_once_and_resumes_away_from_them",
         "chat_silence_twice_with_the_face_gone_at_the_first_look_ends_without_a_sign_off",

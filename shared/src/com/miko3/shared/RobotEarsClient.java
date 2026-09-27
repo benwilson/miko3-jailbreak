@@ -31,8 +31,8 @@ import java.util.concurrent.TimeUnit;
  */
 public final class RobotEarsClient {
     public interface Listener {
-        /** One heard utterance; see RobotEars.Callback.heard. */
-        void onHeard(String text, int side, float angle, int tier, long at, boolean partial);
+        /** One heard utterance; see RobotEars.Callback.heard. kind is RobotEars.KIND_*, never KIND_MISSING. */
+        void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind);
 
         /** The session is gone; reason is fixed text. Called at most once per open(). */
         void onLost(String reason);
@@ -266,6 +266,8 @@ public final class RobotEarsClient {
 
     /** One open session: the launcher's callback, the opener and the renew loop. */
     private final class Session extends RobotEars.Callback.Stub {
+        /** An older launcher's callback parcel ends before the kind: the session ends rather than guess it. */
+        static final String NO_KIND = "the launcher's ears session sends no cue kind (install both APKs together)";
         final Listener listener;
         volatile boolean ended;
         private ScheduledFuture<?> renewing;
@@ -353,15 +355,19 @@ public final class RobotEarsClient {
 
         @Override
         public void heard(final String text, final int side, final float angle, final int tier, final long at,
-                          final boolean partial) {
+                          final boolean partial, final int kind) {
             if (ended) {
+                return;
+            }
+            if (kind == RobotEars.KIND_MISSING) {
+                lost(NO_KIND);
                 return;
             }
             post(new Runnable() {
                 @Override
                 public void run() {
                     if (!ended) {
-                        listener.onHeard(text, side, angle, tier, at, partial);
+                        listener.onHeard(text, side, angle, tier, at, partial, kind);
                     }
                 }
             });

@@ -14,10 +14,10 @@ import android.os.RemoteException;
  *
  * open() takes the one session for the calling uid and streams every heard
  * utterance to the Callback, one-way, as {text, side, angle, tier, at,
- * partial}; the launcher throws IllegalStateException ("ears held by another
- * app") when another uid holds it. renew() is the heartbeat, once a second,
- * carrying the caller's charger latch (KTD6): false means the session is no
- * longer this uid's (missed renews, a death, a close). listen() marks a
+ * partial, kind}; the launcher throws IllegalStateException ("ears held by
+ * another app") when another uid holds it. renew() is the heartbeat, once a
+ * second, carrying the caller's charger latch (KTD6): false means the session
+ * is no longer this uid's (missed renews, a death, a close). listen() marks a
  * conversation listen; clipWindow() opens the deaf window for a local clip;
  * shoved() stamps a shove or collision stop for the classifier. The launcher
  * checks the caller on every call (SecurityException to any app that isn't
@@ -37,6 +37,18 @@ public interface RobotEars extends IInterface {
     int SIDE_LEFT = -1;
     int SIDE_NONE = 0;
     int SIDE_RIGHT = 1;
+    /** The cue kind (Callback.heard's last field): the wake-word engine fired, or the phrase was heard. */
+    int KIND_WAKE_WORD = 0;
+    /** His name in any form the recogniser writes it. */
+    int KIND_NAME = 1;
+    /** A clear greeting aimed at him, or any other strong utterance. */
+    int KIND_GREETING = 2;
+    /** An apology word or phrase; strong within the shove window, weak otherwise. */
+    int KIND_APOLOGY = 3;
+    /** Any other weak utterance: a voice burst, a half-heard word. */
+    int KIND_VOICE = 4;
+    /** Never sent: what Callback.Stub reports when an older launcher's parcel ends before the kind. */
+    int KIND_MISSING = -1;
 
     void open(Callback callback, boolean chargerLatched) throws RemoteException;
 
@@ -56,9 +68,16 @@ public interface RobotEars extends IInterface {
          * text is the recogniser's, trimmed, possibly empty for a voice burst;
          * side is SIDE_*; angle the latched median direction in degrees, NaN
          * when none; tier is TIER_*; at the utterance's start
-         * (SystemClock.elapsedRealtime); partial when the deaf window clipped it.
+         * (SystemClock.elapsedRealtime); partial when the deaf window clipped it;
+         * kind is KIND_*, the launcher's own naming of the cue (its classifier
+         * sees the wake-word engine and the shove clock), so the mode never
+         * guesses it from the text. kind is appended to the KTD1 shape
+         * {text, side, angle, tier, at, partial} (owner-approved 2026-09-26): an
+         * older mode ignores the trailing int, and a newer mode under an older
+         * launcher receives KIND_MISSING.
          */
-        void heard(String text, int side, float angle, int tier, long at, boolean partial) throws RemoteException;
+        void heard(String text, int side, float angle, int tier, long at, boolean partial, int kind)
+                throws RemoteException;
 
         abstract class Stub extends Binder implements Callback {
             private static final String DESCRIPTOR = "com.miko3.shared.RobotEars.Callback";
@@ -95,7 +114,8 @@ public interface RobotEars extends IInterface {
                         int tier = data.readInt();
                         long at = data.readLong();
                         boolean partial = data.readInt() != 0;
-                        heard(text, side, angle, tier, at, partial);
+                        int kind = data.dataAvail() > 0 ? data.readInt() : KIND_MISSING;
+                        heard(text, side, angle, tier, at, partial, kind);
                         return true;
                     }
                     case IBinder.INTERFACE_TRANSACTION:
@@ -120,8 +140,8 @@ public interface RobotEars extends IInterface {
 
                 /** One-way, so the launcher's capture thread never waits on a mode. */
                 @Override
-                public void heard(String text, int side, float angle, int tier, long at, boolean partial)
-                        throws RemoteException {
+                public void heard(String text, int side, float angle, int tier, long at, boolean partial,
+                                  int kind) throws RemoteException {
                     Parcel data = Parcel.obtain();
                     try {
                         data.writeInterfaceToken(DESCRIPTOR);
@@ -131,6 +151,7 @@ public interface RobotEars extends IInterface {
                         data.writeInt(tier);
                         data.writeLong(at);
                         data.writeInt(partial ? 1 : 0);
+                        data.writeInt(kind);
                         remote.transact(TRANSACTION_heard, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();

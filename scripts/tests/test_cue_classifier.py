@@ -25,6 +25,8 @@ SHARED_SRC = REPO / "shared" / "src"
 CLASSIFIER = LAUNCHER_SRC / "com" / "miko3" / "launcher" / "CueClassifier.java"
 WORDS = SHARED_SRC / "com" / "miko3" / "shared" / "CueWords.java"
 HOTWORDS = REPO / "launcher" / "assets" / "hotwords.txt"
+EARS_INTERFACE = SHARED_SRC / "com" / "miko3" / "shared" / "RobotEars.java"
+MODE_PKG = REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "cue_classifier_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "launcher" / "CueClassifierHarness.java"
 
@@ -45,6 +47,8 @@ class CueClassifierHarnessTest(unittest.TestCase):
         "side_follows_the_angle_sign",
         "greeting_inside_a_long_sentence_is_weak",
         "normalisation_ignores_case_and_punctuation",
+        "kinds_follow_the_wake_flag_the_words_and_the_tier",
+        "excuse_me_and_my_bad_after_a_shove_are_strong_apologies",
     )
 
     @classmethod
@@ -110,6 +114,41 @@ class ClassifierSourceTest(unittest.TestCase):
     def test_reads_the_switch_through_an_interface(self):
         # KTD11: the launcher session reads the switch when it classifies a cue.
         self.assertRegex(self.src, r"interface Switch\s*\{[^}]*boolean answersWhenSpokenTo\(\)")
+
+    @staticmethod
+    def _ints(src, prefix):
+        return dict(re.findall(r"int (" + prefix + r"\w+)\s*=\s*(-?\d+);", src))
+
+    def test_tier_side_and_kind_ints_mirror_the_ears_binder(self):
+        """The classifier cannot import RobotEars (android.os), so its TIER_*,
+        SIDE_* and KIND_* ints are copies; the wire carries them as they are."""
+        ears = _strip_comments(EARS_INTERFACE.read_text())
+        for prefix in ("TIER_", "SIDE_", "KIND_"):
+            mine, theirs = self._ints(self.src, prefix), self._ints(ears, prefix)
+            self.assertTrue(mine, f"CueClassifier declares no {prefix}* ints")
+            for name, value in mine.items():
+                self.assertEqual(theirs.get(name), value, f"{name}: classifier {value}, RobotEars {theirs.get(name)}")
+        self.assertEqual(self._ints(self.src, "KIND_"),
+                         {"KIND_WAKE_WORD": "0", "KIND_NAME": "1", "KIND_GREETING": "2", "KIND_APOLOGY": "3",
+                          "KIND_VOICE": "4"})
+
+    def test_kind_is_decided_here_from_the_wake_flag_and_the_tier(self):
+        """The owner's ruling (2026-09-26): the launcher names the kind; the
+        apology check is the same isSorry the tier uses (SORRY_PHRASES too)."""
+        self.assertRegex(self.src, r"static int kind\(String \w+, boolean \w+, int \w+\)")
+        body = re.search(r"static int kind\([^)]*\)\s*\{(.*?)\n    \}", self.src, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn("isSorry(", body.group(1))
+        self.assertIn("CueWords.WAKE_PHRASES", body.group(1))
+        self.assertRegex(_strip_comments(self.words_raw), r"String\[\] WAKE_PHRASES\s*=")
+
+    def test_the_modes_own_copy_of_the_lexicon_is_gone(self):
+        """PR #18 review: CueKinds re-copied CueWords and drifted; the kind now
+        arrives over the wire, so the mode keeps no lexicon at all."""
+        self.assertFalse((MODE_PKG / "CueKinds.java").exists(), "mode-explore still has CueKinds.java")
+        for name in ("NAMES", "SORRY_WORDS", "SORRY_PHRASES", "WAKE_PHRASES"):
+            for java in MODE_PKG.glob("*.java"):
+                self.assertNotRegex(_strip_comments(java.read_text()), r"String\[\] " + name + r"\s*=", java.name)
 
 
 class HotwordsFileTest(unittest.TestCase):
