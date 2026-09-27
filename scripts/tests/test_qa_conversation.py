@@ -74,12 +74,39 @@ LOG_OPENED_TO_NOBODY = "\n".join([
 ])
 
 
+OWNER = "Ben Wilson"
+HELPER = "Sarah Jones"
+OWNER_ID = "0000000000000001"
+HELPER_ID = "0000000000000002"
+
+
+def face_row(handle, decision, best="", score=0.0, outcome="pending", joined="", reason="", near_tie=False,
+             runner_up=""):
+    """One face-check row as the launcher's /settings/face/state JSON carries it (SettingsPage.faceStateJson)."""
+    ids = {OWNER: OWNER_ID, HELPER: HELPER_ID}
+    return {"handle": handle, "at_ms": 1790000000000 + handle * 1000, "decision": decision, "reason": reason,
+            "has_crop": decision != "no face", "best_id": ids.get(best, "00000000000000ff" if best else ""),
+            "best_name": best, "best_slot": 0 if best else -1, "best_photo": "", "score": score,
+            "runner_up_id": ids.get(runner_up, "00000000000000fe" if runner_up else ""),
+            "runner_up_name": runner_up, "runner_up_score": 0.5 if runner_up else None, "near_tie": near_tie,
+            "outcome": outcome, "joined_id": ids.get(joined, "00000000000000ee" if joined else ""),
+            "joined_name": joined}
+
+
+def face_state(checks=(), people=((OWNER_ID, OWNER), (HELPER_ID, HELPER))):
+    return {"thresholds": {"confident": 0.5, "close": 0.363, "margin": 0.05},
+            "checks": list(checks),
+            "people": [{"id": i, "name": n, "photos": 3, "with_embedding": 3, "unusable": 0,
+                        "last_seen_ms": 1790000000000} for i, n in people]}
+
+
 class FakeRobot(qa.Robot):
     """Records adb calls; dumpsys answers the given build ids; the state and
     Settings pages answer scripted bodies in order (the last one repeats)."""
 
-    def __init__(self, launcher_id=BUILD, explore_id=BUILD, states=(), pages=(), logs=(), props=""):
+    def __init__(self, launcher_id=BUILD, explore_id=BUILD, states=(), pages=(), logs=(), props="", faces=()):
         super().__init__("fake:5555")
+        self.faces = list(faces) or [face_state()]
         self.launcher_id = launcher_id
         self.explore_id = explore_id
         self.states = list(states) or [state()]
@@ -109,6 +136,11 @@ class FakeRobot(qa.Robot):
         queue = self.states if port == qa.EXPLORE_HTTPS_PORT else self.pages
         body = queue.pop(0) if len(queue) > 1 else queue[0]
         return body.encode()
+
+    def face_state(self):
+        """The face-check list the way robot-faces.py's fetch_state returns it (the last repeats)."""
+        self.calls.append(("face-state",))
+        return self.faces.pop(0) if len(self.faces) > 1 else self.faces[0]
 
     def setprops(self):
         return [c[2:] for c in self.calls if c[:2] == ("shell", "setprop")]
@@ -151,7 +183,7 @@ class BuildIdTest(unittest.TestCase):
         robot = FakeRobot(launcher_id="aaaaaaaaaaaa", explore_id="bbbbbbbbbbbb")
         ask = ScriptedAsk([True] * 20)
         with self.assertRaises(SystemExit) as cm:
-            run_main(robot, ["--only", "greet"], ask)
+            run_main(robot, ["--only", "charger"], ask)
         message = str(cm.exception.code)
         self.assertIn("differ", message)
         self.assertIn("aaaaaaaaaaaa", message)
@@ -169,7 +201,7 @@ class BuildIdTest(unittest.TestCase):
     def test_one_build_id_is_printed_and_the_checks_run(self):
         robot = FakeRobot()
         ask = ScriptedAsk([True, True])
-        code, out = run_main(robot, ["--only", "greet"], ask)
+        code, out = run_main(robot, ["--only", "charger"], ask)
         self.assertEqual(code, 0)
         self.assertIn(BUILD, out)
         self.assertEqual(len(ask.questions), 1)
@@ -185,10 +217,9 @@ class ChecksTest(unittest.TestCase):
     owner's answer and the state counters; the hallway check prints six stamps."""
 
     def test_checks_print_instructions_and_judge_answers_with_the_counters(self):
-        names = ["greet", "hallway", "leanin", "behind", "charger"]
+        names = ["hallway", "leanin", "behind", "charger"]
         states = [
-            state(),                                                            # before greet
-            state(),                                                            # after greet: nothing moved
+            state(),                                                            # before hallway
             state({"cues": 1, "strongCues": 1, "searches": 1, "facesFound": 1},  # after hallway
                   {"cueAt": 1000, "turnDone": 3100, "faceFound": 4000, "matchAnswered": 6500,
                    "lineRequested": 6600, "firstSound": 9200}),
@@ -205,10 +236,10 @@ class ChecksTest(unittest.TestCase):
                   {"cueAt": 20000, "turnDone": 24000, "faceFound": 26000, "matchAnswered": 29000,
                    "lineRequested": 29100, "firstSound": 31000}),
         ]
-        robot = FakeRobot(states=states, logs=["", "", LOG_OPENED_TO_NOBODY, "", ""])
-        # greet: yes (its answer is the face sample); hallway: yes + greeted by name;
-        # leanin: yes; behind: no + not by name; charger: yes, but a cue got through.
-        ask = ScriptedAsk([True, True, True, True, False, False, True])
+        robot = FakeRobot(states=states, logs=["", LOG_OPENED_TO_NOBODY, "", ""])
+        # hallway: yes + greeted by name; leanin: yes; behind: no + not by name;
+        # charger: yes, but a cue got through.
+        ask = ScriptedAsk([True, True, True, False, False, True])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             results, summary = qa.run_checks(robot, names, ask)
@@ -216,7 +247,7 @@ class ChecksTest(unittest.TestCase):
         for name in names:
             self.assertIn(qa.CHECKS[name].instruction, text)
             self.assertIn(qa.CHECKS[name].question, ask.questions)
-        self.assertEqual(results, [("greet", True), ("hallway", True), ("leanin", True),
+        self.assertEqual(results, [("hallway", True), ("leanin", True),
                                    ("behind", False), ("charger", False)])
         for name, ok in results:
             self.assertIn(f"   {'PASS' if ok else 'FAIL'} {name}", text)
@@ -228,13 +259,13 @@ class ChecksTest(unittest.TestCase):
         # Counter evidence: the lean-in counted at nobody, the cue that got through on the charger.
         self.assertIn("leanIns +1", text)
         self.assertIn("cues +1", text)
-        self.assertEqual(summary["face_match"], (2, 3))
+        self.assertEqual(summary["face_match"], (1, 2))
         self.assertEqual(summary["lean_ins"], 1)
         self.assertEqual(summary["opened_to_nobody"], 1)
         self.assertEqual(summary["repeats"], 1)
         self.assertIn("lean-ins 1", text)
         self.assertIn("opened to nobody 1", text)
-        self.assertIn("face match 2/3", text)
+        self.assertIn("face match 1/2", text)
 
     def test_hallway_with_a_stale_stamp_fails_and_prints_dashes(self):
         # cueAt did not move since before the check: the stamps are an earlier meeting's.
@@ -255,7 +286,10 @@ class ChecksTest(unittest.TestCase):
                  people_page(dave),          # after stranger: nobody new
                  people_page(dave_noted),    # after goodbye: notes landed
                  people_page()]              # after forget: gone
-        robot = FakeRobot(pages=pages)
+        # The face list (face AE6): Dave and his checks are gone after the forget.
+        faces = [face_state([face_row(1, "confident", "Dave", 0.7)], people=(("0123456789abcdef", "Dave"),)),
+                 face_state([], people=())]
+        robot = FakeRobot(pages=pages, faces=faces)
         ask = ScriptedAsk([True, True, True, True, True])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -283,15 +317,244 @@ class ChecksTest(unittest.TestCase):
         self.assertEqual(results, [("walkoff", True)])
 
     def test_every_listed_acceptance_example_has_a_check_in_the_plans_order(self):
-        self.assertEqual(list(qa.CHECKS), ["greet", "hallway", "leanin", "behind", "wedge", "stranger", "goodbye",
+        self.assertEqual(list(qa.CHECKS), ["greet", "close", "notme", "samename", "neartie", "dark", "silent",
+                                           "midname", "hallway", "leanin", "behind", "wedge", "stranger", "goodbye",
                                            "walkoff", "newcomer", "forget", "bait", "switch", "charger", "persona"])
-        aes = {c.ae for c in qa.CHECKS.values() if c.ae}
+        aes = {a for c in qa.CHECKS.values() for a in c.ae.split(", ") if a}
         for ae in ("AE1", "AE2", "AE3", "AE5", "AE6", "AE7", "AE8", "AE9", "AE10", "AE11", "AE12", "AE13"):
+            self.assertIn(ae, aes)
+        # The face plan's acceptance examples, beside the meeting plan's.
+        for ae in ("face AE1", "face AE2", "face AE3", "face AE4", "face AE5", "face AE6", "face AE7",
+                   "face AE8", "face AE9"):
             self.assertIn(ae, aes)
         self.assertEqual(qa.parse_only(None), list(qa.CHECKS))
         self.assertEqual(qa.parse_only("Hallway, forget"), ["hallway", "forget"])
         with self.assertRaises(ValueError):
             qa.parse_only("ae4")
+
+
+class FaceChecksTest(unittest.TestCase):
+    """The band-aware face checks (face plan U10): each reads the face-check list
+    through robot-faces.py and passes only when the expected decision and outcome
+    appear in a check recorded after the check began."""
+
+    NAMES = {"owner": OWNER, "helper": HELPER}
+
+    def run_one(self, name, faces, answers, people_pages=()):
+        robot = FakeRobot(faces=faces, pages=people_pages or ())
+        ask = ScriptedAsk(answers)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            results, summary = qa.run_checks(robot, [name], ask, **self.NAMES)
+        return results, summary, out.getvalue(), ask
+
+    def test_greet_counts_five_front_on_meetings_and_passes_at_four(self):
+        rows = [face_row(1, "confident", OWNER, 0.71), face_row(2, "confident", OWNER, 0.66),
+                face_row(3, "weak", OWNER, 0.21), face_row(4, "confident", OWNER, 0.58),
+                face_row(5, "confident", OWNER, 0.62)]
+        faces = [face_state()] + [face_state(rows[:i]) for i in range(1, 6)]
+        results, summary, text, ask = self.run_one("greet", faces, [True, True, False, True, True])
+        self.assertEqual(results, [("greet", True)])
+        self.assertEqual(len(ask.questions), 5)
+        self.assertEqual(summary["face_match"], (4, 5))
+        self.assertIn(qa.CHECKS["greet"].instruction, text)
+        self.assertIn("answer: yes", text)
+        self.assertIn("answer: no", text)
+        self.assertIn("greeted by name in 4 of 5", text)
+        # The row behind each meeting is printed as robot-faces.py renders it.
+        self.assertIn("| confident", text)
+        self.assertIn("weak", text)
+        self.assertIn(OWNER, text)
+
+    def test_greet_fails_at_three_of_five(self):
+        rows = [face_row(i, "confident" if i <= 3 else "close", OWNER, 0.6) for i in range(1, 6)]
+        faces = [face_state()] + [face_state(rows[:i]) for i in range(1, 6)]
+        results, summary, text, _ = self.run_one("greet", faces, [True] * 5)
+        self.assertEqual(results, [("greet", False)])
+        self.assertEqual(summary["face_match"], (3, 5))
+
+    def test_greet_by_another_persons_name_fails_the_check(self):
+        rows = [face_row(i, "confident", OWNER, 0.6) for i in range(1, 5)] + [face_row(5, "confident", HELPER, 0.55)]
+        faces = [face_state()] + [face_state(rows[:i]) for i in range(1, 6)]
+        results, summary, text, _ = self.run_one("greet", faces, [True] * 5)
+        self.assertEqual(results, [("greet", False)])
+        self.assertIn("another person's name", text)
+        self.assertEqual(summary["wrong_names"], 1)
+
+    def test_owner_answer_yes_without_the_row_fails(self):
+        faces = [face_state()] + [face_state()] * 5
+        results, _, text, _ = self.run_one("greet", faces, [True] * 5)
+        self.assertEqual(results, [("greet", False)])
+        self.assertIn("no new face check", text)
+
+    # (check, the row that should pass it, a near miss that must not)
+    CASES = [
+        ("close", face_row(7, "close", OWNER, 0.42, "yes", joined=OWNER),
+         face_row(7, "close", OWNER, 0.42, "no reply")),
+        ("notme", face_row(7, "close", OWNER, 0.40, "joined", joined=HELPER),
+         face_row(7, "close", OWNER, 0.40, "yes", joined=OWNER)),
+        ("samename", face_row(7, "weak", OWNER, 0.20, "new person", joined="Ben Smith"),
+         face_row(7, "weak", OWNER, 0.20, "yes", joined=OWNER)),
+        ("neartie", face_row(7, "close", OWNER, 0.60, near_tie=True, runner_up="Ben Smith"),
+         face_row(7, "confident", OWNER, 0.60)),
+        ("dark", face_row(7, "rejected", reason="too dark"),
+         face_row(7, "rejected", reason="too blurry")),
+        ("silent", face_row(7, "close", OWNER, 0.41, "no reply"),
+         face_row(7, "close", OWNER, 0.41, "yes", joined=OWNER)),
+        ("midname", face_row(7, "weak", HELPER, 0.25, "joined", joined=HELPER),
+         face_row(7, "weak", HELPER, 0.25, "new person", joined="Sarah")),
+    ]
+
+    def test_each_band_check_passes_only_on_its_band_and_outcome(self):
+        old = face_row(6, "confident", OWNER, 0.7)
+        for name, good, bad in self.CASES:
+            with self.subTest(name):
+                results, _, text, _ = self.run_one(name, [face_state([old]), face_state([old, good])],
+                                                   [True, True, True])
+                self.assertEqual(results, [(name, True)], text)
+                self.assertIn(qa.CHECKS[name].instruction, text)
+                self.assertIn("answer: yes", text)
+                self.assertIn(good["decision"], text)
+                results, _, text, _ = self.run_one(name, [face_state([old]), face_state([old, bad])],
+                                                   [True, True, True])
+                self.assertEqual(results, [(name, False)], text)
+
+    def test_a_matching_row_from_before_the_check_does_not_count(self):
+        dark = face_row(3, "rejected", reason="too dark")
+        results, _, text, _ = self.run_one("dark", [face_state([dark])], [True, True])
+        self.assertEqual(results, [("dark", False)])
+
+    def test_the_owner_saying_no_fails_even_with_the_row(self):
+        dark = face_row(3, "rejected", reason="too dark")
+        results, _, text, _ = self.run_one("dark", [face_state(), face_state([dark])], [False, False])
+        self.assertEqual(results, [("dark", False)])
+        self.assertIn("answer: no", text)
+
+    def test_mid_conversation_name_must_not_store_a_new_person(self):
+        joined = face_row(7, "weak", HELPER, 0.25, "joined", joined=HELPER)
+        newcomer = ((OWNER_ID, OWNER), (HELPER_ID, HELPER), ("00000000000000aa", "Sarah"))
+        results, _, text, _ = self.run_one("midname", [face_state(), face_state([joined], people=newcomer)],
+                                           [True, True])
+        self.assertEqual(results, [("midname", False)])
+        self.assertIn("new person", text)
+
+    def test_forget_leaves_no_face_check_or_person_behind(self):
+        gone = ((OWNER_ID, OWNER),)
+        row = face_row(4, "confident", HELPER, 0.7)
+        pages = [people_page((HELPER_ID, HELPER, "")), people_page()]
+        # Forgotten cleanly: the person and every check naming her are gone.
+        results, _, text, _ = self.run_one("forget", [face_state([row]), face_state([], people=gone)],
+                                           [True, True], pages)
+        self.assertEqual(results, [("forget", True)], text)
+        # A check still names her: the purge (R19) did not happen.
+        results, _, text, _ = self.run_one("forget", [face_state([row]), face_state([row], people=gone)],
+                                           [True, True], pages)
+        self.assertEqual(results, [("forget", False)])
+        self.assertIn("still names", text)
+
+    def test_face_checks_need_the_owner_and_helper_names_before_any_adb(self):
+        robot = FakeRobot()
+        with self.assertRaises(SystemExit) as cm:
+            run_main(robot, ["--only", "greet,notme"], ScriptedAsk([]))
+        self.assertIn("--owner", str(cm.exception.code))
+        self.assertIn("--helper", str(cm.exception.code))
+        self.assertEqual(robot.calls, [])
+
+    def test_face_list_is_read_through_robot_faces(self):
+        rf = qa.robot_faces()
+        self.assertTrue(hasattr(rf, "fetch_state"))
+        self.assertTrue(hasattr(rf, "render_checks"))
+
+
+class LatencyTest(unittest.TestCase):
+    """The before/after stop-to-first-sound measurement (face plan U10, Success Criteria)."""
+
+    def test_summary_is_median_and_worst_case(self):
+        before = [9000, 8000, 12000, 10000, 9500]
+        after = [3000, 4000, 3500, 5000, 2500]
+        s = qa.latency_summary(before, after)
+        self.assertEqual(s["before"], {"n": 5, "median_s": 9.5, "worst_s": 12.0})
+        self.assertEqual(s["after"], {"n": 5, "median_s": 3.5, "worst_s": 5.0})
+        text = "\n".join(qa.latency_lines(s))
+        self.assertIn("median 9.5 s", text)
+        self.assertIn("worst 12.0 s", text)
+        self.assertIn("median 3.5 s", text)
+        self.assertEqual(qa.latency_summary([], after)["before"], {"n": 0, "median_s": None, "worst_s": None})
+
+    def test_stop_to_first_sound_is_face_found_to_first_sound(self):
+        stages = {"cueAt": 1000, "turnDone": 2000, "faceFound": 4000, "matchAnswered": 9000,
+                  "lineRequested": 9100, "firstSound": 13500}
+        self.assertEqual(qa.stop_to_first_sound(None, {"stages": stages}), 9500)
+        # Stale (the cue did not move) or unfinished meetings are not measured.
+        self.assertIsNone(qa.stop_to_first_sound({"stages": stages}, {"stages": stages}))
+        self.assertIsNone(qa.stop_to_first_sound(None, {"stages": {**stages, "firstSound": 0}}))
+
+    def meeting_states(self, durations):
+        states, cue = [state()], 1000
+        for d in durations:
+            states.append(state(stages={"cueAt": cue, "turnDone": cue + 500, "faceFound": cue + 1000,
+                                        "matchAnswered": cue + 2000, "lineRequested": cue + 2100,
+                                        "firstSound": cue + 1000 + d}))
+            cue += 60000
+        return states
+
+    def test_before_run_records_five_meetings_without_installing(self):
+        states = self.meeting_states([9000, 8000, 12000, 10000, 9500])
+        stale = states[2]
+        states.insert(3, stale)  # the third attempt left the stamps unchanged: not counted, asked again
+        robot = FakeRobot(states=states, props=LEFTOVER_PROPS)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(qa, "LATENCY_DIR", Path(tmp)):
+            code, out = run_main(robot, ["--latency", "before"], ScriptedAsk([True] * 6))
+            data = json.loads((Path(tmp) / "latency-before.json").read_text())
+        self.assertEqual(code, 0, out)
+        self.assertEqual(data["label"], "before")
+        self.assertEqual(data["build"], BUILD)
+        self.assertEqual([m["stop_to_first_sound_ms"] for m in data["meetings"]], [9000, 8000, 12000, 10000, 9500])
+        self.assertIn("not counted", out)
+        self.assertFalse(any(c[:1] == ("install",) for c in robot.calls))
+        self.assertIn("median 9.5 s", out)
+        self.expected_cleanup(robot)
+
+    def test_after_run_installs_and_prints_before_against_after(self):
+        robot = FakeRobot(states=self.meeting_states([3000, 4000, 3500, 5000, 2500]))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(qa, "LATENCY_DIR", Path(tmp)):
+            (Path(tmp) / "latency-before.json").write_text(json.dumps(
+                {"label": "before", "build": "old", "meetings": [{"stop_to_first_sound_ms": v}
+                                                                 for v in (9000, 8000, 12000, 10000, 9500)]}))
+            code, out = run_main(robot, ["--latency", "after"], ScriptedAsk([True] * 5))
+            self.assertTrue((Path(tmp) / "latency-after.json").exists())
+        self.assertEqual(code, 0, out)
+        self.assertTrue(any(c[:3] == ("install", "-r", "-t") for c in robot.calls))
+        self.assertIn("before: 5 meetings, median 9.5 s, worst 12.0 s", out)
+        self.assertIn("after: 5 meetings, median 3.5 s, worst 5.0 s", out)
+
+    def test_summary_mode_reads_the_files_and_touches_no_robot(self):
+        robot = FakeRobot()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(qa, "LATENCY_DIR", Path(tmp)):
+            for label, vals in (("before", (9000, 12000)), ("after", (3000, 5000))):
+                (Path(tmp) / f"latency-{label}.json").write_text(json.dumps(
+                    {"label": label, "meetings": [{"stop_to_first_sound_ms": v} for v in vals]}))
+            code, out = run_main(robot, ["--latency", "summary"], ScriptedAsk([]))
+        self.assertEqual(code, 0)
+        self.assertIn("median 10.5 s", out)
+        self.assertIn("worst 5.0 s", out)
+        self.assertEqual(robot.calls, [])
+
+    def test_before_run_refuses_different_build_ids(self):
+        robot = FakeRobot(launcher_id="aaaaaaaaaaaa", explore_id="bbbbbbbbbbbb")
+        with self.assertRaises(SystemExit) as cm:
+            run_main(robot, ["--latency", "before"], ScriptedAsk([]))
+        self.assertIn("differ", str(cm.exception.code))
+
+    def test_interrupt_mid_measurement_clears_the_debug_properties(self):
+        robot = FakeRobot(states=self.meeting_states([9000] * 5), props=LEFTOVER_PROPS)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(qa, "LATENCY_DIR", Path(tmp)):
+            code, out = run_main(robot, ["--latency", "before"], ScriptedAsk([True, KeyboardInterrupt()]))
+            self.assertFalse((Path(tmp) / "latency-before.json").exists())
+        self.assertEqual(code, 130)
+        self.expected_cleanup(robot)
+
+    expected_cleanup = lambda self, robot: CleanupTest.expected_cleanup(self, robot)
 
 
 class ParsingTest(unittest.TestCase):
@@ -338,7 +601,7 @@ class CleanupTest(unittest.TestCase):
     def test_cleared_on_a_normal_exit_after_the_last_check(self):
         robot = FakeRobot(props=LEFTOVER_PROPS)
         ask = ScriptedAsk([True])
-        code, out = run_main(robot, ["--only", "greet"], ask)
+        code, out = run_main(robot, ["--only", "charger"], ask)
         self.assertEqual(code, 0)
         self.expected_cleanup(robot)
         last_prop = max(i for i, c in enumerate(robot.calls) if c[:2] == ("shell", "setprop"))
@@ -348,16 +611,16 @@ class CleanupTest(unittest.TestCase):
     def test_cleared_on_an_interrupt_mid_check(self):
         robot = FakeRobot(props=LEFTOVER_PROPS)
         ask = ScriptedAsk([True, KeyboardInterrupt()])
-        code, out = run_main(robot, ["--only", "greet,hallway"], ask)
+        code, out = run_main(robot, ["--only", "charger,hallway"], ask)
         self.assertEqual(code, 130)
         self.assertIn("interrupted", out)
         self.expected_cleanup(robot)
 
     def test_a_failed_check_exits_one_and_still_cleans_up(self):
         robot = FakeRobot(props=LEFTOVER_PROPS)
-        code, out = run_main(robot, ["--only", "greet"], ScriptedAsk([False]))
+        code, out = run_main(robot, ["--only", "charger"], ScriptedAsk([False]))
         self.assertEqual(code, 1)
-        self.assertIn("FAIL greet", out)
+        self.assertIn("FAIL charger", out)
         self.expected_cleanup(robot)
 
 
