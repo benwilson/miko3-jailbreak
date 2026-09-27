@@ -84,14 +84,29 @@ final class SpeechQueue {
         }
     }
 
+    /** The ears' view of the queue (meeting plan U3, KTD1): a line started
+     * playing, and playback went idle (nothing playing or waiting). Called on
+     * the thread running playNext; neither may block. */
+    interface Speaking {
+        void started();
+
+        void idle();
+    }
+
     private final int maxWords;
     private final ArrayDeque<Line> waiting = new ArrayDeque<Line>();
     private Line playing;
     private boolean shut;
     private long nextId = 1;
+    private volatile Speaking speaking;
 
     SpeechQueue(int maxWords) {
         this.maxWords = maxWords;
+    }
+
+    /** Who hears about line starts and idle; null for nobody. */
+    void setSpeaking(Speaking speaking) {
+        this.speaking = speaking;
     }
 
     /**
@@ -217,6 +232,10 @@ final class SpeechQueue {
             line = waiting.pollFirst();
             playing = line;
         }
+        Speaking ears = speaking;
+        if (ears != null) {
+            ears.started(); // the deaf window opens before the first sound
+        }
         String failure = null;
         try {
             voice.startLine(line.id, line.text, line.queuedAtNanos);
@@ -235,13 +254,18 @@ final class SpeechQueue {
             failure = FAIL_VOICE;
         }
         boolean cancelled;
+        boolean idleNow;
         synchronized (this) {
             cancelled = line.cancelled;
             if (failure == null) {
                 failure = line.failure;
             }
             playing = null;
+            idleNow = waiting.isEmpty();
             notifyAll(); // awaitIdle
+        }
+        if (idleNow && ears != null) {
+            ears.idle(); // the deaf window's tail starts here
         }
         if (failure != null) {
             fireFailed(line, failure);

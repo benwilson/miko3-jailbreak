@@ -14,6 +14,7 @@ tampered with, and its library, the detector and its vocabulary must ship.
 """
 import hashlib
 import importlib.util
+import re
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 BUILD_PY = REPO / "scripts" / "build-mode-explore.py"
+LAUNCHER_BUILD_PY = REPO / "scripts" / "build-custom-launcher.py"
 VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / "arm64-v8a"
 
 
@@ -92,6 +94,15 @@ class VendorLibsTest(unittest.TestCase):
     def test_declares_the_motor_driver_lib(self):
         self.assertEqual(build.DRIVER_LIB, "libmiko_drivers.so")
 
+    def test_does_not_stage_the_wake_word_libraries(self):
+        """Meeting plan U3: the shared wake-word list serves the launcher and
+        mode-voice; explore never dexes a use of it and never stages the libs."""
+        names = {Path(p).name for _, p in build.vendor_native_libs(VENDOR_LIB_DIR)}
+        self.assertTrue(names.isdisjoint(build.bc.WAKEWORD_LIBS), names)
+        src = BUILD_PY.read_text()
+        self.assertNotIn("wakeword_native_libs", src)
+        self.assertNotIn("WAKEWORD", src)
+
     def test_present_returns_arm64_entry(self):
         libs = build.vendor_native_libs(VENDOR_LIB_DIR)
         self.assertEqual(len(libs), 1)
@@ -118,6 +129,71 @@ class VendorLibsTest(unittest.TestCase):
                     build.build(lib_dir=Path(td), bootstrap=False)
         tc.assert_not_called()
         ba.assert_not_called()
+
+
+class BuildIdTest(unittest.TestCase):
+    """Meeting plan U1, step 3: one build id from build_common into both APKs' version
+    names, so scripts/qa-*.py can tell whether launcher and mode-explore came from the
+    same tree."""
+
+    @staticmethod
+    def _git(cwd, *args):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                       env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                            "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+                            "HOME": cwd})
+
+    def test_build_id_is_deterministic_and_shaped(self):
+        a, b = build.bc.build_id(), build.bc.build_id()
+        self.assertEqual(a, b)
+        self.assertRegex(a, r"^(?:[0-9a-f]{12}(?:\+[0-9a-f]{8})?|nogit-[0-9]{8}T[0-9]{6}Z)$")
+
+    def test_build_id_follows_the_commit_and_the_working_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._git(td, "init", "-q")
+            f = Path(td) / "a.txt"
+            f.write_text("one\n")
+            self._git(td, "add", "a.txt")
+            self._git(td, "commit", "-q", "-m", "one")
+            clean = build.bc.build_id(td)
+            head = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], cwd=td, capture_output=True,
+                                  text=True, check=True).stdout.strip()
+            self.assertEqual(clean, head)
+            f.write_text("two\n")
+            dirty = build.bc.build_id(td)
+            self.assertNotEqual(dirty, clean)
+            self.assertTrue(dirty.startswith(clean + "+"), dirty)
+            self.assertEqual(dirty, build.bc.build_id(td), "the same dirty tree must give the same id")
+            f.write_text("three\n")
+            self.assertNotEqual(build.bc.build_id(td), dirty, "a different change is a different build")
+
+    def test_build_id_without_git_is_still_an_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertRegex(build.bc.build_id(td), r"^nogit-[0-9]{8}T[0-9]{6}Z$")
+
+    def test_build_passes_the_shared_build_id_as_the_version_name(self):
+        fake_jar = REPO / "scripts" / "build_common.py"
+        with mock.patch.object(build.bc, "find_sdk", return_value=Path("/sdk")), \
+                mock.patch.object(build.bc, "ensure_toolchain", return_value=("sdk", "bt", "jar", "javac", "kt")), \
+                mock.patch.object(build.bc, "java_home", return_value="/jh"), \
+                mock.patch.object(build, "onnxruntime", return_value=(fake_jar, [])), \
+                mock.patch.object(build.bc, "build_apk") as ba:
+            build.build(bootstrap=False)
+        self.assertEqual(ba.call_count, 1)
+        self.assertEqual(ba.call_args.kwargs.get("version_name"), build.bc.build_id())
+
+    def test_launcher_build_stamps_the_same_build_id(self):
+        src = LAUNCHER_BUILD_PY.read_text()
+        self.assertRegex(src, r"version_name\s*=\s*bc\.build_id\(\)")
+        self.assertRegex(BUILD_PY.read_text(), r"version_name\s*=\s*bc\.build_id\(\)")
+
+    def test_link_step_overrides_the_manifest_version_name(self):
+        with mock.patch.object(build.bc, "run") as run, mock.patch.object(build.bc.shutil, "copy"), \
+                tempfile.TemporaryDirectory() as td:
+            build.bc.link_and_pack("jar", Path("/bt"), Path("/m.xml"), Path(td), version_name="abc123+00000000")
+        link = run.call_args_list[0].args[0]
+        self.assertIn("--version-name", link)
+        self.assertEqual(link[link.index("--version-name") + 1], "abc123+00000000")
 
 
 class AssetsTest(unittest.TestCase):
@@ -216,6 +292,10 @@ class ApkContentsTest(unittest.TestCase):
             # assertTrue, not assertIn: a failing assertIn would print the whole dex.
             self.assertTrue(f"Lcom/miko3/mode/explore/{cls};".encode() in dex, f"{cls} missing from classes.dex")
         self.assertTrue(b"Lcom/miko3/shared/DirectMotorDriver;" in dex, "shared module missing from classes.dex")
+
+    def test_manifest_carries_the_build_id(self):
+        # aapt2 dumps attributes as name(0xid)="value".
+        self.assertRegex(self._manifest_tree(), rf'versionName\(0x[0-9a-f]+\)="{re.escape(build.bc.build_id())}"')
 
     def test_apk_carries_network_security_config(self):
         self.assertIn("res/xml/network_security_config.xml", self.names)

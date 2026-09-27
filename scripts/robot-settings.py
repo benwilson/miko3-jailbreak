@@ -23,11 +23,19 @@ The model comes from --model, then ANTHROPIC_MODEL, then the model already
 stored on the robot. With none, the push saves the rest and prints the
 endpoint's model list so you can pick one.
 
+The persona command (meeting plan U4, KTD11) posts the Conversation form:
+--file pushes a text file as the persona (an empty file goes back to the
+built-in text), --answers on|off sets the "answers when spoken to" switch.
+Whichever is not given keeps what the page shows. The file is checked
+against the 2,500-character cap before any adb command runs.
+
 Usage:
   python3 scripts/robot-settings.py                      # push (the default), then test
   python3 scripts/robot-settings.py push --model claude-opus-5-5
   python3 scripts/robot-settings.py test                 # run Test connection
   python3 scripts/robot-settings.py models               # refresh and print the model list
+  python3 scripts/robot-settings.py persona --file persona.txt
+  python3 scripts/robot-settings.py persona --answers off
   python3 scripts/robot-settings.py --serial 10.0.0.5:5555 test
 """
 import argparse
@@ -50,6 +58,10 @@ SETTINGS_PATH = "/settings"
 SAVE_PATH = "/settings/claude"
 MODELS_PATH = "/settings/claude/models"
 TEST_PATH = "/settings/claude/test"
+CONVERSATION_PATH = "/settings/conversation"
+
+# ConversationSettings.MAX_PERSONA_CHARS: the launcher refuses more.
+PERSONA_MAX_CHARS = 2500
 
 ADB_TIMEOUT = 30
 CONNECT_TIMEOUT = 15
@@ -211,23 +223,37 @@ def status_from_location(location):
 
 
 class _SettingsParser(HTMLParser):
-    """The Claude save form's inputs, the model datalist, and the key status line."""
+    """The Claude save form's inputs, the model datalist, the key status line,
+    and the Conversation form's persona box and switch."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.in_form = False
         self.in_datalist = False
         self.in_key_status = False
+        self.in_conversation = False
+        self.in_persona = False
         self.fields = {}
         self.models = []
         self.key_status = ""
+        # None until the page shows a persona box; "" when it shows the built-in text.
+        self.persona = None
+        self.persona_default = False
+        self.answers = None
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag == "form":
             self.in_form = a.get("action") == SAVE_PATH
+            self.in_conversation = a.get("action") == CONVERSATION_PATH
         elif tag == "input" and self.in_form and a.get("name"):
             self.fields[a["name"]] = a.get("value") or ""
+        elif tag == "input" and self.in_conversation and a.get("name") == "answers":
+            self.answers = "checked" in a
+        elif tag == "textarea" and self.in_conversation and a.get("name") == "persona":
+            self.in_persona = True
+            self.persona = ""
+            self.persona_default = "data-default" in a
         elif tag == "datalist":
             self.in_datalist = a.get("id") == "claude-models"
         elif tag == "option" and self.in_datalist and a.get("value"):
@@ -238,6 +264,9 @@ class _SettingsParser(HTMLParser):
     def handle_endtag(self, tag):
         if tag == "form":
             self.in_form = False
+            self.in_conversation = False
+        elif tag == "textarea":
+            self.in_persona = False
         elif tag == "datalist":
             self.in_datalist = False
         elif tag == "p":
@@ -246,9 +275,11 @@ class _SettingsParser(HTMLParser):
     def handle_data(self, data):
         if self.in_key_status:
             self.key_status += data
+        if self.in_persona:
+            self.persona += data
 
 
-SettingsPage = namedtuple("SettingsPage", "token model models key_status")
+SettingsPage = namedtuple("SettingsPage", "token model models key_status persona persona_default answers")
 
 
 def fetch_page(base):
@@ -266,7 +297,8 @@ def fetch_page(base):
     if not token:
         raise SettingsError(f"!! the Settings page has no Claude form token (name=\"t\" in {SAVE_PATH}); "
                             "install the current launcher.")
-    return SettingsPage(token, p.fields.get("model", ""), p.models, p.key_status.strip())
+    return SettingsPage(token, p.fields.get("model", ""), p.models, p.key_status.strip(),
+                        p.persona, p.persona_default, p.answers)
 
 
 def post(base, path, fields):
@@ -287,11 +319,24 @@ def post(base, path, fields):
 
 # --- the commands ---
 
+def describe_conversation(page):
+    """One line on the stored persona and switch, or None for a launcher without them."""
+    if page.persona is None or page.answers is None:
+        return None
+    persona = ("the built-in text" if page.persona_default
+               else f"{len(page.persona.strip())} characters, the owner's")
+    return f"Conversation: persona {persona}; answers when spoken to: {'on' if page.answers else 'off'}"
+
+
 def run_test(base):
     status = post(base, TEST_PATH, [])
     if not status.startswith("Connection works"):
         raise SettingsError(f"!! {status or 'the test gave no status'}")
     print(f"Test: {status}")
+    # So a persona edit on the page shows up here (meeting plan U4).
+    conversation = describe_conversation(fetch_page(base))
+    if conversation:
+        print(conversation)
 
 
 def run_models(base):
@@ -326,17 +371,67 @@ def run_push(base, base_url, key, model):
         print(redact(f"Robot: {key_status}", key))
 
 
+def resolve_persona_inputs(args):
+    """(persona text or None, answers bool or None); every check runs before any adb call."""
+    if args.file is None and args.answers is None:
+        raise SettingsError("!! persona needs --file <text file> and/or --answers on|off.")
+    text = None
+    if args.file is not None:
+        try:
+            with open(args.file, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as exc:
+            raise SettingsError(f"!! could not read the persona file {args.file}: {exc.strerror or exc}")
+        except UnicodeDecodeError:
+            raise SettingsError(f"!! the persona file {args.file} is not UTF-8 text.")
+        # The launcher's own rule (ClaudeSettings.checkPersona): LF endings, trimmed, then the cap.
+        length = len(text.replace("\r\n", "\n").strip())
+        if length > PERSONA_MAX_CHARS:
+            raise SettingsError(f"!! the persona is {length} characters; the robot keeps at most "
+                                f"{PERSONA_MAX_CHARS}. Shorten {args.file} and re-run.")
+    answers = None if args.answers is None else args.answers == "on"
+    return text, answers
+
+
+def run_persona(base, text, answers):
+    page = fetch_page(base)
+    if page.persona is None or page.answers is None:
+        raise SettingsError("!! the Settings page has no Conversation section; install the current launcher.")
+    if text is None:
+        # Keep what is stored: "" while the page shows the built-in text, so a
+        # switch-only change never turns the default into the owner's text.
+        text = "" if page.persona_default else page.persona
+    if answers is None:
+        answers = page.answers
+    fields = [("persona", text)] + ([("answers", "on")] if answers else [])
+    status = post(base, CONVERSATION_PATH, fields)
+    if not status.startswith(("Conversation settings saved", "Saved")):
+        raise SettingsError(f"!! {status or 'the save gave no status'}")
+    print(f"Persona: {status}")
+    # Read back what the robot stored rather than echoing what was sent.
+    conversation = describe_conversation(fetch_page(base))
+    if conversation:
+        print(conversation)
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
-        description="Push, test, or list the robot's Claude API settings over adb. "
-                    "The key comes from ANTHROPIC_API_KEY or a hidden prompt, never from a flag.")
-    ap.add_argument("command", nargs="?", default="push", choices=["push", "test", "models"],
+        description="Push, test, or list the robot's Claude API settings over adb, or set the "
+                    "conversation persona and switch. The key comes from ANTHROPIC_API_KEY or a hidden "
+                    "prompt, never from a flag.")
+    ap.add_argument("command", nargs="?", default="push", choices=["push", "test", "models", "persona"],
                     help="push (default): save base URL, key, and model, then test; "
-                         "test: run Test connection; models: refresh and print the model list")
+                         "test: run Test connection; models: refresh and print the model list; "
+                         "persona: push --file as the persona text and/or set --answers")
     ap.add_argument("--serial", default=DEFAULT_SERIAL,
                     help=f"adb serial (default: {DEFAULT_SERIAL}; host:port is adb-connected first)")
     ap.add_argument("--base-url", help="Claude API base URL, https:// (default: $ANTHROPIC_BASE_URL)")
     ap.add_argument("--model", help="model id (default: $ANTHROPIC_MODEL, then the robot's stored model)")
+    ap.add_argument("--file", help="persona only: a UTF-8 text file to push as the persona "
+                                   f"(at most {PERSONA_MAX_CHARS} characters; empty goes back to the built-in text)")
+    ap.add_argument("--answers", choices=["on", "off"],
+                    help="persona only: the \"answers when spoken to\" switch (off: only the wake word "
+                         "opens a conversation)")
     return ap.parse_args(argv)
 
 
@@ -344,10 +439,14 @@ def main(argv=None):
     args = parse_args(argv)
     key = ""
     try:
+        if (args.file is not None or args.answers is not None) and args.command != "persona":
+            raise SettingsError(f"!! --file and --answers apply to persona only, not {args.command}.")
         if args.command == "push":
             base_url, key, model = resolve_push_inputs(args)
         elif args.base_url or args.model:
             raise SettingsError(f"!! --base-url and --model apply to push only, not {args.command}.")
+        if args.command == "persona":
+            persona_text, persona_answers = resolve_persona_inputs(args)
         print(f"== reaching the robot at {args.serial} ==", flush=True)
         ensure_reachable(args.serial)
         with port_forward(args.serial) as base:
@@ -355,6 +454,8 @@ def main(argv=None):
                 run_push(base, base_url, key, model)
             elif args.command == "test":
                 run_test(base)
+            elif args.command == "persona":
+                run_persona(base, persona_text, persona_answers)
             else:
                 run_models(base)
     except SettingsError as exc:

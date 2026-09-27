@@ -1,5 +1,7 @@
 package com.miko3.launcher;
 
+import com.miko3.shared.PersonNotes;
+
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -14,20 +16,32 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * The people the robot remembers (explore-on-claude plan U2; R13-R16, KTD1,
  * KTD3): for each person an id, a name ("" when unnamed), when he last saw
- * them, and one 224 px face JPEG.
+ * them, one 224 px face JPEG, and (meeting plan U5, KTD10) their notes.
  *
  * Lives in one launcher-private directory (LauncherApp passes
- * getFilesDir()/people): a face file "<id>.jpg" per person, plus an index
- * file with one line per person, most recently seen first. Every change
- * rewrites the index through a temp file that is fsynced and then renamed
- * over the old one, so a power cut leaves either the old index or the new
- * one, never half of one. A face file is fsynced before the index names it.
- * Faces stay here until the owner forgets that person (R13); nothing expires.
+ * getFilesDir()/people): a face file "<id>.jpg" per person, a notes file
+ * "<id>.json" once they have notes, plus an index file with one line per
+ * person, most recently seen first. Every change rewrites the index through
+ * a temp file that is fsynced and then renamed over the old one, so a power
+ * cut leaves either the old index or the new one, never half of one. A face
+ * file is fsynced before the index names it, and the notes file is written
+ * the same way. Forget rewrites the index, then deletes the notes, then the
+ * face, so a crash leaves only orphan files, and load() deletes any face or
+ * notes file whose id the index does not name. Faces stay here until the
+ * owner forgets that person (R13); nothing expires.
+ *
+ * Notes (KTD10): notes() answers PersonNotes.EMPTY for an unknown id, a
+ * missing file or a malformed one; mergeNotes() validates the delta through
+ * PersonNotes and refuses an unknown id, leaving the document untouched.
+ * The gallery Explore matches against, recent(), skips records with no name
+ * (legacy records from before names were required); all() still lists them
+ * for the People page.
  *
  * Ids are 16 lower-case hex digits from SecureRandom. Every method that takes
  * an id checks it against that shape before touching the file system, so an
@@ -47,12 +61,32 @@ final class PeopleStore {
     static final String REFUSE_NOT_JPEG = "that face is not a JPEG";
     static final String REFUSE_TOO_BIG = "that face image is too large";
     static final String REFUSE_NOT_SAVED = "the face could not be saved";
+    static final String REFUSE_UNKNOWN_PERSON = "that person is not remembered";
+    static final String REFUSE_NOTES_NOT_SAVED = "the notes could not be saved";
+
+    /** A notes file larger than this (a hand edit) reads as empty. */
+    private static final int MAX_NOTES_FILE_BYTES = 4 * PersonNotes.MAX_DOCUMENT_BYTES;
 
     private static final Pattern ID = Pattern.compile("[0-9a-f]{16}");
+    /** The files this store owns: a face or a notes file named by an id. */
+    private static final Pattern OWNED_FILE = Pattern.compile("([0-9a-f]{16})\\.(jpg|json)");
 
     interface Clock {
         long nowMillis();
     }
+
+    /** Opens the index for reading: the file itself, or a stream a host test
+     * makes fail partway to prove a torn read never triggers the sweep. */
+    interface IndexOpener {
+        InputStream open(File index) throws IOException;
+    }
+
+    private static final IndexOpener FILE_OPENER = new IndexOpener() {
+        @Override
+        public InputStream open(File index) throws IOException {
+            return new FileInputStream(index);
+        }
+    };
 
     /** One remembered person, as of the call that returned it. */
     static final class Person {
@@ -70,13 +104,19 @@ final class PeopleStore {
 
     private final File dir;
     private final Clock clock;
+    private final IndexOpener indexOpener;
     private final SecureRandom random = new SecureRandom();
     // Most recently seen first.
     private final List<Person> people = new ArrayList<Person>();
 
     PeopleStore(File dir, Clock clock) {
+        this(dir, clock, FILE_OPENER);
+    }
+
+    PeopleStore(File dir, Clock clock, IndexOpener indexOpener) {
         this.dir = dir;
         this.clock = clock;
+        this.indexOpener = indexOpener;
         load();
     }
 
@@ -163,17 +203,63 @@ final class PeopleStore {
         return saveIndexQuietly();
     }
 
-    /** Deletes a person's face and name for good (R16, AE6). False if unknown. */
+    /** Deletes a person's face, name and notes for good (R16, R18, AE6).
+     * False if unknown. */
     synchronized boolean forget(String id) {
         if (indexOf(id) < 0) {
             return false;
         }
         remove(id);
         // Index first: once it no longer names them, a failed delete leaves
-        // only an orphan file, which load() never reads.
+        // only orphan files, which load() never reads and sweeps away (KTD10).
         saveIndexQuietly();
+        notesFile(id).delete();
         faceFile(id).delete();
         return true;
+    }
+
+    /** The person's notes, or PersonNotes.EMPTY for an unknown id, no notes
+     * file yet, or a malformed one (KTD10). */
+    synchronized PersonNotes notes(String id) {
+        if (indexOf(id) < 0) {
+            return PersonNotes.EMPTY;
+        }
+        return readNotes(id);
+    }
+
+    /**
+     * Merges a delta (a JSON object, see PersonNotes) into a person's notes
+     * and returns the merged document. Throws IllegalArgumentException with
+     * REFUSE_UNKNOWN_PERSON for an id the index does not name, PersonNotes'
+     * fixed REFUSE_* reason for a bad delta (the document is unchanged), or
+     * REFUSE_NOTES_NOT_SAVED when the file can't be written.
+     */
+    synchronized PersonNotes mergeNotes(String id, String deltaJson) {
+        if (indexOf(id) < 0) {
+            throw new IllegalArgumentException(REFUSE_UNKNOWN_PERSON);
+        }
+        PersonNotes merged = readNotes(id).merge(deltaJson, clock.nowMillis());
+        try {
+            writeDurably(notesFile(id), merged.toJson().getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            throw new IllegalArgumentException(REFUSE_NOTES_NOT_SAVED);
+        }
+        return merged;
+    }
+
+    private PersonNotes readNotes(String id) {
+        File f = notesFile(id);
+        if (!f.isFile()) {
+            return PersonNotes.EMPTY;
+        }
+        try {
+            return PersonNotes.parse(new String(readAll(f, MAX_NOTES_FILE_BYTES), StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            return PersonNotes.EMPTY;
+        } catch (IllegalArgumentException e) {
+            // Malformed: treated as empty; the next merge rewrites it whole.
+            return PersonNotes.EMPTY;
+        }
     }
 
     /** The name, "" when unnamed, or null when there is no such person. */
@@ -199,12 +285,20 @@ final class PeopleStore {
         return Collections.unmodifiableList(new ArrayList<Person>(people));
     }
 
-    /** The n most recently seen (R14); empty for n <= 0. */
+    /** The n most recently seen named people (R14), the gallery Explore
+     * matches against; nameless legacy records are skipped (KTD10). Empty
+     * for n <= 0. */
     synchronized List<Person> recent(int n) {
-        if (n <= 0) {
-            return Collections.emptyList();
+        List<Person> out = new ArrayList<Person>();
+        for (Person p : people) {
+            if (out.size() >= n) {
+                break;
+            }
+            if (!p.name.isEmpty()) {
+                out.add(p);
+            }
         }
-        return Collections.unmodifiableList(new ArrayList<Person>(people.subList(0, Math.min(n, people.size()))));
+        return Collections.unmodifiableList(out);
     }
 
     private int indexOf(String id) {
@@ -240,16 +334,40 @@ final class PeopleStore {
         return new File(dir, id + ".jpg");
     }
 
-    /** Reads the index; skips any line that is malformed or whose face file
-     * is missing (a hand edit, or a crash between writing a face and the index). */
+    private File notesFile(String id) {
+        return new File(dir, id + ".json");
+    }
+
+    /** Reads the index, skipping any line that is malformed or whose face
+     * file is missing (a hand edit, or a crash between writing a face and the
+     * index), then deletes every face or notes file whose id the index does
+     * not name: what a crash mid-add or mid-forget leaves behind (KTD10). The
+     * sweep needs the whole index: after a read that failed partway, the
+     * people it never reached would look like orphans. */
     private void load() {
         File index = new File(dir, INDEX_FILE);
-        if (!index.isFile()) {
+        boolean complete = !index.isFile() || readIndex(index);
+        if (!complete) {
             return;
         }
+        String[] names = dir.list();
+        if (names == null) {
+            return;
+        }
+        for (String name : names) {
+            Matcher m = OWNED_FILE.matcher(name);
+            if (m.matches() && indexOf(m.group(1)) < 0) {
+                new File(dir, name).delete();
+            }
+        }
+    }
+
+    /** True when the index was read to its end; false when a read failed
+     * partway, so the index may name people that were never loaded. */
+    private boolean readIndex(File index) {
         BufferedReader in = null;
         try {
-            in = new BufferedReader(new InputStreamReader(new FileInputStream(index), StandardCharsets.UTF_8));
+            in = new BufferedReader(new InputStreamReader(indexOpener.open(index), StandardCharsets.UTF_8));
             String line;
             while ((line = in.readLine()) != null) {
                 String[] f = line.split("\t", -1);
@@ -264,8 +382,10 @@ final class PeopleStore {
                 }
                 people.add(new Person(f[0], cleanName(f[2]), seen));
             }
+            return true;
         } catch (IOException e) {
             // Keep whatever was read; the next write replaces the index whole.
+            return false;
         } finally {
             closeQuietly(in);
         }

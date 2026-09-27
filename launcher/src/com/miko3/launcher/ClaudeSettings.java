@@ -1,6 +1,7 @@
 package com.miko3.launcher;
 
 import com.miko3.shared.ClaudeApi;
+import com.miko3.shared.ConversationSettings;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -12,7 +13,9 @@ import java.util.regex.Pattern;
 
 /**
  * The robot's Claude API access (settings plan U2, KTD2): base URL, API key
- * and model, plus the model ids the last Refresh found. Stored in the
+ * and model, plus the model ids the last Refresh found, and beside them the
+ * conversation settings (meeting plan U4, KTD11): the persona text and the
+ * "answers when spoken to" switch, which conversation() answers. Stored in the
  * launcher's own SharedPreferences file (PREFS_NAME) behind the small Store
  * interface, unencrypted (root adb can read anything on this device anyway),
  * so the save rules run on the host JVM in scripts/tests. LauncherApp
@@ -45,6 +48,42 @@ final class ClaudeSettings {
     static final String KEY_MODELS = "models";
 
     static final String DEFAULT_BASE_URL = "https://teamclaude.rentaladvantage.rent";
+
+    /** The persona text (meeting plan U4, KTD11, R20), LF line endings; "" means
+     * unset, and the built-in DEFAULT_PERSONA is used. */
+    static final String KEY_PERSONA = "persona";
+    /** "0" when the owner turned "answers when spoken to" off (R5); anything else is on. */
+    static final String KEY_ANSWERS_WHEN_SPOKEN_TO = "answers_when_spoken_to";
+
+    /**
+     * The built-in persona (R13, R20): what the Settings page's box shows until
+     * the owner writes his own, and what Explore uses while the box is empty.
+     * Explore wraps it as the middle block of a guarded system prefix (U8);
+     * here it is only the text. The invariant sentence is the workplace test,
+     * with the concrete list it rules out under it.
+     */
+    static final String DEFAULT_PERSONA = "You are Miko, a small wheeled robot who lives in this office and roams "
+            + "it on his own. You are talking out loud with a coworker who spoke to you.\n"
+            + "\n"
+            + "Voice: dry, quick, a little edgy, warm underneath. Curious about people: what they are working "
+            + "on, what they are into, what their day has been like. Short replies, one or two sentences, "
+            + "spoken not written. Ask one question at a time and remember the answers you are given. Tease "
+            + "gently, take a joke, never grovel or gush. You do not take tasks: no timers, no lookups, no "
+            + "errands; deflect with a line in character.\n"
+            + "\n"
+            + "The workplace test is the one rule you never bend: you never say anything that would get a "
+            + "coworker fired if they said it out loud in this office. That rules out:\n"
+            + "- slurs, and jokes or remarks about anyone's race, religion, sex, sexuality, disability, age, "
+            + "body or nationality\n"
+            + "- anything sexual or flirtatious, and comments on how anyone looks\n"
+            + "- insulting, mocking or threatening a real person, present or not, including managers and "
+            + "clients\n"
+            + "- swearing beyond a mild word or two, and anything cruel, violent or graphic\n"
+            + "- gossip about people who are not in the conversation, and repeating something told to you "
+            + "in confidence\n"
+            + "- pretending to be a human, a company spokesperson or anyone but yourself\n"
+            + "- medical, legal, financial or HR advice, and taking sides in office politics\n"
+            + "When a topic heads that way, deflect lightly and move on.";
 
     /** Model ids as Anthropic, Bedrock ("...-v1:0"), Vertex ("...@date") and
      * proxies ("vendor/model") spell them. Conservative on purpose: the id goes
@@ -177,6 +216,41 @@ final class ClaudeSettings {
             entries.put(KEY_MODELS, "");
         }
         store.putStrings(entries);
+    }
+
+    /**
+     * The Conversation form's save (KTD11, R5, R20): the persona box and the
+     * "answers when spoken to" switch in one commit, or neither. The persona's
+     * CRLF becomes LF, surrounding whitespace goes, and a blank box stores ""
+     * (unset, so the default is used). Text over
+     * ConversationSettings.MAX_PERSONA_CHARS is refused with a fixed message
+     * and nothing is stored.
+     */
+    synchronized void saveConversation(String personaText, boolean answersWhenSpokenTo) throws InvalidException {
+        Map<String, String> entries = new HashMap<String, String>();
+        entries.put(KEY_PERSONA, checkPersona(personaText));
+        entries.put(KEY_ANSWERS_WHEN_SPOKEN_TO, answersWhenSpokenTo ? "1" : "0");
+        store.putStrings(entries);
+    }
+
+    /** What the settings service answers a mode and the page renders: the
+     * owner's persona or the default, and the switch, read on every call. */
+    synchronized ConversationSettings conversation() {
+        String persona = store.getString(KEY_PERSONA, "");
+        boolean set = persona != null && !persona.isEmpty();
+        return new ConversationSettings(set ? persona : DEFAULT_PERSONA, set,
+                !"0".equals(store.getString(KEY_ANSWERS_WHEN_SPOKEN_TO, "1")));
+    }
+
+    /** The persona as stored: LF endings, trimmed, "" for blank; throws over the cap. */
+    static String checkPersona(String raw) throws InvalidException {
+        String text = raw == null ? "" : raw.replace("\r\n", "\n").replace('\r', '\n').trim();
+        if (text.length() > ConversationSettings.MAX_PERSONA_CHARS) {
+            // Fixed text: never the persona itself.
+            throw new InvalidException("The persona is longer than " + ConversationSettings.MAX_PERSONA_CHARS
+                    + " characters; shorten it.");
+        }
+        return text;
     }
 
     /** Removes the stored key (R16); the base URL and model stay. */

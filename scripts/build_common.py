@@ -15,10 +15,12 @@ scripts/build-bootagent.py is intentionally NOT ported onto this module —
 its native-neuterd-compile and base64-injection steps are unique to that
 app and out of this refactor's scope.
 """
+import hashlib
 import os
 import shutil
 import subprocess
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 BUILD_TOOLS = "35.0.0"
@@ -28,9 +30,40 @@ SDK_CANDIDATES = [
     Path.home() / "Library" / "Android" / "sdk",
 ]
 
+REPO = Path(__file__).resolve().parent.parent
+VENDOR_ABI = "arm64-v8a"
+VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / VENDOR_ABI
+
+# The vendor's wake-word engine (voice plan KTD7; meeting plan U3 shares it between
+# the voice mode and the launcher's ears session). libnative_wakeword_vad_lib.so is
+# what recognizer.WakeWord (shared/src) loads; it links libncnn.so directly (readelf
+# NEEDED) and the TFLite GPU delegate is dlopen'd by the engine at init, so all
+# three ship together, and the model asset rides beside them.
+WAKEWORD_LIBS = (
+    "libnative_wakeword_vad_lib.so",
+    "libncnn.so",
+    "libtensorflowlite_gpu_delegate.so",
+)
+WAKEWORD_MODEL = REPO / "mode-voice" / "assets" / "miko_wakeword_model.tflite"
+
 
 class BuildError(SystemExit):
     """A build precondition or step failed; message is actionable."""
+
+
+def wakeword_native_libs(lib_dir=VENDOR_LIB_DIR, app="the app"):
+    """[(abi, so_path), ...] for the three wake-word libraries, or BuildError
+    naming every missing one and the directory searched. The launcher and
+    mode-voice both stage exactly this list; mode-explore never calls it."""
+    lib_dir = Path(lib_dir)
+    missing = [name for name in WAKEWORD_LIBS if not (lib_dir / name).is_file()]
+    if missing:
+        raise BuildError(
+            f"!! vendor wake-word librar{'y' if len(missing) == 1 else 'ies'} missing from "
+            f"{lib_dir}: {', '.join(missing)}\n"
+            "   these come from ServiceExam's APK (lib/arm64-v8a/); re-extract it into "
+            f"tools/serviceexam_jadx/resources/ (jadx) before building {app}")
+    return [(VENDOR_ABI, lib_dir / name) for name in WAKEWORD_LIBS]
 
 
 def run(cmd, **kw):
@@ -217,11 +250,41 @@ def compile_resources(bt, res_dir, build_dir):
     return compiled
 
 
-def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None, res_zip=None, native_libs=None):
+def build_id(repo=None):
+    """One id for the tree an APK is built from (meeting plan U1): the short commit,
+    plus "+<8 hex>" over the working-tree diff and the untracked file names when the
+    tree is dirty. Two builds from the same tree get the same id, so a QA script can
+    tell whether the launcher and a mode came from one build by comparing their
+    version names. Without git (or a commit) it is a UTC timestamp, still an id."""
+    root = Path(repo) if repo is not None else REPO
+
+    def git(*args):
+        r = subprocess.run(["git", *args], cwd=str(root), capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode(errors="replace").strip())
+        return r.stdout
+
+    try:
+        head = git("rev-parse", "--short=12", "HEAD").decode().strip()
+        diff = git("diff", "HEAD", "--binary", "--no-ext-diff")
+        untracked = git("ls-files", "--others", "--exclude-standard", "-z")
+    except (OSError, RuntimeError):
+        return "nogit-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if not diff and not untracked:
+        return head
+    return f"{head}+{hashlib.sha256(diff + b'\0' + untracked).hexdigest()[:8]}"
+
+
+def link_and_pack(android_jar, bt, manifest, build_dir, assets_dir=None, res_zip=None, native_libs=None,
+                  version_name=None):
     print("== 2/4 aapt2 link + add dex ==")
     unsigned = build_dir / "unsigned.apk"
     cmd = [bt / "aapt2", "link", "-I", str(android_jar), "--manifest", str(manifest),
            "--min-sdk-version", "28", "--target-sdk-version", "28", "-o", str(unsigned)]
+    if version_name is not None:
+        # The manifests carry a placeholder versionName; --replace-version makes the
+        # build id win over it (build_id() above).
+        cmd += ["--version-name", str(version_name), "--replace-version"]
     if assets_dir is not None:
         cmd += ["-A", str(assets_dir)]
     if res_zip is not None:
@@ -286,11 +349,13 @@ def sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore
 def build_apk(src_dirs, manifest, android_jar, javac, bt, keytool, java_home_dir,
               build_dir, keystore, keystore_alias, keystore_pass, keystore_cn,
               apk_out, asset_sources=None, res_dir=None, native_libs=None, asset_exclude=(),
-              jars=()):
-    """Full pipeline: compile_java -> stage_assets -> compile_resources -> link_and_pack -> sign."""
+              jars=(), version_name=None):
+    """Full pipeline: compile_java -> stage_assets -> compile_resources -> link_and_pack -> sign.
+    version_name, when given, replaces the manifest's versionName (see build_id())."""
     compile_java(src_dirs, android_jar, javac, bt, java_home_dir, build_dir, jars)
     assets_dir = stage_assets(asset_sources, build_dir, asset_exclude) if asset_sources else None
     res_zip = compile_resources(bt, res_dir, build_dir) if res_dir else None
-    withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip, native_libs)
+    withdex = link_and_pack(android_jar, bt, manifest, build_dir, assets_dir, res_zip, native_libs,
+                            version_name=version_name)
     sign(withdex, bt, keytool, java_home_dir, keystore, keystore_alias, keystore_pass,
          keystore_cn, build_dir, apk_out)

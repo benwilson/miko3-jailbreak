@@ -1,5 +1,6 @@
 package com.miko3.mode.explore;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
@@ -140,6 +141,86 @@ interface CuriosityPort {
      */
     String metId();
 
+    // ---- the conversation (meeting plan U6, KTD7, KTD9, KTD10): one turn, the notes, forget, the ears ----
+
+    /**
+     * Start one conversation turn: the persona snapshot, the notes, the
+     * transcript window and what was just heard go to Claude, and the answer
+     * is his next line with its flags (U8). timeoutMs is this try's budget
+     * (the per-turn budget, then the retry's).
+     */
+    void turn(TurnRequest request, long timeoutMs);
+
+    /** The answer to the last turn(), or null while it is still running. */
+    Turn turnAnswer();
+
+    /** Abandon the running turn(), if any; a late answer must never be returned. */
+    void cancelTurn();
+
+    /**
+     * Merge a notes delta into this person's record through the People store
+     * (KTD10, drain-on-persist). Carries no lines and no transcript.
+     */
+    void notesDelta(String personId, String notesUpdate, long timeoutMs);
+
+    /** The result of the last notesDelta(), or null while it is running. */
+    Done notesDeltaAnswer();
+
+    /** Abandon the running notesDelta(), if any. */
+    void cancelNotesDelta();
+
+    /** Forget this person entirely (R18): their record, faces and notes, by id. */
+    void forget(String personId, long timeoutMs);
+
+    /** The result of the last forget(), or null while it is running. */
+    Done forgetAnswer();
+
+    /** Abandon the running forget(), if any. */
+    void cancelForget();
+
+    /**
+     * A conversation listen (U8, KTD8): the next whole utterance with words is
+     * the reply, except a strong one whose latched angle magnitude exceeds
+     * newcomerAngleDeg, which the session hands the brain as a newcomer cue
+     * instead (NaN: everything is the reply). heard() answers it like listen().
+     */
+    void chatListen(long maxMs, float newcomerAngleDeg);
+
+    /**
+     * Store the face the last match() cut out under a new record with this
+     * name (U8, KTD10): a name given mid-conversation, or a mismatch on a known
+     * conversation. Never asks Claude for a line and never writes a debug dump.
+     */
+    void keep(String name, long timeoutMs);
+
+    /** The result of the last keep(), or null while it is running. */
+    Kept keptAnswer();
+
+    /** Abandon the running keep(), if any. */
+    void cancelKeep();
+
+    /** Open the launcher's continuous listening session (KTD1); cues then arrive as Ears step input. */
+    void earsOpen();
+
+    /** Close the session and release the microphone (the charger flag, shutdown; KTD6). */
+    void earsClose();
+
+    /**
+     * A clip is about to play for this long: the session keeps the recogniser
+     * deaf for it plus the deaf-window tail, so he never hears his own clip
+     * (KTD1, KTD12). Lines said through say() need no call: the session sees
+     * the speech service itself.
+     */
+    void clipWindow(long ms);
+
+    /**
+     * A shove while stopped, or a collision stop while driving, happened at this
+     * brain time (KTD3, KTD5): the session's classifier makes "sorry" or "oops"
+     * within its window a strong cue. The brain applies the same rule itself, so
+     * this only keeps the launcher's counters and tiers in step.
+     */
+    void earsShoved(long atMs);
+
     /** No Claude: every stop takes the path it took before U4. */
     CuriosityPort NONE = new CuriosityPort() {
         public boolean canAsk() {
@@ -240,6 +321,61 @@ interface CuriosityPort {
 
         public String metId() {
             return null;
+        }
+
+        public void turn(TurnRequest request, long timeoutMs) {
+        }
+
+        public Turn turnAnswer() {
+            return Turn.failed();
+        }
+
+        public void cancelTurn() {
+        }
+
+        public void notesDelta(String personId, String notesUpdate, long timeoutMs) {
+        }
+
+        public Done notesDeltaAnswer() {
+            return Done.FAILED;
+        }
+
+        public void cancelNotesDelta() {
+        }
+
+        public void forget(String personId, long timeoutMs) {
+        }
+
+        public Done forgetAnswer() {
+            return Done.FAILED;
+        }
+
+        public void cancelForget() {
+        }
+
+        public void chatListen(long maxMs, float newcomerAngleDeg) {
+        }
+
+        public void keep(String name, long timeoutMs) {
+        }
+
+        public Kept keptAnswer() {
+            return Kept.FAILED;
+        }
+
+        public void cancelKeep() {
+        }
+
+        public void earsOpen() {
+        }
+
+        public void earsClose() {
+        }
+
+        public void clipWindow(long ms) {
+        }
+
+        public void earsShoved(long atMs) {
         }
     };
 
@@ -378,6 +514,24 @@ interface CuriosityPort {
         final String unnamedLine;
         final String askLine;
         final String noReplyLine;
+        /**
+         * What the conversation needs at its start (U8, KTD9, KTD11): the persona
+         * snapshot the adapter took when this answer was built (null: none), the
+         * store id of a known person (null for a stranger or a nameless record),
+         * their notes rendered as data (null when none) and the questions already
+         * asked them, normalised. The stand-ins and the meeting-as-today path leave
+         * them null.
+         */
+        final String persona;
+        final String personId;
+        final String notes;
+        final List<String> questionsAsked;
+
+        /** This answer with the conversation's fields attached. */
+        MatchAnswer withConversation(String persona, String personId, String notes, List<String> questionsAsked) {
+            return new MatchAnswer(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, persona,
+                    personId, notes, questionsAsked);
+        }
 
         static MatchAnswer known(String nameOrNull, String namedLine, String unnamedLine) {
             return new MatchAnswer(Status.KNOWN, nameOrNull, namedLine, unnamedLine, null, null);
@@ -399,6 +553,12 @@ interface CuriosityPort {
 
         MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
                     String noReplyLine, boolean faceless) {
+            this(status, name, namedLine, unnamedLine, askLine, noReplyLine, faceless, null, null, null, null);
+        }
+
+        private MatchAnswer(Status status, String name, String namedLine, String unnamedLine, String askLine,
+                            String noReplyLine, boolean faceless, String persona, String personId, String notes,
+                            List<String> questionsAsked) {
             this.faceless = faceless;
             this.status = status;
             this.name = name;
@@ -406,6 +566,11 @@ interface CuriosityPort {
             this.unnamedLine = unnamedLine;
             this.askLine = askLine;
             this.noReplyLine = noReplyLine;
+            this.persona = persona;
+            this.personId = personId;
+            this.notes = notes;
+            this.questionsAsked = questionsAsked == null ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(questionsAsked));
         }
     }
 
@@ -586,6 +751,157 @@ interface CuriosityPort {
         @Override
         public String toString() {
             return status == Status.SAME ? "same as person " + (index + 1) : status.toString();
+        }
+    }
+
+    /** One exchange of the transcript window (KTD9): what they said and what he answered. */
+    final class Exchange {
+        final String heard;
+        final String said;
+
+        Exchange(String heard, String said) {
+            this.heard = heard;
+            this.said = said;
+        }
+    }
+
+    /**
+     * One turn's request (KTD9): the persona snapshot taken when the conversation
+     * began (KTD11), the person's name (null for a stranger), their notes
+     * rendered as data (null when none), the transcript window, and what was
+     * just heard (null for the opener). The adapter builds the prompt from it
+     * and never logs any of it.
+     */
+    final class TurnRequest {
+        final String persona;
+        final String name;
+        final String notes;
+        final List<Exchange> transcript;
+        final String heard;
+        /**
+         * The re-request (U8, KTD9): the question the last answer repeated, as the
+         * model wrote it, so the adapter adds the "not that one" reminder; null on
+         * a first request.
+         */
+        final String avoidQuestion;
+
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard) {
+            this(persona, name, notes, transcript, heard, null);
+        }
+
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
+                    String avoidQuestion) {
+            this.persona = persona;
+            this.name = name;
+            this.notes = notes;
+            this.transcript = transcript == null ? Collections.<Exchange>emptyList() : transcript;
+            this.heard = heard;
+            this.avoidQuestion = avoidQuestion;
+        }
+
+        /** This request again, with the repeated question to avoid. */
+        TurnRequest avoiding(String question) {
+            return new TurnRequest(persona, name, notes, transcript, heard, question);
+        }
+
+        /** The opener: nothing heard yet. */
+        static TurnRequest opener(String persona, String name, String notes) {
+            return new TurnRequest(persona, name, notes, null, null);
+        }
+    }
+
+    /**
+     * One turn's answer (KTD9): his line, the question it asks (normalised by
+     * the brain against the notes so he never repeats one), a name the person
+     * gave (validated by the brain), whether Claude thinks the conversation is
+     * over (spoken as a normal line; the brain decides), whether the line is a
+     * deflection (a task he does not take), and the notes delta to merge at the
+     * end; or a refusal (the deflection clip), unreachable (retry once, then
+     * the local sign-off) or a failure.
+     */
+    final class Turn {
+        enum Status { LINE, REFUSED, UNREACHABLE, FAILED }
+
+        final Status status;
+        final String line;
+        final String questionAsked;
+        final String nameGiven;
+        final boolean endsConversation;
+        final boolean deflected;
+        final String notesUpdate;
+
+        private Turn(Status status, String line, String questionAsked, String nameGiven, boolean endsConversation,
+                     boolean deflected, String notesUpdate) {
+            this.status = status;
+            this.line = line;
+            this.questionAsked = questionAsked;
+            this.nameGiven = nameGiven;
+            this.endsConversation = endsConversation;
+            this.deflected = deflected;
+            this.notesUpdate = notesUpdate;
+        }
+
+        static Turn line(String line, String questionAsked, String nameGiven, boolean endsConversation,
+                         boolean deflected, String notesUpdate) {
+            return new Turn(Status.LINE, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate);
+        }
+
+        /** A plain line with no question, no name, no ending, no deflection and no notes. */
+        static Turn line(String line) {
+            return line(line, null, null, false, false, null);
+        }
+
+        static Turn refused() {
+            return new Turn(Status.REFUSED, null, null, null, false, false, null);
+        }
+
+        static Turn unreachable() {
+            return new Turn(Status.UNREACHABLE, null, null, null, false, false, null);
+        }
+
+        static Turn failed() {
+            return new Turn(Status.FAILED, null, null, null, false, false, null);
+        }
+    }
+
+    /** The result of keep(): the new record's id, or a failure (no face, or the store refused). */
+    final class Kept {
+        enum Status { DONE, FAILED }
+
+        static final Kept FAILED = new Kept(Status.FAILED, null);
+
+        final Status status;
+        final String personId;
+
+        private Kept(Status status, String personId) {
+            this.status = status;
+            this.personId = personId;
+        }
+
+        static Kept done(String personId) {
+            return personId == null || personId.isEmpty() ? FAILED : new Kept(Status.DONE, personId);
+        }
+
+        boolean ok() {
+            return status == Status.DONE && personId != null;
+        }
+    }
+
+    /** The result of a store write (notesDelta, forget): done, or failed. */
+    final class Done {
+        enum Status { DONE, FAILED }
+
+        static final Done OK = new Done(Status.DONE);
+        static final Done FAILED = new Done(Status.FAILED);
+
+        final Status status;
+
+        private Done(Status status) {
+            this.status = status;
+        }
+
+        boolean ok() {
+            return status == Status.DONE;
         }
     }
 }

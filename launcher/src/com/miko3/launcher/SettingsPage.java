@@ -1,10 +1,12 @@
 package com.miko3.launcher;
 
 import com.miko3.shared.ClaudeApi;
+import com.miko3.shared.ConversationSettings;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.PageToken;
+import com.miko3.shared.PersonNotes;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -25,13 +27,16 @@ import java.util.Map;
  * U4, R1-R10, R16): a Home link, then one section per group of settings. v1
  * has the Claude API section: a Save form (base URL, key, model) and
  * three token-only buttons (Refresh models, Test connection, Forget key)
- * that act on what is already saved. Then the Voice section: type a line,
+ * that act on what is already saved. Then the Conversation section (meeting
+ * plan U4, KTD11): the persona box and the "answers when spoken to" switch,
+ * saved together. Then the Voice section: type a line,
  * press Say it, and the robot speaks it through the launcher's own speech
  * queue (the request returns once it is queued, not once it has played).
- * Then the People section (explore-on-claude plan U2, R15, R16): everyone
- * the robot remembers, with their face, name or "unnamed", and when he last
- * saw them, each with a Rename form and a Forget button. The same page serves
- * the robot's own WebView and a LAN browser.
+ * Then the People section (explore-on-claude plan U2, R15, R16; meeting plan
+ * U5, R18): everyone the robot remembers, with their face, name or "unnamed",
+ * when he last saw them and their notes, each with a Rename form and a Forget
+ * button that deletes face, name and notes. The same page serves the robot's
+ * own WebView and a LAN browser.
  *
  * Follows voice mode's SettingsPage pattern: every action is a POST that
  * answers with a redirect to "/settings?status=<message>", and the GET that
@@ -60,9 +65,13 @@ final class SettingsPage {
     private SettingsPage() {
     }
 
-    // Far above anything the form sends; refuses a body that would otherwise be
-    // read into memory whole.
-    static final int MAX_FORM_BYTES = 8192;
+    // Far above anything the form sends (the persona box at its cap, URL-encoded
+    // with non-ASCII text, is about 23 KB); refuses a body that would otherwise
+    // be read into memory whole.
+    static final int MAX_FORM_BYTES = 32 * 1024;
+
+    static final String CONVERSATION_SAVED = "Conversation settings saved.";
+    static final String CONVERSATION_DEFAULT = "Saved: the built-in persona is in use.";
 
     static final String SAY_EMPTY = "Nothing said: type something to say.";
     static final String SAY_TOO_LONG = "Nothing said: that is longer than " + SpeechQueue.MAX_CHARS + " characters.";
@@ -72,9 +81,14 @@ final class SettingsPage {
 
     static final String PEOPLE_RENAMED = "Name changed.";
     static final String PEOPLE_UNNAMED = "Name cleared; that person is now unnamed.";
-    static final String PEOPLE_FORGOTTEN = "Forgotten: their face and name are deleted.";
+    static final String PEOPLE_FORGOTTEN = "Forgotten: their face, name and notes are deleted.";
     static final String PEOPLE_UNKNOWN = "Nothing changed: that person is not remembered.";
     static final String PEOPLE_NOT_SAVED = "Nothing changed: the change could not be saved.";
+    static final String PEOPLE_NO_NOTES = "No notes yet.";
+    /** A record from before names were required (KTD10): out of the matching
+     * gallery, never given notes; the owner names it or deletes it. */
+    static final String PEOPLE_LEGACY = "Legacy record: no name, so he no longer matches this face or keeps notes "
+            + "on it. Give them a name, or Forget deletes it.";
 
     /**
      * The robot's voice, as the Voice section sees it. LauncherApp backs it
@@ -104,7 +118,8 @@ final class SettingsPage {
                 return;
             }
             res.sendText(200, "OK", "text/html; charset=utf-8", buildHtml(token.issue(), settings.status(),
-                    settings.models(), speaker.voiceName(), people.all(), req.queryParam("status", null)));
+                    settings.models(), settings.conversation(), speaker.voiceName(), people,
+                    req.queryParam("status", null)));
             return;
         }
         if (LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH.equals(req.path)) {
@@ -145,6 +160,9 @@ final class SettingsPage {
         }
         if (LauncherProtocol.SETTINGS_VOICE_SAY_PATH.equals(path)) {
             return say(form.get("text"), speaker);
+        }
+        if (LauncherProtocol.SETTINGS_CONVERSATION_PATH.equals(path)) {
+            return saveConversation(form, settings);
         }
         if (LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH.equals(path)) {
             return rename(form.get("id"), form.get("name"), people);
@@ -202,6 +220,18 @@ final class SettingsPage {
         return "Saved.";
     }
 
+    /** The Conversation form (meeting plan U4, KTD11): the persona box and the
+     * switch, which is off when its checkbox is absent from the post. Every
+     * return is fixed text, never the persona. */
+    private static String saveConversation(Map<String, String> form, ClaudeSettings settings) {
+        try {
+            settings.saveConversation(form.get("persona"), "on".equals(form.get("answers")));
+        } catch (ClaudeSettings.InvalidException e) {
+            return "Not saved: " + e.getMessage();
+        }
+        return settings.conversation().personaSet ? CONVERSATION_SAVED : CONVERSATION_DEFAULT;
+    }
+
     private static String refreshModels(ClaudeSettings settings, ClaudeApi api) {
         ClaudeSettings.Credentials c = settings.credentialsForRequests();
         ClaudeApi.Result result = api.listModels(c.baseUrl, c.apiKey);
@@ -250,8 +280,9 @@ final class SettingsPage {
         return SAY_SPEAKING;
     }
 
-    static String buildHtml(String token, ClaudeSettings.Status st, List<String> models, String voiceName,
-                            List<PeopleStore.Person> people, String status) {
+    static String buildHtml(String token, ClaudeSettings.Status st, List<String> models,
+                            ConversationSettings conversation, String voiceName, PeopleStore people,
+                            String status) {
         String t = escapeHtml(token);
         StringBuilder html = new StringBuilder();
         html.append("<!doctype html><html><head><meta charset=\"utf-8\">");
@@ -310,6 +341,8 @@ final class SettingsPage {
         html.append("</div>");
         html.append("</section>");
 
+        appendConversation(html, t, conversation);
+
         html.append("<section id=\"voice\"><h2>Voice</h2>");
         html.append("<p id=\"voice-name\">Voice: ").append(escapeHtml(voiceName)).append("</p>");
         html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_VOICE_SAY_PATH)
@@ -329,10 +362,44 @@ final class SettingsPage {
         return html.toString();
     }
 
-    /** R15, R16: everyone he remembers, most recently seen first. */
-    private static void appendPeople(StringBuilder html, String t, List<PeopleStore.Person> people) {
+    /**
+     * Meeting plan U4 (KTD11; R5, R20): the persona box, showing the owner's
+     * text or the built-in default, with a length hint, and the switch. The
+     * box carries data-default="1" while the default is showing, so
+     * scripts/robot-settings.py can toggle the switch without turning the
+     * default into stored text. Explore reads both per conversation, so a
+     * save here is heard in the next one.
+     */
+    private static void appendConversation(StringBuilder html, String t, ConversationSettings c) {
+        html.append("<section id=\"conversation\"><h2>Conversation</h2>");
+        html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_CONVERSATION_PATH)
+                .append("\">");
+        html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+        html.append("<label for=\"persona\">Persona");
+        html.append("<textarea id=\"persona\" name=\"persona\" rows=\"16\" maxlength=\"")
+                .append(ConversationSettings.MAX_PERSONA_CHARS).append("\"")
+                .append(c.personaSet ? "" : " data-default=\"1\"").append(">")
+                .append(escapeHtml(c.persona)).append("</textarea>");
+        html.append("<small id=\"persona-hint\">").append(c.persona.length()).append(" of ")
+                .append(ConversationSettings.MAX_PERSONA_CHARS).append(" characters. ")
+                .append(c.personaSet ? "Empty the box to go back to the built-in text."
+                        : "This is the built-in text; edit it to make it his.")
+                .append("</small></label>");
+        html.append("<label for=\"answers\"><input type=\"checkbox\" id=\"answers\" name=\"answers\" value=\"on\" "
+                + "role=\"switch\"").append(c.answersWhenSpokenTo ? " checked" : "").append("> Answers when spoken to");
+        html.append("<br><small>Off: only “Hey Miko” opens a conversation.</small></label>");
+        html.append("<button type=\"submit\">Save</button>");
+        html.append("</form>");
+        html.append("</section>");
+    }
+
+    /** R15, R16, R18: everyone he remembers, most recently seen first, each
+     * with their notes (escaped: every entry came from the model or a person)
+     * or a legacy mark when the record has no name (KTD10). */
+    private static void appendPeople(StringBuilder html, String t, PeopleStore store) {
+        List<PeopleStore.Person> people = store.all();
         html.append("<section id=\"people\"><h2>People</h2>");
-        html.append("<p>The people the robot remembers. Forget deletes their face and name for good.</p>");
+        html.append("<p>The people the robot remembers. Forget deletes their face, name and notes for good.</p>");
         if (people.isEmpty()) {
             html.append("<p id=\"people-empty\">He hasn't met anyone yet.</p>");
         }
@@ -346,6 +413,11 @@ final class SettingsPage {
                     .append("\" width=\"112\" height=\"112\">");
             html.append("<p><strong>").append(p.name.isEmpty() ? "<em>unnamed</em>" : name).append("</strong><br>");
             html.append("<small>Last seen ").append(escapeHtml(lastSeen(p.lastSeenMillis))).append("</small></p>");
+            if (p.name.isEmpty()) {
+                html.append("<p class=\"legacy\"><small>").append(PEOPLE_LEGACY).append("</small></p>");
+            } else {
+                appendNotes(html, store.notes(p.id));
+            }
             html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH)
                     .append("\">");
             html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
@@ -363,6 +435,38 @@ final class SettingsPage {
             html.append("</article>");
         }
         html.append("</section>");
+    }
+
+    /** The notes as four short lists, every entry escaped. */
+    private static void appendNotes(StringBuilder html, PersonNotes notes) {
+        if (notes.isEmpty()) {
+            html.append("<p class=\"notes\"><small>").append(PEOPLE_NO_NOTES).append("</small></p>");
+            return;
+        }
+        html.append("<div class=\"notes\">");
+        notesList(html, "Interests", notes.interests);
+        if (!notes.openThreads.isEmpty()) {
+            html.append("<p><strong>Open threads</strong></p><ul>");
+            for (PersonNotes.Thread thread : notes.openThreads) {
+                html.append("<li>").append(escapeHtml(thread.text)).append(" <small>(since ")
+                        .append(escapeHtml(lastSeen(thread.sinceMillis).substring(0, 10))).append(")</small></li>");
+            }
+            html.append("</ul>");
+        }
+        notesList(html, "Topics", notes.topics);
+        notesList(html, "Questions asked", notes.questionsAsked);
+        html.append("</div>");
+    }
+
+    private static void notesList(StringBuilder html, String label, List<String> entries) {
+        if (entries.isEmpty()) {
+            return;
+        }
+        html.append("<p><strong>").append(label).append("</strong></p><ul>");
+        for (String entry : entries) {
+            html.append("<li>").append(escapeHtml(entry)).append("</li>");
+        }
+        html.append("</ul>");
     }
 
     /** "2026-09-24 15:45", the robot's local time. */

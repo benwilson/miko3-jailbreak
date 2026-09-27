@@ -146,6 +146,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private int sessionEv;
 
     private volatile boolean busy;
+
+    private volatile boolean parked;
     /** close() has run on the camera thread and open() has not been called since. */
     private volatile boolean closedDone = true;
     private volatile ExploreBrain.Look latest;
@@ -232,6 +234,16 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 }
             }
         });
+    }
+
+    /**
+     * The detector parked (meeting plan U8, KTD7): frames are dropped at the image
+     * reader until unparked, so speech synthesis has the CPU through a
+     * conversation while the stream stays open for the one look it asks for.
+     */
+    @Override
+    public void park(boolean p) {
+        parked = p;
     }
 
     /** Closed on the camera thread, and no detector run in flight (the brain speaks only then, R6). */
@@ -519,7 +531,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 return;
             }
             try {
-                if (busy || !wanted) {
+                // Parked (meeting plan U8, KTD7): the stream runs, the detector does not.
+                if (busy || !wanted || parked) {
                     return;
                 }
                 ByteBuffer buf = image.getPlanes()[0].getBuffer();

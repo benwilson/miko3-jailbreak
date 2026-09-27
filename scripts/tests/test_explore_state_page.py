@@ -39,10 +39,12 @@ class ExploreStatePageTest(unittest.TestCase):
         text = r.stdout
         cls.page = text[text.index("PAGE-BEGIN") + len("PAGE-BEGIN"):text.index("PAGE-END")]
         cls.states = [json.loads(line[len("STATE "):]) for line in text.splitlines() if line.startswith("STATE ")]
+        cls.holder = json.loads([line for line in text.splitlines() if line.startswith("HOLDER ")][0][len("HOLDER "):])
 
     def test_brain_facing_states_are_the_expected_set(self):
         names = [s["state"] for s in self.states[:-1]]
-        self.assertEqual(sorted(names), sorted(["idle", "look", "flinch", "eyes-only", "resting", "thinking"]))
+        self.assertEqual(sorted(names), sorted(["idle", "look", "flinch", "eyes-only", "resting", "thinking",
+                                                "listening", "glance-left", "glance-right"]))
 
     def test_every_non_idle_state_has_its_own_look(self):
         # idle is the other modes' look unchanged (R6); the rest need a rule keyed on #rig.
@@ -64,10 +66,37 @@ class ExploreStatePageTest(unittest.TestCase):
         # rule that is not !important, so without it these looks never show on the
         # robot (found by browser test: eyes-only rendered fully open).
         self.assertIn("cores[g].style.animation=", self.page)
-        for state in ("flinch", "eyes-only", "resting"):
-            rule = re.search(r"#rig\.s-" + re.escape(state) + r" \.glow-core\{([^}]*)\}", self.page)
+        for state in ("flinch", "eyes-only", "resting", "thinking", "listening", "glance-left", "glance-right"):
+            # A rule may cover several states (the two glances share one): find the block whose
+            # selector list names this state.
+            rule = re.search(r"#rig\.s-" + re.escape(state) + r" \.glow-core[^{]*\{([^}]*)\}", self.page)
             self.assertIsNotNone(rule, state)
             self.assertRegex(rule.group(1), r"animation:[^;]*!important", state)
+
+    def test_glances_slide_the_gaze_to_the_voices_side_and_listening_keeps_it_still(self):
+        # Meeting plan R3, KTD12: a glance holds the eyes on the side the voice came from (the
+        # page shows the robot's left as +x, as the look state does) as soon as it lands.
+        self.assertRegex(self.page, r"exploreState\.state==='glance-left'\)\{x=10;y=0;\}")
+        self.assertRegex(self.page, r"exploreState\.state==='glance-right'\)\{x=-10;y=0;\}")
+        self.assertRegex(self.page, r"exploreState\.state==='listening'\)\{x\*=")
+        self.assertIn("s.state==='glance-left'||s.state==='glance-right')&&was.state!==s.state)gazeTo(0,0,180)", self.page)
+
+    def test_state_json_carries_the_cue_gauges_and_stage_stamps(self):
+        # Meeting plan U7, KTD14: /state carries the cue counters and the stage stamps beside the
+        # eye state, so the owner QA reads them off the page. Unknown keys change nothing.
+        self.assertEqual(self.holder["state"], "listening")
+        gauges = self.holder["gauges"]
+        counters = ["cues", "strongCues", "weakCues", "leanIns", "searches", "facesFound", "quietResumes",
+                    "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats"]
+        stages = ["cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested", "firstSound"]
+        self.assertEqual(sorted(k for k in gauges if k != "stages"), sorted(counters))
+        self.assertEqual(sorted(gauges["stages"]), sorted(stages))
+        self.assertEqual(gauges["cues"], 2)
+        self.assertEqual(gauges["leanIns"], 1)
+        self.assertEqual(gauges["searches"], 0)
+        self.assertEqual(gauges["stages"]["cueAt"], 1234)
+        self.assertEqual(gauges["stages"]["firstSound"], 5678)
+        self.assertEqual(gauges["stages"]["turnDone"], 0)
 
     def test_gaze_wrap_holds_the_look_direction(self):
         # R7: while looking, every glance goes to the published direction.

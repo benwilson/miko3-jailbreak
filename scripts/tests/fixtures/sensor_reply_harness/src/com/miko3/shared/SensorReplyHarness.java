@@ -160,6 +160,59 @@ public final class SensorReplyHarness {
                         && !SensorReply.parse(bytes("IMUGY=1,2,00000000001IMUMG=0" + tail), T).hasGyro,
                 "a partial or malformed gyro must not read as a smaller rate");
 
+        // ---- accelerometer (meeting plan U1, KTD5): IMUAC= is three signed fields, padded ----
+        check("captured_record_carries_the_accelerometer",
+                s != null && s.hasAccel && s.accelX == -2110 && s.accelY == 295 && s.accelZ == 23297, "got " + s);
+
+        boolean allAccel = true;
+        for (String line : lines) {
+            SensorSnapshot each = SensorReply.parse(padded(replyOf(line)), T);
+            allAccel &= each != null && each.hasAccel && each.accelZ > 20000;
+        }
+        check("every_captured_record_carries_the_accelerometer", allAccel, "a baseline record lost its accelerometer");
+
+        SensorSnapshot accelOnly = SensorReply.parse(bytes(
+                "IMUAC=-000000001,0000000005,-000001234XIMUGY=0000000062,-000000757,0000000093IMUMG=0"
+                        + "TOFIR=00209,XXXX,0,XXXX"), T);
+        check("accelerometer_sign_and_padding_are_read",
+                accelOnly != null && accelOnly.hasAccel && accelOnly.accelX == -1 && accelOnly.accelY == 5
+                        && accelOnly.accelZ == -1234 && accelOnly.hasGyro && accelOnly.gyroY == -757,
+                "got " + accelOnly);
+
+        SensorSnapshot noAccel = SensorReply.parse(bytes(
+                "IMUGY=0000000062,-000000757,0000000093IMUMG=0TOFIR=00209,XXXX,0,XXXX"), T);
+        SensorSnapshot accelX = SensorReply.parse(bytes(
+                "IMUAC=XXXXXXXXXX,XXXXXXXXXX,XXXXXXXXXXIMUGY=0000000062,-000000757,0000000093IMUMG=0"
+                        + "TOFIR=00209,XXXX,0,XXXX"), T);
+        check("absent_accelerometer_leaves_the_gyro",
+                noAccel != null && !noAccel.hasAccel && noAccel.hasGyro && noAccel.gyroX == 62
+                        && noAccel.gyroY == -757 && noAccel.gyroZ == 93 && noAccel.tof == 209
+                        && accelX != null && !accelX.hasAccel && accelX.hasGyro && accelX.gyroZ == 93,
+                "missing " + noAccel + " / all-X " + accelX);
+
+        check("cut_off_or_malformed_accelerometer_is_absent",
+                !SensorReply.parse(bytes(tail + "IMUAC=-000002110,0000000295,00000"), T).hasAccel
+                        && !SensorReply.parse(bytes("IMUAC=-000002110,0000000295IMUGY=1,2,3IMUMG=0" + tail), T).hasAccel
+                        && !SensorReply.parse(bytes("IMUAC=00000000X2,1,2IMUGY=1,2,3IMUMG=0" + tail), T).hasAccel
+                        && !SensorReply.parse(bytes("IMUAC=1,,3IMUGY=1,2,3IMUMG=0" + tail), T).hasAccel
+                        && !SensorReply.parse(bytes("IMUAC=1,2,3,4IMUGY=1,2,3IMUMG=0" + tail), T).hasAccel,
+                "a partial or malformed accelerometer must not read as a smaller value");
+
+        // ---- charger latch (meeting plan U1, KTD6): CPL=3 sets, a later ack not 3 clears ----
+        boolean set = SensorReply.chargerLatch(false, "Motion/VEL1 Completion:CPL=3");
+        check("cpl_three_sets_the_charger_latch", set, "CPL=3 must latch");
+        check("a_reply_without_cpl_keeps_the_charger_latch",
+                SensorReply.chargerLatch(true, captured) && !SensorReply.chargerLatch(false, captured)
+                        && SensorReply.chargerLatch(true, (String) null),
+                "a POWER reply carries no CPL and must leave the latch as it was");
+        check("a_later_ack_with_cpl_one_clears_the_charger_latch",
+                !SensorReply.chargerLatch(true, "Motion/VEL1 Completion:CPL=1"), "CPL=1 must clear the latch");
+        check("cpl_two_clears_the_latch_and_never_reads_as_charging",
+                !SensorReply.chargerLatch(true, "tof and edge detectionCPL=2")
+                        && !SensorReply.chargerLatch(false, "tof and edge detectionCPL=2")
+                        && SensorReply.parseCpl("tof and edge detectionCPL=2") == 2,
+                "CPL=2 is a forward refusal, not the charger");
+
         check("malformed_cpl_is_unknown",
                 SensorReply.parseCpl(bytes("CPL=X,")) == SensorSnapshot.ABSENT
                         && SensorReply.parseCpl((byte[]) null) == SensorSnapshot.ABSENT, "expected ABSENT");

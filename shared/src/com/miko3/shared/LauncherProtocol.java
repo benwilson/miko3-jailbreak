@@ -29,7 +29,18 @@ public final class LauncherProtocol {
      * (explore-on-claude plan U3). Modes go through RobotListenClient, not this directly. */
     public static final String ROBOT_LISTEN_ACTION = "com.miko3.launcher.ROBOT_LISTEN";
 
+    /** The launcher's continuous ears session (meeting plan U3, RobotEars):
+     * served by the same ListenService, picked by this bind action. */
+    public static final String ROBOT_EARS_ACTION = "com.miko3.launcher.ROBOT_EARS";
+
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
+
+    /** A mode's fixed reason when the launcher does not answer a Binder
+     * transaction the mode's build knows (meeting plan U4, KTD11): the two
+     * APKs are installed together, and every proxy method added since checks
+     * the transaction result, so an old launcher is named rather than failing
+     * silently. */
+    public static final String LAUNCHER_TOO_OLD = "launcher too old: install the current launcher";
 
     /** Boolean extra on a launch Intent the launcher sends a mode's Activity, asking
      * it to release its lease and exit through its own normal release path (U10). */
@@ -70,6 +81,13 @@ public final class LauncherProtocol {
      * so it is TLS-only like the rest (isTlsOnlyPath): a face never crosses the
      * network in cleartext. */
     public static final String SETTINGS_PEOPLE_FACE_PATH = "/settings/people/face";
+    /** The ears probe (meeting plan U1): POST with the page token and the nonce held by
+     * the launcher's debug property answers per-second direction and recogniser rows;
+     * 404 otherwise. Under SETTINGS_PATH, so TLS-only. Owner tooling: scripts/qa-ears-probe.py. */
+    public static final String SETTINGS_EARS_PROBE_PATH = "/settings/ears-probe";
+    /** Conversation (meeting plan U4, KTD11): the persona box and the "answers
+     * when spoken to" switch, saved together. */
+    public static final String SETTINGS_CONVERSATION_PATH = "/settings/conversation";
 
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;

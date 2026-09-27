@@ -80,7 +80,7 @@ The motor controller's own refusal to drive the robot forward when its front sen
 
 ## Conversation
 
-The window of a voice session that opens when the on-device wake-word spotter hears "Hey Miko" and closes when the relay matches "Goodbye Miko" in the transcript or the silence timeout passes. Only inside a conversation does microphone audio leave the robot; between conversations the mode is listening locally and streams nothing.
+The window in which the robot is talking with one person. In Voice mode it opens when the on-device wake-word spotter hears "Hey Miko" and closes when the relay matches "Goodbye Miko" in the transcript or the silence timeout passes, and only inside it does microphone audio leave the robot. In Explore mode it opens on the wake word or on an address decision made on the robot, runs turn by turn for as long as the person keeps answering, and closes on a goodbye, the person walking off, or two unanswered listens; only inside it does a transcript leave the robot, and audio never does. Between conversations a mode listens locally and streams nothing.
 
 ## Relay
 
@@ -93,3 +93,28 @@ The relay-to-robot direction of a mode's link to the relay, reserved for physica
 ## Settings page
 
 The launcher-served page that is the robot's single home for owner settings, organized in sections, opened either from a LAN browser or from the robot's own screen. Settings a mode needs live here rather than on the mode's own page; a mode reads them from the launcher at the time it uses them. Its first section is Claude API access, whose key the page never displays back and never lets a base-URL change carry forward without being re-entered.
+
+## Lean-in
+
+An autonomous mode's cheap first response to a weak sign that someone may be speaking to it: a voice from one side, a half-heard word, or a shove with no words. The wheels stop, the eyes slide toward the sound, and the robot turns and looks for a face turned toward it. Words together with a facing face open a conversation; nothing found ends in a quiet resume with nothing remembered and nothing sent. A strong cue, meaning the wake word, the robot's name, or a clear greeting, skips the lean-in and goes straight to the greeting. It exists because two microphones only tell left from right, the robot cannot hear well over its own motors, and a missed or wrong first hearing should cost a glance, not a conversation.
+
+## Workplace test
+
+The single rule bounding what the robot says in its persona: it never says anything that would get a coworker fired if they said it. Slightly edgy office small talk is inside the line; the persona text carries the concrete list of what falls outside it. It is the owner's rule, applied by the model that writes the robot's lines, not a filter running on the robot.
+
+## Person notes
+
+The short record an autonomous mode keeps about a person who has given their name, beside the stored face: interests, open threads with roughly when they came up, topics covered, and questions already asked. Never a transcript. Written at the end of each conversation and read before the next, so the robot follows up on what the person said and never asks them the same question twice. A person who never gave a name gets no notes, and anyone can have their face, name and notes wiped by asking to be forgotten.
+
+## Cue
+
+A sign, judged on the robot, that someone may be speaking to it. Cues come in two tiers. A strong cue is the wake word, the robot's name in any form, or a clear greeting aimed at it, and goes straight to a greeting. A weak cue is a voice from one side, a half-heard word, or a shove with no words, and earns only a lean-in; a shove followed within a couple of seconds by "sorry" or "oops" becomes strong. A cue carries the side the sound came from and the moment it landed, a newer or stronger cue replaces a pending one, and a held cue expires after a few seconds. Nothing leaves the robot on a cue alone.
+
+## Ears session
+
+The one long-lived microphone capture the launcher holds on behalf of an autonomous mode while it runs off the charger, as distinct from the one-shot listen used for a single short reply. It feeds the wake-word engine and the recogniser from the same audio, reports each utterance with its side and tier, is kept alive by the mode's renewals and released when the mode goes away. It exists because the device allows one capture at a time and a robot that is addressable while roaming cannot open and close the microphone per question.
+
+## Deaf window
+
+The stretch from the moment the robot starts a spoken line until playback goes idle plus a short tail, during which nothing said to it can be heard because its own voice ducks the microphone. Anything said inside the window is dropped by design, the recogniser is reset at its end so the ducked audio never becomes an utterance, and it is the reason the robot keeps its lines to two sentences and listens the instant a line ends.
+

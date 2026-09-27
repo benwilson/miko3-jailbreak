@@ -12,6 +12,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
+REPO = Path(__file__).resolve().parents[2]
 SCRIPT = HERE.parent / "gen-explore-voice.py"
 SOUNDS = HERE.parent / "gen-explore-sounds.py"
 ASSETS = ROOT / "mode-explore" / "assets"
@@ -170,6 +171,63 @@ class CommittedNameClipsTest(unittest.TestCase):
         expected = {voice.clip_name(label) for label in voice.VOCABULARY}
         present = {p.name for p in ASSETS.glob("name-*")}
         self.assertEqual(present, expected)
+
+
+class LineClipsTest(unittest.TestCase):
+    """The conversation's line clips (meeting plan U8, KTD12): every group the brain
+    plays has phrasings, each renders as react-<group>-<n>.webm the way ClipPlayer
+    indexes reactions, and the binary assets come from the same voice. The voice
+    model needs sherpa-onnx, so a missing asset is reported as pending generation
+    rather than invented."""
+
+    GROUPS = ("acknowledge", "sign-off", "one-sec", "deflect", "nothing-kept")
+
+    def test_every_group_the_brain_plays_has_phrasings(self):
+        self.assertEqual(tuple(voice.LINE_CLIPS), self.GROUPS)
+        for group, phrases in voice.LINE_CLIPS.items():
+            self.assertTrue(phrases, group)
+            for phrase in phrases:
+                self.assertTrue(phrase.strip(), group)
+                self.assertLess(len(phrase.split()), 10, phrase)
+
+    def test_the_brain_and_the_session_play_these_groups(self):
+        brain = (REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore" / "ExploreBrain.java").read_text()
+        session = (REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore" / "ChatSession.java").read_text()
+        self.assertIn('playReaction("acknowledge")', brain)
+        for group in self.GROUPS[1:]:
+            self.assertIn(f'"{group}"', session, group)
+
+    def test_clip_names_follow_the_reaction_index(self):
+        names = [n for n, _ in voice.line_clips()]
+        self.assertEqual(names[:2], ["react-acknowledge-1.webm", "react-acknowledge-2.webm"])
+        self.assertEqual(len(names), len(set(names)))
+        for n in names:
+            self.assertRegex(n, r"^react-[a-z-]+-\d+\.webm$")
+
+    def test_clip_player_indexes_webm_reactions(self):
+        player = (REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore" / "ClipPlayer.java").read_text()
+        self.assertIn('name.endsWith(".webm")', player)
+        self.assertIn('name.startsWith("react-")', player)
+
+    def test_generate_writes_the_line_clips_after_the_names(self):
+        src = SCRIPT.read_text()
+        self.assertIn("for name, text in line_clips():", src)
+        self.assertIn("render_phrase(text, tts)", src)
+
+    def test_line_clip_assets_are_webm_opus_when_present(self):
+        pending = []
+        for name, _ in voice.line_clips():
+            path = ASSETS / name
+            if not path.exists():
+                pending.append(name)
+                continue
+            data = path.read_bytes()
+            self.assertEqual(data[:4], b"\x1a\x45\xdf\xa3", f"{name} is not WebM/Matroska")
+            self.assertIn(b"A_OPUS", data[:512], name)
+            self.assertTrue(500 < len(data) < 40000, f"{name}: {len(data)} bytes")
+        if pending:
+            self.skipTest("line clips pending generation (needs sherpa-onnx and the voice model): "
+                          "run scripts/gen-explore-voice.py; missing " + ", ".join(pending))
 
 
 if __name__ == "__main__":

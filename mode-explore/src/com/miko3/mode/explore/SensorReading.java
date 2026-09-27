@@ -43,6 +43,18 @@ final class SensorReading {
     final int gyroX;
     final int gyroY;
     final int gyroZ;
+    /** The charger latch (meeting plan U1, KTD6): true from the last motion
+     * acknowledgement carrying CPL=3 until a later one carrying another value. The
+     * controller refuses every motion while docked, so the classifier reads it as
+     * motion refused; unlike cpl it is not the reply's own field but the driver's latch. */
+    final boolean charger;
+    /** True when the reply carried the accelerometer (meeting plan U1, KTD5). The
+     * values are signed, so -1 is real: check this rather than the fields. */
+    final boolean hasAccel;
+    /** Raw accelerometer values, in the controller's counts; 0 when !hasAccel. */
+    final int accelX;
+    final int accelY;
+    final int accelZ;
 
     /** No wheel counts and no gyro. */
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault) {
@@ -61,9 +73,23 @@ final class SensorReading {
         this(timestampMs, tof, ir1, ir2, cpl, fault, true, wheelLeft, wheelRight, true, gyroX, gyroY, gyroZ);
     }
 
-    /** Every field, with the wheels' and the gyro's presence explicit. */
+    /** Every field but the charger latch and the accelerometer, with the wheels' and
+     * the gyro's presence explicit. */
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault, boolean hasWheels,
                   long wheelLeft, long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ) {
+        this(timestampMs, tof, ir1, ir2, cpl, fault, hasWheels, wheelLeft, wheelRight, hasGyro, gyroX, gyroY,
+                gyroZ, false, false, 0, 0, 0);
+    }
+
+    /** Every field, with the wheels', the gyro's and the accelerometer's presence explicit. */
+    SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault, boolean hasWheels,
+                  long wheelLeft, long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ,
+                  boolean charger, boolean hasAccel, int accelX, int accelY, int accelZ) {
+        this.charger = charger;
+        this.hasAccel = hasAccel;
+        this.accelX = hasAccel ? accelX : 0;
+        this.accelY = hasAccel ? accelY : 0;
+        this.accelZ = hasAccel ? accelZ : 0;
         this.hasGyro = hasGyro;
         this.gyroX = gyroX;
         this.gyroY = gyroY;
@@ -88,6 +114,7 @@ final class SensorReading {
         return "t=" + timestampMs + " tof=" + tof + " ir1=" + ir1 + " ir2=" + ir2
                 + " cpl=" + cpl + (hasWheels() ? " wheels=" + wheelLeft + "/" + wheelRight : "")
                 + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "")
-                + (fault ? " FAULT" : "");
+                + (hasAccel ? " accel=" + accelX + "," + accelY + "," + accelZ : "")
+                + (charger ? " CHARGER" : "") + (fault ? " FAULT" : "");
     }
 }

@@ -222,6 +222,24 @@ import java.util.Set;
  * approaching people only; the look request's cooling-down flag still follows it.
  * Notes carry counts only, never a name (R15).
  *
+ * Spoken to (meeting plan U7; R1-R3, R6-R9, R15; KTD3-KTD6, KTD8): the launcher's
+ * ears arrive as Ears step input, drained once per tick and handled per state
+ * (drainEars, cueVerdict). A taken cue stops the wheels in that step and runs:
+ *
+ *   CUE_TURN   eyes glance to the voice's side, then bounded measured steps toward
+ *              it, re-read from the angle's trend; between looks, the turn to the
+ *              next look of the plan
+ *   CUE_LOOK   attentive eyes; the camera decides within leanInMs of being ready:
+ *              a face turned toward him (the facing-face box test) plays the
+ *              acknowledgement and enters MEET; nothing, after the plan's looks
+ *              (strong: side, behind, other side; weak: side, opposite), is a quiet
+ *              PAUSE with nothing sent
+ *
+ * Held cues wait for the escape or the line to end, expire after cueHoldMs (a
+ * strong one becoming a lean-in); a shove arms a weak cue only while stopped; the
+ * ears follow the charger latch; in EYES_ONLY only the wake word opens a meeting,
+ * without a turn. The conversation the meeting becomes is U8's (CHAT states).
+ *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
  */
@@ -308,6 +326,14 @@ final class ExploreBrain {
          */
         default void setMoving(boolean moving) {
         }
+
+        /**
+         * Park the detector (meeting plan U8, KTD7): the stream stays open but no frame
+         * runs through the detector, so speech synthesis has the CPU during a
+         * conversation; false runs it again for a look.
+         */
+        default void park(boolean parked) {
+        }
     }
 
     /**
@@ -375,14 +401,18 @@ final class ExploreBrain {
     /** What the eyes show: glancing, leading a turn, startled, resting (cornered), not moving (R10). */
     /** ...and STARE: on something the camera sees (Eyes.stare). */
     /** ...and THINKING: waiting for Claude's answer (explore on Claude R7). */
-    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING }
+    /** ...and GLANCE: eyes sliding toward a voice (gaze is its side; meeting plan R3, KTD12),
+     * and LISTENING: attentive, looking for a face turned toward him or hearing a reply. */
+    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING, GLANCE, LISTENING }
 
     enum State {
         EYES_ONLY, PAUSE, LOOK, TURN, HOP, STARTLE, BACK_OFF, CORNERED, STOPPED,
         SCAN, FACE, APPROACH, INSPECT, REACT_HERE,
         ASK, ORIENT, MEET_LOOK, MEET, SPEAK,
         ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP,
-        RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF;
+        RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF,
+        CUE_TURN, CUE_LOOK,
+        CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES;
 
         /** A curiosity stop's looking states: the camera is always open in these (R2, AE6). */
         boolean curious() {
@@ -405,11 +435,75 @@ final class ExploreBrain {
             return this == RETRACE || this == CIRCLE || this == WAY_OUT || this == DRIVE_OFF;
         }
 
+        /**
+         * The turn to a voice and the look that decides (meeting plan U7, KTD4, KTD7):
+         * the camera is open in these, as in a curiosity stop's looking states.
+         */
+        boolean cueSearch() {
+            return this == CUE_TURN || this == CUE_LOOK;
+        }
+
+        /**
+         * The conversation (meeting plan U8, KTD7): the camera stays open with the
+         * detector parked, looks run only in CHAT_LISTEN, and a lost lease does not
+         * end it.
+         */
+        boolean chats() {
+            return this == CHAT_THINK || this == CHAT_SPEAK || this == CHAT_LISTEN || this == CHAT_NOTES;
+        }
+
         /** Part of a curiosity stop, from the scan until he is back to wandering. */
         boolean inStop() {
-            return curious() || this == ASK || this == ORIENT || this == MEET || this == SPEAK
-                    || this == ASK_NAME || this == LISTEN || this == NAME || this == REMEMBER || this == NAME_CLIP;
+            return curious() || cueSearch() || chats() || this == ASK || this == ORIENT || this == MEET
+                    || this == SPEAK || this == ASK_NAME || this == LISTEN || this == NAME || this == REMEMBER
+                    || this == NAME_CLIP;
         }
+    }
+
+    /**
+     * The state page's counters and stage stamps (meeting plan U7, KTD14): what
+     * the cues did and when each stage of a meeting landed. ModeApp publishes
+     * them beside the eye state; the harness rig counts them. Keys are the
+     * /state field names. LINE_REQUESTED and FIRST_SOUND are stamped by the
+     * conversation (U8).
+     */
+    interface Gauges {
+        enum Counter {
+            CUES("cues"), STRONG_CUES("strongCues"), WEAK_CUES("weakCues"), LEAN_INS("leanIns"),
+            SEARCHES("searches"), FACES_FOUND("facesFound"), QUIET_RESUMES("quietResumes"),
+            CUES_HELD("cuesHeld"), CUES_DROPPED("cuesDropped"), RETARGETS("retargets"), SHOVES("shoves"),
+            /** A question the conversation model repeated after the re-request (U8, KTD9). */
+            REPEATS("repeats");
+
+            final String key;
+
+            Counter(String key) {
+                this.key = key;
+            }
+        }
+
+        enum Stage {
+            CUE_AT("cueAt"), TURN_DONE("turnDone"), FACE_FOUND("faceFound"), MATCH_ANSWERED("matchAnswered"),
+            LINE_REQUESTED("lineRequested"), FIRST_SOUND("firstSound");
+
+            final String key;
+
+            Stage(String key) {
+                this.key = key;
+            }
+        }
+
+        void count(Counter counter);
+
+        void stamp(Stage stage, long atMs);
+
+        Gauges NONE = new Gauges() {
+            public void count(Counter counter) {
+            }
+
+            public void stamp(Stage stage, long atMs) {
+            }
+        };
     }
 
     /** Within SCAN, FACE and APPROACH: what he is doing right now. */
@@ -423,6 +517,8 @@ final class ExploreBrain {
     private final Random random;
     private final Camera camera;
     private final CuriosityPort port;
+    private final Ears ears;
+    private Gauges gauges = Gauges.NONE;
     private final HazardClassifier classifier;
     /** Heading, measured turns and the leg log (explore nav plan U2). */
     private final Heading compass;
@@ -548,8 +644,10 @@ final class ExploreBrain {
     private long meetDeadline;
     /** A new person's lines: the ask line was said, the no-reply line may be. */
     private CuriosityPort.MatchAnswer stranger;
+    /** A clock field's "never": far enough below any tick that now - NEVER cannot overflow. */
+    static final long NEVER = Long.MIN_VALUE / 4;
     /** When the camera last closed, for its reopen gap (tuning.reopenGapMs). */
-    private long cameraClosedAt = Long.MIN_VALUE / 4;
+    private long cameraClosedAt = NEVER;
 
     // ---- the camera while roaming (explore nav plan U4) ----
     /** The last look seen (by identity: a real frame arrived), and when the next must come by. */
@@ -558,7 +656,7 @@ final class ExploreBrain {
     /** The last look checked during the current leg for a blocked way ahead. */
     private Look legLook;
     /** When the last turn stopped: a look captured before that faced another way. */
-    private long headingSettledAt = Long.MIN_VALUE / 4;
+    private long headingSettledAt = NEVER;
     /** The next leg's forward ticks as the steer chose them (0: its bend is the whole move; -1: none). */
     private int plannedTicks = -1;
     /** Look-then-go (KTD7): in PAUSE, waiting for the leg decision's look, captured at or after legLookAfter. */
@@ -571,9 +669,9 @@ final class ExploreBrain {
     /** A timed orient shorter than this is already facing it. */
     private static final long MIN_ORIENT_MS = 50;
     /** A CPL hiccup's retry (cplRetryPauseMs): CPL again before this is a hazard. */
-    private long cplRetryUntil = Long.MIN_VALUE / 4;
+    private long cplRetryUntil = NEVER;
     /** The last mid-leg re-aim, and the last look it weighed (one decision per look). */
-    private long reaimedAt = Long.MIN_VALUE / 4;
+    private long reaimedAt = NEVER;
     private Look reaimLook;
     private long legLookAfter;
     private long legLookDeadline;
@@ -627,7 +725,7 @@ final class ExploreBrain {
      */
     private int failedLadders;
     /** When the last cornered rest ended (its first move after is the pinned check). */
-    private long restEndedAt = Long.MIN_VALUE / 4;
+    private long restEndedAt = NEVER;
     /** This rest is the still-pinned one: when it ends, the ladder, not the wider turn. */
     private boolean ladderAfterRest;
     private boolean ladderTurnBlocked;
@@ -708,11 +806,60 @@ final class ExploreBrain {
     private long metCheckAt;
     private CuriosityPort.Answer gatedPick;
     /** The next check may go at this time; a roaming person is cleared until metClearedUntil. */
-    private long metNextCheckAt = Long.MIN_VALUE / 4;
-    private long metClearedUntil = Long.MIN_VALUE / 4;
+    private long metNextCheckAt = NEVER;
+    private long metClearedUntil = NEVER;
 
     /** The newest reading, where a drive's counts start from. */
     private SensorReading lastReading;
+    // ---- cues, the turn to the voice and the look that decides (meeting plan U7) ----
+    /** When the last motor command went out (TimedMotor): the shove cue's blanking window. */
+    private long lastMotorCommandAt = NEVER;
+    /** Whether the launcher's ears session is open (follows the charger latch, KTD6). */
+    private boolean earsOpen;
+    /** The cue waiting for a state that can take it (KTD3's replacement rule), or null. */
+    private Ears.Cue cueHeld;
+    /** The cue being searched for in CUE_TURN and CUE_LOOK, or null. */
+    private Ears.Cue searchCue;
+    /** A strong cue from the other side already retargeted this search (once only, KTD3). */
+    private boolean searchRetargeted;
+    /** The look headings of this search, relative to where it began (negative left), and the one he is at. */
+    private double[] searchPlan;
+    private int searchLook;
+    /** Degrees turned since the search began, relative and signed like searchPlan. */
+    private double searchRel;
+    /** The first turn, toward the voice: stepped and re-read from the angle's trend (KTD4). */
+    private boolean searchFirstTurn;
+    private double searchRemainingDeg;
+    private boolean searchTurnLeft;
+    private boolean searchTurnDoneStamped;
+    /** The newest angle trend since the last step (Ears.trend), and whether one landed in this turn step. */
+    private Ears.Trend latestTrend;
+    private boolean trendSeenInStep;
+    /** The last shove while stopped and the last collision stop while driving (KTD5): "sorry" within 2 s is strong. */
+    private long lastShoveAt = NEVER;
+    private long bumpAt = NEVER;
+    /** A meeting entered from EYES_ONLY on the wake word (KTD8): the lease and sensor guards let it finish. */
+    private boolean wheellessMeeting;
+    /** The port's stand-in box for a person he cannot see (the wheelless meeting): straight ahead. */
+    private static final Detection UNSEEN_PERSON = new Detection("person", 1f, 0.35f, 0.2f, 0.65f, 0.8f);
+    // ---- the conversation (meeting plan U8; KTD7, KTD8, KTD10, R16) ----
+    /** The conversation running in the CHAT states, or null. */
+    private ChatSession chat;
+    /** The side the voice that started this stop came from, or null: the resume leg turns away from it. */
+    private Direction chatCueSide;
+    private Direction chatSide;
+    /** The lease was lost during the conversation (KTD7): no wheels and no look until it ends. */
+    private boolean chatNoWheels;
+    /** When the sensors went unavailable during the conversation, or MIN while they are fine. */
+    private long chatStallSince = NEVER;
+    /** The detector is parked (CHAT states), and whether the conversation wants one look. */
+    private boolean parked;
+    private boolean chatLookWanted;
+    /** The first leg after a conversation goes this way, away from the person (R16), or null. */
+    private Direction awayLeg;
+    /** An unnamed conversation's side-and-time leave-alone (KTD10). */
+    private Direction leaveAloneSide;
+    private long leaveAloneUntil = NEVER;
 
     ExploreBrain(ExploreTuning tuning, Clock clock, Motor motor, Eyes eyes, Sound sound, Random random) {
         this(tuning, clock, motor, eyes, sound, NO_CAMERA, random);
@@ -725,10 +872,16 @@ final class ExploreBrain {
 
     ExploreBrain(ExploreTuning tuning, Clock clock, Motor motor, Eyes eyes, Sound sound, Camera camera,
                  CuriosityPort port, Random random) {
+        this(tuning, clock, motor, eyes, sound, camera, port, Ears.NONE, random);
+    }
+
+    ExploreBrain(ExploreTuning tuning, Clock clock, Motor motor, Eyes eyes, Sound sound, Camera camera,
+                 CuriosityPort port, Ears ears, Random random) {
         this.tuning = tuning;
         this.port = port;
+        this.ears = ears;
         this.clock = clock;
-        this.motor = motor;
+        this.motor = new TimedMotor(motor);
         this.eyes = eyes;
         this.sound = sound;
         this.camera = camera;
@@ -757,6 +910,11 @@ final class ExploreBrain {
 
     void setTrace(Trace trace) {
         this.trace = trace;
+    }
+
+    /** Where cue counters and stage stamps go (KTD14); none by default. */
+    void setGauges(Gauges gauges) {
+        this.gauges = gauges == null ? Gauges.NONE : gauges;
     }
 
     State state() {
@@ -828,6 +986,7 @@ final class ExploreBrain {
         state = State.STOPPED;
         syncCamera();
         syncMoving();
+        syncEars();
         note("shutdown");
     }
 
@@ -880,6 +1039,8 @@ final class ExploreBrain {
     private void stepOnce(boolean fresh) {
         long now = clock.nowMs();
         HazardClassifier.Status s = classifier.status(now);
+        // The one place cues are consumed (KTD1, KTD3): every state, EYES_ONLY included.
+        drainEars(now);
         if (state == State.EYES_ONLY) {
             if (leaseHeld && s != HazardClassifier.Status.UNAVAILABLE) {
                 note("sensors available and lease held");
@@ -890,18 +1051,37 @@ final class ExploreBrain {
             }
             return;
         }
-        if (!leaseHeld) {
-            enterEyesOnly("lease lost");
-            return;
+        if (!leaseHeld && !wheellessMeeting) {
+            if (!state.chats()) {
+                enterEyesOnly("lease lost");
+                return;
+            }
+            // KTD7's exception: the conversation goes on without wheels or looks.
+            if (!chatNoWheels) {
+                chatNoWheels = true;
+                stopMotors();
+                note("lease lost during the conversation: no wheels and no look until it ends");
+            }
         }
-        if (s == HazardClassifier.Status.UNAVAILABLE) {
-            enterEyesOnly("sensors unavailable: " + classifier.reason());
-            return;
+        if (s == HazardClassifier.Status.UNAVAILABLE && !wheellessMeeting) {
+            if (!state.chats()) {
+                enterEyesOnly("sensors unavailable: " + classifier.reason());
+                return;
+            }
+            if (chatStallSince == NEVER) {
+                chatStallSince = now;
+                note("sensors unavailable during the conversation: " + tuning.chatStallGraceMs + " ms grace");
+            } else if (now - chatStallSince >= tuning.chatStallGraceMs && chat != null) {
+                chat.endWithSignOff(now, "sensors unavailable for " + (now - chatStallSince) + " ms");
+            }
+        } else if (state.chats()) {
+            chatStallSince = NEVER;
         }
         boolean hazard = s == HazardClassifier.Status.HAZARD;
         watchLooks(now);
         doorwayStep(now);
         metCheckStep(now);
+        takeHeldCue(now);
         switch (state) {
             case PAUSE:
                 if (lookForLeg) {
@@ -1013,7 +1193,15 @@ final class ExploreBrain {
             case FACE:
             case APPROACH:
             case ORIENT:
+            case CUE_TURN:
+            case CUE_LOOK:
                 curiosityStep(now, fresh, hazard);
+                break;
+            case CHAT_THINK:
+            case CHAT_SPEAK:
+            case CHAT_LISTEN:
+            case CHAT_NOTES:
+                chatStep(now);
                 break;
             case INSPECT:
             case REACT_HERE:
@@ -1126,6 +1314,12 @@ final class ExploreBrain {
     private void decide(long now, boolean hazard) {
         if (hazard) {
             refuse(now);
+        } else if (awayLeg != null) {
+            // The first leg after a conversation turns away from the person (R16).
+            Direction d = awayLeg;
+            awayLeg = null;
+            note("first leg after the conversation: turning " + d + ", away from them");
+            enterLook(now, d, false, timedMs(tuning.chatAwayDeg), tuning.chatAwayDeg);
         } else if (!hopNext && camera.available() && now >= curiosityAt && now >= curiosityOffUntil) {
             enterScan(now);
         } else if (hopNext) {
@@ -1399,6 +1593,9 @@ final class ExploreBrain {
 
     /** As above, for a hazard the classifier did not see (h null: side unknown). */
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
+        if (drivingForward() && (h == null || h.kind == HazardClassifier.Kind.OBSTACLE)) {
+            stampBump(now);
+        }
         if (state == State.HOP) {
             aheadBlocked();
         }
@@ -1430,6 +1627,13 @@ final class ExploreBrain {
      */
     private void leaveStopForHazard() {
         if (!state.inStop()) {
+            return;
+        }
+        if (state.cueSearch() && searchCue != null) {
+            // R9: the escape comes first; the voice is looked for again from where it leaves him.
+            note("hazard during the turn to a voice: the cue waits for the escape");
+            holdCue(clock.nowMs(), searchCue);
+            clearStop();
             return;
         }
         boolean going = state == State.ORIENT || state == State.FACE || state == State.APPROACH;
@@ -1650,6 +1854,10 @@ final class ExploreBrain {
                         onLook(now, look);
                     }
                 } else if (now >= lookDeadline) {
+                    if (state == State.CUE_LOOK) {
+                        cueLookOver(now, look == null);
+                        break;
+                    }
                     if (look != null) {
                         // Looks are coming, just not a new enough one: a slow detector,
                         // not a broken camera, so only this stop ends.
@@ -1673,12 +1881,20 @@ final class ExploreBrain {
                     turnWouldNotTurn(now);
                 } else if (hazard) {
                     hazardInMotion(now);
+                } else if (state == State.CUE_TURN && trendSaysStop(now)) {
+                    double turned = turnedSoFar(now);
+                    stopMotors();
+                    searchRel += searchTurnLeft ? -turned : turned;
+                    enterCueLook(now);
                 } else if (turnDone(now)) {
+                    double turned = turnedSoFar(now);
                     stopMotors();
                     if (state == State.APPROACH) {
                         step = Step.READY_LEG;
                     } else if (state == State.ORIENT) {
                         oriented(now);
+                    } else if (state == State.CUE_TURN) {
+                        cueTurnStepDone(now, turned);
                     } else {
                         waitForLook(now);
                     }
@@ -1699,8 +1915,12 @@ final class ExploreBrain {
 
     /** A new look arrived (on a fresh reading): decide what the state does with it. */
     private void onLook(long now, Look look) {
+        if (state == State.CUE_LOOK) {
+            cueLook(now, look);
+            return;
+        }
         // Someone met in the last 10 minutes: the detector's fallback never approaches a person (KTD8).
-        boolean ignorePeople = now < peopleIgnoredUntil || anyoneMet(now);
+        boolean ignorePeople = now < peopleIgnoredUntil || anyoneMet(now) || leftAlone(now, look);
         if (state == State.SCAN && claudeStop) {
             scanLook(now, look, ignorePeople);
             return;
@@ -1960,6 +2180,17 @@ final class ExploreBrain {
         scanHeadings.clear();
         askedFrames.clear();
         cues.clear();
+        searchCue = null;
+        searchPlan = null;
+        searchFirstTurn = false;
+        latestTrend = null;
+        wheellessMeeting = false;
+        chat = null;
+        chatCueSide = null;
+        chatNoWheels = false;
+        chatStallSince = NEVER;
+        chatLookWanted = false;
+        syncPark();
     }
 
     /**
@@ -1976,7 +2207,11 @@ final class ExploreBrain {
         if (!camera.available() || !leaseHeld || now < curiosityOffUntil) {
             return false;
         }
-        if (state.curious()) {
+        if (state.curious() || state.cueSearch() || state.chats()) {
+            return true;
+        }
+        if (state == State.MEET && chatLikely()) {
+            // The meeting the conversation grows out of (KTD7): open, with the detector parked.
             return true;
         }
         if (!state.roams()) {
@@ -1990,6 +2225,7 @@ final class ExploreBrain {
 
     private void syncCamera() {
         long now = clock.nowMs();
+        syncPark();
         boolean want = state != State.STOPPED && cameraWanted(now);
         if (want != cameraOpen) {
             cameraOpen = want;
@@ -2548,6 +2784,7 @@ final class ExploreBrain {
         meetingHeld = true;
         stranger = null;
         meetLines = false;
+        syncPark();
         show(EyeState.THINKING, null);
         meetDeadline = now + tuning.meetTimeoutMs;
         note("a person: checking whether we've met");
@@ -2562,8 +2799,15 @@ final class ExploreBrain {
             }
             note("no answer about the person in " + tuning.meetTimeoutMs + " ms");
             a = CuriosityPort.MatchAnswer.FAILED;
+        } else if (!meetLines) {
+            gauges.stamp(Gauges.Stage.MATCH_ANSWERED, now);
         }
-        if (!meetLines && a.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
+        if (chatPossible(a) && (a.status == CuriosityPort.MatchAnswer.Status.KNOWN
+                || a.status == CuriosityPort.MatchAnswer.Status.NEW)) {
+            // The conversation path (U8, KTD8): known and unknown alike go to CHAT_THINK,
+            // where the opener asks a stranger's name; the ladder below is the degraded path.
+            enterChat(now, a);
+        } else if (!meetLines && a.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
             greet(now, a);
         } else if (a.status == CuriosityPort.MatchAnswer.Status.NEW && usable(a.askLine)) {
             askName(now, a);
@@ -2908,7 +3152,7 @@ final class ExploreBrain {
         if (failedLadders > 0 && now - restEndedAt <= tuning.pinnedWindowMs) {
             // The first move after the rest is blocked too: still pinned. The ladder (and
             // its two Claude asks) waits out a longer rest instead of running again now.
-            restEndedAt = Long.MIN_VALUE / 4;
+            restEndedAt = NEVER;
             long rest = pinnedRestMs();
             note("still pinned after the rest: " + why + " (" + failedLadders + " failed escapes in a row); resting "
                     + rest + " ms before the next escape");
@@ -3972,7 +4216,7 @@ final class ExploreBrain {
             startMetCheck(now, look.jpeg, p);
             return false;
         }
-        metClearedUntil = Long.MIN_VALUE / 4;
+        metClearedUntil = NEVER;
         approachPerson(now, look, p);
         return true;
     }
@@ -3994,24 +4238,34 @@ final class ExploreBrain {
      * pick, so FACE, APPROACH (to the polite distance), MEET_LOOK and the meeting run
      * as for Claude's person pick at a stop. Started on a fresh reading (decide).
      */
+    /**
+     * Opens a Claude stop on one person: the held pick and the scan cleared, this
+     * look (when there is one) the only one scanned, and the person the pick.
+     */
+    private void beginPersonStop(long now, Look lookOrNull, Detection person) {
+        claudeStop = true;
+        heldPick = null;
+        scanned.clear();
+        scanHeadings.clear();
+        askedFrames.clear();
+        if (lookOrNull != null) {
+            scanned.add(lookOrNull);
+            scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
+            askedFrames.add(new CuriosityPort.Frame(0, lookOrNull.jpeg));
+        }
+        pick = CuriosityPort.Answer.pick(0, person, CuriosityPort.Kind.PERSON, null);
+        pickAt = now;
+        pickRecentred = false;
+        remarkOnly = false;
+    }
+
     private void approachPerson(long now, Look look, Detection p) {
         note("a person while roaming: going over to meet them");
         lookForLeg = false;
         hopNext = false;
         plannedTicks = -1;
         doorwayLeg = false;
-        claudeStop = true;
-        heldPick = null;
-        scanned.clear();
-        scanHeadings.clear();
-        askedFrames.clear();
-        scanned.add(look);
-        scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
-        askedFrames.add(new CuriosityPort.Frame(0, look.jpeg));
-        pick = CuriosityPort.Answer.pick(0, p, CuriosityPort.Kind.PERSON, null);
-        pickAt = now;
-        pickRecentred = false;
-        remarkOnly = false;
+        beginPersonStop(now, look, p);
         remember(p.label, CuriosityPort.Kind.PERSON, now);
         target = p;
         state = State.FACE;
@@ -4101,6 +4355,763 @@ final class ExploreBrain {
         }
     }
 
+
+    // ---- cues, the lean-in and the turn to the voice (meeting plan U7; R1-R3, R6-R9, R15; KTD3-KTD6, KTD8) ----
+    //
+    // The adapter only enqueues (KTD1); this is the one place cues are consumed.
+    // Each tick drains the queue, arms a shove (KTD5), makes an apology strong
+    // within bumpApologyMs of a shove or a bump (KTD3), and hands each cue to the
+    // per-state table (KTD8): taken, held (KTD3's replacement rule, expiring after
+    // cueHoldMs, a strong one degrading to a lean-in), dropped, or, on the way to a
+    // person, a confirmation. A taken cue stops the wheels in this same step and
+    // enters CUE_TURN: the eyes glance to the side, then measured steps of at most
+    // cueTurnStepDeg toward the voice, each re-read from the angle's trend (KTD4),
+    // until the angle is under the stop band or grows (the voice was behind), or
+    // the estimate is spent. CUE_LOOK then waits up to leanInMs for a look with a
+    // face turned toward him (the facing-face box test); nothing found turns to the
+    // next look of the plan (strong: that side, behind, the other side; weak: that
+    // side, the opposite) and, after the last, resumes quietly with nothing sent. A
+    // facing face plays the acknowledgement in a clip window (KTD14) and enters the
+    // MEET path. In EYES_ONLY, or with no camera to decide, only the wake word
+    // opens a meeting: no turn, the stranger's lines, the lease guard held off
+    // until it ends (KTD8). The ears session follows the charger latch (KTD6).
+
+    private enum CueVerdict { TAKE, HOLD, DROP, CONFIRM }
+
+    /** Opens and closes the launcher's ears with the charger latch (KTD6) and at shutdown. */
+    private void syncEars() {
+        // A conversation already open finishes on the charger (KTD6): the ears stay with it.
+        boolean want = ears.present() && state != State.STOPPED && (!classifier.charger() || state.chats());
+        if (want == earsOpen) {
+            return;
+        }
+        earsOpen = want;
+        if (want) {
+            note("ears open");
+            port.earsOpen();
+        } else {
+            note("ears closed: " + (state == State.STOPPED ? "stopping" : "on the charger"));
+            port.earsClose();
+        }
+    }
+
+    /** Once per step: the queue, the angle trend, a shove, then the held cue's clock. */
+    private void drainEars(long now) {
+        syncEars();
+        List<Ears.Cue> cues = ears.drain();
+        Ears.Trend t = ears.trend();
+        if (t != null) {
+            latestTrend = t;
+            trendSeenInStep = true;
+        }
+        Ears.Shove shove = ears.shove();
+        if (!earsOpen || !ears.listening()) {
+            if (!cues.isEmpty()) {
+                note(cues.size() + " cue(s) ignored: the ears are closed");
+            }
+            return;
+        }
+        if (shove != null) {
+            offerShove(now, shove);
+        }
+        for (Ears.Cue c : cues) {
+            offerCue(now, apologyUpgraded(c));
+        }
+        expireHeldCue(now);
+    }
+
+    /** A shove counts only while the wheels are commanded stopped and past the blanking window (KTD5). */
+    private void offerShove(long now, Ears.Shove shove) {
+        long sinceCommand = now - lastMotorCommandAt;
+        if (moving || sinceCommand < tuning.shoveBlankingMs) {
+            note("shove of " + shove.counts + " ignored: wheels " + (moving ? "moving" : "commanded " + sinceCommand
+                    + " ms ago"));
+            return;
+        }
+        note("shoved: " + shove.counts + " counts while stopped");
+        gauges.count(Gauges.Counter.SHOVES);
+        lastShoveAt = shove.at;
+        port.earsShoved(shove.at);
+        offerCue(now, new Ears.Cue(Ears.Kind.VOICE, Ears.Tier.WEAK, Ears.Side.UNKNOWN, Float.NaN, shove.at));
+    }
+
+    /** A collision stop while driving (a stall, an obstacle): "sorry" within bumpApologyMs is strong (KTD5). */
+    private void stampBump(long now) {
+        bumpAt = now;
+        note("collision stop: a bump");
+        port.earsShoved(now);
+    }
+
+    /** An apology within bumpApologyMs of a shove or a bump is strong (KTD3); the tier the session gave stands otherwise. */
+    private Ears.Cue apologyUpgraded(Ears.Cue c) {
+        if (c.kind != Ears.Kind.APOLOGY || c.strong()) {
+            return c;
+        }
+        long last = Math.max(lastShoveAt, bumpAt);
+        if (c.at >= last && c.at - last <= tuning.bumpApologyMs) {
+            note("an apology " + (c.at - last) + " ms after the bump: strong");
+            return new Ears.Cue(c.kind, Ears.Tier.STRONG, c.side, c.angleDeg, c.at);
+        }
+        return c;
+    }
+
+    /** One cue from the session, through the per-state table (KTD8). */
+    private void offerCue(long now, Ears.Cue c) {
+        gauges.count(Gauges.Counter.CUES);
+        gauges.count(c.strong() ? Gauges.Counter.STRONG_CUES : Gauges.Counter.WEAK_CUES);
+        if (state.cueSearch()) {
+            offerCueDuringSearch(now, c);
+            return;
+        }
+        switch (cueVerdict(now, c)) {
+            case TAKE:
+                takeCue(now, c);
+                break;
+            case HOLD:
+                holdCue(now, c);
+                break;
+            case CONFIRM:
+                note("a voice from the person's side: carrying on toward them");
+                break;
+            default:
+                dropCue("cue " + c.tier + " " + c.side + " dropped in " + state);
+                break;
+        }
+    }
+
+    /** During a search (KTD3): a strong cue from the other side retargets once; everything else is ignored. */
+    private void offerCueDuringSearch(long now, Ears.Cue c) {
+        Direction side = sideOf(c);
+        Direction searching = searchCue == null ? null : sideOf(searchCue);
+        if (c.strong() && side != null && searching != null && side != searching && !searchRetargeted) {
+            note("strong cue from the other side during the search: retargeting once");
+            gauges.count(Gauges.Counter.RETARGETS);
+            stopMotors();
+            enterCueSearch(now, c, true);
+            return;
+        }
+        dropCue("cue " + c.tier + " " + c.side + " during the search: ignored");
+    }
+
+    /** The per-state table (KTD8) for a cue arriving now, or a held one whose turn may have come. */
+    private CueVerdict cueVerdict(long now, Ears.Cue c) {
+        if (state.chats()) {
+            return chatVerdict(c);
+        }
+        if (state == State.EYES_ONLY || !camera.available() || now < curiosityOffUntil) {
+            // He cannot move, or has no camera to decide with: only the wake word opens a meeting.
+            return c.kind == Ears.Kind.WAKE_WORD ? CueVerdict.TAKE : CueVerdict.DROP;
+        }
+        switch (state) {
+            case PAUSE: case HOP: case SCAN: case INSPECT: case REACT_HERE: case CORNERED: case ASK: case ORIENT:
+                return CueVerdict.TAKE;
+            case LOOK: case TURN:
+                return escape ? CueVerdict.HOLD : CueVerdict.TAKE;
+            case SPEAK:
+                // Before the line starts the remark is dropped; while it plays the deaf window is open (KTD1).
+                return pendingLine != null ? CueVerdict.TAKE : CueVerdict.HOLD;
+            case FACE: case APPROACH: case MEET_LOOK: case MEET:
+                return sameSideAsPerson(c) ? CueVerdict.CONFIRM : CueVerdict.TAKE;
+            case STARTLE: case BACK_OFF: case RETRACE: case CIRCLE: case WAY_OUT: case DRIVE_OFF:
+            case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP:
+                return CueVerdict.HOLD;
+            default:
+                return CueVerdict.DROP;
+        }
+    }
+
+    /**
+     * The CHAT states (KTD8): a strong utterance whose latched angle magnitude exceeds
+     * newcomerAngleDeg is held as a newcomer cue (kept until the conversation ends,
+     * however long it runs); one inside it, the wake word included, is the speaker's
+     * reply (the listen hears it) or dropped, since the listening look tells them
+     * when he hears; weak cues are ignored. Without an angle nobody can be told
+     * apart, so the voice is the speaker's.
+     */
+    private CueVerdict chatVerdict(Ears.Cue c) {
+        if (!c.strong()) {
+            return CueVerdict.DROP;
+        }
+        return c.hasAngle() && Math.abs(c.angleDeg) > tuning.newcomerAngleDeg ? CueVerdict.HOLD : CueVerdict.DROP;
+    }
+
+    /**
+     * On the way to a person (R15): a voice from their side confirms the approach;
+     * one from elsewhere wins. With an angle, "their side" is within newcomerAngleDeg
+     * of where their box puts them; with only a side, a box near the centre counts as
+     * either side and a voice with no side as theirs.
+     */
+    private boolean sameSideAsPerson(Ears.Cue c) {
+        Detection box = target != null ? target : meetExpect != null ? meetExpect : pick != null ? pick.box : null;
+        if (box == null) {
+            return false;
+        }
+        float cx = box.centerX();
+        if (c.hasAngle()) {
+            return Math.abs(c.angleDeg - cx * tuning.cameraHalfFovDeg) <= tuning.newcomerAngleDeg;
+        }
+        if (c.side == Ears.Side.UNKNOWN || Math.abs(cx) <= tuning.centreTolerance) {
+            return true;
+        }
+        return (cx < 0) == (c.side == Ears.Side.LEFT);
+    }
+
+    /** Holds a cue for a later state, by KTD3's rule: stronger replaces, or the same tier and side, newer. */
+    private void holdCue(long now, Ears.Cue c) {
+        if (cueHeld != null) {
+            boolean stronger = c.strong() && !cueHeld.strong();
+            boolean sameSideNewer = c.tier == cueHeld.tier && c.side == cueHeld.side && c.at >= cueHeld.at;
+            if (!stronger && !sameSideNewer) {
+                dropCue("cue " + c.tier + " " + c.side + " dropped: a " + cueHeld.tier + " one is held");
+                return;
+            }
+            note("held cue replaced by a " + c.tier + " one from " + c.side);
+        } else {
+            note("cue " + c.tier + " " + c.side + " held in " + state);
+        }
+        cueHeld = c;
+        gauges.count(Gauges.Counter.CUES_HELD);
+        if (state.chats() && chat != null) {
+            chat.newcomer(sideOf(c));
+        }
+    }
+
+    private void dropCue(String why) {
+        note(why);
+        gauges.count(Gauges.Counter.CUES_DROPPED);
+    }
+
+    /** A held cue lasts cueHoldMs; past that a strong one becomes a lean-in and a weak one is dropped (KTD3). */
+    private void expireHeldCue(long now) {
+        // A newcomer held during a conversation keeps however long it runs (KTD3, R15).
+        if (cueHeld == null || state.chats() || now - cueHeld.at <= tuning.cueHoldMs) {
+            return;
+        }
+        if (cueHeld.strong()) {
+            note("held strong cue " + (now - cueHeld.at) + " ms old: now a lean-in");
+            cueHeld = new Ears.Cue(cueHeld.kind, Ears.Tier.WEAK, cueHeld.side, cueHeld.angleDeg, now);
+        } else {
+            dropCue("held cue " + (now - cueHeld.at) + " ms old: expired");
+            cueHeld = null;
+        }
+    }
+
+    /** Each step: the held cue, if the state can take it now (a hold state keeps it, a drop state loses it). */
+    private void takeHeldCue(long now) {
+        if (cueHeld == null || state.cueSearch()) {
+            return;
+        }
+        Ears.Cue c = cueHeld;
+        switch (cueVerdict(now, c)) {
+            case TAKE:
+                cueHeld = null;
+                note("taking the held cue");
+                takeCue(now, c);
+                break;
+            case CONFIRM:
+                cueHeld = null;
+                break;
+            case DROP:
+                cueHeld = null;
+                dropCue("held cue " + c.tier + " " + c.side + " dropped in " + state);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** Takes a cue: the search, or, when he cannot move or see, the wake word's meeting without a turn. */
+    private void takeCue(long now, Ears.Cue c) {
+        if (state == State.EYES_ONLY || !camera.available() || now < curiosityOffUntil) {
+            meetWithoutLooking(now, c);
+            return;
+        }
+        leaveForCue();
+        enterCueSearch(now, c, false);
+    }
+
+    /** Stops whatever the state was doing so the search can start: the wheels, a stop's pick or line, a leg plan. */
+    private void leaveForCue() {
+        stopMotors();
+        if (state.inStop()) {
+            if (pendingLine != null) {
+                note("a voice before the line started: dropping the remark");
+            } else if (pick != null) {
+                note("a voice: dropping this stop's pick");
+            }
+            clearStop();
+        }
+        hopNext = false;
+        plannedTicks = -1;
+        doorwayLeg = false;
+        lookForLeg = false;
+        steerWaitUntil = NO_WAIT;
+        escape = false;
+    }
+
+    /** CUE_TURN: the eyes glance to the side, then the first turn toward the voice (KTD4). */
+    private void enterCueSearch(long now, Ears.Cue c, boolean retarget) {
+        state = State.CUE_TURN;
+        searchCue = c;
+        searchRetargeted = retarget;
+        if (!retarget) {
+            gauges.count(Gauges.Counter.SEARCHES);
+            gauges.stamp(Gauges.Stage.CUE_AT, c.at);
+            if (!c.strong()) {
+                gauges.count(Gauges.Counter.LEAN_INS);
+            }
+        }
+        double first = firstTurnDeg(c);
+        searchPlan = lookPlan(first, c.strong());
+        searchLook = 0;
+        searchRel = 0;
+        searchTurnDoneStamped = false;
+        searchFirstTurn = true;
+        searchRemainingDeg = Math.abs(first);
+        searchTurnLeft = first < 0;
+        latestTrend = null;
+        trendSeenInStep = false;
+        show(EyeState.GLANCE, sideOf(c));
+        note((c.strong() ? "a strong cue" : "a lean-in") + " from " + c.side
+                + (c.hasAngle() ? " at " + Math.round(c.angleDeg) + " deg" : "") + ": " + searchPlan.length + " looks");
+        if (searchRemainingDeg < 1) {
+            enterCueLook(now);
+            return;
+        }
+        startCueTurnStep(now, tuning.lookLeadMs);
+    }
+
+    /** Signed degrees of the first turn (negative left): the angle when there is one, else a set amount to the side. */
+    private double firstTurnDeg(Ears.Cue c) {
+        if (c.hasAngle()) {
+            return Math.max(-180, Math.min(180, c.angleDeg));
+        }
+        switch (c.side) {
+            case LEFT:
+                return -tuning.cueTurnDefaultDeg;
+            case RIGHT:
+                return tuning.cueTurnDefaultDeg;
+            default:
+                return 0;
+        }
+    }
+
+    /**
+     * The look headings (KTD4): a strong cue cycles that side, behind, the other side
+     * for strongCueLooks looks; a weak cue that side and the opposite for weakCueLooks.
+     */
+    private double[] lookPlan(double first, boolean strong) {
+        double side = first;
+        double[] cycle;
+        if (Math.abs(side) < 1) {
+            // No side to go by: ahead, behind, then a quarter turn.
+            cycle = strong ? new double[]{0, 180, 90} : new double[]{0, 180};
+        } else {
+            double behind = side < 0 ? -180 : 180;
+            cycle = strong ? new double[]{side, behind, -side} : new double[]{side, -side};
+        }
+        int looks = strong ? tuning.strongCueLooks : tuning.weakCueLooks;
+        double[] plan = new double[looks];
+        for (int i = 0; i < looks; i++) {
+            plan[i] = cycle[i % cycle.length];
+        }
+        return plan;
+    }
+
+    /** One bounded step of the first turn: at most cueTurnStepDeg, after leadMs, on a fresh reading (LEAD). */
+    private void startCueTurnStep(long now, long leadMs) {
+        startCueTurn(now, Math.min(searchRemainingDeg, tuning.cueTurnStepDeg), searchTurnLeft, leadMs);
+    }
+
+    /** One turn of the search: deg to the left or the right, after leadMs, on a fresh reading (LEAD). */
+    private void startCueTurn(long now, double deg, boolean left, long leadMs) {
+        heading = left ? Direction.LEFT : Direction.RIGHT;
+        turnDeg = deg;
+        turnMs = timedMs(deg);
+        trendSeenInStep = false;
+        step = Step.LEAD;
+        phaseUntil = now + leadMs;
+        show(EyeState.LOOK, heading);
+    }
+
+    /** Degrees the current turn has gone: measured from the gyro, else the amount asked. */
+    private double turnedSoFar(long now) {
+        return measured && compass.usable(now) ? compass.turned() : turnDeg;
+    }
+
+    /**
+     * While the first turn runs: the newest trend ends it when the angle is under the
+     * stop band (the voice is ahead) or grew (it was behind him); otherwise it re-aims
+     * the rest of the turn.
+     */
+    private boolean trendSaysStop(long now) {
+        Ears.Trend t = latestTrend;
+        if (t == null || !searchFirstTurn) {
+            return false;
+        }
+        latestTrend = null;
+        float mag = Math.abs(t.angleDeg);
+        if (mag <= tuning.cueStopBandDeg) {
+            note("the voice is ahead: " + Math.round(t.angleDeg) + " deg");
+            return true;
+        }
+        if (t.growing()) {
+            note("the voice is behind: " + Math.round(t.angleDeg) + " deg from " + Math.round(t.previousDeg));
+            return true;
+        }
+        searchRemainingDeg = mag;
+        searchTurnLeft = t.angleDeg < 0;
+        return false;
+    }
+
+    /** A step of the first turn ended: what the trend says is left of it, else the estimate less this step. */
+    private void cueTurnStepDone(long now, double turned) {
+        searchRel += searchTurnLeft ? -turned : turned;
+        if (!searchFirstTurn) {
+            enterCueLook(now);
+            return;
+        }
+        if (!trendSeenInStep) {
+            searchRemainingDeg = Math.max(0, searchRemainingDeg - turnDeg);
+        }
+        if (searchRemainingDeg >= 1) {
+            startCueTurnStep(now, 0);
+            return;
+        }
+        enterCueLook(now);
+    }
+
+    /** CUE_LOOK: attentive eyes, the camera deciding within leanInMs of being ready (KTD4). */
+    private void enterCueLook(long now) {
+        searchFirstTurn = false;
+        if (!searchTurnDoneStamped) {
+            searchTurnDoneStamped = true;
+            gauges.stamp(Gauges.Stage.TURN_DONE, now);
+        }
+        state = State.CUE_LOOK;
+        show(EyeState.LISTENING, null);
+        step = Step.WAIT_LOOK;
+        lookAfter = now + tuning.lookSettleMs;
+        long ready = Math.max(now, cameraClosedAt + tuning.reopenGapMs);
+        lookDeadline = ready + tuning.leanInMs;
+        note("looking for a face turned toward him (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
+    }
+
+    /** A look during CUE_LOOK: a facing face ends the search in the meeting; anything else waits for the next look. */
+    private void cueLook(long now, Look look) {
+        Detection face = facingFace(look.detections);
+        if (face == null || look.jpeg == null) {
+            lookAfter = look.frameMs + 1;
+            return;
+        }
+        foundFace(now, look, face);
+    }
+
+    /** "A face turned toward him" (KTD4): the largest person box that is wide enough for its height and big enough. */
+    private Detection facingFace(List<Detection> found) {
+        Detection best = null;
+        for (Detection d : found) {
+            if (d.score < tuning.confidenceFloor || CuriosityPort.Kind.of(d.label) != CuriosityPort.Kind.PERSON) {
+                continue;
+            }
+            float h = d.height();
+            if (h <= 0 || h < tuning.facingFaceMinHeight || d.width() / h < tuning.facingFaceMinRatio) {
+                continue;
+            }
+            if (best == null || d.area() > best.area()) {
+                best = d;
+            }
+        }
+        return best;
+    }
+
+    /** A facing face: the acknowledgement plays in a clip window (KTD14) and the MEET path takes over. */
+    private void foundFace(long now, Look look, Detection face) {
+        gauges.stamp(Gauges.Stage.FACE_FOUND, now);
+        gauges.count(Gauges.Counter.FACES_FOUND);
+        note("a face turned toward him after the cue");
+        port.clipWindow(tuning.ackClipMs);
+        sound.playReaction("acknowledge");
+        Ears.Cue c = searchCue;
+        chatCueSide = c == null ? null : sideOf(c);
+        searchCue = null;
+        searchPlan = null;
+        beginPersonStop(now, look, face);
+        target = face;
+        remember(face.label, CuriosityPort.Kind.PERSON, now);
+        if (!port.canAsk()) {
+            note("no Claude to meet them with: the name clip");
+            nameClip(now);
+            return;
+        }
+        enterMeet(now, look.jpeg, face);
+    }
+
+    /** The look's budget passed with no facing face: the next look of the plan, or a quiet resume. */
+    private void cueLookOver(long now, boolean noLookAtAll) {
+        if (noLookAtAll) {
+            note("camera gave no look in time; curiosity off for " + tuning.cameraBackoffMs + " ms");
+            curiosityOffUntil = now + tuning.cameraBackoffMs;
+            quietResume(now);
+            return;
+        }
+        searchLook++;
+        if (searchLook >= searchPlan.length) {
+            quietResume(now);
+            return;
+        }
+        double delta = Heading.wrap(searchPlan[searchLook] - searchRel + 180) - 180;
+        if (Math.abs(delta) < 1) {
+            enterCueLook(now);
+            return;
+        }
+        state = State.CUE_TURN;
+        searchFirstTurn = false;
+        searchRemainingDeg = Math.abs(delta);
+        searchTurnLeft = delta < 0;
+        note("nobody facing him here: turning " + (searchTurnLeft ? "left" : "right") + " " + Math.round(Math.abs(delta))
+                + " deg for the next look");
+        startCueTurn(now, Math.abs(delta), searchTurnLeft, 0);
+    }
+
+    /** Nothing found (R3): back to wandering, nothing remembered, nothing sent. */
+    private void quietResume(long now) {
+        note("nobody facing him: carrying on");
+        gauges.count(Gauges.Counter.QUIET_RESUMES);
+        endCuriosity(now);
+    }
+
+    /**
+     * The wake word while he cannot move or cannot look (KTD8): no turn and no face,
+     * so the meeting takes the stranger's text-only lines and the guards that would
+     * send him to EYES_ONLY hold off until it ends.
+     */
+    private void meetWithoutLooking(long now, Ears.Cue c) {
+        if (!port.canAsk()) {
+            dropCue("wake word, but no Claude to meet anyone with");
+            return;
+        }
+        note("wake word while he cannot turn to it: meeting without a look");
+        gauges.stamp(Gauges.Stage.CUE_AT, c.at);
+        stopMotors();
+        if (state.inStop()) {
+            clearStop();
+        }
+        chatCueSide = sideOf(c);
+        wheellessMeeting = true;
+        beginPersonStop(now, null, UNSEEN_PERSON);
+        target = null;
+        state = State.MEET;
+        meetingHeld = true;
+        stranger = null;
+        meetLines = true;
+        show(EyeState.THINKING, null);
+        meetDeadline = now + tuning.meetTimeoutMs;
+        port.lines(tuning.meetTimeoutMs);
+    }
+
+    // ---- the conversation (meeting plan U8; KTD7-KTD10, KTD14, R16) ----
+
+    /**
+     * The conversation path is open when the ears session is listening and the
+     * adapter attached a persona snapshot to the answer (an older launcher, or no
+     * session, leaves it null: the meeting runs as it did before).
+     */
+    private boolean chatPossible(CuriosityPort.MatchAnswer a) {
+        return a.persona != null && chatLikely();
+    }
+
+    /** The ears session is listening and Claude is set up: a meeting will most likely become a conversation. */
+    private boolean chatLikely() {
+        return earsOpen && ears.listening() && port.canAsk();
+    }
+
+    /** MEET becomes the conversation (KTD8): turn 1 goes out the moment the match answered. */
+    private void enterChat(long now, CuriosityPort.MatchAnswer a) {
+        stopMotors();
+        meetingHeld = true;
+        boolean faceless = wheellessMeeting || a.faceless;
+        chatSide = chatCueSide != null ? chatCueSide : sideOfPick();
+        chatNoWheels = !leaseHeld;
+        chatStallSince = NEVER;
+        if (a.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
+            port.touch();
+        }
+        note("the meeting becomes a conversation" + (faceless ? " with nobody in view" : "") + " (" + a.status + ")");
+        chat = new ChatSession(tuning, port, chatHost);
+        state = State.CHAT_THINK;
+        syncPark();
+        chat.start(now, a, faceless);
+        state = chatState(chat.state());
+    }
+
+    private void chatStep(long now) {
+        if (chat == null) {
+            endCuriosity(now);
+            return;
+        }
+        chat.step(now);
+        state = chatState(chat.state());
+        syncPark();
+        if (chat.finished()) {
+            finishChat(now);
+        }
+    }
+
+    private static State chatState(ChatSession.State s) {
+        return State.valueOf(s.name());
+    }
+
+    /**
+     * The conversation is over: a named person joins the met list through the
+     * port's handle; an unnamed one leaves a side-and-time leave-alone (KTD10);
+     * a newcomer's held cue is taken now (R15); else the first leg turns away
+     * from them (R16), unless he is on the charger.
+     */
+    private void finishChat(long now) {
+        boolean named = chat.named();
+        boolean docked = classifier.charger();
+        peopleIgnoredUntil = now + tuning.peopleCooldownMs;
+        if (named) {
+            met.addLast(new Met(port.metId(), now));
+            note("conversation with someone named over: left alone for " + (tuning.metLeaveAloneMs / 1000) + " s ("
+                    + met.size() + " met recently)");
+        } else {
+            leaveAloneSide = chatSide;
+            leaveAloneUntil = now + tuning.unnamedLeaveAloneMs;
+            note("conversation with someone unnamed over: their side (" + chatSide + ") left alone for "
+                    + (tuning.unnamedLeaveAloneMs / 1000) + " s");
+        }
+        if (cueHeld != null) {
+            note("the newcomer's held cue is taken now");
+            cueHeld = new Ears.Cue(cueHeld.kind, cueHeld.tier, cueHeld.side, cueHeld.angleDeg, now);
+            awayLeg = null;
+        } else if (docked) {
+            note("on the charger: no resume leg");
+            awayLeg = null;
+        } else {
+            awayLeg = chatSide == null ? null : chatSide.opposite();
+        }
+        endCuriosity(now);
+        // The guards the conversation held off (KTD7) apply again at once.
+        if (!leaseHeld) {
+            enterEyesOnly("lease lost");
+        } else if (classifier.status(now) == HazardClassifier.Status.UNAVAILABLE) {
+            enterEyesOnly("sensors unavailable: " + classifier.reason());
+        }
+    }
+
+    /** The side the person is on from their box; when centred (he faces them), a random way. */
+    private Direction sideOfPick() {
+        Detection box = target != null ? target : pick != null ? pick.box : null;
+        if (box != null && Math.abs(box.centerX()) > tuning.centreTolerance) {
+            return box.centerX() < 0 ? Direction.LEFT : Direction.RIGHT;
+        }
+        return randomDirection();
+    }
+
+    /** The detector is parked through the CHAT states except for the one look the conversation asks for (KTD7). */
+    private void syncPark() {
+        boolean want = (state.chats() || state == State.MEET && chatLikely()) && !chatLookWanted;
+        if (want != parked) {
+            parked = want;
+            camera.park(parked);
+        }
+    }
+
+    /** An unnamed conversation's leave-alone (KTD10): a person on that side, within the time, is not approached. */
+    private boolean leftAlone(long now, Look look) {
+        if (leaveAloneSide == null || now >= leaveAloneUntil) {
+            leaveAloneSide = null;
+            return false;
+        }
+        Detection best = null;
+        for (Detection d : look.detections) {
+            if (CuriosityPort.Kind.of(d.label) == CuriosityPort.Kind.PERSON && (best == null || d.area() > best.area())) {
+                best = d;
+            }
+        }
+        if (best == null) {
+            return false;
+        }
+        float cx = best.centerX();
+        return Math.abs(cx) <= tuning.centreTolerance || (cx < 0) == (leaveAloneSide == Direction.LEFT);
+    }
+
+    /** What the conversation needs from the brain: the eyes, the clips, the gauges, the trace and one look. */
+    private final ChatSession.Host chatHost = new ChatSession.Host() {
+        @Override
+        public void eyes(EyeState s, Direction gaze) {
+            if (s == EyeState.STARE) {
+                stareAtPick();
+            } else {
+                show(s, gaze);
+            }
+        }
+
+        @Override
+        public void playClip(String group) {
+            sound.playReaction(group);
+        }
+
+        @Override
+        public void stamp(Gauges.Stage stage, long atMs) {
+            gauges.stamp(stage, atMs);
+        }
+
+        @Override
+        public void count(Gauges.Counter counter) {
+            gauges.count(counter);
+        }
+
+        @Override
+        public void note(String message) {
+            ExploreBrain.this.note(message);
+        }
+
+        @Override
+        public boolean looksAllowed() {
+            // The camera rule keeps its lease requirement (KTD7): without it the look is skipped.
+            return leaseHeld && !chatNoWheels && cameraOpen && camera.available() && clock.nowMs() >= curiosityOffUntil;
+        }
+
+        @Override
+        public void wantLook(boolean want) {
+            chatLookWanted = want;
+            syncPark();
+        }
+
+        @Override
+        public Look look() {
+            return camera.latest();
+        }
+
+        @Override
+        public boolean facing(Look look) {
+            return facingFace(look.detections) != null;
+        }
+
+        @Override
+        public boolean charger() {
+            return classifier.charger();
+        }
+    };
+
+    /** A cue's side as a turn direction; null when the mics tied. */
+    private static Direction sideOf(Ears.Cue c) {
+        if (c.hasAngle() && Math.abs(c.angleDeg) >= 1) {
+            return c.angleDeg < 0 ? Direction.LEFT : Direction.RIGHT;
+        }
+        switch (c.side) {
+            case LEFT:
+                return Direction.LEFT;
+            case RIGHT:
+                return Direction.RIGHT;
+            default:
+                return null;
+        }
+    }
+
     // ---- entering states ----
 
     private void enterEyesOnly(String why) {
@@ -4127,10 +5138,21 @@ final class ExploreBrain {
         heldPick = null;
         afterOrient = null;
         cues.clear();
+        searchCue = null;
+        searchPlan = null;
+        searchFirstTurn = false;
+        wheellessMeeting = false;
+        chat = null;
+        chatCueSide = null;
+        chatNoWheels = false;
+        chatStallSince = NEVER;
+        chatLookWanted = false;
+        awayLeg = null;
         if (state != State.EYES_ONLY || shownState == null) {
             note("eyes only: " + why);
         }
         state = State.EYES_ONLY;
+        syncPark();
         show(EyeState.EYES_ONLY, null);
     }
 
@@ -4252,6 +5274,38 @@ final class ExploreBrain {
     }
 
     // ---- helpers ----
+
+    /**
+     * The drive adapter's commands, each stamped with the brain's clock: the
+     * shove cue's blanking window runs from the last one (meeting plan KTD5).
+     */
+    private final class TimedMotor implements Motor {
+        private final Motor inner;
+
+        TimedMotor(Motor inner) {
+            this.inner = inner;
+        }
+
+        public void hopTick() {
+            lastMotorCommandAt = clock.nowMs();
+            inner.hopTick();
+        }
+
+        public void turn(Direction direction) {
+            lastMotorCommandAt = clock.nowMs();
+            inner.turn(direction);
+        }
+
+        public void backTick() {
+            lastMotorCommandAt = clock.nowMs();
+            inner.backTick();
+        }
+
+        public void stop() {
+            lastMotorCommandAt = clock.nowMs();
+            inner.stop();
+        }
+    }
 
     private void stopMotors() {
         if (moving) {

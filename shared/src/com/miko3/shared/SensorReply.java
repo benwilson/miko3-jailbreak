@@ -22,6 +22,7 @@ public final class SensorReply {
     private static final String LEFT = "Left=";
     private static final String RIGHT = "Right=";
     private static final String IMUGY = "IMUGY=";
+    private static final String IMUAC = "IMUAC=";
 
     private SensorReply() {
     }
@@ -56,30 +57,43 @@ public final class SensorReply {
         Long left = count(text, LEFT);
         Long right = count(text, RIGHT);
         boolean wheels = left != null && right != null;
-        int[] gyro = gyro(text);
+        int[] gyro = signedTriple(text, IMUGY);
         boolean hasGyro = gyro != null;
         if (!hasGyro) {
             gyro = new int[] {SensorSnapshot.ABSENT, SensorSnapshot.ABSENT, SensorSnapshot.ABSENT};
         }
+        int[] accel = signedTriple(text, IMUAC);
+        boolean hasAccel = accel != null;
+        if (!hasAccel) {
+            accel = new int[] {SensorSnapshot.ABSENT, SensorSnapshot.ABSENT, SensorSnapshot.ABSENT};
+        }
         return new SensorSnapshot(timestampMs, tof, ir1, ir2, wheels, wheels ? left : SensorSnapshot.ABSENT,
-                wheels ? right : SensorSnapshot.ABSENT, hasGyro, gyro[0], gyro[1], gyro[2]);
+                wheels ? right : SensorSnapshot.ABSENT, hasGyro, gyro[0], gyro[1], gyro[2],
+                hasAccel, accel[0], accel[1], accel[2]);
     }
 
-    /** The three signed gyro rates after IMUGY= ("0000000062,-000000757,0000000093"), or
-     * null unless all three read cleanly (explore nav plan U1). The section must end at
-     * the next section key: one running into the end of the reply may be cut off
-     * mid-field, and a partial rate would read as a smaller one. */
-    private static int[] gyro(String text) {
-        int start = text.indexOf(IMUGY);
+    /** The three signed fields after {@code key}: the gyro rates after IMUGY=
+     * ("0000000062,-000000757,0000000093", explore nav plan U1) or the accelerometer
+     * after IMUAC= ("-000002110,0000000295,0000023297X", meeting plan U1, KTD5). Null
+     * unless all three read cleanly. The section must end at the next section key:
+     * one running into the end of the reply may be cut off mid-field, and a partial
+     * value would read as a smaller one. Trailing 'X' padding (the live IMUAC section
+     * ends in one) is not part of the last field. */
+    private static int[] signedTriple(String text, String key) {
+        int start = text.indexOf(key);
         if (start < 0) {
             return null;
         }
-        int from = start + IMUGY.length();
+        int from = start + key.length();
         String body = sectionBody(text, from);
         if (from + body.length() >= text.length()) {
             return null;
         }
-        String[] fields = body.split(",", -1);
+        int end = body.length();
+        while (end > 0 && body.charAt(end - 1) == 'X') {
+            end--;
+        }
+        String[] fields = body.substring(0, end).split(",", -1);
         if (fields.length != 3) {
             return null;
         }
@@ -154,6 +168,22 @@ public final class SensorReply {
             end++;
         }
         return end == i ? SensorSnapshot.ABSENT : number(text.substring(i, end));
+    }
+
+    /**
+     * The charger latch after {@code reply} (meeting plan U1, KTD6). The MCU reports
+     * CPL=3 (charger connected, motion stopped; docs/hardware/motors-wheels.md) only in
+     * motion acknowledgements, so the flag is a latch: set by any reply carrying CPL=3,
+     * kept by a reply with no CPL at all (every POWER poll), and cleared only by a later
+     * acknowledgement whose CPL is another value. CPL=2 is a forward refusal and never
+     * reads as charging; it clears the latch like any other acknowledgement.
+     */
+    public static boolean chargerLatch(boolean latched, String reply) {
+        int cpl = parseCpl(reply);
+        if (cpl == 3) {
+            return true;
+        }
+        return cpl == SensorSnapshot.ABSENT ? latched : false;
     }
 
     /** A reply as the ASCII text both parsers read, so a caller parsing it twice decodes once. */

@@ -162,7 +162,10 @@ final class ClipPlayer {
                 return;
             }
             for (String name : names) {
-                if (!name.startsWith("react-") || !name.endsWith(".wav")) {
+                // The generated reactions are WAV; the conversation's line clips in his cloned
+                // voice (meeting plan U8, KTD12: acknowledge, sign-off, one-sec, deflect,
+                // nothing-kept) are Opus/WebM from scripts/gen-explore-voice.py.
+                if (!name.startsWith("react-") || !(name.endsWith(".wav") || name.endsWith(".webm"))) {
                     continue;
                 }
                 int dash = name.lastIndexOf('-');

@@ -70,9 +70,13 @@ BUILD = APP_DIR / "build"
 # System.loadLibrary()s it, and the /system/lib64 copy is out of reach behind
 # linker namespace isolation (live test: NoClassDefFoundError SensorModule).
 # Same source as build-mode-explore.py and build-mode-remote-control.py.
+# libconexant_dsp_lib.so rides the same way (meeting plan U1, KTD4): the
+# voice-direction stubs under shared/src/com/example/conexantapi/ load it for
+# VoiceDirection, which only the launcher uses (it holds the microphone).
 VENDOR_ABI = "arm64-v8a"
 VENDOR_LIB_DIR = REPO / "tools" / "serviceexam_jadx" / "resources" / "lib" / VENDOR_ABI
 DRIVER_LIB = "libmiko_drivers.so"
+DSP_LIB = "libconexant_dsp_lib.so"
 
 KEYSTORE_ALIAS = "miko3launcher"
 KEYSTORE_PASS = "miko3launcher"
@@ -102,6 +106,19 @@ LISTEN_MODEL_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr
 LISTEN_MODEL_SHA256 = "9c559283e8498d3fe95913c79ca1cb454bb26281ac2b102b41306c7d752765d9"
 LISTEN_CACHE = REPO / "tools" / "third_party" / LISTEN_MODEL
 LISTEN_PARTS = ("encoder", "decoder", "joiner")
+# Meeting plan U3, KTD2: hotwords bias nothing without the model's bpe vocabulary,
+# and the sherpa tarball ships none. The package's own bpe.model comes from the
+# icefall repository its README names (pinned), and the build writes bpe.vocab
+# from it beside tokens.txt. The Silero VAD gate's model rides along there too.
+BPE_MODEL_URL = ("https://huggingface.co/desh2608/icefall-asr-librispeech-pruned-transducer-stateless7-"
+                 "streaming-small/resolve/main/data/lang_bpe_500/bpe.model")
+BPE_MODEL_SHA256 = "c53433de083c4a6ad12d034550ef22de68cec62c4f58932a7b6b8b2f1e743fa5"
+BPE_VOCAB = "bpe.vocab"
+VAD_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+VAD_MODEL_SHA256 = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
+VAD_MODEL = "silero_vad.onnx"
+# The hotwords file lives at the APK asset root, outside the staged model directory.
+HOTWORDS = LAUNCHER_ASSETS / "hotwords.txt"
 STAMP = "stamp.txt"
 LABEL = "label.txt"
 
@@ -206,13 +223,103 @@ def extract_listen_model(tarball, out):
     return out
 
 
+def _varint(data, i):
+    shift, value = 0, 0
+    while True:
+        if i >= len(data):
+            raise BuildError("!! bpe.model is truncated")
+        b = data[i]
+        i += 1
+        value |= (b & 0x7F) << shift
+        shift += 7
+        if b < 0x80:
+            return value, i
+
+
+def _protobuf_fields(data):
+    """(field number, wire type, value) for each field of a protobuf message."""
+    i = 0
+    while i < len(data):
+        key, i = _varint(data, i)
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            value, i = _varint(data, i)
+        elif wire == 1:
+            value, i = data[i:i + 8], i + 8
+        elif wire == 2:
+            n, i = _varint(data, i)
+            value, i = data[i:i + n], i + n
+        elif wire == 5:
+            value, i = data[i:i + 4], i + 4
+        else:
+            raise BuildError(f"!! bpe.model has an unexpected protobuf wire type {wire}")
+        yield field, wire, value
+
+
+def bpe_vocab(model_bytes):
+    """bpe.vocab text from a sentencepiece bpe.model: one "piece<TAB>score" line
+    per piece in id order, what sherpa-onnx's script/export_bpe_vocab.py prints.
+    The ModelProto is decoded by hand (field 1 repeated SentencePiece{1: piece,
+    2: score}) so the build needs no sentencepiece dependency."""
+    import struct
+    lines = []
+    for field, wire, value in _protobuf_fields(model_bytes):
+        if field != 1 or wire != 2:
+            continue
+        piece, score = None, 0.0
+        for f, w, v in _protobuf_fields(value):
+            if f == 1 and w == 2:
+                piece = v.decode("utf-8")
+            elif f == 2 and w == 5:
+                score = struct.unpack("<f", v)[0]
+        if piece is not None:
+            lines.append(f"{piece}\t{score}\n")
+    if not lines:
+        raise BuildError("!! bpe.model holds no pieces; is it a sentencepiece model?")
+    return "".join(lines)
+
+
+def listen_extras(root, fetch=fetch):
+    """Writes listen/bpe.vocab (from the pinned bpe.model) and listen/silero_vad.onnx
+    beside tokens.txt under root, fetching each once. Raises BuildError, naming the
+    file, when either cannot be produced: hotwords need the vocabulary (KTD2)."""
+    root = Path(root)
+    listen = root / "listen"
+    vocab = listen / BPE_VOCAB
+    if not vocab.is_file():
+        try:
+            model = fetch(BPE_MODEL_URL, root / "bpe.model", BPE_MODEL_SHA256)
+        except BuildError as e:
+            raise BuildError(f"!! cannot stage {BPE_VOCAB}: the model package's bpe.model is unavailable\n   {e}")
+        vocab.write_text(bpe_vocab(Path(model).read_bytes()))
+    vad = listen / VAD_MODEL
+    if not vad.is_file():
+        try:
+            src = fetch(VAD_MODEL_URL, root / VAD_MODEL, VAD_MODEL_SHA256)
+        except BuildError as e:
+            raise BuildError(f"!! cannot stage {VAD_MODEL}: the Silero VAD model is unavailable\n   {e}")
+        if Path(src).resolve() != vad.resolve():
+            shutil.copy(src, vad)
+    return root
+
+
+def check_hotwords(path=HOTWORDS):
+    """The hotwords file is read by the launcher at start; a missing one fails the build."""
+    path = Path(path)
+    if not path.is_file():
+        raise BuildError(f"!! hotwords file missing: {path}\n"
+                         "   it lives at the launcher's asset root (meeting plan U3, KTD2)")
+    return path
+
+
 def listen_model(cache=LISTEN_CACHE):
-    """Asset root holding listen/ for the pinned zipformer model."""
+    """Asset root holding listen/ for the pinned zipformer model, its bpe
+    vocabulary and the VAD model."""
     root = Path(cache)
     if not all((root / "listen" / f"{p}.onnx").is_file() for p in LISTEN_PARTS):
         tarball = fetch(LISTEN_MODEL_URL, root.parent / Path(LISTEN_MODEL_URL).name, LISTEN_MODEL_SHA256)
         extract_listen_model(tarball, root)
-    return root
+    return listen_extras(root)
 
 
 def placeholder_voice(cache=SHERPA_CACHE):
@@ -246,17 +353,28 @@ def voice_stamp(voice_dir):
 
 
 def vendor_native_libs(lib_dir=None):
-    """[(abi, so_path)] for the motor-driver library, or BuildError naming the
-    missing file and the directory searched."""
-    lib = Path(lib_dir if lib_dir is not None else VENDOR_LIB_DIR) / DRIVER_LIB
-    if not lib.is_file():
+    """[(abi, so_path)] for the motor-driver and voice-direction libraries, or
+    BuildError naming the missing file and the directory searched."""
+    lib_dir = Path(lib_dir if lib_dir is not None else VENDOR_LIB_DIR)
+    driver = lib_dir / DRIVER_LIB
+    if not driver.is_file():
         raise BuildError(
-            f"!! vendor motor-driver library missing: {lib}\n"
+            f"!! vendor motor-driver library missing: {driver}\n"
             "   it comes from ServiceExam's APK (lib/arm64-v8a/); re-extract it into "
             "tools/serviceexam_jadx/resources/ (jadx) before building the launcher.\n"
             "   Without it the drive lease's DirectMotorDriver cannot load SensorModule, "
             "and the launcher crashes when a mode takes the lease.")
-    return [(VENDOR_ABI, lib)]
+    dsp = lib_dir / DSP_LIB
+    if not dsp.is_file():
+        raise BuildError(
+            f"!! vendor voice-direction library missing: {dsp}\n"
+            "   it comes from ServiceExam's APK (lib/arm64-v8a/), next to libmiko_drivers.so; "
+            "re-extract it into tools/serviceexam_jadx/resources/ (jadx) before building the launcher.\n"
+            "   Without it VoiceDirection has no backend and the ears probe reports no angle "
+            "(meeting plan U1, KTD4).")
+    # Meeting plan U3: the ears session runs the vendor wake-word engine, from the
+    # same shared list mode-voice stages.
+    return [(VENDOR_ABI, driver), (VENDOR_ABI, dsp)] + bc.wakeword_native_libs(lib_dir, "the launcher")
 
 
 def main():
@@ -266,8 +384,12 @@ def main():
                     help="fail if the toolchain is missing instead of installing it")
     args = ap.parse_args()
 
-    # Checked first, so a missing library never costs toolchain work.
+    # Checked first, so a missing library or asset never costs toolchain work.
     vendor_native_libs()
+    check_hotwords()
+    if not bc.WAKEWORD_MODEL.is_file():
+        raise BuildError(f"!! wake-word model missing: {bc.WAKEWORD_MODEL}\n"
+                         "   the ears session (meeting plan U3) needs the vendor model mode-voice ships")
     sdk = bc.find_sdk(args.sdk)
     sdk, bt, android_jar, javac, keytool = bc.ensure_toolchain(sdk, not args.no_bootstrap)
     jh = bc.java_home()
@@ -289,6 +411,9 @@ def main():
         (stamp_root / "voice" / LABEL).write_text(("stock lessac medium" if placeholder else "trained") + "\n")
         (stamp_root / "listen").mkdir()
         (stamp_root / "listen" / STAMP).write_text(voice_stamp(listen_root / "listen") + "\n")
+        # The wake-word model at the asset root, where recognizer.WakeWord looks for it
+        # (meeting plan U3): the same file mode-voice ships, never a second copy in git.
+        shutil.copy(bc.WAKEWORD_MODEL, stamp_root / bc.WAKEWORD_MODEL.name)
         bc.build_apk(
             src_dirs=[SRC, SHARED_SRC],
             manifest=MANIFEST,
@@ -303,8 +428,11 @@ def main():
             res_dir=RES,
             native_libs=native_libs,
             jars=[sherpa_jar],
+            # One id with build-mode-explore.py (meeting plan U1): the QA scripts compare
+            # the two APKs' version names to know they came from the same tree.
+            version_name=bc.build_id(),
         )
-    print(f"\n== 4/4 BUILT: {APK.relative_to(REPO)} ({APK.stat().st_size} bytes) ==")
+    print(f"\n== 4/4 BUILT: {APK.relative_to(REPO)} ({APK.stat().st_size} bytes, build {bc.build_id()}) ==")
     return 0
 
 

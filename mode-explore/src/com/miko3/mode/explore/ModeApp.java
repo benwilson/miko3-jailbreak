@@ -54,6 +54,8 @@ public class ModeApp extends Application {
     private ExploreCamera camera;
     // Claude, the launcher's voice, ears and people store at curiosity stops (explore on Claude U6).
     private ClaudeCuriosity curiosity;
+    // The launcher's continuous ears as the brain's step input (meeting plan U7, KTD1).
+    private EarsAdapter ears;
 
     /** How often the brain loop runs; well under a hop tick (ExploreBrain.onTick). */
     private static final long BRAIN_TICK_MS = 20;
@@ -176,8 +178,13 @@ public class ModeApp extends Application {
             drive.start();
             // Fetches the Claude settings now and again every stop; with none set up, stops run as before.
             curiosity = new ClaudeCuriosity(this);
+            // The ears follow the charger latch and take the accelerometer from the drive's readings.
+            ears = new EarsAdapter(this);
+            drive.setReadingListener(ears);
+            curiosity.setEars(ears);
             loop = new ExploreLoop(tuning, ExploreDrive.CLOCK, drive, drive, drive, eyes, sound, camera, curiosity,
-                    drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
+                    ears, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
+            loop.setGauges(gauges);
             loop.start();
             Log.i(TAG, "explore started");
         }
@@ -199,11 +206,14 @@ public class ModeApp extends Application {
             }
             exploring = false;
             loop.stop();
+            drive.setReadingListener(null);
+            ears.release();
             curiosity.release();
             camera.release();
             drive.release();
             clips.release();
             loop = null;
+            ears = null;
             curiosity = null;
             camera = null;
             drive = null;
@@ -247,6 +257,14 @@ public class ModeApp extends Application {
                 case THINKING:
                     setExploreState(ExploreState.of(ExploreState.THINKING));
                     break;
+                case GLANCE:
+                    // Toward the voice's side; with no side (a shove) the attentive look.
+                    setExploreState(ExploreState.of(gaze == ExploreBrain.Direction.LEFT ? ExploreState.GLANCE_LEFT
+                            : gaze == ExploreBrain.Direction.RIGHT ? ExploreState.GLANCE_RIGHT : ExploreState.LISTENING));
+                    break;
+                case LISTENING:
+                    setExploreState(ExploreState.of(ExploreState.LISTENING));
+                    break;
                 default:
                     setExploreState(ExploreState.IDLE_STATE);
                     break;
@@ -261,6 +279,19 @@ public class ModeApp extends Application {
                 c.stopSinging();
             }
             setExploreState(ExploreState.look(ExploreState.LOOK, -x, y));
+        }
+    };
+
+    /** The brain's cue counters and stage stamps land beside the state on /state (meeting plan U7, KTD14). */
+    private final ExploreBrain.Gauges gauges = new ExploreBrain.Gauges() {
+        @Override
+        public void count(ExploreBrain.Gauges.Counter counter) {
+            exploreState.count(counter.key);
+        }
+
+        @Override
+        public void stamp(ExploreBrain.Gauges.Stage stage, long atMs) {
+            exploreState.stamp(stage.key, atMs);
         }
     };
 

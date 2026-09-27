@@ -1,5 +1,7 @@
 package com.miko3.launcher;
 
+import com.miko3.shared.ConversationSettings;
+
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -485,6 +487,98 @@ public final class ClaudeSettingsHarness {
                 f.settings.save("https://other.example", KEY_B, "m1");
                 check(n, Arrays.asList("claude-a").equals(sameUrl) && f.settings.models().isEmpty(),
                         "sameUrl=" + sameUrl + " after=" + f.settings.models());
+            }
+        });
+
+        // Meeting plan U4 (KTD11, R5, R20): the persona box and the switch.
+        scenario("persona_round_trips_same_bytes", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String text = "You are Miko.\n\nDry wit; \u00e9\u00e8 \"quotes\" & <tags>.";
+                f.settings.saveConversation(text, true);
+                ConversationSettings c = f.settings.conversation();
+                ConversationSettings again = new ClaudeSettings(f.store, f.clock).conversation();
+                check(n, text.equals(c.persona) && c.personaSet && text.equals(again.persona) && again.personaSet,
+                        "got=" + c);
+            }
+        });
+
+        scenario("blank_persona_reads_as_unset_and_default", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                ConversationSettings fresh = f.settings.conversation();
+                f.settings.saveConversation("Custom.", true);
+                f.settings.saveConversation("  \n\t ", true);
+                ConversationSettings blank = f.settings.conversation();
+                f.settings.saveConversation("Custom.", true);
+                f.settings.saveConversation(null, true);
+                ConversationSettings nul = f.settings.conversation();
+                check(n, !fresh.personaSet && ClaudeSettings.DEFAULT_PERSONA.equals(fresh.persona)
+                                && !blank.personaSet && ClaudeSettings.DEFAULT_PERSONA.equals(blank.persona)
+                                && !nul.personaSet && ClaudeSettings.DEFAULT_PERSONA.equals(nul.persona)
+                                && !ClaudeSettings.DEFAULT_PERSONA.isEmpty(),
+                        "fresh=" + fresh + " blank=" + blank + " null=" + nul);
+            }
+        });
+
+        scenario("persona_over_cap_rejected_with_message", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.settings.saveConversation("Keep me.", true);
+                int commits = f.store.commits;
+                String why = null;
+                try {
+                    f.settings.saveConversation(repeat('x', ConversationSettings.MAX_PERSONA_CHARS + 1), true);
+                } catch (ClaudeSettings.InvalidException e) {
+                    why = e.getMessage();
+                }
+                check(n, why != null && why.contains(String.valueOf(ConversationSettings.MAX_PERSONA_CHARS))
+                                && !why.contains("xxxx") && f.store.commits == commits
+                                && "Keep me.".equals(f.settings.conversation().persona),
+                        "why=" + why + " persona=" + f.settings.conversation().persona);
+            }
+        });
+
+        scenario("persona_at_cap_accepted", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String text = repeat('y', ConversationSettings.MAX_PERSONA_CHARS);
+                f.settings.saveConversation(text, true);
+                check(n, text.equals(f.settings.conversation().persona), "length="
+                        + f.settings.conversation().persona.length());
+            }
+        });
+
+        scenario("persona_crlf_saved_as_lf", new Scenario() {
+            public void run(String n) throws Exception {
+                // A browser textarea posts CRLF; the prompt (and the cap) see LF.
+                Fixture f = new Fixture();
+                f.settings.saveConversation("one\r\ntwo\r\n", true);
+                check(n, "one\ntwo".equals(f.settings.conversation().persona),
+                        "got=" + f.settings.conversation().persona.replace("\r", "\\r").replace("\n", "\\n"));
+            }
+        });
+
+        scenario("answers_switch_defaults_on_and_round_trips", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                boolean fresh = f.settings.conversation().answersWhenSpokenTo;
+                f.settings.saveConversation("", false);
+                boolean off = f.settings.conversation().answersWhenSpokenTo;
+                boolean offAgain = new ClaudeSettings(f.store, f.clock).conversation().answersWhenSpokenTo;
+                f.settings.saveConversation("", true);
+                boolean on = f.settings.conversation().answersWhenSpokenTo;
+                check(n, fresh && !off && !offAgain && on, "fresh=" + fresh + " off=" + off + " on=" + on);
+            }
+        });
+
+        scenario("persona_and_switch_leave_the_key_alone", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = withKey();
+                f.settings.saveConversation("Custom.", false);
+                ClaudeSettings.Credentials c = f.settings.credentialsForRequests();
+                check(n, KEY_A.equals(c.apiKey) && "m1".equals(c.model)
+                        && !f.settings.conversation().toString().contains(KEY_A), "creds=" + c);
             }
         });
 

@@ -34,9 +34,15 @@ final class ExploreState {
     static final String RESTING = "resting";
     /** Waiting for Claude at a curiosity stop (explore on Claude R7): eyes up, a slow pulse. */
     static final String THINKING = "thinking";
+    /** Listening (meeting plan KTD12): wide, bright and still, looking for a face or hearing a reply. */
+    static final String LISTENING = "listening";
+    /** A glance toward a voice (meeting plan R3, KTD12): the eyes slide to that side and widen. */
+    static final String GLANCE_LEFT = "glance-left";
+    static final String GLANCE_RIGHT = "glance-right";
 
     /** Every state the brain publishes, for the page tests. */
-    static final String[] ALL_STATES = {IDLE, LOOK, FLINCH, EYES_ONLY, RESTING, THINKING};
+    static final String[] ALL_STATES = {IDLE, LOOK, FLINCH, EYES_ONLY, RESTING, THINKING, LISTENING, GLANCE_LEFT,
+            GLANCE_RIGHT};
 
     static final ExploreState IDLE_STATE = new ExploreState(IDLE, 0, 0);
 
@@ -86,11 +92,89 @@ final class ExploreState {
     }
 
     /**
+     * The cue counters and the stage stamps of the last meeting (meeting plan U7,
+     * KTD14), published beside the state so the owner's QA script can read them
+     * off /state. Immutable: each count or stamp makes a new one. Keys follow
+     * ExploreBrain.Gauges; lineRequested and firstSound are the conversation's (U8).
+     */
+    static final class Gauges {
+        static final String[] COUNTERS = {"cues", "strongCues", "weakCues", "leanIns", "searches", "facesFound",
+                "quietResumes", "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats"};
+        static final String[] STAGES = {"cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested",
+                "firstSound"};
+        static final Gauges NONE = new Gauges(new int[COUNTERS.length], new long[STAGES.length]);
+
+        private final int[] counts;
+        private final long[] stamps;
+
+        private Gauges(int[] counts, long[] stamps) {
+            this.counts = counts;
+            this.stamps = stamps;
+        }
+
+        /** This with the counter one higher; an unknown key changes nothing. */
+        Gauges counted(String key) {
+            int i = indexOf(COUNTERS, key);
+            if (i < 0) {
+                return this;
+            }
+            int[] c = counts.clone();
+            c[i]++;
+            return new Gauges(c, stamps);
+        }
+
+        /** This with the stage stamped at atMs (the brain's clock); an unknown key changes nothing. */
+        Gauges stamped(String key, long atMs) {
+            int i = indexOf(STAGES, key);
+            if (i < 0) {
+                return this;
+            }
+            long[] st = stamps.clone();
+            st[i] = atMs;
+            return new Gauges(counts, st);
+        }
+
+        int count(String key) {
+            int i = indexOf(COUNTERS, key);
+            return i < 0 ? 0 : counts[i];
+        }
+
+        long stamp(String key) {
+            int i = indexOf(STAGES, key);
+            return i < 0 ? 0 : stamps[i];
+        }
+
+        /** {"cues":0,...,"stages":{"cueAt":0,...}}; a stage never reached reads 0. */
+        String toJson() {
+            StringBuilder b = new StringBuilder("{");
+            for (int i = 0; i < COUNTERS.length; i++) {
+                b.append('"').append(COUNTERS[i]).append("\":").append(counts[i]).append(',');
+            }
+            b.append("\"stages\":{");
+            for (int i = 0; i < STAGES.length; i++) {
+                b.append(i == 0 ? "" : ",").append('"').append(STAGES[i]).append("\":").append(stamps[i]);
+            }
+            return b.append("}}").toString();
+        }
+
+        private static int indexOf(String[] keys, String key) {
+            for (int i = 0; i < keys.length; i++) {
+                if (keys[i].equals(key)) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+    }
+
+    /**
      * The current state, shared between the brain thread that sets it and the
      * HTTP threads that read it. A single volatile reference: reads never block.
+     * The gauges ride beside it the same way.
      */
     static final class Holder {
         private volatile ExploreState current = IDLE_STATE;
+        private volatile Gauges gauges = Gauges.NONE;
 
         void set(ExploreState state) {
             if (state == null) {
@@ -103,9 +187,23 @@ final class ExploreState {
             return current;
         }
 
-        /** /state's body. */
+        /** One more of this counter (the brain's thread; each is a fresh snapshot, so reads never block). */
+        synchronized void count(String key) {
+            gauges = gauges.counted(key);
+        }
+
+        synchronized void stamp(String key, long atMs) {
+            gauges = gauges.stamped(key, atMs);
+        }
+
+        Gauges gauges() {
+            return gauges;
+        }
+
+        /** /state's body: the state's fields plus "gauges". */
         String json() {
-            return current.toJson();
+            String state = current.toJson();
+            return state.substring(0, state.length() - 1) + ",\"gauges\":" + gauges.toJson() + "}";
         }
     }
 
@@ -132,7 +230,15 @@ final class ExploreState {
             + "#rig.s-" + RESTING + " .glow-core{animation:drowse 2.4s ease-in-out infinite alternate!important}"
             // Thinking (waiting for Claude): a slow bright-dim pulse; the gaze goes up (GAZE_JS).
             + "@keyframes ponder{from{filter:brightness(.8)}to{filter:brightness(1.25)}}"
-            + "#rig.s-" + THINKING + " .glow-core{animation:ponder 1.2s ease-in-out infinite alternate!important}";
+            + "#rig.s-" + THINKING + " .glow-core{animation:ponder 1.2s ease-in-out infinite alternate!important}"
+            // Listening (meeting plan KTD12): wide open and bright, a slow attentive swell, no blink.
+            + "@keyframes attend{from{transform:scale(1.06,1.1);filter:brightness(1.1)}"
+            + "to{transform:scale(1.1,1.16);filter:brightness(1.25)}}"
+            + "#rig.s-" + LISTENING + " .glow-core{animation:attend 1.6s ease-in-out infinite alternate!important}"
+            // A glance toward a voice: one quick widen that stays; the gaze slides to that side (GAZE_JS).
+            + "@keyframes perk{0%{transform:scale(1,1)}30%{transform:scale(1.14,1.18)}100%{transform:scale(1.06,1.08)}}"
+            + "#rig.s-" + GLANCE_LEFT + " .glow-core,#rig.s-" + GLANCE_RIGHT + " .glow-core"
+            + "{animation:perk .45s ease-out 1 forwards!important}";
 
     // The poll. setTimeout chained off each answer (not setInterval) and
     // XMLHttpRequest with a timeout, as in the voice mode, so a hung request
@@ -168,6 +274,8 @@ final class ExploreState {
     // - eyes-only / resting: glances are damped, not stopped, so the eyes never
     //   look frozen (R10).
     // - thinking: glances drift up and narrow, the look of someone pondering.
+    // - glance-left / glance-right: the eyes go to that side at once and stay there (R3).
+    // - listening: glances are nearly still, so he reads as attending to the person.
     // showExploreState is wrapped too, so a look moves the eyes the moment it
     // arrives rather than at the next glance, which can be seconds away; the
     // brain only waits ~500ms before turning (KTD10).
@@ -178,6 +286,10 @@ final class ExploreState {
             + "else if(exploreState.state==='" + FLINCH + "'){x=0;y=0;}"
             + "else if(exploreState.state==='" + EYES_ONLY + "'||exploreState.state==='" + RESTING + "'){x*=0.35;y*=0.35;}"
             + "else if(exploreState.state==='" + THINKING + "'){x*=0.4;y=-6;}"
+            // A glance holds the eyes on the voice's side (the page shows the robot's left as +x, as look does).
+            + "else if(exploreState.state==='" + GLANCE_LEFT + "'){x=10;y=0;}"
+            + "else if(exploreState.state==='" + GLANCE_RIGHT + "'){x=-10;y=0;}"
+            + "else if(exploreState.state==='" + LISTENING + "'){x*=0.3;y*=0.3;}"
             + "eyesGazeTo(x,y,speedMs);"
             + "};"
             + "var showExploreStateBase=showExploreState;"
@@ -186,6 +298,7 @@ final class ExploreState {
             + "showExploreStateBase(s);"
             + "if(s.state==='" + LOOK + "'&&(was.state!=='" + LOOK + "'||was.lookX!==s.lookX||was.lookY!==s.lookY))gazeTo(0,0,260);"
             + "else if(s.state==='" + FLINCH + "'&&was.state!=='" + FLINCH + "')gazeTo(0,0,90);"
+            + "else if((s.state==='" + GLANCE_LEFT + "'||s.state==='" + GLANCE_RIGHT + "')&&was.state!==s.state)gazeTo(0,0,180);"
             + "};";
 
     /** GET /device-view (and /): the shared eyes plus the state hook. */

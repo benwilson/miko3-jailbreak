@@ -174,6 +174,73 @@ final class ExploreTuning {
     final long meetTimeoutMs;
     final long listenMs;
     final long listenMarginMs;
+    /**
+     * Cues and the turn to the voice (meeting plan Assumptions, KTD3, KTD4; U6
+     * pins them, U7 uses them). A held cue expires after cueHoldMs and an
+     * expired strong cue degrades to a lean-in; a weak cue's lean-in has
+     * leanInMs after the camera is ready to find a face. During CHAT states a
+     * strong utterance whose latched angle magnitude exceeds newcomerAngleDeg is
+     * a newcomer cue (KTD8). CUE_TURN stops when the angle magnitude is under
+     * cueStopBandDeg or starts growing; a strong cue gets strongCueLooks looks
+     * (side, rear, other side) and a weak cue weakCueLooks (side, opposite).
+     */
+    final long cueHoldMs;
+    final long leanInMs;
+    final float newcomerAngleDeg;
+    final float cueStopBandDeg;
+    final int strongCueLooks;
+    final int weakCueLooks;
+    /**
+     * "A face turned toward him" (KTD4): a face box whose width-to-height ratio
+     * is at least facingFaceMinRatio and whose height is at least
+     * facingFaceMinHeight of the frame; profile faces are narrower and do not
+     * count. Placeholders until U2's frontal, 45-degree and profile captures at
+     * 1.5 m set them.
+     */
+    final float facingFaceMinRatio;
+    final float facingFaceMinHeight;
+    /**
+     * The turn to the voice and the shove cue (meeting plan U7; KTD4, KTD5,
+     * KTD14). CUE_TURN turns toward the side in steps of at most cueTurnStepDeg,
+     * re-reading the latched angle's trend between them; with no angle it turns
+     * cueTurnDefaultDeg toward the side the mics gave. A shove arms a weak cue
+     * only while the wheels are commanded stopped and at least shoveBlankingMs
+     * after the last motor command; "sorry" or "oops" within bumpApologyMs of a
+     * shove or a collision stop is a strong cue. The acknowledgement clip that
+     * plays when a facing face is found lasts about ackClipMs, the deaf window
+     * the port opens for it.
+     */
+    final double cueTurnStepDeg;
+    final double cueTurnDefaultDeg;
+    final long shoveBlankingMs;
+    final long bumpApologyMs;
+    final long ackClipMs;
+    /**
+     * The conversation (meeting plan Assumptions, KTD7, KTD9; U8 uses them). An
+     * unanswered listen is unansweredListenMs with no utterance, kept by the
+     * brain; two of them end the conversation. A sensor stall that persists
+     * chatStallGraceMs ends it with the local sign-off. Each turn request has
+     * turnBudgetMs, then one retry of turnRetryMs. A line is cut to sentenceCap
+     * sentences. The transcript window is transcriptWindow exchanges. The deaf
+     * window runs from a line's start to playback idle plus deafTailMs (KTD1),
+     * a default until U2 measures it.
+     */
+    final long unansweredListenMs;
+    final long chatStallGraceMs;
+    final long turnBudgetMs;
+    final long turnRetryMs;
+    final int sentenceCap;
+    final int transcriptWindow;
+    final long deafTailMs;
+    /**
+     * The conversation's line clips (U8, KTD12: the sign-off, "one sec", the
+     * deflection, "nothing kept") each get a clip window of chatClipMs, and an
+     * unnamed conversation leaves that side alone for unnamedLeaveAloneMs (KTD10).
+     */
+    final long chatClipMs;
+    final long unnamedLeaveAloneMs;
+    /** The first leg after a conversation turns this far away from the person (R16). */
+    final double chatAwayDeg;
     /** Claude's box and a detector box are the same thing at this overlap (KTD7). */
     final float pickMatchIou;
     /**
@@ -525,6 +592,29 @@ final class ExploreTuning {
         meetTimeoutMs = b.meetTimeoutMs;
         listenMs = b.listenMs;
         listenMarginMs = b.listenMarginMs;
+        cueHoldMs = Math.max(0, b.cueHoldMs);
+        leanInMs = Math.max(0, b.leanInMs);
+        newcomerAngleDeg = Math.max(0f, b.newcomerAngleDeg);
+        cueStopBandDeg = Math.max(0f, b.cueStopBandDeg);
+        strongCueLooks = Math.max(1, b.strongCueLooks);
+        weakCueLooks = Math.max(1, b.weakCueLooks);
+        facingFaceMinRatio = Math.max(0f, b.facingFaceMinRatio);
+        facingFaceMinHeight = Math.max(0f, b.facingFaceMinHeight);
+        cueTurnStepDeg = Math.max(1, b.cueTurnStepDeg);
+        cueTurnDefaultDeg = Math.max(0, b.cueTurnDefaultDeg);
+        shoveBlankingMs = Math.max(0, b.shoveBlankingMs);
+        bumpApologyMs = Math.max(0, b.bumpApologyMs);
+        ackClipMs = Math.max(0, b.ackClipMs);
+        unansweredListenMs = Math.max(1, b.unansweredListenMs);
+        chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
+        turnBudgetMs = Math.max(1, b.turnBudgetMs);
+        turnRetryMs = Math.max(0, b.turnRetryMs);
+        sentenceCap = Math.max(1, b.sentenceCap);
+        transcriptWindow = Math.max(1, b.transcriptWindow);
+        deafTailMs = Math.max(0, b.deafTailMs);
+        chatClipMs = Math.max(0, b.chatClipMs);
+        unnamedLeaveAloneMs = Math.max(0, b.unnamedLeaveAloneMs);
+        chatAwayDeg = Math.max(1, b.chatAwayDeg);
         pickMatchIou = b.pickMatchIou;
         reopenGapMs = b.reopenGapMs;
         calibration = b.calibration;
@@ -761,6 +851,39 @@ final class ExploreTuning {
         // KTD4's 6 s cap, and room for the launcher to wait out the speech queue and decode.
         private long listenMs = 6000;
         private long listenMarginMs = 6000;
+        // Meeting plan Assumptions: a held cue lasts 10 s; the lean-in has 4 s after the camera is ready;
+        // a newcomer needs an angle magnitude above 45 degrees; the turn stops inside about 10 degrees;
+        // a strong cue gets three looks and a weak cue two.
+        private long cueHoldMs = 10000;
+        private long leanInMs = 4000;
+        private float newcomerAngleDeg = 45f;
+        private float cueStopBandDeg = 10f;
+        private int strongCueLooks = 3;
+        private int weakCueLooks = 2;
+        // Placeholders until U2's captures: a frontal face box is about as wide as it is tall
+        // (0.75 to 0.85), a profile one narrower (about 0.55); 1.5 m fills about an eighth of the frame.
+        private float facingFaceMinRatio = 0.65f;
+        private float facingFaceMinHeight = 0.12f;
+        // Meeting plan U7: 45-degree steps toward the voice, a quarter turn when the mics only gave
+        // a side, half a second of blanking after a motor command, KTD3's 2 s apology window, and
+        // a short "hm?" (the asset is U8's; the window is opened either way).
+        private double cueTurnStepDeg = 45;
+        private double cueTurnDefaultDeg = 90;
+        private long shoveBlankingMs = 500;
+        private long bumpApologyMs = 2000;
+        private long ackClipMs = 600;
+        // Meeting plan Assumptions: an unanswered listen is 4 s; the chat sensor-stall grace 5 s;
+        // a turn has 5 s plus a 3 s retry; two sentences; a window of 30 exchanges; a 500 ms deaf tail.
+        private long unansweredListenMs = 4000;
+        private long chatStallGraceMs = 5000;
+        private long turnBudgetMs = 5000;
+        private long turnRetryMs = 3000;
+        private int sentenceCap = 2;
+        private int transcriptWindow = 30;
+        private long deafTailMs = 500;
+        private long chatClipMs = 1500;
+        private long unnamedLeaveAloneMs = 120000;
+        private double chatAwayDeg = 120;
         private float pickMatchIou = 0.3f;
         private long reopenGapMs = 3000;
         private Calibration calibration;
@@ -1167,6 +1290,48 @@ final class ExploreTuning {
             metCheckIntervalMs = checkIntervalMs;
             metCheckTimeoutMs = checkTimeoutMs;
             metClearedMs = clearedMs;
+            return this;
+        }
+
+        Builder cues(long holdMs, long leanInMs, float newcomerAngleDeg, float stopBandDeg, int strongLooks,
+                     int weakLooks) {
+            this.cueHoldMs = holdMs;
+            this.leanInMs = leanInMs;
+            this.newcomerAngleDeg = newcomerAngleDeg;
+            this.cueStopBandDeg = stopBandDeg;
+            this.strongCueLooks = strongLooks;
+            this.weakCueLooks = weakLooks;
+            return this;
+        }
+        Builder facingFace(float minRatio, float minHeight) {
+            this.facingFaceMinRatio = minRatio;
+            this.facingFaceMinHeight = minHeight;
+            return this;
+        }
+        Builder cueTurn(double stepDeg, double defaultDeg, long shoveBlankingMs, long bumpApologyMs, long ackClipMs) {
+            this.cueTurnStepDeg = stepDeg;
+            this.cueTurnDefaultDeg = defaultDeg;
+            this.shoveBlankingMs = shoveBlankingMs;
+            this.bumpApologyMs = bumpApologyMs;
+            this.ackClipMs = ackClipMs;
+            return this;
+        }
+        Builder chat(long unansweredListenMs, long stallGraceMs, long turnBudgetMs, long turnRetryMs, int sentenceCap,
+                     int transcriptWindow, long deafTailMs) {
+            this.unansweredListenMs = unansweredListenMs;
+            this.chatStallGraceMs = stallGraceMs;
+            this.turnBudgetMs = turnBudgetMs;
+            this.turnRetryMs = turnRetryMs;
+            this.sentenceCap = sentenceCap;
+            this.transcriptWindow = transcriptWindow;
+            this.deafTailMs = deafTailMs;
+            return this;
+        }
+
+        Builder chatClips(long chatClipMs, long unnamedLeaveAloneMs, double chatAwayDeg) {
+            this.chatClipMs = chatClipMs;
+            this.unnamedLeaveAloneMs = unnamedLeaveAloneMs;
+            this.chatAwayDeg = chatAwayDeg;
             return this;
         }
 

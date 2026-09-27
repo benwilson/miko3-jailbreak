@@ -21,9 +21,16 @@ public interface RobotSettings extends IInterface {
      * launcher's store on this call (R13), or ClaudeAccess.notSetUp(). */
     ClaudeAccess getClaudeAccess() throws RemoteException;
 
+    /** The persona text and the "answers when spoken to" switch, read from
+     * the launcher's store on this call (meeting plan U4, KTD11). Appended
+     * after getClaudeAccess; its Proxy throws UnsupportedOperationException
+     * (LauncherProtocol.LAUNCHER_TOO_OLD) when the launcher predates it. */
+    ConversationSettings getConversationSettings() throws RemoteException;
+
     abstract class Stub extends Binder implements RobotSettings {
         private static final String DESCRIPTOR = "com.miko3.shared.RobotSettings";
         static final int TRANSACTION_getClaudeAccess = 1;
+        static final int TRANSACTION_getConversationSettings = 2;
 
         public Stub() {
             attachInterface(this, DESCRIPTOR);
@@ -59,6 +66,15 @@ public interface RobotSettings extends IInterface {
                         reply.writeString(access.apiKey);
                         reply.writeString(access.model);
                     }
+                    return true;
+                }
+                case TRANSACTION_getConversationSettings: {
+                    data.enforceInterface(DESCRIPTOR);
+                    ConversationSettings c = getConversationSettings();
+                    reply.writeNoException();
+                    reply.writeString(c.persona);
+                    reply.writeInt(c.personaSet ? 1 : 0);
+                    reply.writeInt(c.answersWhenSpokenTo ? 1 : 0);
                     return true;
                 }
                 case IBinder.INTERFACE_TRANSACTION: {
@@ -97,6 +113,28 @@ public interface RobotSettings extends IInterface {
                     String apiKey = reply.readString();
                     String model = reply.readString();
                     return ClaudeAccess.setUp(baseUrl, apiKey, model);
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public ConversationSettings getConversationSettings() throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    // A launcher without this code answers false (Binder's default
+                    // onTransact) and an empty reply; name it rather than read zeros.
+                    if (!remote.transact(TRANSACTION_getConversationSettings, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    String persona = reply.readString();
+                    boolean personaSet = reply.readInt() != 0;
+                    boolean answers = reply.readInt() != 0;
+                    return new ConversationSettings(persona, personaSet, answers);
                 } finally {
                     reply.recycle();
                     data.recycle();

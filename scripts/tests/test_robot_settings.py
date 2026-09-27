@@ -9,10 +9,12 @@ reaches an adb argv, stdout, or stderr (R14). The real run on the robot is U7.
 """
 import importlib.util
 import io
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
+from html import escape
 from urllib.parse import parse_qs, quote, urlsplit
 
 REPO = Path(__file__).resolve().parents[2]
@@ -35,6 +37,7 @@ KEY = "sk-ant-api03-SECRETSECRETSECRET-wxyz"
 URL = "https://teamclaude.example.com"
 MODEL = "claude-opus-5-5"
 PORT = "53117"
+DEFAULT_PERSONA = "You are Miko, the office robot. <default>"
 
 
 def done(stdout="", returncode=0, stderr=""):
@@ -73,9 +76,11 @@ class FakeLauncher:
     """The Settings page's contract: GET /settings renders, each POST 302s to ?status=."""
 
     def __init__(self, model="", key_set=False, models=("claude-opus-5-5", "claude-haiku-5"),
-                 fail_on=None, status_override=None):
+                 fail_on=None, status_override=None, persona="", answers=True):
         self.base_url = URL if key_set else ""
         self.model = model
+        self.persona = persona
+        self.answers = answers
         self.last_four = "abcd" if key_set else ""
         self.models = []
         self.available = list(models)
@@ -94,7 +99,15 @@ class FakeLauncher:
                 '<input type="text" id="model" name="model" list="claude-models" value="%s">'
                 '<datalist id="claude-models">%s</datalist></form>'
                 '<p id="claude-key-status">%s</p>'
-                "</section></main></body></html>") % (self.base_url, self.model, opts, key_status)
+                "</section>"
+                '<section id="conversation"><form method="post" action="/settings/conversation">'
+                '<input type="hidden" name="t" value="tok123">'
+                '<textarea id="persona" name="persona"%s>%s</textarea>'
+                '<input type="checkbox" id="answers" name="answers" value="on"%s>'
+                "</form></section></main></body></html>") % (
+                    self.base_url, self.model, opts, key_status,
+                    "" if self.persona else ' data-default="1"',
+                    escape(self.persona or DEFAULT_PERSONA), " checked" if self.answers else "")
 
     def __call__(self, method, url, body=None, headers=None, timeout=None):
         parts = urlsplit(url)
@@ -119,6 +132,14 @@ class FakeLauncher:
             status = "Found %d models." % len(self.models)
         elif parts.path == "/settings/claude/test":
             status = "Connection works: %s answered." % self.model
+        elif parts.path == "/settings/conversation":
+            text = form.get("persona", "").replace("\r\n", "\n").strip()
+            if len(text) > 2500:
+                status = "Not saved: the persona is longer than 2500 characters."
+            else:
+                self.persona = text
+                self.answers = form.get("answers") == "on"
+                status = "Conversation settings saved." if text else "Saved: the built-in persona is in use."
         else:
             status = "Nothing changed: unknown action."
         if self.status_override:
@@ -418,6 +439,16 @@ class TestAndModelsCommandTest(SecrecyMixin, unittest.TestCase):
         self.assertIn("Connection works", run.stdout)
         self.assertEqual(len(run.adb.forwards_removed()), 1)
 
+    def test_test_command_reports_the_conversation_settings(self):
+        # Meeting plan U4: a persona edit on the page shows in `test`.
+        launcher = FakeLauncher(model=MODEL, key_set=True, persona="Stored.", answers=False)
+        run = Run(["test"], {}, launcher=launcher)
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertIn("Conversation: persona 7 characters, the owner's; answers when spoken to: off", run.stdout)
+        fresh = Run(["test"], {}, launcher=FakeLauncher(model=MODEL, key_set=True))
+        self.assertIn("Conversation: persona the built-in text; answers when spoken to: on", fresh.stdout)
+        self.assertNotIn("Stored.", run.stdout)
+
     def test_test_command_failure_is_nonzero(self):
         launcher = FakeLauncher(model=MODEL, key_set=True,
                                 status_override="Test failed: the key was rejected.")
@@ -440,6 +471,114 @@ class TestAndModelsCommandTest(SecrecyMixin, unittest.TestCase):
         run = Run(["models"], {}, launcher=launcher)
         self.assertNotEqual(run.code, 0)
         self.assertIn("Models not refreshed", run.stdout + run.stderr)
+
+
+class PersonaCommandTest(SecrecyMixin, unittest.TestCase):
+    """Meeting plan U4 (KTD11, R5, R20): `persona` pushes a text file and toggles
+    the switch, through the same form the page posts."""
+
+    def persona_file(self, text):
+        f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+        self.addCleanup(lambda: Path(f.name).unlink(missing_ok=True))
+        f.write(text)
+        f.close()
+        return f.name
+
+    def test_persona_file_is_posted_and_switch_kept(self):
+        launcher = FakeLauncher(persona="Old.", answers=False)
+        path = self.persona_file("Dry wit.\nKind, never cruel.\n")
+        run = Run(["persona", "--file", path], {}, launcher=launcher)
+        self.assertEqual(run.code, 0, run.stderr)
+        run.getpass.assert_not_called()
+        form = launcher.post_form("/settings/conversation")
+        self.assertEqual(form["persona"], "Dry wit.\nKind, never cruel.\n")
+        self.assertNotIn("answers", form)
+        self.assertEqual(launcher.persona, "Dry wit.\nKind, never cruel.")
+        self.assertFalse(launcher.answers)
+        self.assertIn("Conversation settings saved.", run.stdout)
+        self.assertEqual([p for p, _ in launcher.posts()], ["/settings/conversation"])
+
+    def test_switch_off_resends_the_stored_persona(self):
+        launcher = FakeLauncher(persona="Stored <b>text</b>.", answers=True)
+        run = Run(["persona", "--answers", "off"], {}, launcher=launcher)
+        self.assertEqual(run.code, 0, run.stderr)
+        form = launcher.post_form("/settings/conversation")
+        self.assertEqual(form["persona"], "Stored <b>text</b>.")
+        self.assertNotIn("answers", form)
+        self.assertEqual(launcher.persona, "Stored <b>text</b>.")
+        self.assertFalse(launcher.answers)
+        self.assertIn("off", run.stdout)
+
+    def test_switch_off_on_a_fresh_robot_keeps_the_built_in_persona(self):
+        launcher = FakeLauncher()
+        run = Run(["persona", "--answers", "off"], {}, launcher=launcher)
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual(launcher.post_form("/settings/conversation")["persona"], "")
+        self.assertEqual(launcher.persona, "")
+        self.assertFalse(launcher.answers)
+        self.assertIn("built-in", run.stdout)
+
+    def test_switch_on_with_a_file(self):
+        launcher = FakeLauncher(persona="Old.", answers=False)
+        run = Run(["persona", "--file", self.persona_file("New."), "--answers", "on"], {}, launcher=launcher)
+        self.assertEqual(run.code, 0, run.stderr)
+        form = launcher.post_form("/settings/conversation")
+        self.assertEqual((form["persona"], form.get("answers")), ("New.", "on"))
+        self.assertTrue(launcher.answers)
+
+    def test_empty_file_resets_to_the_built_in_persona(self):
+        launcher = FakeLauncher(persona="Old.")
+        run = Run(["persona", "--file", self.persona_file("  \n")], {}, launcher=launcher)
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual(launcher.post_form("/settings/conversation")["persona"], "  \n")
+        self.assertEqual(launcher.persona, "")
+        self.assertIn("built-in", run.stdout)
+
+    def test_persona_needs_a_file_or_a_switch(self):
+        run = Run(["persona"], {})
+        self.assertNotEqual(run.code, 0)
+        self.assertEqual(run.adb.calls, [])
+        self.assertIn("--file", run.stderr)
+        self.assertIn("--answers", run.stderr)
+
+    def test_persona_over_the_cap_fails_before_any_adb_command(self):
+        run = Run(["persona", "--file", self.persona_file("x" * 2501)], {})
+        self.assertNotEqual(run.code, 0)
+        self.assertEqual(run.adb.calls, [])
+        self.assertIn("2500", run.stderr)
+
+    def test_persona_at_the_cap_is_pushed(self):
+        launcher = FakeLauncher()
+        run = Run(["persona", "--file", self.persona_file("y" * 2500)], {}, launcher=launcher)
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual(len(launcher.persona), 2500)
+
+    def test_missing_file_is_readable_and_before_adb(self):
+        run = Run(["persona", "--file", "/nonexistent/persona.txt"], {})
+        self.assertNotEqual(run.code, 0)
+        self.assertEqual(run.adb.calls, [])
+        self.assertIn("persona.txt", run.stderr)
+
+    def test_robot_refusal_is_nonzero(self):
+        launcher = FakeLauncher(status_override="Not saved: the persona is longer than 2500 characters.")
+        run = Run(["persona", "--file", self.persona_file("New.")], {}, launcher=launcher)
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("Not saved", run.stdout + run.stderr)
+
+    def test_persona_flags_apply_to_persona_only(self):
+        for argv in (["test", "--file", "x.txt"], ["push", "--answers", "off"]):
+            with self.subTest(argv=argv):
+                run = Run(argv, ALL_ENV)
+                self.assertNotEqual(run.code, 0)
+                self.assertEqual(run.adb.calls, [])
+        run = Run(["persona", "--model", "m", "--file", self.persona_file("New.")], {})
+        self.assertNotEqual(run.code, 0)
+        self.assertEqual(run.adb.calls, [])
+
+    def test_forward_removed_after_persona(self):
+        run = Run(["persona", "--answers", "on"], {})
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual(len(run.adb.forwards_removed()), 1)
 
 
 class HelperTest(unittest.TestCase):

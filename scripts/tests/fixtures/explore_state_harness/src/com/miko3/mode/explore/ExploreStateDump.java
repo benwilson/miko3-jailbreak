@@ -15,5 +15,16 @@ public final class ExploreStateDump {
             System.out.println("STATE " + ExploreState.of(name).toJson());
         }
         System.out.println("STATE " + ExploreState.look(ExploreState.LOOK, -1.5, 0.25).toJson());
+        // The holder's /state body with a few gauges counted and stamped (meeting plan U7, KTD14).
+        ExploreState.Holder holder = new ExploreState.Holder();
+        holder.set(ExploreState.of(ExploreState.LISTENING));
+        holder.count("cues");
+        holder.count("cues");
+        holder.count("leanIns");
+        holder.count("not-a-counter");
+        holder.stamp("cueAt", 1234);
+        holder.stamp("firstSound", 5678);
+        holder.stamp("not-a-stage", 1);
+        System.out.println("HOLDER " + holder.json());
     }
 }

@@ -138,6 +138,8 @@ def build(sdk=None, bootstrap=True, apk_out=APK, build_dir=BUILD, keystore=KEYST
         res_dir=RES,
         native_libs=native_libs,
         jars=[ort_jar],
+        # One id with build-custom-launcher.py (meeting plan U1), compared by the QA scripts.
+        version_name=bc.build_id(),
     )
     return Path(apk_out)
 

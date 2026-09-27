@@ -18,8 +18,11 @@ package com.miko3.mode.explore;
  * within staleMs of the one before, so a flapping feed cannot bounce the robot
  * in and out of driving. Any bad reading or staleness restarts the count.
  *
- * Once available, a hazard is a calibrated threshold crossed or CPL=2 (the
- * controller refused a forward command, R9) in the latest reading.
+ * Once available, a hazard is a calibrated threshold crossed, CPL=2 (the
+ * controller refused a forward command, R9) in the latest reading, or the
+ * charger latch (CPL=3, meeting plan U1, KTD6): docked, the controller refuses
+ * every motion, so it reads as motion refused too, and charger() tells the
+ * brain which it was.
  *
  * During an approach the brain asks approach() instead (KTD4): the same ir flag
  * and CPL=2 refusal fire both for something close and for a drop-off, and the
@@ -154,10 +157,22 @@ final class HazardClassifier {
         if (cal.obstacleTofBelow >= 0 && r.tof < cal.obstacleTofBelow) {
             return new Hazard(Kind.OBSTACLE, null);
         }
-        if (r.cpl != null && r.cpl == 2) {
+        if (refused(r)) {
             return new Hazard(Kind.CPL, null);
         }
         return null;
+    }
+
+    /** The controller refused motion: a forward refusal (CPL=2) or the charger latch. */
+    private static boolean refused(SensorReading r) {
+        return (r.cpl != null && r.cpl == 2) || r.charger;
+    }
+
+    /** True while the latest reading carries the charger latch (meeting plan U1, KTD6):
+     * he is docked and no motion will be honoured. False with no reading. */
+    boolean charger() {
+        SensorReading r = latest;
+        return r != null && r.charger;
     }
 
     /**
@@ -190,14 +205,14 @@ final class HazardClassifier {
      *  - an ir edge flag or CPL=2 with tof below the band's lower bound: CLOSE;
      *    above its upper bound: EDGE; inside the band: EDGE, the safe reading;
      *  - otherwise CLEAR.
-     * A CLOSE with CPL=2 present is reported as CLOSE_REFUSED.
+     * A CLOSE with CPL=2 or the charger latch present is reported as CLOSE_REFUSED.
      */
     ApproachVerdict approach(long nowMs) {
         if (status(nowMs) == Status.UNAVAILABLE) {
             return ApproachVerdict.UNAVAILABLE;
         }
         SensorReading r = latest;
-        boolean refused = r.cpl != null && r.cpl == 2;
+        boolean refused = refused(r);
         ApproachVerdict close = refused ? ApproachVerdict.CLOSE_REFUSED : ApproachVerdict.CLOSE;
         if (r.tof == tuning.tofFault) {
             return ApproachVerdict.EDGE;

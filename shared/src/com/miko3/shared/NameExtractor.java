@@ -50,7 +50,9 @@ public final class NameExtractor {
             "thanks", "thank", "please", "and", "but", "from", "nice", "to", "here", "by", "what",
             "whats", "what's", "who", "you", "your", "the", "a", "an", "of", "in", "at", "on", "sir",
             "robot", "miko", "hi", "hello", "hey", "yes", "yeah", "ok", "okay", "too", "also", "now",
-            "then", "if", "because", "so", "um", "uh");
+            "then", "if", "because", "so", "um", "uh",
+            // Mid-conversation trailers (meeting plan U8): "I'm Sarah, by the way", "it's Priya actually".
+            "actually", "anyway", "though", "btw");
 
     /** All that may follow a bare name. */
     private static final Set<String> COURTESY = set("thanks", "thank", "you", "please");
@@ -98,6 +100,25 @@ public final class NameExtractor {
             }
         }
         return title(words.subList(start, start + n));
+    }
+
+    /**
+     * A name the conversation model says the person gave (meeting plan U8, KTD9),
+     * validated the way a spoken reply's name is: one or two words of letters (an
+     * inner apostrophe or hyphen allowed), none a word from the lists above, else
+     * null. Title-cased. "x9 lol" is no name; "Sarah" and "Mary Jane" are.
+     */
+    public static String validName(String given) {
+        List<String> words = words(given);
+        if (words.isEmpty() || words.size() > 2) {
+            return null;
+        }
+        for (String w : words) {
+            if (!isNameWord(w) || STOPS.contains(w) || FILLERS.contains(w) || COURTESY.contains(w)) {
+                return null;
+            }
+        }
+        return title(words);
     }
 
     private static String nameAt(List<String> words, int at) {

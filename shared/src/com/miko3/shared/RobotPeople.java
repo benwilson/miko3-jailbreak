@@ -18,7 +18,9 @@ import android.os.RemoteException;
  * id. touch() marks someone seen now (false for an unknown id). nameOf()
  * answers a name, "" for an unnamed person, or null once the owner has
  * forgotten them. Names never leave the launcher except through nameOf(), so
- * the match request itself carries faces only (KTD3).
+ * the match request itself carries faces only (KTD3). notesOf(), mergeNotes()
+ * and forget() (meeting plan U5, KTD10) carry a person's notes as PersonNotes
+ * JSON and wipe a person by id, never by name.
  *
  * The launcher checks the caller on every call and throws SecurityException
  * to any app that isn't one of ours, and IllegalArgumentException with a
@@ -38,6 +40,20 @@ public interface RobotPeople extends IInterface {
 
     String nameOf(String id) throws RemoteException;
 
+    /** The person's notes as PersonNotes JSON (meeting plan U5, KTD10); the
+     * empty document for an unknown id. Appended: its Proxy throws
+     * UnsupportedOperationException (LauncherProtocol.LAUNCHER_TOO_OLD) when
+     * the launcher predates it, as do mergeNotes() and forget(). */
+    String notesOf(String id) throws RemoteException;
+
+    /** Merges a delta (a PersonNotes JSON object) into the person's notes and
+     * answers the merged document. IllegalArgumentException with the store's
+     * or PersonNotes' fixed reason for an unknown id or a bad delta. */
+    String mergeNotes(String id, String deltaJson) throws RemoteException;
+
+    /** Wipes the person's face, name and notes (R18); false if unknown. */
+    boolean forget(String id) throws RemoteException;
+
     /** One remembered person's id and face, as recent() answers them. */
     final class Face {
         public final String id;
@@ -55,6 +71,9 @@ public interface RobotPeople extends IInterface {
         static final int TRANSACTION_add = 2;
         static final int TRANSACTION_touch = 3;
         static final int TRANSACTION_nameOf = 4;
+        static final int TRANSACTION_notesOf = 5;
+        static final int TRANSACTION_mergeNotes = 6;
+        static final int TRANSACTION_forget = 7;
 
         public Stub() {
             attachInterface(this, DESCRIPTOR);
@@ -112,6 +131,29 @@ public interface RobotPeople extends IInterface {
                     String name = nameOf(data.readString());
                     reply.writeNoException();
                     reply.writeString(name);
+                    return true;
+                }
+                case TRANSACTION_notesOf: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String notes = notesOf(data.readString());
+                    reply.writeNoException();
+                    reply.writeString(notes);
+                    return true;
+                }
+                case TRANSACTION_mergeNotes: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    String delta = data.readString();
+                    String merged = mergeNotes(id, delta);
+                    reply.writeNoException();
+                    reply.writeString(merged);
+                    return true;
+                }
+                case TRANSACTION_forget: {
+                    data.enforceInterface(DESCRIPTOR);
+                    boolean known = forget(data.readString());
+                    reply.writeNoException();
+                    reply.writeInt(known ? 1 : 0);
                     return true;
                 }
                 case IBinder.INTERFACE_TRANSACTION: {
@@ -203,6 +245,65 @@ public interface RobotPeople extends IInterface {
                     remote.transact(TRANSACTION_nameOf, data, reply, 0);
                     reply.readException();
                     return reply.readString();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            // The three appended calls check the transaction result: a launcher
+            // without the code answers false (Binder's default onTransact) and
+            // an empty reply, which must be named, not read as empty notes.
+
+            @Override
+            public String notesOf(String id) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    if (!remote.transact(TRANSACTION_notesOf, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readString();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public String mergeNotes(String id, String deltaJson) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeString(deltaJson);
+                    if (!remote.transact(TRANSACTION_mergeNotes, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readString();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public boolean forget(String id) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    if (!remote.transact(TRANSACTION_forget, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt() != 0;
                 } finally {
                     reply.recycle();
                     data.recycle();

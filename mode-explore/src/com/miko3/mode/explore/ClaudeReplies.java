@@ -219,6 +219,23 @@ final class ClaudeReplies {
         return line == null ? CuriosityPort.Answer.failed() : CuriosityPort.Answer.line(line);
     }
 
+    /**
+     * One conversation turn's reply (meeting plan U8, KTD9): the line, the question it
+     * asks, a name given, the advisory ending, the deflection flag and the notes delta,
+     * which the adapter hands over already serialised (null or empty: none). No line
+     * is a failure. The brain caps the sentences and validates the name.
+     */
+    static CuriosityPort.Turn turn(Map<String, Object> json, String notesUpdateJson) {
+        String line = text(json.get("line"));
+        if (line == null) {
+            return CuriosityPort.Turn.failed();
+        }
+        String notes = notesUpdateJson == null || notesUpdateJson.trim().isEmpty() || "{}".equals(notesUpdateJson.trim())
+                ? null : notesUpdateJson;
+        return CuriosityPort.Turn.line(line, text(json.get("question_asked")), text(json.get("name_given")),
+                Boolean.TRUE.equals(json.get("ends_conversation")), Boolean.TRUE.equals(json.get("deflected")), notes);
+    }
+
     /** Claude's named line with the stored name put in (the robot's side of KTD3). */
     static String fill(String namedLine, String name) {
         return namedLine.replace("{name}", name);
