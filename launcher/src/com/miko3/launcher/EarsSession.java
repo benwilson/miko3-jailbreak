@@ -26,8 +26,9 @@ import java.util.List;
  * plus the tuned tail, or for a clip window's stated duration plus the tail:
  * chunks inside it are dropped, an utterance the window cut short is
  * delivered flagged partial, and the streams are reset when it closes. An
- * utterance is delivered as {text, side, angle, tier, at, partial} when the
- * classifier gives it a tier and it carries words, the wake word or a side.
+ * utterance is delivered as {text, side, angle, tier, at, partial, kind} when
+ * the classifier gives it a tier and it carries words, the wake word or a
+ * side; kind is the classifier's naming of the cue, appended last on the wire.
  *
  * Logs counters through Diag, never words.
  */
@@ -127,20 +128,23 @@ final class EarsSession {
         final long at;
         /** True when the deaf window clipped the utterance. */
         final boolean partial;
+        /** CueClassifier.KIND_*: what the tier came from. */
+        final int kind;
 
-        Utterance(String text, int side, Float angle, int tier, long at, boolean partial) {
+        Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind) {
             this.text = text;
             this.side = side;
             this.angle = angle;
             this.tier = tier;
             this.at = at;
             this.partial = partial;
+            this.kind = kind;
         }
 
         @Override
         public String toString() {
-            return "tier " + tier + " side " + side + (partial ? " partial" : "") + " at " + at + " ("
-                    + text.length() + " chars)";
+            return "tier " + tier + " kind " + kind + " side " + side + (partial ? " partial" : "") + " at " + at
+                    + " (" + text.length() + " chars)";
         }
     }
 
@@ -523,7 +527,8 @@ final class EarsSession {
                 } else {
                     // The engine fired with the gate closed: a bare wake cue.
                     utterances++;
-                    deliver(new Utterance("", CueClassifier.SIDE_NONE, null, CueClassifier.TIER_STRONG, now, false));
+                    deliver(new Utterance("", CueClassifier.SIDE_NONE, null, CueClassifier.TIER_STRONG, now, false,
+                            CueClassifier.KIND_WAKE_WORD));
                 }
             }
             if (inSpeech) {
@@ -565,7 +570,8 @@ final class EarsSession {
         if (partial) {
             partials++;
         }
-        deliver(new Utterance(text, side, angle, tier, at, partial));
+        int kind = CueClassifier.kind(text, wasWake, tier);
+        deliver(new Utterance(text, side, angle, tier, at, partial, kind));
     }
 
     /** Caller holds feedLock. The capture is closing: nothing is delivered. */

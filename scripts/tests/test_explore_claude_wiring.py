@@ -110,21 +110,38 @@ class EarsAdapterWiringTest(unittest.TestCase):
         self.assertRegex(loop, r"new ExploreBrain\([^;]*\bears\b")
 
     def test_the_adapter_maps_every_callback_field(self):
+        """The kind is appended last on the wire (KTD1 shape, owner-approved
+        2026-09-26) and mapped here by int, never guessed from the text."""
         a = code_only(src("EarsAdapter.java"))
         self.assertIn("implements Ears, RobotEarsClient.Listener, ExploreDrive.ReadingListener", a)
         heard = re.search(r"public void onHeard\(String text, int side, float angle, int tier, long at, "
-                          r"boolean partialUtterance\)\s*\{(.*?)\n    \}", a, re.S)
+                          r"boolean partialUtterance, int kind\)\s*\{(.*?)\n    \}", a, re.S)
         self.assertIsNotNone(heard)
         body = heard.group(1)
-        self.assertIn("CueKinds.of(text, t)", body)
+        self.assertNotIn("CueKinds", a)
         self.assertIn("side == RobotEars.SIDE_LEFT", body)
         self.assertIn("side == RobotEars.SIDE_RIGHT", body)
         self.assertIn("tier == RobotEars.TIER_STRONG", body)
-        self.assertIn("new Ears.Cue(CueKinds.of(text, t), t, s, angle, at)", body)
+        self.assertIn("Ears.Kind k = kindOf(kind, t)", body)
+        self.assertIn("new Ears.Cue(k, t, s, angle, at)", body)
         self.assertIn("if (partialUtterance)", body)
         self.assertIn("partial = cue", body)
         self.assertIn("queue.addLast(cue)", body)
         self.assertIn("QUEUE_MAX", body)
+
+    def test_the_adapter_maps_all_five_kinds_and_falls_back_by_tier(self):
+        a = code_only(src("EarsAdapter.java"))
+        m = re.search(r"static Ears\.Kind kindOf\(int (\w+), Ears\.Tier (\w+)\)\s*\{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(m, "no kindOf(int, Ears.Tier)")
+        wire, tier, body = m.group(1), m.group(2), m.group(3)
+        self.assertIn("switch (" + wire + ")", body)
+        for kind in ("WAKE_WORD", "NAME", "GREETING", "APOLOGY", "VOICE"):
+            self.assertRegex(body, r"case RobotEars\.KIND_" + kind + r":\s*return Ears\.Kind\." + kind + ";")
+        default = re.search(r"default:(.*)", body, re.S)
+        self.assertIsNotNone(default)
+        self.assertIn("Log.w(", default.group(1))
+        self.assertRegex(default.group(1),
+                         tier + r" == Ears\.Tier\.STRONG \? Ears\.Kind\.GREETING : Ears\.Kind\.VOICE")
 
     def test_the_adapter_never_logs_the_text(self):
         a = code_only(src("EarsAdapter.java"))

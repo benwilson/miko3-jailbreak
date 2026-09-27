@@ -138,5 +138,53 @@ public final class CueClassifierHarness {
                         tiers(c, "HEY MIKO!", "Miko?", "Hey, buddy.") + "/" + CueClassifier.normalize("  HEY,  Miko! "));
             }
         });
+        scenario("kinds_follow_the_wake_flag_the_words_and_the_tier", new Scenario() {
+            public void run(String n) {
+                CueClassifier c = new CueClassifier(new Switch());
+                int s = CueClassifier.TIER_STRONG;
+                int w = CueClassifier.TIER_WEAK;
+                // The engine's flag is authoritative, even with words the recogniser decoded.
+                boolean wake = CueClassifier.kind("come here", true, s) == CueClassifier.KIND_WAKE_WORD
+                        && CueClassifier.kind("", true, s) == CueClassifier.KIND_WAKE_WORD;
+                // Without the flag: nothing decoded, or the phrase itself, is still the wake word.
+                boolean phrase = CueClassifier.kind("", false, s) == CueClassifier.KIND_WAKE_WORD
+                        && CueClassifier.kind("hey miko, come here", false, s) == CueClassifier.KIND_WAKE_WORD
+                        && CueClassifier.kind("Hey Miko", false, s) == CueClassifier.KIND_WAKE_WORD;
+                boolean name = CueClassifier.kind("Miko!", false, s) == CueClassifier.KIND_NAME
+                        && CueClassifier.kind("hi mikey", false, s) == CueClassifier.KIND_NAME
+                        && CueClassifier.kind("sorry miko", false, s) == CueClassifier.KIND_NAME;
+                boolean greet = CueClassifier.kind("hey buddy", false, s) == CueClassifier.KIND_GREETING
+                        && CueClassifier.kind("morning", false, s) == CueClassifier.KIND_GREETING;
+                c.shoved(5000);
+                int shoved = c.tier("oops sorry", false, false, 5800);
+                boolean apology = shoved == s && CueClassifier.kind("oops sorry", false, shoved) == CueClassifier.KIND_APOLOGY
+                        && CueClassifier.kind("sorry", false, w) == CueClassifier.KIND_APOLOGY
+                        && CueClassifier.kind("whoops!", false, w) == CueClassifier.KIND_APOLOGY;
+                boolean voice = CueClassifier.kind("", false, w) == CueClassifier.KIND_VOICE
+                        && CueClassifier.kind("the printer again", false, w) == CueClassifier.KIND_VOICE
+                        && CueClassifier.kind(null, false, w) == CueClassifier.KIND_VOICE;
+                check(n, wake && phrase && name && greet && apology && voice,
+                        "wake=" + wake + " phrase=" + phrase + " name=" + name + " greet=" + greet
+                                + " apology=" + apology + " voice=" + voice);
+            }
+        });
+        scenario("excuse_me_and_my_bad_after_a_shove_are_strong_apologies", new Scenario() {
+            public void run(String n) {
+                // The PR #18 finding: the apology phrases count too, not only the sorry words.
+                CueClassifier c = new CueClassifier(new Switch());
+                c.shoved(5000);
+                int excuse = c.tier("excuse me", false, false, 6000);
+                int myBad = c.tier("my bad", false, false, 6000);
+                CueClassifier calm = new CueClassifier(new Switch());
+                int unshoved = calm.tier("excuse me", false, false, 6000);
+                check(n, excuse == CueClassifier.TIER_STRONG && myBad == CueClassifier.TIER_STRONG
+                        && CueClassifier.kind("excuse me", false, excuse) == CueClassifier.KIND_APOLOGY
+                        && CueClassifier.kind("my bad", false, myBad) == CueClassifier.KIND_APOLOGY
+                        && unshoved == CueClassifier.TIER_WEAK
+                        && CueClassifier.kind("excuse me", false, unshoved) == CueClassifier.KIND_APOLOGY,
+                        "excuse=" + excuse + " myBad=" + myBad + " unshoved=" + unshoved + " kind="
+                                + CueClassifier.kind("excuse me", false, excuse));
+            }
+        });
     }
 }

@@ -238,7 +238,7 @@ final class ListenEngine implements ListenSession.Ears {
                         public void run() {
                             try {
                                 callback.heard(u.text, u.side, u.angle == null ? Float.NaN : u.angle, u.tier, u.at,
-                                        u.partial);
+                                        u.partial, u.kind);
                             } catch (RemoteException | RuntimeException e) {
                                 // The client is gone; its death releases the session.
                             }

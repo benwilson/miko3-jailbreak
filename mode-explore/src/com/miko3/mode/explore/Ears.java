@@ -25,8 +25,10 @@ interface Ears {
      * What the session heard (KTD3). Strong: the wake word, his name, a clear
      * greeting. Weak: a burst of voice or a half-heard word. An apology is weak
      * on its own; the brain makes it strong within 2 s of a shove or a bump.
-     * The session sets the tier; the kind is for the rules that need it (only
-     * the wake word opens a conversation in EYES_ONLY, KTD8).
+     * The session sets the tier and names the kind (it alone sees the
+     * wake-word engine and the shove clock; the kind rides its callback); the
+     * kind is for the rules that need it: only the wake word opens a
+     * conversation in EYES_ONLY (KTD8), only an apology upgrades after a shove.
      */
     enum Kind {
         WAKE_WORD(Tier.STRONG), NAME(Tier.STRONG), GREETING(Tier.STRONG), APOLOGY(Tier.WEAK), VOICE(Tier.WEAK);

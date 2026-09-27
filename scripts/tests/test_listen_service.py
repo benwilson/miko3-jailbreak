@@ -453,8 +453,47 @@ class InterfaceAndClientTest(unittest.TestCase):
                   r"void listen\(long \w+\) throws RemoteException;",
                   r"void clipWindow\(long \w+\) throws RemoteException;",
                   r"void shoved\(long \w+\) throws RemoteException;",
-                  r"void heard\(String \w+, int \w+, float \w+, int \w+, long \w+, boolean \w+\)"):
+                  r"void heard\(String \w+, int \w+, float \w+, int \w+, long \w+, boolean \w+, int \w+\)"):
             self.assertRegex(head, m)
+
+    def test_ears_callback_kind_is_appended_last_and_an_older_launcher_ends_the_session(self):
+        """Owner-approved 2026-09-26: the cue kind rides the KTD1 callback as
+        its last field. An older mode ignores the trailing int; a newer mode
+        under an older launcher finds none and ends the session once, never
+        guessing the kind from the text."""
+        src = _read(EARS_INTERFACE)
+        for name, value in (("KIND_WAKE_WORD", 0), ("KIND_NAME", 1), ("KIND_GREETING", 2), ("KIND_APOLOGY", 3),
+                            ("KIND_VOICE", 4), ("KIND_MISSING", -1)):
+            self.assertRegex(src, rf"int {name}\s*=\s*{value};")
+        stub = _method_body(src, "public boolean onTransact")
+        self.assertIsNotNone(stub)
+        self.assertRegex(stub, r"boolean partial = data\.readInt\(\) != 0;\s*"
+                               r"int kind = data\.dataAvail\(\) > 0 \? data\.readInt\(\) : KIND_MISSING;\s*"
+                               r"heard\(text, side, angle, tier, at, partial, kind\);")
+        proxy = src.split("private static class Proxy implements Callback", 1)[1]
+        self.assertRegex(proxy, r"data\.writeInt\(partial \? 1 : 0\);\s*data\.writeInt\(kind\);\s*"
+                                r"remote\.transact\(TRANSACTION_heard")
+        client = _read(EARS_CLIENT)
+        self.assertRegex(client, r"void onHeard\(String \w+, int \w+, float \w+, int \w+, long \w+, "
+                                 r"boolean \w+, int \w+\);")
+        self.assertRegex(client, r'NO_KIND\s*=\s*"the launcher\'s ears session sends no cue kind '
+                                 r'\(install both APKs together\)"')
+        heard = _method_body(client, "public void heard")
+        self.assertIsNotNone(heard)
+        self.assertRegex(heard, r"if \(kind == RobotEars\.KIND_MISSING\)\s*\{\s*lost\(NO_KIND\);\s*return;")
+        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind)", heard)
+
+    def test_ears_session_names_the_kind_and_the_engine_relays_it_last(self):
+        ears = _read(EARS)
+        self.assertRegex(ears, r"Utterance\(String \w+, int \w+, Float \w+, int \w+, long \w+, boolean \w+, "
+                               r"int kind\)")
+        self.assertIn("final int kind;", ears)
+        self.assertIn("int kind = CueClassifier.kind(text, wasWake, tier);", ears)
+        self.assertIn("new Utterance(text, side, angle, tier, at, partial, kind)", ears)
+        self.assertRegex(ears, r"new Utterance\(\"\", CueClassifier\.SIDE_NONE, null, CueClassifier\.TIER_STRONG, "
+                               r"now, false,\s*CueClassifier\.KIND_WAKE_WORD\)")
+        engine = _read(LAUNCHER / "ListenEngine.java")
+        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind\);")
 
     def test_ears_proxy_detects_an_older_launcher(self):
         """KTD11: every new proxy method checks the transaction result."""

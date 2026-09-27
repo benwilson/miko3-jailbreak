@@ -16,9 +16,14 @@ import java.util.List;
  * KTD1, KTD3, KTD5, KTD6). One RobotEarsClient per open: ClaudeCuriosity's
  * earsOpen() and earsClose() come from the brain as the charger latch clears
  * and sets, so a fresh client is bound each time (close() is terminal on the
- * client). Every heard utterance {text, side, angle, tier, at, partial} is
- * mapped onto an Ears.Cue on the client's thread and enqueued in a small
- * bounded queue the brain drains once per tick; nothing is decided here.
+ * client). Every heard utterance {text, side, angle, tier, at, partial, kind}
+ * is mapped onto an Ears.Cue on the client's thread and enqueued in a small
+ * bounded queue the brain drains once per tick; nothing is decided here. The
+ * kind arrives named by the launcher's classifier (the last field, owner's
+ * ruling 2026-09-26) and is only mapped onto Ears.Kind: the brain needs it
+ * because only the wake word opens a conversation in EYES_ONLY and only an
+ * apology upgrades after a shove, and the launcher alone sees the wake-word
+ * engine and the shove clock. No lexicon lives here.
  *
  * Partial utterances (the deaf window clipped them) are held rather than
  * enqueued: the next whole utterance within PARTIAL_JOIN_MS takes the stronger
@@ -199,12 +204,13 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     // ---- RobotEarsClient.Listener: the launcher's thread ----
 
     @Override
-    public void onHeard(String text, int side, float angle, int tier, long at, boolean partialUtterance) {
+    public void onHeard(String text, int side, float angle, int tier, long at, boolean partialUtterance, int kind) {
         Ears.Tier t = tier == RobotEars.TIER_STRONG ? Ears.Tier.STRONG : Ears.Tier.WEAK;
         Ears.Side s = side == RobotEars.SIDE_LEFT ? Ears.Side.LEFT
                 : side == RobotEars.SIDE_RIGHT ? Ears.Side.RIGHT : Ears.Side.UNKNOWN;
+        Ears.Kind k = kindOf(kind, t);
         // The DSP's angle is already signed the brain's way (VoiceDirection: negative left); NaN passes through.
-        Ears.Cue cue = new Ears.Cue(CueKinds.of(text, t), t, s, angle, at);
+        Ears.Cue cue = new Ears.Cue(k, t, s, angle, at);
         boolean words = text != null && !text.trim().isEmpty();
         Reply r = null;
         synchronized (lock) {
@@ -236,6 +242,25 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         }
         if (r != null) {
             r.heard(text);
+        }
+    }
+
+    /** The wire's RobotEars.KIND_* as an Ears.Kind; a kind this build does not know falls back by tier. */
+    static Ears.Kind kindOf(int wire, Ears.Tier tier) {
+        switch (wire) {
+            case RobotEars.KIND_WAKE_WORD:
+                return Ears.Kind.WAKE_WORD;
+            case RobotEars.KIND_NAME:
+                return Ears.Kind.NAME;
+            case RobotEars.KIND_GREETING:
+                return Ears.Kind.GREETING;
+            case RobotEars.KIND_APOLOGY:
+                return Ears.Kind.APOLOGY;
+            case RobotEars.KIND_VOICE:
+                return Ears.Kind.VOICE;
+            default:
+                Log.w(TAG, "unknown cue kind " + wire + " from the launcher; taking the tier's default");
+                return tier == Ears.Tier.STRONG ? Ears.Kind.GREETING : Ears.Kind.VOICE;
         }
     }
 
