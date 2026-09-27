@@ -1,6 +1,7 @@
 package com.miko3.launcher;
 
 import com.miko3.shared.ConversationSettings;
+import com.miko3.shared.FaceSettings;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -101,6 +102,21 @@ public final class ClaudeSettingsHarness {
         Fixture f = new Fixture();
         f.settings.save(ClaudeSettings.DEFAULT_BASE_URL, KEY_A, "m1");
         return f;
+    }
+
+    /** The face-settings refusal message, or null when the save went through. */
+    private static String faceRefusal(ClaudeSettings s, FaceSettings f) {
+        try {
+            s.saveFace(f);
+            return null;
+        } catch (ClaudeSettings.InvalidException e) {
+            return e.getMessage();
+        }
+    }
+
+    private static FaceSettings face(float confident, float close, float margin, int minWidth, double darkFloor,
+                                     double dimLevel, double blurFloor) {
+        return new FaceSettings(confident, close, margin, minWidth, darkFloor, dimLevel, blurFloor);
     }
 
     public static void main(String[] args) {
@@ -579,6 +595,117 @@ public final class ClaudeSettingsHarness {
                 ClaudeSettings.Credentials c = f.settings.credentialsForRequests();
                 check(n, KEY_A.equals(c.apiKey) && "m1".equals(c.model)
                         && !f.settings.conversation().toString().contains(KEY_A), "creds=" + c);
+            }
+        });
+
+        // Face plan U5 (KTD5): band and gate thresholds beside the Claude settings.
+        scenario("face_settings_default_to_the_starting_values", new Scenario() {
+            public void run(String n) {
+                FaceSettings d = new Fixture().settings.faceSettings();
+                check(n, d.confident == 0.50f && d.close == 0.363f && d.margin == 0.05f && d.minWidth == 48
+                        && d.darkFloor == 40 && d.dimLevel == 90 && d.blurFloor == 30, "got=" + d);
+            }
+        });
+
+        scenario("face_settings_round_trip_and_survive_a_new_instance", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.settings.saveFace(face(0.61f, 0.4f, 0.07f, 60, 35, 100, 42.5));
+                FaceSettings again = new ClaudeSettings(f.store, f.clock).faceSettings();
+                check(n, again.confident == 0.61f && again.close == 0.4f && again.margin == 0.07f
+                        && again.minWidth == 60 && again.darkFloor == 35 && again.dimLevel == 100
+                        && again.blurFloor == 42.5 && f.store.commits == 1, "got=" + again + " commits=" + f.store.commits);
+            }
+        });
+
+        scenario("face_save_close_above_confident_refused_and_unchanged", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.settings.saveFace(face(0.55f, 0.4f, 0.05f, 48, 40, 90, 30));
+                String before = f.settings.faceSettings().toString();
+                String why = faceRefusal(f.settings, face(0.5f, 0.6f, 0.05f, 48, 40, 90, 30));
+                check(n, ClaudeSettings.FACE_REFUSE_BANDS.equals(why)
+                        && before.equals(f.settings.faceSettings().toString()), "why=" + why);
+            }
+        });
+
+        scenario("face_save_dark_floor_above_dim_level_refused_and_unchanged", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String why = faceRefusal(f.settings, face(0.5f, 0.363f, 0.05f, 48, 95, 90, 30));
+                String same = faceRefusal(f.settings, face(0.5f, 0.363f, 0.05f, 48, 90, 90, 30));
+                check(n, ClaudeSettings.FACE_REFUSE_LUMA.equals(why) && ClaudeSettings.FACE_REFUSE_LUMA.equals(same)
+                        && f.store.commits == 0 && f.settings.faceSettings().darkFloor == 40, "why=" + why + " same=" + same);
+            }
+        });
+
+        scenario("face_save_out_of_range_values_refused", new Scenario() {
+            public void run(String n) {
+                Fixture f = new Fixture();
+                List<String> wrong = new ArrayList<String>();
+                FaceSettings[] bad = {
+                    face(1.1f, 0.3f, 0.05f, 48, 40, 90, 30), face(0.5f, -0.1f, 0.05f, 48, 40, 90, 30),
+                    face(Float.NaN, 0.3f, 0.05f, 48, 40, 90, 30), face(0.5f, 0.3f, 0.31f, 48, 40, 90, 30),
+                    face(0.5f, 0.3f, -0.01f, 48, 40, 90, 30), face(0.5f, 0.3f, 0.05f, 15, 40, 90, 30),
+                    face(0.5f, 0.3f, 0.05f, 641, 40, 90, 30), face(0.5f, 0.3f, 0.05f, 48, -1, 90, 30),
+                    face(0.5f, 0.3f, 0.05f, 48, 40, 256, 30), face(0.5f, 0.3f, 0.05f, 48, 40, 90, -1),
+                    face(0.5f, 0.3f, 0.05f, 48, 40, 90, Double.POSITIVE_INFINITY),
+                    face(0.5f, 0.3f, 0.05f, 48, Double.NaN, 90, 30),
+                };
+                for (FaceSettings b : bad) {
+                    if (faceRefusal(f.settings, b) == null) {
+                        wrong.add(b.toString());
+                    }
+                }
+                check(n, wrong.isEmpty() && f.store.commits == 0, "accepted " + wrong);
+            }
+        });
+
+        scenario("face_save_edges_accepted", new Scenario() {
+            public void run(String n) {
+                Fixture f = new Fixture();
+                List<String> wrong = new ArrayList<String>();
+                FaceSettings[] edges = {
+                    face(0.5f, 0.5f, 0.3f, 16, 0, 255, 0), face(1f, 0f, 0f, 640, 254, 255, 1000),
+                };
+                for (FaceSettings e : edges) {
+                    String why = faceRefusal(f.settings, e);
+                    if (why != null) {
+                        wrong.add(e + "->" + why);
+                    }
+                }
+                check(n, wrong.isEmpty(), wrong.toString());
+            }
+        });
+
+        scenario("face_refusals_are_fixed_text", new Scenario() {
+            public void run(String n) {
+                Fixture f = new Fixture();
+                String why = faceRefusal(f.settings, face(0.5f, 0.3f, 0.05f, 12345, 40, 90, 30));
+                check(n, ClaudeSettings.FACE_REFUSE_WIDTH.equals(why) && !why.contains("12345"), "why=" + why);
+            }
+        });
+
+        scenario("corrupt_stored_face_value_reads_as_defaults", new Scenario() {
+            public void run(String n) {
+                Fixture f = new Fixture();
+                f.store.values.put(ClaudeSettings.KEY_FACE_CONFIDENT, "lots");
+                FaceSettings a = f.settings.faceSettings();
+                f.store.values.put(ClaudeSettings.KEY_FACE_CONFIDENT, "0.2");
+                // 0.2 is below the stored-default close of 0.363: an invalid set reads as the defaults.
+                FaceSettings b = f.settings.faceSettings();
+                check(n, a.toString().equals(FaceSettings.DEFAULTS.toString())
+                        && b.toString().equals(FaceSettings.DEFAULTS.toString()), "a=" + a + " b=" + b);
+            }
+        });
+
+        scenario("face_settings_leave_the_key_alone", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = withKey();
+                f.settings.saveFace(face(0.6f, 0.4f, 0.05f, 48, 40, 90, 30));
+                ClaudeSettings.Credentials c = f.settings.credentialsForRequests();
+                check(n, KEY_A.equals(c.apiKey) && "m1".equals(c.model)
+                        && !f.settings.faceSettings().toString().contains(KEY_A), "creds=" + c);
             }
         });
 

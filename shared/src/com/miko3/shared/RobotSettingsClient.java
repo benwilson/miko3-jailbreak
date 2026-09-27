@@ -14,10 +14,11 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * How a mode reads the robot's settings from the launcher (settings plan U5,
- * R13; meeting plan U4, KTD11): bind RobotSettingsService, fetch once,
- * unbind. Call it before each Claude request (or each conversation, or each
- * cue) rather than caching the answer, so a change on the Settings page
- * applies to the mode's next request (AE5).
+ * R13; meeting plan U4, KTD11; face plan U5, KTD5): bind
+ * RobotSettingsService, fetch once, unbind. Call it before each Claude
+ * request (or each conversation, cue or meeting) rather than caching the
+ * answer, so a change on the Settings page applies to the mode's next
+ * request (AE5).
  *
  * Blocks, so call it from a worker thread: onServiceConnected() arrives on
  * the main thread, and waiting for it there would deadlock.
@@ -68,6 +69,25 @@ public final class RobotSettingsClient {
 
     public static ConversationSettings fetchConversation(Context context) throws IOException {
         return fetchConversation(context, DEFAULT_TIMEOUT_MS);
+    }
+
+    /**
+     * The face band and gate thresholds (face plan U5, KTD5), read fresh at
+     * each meeting so an edit applies from the next one. Throws IOException
+     * with a fixed message when the launcher can't be reached, turns this app
+     * away, or is too old to answer (LauncherProtocol.LAUNCHER_TOO_OLD).
+     */
+    public static FaceSettings fetchFaceSettings(Context context, long timeoutMs) throws IOException {
+        return call(context, timeoutMs, new Call<FaceSettings>() {
+            @Override
+            public FaceSettings run(RobotSettings settings) throws RemoteException {
+                return settings.getFaceSettings();
+            }
+        });
+    }
+
+    public static FaceSettings fetchFaceSettings(Context context) throws IOException {
+        return fetchFaceSettings(context, DEFAULT_TIMEOUT_MS);
     }
 
     private static <T> T call(Context context, long timeoutMs, Call<T> call) throws IOException {

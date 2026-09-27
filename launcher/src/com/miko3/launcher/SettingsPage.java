@@ -2,8 +2,11 @@ package com.miko3.launcher;
 
 import com.miko3.shared.ClaudeApi;
 import com.miko3.shared.ConversationSettings;
+import com.miko3.shared.FaceCheck;
+import com.miko3.shared.FaceSettings;
 import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
+import com.miko3.shared.Json;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.PageToken;
 import com.miko3.shared.PersonNotes;
@@ -17,7 +20,9 @@ import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -38,6 +43,16 @@ import java.util.Map;
  * button that deletes face, name and notes. The same page serves the robot's
  * own WebView and a LAN browser.
  *
+ * Face plan U5 (KTD5, KTD8; R13-R15, R19) adds the Face checks section (the
+ * last few checks from FaceChecks, newest first: the crop, the best match's
+ * photo and name, the score, the decision and what happened next), a
+ * read-only Face thresholds block, and per person a strip of their photos
+ * with a delete control for one photo and a mark on photos with no findable
+ * face. Two more routes serve host tooling (scripts/robot-faces.py): the
+ * thresholds save, which takes loopback callers only (the CLI arrives over
+ * adb forward, so nobody on the office network can set confident to 0), and
+ * a token-protected JSON view of the checks, people and thresholds.
+ *
  * Follows voice mode's SettingsPage pattern: every action is a POST that
  * answers with a redirect to "/settings?status=<message>", and the GET that
  * follows re-renders from what is actually stored. Status messages are fixed
@@ -45,10 +60,12 @@ import java.util.Map;
  * that was typed (KTD6), so a refused URL or key never lands in a URL, and
  * a person's name never does either.
  *
- * Faces: the page's <img> tags load SETTINGS_PEOPLE_FACE_PATH?id=<id>, the
- * one GET besides the page itself. It is under SETTINGS_PATH, so TLS-only,
- * and PeopleStore accepts only its own 16-hex-digit id shape before it
- * touches a file, so the id can't name any other file.
+ * Faces: the page's <img> tags load SETTINGS_PEOPLE_FACE_PATH?id=<id>,
+ * SETTINGS_PEOPLE_PHOTO_PATH (id, slot and added-at time) and
+ * SETTINGS_FACE_CHECK_CROP_PATH?id=<handle>, the only GETs besides the page
+ * itself. They are under SETTINGS_PATH, so TLS-only, and PeopleStore accepts
+ * only its own 16-hex-digit id shape before it touches a file, so the id
+ * can't name any other file. A check's crop lives only in memory.
  *
  * Secrecy (R4, R14): the page renders only from ClaudeSettings.status(), and
  * the key input is always empty. The key arrives only in a POST body, and
@@ -90,6 +107,25 @@ final class SettingsPage {
     static final String PEOPLE_LEGACY = "Legacy record: no name, so he no longer matches this face or keeps notes "
             + "on it. Give them a name, or Forget deletes it.";
 
+    // Face plan U5: fixed text for the face checks, photos and thresholds.
+    static final String CHECKS_EMPTY = "No face checks since the launcher started.";
+    static final String CHECK_PHOTO_REPLACED = "That photo has since been replaced.";
+    static final String CHECK_PERSON_GONE = "That person is no longer remembered.";
+    static final String NEAR_TIE = "Near tie with";
+    static final String PHOTO_UNUSABLE = "No face found in this photo: it is not used for matching. Delete it, "
+            + "and he will take a new one.";
+    static final String PHOTO_DELETED = "Photo deleted.";
+    static final String PHOTO_LAST = "Nothing changed: a person keeps at least one photo. Forget removes them.";
+    static final String PHOTO_UNKNOWN = "Nothing changed: that photo is not stored.";
+    static final String FACE_THRESHOLDS_SAVED = "Face thresholds saved; they apply from the next meeting.";
+    static final String FACE_NOT_A_NUMBER = "Not saved: every face threshold must be a number.";
+    static final String FACE_THRESHOLDS_LOOPBACK_ONLY = "Face thresholds can only be set from the robot itself "
+            + "(scripts/robot-faces.py over adb).";
+    /** What the photo route answers for a slot whose photo was replaced or deleted. */
+    static final String REPLACED_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"112\" height=\"112\" "
+            + "viewBox=\"0 0 112 112\"><rect width=\"112\" height=\"112\" fill=\"#ddd\"/>"
+            + "<text x=\"56\" y=\"60\" font-size=\"14\" text-anchor=\"middle\" fill=\"#555\">replaced</text></svg>";
+
     /**
      * The robot's voice, as the Voice section sees it. LauncherApp backs it
      * with SpeechEngine's queue in-process; the host harness fakes it.
@@ -111,19 +147,27 @@ final class SettingsPage {
 
     /** Every settings route. GET the page; POST an action with the page token. */
     static void handle(HttpRequest req, HttpResponse res, PageToken token, ClaudeSettings settings,
-                       ClaudeApi api, Speaker speaker, PeopleStore people) throws IOException {
+                       ClaudeApi api, Speaker speaker, PeopleStore people, FaceChecks checks) throws IOException {
         if (LauncherProtocol.SETTINGS_PATH.equals(req.path)) {
             if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
                 res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
                 return;
             }
             res.sendText(200, "OK", "text/html; charset=utf-8", buildHtml(token.issue(), settings.status(),
-                    settings.models(), settings.conversation(), speaker.voiceName(), people,
-                    req.queryParam("status", null)));
+                    settings.models(), settings.conversation(), speaker.voiceName(), people, checks,
+                    settings.faceSettings(), req.queryParam("status", null)));
             return;
         }
         if (LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH.equals(req.path)) {
             sendFace(req, res, people);
+            return;
+        }
+        if (LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH.equals(req.path)) {
+            sendPhoto(req, res, people);
+            return;
+        }
+        if (LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH.equals(req.path)) {
+            sendCheckCrop(req, res, checks);
             return;
         }
         // The action paths never act on a GET, so nothing in a URL (which the
@@ -132,13 +176,21 @@ final class SettingsPage {
             res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "POST only");
             return;
         }
-        String status = act(req.path, readForm(req), token, settings, api, speaker, people);
+        if (LauncherProtocol.SETTINGS_FACE_STATE_PATH.equals(req.path)) {
+            sendFaceState(req, res, token, settings, people, checks);
+            return;
+        }
+        if (LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH.equals(req.path)) {
+            saveThresholds(req, res, token, settings);
+            return;
+        }
+        String status = act(req.path, readForm(req), token, settings, api, speaker, people, checks);
         res.redirect(LauncherProtocol.SETTINGS_PATH + "?status=" + urlEncode(status));
     }
 
     /** Runs one action; returns the status line to show. */
     static String act(String path, Map<String, String> form, PageToken token, ClaudeSettings settings,
-                      ClaudeApi api, Speaker speaker, PeopleStore people) {
+                      ClaudeApi api, Speaker speaker, PeopleStore people, FaceChecks checks) {
         if (form == null) {
             return "Nothing changed: the form was too large.";
         }
@@ -168,7 +220,10 @@ final class SettingsPage {
             return rename(form.get("id"), form.get("name"), people);
         }
         if (LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH.equals(path)) {
-            return forget(form.get("id"), people);
+            return forget(form.get("id"), people, checks);
+        }
+        if (LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH.equals(path)) {
+            return deletePhoto(form.get("id"), form.get("slot"), people);
         }
         return "Nothing changed: unknown action.";
     }
@@ -199,8 +254,260 @@ final class SettingsPage {
         return people.nameOf(id).isEmpty() ? PEOPLE_UNNAMED : PEOPLE_RENAMED;
     }
 
-    private static String forget(String id, PeopleStore people) {
-        return people.forget(id) ? PEOPLE_FORGOTTEN : PEOPLE_UNKNOWN;
+    private static String forget(String id, PeopleStore people, FaceChecks checks) {
+        boolean known = people.forget(id);
+        // R19: every check that matched or joined them goes too.
+        checks.purgePerson(id);
+        return known ? PEOPLE_FORGOTTEN : PEOPLE_UNKNOWN;
+    }
+
+    /** One photo by id and slot (KTD8); refused for the last one, since a
+     * person with no photo would not load again. Fixed text only. */
+    private static String deletePhoto(String id, String slotText, PeopleStore people) {
+        int slot = parseSlot(slotText);
+        if (slot < 0) {
+            return PHOTO_UNKNOWN;
+        }
+        try {
+            return people.deletePhoto(id, slot) ? PHOTO_DELETED : PHOTO_UNKNOWN;
+        } catch (IllegalArgumentException e) {
+            // PeopleStore.REFUSE_LAST_PHOTO is its only refusal here.
+            return PHOTO_LAST;
+        }
+    }
+
+    /** A slot index 0 to PeopleStore.MAX_PHOTOS - 1, or -1. */
+    private static int parseSlot(String text) {
+        if (text == null || !text.matches("[0-9]")) {
+            return -1;
+        }
+        int slot = Integer.parseInt(text);
+        return slot < PeopleStore.MAX_PHOTOS ? slot : -1;
+    }
+
+    /**
+     * The photo at ?id=&slot= while that slot still holds the photo added at
+     * ?at= (KTD8); otherwise, replaced or deleted since, a "replaced"
+     * placeholder, never the newer photo. 404 for a malformed request or an
+     * unknown person.
+     */
+    private static void sendPhoto(HttpRequest req, HttpResponse res, PeopleStore people) throws IOException {
+        if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
+            res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
+            return;
+        }
+        String id = req.queryParam("id", null);
+        int slot = parseSlot(req.queryParam("slot", null));
+        long at = parseLong(req.queryParam("at", null));
+        if (!PeopleStore.isValidId(id) || slot < 0 || at < 0 || people.nameOf(id) == null) {
+            res.sendText(404, "Not Found", "text/plain; charset=utf-8", "No such photo.");
+            return;
+        }
+        byte[] jpeg = currentAddedAt(people.photos(id), slot) == at ? people.photo(id, slot) : null;
+        // The slot may change between the two reads; check once more after.
+        if (jpeg == null || currentAddedAt(people.photos(id), slot) != at) {
+            res.sendText(200, "OK", "image/svg+xml", REPLACED_SVG);
+            return;
+        }
+        res.sendBytes(200, "OK", "image/jpeg", jpeg);
+    }
+
+    /** The slot's photo's added-at time, or -1 when the slot is empty. */
+    private static long currentAddedAt(List<PeopleStore.Photo> photos, int slot) {
+        for (PeopleStore.Photo p : photos) {
+            if (p.slot == slot) {
+                return p.addedAtMillis;
+            }
+        }
+        return -1;
+    }
+
+    /** A check's crop by ?id=<handle>, or 404 once it has rolled off or had none. */
+    private static void sendCheckCrop(HttpRequest req, HttpResponse res, FaceChecks checks) throws IOException {
+        if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
+            res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
+            return;
+        }
+        long handle = parseLong(req.queryParam("id", null));
+        byte[] crop = handle > 0 ? checks.crop(handle) : null;
+        if (crop == null) {
+            res.sendText(404, "Not Found", "text/plain; charset=utf-8", "No such face check.");
+            return;
+        }
+        res.sendBytes(200, "OK", "image/jpeg", crop);
+    }
+
+    /** A non-negative decimal of at most 18 digits, or -1. */
+    private static long parseLong(String text) {
+        return text != null && text.matches("[0-9]{1,18}") ? Long.parseLong(text) : -1;
+    }
+
+    /**
+     * The thresholds save (KTD5). Loopback callers only, checked before the
+     * body is read; then the page token, as every action. Fields left out keep
+     * their stored value, and the whole set must pass ClaudeSettings'
+     * rules or nothing is stored. Redirects with a fixed status, like the
+     * page's own forms, so the CLI reads the result the same way.
+     */
+    private static void saveThresholds(HttpRequest req, HttpResponse res, PageToken token, ClaudeSettings settings)
+            throws IOException {
+        if (!req.fromLoopback) {
+            res.sendText(403, "Forbidden", "text/plain; charset=utf-8", FACE_THRESHOLDS_LOOPBACK_ONLY + "\n");
+            return;
+        }
+        Map<String, String> form = readForm(req);
+        String status;
+        if (form == null) {
+            status = "Nothing changed: the form was too large.";
+        } else if (!token.check(form.get("t"))) {
+            status = "Nothing changed: this page had expired. Try again.";
+        } else {
+            status = saveFace(form, settings);
+        }
+        res.redirect(LauncherProtocol.SETTINGS_PATH + "?status=" + urlEncode(status));
+    }
+
+    private static String saveFace(Map<String, String> form, ClaudeSettings settings) {
+        FaceSettings now = settings.faceSettings();
+        FaceSettings next;
+        try {
+            next = new FaceSettings(
+                    floatField(form, "confident", now.confident), floatField(form, "close", now.close),
+                    floatField(form, "margin", now.margin), intField(form, "min_width", now.minWidth),
+                    doubleField(form, "dark_floor", now.darkFloor), doubleField(form, "dim_level", now.dimLevel),
+                    doubleField(form, "blur_floor", now.blurFloor));
+        } catch (NumberFormatException e) {
+            return FACE_NOT_A_NUMBER;
+        }
+        try {
+            settings.saveFace(next);
+        } catch (ClaudeSettings.InvalidException e) {
+            // Fixed text by contract (ClaudeSettings), never what was typed.
+            return "Not saved: " + e.getMessage();
+        }
+        return FACE_THRESHOLDS_SAVED;
+    }
+
+    private static float floatField(Map<String, String> form, String name, float current) {
+        String v = trimmed(form.get(name));
+        return v.isEmpty() ? current : Float.parseFloat(number(v));
+    }
+
+    private static double doubleField(Map<String, String> form, String name, double current) {
+        String v = trimmed(form.get(name));
+        return v.isEmpty() ? current : Double.parseDouble(number(v));
+    }
+
+    private static int intField(Map<String, String> form, String name, int current) {
+        String v = trimmed(form.get(name));
+        return v.isEmpty() ? current : Integer.parseInt(v);
+    }
+
+    /** Plain decimals only: Java would also parse "NaN", "Infinity" and "1f". */
+    private static String number(String v) {
+        if (!v.matches("-?[0-9]{1,6}(\\.[0-9]{1,6})?")) {
+            throw new NumberFormatException();
+        }
+        return v;
+    }
+
+    private static String trimmed(String s) {
+        return s == null ? "" : s.trim();
+    }
+
+    /**
+     * The JSON view for scripts/robot-faces.py (R15): the checks newest first
+     * with names, people with photo counts, and the thresholds; never an
+     * image. POST with the page token in the body; 403 without it.
+     */
+    private static void sendFaceState(HttpRequest req, HttpResponse res, PageToken token, ClaudeSettings settings,
+                                      PeopleStore people, FaceChecks checks) throws IOException {
+        Map<String, String> form = readForm(req);
+        if (form == null || !token.check(form.get("t"))) {
+            res.sendText(403, "Forbidden", "text/plain; charset=utf-8", "page token missing or expired\n");
+            return;
+        }
+        res.sendText(200, "OK", "application/json; charset=utf-8",
+                faceStateJson(settings.faceSettings(), people, checks) + "\n");
+    }
+
+    static String faceStateJson(FaceSettings f, PeopleStore store, FaceChecks checks) {
+        Map<String, Object> th = new LinkedHashMap<String, Object>();
+        th.put("confident", decimal(f.confident));
+        th.put("close", decimal(f.close));
+        th.put("margin", decimal(f.margin));
+        th.put("min_width", f.minWidth);
+        th.put("dark_floor", f.darkFloor);
+        th.put("dim_level", f.dimLevel);
+        th.put("blur_floor", f.blurFloor);
+
+        List<Object> checkRows = new ArrayList<Object>();
+        for (FaceChecks.Entry e : checks.list()) {
+            FaceCheck c = e.check;
+            Map<String, Object> row = new LinkedHashMap<String, Object>();
+            row.put("handle", e.handle);
+            row.put("at_ms", e.atMillis);
+            row.put("decision", decisionName(c.decision));
+            row.put("reason", reasonText(c.rejectReason));
+            row.put("has_crop", c.cropJpeg != null);
+            row.put("best_id", c.bestId);
+            row.put("best_name", c.bestId.isEmpty() ? "" : nameOrEmpty(store, c.bestId));
+            row.put("best_slot", c.bestSlot);
+            row.put("best_photo", bestPhotoState(store, c));
+            row.put("score", decimal(c.score));
+            row.put("runner_up_id", c.runnerUpId);
+            row.put("runner_up_name", c.runnerUpId.isEmpty() ? "" : nameOrEmpty(store, c.runnerUpId));
+            row.put("runner_up_score", c.runnerUpId.isEmpty() ? null : decimal(c.runnerUpScore));
+            row.put("near_tie", c.nearTie);
+            row.put("outcome", outcomeText(e.outcome));
+            row.put("joined_id", e.joinedId);
+            row.put("joined_name", e.joinedId.isEmpty() ? "" : nameOrEmpty(store, e.joinedId));
+            checkRows.add(row);
+        }
+
+        List<Object> peopleRows = new ArrayList<Object>();
+        for (PeopleStore.Person p : store.all()) {
+            int unusable = 0;
+            int embedded = 0;
+            List<PeopleStore.Photo> photos = store.photos(p.id);
+            for (PeopleStore.Photo ph : photos) {
+                unusable += ph.unusable ? 1 : 0;
+                embedded += ph.embedding != null ? 1 : 0;
+            }
+            Map<String, Object> row = new LinkedHashMap<String, Object>();
+            row.put("id", p.id);
+            row.put("name", p.name);
+            row.put("last_seen_ms", p.lastSeenMillis);
+            row.put("photos", photos.size());
+            row.put("with_embedding", embedded);
+            row.put("unusable", unusable);
+            peopleRows.add(row);
+        }
+
+        Map<String, Object> root = new LinkedHashMap<String, Object>();
+        root.put("thresholds", th);
+        root.put("checks", checkRows);
+        root.put("people", peopleRows);
+        return Json.write(root);
+    }
+
+    /** A float as the decimal it was typed as (0.363, not 0.36300000548). */
+    private static Double decimal(float f) {
+        return Double.valueOf(Float.toString(f));
+    }
+
+    private static String nameOrEmpty(PeopleStore store, String id) {
+        String name = store.nameOf(id);
+        return name == null ? "" : name;
+    }
+
+    /** "current" while the matched slot still holds that photo, "replaced" once
+     * it doesn't (or the person is gone), "none" with no best match. */
+    private static String bestPhotoState(PeopleStore store, FaceCheck c) {
+        if (c.bestId.isEmpty()) {
+            return "none";
+        }
+        return currentAddedAt(store.photos(c.bestId), c.bestSlot) == c.bestAddedAtMillis ? "current" : "replaced";
     }
 
     private static String save(Map<String, String> form, ClaudeSettings settings) {
@@ -282,7 +589,7 @@ final class SettingsPage {
 
     static String buildHtml(String token, ClaudeSettings.Status st, List<String> models,
                             ConversationSettings conversation, String voiceName, PeopleStore people,
-                            String status) {
+                            FaceChecks checks, FaceSettings face, String status) {
         String t = escapeHtml(token);
         StringBuilder html = new StringBuilder();
         html.append("<!doctype html><html><head><meta charset=\"utf-8\">");
@@ -356,6 +663,8 @@ final class SettingsPage {
         html.append("</form>");
         html.append("</section>");
 
+        appendFaceChecks(html, people, checks);
+        appendThresholds(html, face);
         appendPeople(html, t, people);
 
         html.append("</main></body></html>");
@@ -418,6 +727,7 @@ final class SettingsPage {
             } else {
                 appendNotes(html, store.notes(p.id));
             }
+            appendPhotoStrip(html, t, p.id, store.photos(p.id));
             html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_PEOPLE_RENAME_PATH)
                     .append("\">");
             html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
@@ -435,6 +745,194 @@ final class SettingsPage {
             html.append("</article>");
         }
         html.append("</section>");
+    }
+
+    /**
+     * Face plan U5 (KTD8; R13, R14): the recent checks, newest first. Each
+     * shows its crop (none for "no face found"), and for a match the best
+     * person's photo as it was when matched (or a marker once that slot was
+     * replaced), their name, the score to two decimals and the decision; a
+     * rejected check shows its reason instead. A near tie names the
+     * runner-up with their score. Names are escaped: they were typed or heard.
+     */
+    private static void appendFaceChecks(StringBuilder html, PeopleStore store, FaceChecks checks) {
+        List<FaceChecks.Entry> entries = checks.list();
+        html.append("<section id=\"face-checks\"><h2>Face checks</h2>");
+        html.append("<p>The robot's last ").append(FaceChecks.CAPACITY).append(" looks at a face, newest first. "
+                + "Kept in memory only: they are gone when the launcher restarts.</p>");
+        if (entries.isEmpty()) {
+            html.append("<p id=\"checks-empty\">").append(CHECKS_EMPTY).append("</p>");
+        }
+        for (FaceChecks.Entry e : entries) {
+            FaceCheck c = e.check;
+            html.append("<article id=\"check-").append(e.handle).append("\">");
+            html.append("<div class=\"grid\">");
+            if (c.cropJpeg != null) {
+                html.append("<img src=\"").append(LauncherProtocol.SETTINGS_FACE_CHECK_CROP_PATH).append("?id=")
+                        .append(e.handle).append("\" alt=\"the face he saw\" width=\"112\" height=\"112\">");
+            } else {
+                html.append("<p><small>No crop.</small></p>");
+            }
+            if (!c.bestId.isEmpty()) {
+                appendBestMatch(html, store, c);
+            }
+            html.append("</div>");
+            html.append("<p><strong>").append(escapeHtml(decisionText(c.decision, c.rejectReason))).append("</strong>");
+            if (!c.bestId.isEmpty()) {
+                html.append(", score ").append(score(c.score));
+            }
+            html.append("<br><small>").append(escapeHtml(lastSeen(e.atMillis))).append("</small></p>");
+            if (c.nearTie && !c.runnerUpId.isEmpty()) {
+                String other = store.nameOf(c.runnerUpId);
+                html.append("<p class=\"near-tie\"><small>").append(NEAR_TIE).append(' ')
+                        .append(other == null ? "someone since forgotten" : nameHtml(other)).append(" (")
+                        .append(score(c.runnerUpScore)).append(")</small></p>");
+            }
+            html.append("<p class=\"outcome\">Then: ").append(escapeHtml(outcomeText(e.outcome)));
+            if (!e.joinedId.isEmpty()) {
+                String joined = store.nameOf(e.joinedId);
+                if (joined != null) {
+                    html.append(" (").append(nameHtml(joined)).append(")");
+                }
+            }
+            html.append("</p>");
+            html.append("</article>");
+        }
+        html.append("</section>");
+    }
+
+    /** The best match's photo as it was when matched, then their name. */
+    private static void appendBestMatch(StringBuilder html, PeopleStore store, FaceCheck c) {
+        String name = store.nameOf(c.bestId);
+        if (name == null) {
+            html.append("<p><small>").append(CHECK_PERSON_GONE).append("</small></p>");
+            return;
+        }
+        html.append("<div>");
+        if (currentAddedAt(store.photos(c.bestId), c.bestSlot) == c.bestAddedAtMillis) {
+            html.append("<img src=\"").append(escapeHtml(photoUrl(c.bestId, c.bestSlot, c.bestAddedAtMillis)))
+                    .append("\" alt=\"best match\" width=\"112\" height=\"112\">");
+        } else {
+            html.append("<p class=\"replaced\"><small>").append(CHECK_PHOTO_REPLACED).append("</small></p>");
+        }
+        html.append("<p>").append(nameHtml(name)).append("</p></div>");
+    }
+
+    /** Face plan U5 (KTD5): the thresholds, read-only. They are set with
+     * scripts/robot-faces.py over adb, never from this page. */
+    private static void appendThresholds(StringBuilder html, FaceSettings f) {
+        html.append("<section id=\"face-thresholds\"><h2>Face thresholds</h2>");
+        html.append("<p>Read-only here: set them with scripts/robot-faces.py over adb. "
+                + "They apply from the next meeting.</p>");
+        html.append("<table><tbody>");
+        thresholdRow(html, "Confident (greets by name) at or above", Float.toString(f.confident));
+        thresholdRow(html, "Close (asks \u201cIs that you?\u201d) at or above", Float.toString(f.close));
+        thresholdRow(html, "Near-tie margin", Float.toString(f.margin));
+        thresholdRow(html, "Smallest face width (pixels)", Integer.toString(f.minWidth));
+        thresholdRow(html, "Too dark below (mean brightness)", plain(f.darkFloor));
+        thresholdRow(html, "Brightened below (mean brightness)", plain(f.dimLevel));
+        thresholdRow(html, "Too blurry below (sharpness)", plain(f.blurFloor));
+        html.append("</tbody></table>");
+        html.append("</section>");
+    }
+
+    private static void thresholdRow(StringBuilder html, String label, String value) {
+        html.append("<tr><th scope=\"row\">").append(label).append("</th><td>").append(escapeHtml(value))
+                .append("</td></tr>");
+    }
+
+    /** 40 for 40.0, 31.5 for 31.5. */
+    private static String plain(double d) {
+        return d == Math.rint(d) && Math.abs(d) < 1e15 ? Long.toString((long) d) : Double.toString(d);
+    }
+
+    /** A person's photos in slot order (KTD8, KTD11), each deletable while
+     * they have another, and marked when no face was found in it. */
+    private static void appendPhotoStrip(StringBuilder html, String t, String id, List<PeopleStore.Photo> photos) {
+        if (photos.isEmpty()) {
+            return;
+        }
+        String eid = escapeHtml(id);
+        html.append("<div class=\"photos grid\">");
+        for (PeopleStore.Photo ph : photos) {
+            html.append("<figure id=\"photo-").append(eid).append('-').append(ph.slot).append("\">");
+            html.append("<img src=\"").append(escapeHtml(photoUrl(id, ph.slot, ph.addedAtMillis)))
+                    .append("\" alt=\"photo ").append(ph.slot + 1).append("\" width=\"80\" height=\"80\">");
+            if (ph.unusable) {
+                html.append("<figcaption><mark>").append(PHOTO_UNUSABLE).append("</mark></figcaption>");
+            }
+            if (photos.size() > 1) {
+                html.append("<form method=\"post\" action=\"")
+                        .append(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH).append("\">");
+                html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+                html.append("<input type=\"hidden\" name=\"id\" value=\"").append(eid).append("\">");
+                html.append("<input type=\"hidden\" name=\"slot\" value=\"").append(ph.slot).append("\">");
+                html.append("<button type=\"submit\" class=\"secondary outline\">Delete photo</button></form>");
+            }
+            html.append("</figure>");
+        }
+        html.append("</div>");
+        if (photos.size() == 1) {
+            html.append("<p><small>Their only photo; Forget removes it with them.</small></p>");
+        }
+    }
+
+    private static String photoUrl(String id, int slot, long addedAtMillis) {
+        return LauncherProtocol.SETTINGS_PEOPLE_PHOTO_PATH + "?id=" + id + "&slot=" + slot + "&at=" + addedAtMillis;
+    }
+
+    private static String nameHtml(String name) {
+        return name.isEmpty() ? "<em>unnamed</em>" : escapeHtml(name);
+    }
+
+    /** A score to two decimals, e.g. "0.61". */
+    static String score(float f) {
+        return String.format(Locale.US, "%.2f", f);
+    }
+
+    /** The decision as the page says it: the band, or the rejection with its reason. */
+    static String decisionText(int decision, int reason) {
+        switch (decision) {
+            case FaceCheck.CONFIDENT: return "confident";
+            case FaceCheck.CLOSE: return "close";
+            case FaceCheck.WEAK: return "weak";
+            case FaceCheck.REJECTED: return "rejected: " + reasonText(reason);
+            case FaceCheck.NOT_READY: return "store not ready";
+            case FaceCheck.NO_FACE: return "no face found";
+            default: return "unknown";
+        }
+    }
+
+    /** The decision as the JSON view names it. */
+    static String decisionName(int decision) {
+        switch (decision) {
+            case FaceCheck.REJECTED: return "rejected";
+            case FaceCheck.NOT_READY: return "not ready";
+            case FaceCheck.NO_FACE: return "no face";
+            default: return decisionText(decision, FaceCheck.REASON_NONE);
+        }
+    }
+
+    static String reasonText(int reason) {
+        switch (reason) {
+            case FaceCheck.TOO_DARK: return "too dark";
+            case FaceCheck.TOO_BLURRY: return "too blurry";
+            case FaceCheck.TOO_SMALL: return "too small";
+            default: return "";
+        }
+    }
+
+    static String outcomeText(int outcome) {
+        switch (outcome) {
+            case FaceCheck.YES: return "yes";
+            case FaceCheck.NO: return "no";
+            case FaceCheck.NAME_GIVEN: return "name given";
+            case FaceCheck.JOINED: return "joined";
+            case FaceCheck.NEW_PERSON: return "new person";
+            case FaceCheck.NO_REPLY: return "no reply";
+            case FaceCheck.ENDED_WITHOUT_ANSWER: return "ended without an answer";
+            default: return "pending";
+        }
     }
 
     /** The notes as four short lists, every entry escaped. */

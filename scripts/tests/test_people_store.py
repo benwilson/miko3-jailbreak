@@ -34,6 +34,7 @@ PAGE = LAUNCHER / "SettingsPage.java"
 INTERFACE = SHARED / "RobotPeople.java"
 CLIENT = SHARED / "RobotPeopleClient.java"
 NOTES = SHARED / "PersonNotes.java"
+FACE_CHECK = SHARED / "FaceCheck.java"
 PROTOCOL = SHARED / "LauncherProtocol.java"
 MANIFEST = REPO / "launcher" / "AndroidManifest.xml"
 
@@ -262,6 +263,28 @@ class ServiceWiringTest(unittest.TestCase):
                 self.assertGreaterEqual(check, 0, f"{method} never checks the caller")
                 self.assertGreater(store, check, f"{method} touches the store before the caller check")
 
+    def test_check_calls_check_the_caller_before_the_ring(self):
+        # Face plan U5 (KTD8): the face-check ring is reached only after the caller check.
+        for method in ("public long recordCheck", "public boolean updateCheck"):
+            with self.subTest(method=method):
+                body = _method_body(self.src, method)
+                self.assertIsNotNone(body, f"PeopleService does not implement {method}")
+                check, ring = body.find("enforceCaller("), body.find("checks()")
+                self.assertGreaterEqual(check, 0, f"{method} never checks the caller")
+                self.assertGreater(ring, check, f"{method} touches the ring before the caller check")
+
+    def test_update_check_closes_as_ended_only_through_the_ring_rule(self):
+        body = _method_body(self.src, "public boolean updateCheck") or ""
+        self.assertIn("FaceCheck.ENDED_WITHOUT_ANSWER", body)
+        self.assertIn(".closeAsEnded(", body)
+        self.assertIn(".updateOutcome(", body)
+
+    def test_forget_purges_the_face_checks(self):
+        # R19: forgetting a person removes every check that matched or joined them.
+        body = _method_body(self.src, "public boolean forget") or ""
+        self.assertLess(body.find("people().forget("), body.find(".purgePerson("))
+        self.assertGreaterEqual(body.find("people().forget("), 0)
+
     def test_caller_gate_is_reused(self):
         self.assertIn("CallerGate.enforce(", self.src)
 
@@ -303,7 +326,9 @@ class InterfaceAndClientTest(unittest.TestCase):
 
     # Face plan U4 (KTD10-KTD12) appends 8-14; later units append after them.
     FACE_TRANSACTIONS = (("gallery", 8), ("photo", 9), ("idsNamed", 10), ("addPhoto", 11),
-                         ("addPerson", 12), ("setEmbedding", 13), ("markUnusable", 14))
+                         ("addPerson", 12), ("setEmbedding", 13), ("markUnusable", 14),
+                         # Face plan U5 (KTD8): the face-check ring.
+                         ("recordCheck", 15), ("updateCheck", 16))
 
     def test_transaction_codes_are_appended(self):
         # KTD10: the existing codes are unchanged; new ones only ever follow.
@@ -322,7 +347,9 @@ class InterfaceAndClientTest(unittest.TestCase):
                         r"int addPhoto\(String \w+, byte\[\] \w+, String \w+, float\[\] \w+\) throws RemoteException;",
                         r"String addPerson\(byte\[\] \w+, String \w+, String \w+, float\[\] \w+\) throws RemoteException;",
                         r"boolean setEmbedding\(String \w+, int \w+, long \w+, String \w+, float\[\] \w+\)\s+throws RemoteException;",
-                        r"boolean markUnusable\(String \w+, int \w+, long \w+\) throws RemoteException;"):
+                        r"boolean markUnusable\(String \w+, int \w+, long \w+\) throws RemoteException;",
+                        r"long recordCheck\(FaceCheck \w+\) throws RemoteException;",
+                        r"boolean updateCheck\(long \w+, int \w+, String \w+\) throws RemoteException;"):
             self.assertRegex(body, pattern)
         # KTD10: names leave only through nameOf; the gallery record has no name.
         gallery = body[body.index("class GalleryPhoto"):]
@@ -371,8 +398,23 @@ class InterfaceAndClientTest(unittest.TestCase):
         src = _read(CLIENT)
         for needle in ("RobotPeople.GalleryPhoto[] gallery(Context", "byte[] photo(Context", "String[] idsNamed(Context",
                        "int addPhoto(Context", "String addPerson(Context", "boolean setEmbedding(Context",
-                       "boolean markUnusable(Context"):
+                       "boolean markUnusable(Context", "long recordCheck(Context", "boolean updateCheck(Context",
+                       "boolean closeCheck(Context"):
             self.assertIn(needle, src)
+
+    def test_face_check_is_plain_java_and_carries_ids_not_names(self):
+        raw = FACE_CHECK.read_text() if FACE_CHECK.exists() else ""
+        self.assertTrue(raw, "FaceCheck.java missing")
+        self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
+        self.assertNotRegex(_strip_comments(raw), r"(?i)\bString\s+\w*name")
+        # KTD8: the crop's cap is the stored photo's cap.
+        self.assertRegex(_strip_comments(raw), r"MAX_CROP_BYTES\s*=\s*40\s*\*\s*1024\s*;")
+
+    def test_record_check_reads_the_crop_bytes(self):
+        src = _read(INTERFACE)
+        stub = src[src.index("case TRANSACTION_recordCheck"):]
+        stub = stub[:stub.index("return true;")]
+        self.assertIn("createByteArray()", stub)
 
     def test_person_notes_is_plain_java_with_named_caps(self):
         raw = NOTES.read_text() if NOTES.exists() else ""

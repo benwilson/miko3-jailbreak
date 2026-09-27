@@ -6,12 +6,14 @@ import android.os.IBinder;
 
 import com.miko3.shared.ClaudeAccess;
 import com.miko3.shared.ConversationSettings;
+import com.miko3.shared.FaceSettings;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotSettings;
 
 /**
  * Exported bound Service that hands the robot's Claude API settings, and the
- * conversation settings (meeting plan U4, KTD11), to our own mode apps
+ * conversation settings (meeting plan U4, KTD11) and the face thresholds
+ * (face plan U5, KTD5), to our own mode apps
  * (settings plan U5, KTD1; R13, R14, R16). Every call first
  * checks who is calling (CallerCheck) and only then reads the store, so a
  * vendor app gets a SecurityException and never a key, and a Save or Forget
@@ -36,6 +38,12 @@ public class RobotSettingsService extends Service {
         public ConversationSettings getConversationSettings() {
             enforceCaller();
             return ((LauncherApp) getApplication()).claudeSettings().conversation();
+        }
+
+        @Override
+        public FaceSettings getFaceSettings() {
+            enforceCaller();
+            return ((LauncherApp) getApplication()).claudeSettings().faceSettings();
         }
     };
 

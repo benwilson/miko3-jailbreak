@@ -88,6 +88,22 @@ public final class LauncherProtocol {
     /** Conversation (meeting plan U4, KTD11): the persona box and the "answers
      * when spoken to" switch, saved together. */
     public static final String SETTINGS_CONVERSATION_PATH = "/settings/conversation";
+    /** Face plan U5 (KTD8): GET ?id=<check handle> answers that face check's
+     * crop JPEG, 404 once it has rolled off the ring. Under SETTINGS_PATH, so TLS-only. */
+    public static final String SETTINGS_FACE_CHECK_CROP_PATH = "/settings/face/check-crop";
+    /** GET ?id=<person id>&slot=<n>&at=<added-at ms> answers that stored photo while
+     * the slot still holds the photo added at that time, else a "replaced" placeholder. */
+    public static final String SETTINGS_PEOPLE_PHOTO_PATH = "/settings/people/photo";
+    /** POST with the page token, id and slot deletes one photo; never a person's last. */
+    public static final String SETTINGS_PEOPLE_PHOTO_DELETE_PATH = "/settings/people/photo/delete";
+    /** Face plan U5 (KTD5): POST with the page token and any of confident, close,
+     * margin, min_width, dark_floor, dim_level, blur_floor sets the face thresholds.
+     * Loopback callers only (the CLI over adb forward); 403 for anyone else. */
+    public static final String SETTINGS_FACE_THRESHOLDS_PATH = "/settings/face/thresholds";
+    /** POST with the page token answers the recent face checks, the people with
+     * their photo counts and the thresholds as JSON, names included, no images.
+     * Owner tooling: scripts/robot-faces.py. */
+    public static final String SETTINGS_FACE_STATE_PATH = "/settings/face/state";
 
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;

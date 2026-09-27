@@ -30,7 +30,13 @@ import android.os.RemoteException;
  * addPerson() store a photo with the embedding the mode computed;
  * setEmbedding() and markUnusable() write back the mode's migration result
  * and are refused (false) once the slot's photo has been replaced or the
- * person forgotten. Later units append from 15.
+ * person forgotten.
+ *
+ * Face plan U5 (R13, R14, R19; KTD8) appends 15 and 16: recordCheck() hands
+ * the launcher one face check (crop, best match by id, score, decision; see
+ * FaceCheck) for the Settings page's memory-only ring and answers a handle;
+ * updateCheck() sets that check's outcome, and closes a still-pending one as
+ * ended without an answer when the meeting ends.
  *
  * The launcher checks the caller on every call and throws SecurityException
  * to any app that isn't one of ours, and IllegalArgumentException with a
@@ -113,6 +119,21 @@ public interface RobotPeople extends IInterface {
      * as setEmbedding(). */
     boolean markUnusable(String id, int slot, long addedAtMillis) throws RemoteException;
 
+    // Face plan U5 (KTD8). Appended as above.
+
+    /** Records one face check in the launcher's ring of recent checks and
+     * answers its handle (above 0). IllegalArgumentException with a fixed
+     * reason for a crop over FaceCheck.MAX_CROP_BYTES, a crop that isn't a
+     * JPEG, or an unknown code. */
+    long recordCheck(FaceCheck check) throws RemoteException;
+
+    /** Sets a recorded check's outcome (a FaceCheck outcome code) and, for an
+     * answer that joined the crop to someone, their id (else null).
+     * FaceCheck.ENDED_WITHOUT_ANSWER closes the check only if it is still
+     * pending. False, changing nothing, once the check has rolled off the
+     * ring or been purged by forget. */
+    boolean updateCheck(long handle, int outcome, String joinedId) throws RemoteException;
+
     /** One stored photo as gallery() answers it: never a name or an image. */
     final class GalleryPhoto {
         public final String id;
@@ -170,6 +191,8 @@ public interface RobotPeople extends IInterface {
         static final int TRANSACTION_addPerson = 12;
         static final int TRANSACTION_setEmbedding = 13;
         static final int TRANSACTION_markUnusable = 14;
+        static final int TRANSACTION_recordCheck = 15;
+        static final int TRANSACTION_updateCheck = 16;
 
         public Stub() {
             attachInterface(this, DESCRIPTOR);
@@ -328,6 +351,33 @@ public interface RobotPeople extends IInterface {
                     boolean marked = markUnusable(id, slot, data.readLong());
                     reply.writeNoException();
                     reply.writeInt(marked ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_recordCheck: {
+                    data.enforceInterface(DESCRIPTOR);
+                    int decision = data.readInt();
+                    int reason = data.readInt();
+                    byte[] crop = data.createByteArray();
+                    String bestId = data.readString();
+                    int bestSlot = data.readInt();
+                    long bestAddedAt = data.readLong();
+                    float score = data.readFloat();
+                    String runnerUpId = data.readString();
+                    float runnerUpScore = data.readFloat();
+                    boolean nearTie = data.readInt() != 0;
+                    long handle = recordCheck(new FaceCheck(decision, reason, crop, bestId, bestSlot, bestAddedAt,
+                            score, runnerUpId, runnerUpScore, nearTie));
+                    reply.writeNoException();
+                    reply.writeLong(handle);
+                    return true;
+                }
+                case TRANSACTION_updateCheck: {
+                    data.enforceInterface(DESCRIPTOR);
+                    long handle = data.readLong();
+                    int outcome = data.readInt();
+                    boolean updated = updateCheck(handle, outcome, data.readString());
+                    reply.writeNoException();
+                    reply.writeInt(updated ? 1 : 0);
                     return true;
                 }
                 case IBinder.INTERFACE_TRANSACTION: {
@@ -638,6 +688,53 @@ public interface RobotPeople extends IInterface {
                     data.writeInt(slot);
                     data.writeLong(addedAtMillis);
                     if (!remote.transact(TRANSACTION_markUnusable, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public long recordCheck(FaceCheck check) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeInt(check.decision);
+                    data.writeInt(check.rejectReason);
+                    data.writeByteArray(check.cropJpeg);
+                    data.writeString(check.bestId);
+                    data.writeInt(check.bestSlot);
+                    data.writeLong(check.bestAddedAtMillis);
+                    data.writeFloat(check.score);
+                    data.writeString(check.runnerUpId);
+                    data.writeFloat(check.runnerUpScore);
+                    data.writeInt(check.nearTie ? 1 : 0);
+                    if (!remote.transact(TRANSACTION_recordCheck, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readLong();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public boolean updateCheck(long handle, int outcome, String joinedId) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeLong(handle);
+                    data.writeInt(outcome);
+                    data.writeString(joinedId);
+                    if (!remote.transact(TRANSACTION_updateCheck, data, reply, 0)) {
                         throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
                     }
                     reply.readException();

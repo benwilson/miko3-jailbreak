@@ -32,6 +32,7 @@ INTERFACE = SHARED / "RobotSettings.java"
 ACCESS = SHARED / "ClaudeAccess.java"
 CLIENT = SHARED / "RobotSettingsClient.java"
 CONVERSATION = SHARED / "ConversationSettings.java"
+FACE_SETTINGS = SHARED / "FaceSettings.java"
 PROTOCOL = SHARED / "LauncherProtocol.java"
 MANIFEST = REPO / "launcher" / "AndroidManifest.xml"
 
@@ -56,7 +57,7 @@ def _read(path):
 
 
 # The store accessors a service method may call, one per transaction.
-STORE_READS = ("credentialsForRequests(", ".conversation(")
+STORE_READS = ("credentialsForRequests(", ".conversation(", ".faceSettings(")
 
 
 class RobotSettingsServiceHarnessTest(unittest.TestCase):
@@ -80,6 +81,8 @@ class RobotSettingsServiceHarnessTest(unittest.TestCase):
         "conversation_answer_blank_persona_is_unset_with_default",
         "conversation_edit_shows_on_next_call",
         "conversation_answer_never_carries_the_key",
+        "face_settings_answer_defaults_before_any_save",
+        "face_settings_answer_carries_the_saved_values",
     )
 
     @classmethod
@@ -195,6 +198,7 @@ class ServiceWiringTest(unittest.TestCase):
         # KTD11: the existing code is unchanged and the new one is appended.
         self.assertRegex(self.iface, r"TRANSACTION_getClaudeAccess\s*=\s*1\s*;")
         self.assertRegex(self.iface, r"TRANSACTION_getConversationSettings\s*=\s*2\s*;")
+        self.assertRegex(self.iface, r"TRANSACTION_getFaceSettings\s*=\s*3\s*;")
         codes = [int(c) for c in re.findall(r"TRANSACTION_\w+\s*=\s*(\d+)\s*;", self.iface)]
         self.assertEqual(codes, list(range(1, len(codes) + 1)))
 
@@ -206,6 +210,35 @@ class ServiceWiringTest(unittest.TestCase):
         self.assertIsNotNone(m, "Proxy does not implement getConversationSettings")
         self.assertRegex(m.group(1), r"if\s*\(\s*!remote\.transact\(\s*TRANSACTION_getConversationSettings")
         self.assertIn("LauncherProtocol.LAUNCHER_TOO_OLD", m.group(1))
+
+    def test_face_proxy_method_checks_the_transaction_result(self):
+        # Face plan U5 (KTD5): appended, so an older launcher answers LAUNCHER_TOO_OLD.
+        proxy = self.iface[self.iface.index("class Proxy"):]
+        m = re.search(r"public FaceSettings getFaceSettings\(\)[^{]*\{(.*?)\n            \}", proxy, flags=re.S)
+        self.assertIsNotNone(m, "Proxy does not implement getFaceSettings")
+        self.assertRegex(m.group(1), r"if\s*\(\s*!remote\.transact\(\s*TRANSACTION_getFaceSettings")
+        self.assertIn("LauncherProtocol.LAUNCHER_TOO_OLD", m.group(1))
+
+    def test_face_settings_cross_binder_in_the_same_order(self):
+        # Stub writes and Proxy reads the seven values in one order.
+        stub = self.iface[self.iface.index("case TRANSACTION_getFaceSettings"):]
+        stub = stub[:stub.index("return true;")]
+        proxy = self.iface[self.iface.index("public FaceSettings getFaceSettings()", self.iface.index("class Proxy")):]
+        proxy = proxy[:proxy.index("finally")]
+        writes = re.findall(r"reply\.write(Float|Int|Double)\(", stub)
+        reads = re.findall(r"reply\.read(Float|Int|Double)\(", proxy)
+        self.assertEqual(writes, ["Float", "Float", "Float", "Int", "Double", "Double", "Double"])
+        self.assertEqual(writes, reads)
+
+    def test_client_fetches_face_settings(self):
+        src = _read(CLIENT)
+        self.assertIn("public static FaceSettings fetchFaceSettings(Context", src)
+        self.assertIn("getFaceSettings()", src)
+
+    def test_face_settings_is_plain_java(self):
+        raw = FACE_SETTINGS.read_text() if FACE_SETTINGS.exists() else ""
+        self.assertTrue(raw, "FaceSettings.java missing")
+        self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
 
     def test_client_reports_an_old_launcher(self):
         src = _read(CLIENT)

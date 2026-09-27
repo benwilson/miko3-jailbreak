@@ -195,6 +195,39 @@ public final class RobotPeopleClient {
         });
     }
 
+    // Face plan U5 (KTD8). Each throws LauncherProtocol.LAUNCHER_TOO_OLD as an
+    // IOException when the launcher predates it.
+
+    /** Records one face check for the Settings page; answers its handle for
+     * updateCheck and closeCheck. IOException with the launcher's fixed
+     * reason for a crop it won't keep or an unknown code. */
+    public static long recordCheck(Context context, final FaceCheck check) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Long>() {
+            @Override
+            public Long run(RobotPeople people) throws RemoteException {
+                return people.recordCheck(check);
+            }
+        });
+    }
+
+    /** Sets a check's outcome (a FaceCheck outcome code), with the id the
+     * answer joined the crop to, or null; false once the check is gone. */
+    public static boolean updateCheck(Context context, final long handle, final int outcome, final String joinedId)
+            throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.updateCheck(handle, outcome, joinedId);
+            }
+        });
+    }
+
+    /** At the end of a meeting: closes the check as "ended without an answer"
+     * if it is still pending; false when it was answered or is gone. */
+    public static boolean closeCheck(Context context, long handle) throws IOException {
+        return updateCheck(context, handle, FaceCheck.ENDED_WITHOUT_ANSWER, null);
+    }
+
     private static PersonNotes parseNotes(String json) {
         try {
             return PersonNotes.parse(json);

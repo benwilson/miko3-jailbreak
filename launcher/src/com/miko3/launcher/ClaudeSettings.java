@@ -2,6 +2,7 @@ package com.miko3.launcher;
 
 import com.miko3.shared.ClaudeApi;
 import com.miko3.shared.ConversationSettings;
+import com.miko3.shared.FaceSettings;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -15,7 +16,8 @@ import java.util.regex.Pattern;
  * The robot's Claude API access (settings plan U2, KTD2): base URL, API key
  * and model, plus the model ids the last Refresh found, and beside them the
  * conversation settings (meeting plan U4, KTD11): the persona text and the
- * "answers when spoken to" switch, which conversation() answers. Stored in the
+ * "answers when spoken to" switch, which conversation() answers, and the face
+ * thresholds (face plan U5, KTD5), which faceSettings() answers. Stored in the
  * launcher's own SharedPreferences file (PREFS_NAME) behind the small Store
  * interface, unencrypted (root adb can read anything on this device anyway),
  * so the save rules run on the host JVM in scripts/tests. LauncherApp
@@ -54,6 +56,26 @@ final class ClaudeSettings {
     static final String KEY_PERSONA = "persona";
     /** "0" when the owner turned "answers when spoken to" off (R5); anything else is on. */
     static final String KEY_ANSWERS_WHEN_SPOKEN_TO = "answers_when_spoken_to";
+
+    /** Face plan U5 (KTD5): the band and gate thresholds as decimal strings;
+     * absent means FaceSettings.DEFAULTS. Saved together, read together. */
+    static final String KEY_FACE_CONFIDENT = "face_confident";
+    static final String KEY_FACE_CLOSE = "face_close";
+    static final String KEY_FACE_MARGIN = "face_margin";
+    static final String KEY_FACE_MIN_WIDTH = "face_min_width";
+    static final String KEY_FACE_DARK_FLOOR = "face_dark_floor";
+    static final String KEY_FACE_DIM_LEVEL = "face_dim_level";
+    static final String KEY_FACE_BLUR_FLOOR = "face_blur_floor";
+
+    /** Fixed refusals for a face-settings save (KTD5), shown verbatim. */
+    static final String FACE_REFUSE_BANDS = "The bands need 0 <= close <= confident <= 1.";
+    static final String FACE_REFUSE_MARGIN = "The near-tie margin must be between 0 and 0.3.";
+    static final String FACE_REFUSE_LUMA = "The dark floor must be below the dim level, both between 0 and 255.";
+    static final String FACE_REFUSE_BLUR = "The blur floor must be 0 or more.";
+    static final String FACE_REFUSE_WIDTH = "The minimum face width must be between 16 and 640 pixels.";
+    static final float FACE_MAX_MARGIN = 0.3f;
+    static final int FACE_MIN_WIDTH_LOW = 16;
+    static final int FACE_MIN_WIDTH_HIGH = 640;
 
     /**
      * The built-in persona (R13, R20): what the Settings page's box shows until
@@ -240,6 +262,74 @@ final class ClaudeSettings {
         boolean set = persona != null && !persona.isEmpty();
         return new ConversationSettings(set ? persona : DEFAULT_PERSONA, set,
                 !"0".equals(store.getString(KEY_ANSWERS_WHEN_SPOKEN_TO, "1")));
+    }
+
+    /**
+     * The face thresholds' save (face plan U5, KTD5): all seven in one commit,
+     * or none when checkFace() refuses them, so the stored set is always one
+     * that passed. The page never calls this directly; its save route takes
+     * loopback callers only (SettingsPage).
+     */
+    synchronized void saveFace(FaceSettings f) throws InvalidException {
+        checkFace(f);
+        Map<String, String> entries = new HashMap<String, String>();
+        entries.put(KEY_FACE_CONFIDENT, Float.toString(f.confident));
+        entries.put(KEY_FACE_CLOSE, Float.toString(f.close));
+        entries.put(KEY_FACE_MARGIN, Float.toString(f.margin));
+        entries.put(KEY_FACE_MIN_WIDTH, Integer.toString(f.minWidth));
+        entries.put(KEY_FACE_DARK_FLOOR, Double.toString(f.darkFloor));
+        entries.put(KEY_FACE_DIM_LEVEL, Double.toString(f.dimLevel));
+        entries.put(KEY_FACE_BLUR_FLOOR, Double.toString(f.blurFloor));
+        store.putStrings(entries);
+    }
+
+    /** What the settings service answers the mode and the page renders: the
+     * stored thresholds, or FaceSettings.DEFAULTS when none are stored or the
+     * stored set is unreadable or would not pass checkFace(). Read on every call. */
+    synchronized FaceSettings faceSettings() {
+        FaceSettings d = FaceSettings.DEFAULTS;
+        try {
+            FaceSettings f = new FaceSettings(
+                    Float.parseFloat(stored(KEY_FACE_CONFIDENT, Float.toString(d.confident))),
+                    Float.parseFloat(stored(KEY_FACE_CLOSE, Float.toString(d.close))),
+                    Float.parseFloat(stored(KEY_FACE_MARGIN, Float.toString(d.margin))),
+                    Integer.parseInt(stored(KEY_FACE_MIN_WIDTH, Integer.toString(d.minWidth))),
+                    Double.parseDouble(stored(KEY_FACE_DARK_FLOOR, Double.toString(d.darkFloor))),
+                    Double.parseDouble(stored(KEY_FACE_DIM_LEVEL, Double.toString(d.dimLevel))),
+                    Double.parseDouble(stored(KEY_FACE_BLUR_FLOOR, Double.toString(d.blurFloor))));
+            checkFace(f);
+            return f;
+        } catch (NumberFormatException e) {
+            return d;
+        } catch (InvalidException e) {
+            return d;
+        }
+    }
+
+    /** KTD5's rules: 0 <= close <= confident <= 1, 0 <= margin <= 0.3,
+     * 0 <= dark floor < dim level <= 255, blur floor >= 0 (and finite), and
+     * 16 <= minimum width <= 640. NaN fails every rule. Fixed text only. */
+    static void checkFace(FaceSettings f) throws InvalidException {
+        if (!(0 <= f.close && f.close <= f.confident && f.confident <= 1)) {
+            throw new InvalidException(FACE_REFUSE_BANDS);
+        }
+        if (!(0 <= f.margin && f.margin <= FACE_MAX_MARGIN)) {
+            throw new InvalidException(FACE_REFUSE_MARGIN);
+        }
+        if (!(0 <= f.darkFloor && f.darkFloor < f.dimLevel && f.dimLevel <= 255)) {
+            throw new InvalidException(FACE_REFUSE_LUMA);
+        }
+        if (!(0 <= f.blurFloor && f.blurFloor < Double.POSITIVE_INFINITY)) {
+            throw new InvalidException(FACE_REFUSE_BLUR);
+        }
+        if (f.minWidth < FACE_MIN_WIDTH_LOW || f.minWidth > FACE_MIN_WIDTH_HIGH) {
+            throw new InvalidException(FACE_REFUSE_WIDTH);
+        }
+    }
+
+    private String stored(String key, String def) {
+        String v = store.getString(key, "");
+        return v == null || v.isEmpty() ? def : v;
     }
 
     /** The persona as stored: LF endings, trimmed, "" for blank; throws over the cap. */
