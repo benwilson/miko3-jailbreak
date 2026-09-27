@@ -689,6 +689,10 @@ public final class ExploreBrainHarness {
         /** The fake ears (meeting plan U6): cues, the angle trend and shove spikes as step input. */
         boolean earsPresent = true;
         boolean earsListening;
+        /** An earsOpen() before this time binds and fails at once: listening stays false (the reopen backoff). */
+        long earsOpenRefusedUntil = Long.MIN_VALUE;
+        /** When >= 0, every session opened is lost again this long after the open (a flapping launcher). */
+        long earsHoldMs = -1;
         int earsOpens;
         int earsCloses;
         private final List<Ears.Cue> cues = new ArrayList<Ears.Cue>();
@@ -1503,7 +1507,10 @@ public final class ExploreBrainHarness {
         @Override
         public void earsOpen() {
             earsOpens++;
-            earsListening = earsPresent;
+            earsListening = earsPresent && now >= earsOpenRefusedUntil;
+            if (earsListening && earsHoldMs >= 0) {
+                at(now + earsHoldMs, () -> earsListening = false);
+            }
             log.add(new Event(now, "ears open"));
         }
 
@@ -4962,6 +4969,11 @@ public final class ExploreBrainHarness {
         return next == null ? -1 : next.t - t;
     }
 
+    /** A time within one 10 ms tick of the expected one (and not the -1 of a missing event). */
+    private static boolean withinTick(long t, long expected) {
+        return t >= 0 && Math.abs(t - expected) <= 10;
+    }
+
     private static int notesWith(List<String> notes, String part) {
         int n = 0;
         for (String x : notes) {
@@ -7551,6 +7563,91 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     "close@" + rig.timeOf(close) + " reopen@" + rig.timeOf(reopen) + " none=" + none + " search@" + search
                             + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("ears_lost_reopens_with_backoff", n -> {
+            // Lost at 5 s; the launcher refuses every bind until 20 s, so the retries at +2, +4 and +8 s
+            // fail and the one at +16 s (35 s) holds. A second loss at 80 s starts over at 2 s.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cueRig(EMPTY_ROOM);
+            rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+            rig.started();
+            rig.earsOpenRefusedUntil = 20000;
+            rig.at(5000, () -> rig.earsListening = false);
+            rig.at(80000, () -> rig.earsListening = false);
+            rig.runUntil(90000);
+            long open0 = rig.timeOf(rig.first("ears open", 0));
+            long r1 = rig.timeOf(rig.firstAfter("ears open", 5000));
+            long r2 = rig.timeOf(rig.firstAfter("ears open", r1 + 10));
+            long r3 = rig.timeOf(rig.firstAfter("ears open", r2 + 10));
+            long r4 = rig.timeOf(rig.firstAfter("ears open", r3 + 10));
+            long r5 = rig.timeOf(rig.firstAfter("ears open", r4 + 10));
+            int between = rig.countPrefix("ears open", r4 + 10, 80000);
+            int after = rig.countPrefix("ears open", r5 + 10, 90001);
+            check(n, open0 <= 100 && withinTick(r1, 7000) && withinTick(r2, 11000) && withinTick(r3, 19000)
+                            && withinTick(r4, 35000) && between == 0 && withinTick(r5, 82000) && after == 0
+                            && rig.earsOpens == 6 && rig.earsCloses == 0 && rig.listening()
+                            && notesWith(notes, "ears lost: reopening in 2000ms (attempt 1)") == 2
+                            && notesWith(notes, "ears back after 4 attempt(s)") == 1
+                            && notesWith(notes, "ears back") == 2 && rig.violations.isEmpty(),
+                    "open0@" + open0 + " retries@" + r1 + "," + r2 + "," + r3 + "," + r4 + " between=" + between
+                            + " second@" + r5 + " after=" + after + " opens=" + rig.earsOpens + " closes=" + rig.earsCloses
+                            + " listening=" + rig.listening() + " lost=" + notesWith(notes, "ears lost")
+                            + " back=" + notesWith(notes, "ears back") + " " + rig.tail());
+        });
+        scenario("ears_flapping_session_keeps_backing_off", n -> {
+            // Every reopen binds and is lost 500 ms later, before the next check: the interval keeps
+            // doubling to the 30 s cap and never collapses back to 2 s, one bind per interval.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cueRig(EMPTY_ROOM);
+            rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+            rig.started();
+            rig.earsHoldMs = 500;
+            rig.at(5000, () -> rig.earsListening = false);
+            rig.runUntil(130000);
+            long[] r = new long[7];
+            long from = 5000;
+            for (int i = 0; i < r.length; i++) {
+                r[i] = rig.timeOf(rig.firstAfter("ears open", from));
+                from = r[i] + 10;
+            }
+            int perInterval = rig.countPrefix("ears open", 95010, 125000);
+            check(n, withinTick(r[0], 7000) && withinTick(r[1], 11000) && withinTick(r[2], 19000)
+                            && withinTick(r[3], 35000) && withinTick(r[4], 65000) && withinTick(r[5], 95000)
+                            && withinTick(r[6], 125000) && perInterval == 0 && rig.earsOpens == 8 && rig.earsCloses == 0
+                            && notesWith(notes, "ears lost") == 1 && notesWith(notes, "ears back") == 0
+                            && rig.violations.isEmpty(),
+                    "retries@" + java.util.Arrays.toString(r) + " perInterval=" + perInterval + " opens=" + rig.earsOpens
+                            + " closes=" + rig.earsCloses + " lost=" + notesWith(notes, "ears lost")
+                            + " back=" + notesWith(notes, "ears back") + " " + rig.tail());
+        });
+        scenario("ears_lost_on_the_charger_waits_for_the_latch", n -> {
+            // Lost at 2.5 s; the retry at 4.5 s fails (attempt 1, next look due at 8.5 s). The charger
+            // latch at 5 s closes the ears with that reopen pending and nothing binds until it clears at
+            // 8 s. A loss at 10 s then retries 2 s later, not 4: the latch reset the count and the stale
+            // due time, so there is exactly one "ears back" and no bind on the tick after the clear.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cueRig(cueTuning(), t -> t >= 5000 && t < 8000 ? charger(t) : clear(t), EMPTY_ROOM);
+            rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+            rig.started();
+            rig.earsOpenRefusedUntil = 6000;
+            rig.at(2500, () -> rig.earsListening = false);
+            rig.at(10000, () -> rig.earsListening = false);
+            rig.runUntil(17000);
+            long close = rig.timeOf(rig.firstAfter("ears close", 0));
+            int latched = rig.countPrefix("ears open", 5000, 8000);
+            long reopen = rig.timeOf(rig.firstAfter("ears open", 8000));
+            long retry = rig.timeOf(rig.firstAfter("ears open", 10000));
+            int after = rig.countPrefix("ears open", retry + 10, 17001);
+            check(n, close == 5000 && latched == 0 && reopen == 8000 && withinTick(retry, 12000) && after == 0
+                            && rig.earsOpens == 4 && rig.earsCloses == 1 && rig.listening()
+                            && notesWith(notes, "ears lost: reopening in 2000ms (attempt 1)") == 2
+                            && notesWith(notes, "ears lost") == 2 && notesWith(notes, "ears back") == 1
+                            && notesWith(notes, "ears back after 1 attempt(s)") == 1
+                            && rig.violations.isEmpty(),
+                    "close@" + close + " latched=" + latched + " reopen@" + reopen + " retry@" + retry + " after=" + after
+                            + " opens=" + rig.earsOpens + " closes=" + rig.earsCloses + " listening=" + rig.listening()
+                            + " lost=" + notesWith(notes, "ears lost") + " back=" + notesWith(notes, "ears back")
+                            + " " + rig.tail());
         });
         scenario("cue_eyes_only_wake_word_enters_the_meeting_path_without_a_turn_and_a_name_cue_is_dropped", n -> {
             // No lease ever: eyes only. Nobody can be seen, so the wake word takes the stranger path.

@@ -112,7 +112,7 @@ A sign, judged on the robot, that someone may be speaking to it. Cues come in tw
 
 ## Ears session
 
-The one long-lived microphone capture the launcher holds on behalf of an autonomous mode while it runs off the charger, as distinct from the one-shot listen used for a single short reply. It feeds the wake-word engine and the recogniser from the same audio, reports each utterance with its side and tier, is kept alive by the mode's renewals and released when the mode goes away. It exists because the device allows one capture at a time and a robot that is addressable while roaming cannot open and close the microphone per question.
+The one long-lived microphone capture the launcher holds on behalf of an autonomous mode while it runs off the charger, as distinct from the one-shot listen used for a single short reply. It feeds the wake-word engine and the recogniser from the same audio, reports each utterance with its side and tier, is kept alive by the mode's renewals and released when the mode goes away. A session the launcher drops while the mode still wants it is reopened on the same backoff as the drive lease, 2 s doubling to 30 s, so a launcher restart brings the ears back with the wheels. It exists because the device allows one capture at a time and a robot that is addressable while roaming cannot open and close the microphone per question.
 
 ## Deaf window
 
