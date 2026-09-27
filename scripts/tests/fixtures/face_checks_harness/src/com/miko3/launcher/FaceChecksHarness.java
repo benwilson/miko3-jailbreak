@@ -20,7 +20,7 @@ public final class FaceChecksHarness {
     static final String TOM = "00000000000000bb";
     static final String NEW = "00000000000000cc";
 
-    static final class FakeClock implements FaceChecks.Clock {
+    static final class FakeClock implements PeopleStore.Clock {
         long now = 1_700_000_000_000L;
 
         @Override

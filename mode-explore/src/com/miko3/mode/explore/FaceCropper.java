@@ -84,7 +84,8 @@ final class FaceCropper implements FaceCrop {
         /** The decoded frame's size, the space the face's coordinates are in. */
         final int frameW;
         final int frameH;
-        /** The decoded frame's ARGB pixels, row by row, for FaceAlign (face plan U6). */
+        /** The decoded frame's ARGB pixels, row by row, for FaceAlign (face plan U6);
+         * null from crop(), which never aligns. */
         final int[] argb;
 
         Located(Result crop, YuNetDecoder.Face face, int frameW, int frameH, int[] argb) {
@@ -103,7 +104,7 @@ final class FaceCropper implements FaceCrop {
 
     @Override
     public synchronized Result crop(byte[] frameJpeg, Detection personBox) {
-        Located found = locate(frameJpeg, personBox);
+        Located found = locate(frameJpeg, personBox, false);
         if (found == null) {
             return Result.NONE;
         }
@@ -116,6 +117,11 @@ final class FaceCropper implements FaceCrop {
      * is matched or stored.
      */
     synchronized Located locate(byte[] frameJpeg, Detection personBox) {
+        return locate(frameJpeg, personBox, true);
+    }
+
+    /** locate(), with the frame's pixels copied out only when withPixels. */
+    private Located locate(byte[] frameJpeg, Detection personBox, boolean withPixels) {
         if (frameJpeg == null || personBox == null) {
             return null;
         }
@@ -142,8 +148,11 @@ final class FaceCropper implements FaceCrop {
             if (cut != frame) {
                 cut.recycle();
             }
-            int[] argb = new int[w * h];
-            frame.getPixels(argb, 0, w, 0, 0, w, h);
+            int[] argb = null;
+            if (withPixels) {
+                argb = new int[w * h];
+                frame.getPixels(argb, 0, w, 0, 0, w, h);
+            }
             return new Located(new Result(out.toByteArray(), sq), best, w, h, argb);
         } finally {
             frame.recycle();

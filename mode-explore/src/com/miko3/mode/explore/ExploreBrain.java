@@ -893,8 +893,6 @@ final class ExploreBrain {
     private CuriosityPort.MatchAnswer confirming;
     /** The resolve decides a conversation start (true) or the degraded ladder's next line. */
     private boolean idChat;
-    /** The resolve came from the ladder's NAME step, where the name was already asked. */
-    private boolean idFromName;
     /** A yes to the question (its photo's outcome is YES, not JOINED). */
     private boolean idYes;
     /** The name given (waiting for its last name), the name being kept, and the id a photo is added to. */
@@ -907,13 +905,6 @@ final class ExploreBrain {
     private String chatSettled;
     /** The acknowledgement clip's window (KTD14): the local question waits for it to end. */
     private long ackUntil = NEVER;
-    /** The names in a reply by the robot's own patterns (the port's NameExtractor). */
-    private final AnswerParser.Names names = new AnswerParser.Names() {
-        @Override
-        public String nameIn(String transcript) {
-            return port.nameIn(transcript);
-        }
-    };
     /** The side the voice that started this stop came from, or null: the resume leg turns away from it. */
     private Direction chatCueSide;
     private Direction chatSide;
@@ -2964,8 +2955,7 @@ final class ExploreBrain {
             enterChat(now, a);
         } else if (a.status == CuriosityPort.MatchAnswer.Status.NEW && usable(a.askLine)) {
             // No look means no face of this person: an earlier meeting's must never be stored under the name.
-            askName(now, wheellessMeeting ? new CuriosityPort.MatchAnswer(CuriosityPort.MatchAnswer.Status.NEW, null,
-                    null, null, a.askLine, a.noReplyLine, true) : a);
+            askName(now, wheellessMeeting ? CuriosityPort.MatchAnswer.faceless(a.askLine, a.noReplyLine) : a);
         } else {
             note("no lines for the person either; just the name clip");
             nameClip(now);
@@ -2979,8 +2969,8 @@ final class ExploreBrain {
             greet(now, m, lines.status == CuriosityPort.MatchAnswer.Status.FAILED ? null : lines);
         } else if (lines.status == CuriosityPort.MatchAnswer.Status.NEW && usable(lines.askLine)) {
             // The match decides what may be stored (faceless: nothing); the lines are what he says.
-            askName(now, new CuriosityPort.MatchAnswer(CuriosityPort.MatchAnswer.Status.NEW, null, null, null,
-                    lines.askLine, lines.noReplyLine, m.faceless));
+            askName(now, m.faceless ? CuriosityPort.MatchAnswer.faceless(lines.askLine, lines.noReplyLine)
+                    : CuriosityPort.MatchAnswer.stranger(lines.askLine, lines.noReplyLine));
         } else {
             note("no lines for the person; just the name clip");
             nameClip(now);
@@ -3002,7 +2992,7 @@ final class ExploreBrain {
             line = lines.unnamedLine;
             note("someone we've met, without a name");
         } else if (name != null) {
-            line = ChatSession.LOCAL_GREETING.replace("{name}", name);
+            line = ClaudeReplies.fill(ChatSession.LOCAL_GREETING, name);
             note("someone we've met, with a name, and no line: the local greeting");
         }
         if (line == null) {
@@ -3090,7 +3080,6 @@ final class ExploreBrain {
         note("got a name; checking it against the people stored");
         confirming = null;
         idChat = false;
-        idFromName = true;
         state = State.NAME;
         resolve(now, name);
     }
@@ -3127,10 +3116,9 @@ final class ExploreBrain {
     private void enterConfirm(long now, CuriosityPort.MatchAnswer a) {
         confirming = a;
         idChat = chatPossible(a);
-        idFromName = false;
         idYes = false;
         note("a close match: asking whether it is them");
-        sayLocal(now, ChatSession.CONFIRM_QUESTION.replace("{name}", a.confirmName.trim()), State.CONFIRM);
+        sayLocal(now, ClaudeReplies.fill(ChatSession.CONFIRM_QUESTION, a.confirmName.trim()), State.CONFIRM);
     }
 
     /**
@@ -3139,13 +3127,8 @@ final class ExploreBrain {
      * camera closes first, as for any line. It waits for the acknowledgement clip.
      */
     private void sayLocal(long now, String line, State s) {
-        stopMotors();
-        state = s;
+        queueLine(now, line, s);
         idStep = IdStep.ASKING;
-        syncCamera();
-        stareAtPick();
-        pendingLine = line;
-        quietUntil = now + tuning.quietWaitMs;
     }
 
     private void identityStep(long now) {
@@ -3179,10 +3162,7 @@ final class ExploreBrain {
             if (!ready && now < quietUntil) {
                 return;
             }
-            sayUntil = now + tuning.sayTimeoutMs;
-            String line = pendingLine;
-            pendingLine = null;
-            port.say(line);
+            handOffLine(now);
             return;
         }
         if (port.sayFinished() || now >= sayUntil) {
@@ -3215,7 +3195,7 @@ final class ExploreBrain {
             startAs(now, confirming);
             return;
         }
-        AnswerParser.Reply r = AnswerParser.parse(text, confirming.confirmName, names);
+        AnswerParser.Reply r = AnswerParser.parse(text, confirming.confirmName, port);
         // The kind only: never the words or a name.
         note("the answer to the question: " + r.kind);
         switch (r.kind) {
@@ -3235,7 +3215,7 @@ final class ExploreBrain {
     }
 
     private void lastNameAnswer(long now, String text) {
-        String last = text == null ? null : AnswerParser.lastName(text, idFirst, names);
+        String last = text == null ? null : AnswerParser.lastName(text, idFirst, port);
         if (last == null) {
             note(text == null ? "no last name came: nobody is stored" : "no last name in the reply: nobody is stored");
             settleUnnamed(now);
@@ -3315,7 +3295,8 @@ final class ExploreBrain {
         }
         note("the store refused the photo (forgotten meanwhile?): nobody is re-created");
         outcome(idYes ? CuriosityPort.Outcome.YES : CuriosityPort.Outcome.NAME_GIVEN, null);
-        if (idFromName || confirming == null) {
+        // No close match being confirmed: the resolve came from the ladder's NAME step.
+        if (confirming == null) {
             welcomeOnly(now, idFirst);
         } else {
             startAs(now, confirming);
@@ -3366,7 +3347,8 @@ final class ExploreBrain {
      */
     private void settleUnnamed(long now) {
         outcome(CuriosityPort.Outcome.NAME_GIVEN, null);
-        if (idChat && confirming != null) {
+        // idChat is only ever set with confirming (enterConfirm).
+        if (idChat) {
             chatSettled = idFirst;
             startAs(now, confirming);
         } else {
@@ -3398,7 +3380,6 @@ final class ExploreBrain {
         idStep = IdStep.NONE;
         confirming = null;
         idChat = false;
-        idFromName = false;
         idYes = false;
         idFirst = null;
         idName = null;
@@ -3436,6 +3417,12 @@ final class ExploreBrain {
     }
 
     private void say(long now, String line, State s) {
+        queueLine(now, line, s);
+        lineStarted(now);
+    }
+
+    /** Stops, enters s and queues the line for the speech service. */
+    private void queueLine(long now, String line, State s) {
         stopMotors();
         state = s;
         // Close the camera and detector before speech begins, not at the end of
@@ -3445,7 +3432,14 @@ final class ExploreBrain {
         stareAtPick();
         pendingLine = line;
         quietUntil = now + tuning.quietWaitMs;
-        lineStarted(now);
+    }
+
+    /** Hands the waiting line to the speech service now. */
+    private void handOffLine(long now) {
+        sayUntil = now + tuning.sayTimeoutMs;
+        String line = pendingLine;
+        pendingLine = null;
+        port.say(line);
     }
 
     /**
@@ -3462,10 +3456,7 @@ final class ExploreBrain {
             }
             note("camera or detector still busy after " + tuning.quietWaitMs + " ms; speaking anyway");
         }
-        sayUntil = now + tuning.sayTimeoutMs;
-        String line = pendingLine;
-        pendingLine = null;
-        port.say(line);
+        handOffLine(now);
         return false;
     }
 

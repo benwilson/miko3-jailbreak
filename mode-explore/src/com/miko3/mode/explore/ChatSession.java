@@ -117,8 +117,6 @@ final class ChatSession {
     private final ExploreTuning tuning;
     private final CuriosityPort port;
     private final Host host;
-    /** The names in a reply by the robot's own patterns (the port's NameExtractor). */
-    private final AnswerParser.Names names;
     private State state;
     private Phase phase = Phase.NONE;
 
@@ -205,12 +203,6 @@ final class ChatSession {
         this.port = port;
         this.host = host;
         this.state = State.CHAT_THINK;
-        this.names = new AnswerParser.Names() {
-            @Override
-            public String nameIn(String transcript) {
-                return ChatSession.this.port.nameIn(transcript);
-            }
-        };
     }
 
     State state() {
@@ -407,7 +399,7 @@ final class ChatSession {
             greetedLocally = true;
             host.note("turn 1 failed for someone known: the local greeting, then the sign-off");
             signOffAfterLine = true;
-            speak(now, LOCAL_GREETING.replace("{name}", name), false);
+            speak(now, ClaudeReplies.fill(LOCAL_GREETING, name), false);
             return;
         }
         signOff(now);
@@ -821,7 +813,7 @@ final class ChatSession {
         glanceIfNewcomer(now);
         if (askingLastName) {
             askingLastName = false;
-            String last = AnswerParser.lastName(text, pendingFirst, names);
+            String last = AnswerParser.lastName(text, pendingFirst, port);
             if (last != null) {
                 lastNameReply = text;
                 startResolve(now, Resolving.LAST_NAME);
@@ -861,7 +853,7 @@ final class ChatSession {
             } else {
                 host.note("a forget request: asking them to confirm by name");
                 confirmingForget = true;
-                speak(now, CONFIRM_FORGET.replace("{name}", name), false);
+                speak(now, ClaudeReplies.fill(CONFIRM_FORGET, name), false);
             }
             return;
         }

@@ -438,18 +438,15 @@ final class ClaudeSettings {
     }
 
     private String storedBaseUrl() {
-        String v = store.getString(KEY_BASE_URL, "");
-        return v == null || v.isEmpty() ? DEFAULT_BASE_URL : v;
+        return stored(KEY_BASE_URL, DEFAULT_BASE_URL);
     }
 
     private String storedKey() {
-        String v = store.getString(KEY_API_KEY, "");
-        return v == null ? "" : v;
+        return stored(KEY_API_KEY, "");
     }
 
     private String storedModel() {
-        String v = store.getString(KEY_MODEL, "");
-        return v == null ? "" : v;
+        return stored(KEY_MODEL, "");
     }
 
     private static String trim(String s) {

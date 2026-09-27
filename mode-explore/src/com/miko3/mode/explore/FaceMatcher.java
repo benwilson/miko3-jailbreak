@@ -127,17 +127,13 @@ final class FaceMatcher {
         Map<String, Float> bestScore = new HashMap<>();
         if (probe != null && gallery != null) {
             for (Entry e : gallery) {
-                if (e == null || e.personId == null || e.embedding == null || e.embedding.length != probe.length) {
+                if (e == null || e.personId == null || e.embedding == null) {
                     continue;
                 }
-                double sum = 0;
-                for (int i = 0; i < probe.length; i++) {
-                    sum += probe[i] * (double) e.embedding[i];
-                }
-                if (Double.isNaN(sum) || Double.isInfinite(sum)) {
+                float s = score(probe, e.embedding);
+                if (Float.isNaN(s)) {
                     continue;
                 }
-                float s = (float) sum;
                 Float cur = bestScore.get(e.personId);
                 if (cur == null || s > cur || (s == cur && e.slot < bestPhoto.get(e.personId).slot)) {
                     bestScore.put(e.personId, s);
@@ -186,6 +182,22 @@ final class FaceMatcher {
         float sa = scores.get(a);
         float sb = scores.get(b);
         return sa > sb || (sa == sb && a.compareTo(b) < 0);
+    }
+
+    /** The dot product of probe and e, summed in double and rounded to float
+     * once; NaN when the lengths differ or the sum is not finite. */
+    static float score(float[] probe, float[] e) {
+        if (probe.length != e.length) {
+            return Float.NaN;
+        }
+        double sum = 0;
+        for (int i = 0; i < probe.length; i++) {
+            sum += probe[i] * (double) e[i];
+        }
+        if (Double.isNaN(sum) || Double.isInfinite(sum)) {
+            return Float.NaN;
+        }
+        return (float) sum;
     }
 
     /** v scaled to unit length, as a new array; null when v is null, empty, all zero or not finite. */

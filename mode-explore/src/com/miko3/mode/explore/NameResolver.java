@@ -62,15 +62,10 @@ final class NameResolver {
         float best = Float.NEGATIVE_INFINITY;
         if (probe != null && gallery != null) {
             for (FaceMatcher.Entry e : gallery) {
-                if (e == null || e.embedding == null || e.embedding.length != probe.length
-                        || !candidateIds.contains(e.personId)) {
+                if (e == null || e.embedding == null || !candidateIds.contains(e.personId)) {
                     continue;
                 }
-                double sum = 0;
-                for (int i = 0; i < probe.length; i++) {
-                    sum += probe[i] * (double) e.embedding[i];
-                }
-                float s = (float) sum;
+                float s = FaceMatcher.score(probe, e.embedding);
                 if (Float.isNaN(s) || Float.isInfinite(s)) {
                     continue;
                 }
@@ -97,8 +92,7 @@ final class NameResolver {
      * in the store's order), else someone new under the full name.
      */
     static Decision afterLastName(String first, String last, Map<String, String> storedNames) {
-        String full = (first == null ? "" : first.trim()) + " " + (last == null ? "" : last.trim());
-        full = full.trim().replaceAll("\\s+", " ");
+        String full = fullName(first, last);
         if (storedNames != null) {
             for (Map.Entry<String, String> e : storedNames.entrySet()) {
                 if (AnswerParser.same(e.getValue(), full)) {
@@ -107,6 +101,12 @@ final class NameResolver {
             }
         }
         return new Decision(Kind.NEW, null, titled(full), Float.NaN);
+    }
+
+    /** First and last as one full name: trimmed, single-spaced. */
+    static String fullName(String first, String last) {
+        String full = (first == null ? "" : first.trim()) + " " + (last == null ? "" : last.trim());
+        return full.trim().replaceAll("\\s+", " ");
     }
 
     /**

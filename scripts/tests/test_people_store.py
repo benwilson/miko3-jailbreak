@@ -282,8 +282,10 @@ class ServiceWiringTest(unittest.TestCase):
     def test_forget_purges_the_face_checks(self):
         # R19: forgetting a person removes every check that matched or joined them.
         body = _method_body(self.src, "public boolean forget") or ""
-        self.assertLess(body.find("people().forget("), body.find(".purgePerson("))
-        self.assertGreaterEqual(body.find("people().forget("), 0)
+        self.assertIn("FaceChecks.forget(people(), checks(), id)", body)
+        shared = _method_body((LAUNCHER / "FaceChecks.java").read_text(), "static boolean forget") or ""
+        self.assertLess(shared.find("people.forget("), shared.find(".purgePerson("))
+        self.assertGreaterEqual(shared.find("people.forget("), 0)
 
     def test_caller_gate_is_reused(self):
         self.assertIn("CallerGate.enforce(", self.src)
@@ -398,8 +400,7 @@ class InterfaceAndClientTest(unittest.TestCase):
         src = _read(CLIENT)
         for needle in ("RobotPeople.GalleryPhoto[] gallery(Context", "byte[] photo(Context", "String[] idsNamed(Context",
                        "int addPhoto(Context", "String addPerson(Context", "boolean setEmbedding(Context",
-                       "boolean markUnusable(Context", "long recordCheck(Context", "boolean updateCheck(Context",
-                       "boolean closeCheck(Context"):
+                       "boolean markUnusable(Context", "long recordCheck(Context", "boolean updateCheck(Context"):
             self.assertIn(needle, src)
 
     def test_face_check_is_plain_java_and_carries_ids_not_names(self):

@@ -149,8 +149,7 @@ final class SettingsPage {
     static void handle(HttpRequest req, HttpResponse res, PageToken token, ClaudeSettings settings,
                        ClaudeApi api, Speaker speaker, PeopleStore people, FaceChecks checks) throws IOException {
         if (LauncherProtocol.SETTINGS_PATH.equals(req.path)) {
-            if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
-                res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
+            if (refusedUnlessGet(req, res)) {
                 return;
             }
             res.sendText(200, "OK", "text/html; charset=utf-8", buildHtml(token.issue(), settings.status(),
@@ -180,12 +179,22 @@ final class SettingsPage {
             sendFaceState(req, res, token, settings, people, checks);
             return;
         }
-        if (LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH.equals(req.path)) {
-            saveThresholds(req, res, token, settings);
+        // The thresholds save (KTD5) is loopback-only, checked before the body is read.
+        if (LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH.equals(req.path) && !req.fromLoopback) {
+            res.sendText(403, "Forbidden", "text/plain; charset=utf-8", FACE_THRESHOLDS_LOOPBACK_ONLY + "\n");
             return;
         }
         String status = act(req.path, readForm(req), token, settings, api, speaker, people, checks);
         res.redirect(LauncherProtocol.SETTINGS_PATH + "?status=" + urlEncode(status));
+    }
+
+    /** Sends 405 and returns true unless the request is a GET or HEAD. */
+    private static boolean refusedUnlessGet(HttpRequest req, HttpResponse res) throws IOException {
+        if ("GET".equals(req.method) || "HEAD".equals(req.method)) {
+            return false;
+        }
+        res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
+        return true;
     }
 
     /** Runs one action; returns the status line to show. */
@@ -225,14 +234,16 @@ final class SettingsPage {
         if (LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH.equals(path)) {
             return deletePhoto(form.get("id"), form.get("slot"), people);
         }
+        if (LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH.equals(path)) {
+            return saveFace(form, settings);
+        }
         return "Nothing changed: unknown action.";
     }
 
     /** The face JPEG for ?id=, or 404 for anything that isn't a remembered
      * person's id. The id is checked by PeopleStore before any file access. */
     private static void sendFace(HttpRequest req, HttpResponse res, PeopleStore people) throws IOException {
-        if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
-            res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
+        if (refusedUnlessGet(req, res)) {
             return;
         }
         byte[] face = people.face(req.queryParam("id", null));
@@ -255,10 +266,7 @@ final class SettingsPage {
     }
 
     private static String forget(String id, PeopleStore people, FaceChecks checks) {
-        boolean known = people.forget(id);
-        // R19: every check that matched or joined them goes too.
-        checks.purgePerson(id);
-        return known ? PEOPLE_FORGOTTEN : PEOPLE_UNKNOWN;
+        return FaceChecks.forget(people, checks, id) ? PEOPLE_FORGOTTEN : PEOPLE_UNKNOWN;
     }
 
     /** One photo by id and slot (KTD8); refused for the last one, since a
@@ -292,8 +300,7 @@ final class SettingsPage {
      * unknown person.
      */
     private static void sendPhoto(HttpRequest req, HttpResponse res, PeopleStore people) throws IOException {
-        if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
-            res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
+        if (refusedUnlessGet(req, res)) {
             return;
         }
         String id = req.queryParam("id", null);
@@ -303,29 +310,17 @@ final class SettingsPage {
             res.sendText(404, "Not Found", "text/plain; charset=utf-8", "No such photo.");
             return;
         }
-        byte[] jpeg = currentAddedAt(people.photos(id), slot) == at ? people.photo(id, slot) : null;
-        // The slot may change between the two reads; check once more after.
-        if (jpeg == null || currentAddedAt(people.photos(id), slot) != at) {
+        byte[] jpeg = people.photoIfAddedAt(id, slot, at);
+        if (jpeg == null) {
             res.sendText(200, "OK", "image/svg+xml", REPLACED_SVG);
             return;
         }
         res.sendBytes(200, "OK", "image/jpeg", jpeg);
     }
 
-    /** The slot's photo's added-at time, or -1 when the slot is empty. */
-    private static long currentAddedAt(List<PeopleStore.Photo> photos, int slot) {
-        for (PeopleStore.Photo p : photos) {
-            if (p.slot == slot) {
-                return p.addedAtMillis;
-            }
-        }
-        return -1;
-    }
-
     /** A check's crop by ?id=<handle>, or 404 once it has rolled off or had none. */
     private static void sendCheckCrop(HttpRequest req, HttpResponse res, FaceChecks checks) throws IOException {
-        if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
-            res.sendText(405, "Method Not Allowed", "text/plain; charset=utf-8", "GET only");
+        if (refusedUnlessGet(req, res)) {
             return;
         }
         long handle = parseLong(req.queryParam("id", null));
@@ -343,30 +338,9 @@ final class SettingsPage {
     }
 
     /**
-     * The thresholds save (KTD5). Loopback callers only, checked before the
-     * body is read; then the page token, as every action. Fields left out keep
-     * their stored value, and the whole set must pass ClaudeSettings'
-     * rules or nothing is stored. Redirects with a fixed status, like the
-     * page's own forms, so the CLI reads the result the same way.
+     * The thresholds save (KTD5): fields left out keep their stored value, and
+     * the whole set must pass ClaudeSettings' rules or nothing is stored.
      */
-    private static void saveThresholds(HttpRequest req, HttpResponse res, PageToken token, ClaudeSettings settings)
-            throws IOException {
-        if (!req.fromLoopback) {
-            res.sendText(403, "Forbidden", "text/plain; charset=utf-8", FACE_THRESHOLDS_LOOPBACK_ONLY + "\n");
-            return;
-        }
-        Map<String, String> form = readForm(req);
-        String status;
-        if (form == null) {
-            status = "Nothing changed: the form was too large.";
-        } else if (!token.check(form.get("t"))) {
-            status = "Nothing changed: this page had expired. Try again.";
-        } else {
-            status = saveFace(form, settings);
-        }
-        res.redirect(LauncherProtocol.SETTINGS_PATH + "?status=" + urlEncode(status));
-    }
-
     private static String saveFace(Map<String, String> form, ClaudeSettings settings) {
         FaceSettings now = settings.faceSettings();
         FaceSettings next;
@@ -507,7 +481,7 @@ final class SettingsPage {
         if (c.bestId.isEmpty()) {
             return "none";
         }
-        return currentAddedAt(store.photos(c.bestId), c.bestSlot) == c.bestAddedAtMillis ? "current" : "replaced";
+        return store.addedAt(c.bestId, c.bestSlot) == c.bestAddedAtMillis ? "current" : "replaced";
     }
 
     private static String save(Map<String, String> form, ClaudeSettings settings) {
@@ -809,7 +783,7 @@ final class SettingsPage {
             return;
         }
         html.append("<div>");
-        if (currentAddedAt(store.photos(c.bestId), c.bestSlot) == c.bestAddedAtMillis) {
+        if (store.addedAt(c.bestId, c.bestSlot) == c.bestAddedAtMillis) {
             html.append("<img src=\"").append(escapeHtml(photoUrl(c.bestId, c.bestSlot, c.bestAddedAtMillis)))
                     .append("\" alt=\"best match\" width=\"112\" height=\"112\">");
         } else {

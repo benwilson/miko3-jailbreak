@@ -231,7 +231,7 @@ public class LauncherApp extends Application {
         });
         // The recent face checks Explore records, for the Settings page (face
         // plan U5). Memory only, so a restart clears them (R19).
-        faceChecks = new FaceChecks(new FaceChecks.Clock() {
+        faceChecks = new FaceChecks(new PeopleStore.Clock() {
             @Override
             public long nowMillis() {
                 return System.currentTimeMillis();

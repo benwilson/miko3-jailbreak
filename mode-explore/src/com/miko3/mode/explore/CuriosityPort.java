@@ -17,7 +17,7 @@ import java.util.List;
  * answer must never be returned. The brain keeps its own deadline per try, so
  * an adapter that never answers can't hang a stop.
  */
-interface CuriosityPort {
+interface CuriosityPort extends AnswerParser.Names {
 
     /** False when Claude isn't set up or reachable at all: the stop runs as it did before U4. */
     boolean canAsk();
@@ -229,6 +229,7 @@ interface CuriosityPort {
      * or null. Synchronous and local: no request, nothing logged. AnswerParser
      * reads the confirmation and last-name replies with it.
      */
+    @Override
     String nameIn(String transcript);
 
     /**

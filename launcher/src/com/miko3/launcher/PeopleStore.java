@@ -241,13 +241,7 @@ final class PeopleStore {
      * (R19: nothing is written then), or can't be written.
      */
     synchronized String add(byte[] faceJpeg, String name) {
-        if (faceJpeg == null || faceJpeg.length < 4 || (faceJpeg[0] & 0xff) != 0xFF
-                || (faceJpeg[1] & 0xff) != 0xD8) {
-            throw new IllegalArgumentException(REFUSE_NOT_JPEG);
-        }
-        if (faceJpeg.length > MAX_FACE_BYTES) {
-            throw new IllegalArgumentException(REFUSE_TOO_BIG);
-        }
+        checkJpeg(faceJpeg);
         String cleanName = cleanName(name);
         if (cleanName.isEmpty()) {
             throw new IllegalArgumentException(REFUSE_NO_NAME);
@@ -545,6 +539,21 @@ final class PeopleStore {
         } catch (IOException e) {
             return null;
         }
+    }
+
+    /** When the slot's photo was added, or -1 for an unknown or malformed id
+     * or an empty or out-of-range slot. */
+    synchronized long addedAt(String id, int slot) {
+        if (indexOf(id) < 0 || slot < 0 || slot >= MAX_PHOTOS || slots.get(id)[slot] == null) {
+            return -1;
+        }
+        return slots.get(id)[slot].addedAtMillis;
+    }
+
+    /** The slot's photo JPEG while it is still the one added at addedAtMillis
+     * (KTD8), checked and read in one step; otherwise null. */
+    synchronized byte[] photoIfAddedAt(String id, int slot, long addedAtMillis) {
+        return addedAt(id, slot) == addedAtMillis ? photo(id, slot) : null;
     }
 
     /** One person's photos in slot order, named or not (the People page);

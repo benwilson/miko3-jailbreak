@@ -31,7 +31,8 @@ SCRIPT = REPO / "scripts" / "face-bench.py"
 PKG = REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "face_bench_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "FaceBenchHarness.java"
-PLAIN_JAVA = [PKG / "FaceAlign.java", PKG / "FaceQuality.java", PKG / "Brightness.java"]
+FACE_SETTINGS = REPO / "shared" / "src" / "com" / "miko3" / "shared" / "FaceSettings.java"
+PLAIN_JAVA = [PKG / "FaceAlign.java", PKG / "FaceQuality.java", PKG / "Brightness.java", FACE_SETTINGS]
 MAIN_CLASS = "com.miko3.mode.explore.FaceBenchHarness"
 FACES = TESTS / "fixtures" / "faces"
 

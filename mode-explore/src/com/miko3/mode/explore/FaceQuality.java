@@ -1,5 +1,7 @@
 package com.miko3.mode.explore;
 
+import com.miko3.shared.FaceSettings;
+
 /**
  * The face quality gate and the brighten (on-device face recognition plan
  * KTD3, R11, R12). Plain Java; the bench (U9) mirrors it in numpy with the
@@ -42,7 +44,7 @@ final class FaceQuality {
 
     /** The gate's thresholds, from the launcher settings (KTD5). */
     static final class Thresholds {
-        static final Thresholds DEFAULTS = new Thresholds(48, 40, 90, 30);
+        static final Thresholds DEFAULTS = of(FaceSettings.DEFAULTS);
 
         /** Minimum face box width, frame pixels. */
         final int minWidth;
@@ -58,6 +60,11 @@ final class FaceQuality {
             this.darkFloor = darkFloor;
             this.dimLevel = dimLevel;
             this.blurFloor = blurFloor;
+        }
+
+        /** The gate's half of the launcher's face settings. */
+        static Thresholds of(FaceSettings s) {
+            return new Thresholds(s.minWidth, s.darkFloor, s.dimLevel, s.blurFloor);
         }
 
         @Override

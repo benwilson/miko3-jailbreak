@@ -181,14 +181,7 @@ final class AnswerParser {
     }
 
     private static String join(List<String> words) {
-        StringBuilder out = new StringBuilder();
-        for (String w : words) {
-            if (out.length() > 0) {
-                out.append(' ');
-            }
-            out.append(w);
-        }
-        return out.toString();
+        return String.join(" ", words);
     }
 
     /** Lower-case words; punctuation other than an apostrophe or hyphen is a space; curly apostrophes made straight. */

@@ -732,7 +732,7 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertNotIn("addPerson", photo)
         self.assertIn("NameExtractor.extract(transcript)", a)
         over = re.search(r"public void meetingOver\((.*?)\n    \}", a, re.S).group(1)
-        self.assertIn("closeCheck(meeting)", over)
+        self.assertIn("checkOutcome(meeting, FaceCheck.ENDED_WITHOUT_ANSWER, null)", over)
         self.assertIn("stranger.withConfirm(confirmName(r.bestId))", a)
 
     def test_the_state_page_counts_repeats_and_the_clips_are_reactions(self):

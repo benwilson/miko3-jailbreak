@@ -99,6 +99,8 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final FaceMigration migration;
     private volatile boolean faceWorkAllowed;
     private final AtomicBoolean migrating = new AtomicBoolean();
+    /** The current migration pass's gate; null until the pass first needs it. */
+    private FaceQuality.Thresholds passGate;
     private final ExecutorService worker = Executors.newCachedThreadPool(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
@@ -168,6 +170,10 @@ final class ClaudeCuriosity implements CuriosityPort {
          */
         volatile float[] probe;
         volatile byte[] storeCrop;
+        /** The gallery and close threshold the match ran with (KTD11: the gallery
+         * once per meeting); the resolver scores against these. Set before probe. */
+        volatile List<FaceMatcher.Entry> entries;
+        volatile float close;
         /** The matcher's decision (null when none ran) and the face check's handle (-1: none). */
         volatile FaceMatcher.Result result;
         volatile long checkHandle = -1;
@@ -874,7 +880,8 @@ final class ClaudeCuriosity implements CuriosityPort {
         final int g = matches.start();
         meetFace = null;
         matchedId = null;
-        closeCheck(meeting);
+        // A check still waiting for an answer ends "without an answer" (KTD8).
+        checkOutcome(meeting, FaceCheck.ENDED_WITHOUT_ANSWER, null);
         final MetFace mf = new MetFace();
         meeting = mf;
         run(new Runnable() {
@@ -919,8 +926,7 @@ final class ClaudeCuriosity implements CuriosityPort {
         } catch (IOException e) {
             return facelessBecause("the face settings", e);
         }
-        FaceQuality.Thresholds gate = new FaceQuality.Thresholds(settings.minWidth, settings.darkFloor,
-                settings.dimLevel, settings.blurFloor);
+        FaceQuality.Thresholds gate = FaceQuality.Thresholds.of(settings);
         int[] aligned = FaceAlign.align(found.argb, found.frameW, found.frameH, found.face.landmarks);
         if (aligned == null) {
             Log.w(TAG, "person match: the face could not be straightened; meeting without storing anything");
@@ -937,6 +943,9 @@ final class ClaudeCuriosity implements CuriosityPort {
         }
         // A dim crop is brightened before it is matched or stored, once (R12).
         byte[] storable = v.dim ? FaceCropper.brighten(loose, v.table) : loose;
+        if (!matches.current(g)) {
+            return MatchAnswer.FAILED;
+        }
         float[] probe = embedder.embed(v.brighten(aligned));
         if (probe == null) {
             Log.w(TAG, "person match: no embedding, the face model is unavailable; meeting without storing anything");
@@ -953,7 +962,8 @@ final class ClaudeCuriosity implements CuriosityPort {
             return MatchAnswer.FAILED;
         }
         boolean ready = FaceMigration.ready(photosOf(gallery));
-        FaceMatcher.Result r = FaceMatcher.match(probe, entriesOf(gallery),
+        List<FaceMatcher.Entry> entries = entriesOf(gallery);
+        FaceMatcher.Result r = FaceMatcher.match(probe, entries,
                 new FaceMatcher.Thresholds(settings.confident, settings.close, settings.margin), ready);
         long ms = System.currentTimeMillis() - t0;
         int photos = gallery == null ? 0 : gallery.length;
@@ -966,6 +976,8 @@ final class ClaudeCuriosity implements CuriosityPort {
             return facelessMeeting(r.band, h);
         }
         long h = record(mf, check(decisionOf(r.band), FaceCheck.REASON_NONE, storable, r, gallery));
+        mf.entries = entries;
+        mf.close = settings.close;
         mf.probe = probe;
         mf.storeCrop = storable;
         meetFace = storable;
@@ -1044,9 +1056,8 @@ final class ClaudeCuriosity implements CuriosityPort {
         try {
             String[] found = RobotPeopleClient.idsNamed(app, name);
             List<String> ids = found == null ? Collections.<String>emptyList() : Arrays.asList(found);
-            List<FaceMatcher.Entry> entries = ids.isEmpty() ? Collections.<FaceMatcher.Entry>emptyList()
-                    : entriesOf(RobotPeopleClient.gallery(app));
-            float close = RobotSettingsClient.fetchFaceSettings(app).close;
+            List<FaceMatcher.Entry> entries = mf.entries;
+            float close = mf.close;
             NameResolver.Decision d = NameResolver.resolve(name, probe, ids, entries, close);
             Log.i(TAG, "name resolved over " + ids.size() + " stored id(s): " + d);
             switch (d.kind) {
@@ -1087,12 +1098,17 @@ final class ClaudeCuriosity implements CuriosityPort {
         }
         try {
             String[] found = RobotPeopleClient.idsNamed(app, first + " " + lastName.trim());
+            String full = NameResolver.fullName(first, lastName);
             Map<String, String> stored = new LinkedHashMap<String, String>();
             if (found != null) {
                 for (String id : found) {
                     String n = RobotPeopleClient.nameOf(app, id);
                     if (n != null) {
                         stored.put(id, n);
+                        if (AnswerParser.same(n, full)) {
+                            // afterLastName joins the first match: later names are not needed.
+                            break;
+                        }
                     }
                 }
             }
@@ -1188,7 +1204,8 @@ final class ClaudeCuriosity implements CuriosityPort {
 
     @Override
     public void meetingOver() {
-        closeCheck(meeting);
+        // A check still waiting for an answer ends "without an answer" (KTD8).
+        checkOutcome(meeting, FaceCheck.ENDED_WITHOUT_ANSWER, null);
     }
 
     /**
@@ -1314,24 +1331,6 @@ final class ClaudeCuriosity implements CuriosityPort {
         }, null, 0, null);
     }
 
-    /** The previous meeting's check, if still waiting for an answer, ends "without an answer" (KTD8). */
-    private void closeCheck(final MetFace mf) {
-        final long h = mf == null ? -1 : mf.checkHandle;
-        if (h < 0) {
-            return;
-        }
-        run(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    RobotPeopleClient.closeCheck(app, h);
-                } catch (IOException e) {
-                    Log.w(TAG, "face check not closed: " + e.getMessage());
-                }
-            }
-        }, null, 0, null);
-    }
-
     // ---- the start-up migration (face plan U6, KTD11) ----
 
     /** ModeApp.startExplore: embed the stored photos that predate the current model, while the brain allows. */
@@ -1362,6 +1361,7 @@ final class ClaudeCuriosity implements CuriosityPort {
             public void run() {
                 try {
                     long t0 = System.currentTimeMillis();
+                    passGate = null;
                     FaceMigration.Outcome o = migration.pass();
                     Log.i(TAG, "face migration " + o + ": " + migration.embedded() + " embedded, "
                             + migration.unusable() + " marked unusable, " + migration.waiting() + " waiting, in "
@@ -1389,15 +1389,24 @@ final class ClaudeCuriosity implements CuriosityPort {
             return FaceMigration.NO_FACE;
         }
         FaceQuality.Verdict v = FaceQuality.check(found.faceWidth(), aligned, FaceAlign.SIDE, FaceAlign.SIDE,
-                migrationGate(), true);
+                passGate(), true);
         return embedder.embed(v.brighten(aligned));
+    }
+
+    /** migrationGate(), fetched once per migration pass (on the pass's first
+     * found face), not once per photo. Migration worker only. */
+    private FaceQuality.Thresholds passGate() {
+        if (passGate == null) {
+            passGate = migrationGate();
+        }
+        return passGate;
     }
 
     /** The dim level from the launcher's face settings, else the defaults (nothing is rejected here). */
     private FaceQuality.Thresholds migrationGate() {
         try {
             FaceSettings s = RobotSettingsClient.fetchFaceSettings(app);
-            return new FaceQuality.Thresholds(s.minWidth, s.darkFloor, s.dimLevel, s.blurFloor);
+            return FaceQuality.Thresholds.of(s);
         } catch (IOException e) {
             return FaceQuality.Thresholds.DEFAULTS;
         }

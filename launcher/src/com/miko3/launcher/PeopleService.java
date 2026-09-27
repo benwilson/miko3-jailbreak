@@ -83,10 +83,7 @@ public class PeopleService extends Service {
         @Override
         public boolean forget(String id) {
             enforceCaller();
-            boolean known = people().forget(id);
-            // R19: every check that matched or joined them goes too.
-            checks().purgePerson(id);
-            return known;
+            return FaceChecks.forget(people(), checks(), id);
         }
 
         @Override

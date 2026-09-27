@@ -33,11 +33,6 @@ final class FaceChecks {
     /** Refusal for a check or outcome code this ring doesn't know. */
     static final String REFUSE_BAD_CHECK = "that face check is not valid";
 
-    /** Wall-clock time, injected so tests can pin when a check happened. */
-    interface Clock {
-        long nowMillis();
-    }
-
     /** One recorded check as of the call that returned it. */
     static final class Entry {
         final long handle;
@@ -79,12 +74,13 @@ final class FaceChecks {
         }
     }
 
-    private final Clock clock;
+    /** Wall-clock time, injected so tests can pin when a check happened. */
+    private final PeopleStore.Clock clock;
     /** Newest first; never longer than CAPACITY. */
     private final LinkedList<Slot> ring = new LinkedList<Slot>();
     private long lastHandle;
 
-    FaceChecks(Clock clock) {
+    FaceChecks(PeopleStore.Clock clock) {
         this.clock = clock;
     }
 
@@ -135,6 +131,15 @@ final class FaceChecks {
         }
         s.outcome = FaceCheck.ENDED_WITHOUT_ANSWER;
         return true;
+    }
+
+    /** Forgets a person, then (R19) every check that matched or joined them;
+     * the one forget path for the page and PeopleService. Answers whether
+     * they were known. */
+    static boolean forget(PeopleStore people, FaceChecks checks, String id) {
+        boolean known = people.forget(id);
+        checks.purgePerson(id);
+        return known;
     }
 
     /** R19: removes every check whose best match or joined id is id; answers how many. */

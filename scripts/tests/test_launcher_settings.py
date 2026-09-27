@@ -600,13 +600,19 @@ class FaceWiringTest(unittest.TestCase):
     def test_page_forget_purges_the_checks(self):
         m = re.search(r"private static String forget\([^)]*\)\s*\{(.*?)\n    \}", self.page, flags=re.S)
         self.assertIsNotNone(m, "SettingsPage has no forget()")
-        self.assertIn(".forget(", m.group(1))
-        self.assertIn(".purgePerson(", m.group(1))
+        # The page and PeopleService share one forget path: the person, then their checks.
+        self.assertIn("FaceChecks.forget(", m.group(1))
+        checks = _strip_comments(FACE_CHECKS.read_text())
+        f = re.search(r"static boolean forget\([^)]*\)\s*\{(.*?)\n    \}", checks, flags=re.S)
+        self.assertIsNotNone(f, "FaceChecks has no forget()")
+        self.assertGreaterEqual(f.group(1).find(".forget("), 0)
+        self.assertLess(f.group(1).find(".forget("), f.group(1).find(".purgePerson("))
 
     def test_threshold_save_checks_loopback_first(self):
-        m = re.search(r"private static void saveThresholds\([^)]*\)[^{]*\{(.*?)\n    \}", self.page, flags=re.S)
-        self.assertIsNotNone(m, "SettingsPage has no saveThresholds()")
+        m = re.search(r"static void handle\([^)]*\)[^{]*\{(.*?)\n    \}", self.page, flags=re.S)
+        self.assertIsNotNone(m, "SettingsPage has no handle()")
         body = m.group(1)
+        self.assertRegex(body, r"SETTINGS_FACE_THRESHOLDS_PATH\.equals\(req\.path\) && !req\.fromLoopback")
         self.assertGreaterEqual(body.find("fromLoopback"), 0)
         self.assertLess(body.find("fromLoopback"), body.find("readForm("))
 

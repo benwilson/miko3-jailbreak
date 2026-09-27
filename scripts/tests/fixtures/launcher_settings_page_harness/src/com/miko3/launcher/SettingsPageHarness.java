@@ -110,7 +110,7 @@ public final class SettingsPageHarness {
         final FakeSpeaker speaker = new FakeSpeaker();
         final PeopleClock peopleClock = new PeopleClock();
         final PeopleStore people = new PeopleStore(tempDir(), peopleClock);
-        final FaceChecks checks = new FaceChecks(new FaceChecks.Clock() {
+        final FaceChecks checks = new FaceChecks(new PeopleStore.Clock() {
             @Override
             public long nowMillis() {
                 return 1_700_000_000_000L;

@@ -32,7 +32,8 @@ REPO = Path(__file__).resolve().parents[2]
 PKG = REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "face_align_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "FaceAlignHarness.java"
-PLAIN_JAVA = [PKG / "FaceAlign.java", PKG / "FaceQuality.java", PKG / "Brightness.java"]
+FACE_SETTINGS = REPO / "shared" / "src" / "com" / "miko3" / "shared" / "FaceSettings.java"
+PLAIN_JAVA = [PKG / "FaceAlign.java", PKG / "FaceQuality.java", PKG / "Brightness.java", FACE_SETTINGS]
 FACES = TESTS / "fixtures" / "faces"
 MAIN_CLASS = "com.miko3.mode.explore.FaceAlignHarness"
 

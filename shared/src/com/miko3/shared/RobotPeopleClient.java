@@ -199,7 +199,7 @@ public final class RobotPeopleClient {
     // IOException when the launcher predates it.
 
     /** Records one face check for the Settings page; answers its handle for
-     * updateCheck and closeCheck. IOException with the launcher's fixed
+     * updateCheck. IOException with the launcher's fixed
      * reason for a crop it won't keep or an unknown code. */
     public static long recordCheck(Context context, final FaceCheck check) throws IOException {
         return call(context, DEFAULT_TIMEOUT_MS, new Call<Long>() {
@@ -220,12 +220,6 @@ public final class RobotPeopleClient {
                 return people.updateCheck(handle, outcome, joinedId);
             }
         });
-    }
-
-    /** At the end of a meeting: closes the check as "ended without an answer"
-     * if it is still pending; false when it was answered or is gone. */
-    public static boolean closeCheck(Context context, long handle) throws IOException {
-        return updateCheck(context, handle, FaceCheck.ENDED_WITHOUT_ANSWER, null);
     }
 
     private static PersonNotes parseNotes(String json) {
