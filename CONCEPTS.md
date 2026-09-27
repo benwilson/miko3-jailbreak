@@ -118,3 +118,7 @@ The one long-lived microphone capture the launcher holds on behalf of an autonom
 
 The stretch from the moment the robot starts a spoken line until playback goes idle plus a short tail, during which nothing said to it can be heard because its own voice ducks the microphone. Anything said inside the window is dropped by design, the recogniser is reset at its end so the ducked audio never becomes an utterance, and it is the reason the robot keeps its lines to two sentences and listens the instant a line ends.
 
+
+## Face check
+
+An autonomous mode's decision about one face it has just cropped at a meeting: whether the crop is usable at all, which stored person it most resembles, how strongly, and which of three answers follows. A confident match is greeted by name, a close one is asked "Is that you?", and a weak one is treated as someone new and asked their name. The person's answer teaches the robot another photo of them. A crop too dark, blurry or small is rejected rather than guessed at. Two stored people scoring almost equally is treated as a close call and asked about rather than greeted, and while stored photos are still waiting to be re-processed for the current matcher, the robot still talks with the person but matches nobody and stores or learns nobody. Each check is kept briefly with its crop, score and outcome so the owner can see why the robot did or didn't recognise someone.
