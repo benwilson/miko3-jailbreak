@@ -107,11 +107,6 @@ final class EarsProbe {
         final Integer raw;
 
         Row(int second, Float angle, int rms, long decodeMs, long decodeMaxMs, int chunks, int words,
-            boolean matched) {
-            this(second, angle, rms, decodeMs, decodeMaxMs, chunks, words, matched, null);
-        }
-
-        Row(int second, Float angle, int rms, long decodeMs, long decodeMaxMs, int chunks, int words,
             boolean matched, Integer raw) {
             this.raw = raw;
             this.second = second;

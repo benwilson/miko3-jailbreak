@@ -18,7 +18,7 @@ import java.util.List;
  * or a close release the microphone. The capture runs whenever the session
  * is held, on the charger too (Hey Miko plan KTD5, replacing the meeting
  * plan's KTD6 close): a docked robot still answers his name. The client's
- * charger latch is kept for the log only. One capture loop feeds every chunk to the
+ * charger latch is logged on open and otherwise ignored. One capture loop feeds every chunk to the
  * wake-word engine and the VAD gate, and to the recogniser only while speech
  * is present (plus a short hangover so its endpoint rule sees silence). The
  * direction angle is sampled at DIRECTION_PERIOD_MS on the sampler's own
@@ -177,7 +177,6 @@ final class EarsSession {
 
     // Guarded by this.
     private Client client;
-    private boolean charger;
     private long listenUntil; // 0 when no conversation listen is active
     private Thread captureThread;
     private boolean captureWanted;
@@ -253,7 +252,6 @@ final class EarsSession {
             throw new IllegalStateException("client already dead");
         }
         this.client = client;
-        this.charger = chargerLatched;
         this.listenUntil = 0;
         this.lastSummaryMs = clock.nowMs();
         diag.log("opened by uid " + holder + (chargerLatched ? " (charger latched)" : ""));
@@ -266,7 +264,6 @@ final class EarsSession {
             diag.log("renew refused from uid " + holder);
             return false;
         }
-        charger = chargerLatched;
         reconcile();
         return true;
     }
@@ -429,7 +426,7 @@ final class EarsSession {
 
     /** Caller holds the lock. Starts or stops the capture to match the rules. */
     private void reconcile() {
-        // KTD5 (Hey Miko plan): the charger latch no longer closes the capture.
+        // Capture runs whenever held, charger included (KTD5).
         boolean want = keeper.holder() != null;
         captureWanted = want;
         if (want && captureThread == null && clock.nowMs() - captureFailedAt >= RETRY_MS) {

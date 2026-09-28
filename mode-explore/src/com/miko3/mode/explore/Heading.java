@@ -397,12 +397,11 @@ final class Heading {
                 samples.addLast(new double[]{nowMs, deg});
             }
             while (samples.size() > 2) {
-                Iterator<double[]> it = samples.iterator();
-                it.next();
-                if (nowMs - (long) it.next()[0] < keepMs) {
+                double[] oldest = samples.pollFirst();
+                if (nowMs - (long) samples.peekFirst()[0] < keepMs) {
+                    samples.addFirst(oldest);
                     break;
                 }
-                samples.pollFirst();
             }
         }
 

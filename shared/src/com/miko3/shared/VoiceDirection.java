@@ -69,6 +69,8 @@ public final class VoiceDirection {
     static final int MAX_MISSES = 3;
     /** How many raw replies are logged in full (hex), so the robot session can place the reply CRC. */
     static final int LOGGED_REPLIES = 3;
+    /** The DOA GET frame, built once; Port.write only reads it. */
+    private static final byte[] DOA_QUERY = NcFrames.doaQuery();
     /** While uncalibrated, a raw value is logged at most this often, for calibration. */
     static final long RAW_LOG_PERIOD_MS = 1000;
 
@@ -302,7 +304,7 @@ public final class VoiceDirection {
                     break;
                 }
             }
-            port.write(NcFrames.doaQuery());
+            port.write(DOA_QUERY);
             long deadline = System.nanoTime() + deadlineMs * 1000000L;
             while (true) {
                 int need = NcFrames.replyLength(reply, have);
@@ -327,7 +329,7 @@ public final class VoiceDirection {
         } catch (IOException e) {
             have = 0;
         }
-        if (have > 0) {
+        if (have > 0 && (firstReplyHex == null || logged < LOGGED_REPLIES)) {
             String hex = NcFrames.hex(reply, have);
             if (firstReplyHex == null) {
                 firstReplyHex = hex;

@@ -475,6 +475,11 @@ final class ExploreBrain {
             return this == CONFIRM || this == LAST_NAME;
         }
 
+        /** Heading for, or meeting, a person he found: FACE, APPROACH or MEET_LOOK. */
+        boolean approachesPerson() {
+            return this == FACE || this == APPROACH || this == MEET_LOOK;
+        }
+
         /**
          * A conversation with someone (hey-miko plan KTD2 step 2): the meeting and
          * everything after it, up to the end of the CHAT states. A call waits these out.
@@ -1761,8 +1766,7 @@ final class ExploreBrain {
         if (!state.inStop()) {
             return;
         }
-        if (call != null && callTaken && (state.cueSearch() || state == State.FACE || state == State.APPROACH
-                || state == State.MEET_LOOK)) {
+        if (callsOwn() && (state.cueSearch() || state.approachesPerson())) {
             // KTD1: the escape comes first; the call is retaken from where it leaves him.
             handBackCall("a hazard");
             clearStop();
@@ -4926,7 +4930,7 @@ final class ExploreBrain {
 
     /**
      * Opens the launcher's ears and closes them at shutdown (they stay open on the charger,
-     * hey-miko plan KTD5, replacing the meeting plan's KTD6 dock rule), and
+     * hey-miko plan KTD5), and
      * reopens a session that died while wanted (a launcher restart is a lease loss and an
      * ears-session loss at once, meeting plan: "re-opens the ears with the same backoff the
      * drive lease uses"). The backoff mirrors ExploreDrive.scheduleLeaseRetry: the loss is
@@ -5062,7 +5066,7 @@ final class ExploreBrain {
             whereReply(now, c);
             return;
         }
-        if (callsOwn() && (state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK)) {
+        if (callsOwn() && state.approachesPerson()) {
             // The call's own approach (KTD8): only another call can turn him from it.
             dropCue("cue " + c.tier + " " + c.side + " during the call's approach: ignored");
             return;
@@ -5128,11 +5132,8 @@ final class ExploreBrain {
             return;
         }
         if (call == null) {
+            clearCall();
             call = c;
-            callTaken = false;
-            callAnswered = false;
-            callWaitCounted = false;
-            callReplied = false;
             gauges.stamp(Gauges.Stage.CALL_HEARD, c.at);
             note("a call from " + c.side + " in " + state);
             if (state.chats() && chat != null && c.hasAngle()) {
@@ -5141,7 +5142,7 @@ final class ExploreBrain {
             }
             return;
         }
-        Ears.Cue merged = mergeCalls(call, c);
+        Ears.Cue merged = mergeCalls(c.kind, call, c);
         call = merged;
         if (callTaken && state == State.CUE_WHERE) {
             // KTD9: a new call after "Where'd you go?" looks again, every time, with no second answer.
@@ -5160,7 +5161,7 @@ final class ExploreBrain {
             }
             return;
         }
-        if (callTaken && (state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK)) {
+        if (callTaken && state.approachesPerson()) {
             // KTD8: merged into the call's own approach unless its angle is away from that person.
             if (c.hasAngle() && !sameSideAsPerson(c)) {
                 note("a new call from away from the person during the call's approach: retargeting");
@@ -5175,12 +5176,12 @@ final class ExploreBrain {
         note("a second call merged into the first, now from " + merged.side);
     }
 
-    /** Two calls are one (KTD1): the newer one's angle, or side, wins when it has one. */
-    private static Ears.Cue mergeCalls(Ears.Cue older, Ears.Cue newer) {
+    /** Two calls are one (KTD1), of the given kind: the newer one's angle, or side, wins when it has one. */
+    private static Ears.Cue mergeCalls(Ears.Kind kind, Ears.Cue older, Ears.Cue newer) {
         boolean newerPlaces = newer.hasAngle() || (!older.hasAngle() && newer.side != Ears.Side.UNKNOWN);
         Ears.Cue where = newerPlaces ? newer : older;
         // The angle keeps the time it was sampled at: KTD7 corrects it for his turning since then.
-        return new Ears.Cue(newer.kind, Ears.Tier.STRONG, where.side, where.angleDeg, where.at);
+        return new Ears.Cue(kind, Ears.Tier.STRONG, where.side, where.angleDeg, where.at);
     }
 
     /**
@@ -5241,7 +5242,7 @@ final class ExploreBrain {
         if (state == State.EYES_ONLY || !leaseHeld || !camera.available() || now < curiosityOffUntil) {
             return CallVerdict.IN_PLACE;
         }
-        if ((state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK)
+        if (state.approachesPerson()
                 && headingForAPerson() && (!c.hasAngle() || sameSideAsPerson(c))) {
             return CallVerdict.CARRY_ON;
         }
@@ -5283,7 +5284,7 @@ final class ExploreBrain {
                 carryOnAfterAnswer(now);
                 break;
             default:
-                startCallSearch(now, c);
+                startCallSearch(now, c, false);
                 break;
         }
     }
@@ -5298,9 +5299,6 @@ final class ExploreBrain {
         ackUntil = now + tuning.answerClipMs + tuning.deafTailMs;
     }
 
-    private void startCallSearch(long now, Ears.Cue c) {
-        startCallSearch(now, c, false);
-    }
 
     /**
      * R4 wins over KTD2 step 6's wording: a call from the person he was going to stops
@@ -5493,9 +5491,7 @@ final class ExploreBrain {
         }
         callReplied = true;
         note("a reply after asking where they went: looking again");
-        boolean places = c.hasAngle() || (!call.hasAngle() && c.side != Ears.Side.UNKNOWN);
-        Ears.Cue where = places ? c : call;
-        call = new Ears.Cue(call.kind, Ears.Tier.STRONG, where.side, where.angleDeg, where.at);
+        call = mergeCalls(call.kind, call, c);
         startCallSearch(now, call, false);
     }
 
@@ -5517,10 +5513,10 @@ final class ExploreBrain {
      * EYES_ONLY) allows; anywhere else (its meeting) the call is over.
      */
     private void handBackCall(String why) {
-        if (call == null || !callTaken) {
+        if (!callsOwn()) {
             return;
         }
-        if (state.cueSearch() || state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK) {
+        if (state.cueSearch() || state.approachesPerson()) {
             callTaken = false;
             callWaitCounted = false;
             note(why + " during the call's search or approach: the call waits in its slot");
@@ -5602,21 +5598,26 @@ final class ExploreBrain {
         return c.hasAngle() && Math.abs(c.angleDeg) > tuning.newcomerAngleDeg ? CueVerdict.HOLD : CueVerdict.DROP;
     }
 
+    /** The box the stop is heading for: the target, else the meeting's expected box, else the pick's. */
+    private Detection headedBox() {
+        return target != null ? target : meetExpect != null ? meetExpect : pick != null ? pick.box : null;
+    }
+
+    /** Whether the stop is heading for a person (KTD2 step 6: only a person can be the caller
+     * he carries on toward; a call made while he approaches a thing still searches, R1). */
+    private boolean headingForAPerson() {
+        Detection box = headedBox();
+        return box != null && CuriosityPort.Kind.of(box.label) == CuriosityPort.Kind.PERSON;
+    }
+
     /**
      * On the way to a person (R15): a voice from their side confirms the approach;
      * one from elsewhere wins. With an angle, "their side" is within newcomerAngleDeg
      * of where their box puts them; with only a side, a box near the centre counts as
      * either side and a voice with no side as theirs.
      */
-    /** Whether the stop is heading for a person (KTD2 step 6: only a person can be the caller
-     * he carries on toward; a call made while he approaches a thing still searches, R1). */
-    private boolean headingForAPerson() {
-        Detection box = target != null ? target : meetExpect != null ? meetExpect : pick != null ? pick.box : null;
-        return box != null && CuriosityPort.Kind.of(box.label) == CuriosityPort.Kind.PERSON;
-    }
-
     private boolean sameSideAsPerson(Ears.Cue c) {
-        Detection box = target != null ? target : meetExpect != null ? meetExpect : pick != null ? pick.box : null;
+        Detection box = headedBox();
         if (box == null) {
             return false;
         }
