@@ -56,13 +56,24 @@ interface Ears {
         final Side side;
         final float angleDeg;
         final long at;
+        /**
+         * Hey Miko plan KTD4: the end-of-utterance delivery of a wake word the
+         * launcher already sent as an early cue for this at. The call was made
+         * then, so this cue makes no second one. False unless the launcher says so.
+         */
+        final boolean called;
 
         Cue(Kind kind, Tier tier, Side side, float angleDeg, long at) {
+            this(kind, tier, side, angleDeg, at, false);
+        }
+
+        Cue(Kind kind, Tier tier, Side side, float angleDeg, long at, boolean called) {
             this.kind = kind;
             this.tier = tier;
             this.side = side;
             this.angleDeg = angleDeg;
             this.at = at;
+            this.called = called;
         }
 
         /** A cue whose tier is its kind's. */
@@ -76,6 +87,11 @@ interface Ears {
 
         boolean hasAngle() {
             return !Float.isNaN(angleDeg);
+        }
+
+        /** The call for this at was already made by the early cue (KTD4). */
+        boolean alreadyCalled() {
+            return called;
         }
 
         @Override

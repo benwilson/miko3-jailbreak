@@ -29,6 +29,14 @@ import java.util.List;
  * enqueued: the next whole utterance within PARTIAL_JOIN_MS takes the stronger
  * of the two tiers, and a partial with nothing after it is dropped.
  *
+ * The wake word (Hey Miko plan KTD4): the launcher sends it as an early cue
+ * (empty text) as soon as it is spotted, and marks the utterance's own
+ * delivery at its end as already called. The mark rides the cue into the
+ * queue, and a held partial keeps it. An already-called partial is never
+ * joined into a later cue: that would be a second call with a new at. An
+ * early cue has no words, so it never goes to an armed reply; it reaches the
+ * queue while the reply stays armed for the words.
+ *
  * The accelerometer arrives on the drive's readings (ExploreDrive.ReadingListener):
  * a magnitude step above the resting level is a shove spike for the brain, which
  * arms it only while stopped and past its blanking window (KTD5). The charger
@@ -204,13 +212,14 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     // ---- RobotEarsClient.Listener: the launcher's thread ----
 
     @Override
-    public void onHeard(String text, int side, float angle, int tier, long at, boolean partialUtterance, int kind) {
+    public void onHeard(String text, int side, float angle, int tier, long at, boolean partialUtterance, int kind,
+                        boolean called) {
         Ears.Tier t = tier == RobotEars.TIER_STRONG ? Ears.Tier.STRONG : Ears.Tier.WEAK;
         Ears.Side s = side == RobotEars.SIDE_LEFT ? Ears.Side.LEFT
                 : side == RobotEars.SIDE_RIGHT ? Ears.Side.RIGHT : Ears.Side.UNKNOWN;
         Ears.Kind k = kindOf(kind, t);
         // The DSP's angle is already signed the brain's way (VoiceDirection: negative left); NaN passes through.
-        Ears.Cue cue = new Ears.Cue(k, t, s, angle, at);
+        Ears.Cue cue = new Ears.Cue(k, t, s, angle, at, called);
         boolean words = text != null && !text.trim().isEmpty();
         Reply r = null;
         synchronized (lock) {
@@ -229,7 +238,8 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
                 r = reply;
                 reply = null;
             } else {
-                if (partial != null && at - partial.at <= PARTIAL_JOIN_MS && partial.strong() && !cue.strong()) {
+                if (partial != null && !partial.alreadyCalled() && at - partial.at <= PARTIAL_JOIN_MS
+                        && partial.strong() && !cue.strong()) {
                     cue = new Ears.Cue(partial.kind, Ears.Tier.STRONG, s, angle, at);
                 }
                 partial = null;

@@ -114,9 +114,18 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_client_death_releases_capture",
         "ears_close_releases_capture",
         "ears_capture_that_will_not_open_retries_on_tick",
-        "ears_charger_closes_idle_session_keeps_conversation_listen",
-        "ears_opens_closed_while_docked",
+        # Hey Miko plan U3 (KTD5): the ears stay open on the charger; these replace
+        # the meeting plan's charger-closes-capture scenarios.
+        "ears_charger_keeps_capturing_and_delivers_the_wake_word",
+        "ears_charger_latch_changes_never_close_the_capture",
         "ears_wake_word_is_strong_with_the_switch_off",
+        # Hey Miko plan U3 (KTD4): the wake word is delivered as soon as it is spotted.
+        "ears_wake_mid_speech_delivers_an_early_cue_at_once",
+        "ears_end_of_a_called_utterance_is_marked_already_called",
+        "ears_two_hits_in_one_utterance_send_one_early_cue",
+        "ears_wake_inside_the_deaf_window_delivers_nothing",
+        "ears_early_cue_keeps_the_conversation_listen_for_the_words",
+        "ears_bare_wake_with_the_gate_closed_is_unchanged",
         "ears_direction_sampled_only_while_speech",
         "ears_burst_without_words_or_side_is_dropped",
         "ears_shove_then_sorry_is_strong",
@@ -453,7 +462,8 @@ class InterfaceAndClientTest(unittest.TestCase):
                   r"void listen\(long \w+\) throws RemoteException;",
                   r"void clipWindow\(long \w+\) throws RemoteException;",
                   r"void shoved\(long \w+\) throws RemoteException;",
-                  r"void heard\(String \w+, int \w+, float \w+, int \w+, long \w+, boolean \w+, int \w+\)"):
+                  r"void heard\(String \w+, int \w+, float \w+, int \w+, long \w+, boolean \w+, int \w+,\s+"
+                  r"boolean \w+\)"):
             self.assertRegex(head, m)
 
     def test_ears_callback_kind_is_appended_last_and_an_older_launcher_ends_the_session(self):
@@ -469,19 +479,48 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertIsNotNone(stub)
         self.assertRegex(stub, r"boolean partial = data\.readInt\(\) != 0;\s*"
                                r"int kind = data\.dataAvail\(\) > 0 \? data\.readInt\(\) : KIND_MISSING;\s*"
-                               r"heard\(text, side, angle, tier, at, partial, kind\);")
+                               r"boolean called = data\.dataAvail\(\) > 0 && data\.readInt\(\) != 0;\s*"
+                               r"heard\(text, side, angle, tier, at, partial, kind, called\);")
         proxy = src.split("private static class Proxy implements Callback", 1)[1]
         self.assertRegex(proxy, r"data\.writeInt\(partial \? 1 : 0\);\s*data\.writeInt\(kind\);\s*"
+                                r"data\.writeInt\(called \? 1 : 0\);\s*"
                                 r"remote\.transact\(TRANSACTION_heard")
         client = _read(EARS_CLIENT)
         self.assertRegex(client, r"void onHeard\(String \w+, int \w+, float \w+, int \w+, long \w+, "
-                                 r"boolean \w+, int \w+\);")
+                                 r"boolean \w+, int \w+,\s+boolean \w+\);")
         self.assertRegex(client, r'NO_KIND\s*=\s*"the launcher\'s ears session sends no cue kind '
                                  r'\(install both APKs together\)"')
         heard = _method_body(client, "public void heard")
         self.assertIsNotNone(heard)
         self.assertRegex(heard, r"if \(kind == RobotEars\.KIND_MISSING\)\s*\{\s*lost\(NO_KIND\);\s*return;")
-        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind)", heard)
+        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind, called)", heard)
+
+    def test_ears_callback_already_called_flag_is_appended_after_the_kind(self):
+        """Hey Miko plan U3 (KTD4): the end-of-utterance delivery of a call the
+        early cue already made carries a flag, appended after the kind (never
+        reordered). An older launcher's parcel ends before it: read as false."""
+        src = _read(EARS_INTERFACE)
+        head = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(head, r"void heard\(String text, int side, float angle, int tier, long at, boolean partial, "
+                               r"int kind,\s*boolean called\)")
+        self.assertEqual(src.count("TRANSACTION_heard = 1;"), 1)
+        ears = _read(EARS)
+        self.assertIn("final boolean called;", ears)
+        self.assertRegex(ears, r"Utterance\(String \w+, int \w+, Float \w+, int \w+, long \w+, boolean \w+, "
+                               r"int \w+, boolean called\)")
+        engine = _read(LAUNCHER / "ListenEngine.java")
+        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind, u\.called\);")
+
+    def test_ears_session_capture_ignores_the_charger_latch(self):
+        """Hey Miko plan U3 (KTD5): the capture rule no longer closes on the
+        charger latch, and a conversation listen is no longer refused docked."""
+        body = _method_body(_read(EARS), "private void reconcile")
+        self.assertIsNotNone(body)
+        self.assertRegex(body, r"boolean want = keeper\.holder\(\) != null;")
+        self.assertNotIn("charger", body)
+        listen = _method_body(_read(EARS), "synchronized boolean listen")
+        self.assertIsNotNone(listen)
+        self.assertNotIn("charger", listen)
 
     def test_ears_session_names_the_kind_and_the_engine_relays_it_last(self):
         ears = _read(EARS)
@@ -489,11 +528,11 @@ class InterfaceAndClientTest(unittest.TestCase):
                                r"int kind\)")
         self.assertIn("final int kind;", ears)
         self.assertIn("int kind = CueClassifier.kind(text, wasWake, tier);", ears)
-        self.assertIn("new Utterance(text, side, angle, tier, at, partial, kind)", ears)
+        self.assertIn("new Utterance(text, side, angle, tier, at, partial, kind, wasWake)", ears)
         self.assertRegex(ears, r"new Utterance\(\"\", CueClassifier\.SIDE_NONE, null, CueClassifier\.TIER_STRONG, "
                                r"now, false,\s*CueClassifier\.KIND_WAKE_WORD\)")
         engine = _read(LAUNCHER / "ListenEngine.java")
-        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind\);")
+        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind, u\.called\);")
 
     def test_ears_proxy_detects_an_older_launcher(self):
         """KTD11: every new proxy method checks the transaction result."""

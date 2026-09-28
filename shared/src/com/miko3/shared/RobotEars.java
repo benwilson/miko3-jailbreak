@@ -74,10 +74,14 @@ public interface RobotEars extends IInterface {
          * guesses it from the text. kind is appended to the KTD1 shape
          * {text, side, angle, tier, at, partial} (owner-approved 2026-09-26): an
          * older mode ignores the trailing int, and a newer mode under an older
-         * launcher receives KIND_MISSING.
+         * launcher receives KIND_MISSING. called (Hey Miko plan KTD4) is
+         * appended after it: true on the end-of-utterance delivery of a wake
+         * word the launcher already sent as an early cue for the same at, so
+         * the mode makes no second call. An older launcher's parcel ends before
+         * it, which reads as false.
          */
-        void heard(String text, int side, float angle, int tier, long at, boolean partial, int kind)
-                throws RemoteException;
+        void heard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
+                   boolean called) throws RemoteException;
 
         abstract class Stub extends Binder implements Callback {
             private static final String DESCRIPTOR = "com.miko3.shared.RobotEars.Callback";
@@ -115,7 +119,8 @@ public interface RobotEars extends IInterface {
                         long at = data.readLong();
                         boolean partial = data.readInt() != 0;
                         int kind = data.dataAvail() > 0 ? data.readInt() : KIND_MISSING;
-                        heard(text, side, angle, tier, at, partial, kind);
+                        boolean called = data.dataAvail() > 0 && data.readInt() != 0;
+                        heard(text, side, angle, tier, at, partial, kind, called);
                         return true;
                     }
                     case IBinder.INTERFACE_TRANSACTION:
@@ -141,7 +146,7 @@ public interface RobotEars extends IInterface {
                 /** One-way, so the launcher's capture thread never waits on a mode. */
                 @Override
                 public void heard(String text, int side, float angle, int tier, long at, boolean partial,
-                                  int kind) throws RemoteException {
+                                  int kind, boolean called) throws RemoteException {
                     Parcel data = Parcel.obtain();
                     try {
                         data.writeInterfaceToken(DESCRIPTOR);
@@ -152,6 +157,7 @@ public interface RobotEars extends IInterface {
                         data.writeLong(at);
                         data.writeInt(partial ? 1 : 0);
                         data.writeInt(kind);
+                        data.writeInt(called ? 1 : 0);
                         remote.transact(TRANSACTION_heard, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();

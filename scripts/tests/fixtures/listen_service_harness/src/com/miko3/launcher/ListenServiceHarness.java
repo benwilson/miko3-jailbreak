@@ -326,6 +326,7 @@ public final class ListenServiceHarness {
         @Override
         public void reset() {
             resets++;
+            hitNext = false; // a reset engine forgets what it was about to report
         }
     }
 
@@ -375,8 +376,10 @@ public final class ListenServiceHarness {
         }
     }
 
+    /** Like VoiceDirection's sampler, drain() hands out only the readings since the last drain. */
     static final class FakeSampling implements EarsSession.Sampling {
         final List<Float> angles;
+        int drained;
         boolean stopped;
 
         FakeSampling(List<Float> angles) {
@@ -385,7 +388,9 @@ public final class ListenServiceHarness {
 
         @Override
         public List<Float> drain() {
-            return new ArrayList<Float>(angles);
+            List<Float> out = new ArrayList<Float>(angles.subList(drained, angles.size()));
+            drained = angles.size();
+            return out;
         }
 
         @Override
@@ -542,7 +547,8 @@ public final class ListenServiceHarness {
             StringBuilder b = new StringBuilder();
             synchronized (client.heard) {
                 for (EarsSession.Utterance u : client.heard) {
-                    b.append(u.tier).append(u.partial ? "p" : "").append('@').append(u.at).append(' ');
+                    b.append(u.tier).append(u.partial ? "p" : "").append(u.called ? "c" : "").append('k')
+                            .append(u.kind).append(u.text.isEmpty() ? "-" : "w").append('@').append(u.at).append(' ');
                 }
             }
             return b.toString();
@@ -984,38 +990,46 @@ public final class ListenServiceHarness {
         });
 
         // ---- the charger flag (KTD6) ----
-        scenario("ears_charger_closes_idle_session_keeps_conversation_listen", new Scenario() {
+        scenario("ears_charger_keeps_capturing_and_delivers_the_wake_word", new Scenario() {
+            public void run(String n) throws Exception {
+                // Hey Miko plan KTD5: the ears stay open on the charger (this replaces the meeting plan's KTD6 close).
+                Rig r = new Rig();
+                r.open(true);
+                boolean opened = r.awaitMic(true);
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                int early = r.client.heard.size();
+                r.rec.text = "HEY MIKO";
+                r.rec.endpoint = true;
+                r.chunk(true);
+                boolean listenDocked = r.session.listen("10001", 6000);
+                r.session.renew("10001", true);
+                Thread.sleep(40);
+                boolean stillCapturing = r.session.capturing() && r.session.held() && r.capture.opens == 1;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, opened && early == 1 && u != null && u.kind == CueClassifier.KIND_WAKE_WORD
+                        && u.tier == CueClassifier.TIER_STRONG && listenDocked && stillCapturing
+                        && r.client.heard.size() == 2,
+                        "opened=" + opened + " early=" + early + " listenDocked=" + listenDocked
+                                + " stillCapturing=" + stillCapturing + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_charger_latch_changes_never_close_the_capture", new Scenario() {
             public void run(String n) throws Exception {
                 Rig r = new Rig();
                 r.open(false);
                 boolean opened = r.awaitMic(true);
-                boolean listening = r.session.listen("10001", 6000);
-                r.session.renew("10001", true); // docked mid-listen: the listen finishes first
+                r.session.renew("10001", true);
+                r.session.tick();
                 Thread.sleep(40);
-                boolean keptWhileListening = r.session.capturing() && r.session.held();
-                // The reply ends the listen; now the charger rule closes the capture.
-                r.utter("YEAH GOOD THANKS", 4);
-                boolean closedAfter = r.awaitMic(false) && r.session.held() && !r.session.listening();
-                boolean refusedDocked = !r.session.listen("10001", 6000);
-                // Off the charger again: the capture comes back.
-                r.log.events.clear();
+                boolean dockedOpen = r.session.capturing();
                 r.session.renew("10001", false);
-                boolean reopened = r.awaitMic(true);
-                check(n, opened && listening && keptWhileListening && closedAfter && refusedDocked && reopened
-                        && r.client.heard.size() == 1, "opened=" + opened + " kept=" + keptWhileListening
-                        + " closedAfter=" + closedAfter + " refusedDocked=" + refusedDocked + " reopened=" + reopened
-                        + " heard=" + r.heard());
-            }
-        });
-        scenario("ears_opens_closed_while_docked", new Scenario() {
-            public void run(String n) throws Exception {
-                Rig r = new Rig();
-                r.open(true);
+                r.session.tick();
                 Thread.sleep(40);
-                boolean stayedClosed = r.session.held() && !r.session.capturing() && r.capture.opens == 0;
-                r.session.renew("10001", false);
-                boolean opened = r.awaitMic(true);
-                check(n, stayedClosed && opened, "stayedClosed=" + stayedClosed + " opened=" + opened);
+                check(n, opened && dockedOpen && r.session.capturing() && r.capture.opens == 1
+                        && r.log.indexOf("mic-closed") < 0,
+                        "opened=" + opened + " dockedOpen=" + dockedOpen + " opens=" + r.capture.opens);
             }
         });
 
@@ -1033,9 +1047,118 @@ public final class ListenServiceHarness {
                 r.chunk(true);
                 r.rec.endpoint = true;
                 r.chunk(true);
+                // The early cue (Hey Miko plan KTD4), then the words, marked already called.
+                EarsSession.Utterance u = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, quiet == 0 && u != null && u.tier == CueClassifier.TIER_STRONG && !u.partial && u.called
+                        && r.client.heard.size() == 2, "quiet=" + quiet + " heard=" + r.heard());
+            }
+        });
+        // ---- Hey Miko plan U3 (KTD4): the wake word is delivered as soon as it is spotted ----
+        scenario("ears_wake_mid_speech_delivers_an_early_cue_at_once", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.direction.angles = new ArrayList<Float>(Arrays.asList(20f, 30f, 40f));
+                r.chunk(true);
+                long start = r.clock.now;
+                r.rec.text = "HEY MIKO";
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true); // the engine fires here, mid-speech
+                EarsSession.Utterance e = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                int atOnce = r.client.heard.size();
+                check(n, atOnce == 1 && e != null && "".equals(e.text) && e.kind == CueClassifier.KIND_WAKE_WORD
+                        && e.tier == CueClassifier.TIER_STRONG && e.at == start && !e.called && !e.partial
+                        && e.angle != null && e.angle == 30f && e.side == CueClassifier.SIDE_RIGHT,
+                        "atOnce=" + atOnce + " start=" + start + " heard=" + r.heard()
+                                + (e == null ? "" : " angle=" + e.angle));
+            }
+        });
+        scenario("ears_end_of_a_called_utterance_is_marked_already_called", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.direction.angles = new ArrayList<Float>(Arrays.asList(20f, 30f, 40f));
+                r.chunk(true);
+                long start = r.clock.now;
+                r.rec.text = "HEY MIKO";
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                // More readings after the early cue: the final median takes all of them.
+                r.direction.angles.add(80f);
+                r.direction.angles.add(90f);
+                r.utter("HEY MIKO WHAT'S UP", 2);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, r.client.heard.size() == 2 && f != null && f.called && f.at == start
+                        && "HEY MIKO WHAT'S UP".equals(f.text) && f.kind == CueClassifier.KIND_WAKE_WORD
+                        && f.angle != null && f.angle == 40f && !r.client.heard.get(0).called,
+                        "heard=" + r.heard() + (f == null ? "" : " angle=" + f.angle));
+            }
+        });
+        scenario("ears_two_hits_in_one_utterance_send_one_early_cue", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                int early = r.client.heard.size();
+                r.utter("HEY MIKO HEY MIKO", 2);
+                int bare = 0;
+                int called = 0;
+                synchronized (r.client.heard) {
+                    for (EarsSession.Utterance u : r.client.heard) {
+                        bare += u.text.isEmpty() ? 1 : 0;
+                        called += u.called ? 1 : 0;
+                    }
+                }
+                check(n, early == 1 && r.client.heard.size() == 2 && bare == 1 && called == 1,
+                        "early=" + early + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_wake_inside_the_deaf_window_delivers_nothing", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.session.lineStarted();
+                r.chunk(true);
+                r.spotter.hitNext = true; // his own clip says the phrase: the window drops it unheard
+                r.chunk(true);
+                r.chunk(true);
+                r.session.playbackIdle();
+                r.silence(Rig.TAIL + 400);
+                check(n, r.client.heard.isEmpty(), "heard=" + r.heard());
+            }
+        });
+        scenario("ears_early_cue_keeps_the_conversation_listen_for_the_words", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                boolean listening = r.session.listen("10001", 6000);
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                boolean stillListening = r.session.listening();
+                int early = r.client.heard.size();
+                r.utter("HEY MIKO I'M SAM", 2);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, listening && early == 1 && stillListening && f != null && f.called
+                        && "HEY MIKO I'M SAM".equals(f.text) && !r.session.listening(),
+                        "early=" + early + " stillListening=" + stillListening + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_bare_wake_with_the_gate_closed_is_unchanged", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.spotter.hitNext = true;
+                r.chunk(false);
                 EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
-                check(n, quiet == 0 && u != null && u.tier == CueClassifier.TIER_STRONG && !u.partial
-                        && r.client.heard.size() == 1, "quiet=" + quiet + " heard=" + r.heard());
+                check(n, r.client.heard.size() == 1 && u != null && "".equals(u.text) && !u.called
+                        && u.at == r.clock.now && u.kind == CueClassifier.KIND_WAKE_WORD, "heard=" + r.heard());
             }
         });
         scenario("ears_direction_sampled_only_while_speech", new Scenario() {

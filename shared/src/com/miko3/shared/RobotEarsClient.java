@@ -31,8 +31,12 @@ import java.util.concurrent.TimeUnit;
  */
 public final class RobotEarsClient {
     public interface Listener {
-        /** One heard utterance; see RobotEars.Callback.heard. kind is RobotEars.KIND_*, never KIND_MISSING. */
-        void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind);
+        /**
+         * One heard utterance; see RobotEars.Callback.heard. kind is RobotEars.KIND_*, never KIND_MISSING;
+         * called marks the end of an utterance whose wake word already went out as an early cue.
+         */
+        void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
+                     boolean called);
 
         /** The session is gone; reason is fixed text. Called at most once per open(). */
         void onLost(String reason);
@@ -355,7 +359,7 @@ public final class RobotEarsClient {
 
         @Override
         public void heard(final String text, final int side, final float angle, final int tier, final long at,
-                          final boolean partial, final int kind) {
+                          final boolean partial, final int kind, final boolean called) {
             if (ended) {
                 return;
             }
@@ -367,7 +371,7 @@ public final class RobotEarsClient {
                 @Override
                 public void run() {
                     if (!ended) {
-                        listener.onHeard(text, side, angle, tier, at, partial, kind);
+                        listener.onHeard(text, side, angle, tier, at, partial, kind, called);
                     }
                 }
             });

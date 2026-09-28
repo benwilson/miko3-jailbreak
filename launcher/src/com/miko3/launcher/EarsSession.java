@@ -3,6 +3,7 @@ package com.miko3.launcher;
 import com.miko3.shared.VoiceDirection;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -14,9 +15,10 @@ import java.util.List;
  *
  * One client (Explore, by uid) opens the session and renews it every
  * RENEW_PERIOD_MS through a LeaseKeeper; three missed renews, a Binder death
- * or a close release the microphone. The capture runs only while the charger
- * latch the client reports is clear (KTD6), except that a conversation listen
- * already running finishes first. One capture loop feeds every chunk to the
+ * or a close release the microphone. The capture runs whenever the session
+ * is held, on the charger too (Hey Miko plan KTD5, replacing the meeting
+ * plan's KTD6 close): a docked robot still answers his name. The client's
+ * charger latch is kept for the log only. One capture loop feeds every chunk to the
  * wake-word engine and the VAD gate, and to the recogniser only while speech
  * is present (plus a short hangover so its endpoint rule sees silence). The
  * direction angle is sampled at DIRECTION_PERIOD_MS on the sampler's own
@@ -26,9 +28,16 @@ import java.util.List;
  * plus the tuned tail, or for a clip window's stated duration plus the tail:
  * chunks inside it are dropped, an utterance the window cut short is
  * delivered flagged partial, and the streams are reset when it closes. An
- * utterance is delivered as {text, side, angle, tier, at, partial, kind} when
- * the classifier gives it a tier and it carries words, the wake word or a
- * side; kind is the classifier's naming of the cue, appended last on the wire.
+ * utterance is delivered as {text, side, angle, tier, at, partial, kind,
+ * called} when the classifier gives it a tier and it carries words, the wake
+ * word or a side; kind is the classifier's naming of the cue.
+ *
+ * The wake word (Hey Miko plan KTD4): when the engine fires while speech is
+ * present, an early cue goes out in that same chunk (empty text, the median
+ * angle so far, at = the speech start, KIND_WAKE_WORD), once per utterance.
+ * The utterance's own delivery at its end, for the same at, is then marked
+ * called so the mode makes no second call from it. The engine firing with the
+ * gate closed still sends a bare wake cue at once, as before.
  *
  * Logs counters through Diag, never words.
  */
@@ -130,8 +139,14 @@ final class EarsSession {
         final boolean partial;
         /** CueClassifier.KIND_*: what the tier came from. */
         final int kind;
+        /** Hey Miko plan KTD4: the early wake cue for this at was already sent, so this delivery makes no call. */
+        final boolean called;
 
         Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind) {
+            this(text, side, angle, tier, at, partial, kind, false);
+        }
+
+        Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind, boolean called) {
             this.text = text;
             this.side = side;
             this.angle = angle;
@@ -139,12 +154,13 @@ final class EarsSession {
             this.at = at;
             this.partial = partial;
             this.kind = kind;
+            this.called = called;
         }
 
         @Override
         public String toString() {
-            return "tier " + tier + " kind " + kind + " side " + side + (partial ? " partial" : "") + " at " + at
-                    + " (" + text.length() + " chars)";
+            return "tier " + tier + " kind " + kind + " side " + side + (partial ? " partial" : "")
+                    + (called ? " called" : "") + " at " + at + " (" + text.length() + " chars)";
         }
     }
 
@@ -183,6 +199,8 @@ final class EarsSession {
     private long lastSpeechMs;
     private long hearingSince = Long.MIN_VALUE / 4;
     private Sampling sampling;
+    /** Every angle drained during the utterance so far: the early cue's median takes some, the end all. */
+    private final List<Float> angles = new ArrayList<Float>();
 
     // Counters, for Diag.
     private long chunks;
@@ -264,17 +282,13 @@ final class EarsSession {
 
     /**
      * A conversation listen: for up to maxMs (clamped as a one-shot listen's
-     * cap) the switch does not apply and the capture keeps running even when
-     * the charger latches. Ends at the first utterance delivered or at the
-     * cap. False for a non-holder, or while docked with the capture closed.
+     * cap) the switch does not apply. Ends at the first utterance delivered
+     * with words or strong (an early wake cue does not end it), or at the cap.
+     * False for a non-holder.
      */
     synchronized boolean listen(String holder, long maxMs) {
         if (!isHolder(holder)) {
             diag.log("listen refused from uid " + holder);
-            return false;
-        }
-        if (charger && !captureWanted) {
-            diag.log("listen refused: charger latched");
             return false;
         }
         listenUntil = clock.nowMs() + ListenSession.clampCap(maxMs);
@@ -415,7 +429,8 @@ final class EarsSession {
 
     /** Caller holds the lock. Starts or stops the capture to match the rules. */
     private void reconcile() {
-        boolean want = keeper.holder() != null && (!charger || listenUntil != 0);
+        // KTD5 (Hey Miko plan): the charger latch no longer closes the capture.
+        boolean want = keeper.holder() != null;
         captureWanted = want;
         if (want && captureThread == null && clock.nowMs() - captureFailedAt >= RETRY_MS) {
             Thread t = new Thread(new Runnable() {
@@ -514,6 +529,7 @@ final class EarsSession {
                 if (!inSpeech) {
                     inSpeech = true;
                     wake = false;
+                    angles.clear();
                     speechStartMs = now;
                     partialHead = now - hearingSince < PARTIAL_HEAD_MS;
                     sampling = direction.start();
@@ -523,7 +539,15 @@ final class EarsSession {
             if (hit) {
                 wakes++;
                 if (inSpeech) {
-                    wake = true;
+                    if (!wake) {
+                        // KTD4: the call goes out now, not 0.8-1 s after the speaker stops.
+                        wake = true;
+                        utterances++;
+                        Float so = latchAngle();
+                        // It leaves a conversation listen armed: the words at the end are the reply.
+                        deliver(new Utterance("", CueClassifier.side(so), so, CueClassifier.TIER_STRONG, speechStartMs,
+                                false, CueClassifier.KIND_WAKE_WORD), false);
+                    }
                 } else {
                     // The engine fired with the gate closed: a bare wake cue.
                     utterances++;
@@ -544,12 +568,12 @@ final class EarsSession {
     private void endUtterance(long now, boolean cutShort) {
         String text = recognizer.text();
         text = text == null ? "" : text.trim();
-        Float angle = null;
+        Float angle = latchAngle();
         if (sampling != null) {
-            angle = VoiceDirection.median(sampling.drain());
             sampling.stop();
             sampling = null;
         }
+        angles.clear();
         boolean partial = cutShort || partialHead;
         boolean wasWake = wake;
         long at = speechStartMs;
@@ -571,7 +595,16 @@ final class EarsSession {
             partials++;
         }
         int kind = CueClassifier.kind(text, wasWake, tier);
-        deliver(new Utterance(text, side, angle, tier, at, partial, kind));
+        // wasWake: the early cue for this at already went out (every in-speech hit sends one).
+        deliver(new Utterance(text, side, angle, tier, at, partial, kind, wasWake));
+    }
+
+    /** Caller holds feedLock. The median of every angle drained this utterance, or null when none. */
+    private Float latchAngle() {
+        if (sampling != null) {
+            angles.addAll(sampling.drain());
+        }
+        return angles.isEmpty() ? null : VoiceDirection.median(angles);
     }
 
     /** Caller holds feedLock. The capture is closing: nothing is delivered. */
@@ -582,10 +615,16 @@ final class EarsSession {
         }
         inSpeech = false;
         wake = false;
+        angles.clear();
         recognizer.reset();
     }
 
     private void deliver(Utterance u) {
+        deliver(u, true);
+    }
+
+    /** endsListen: false only for the early wake cue, which must not take a conversation listen's reply. */
+    private void deliver(Utterance u, boolean endsListen) {
         Client c;
         synchronized (this) {
             c = client;
@@ -594,7 +633,7 @@ final class EarsSession {
             } else {
                 weak++;
             }
-            if (listenUntil != 0 && (!u.text.isEmpty() || u.tier == CueClassifier.TIER_STRONG)) {
+            if (endsListen && listenUntil != 0 && (!u.text.isEmpty() || u.tier == CueClassifier.TIER_STRONG)) {
                 listenUntil = 0;
                 reconcile();
             }

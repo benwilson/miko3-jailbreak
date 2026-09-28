@@ -118,7 +118,7 @@ class EarsAdapterWiringTest(unittest.TestCase):
         a = code_only(src("EarsAdapter.java"))
         self.assertIn("implements Ears, RobotEarsClient.Listener, ExploreDrive.ReadingListener", a)
         heard = re.search(r"public void onHeard\(String text, int side, float angle, int tier, long at, "
-                          r"boolean partialUtterance, int kind\)\s*\{(.*?)\n    \}", a, re.S)
+                          r"boolean partialUtterance, int kind,\s+boolean called\)\s*\{(.*?)\n    \}", a, re.S)
         self.assertIsNotNone(heard)
         body = heard.group(1)
         self.assertNotIn("CueKinds", a)
@@ -126,11 +126,33 @@ class EarsAdapterWiringTest(unittest.TestCase):
         self.assertIn("side == RobotEars.SIDE_RIGHT", body)
         self.assertIn("tier == RobotEars.TIER_STRONG", body)
         self.assertIn("Ears.Kind k = kindOf(kind, t)", body)
-        self.assertIn("new Ears.Cue(k, t, s, angle, at)", body)
+        self.assertIn("new Ears.Cue(k, t, s, angle, at, called)", body)
         self.assertIn("if (partialUtterance)", body)
         self.assertIn("partial = cue", body)
         self.assertIn("queue.addLast(cue)", body)
         self.assertIn("QUEUE_MAX", body)
+
+    def test_an_already_called_cue_keeps_its_mark_and_never_joins_a_later_cue(self):
+        """Hey Miko plan U3 (KTD4): the launcher marks the end-of-utterance
+        delivery of a wake word it already sent early. The mark rides the cue
+        (a partial keeps it, being the same cue), an already-called partial is
+        never joined into a later cue (that would be a second call with a new
+        at), and an empty-text early cue never reaches an armed reply."""
+        cue = code_only(src("Ears.java"))
+        self.assertIn("final boolean called;", cue)
+        self.assertRegex(cue, r"Cue\(Kind kind, Tier tier, Side side, float angleDeg, long at\)\s*\{\s*"
+                              r"this\(kind, tier, side, angleDeg, at, false\);")
+        self.assertRegex(cue, r"Cue\(Kind kind, Tier tier, Side side, float angleDeg, long at, boolean called\)")
+        self.assertRegex(cue, r"boolean alreadyCalled\(\)\s*\{\s*return called;")
+        a = code_only(src("EarsAdapter.java"))
+        heard = re.search(r"public void onHeard\((.*?)\n    \}", a, re.S).group(1)
+        self.assertRegex(heard, r"if \(partialUtterance\) \{[^}]*partial = cue;")
+        join = re.search(r"if \(partial != null && ([^{]*)\) \{", heard)
+        self.assertIsNotNone(join, "no partial join")
+        self.assertIn("!partial.alreadyCalled()", join.group(1))
+        # The reply takes only an utterance with words: an empty early cue goes to the queue.
+        self.assertIn("boolean words = text != null && !text.trim().isEmpty();", heard)
+        self.assertIn("if (reply != null && words && !newcomer)", heard)
 
     def test_the_adapter_maps_all_five_kinds_and_falls_back_by_tier(self):
         a = code_only(src("EarsAdapter.java"))
