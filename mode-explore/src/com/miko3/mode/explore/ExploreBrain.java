@@ -243,9 +243,11 @@ import java.util.Set;
  *              PAUSE with nothing sent
  *
  * Held cues wait for the escape or the line to end, expire after cueHoldMs (a
- * strong one becoming a lean-in); a shove arms a weak cue only while stopped; the
- * ears follow the charger latch; in EYES_ONLY only the wake word opens a meeting,
- * without a turn. The conversation the meeting becomes is U8's (CHAT states).
+ * strong one becoming a lean-in); a shove arms a weak cue only while stopped. A
+ * call (a strong wake word or name, hey-miko plan U5) has its own slot instead:
+ * never dropped, answered with a local clip the moment KTD2's order allows, and,
+ * on the charger or in EYES_ONLY, met without a turn. The ears stay open on the
+ * charger. The conversation the meeting becomes is U8's (CHAT states).
  *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
@@ -467,6 +469,15 @@ final class ExploreBrain {
          */
         boolean confirms() {
             return this == CONFIRM || this == LAST_NAME;
+        }
+
+        /**
+         * A conversation with someone (hey-miko plan KTD2 step 2): the meeting and
+         * everything after it, up to the end of the CHAT states. A call waits these out.
+         */
+        boolean converses() {
+            return chats() || confirms() || this == MEET || this == ASK_NAME || this == LISTEN || this == NAME
+                    || this == REMEMBER || this == NAME_CLIP;
         }
 
         /** Part of a curiosity stop, from the scan until he is back to wandering. */
@@ -848,7 +859,7 @@ final class ExploreBrain {
     /** When the last motor command went out (TimedMotor): the shove cue's blanking window. */
     private long lastMotorCommandAt = NEVER;
     /**
-     * Whether the brain wants the launcher's ears session open (follows the charger latch, KTD6).
+     * Whether the brain wants the launcher's ears session open (always, until shutdown; hey-miko plan KTD5).
      * The session itself can die underneath (ears.listening() false while this is true): that
      * is a lost session, reopened on the drive lease's backoff below.
      */
@@ -859,6 +870,21 @@ final class ExploreBrain {
     private long earsReopenDueAt = NEVER;
     /** The cue waiting for a state that can take it (KTD3's replacement rule), or null. */
     private Ears.Cue cueHeld;
+    /**
+     * The call (hey-miko plan KTD1): a strong WAKE_WORD or NAME cue, in its own slot apart
+     * from cueHeld. It never expires or degrades, repeated calls merge into it (the newest
+     * angle wins), and it is kept until the conversation it leads to opens.
+     */
+    private Ears.Cue call;
+    /** The call is being acted on (its search, the approach it carries on, its meeting). */
+    private boolean callTaken;
+    /** The answer clip has played for this call: a call handed back is retaken without a second one. */
+    private boolean callAnswered;
+    /** The call's wait was counted (CUES_HELD once per call). */
+    private boolean callWaitCounted;
+    /** The utterance keys (Cue.at) of recent calls: an already-called delivery with one of them is absorbed (KTD4). */
+    private final ArrayDeque<Long> callAts = new ArrayDeque<Long>();
+    private static final int CALL_ATS_KEPT = 8;
     /** The cue being searched for in CUE_TURN and CUE_LOOK, or null. */
     private Ears.Cue searchCue;
     /** A strong cue from the other side already retargeted this search (once only, KTD3). */
@@ -879,7 +905,7 @@ final class ExploreBrain {
     /** The last shove while stopped and the last collision stop while driving (KTD5): "sorry" within 2 s is strong. */
     private long lastShoveAt = NEVER;
     private long bumpAt = NEVER;
-    /** A meeting entered from EYES_ONLY on the wake word (KTD8): the lease and sensor guards let it finish. */
+    /** A meeting entered without a turn on a call (KTD8; EYES_ONLY, no lease or camera, the charger): the lease and sensor guards let it finish. */
     private boolean wheellessMeeting;
     /** The port's stand-in box for a person he cannot see (the wheelless meeting): straight ahead. */
     private static final Detection UNSEEN_PERSON = new Detection("person", 1f, 0.35f, 0.2f, 0.65f, 0.8f);
@@ -1102,6 +1128,9 @@ final class ExploreBrain {
         HazardClassifier.Status s = classifier.status(now);
         // The one place cues are consumed (KTD1, KTD3): every state, EYES_ONLY included.
         drainEars(now);
+        // The call (hey-miko plan KTD1, KTD2): in every state, EYES_ONLY included, before
+        // the state's own step, so a take and its answer clip land in this very step.
+        callStep(now);
         if (state == State.EYES_ONLY) {
             if (leaseHeld && s != HazardClassifier.Status.UNAVAILABLE) {
                 if (!faceHoldReleased) {
@@ -1703,6 +1732,13 @@ final class ExploreBrain {
      */
     private void leaveStopForHazard() {
         if (!state.inStop()) {
+            return;
+        }
+        if (call != null && callTaken && (state.cueSearch() || state == State.FACE || state == State.APPROACH
+                || state == State.MEET_LOOK)) {
+            // KTD1: the escape comes first; the call is retaken from where it leaves him.
+            handBackCall("a hazard");
+            clearStop();
             return;
         }
         if (state.cueSearch() && searchCue != null) {
@@ -4843,22 +4879,24 @@ final class ExploreBrain {
     // next look of the plan (strong: that side, behind, the other side; weak: that
     // side, the opposite) and, after the last, resumes quietly with nothing sent. A
     // facing face plays the acknowledgement in a clip window (KTD14) and enters the
-    // MEET path. In EYES_ONLY, or with no camera to decide, only the wake word
-    // opens a meeting: no turn, the stranger's lines, the lease guard held off
-    // until it ends (KTD8). The ears session follows the charger latch (KTD6).
+    // MEET path. In EYES_ONLY, or with no camera to decide, only a call opens a
+    // meeting: no turn, the stranger's lines, the lease guard held off until it
+    // ends (KTD8). Calls (strong wake words and names) skip this table: see the
+    // call section below. The ears stay open on the charger (hey-miko plan KTD5).
 
     private enum CueVerdict { TAKE, HOLD, DROP, CONFIRM }
 
     /**
-     * Opens and closes the launcher's ears with the charger latch (KTD6) and at shutdown, and
+     * Opens the launcher's ears and closes them at shutdown (they stay open on the charger,
+     * hey-miko plan KTD5, replacing the meeting plan's KTD6 dock rule), and
      * reopens a session that died while wanted (a launcher restart is a lease loss and an
      * ears-session loss at once, meeting plan: "re-opens the ears with the same backoff the
      * drive lease uses"). The backoff mirrors ExploreDrive.scheduleLeaseRetry: the loss is
      * noticed, the first reopen fires 2 s later, then 4, 8, 16 and 30 s apart until one holds.
      */
     private void syncEars(long now) {
-        // A conversation already open finishes on the charger (KTD6): the ears stay with it.
-        boolean want = ears.present() && state != State.STOPPED && (!classifier.charger() || state.chats());
+        // The ears stay open on the charger (hey-miko plan KTD5): a call there opens a meeting that does not move.
+        boolean want = ears.present() && state != State.STOPPED;
         if (want != earsOpen) {
             earsOpen = want;
             earsReopenAttempt = 0;
@@ -4867,7 +4905,7 @@ final class ExploreBrain {
                 note("ears open");
                 port.earsOpen();
             } else {
-                note("ears closed: " + (state == State.STOPPED ? "stopping" : "on the charger"));
+                note("ears closed: stopping");
                 port.earsClose();
             }
             return;
@@ -4978,6 +5016,10 @@ final class ExploreBrain {
     private void offerCue(long now, Ears.Cue c) {
         gauges.count(Gauges.Counter.CUES);
         gauges.count(c.strong() ? Gauges.Counter.STRONG_CUES : Gauges.Counter.WEAK_CUES);
+        if (isCall(c)) {
+            offerCall(now, c);
+            return;
+        }
         if (state.cueSearch()) {
             offerCueDuringSearch(now, c);
             return;
@@ -4996,6 +5038,223 @@ final class ExploreBrain {
                 dropCue("cue " + c.tier + " " + c.side + " dropped in " + state);
                 break;
         }
+    }
+
+    // ---- the call (hey-miko plan U5; R1-R4, R11; KTD1-KTD5) ----
+    //
+    // A strong WAKE_WORD or NAME cue is a call. It goes to its own slot, never expires
+    // and is never dropped: callVerdict (KTD2's order) says whether it waits for a
+    // moment to finish or is taken now. A take stops the wheels and plays the answer
+    // clip in the same step (KTD3), then searches (the hand-off U6 replaces), carries
+    // on toward the person he was already going to, or, on the charger, in EYES_ONLY,
+    // without the lease or without a camera, meets without moving. A hazard or a lost
+    // lease during the call's search or approach hands it back to the slot, answered,
+    // to be retaken without a second clip. The slot clears when the conversation
+    // opens, when the call's stop ends without one, or at once when no conversation
+    // can open (no Claude): then the answer clip is the whole response. Logs carry
+    // sides and counts only.
+
+    private enum CallVerdict { WAIT, IN_PLACE, CARRY_ON, SEARCH }
+
+    /** A call (KTD1): a strong wake word or name cue. Other cues keep the held-cue rules. */
+    private static boolean isCall(Ears.Cue c) {
+        return c.strong() && (c.kind == Ears.Kind.WAKE_WORD || c.kind == Ears.Kind.NAME);
+    }
+
+    /**
+     * A call from the session: absorbed when its utterance already called (KTD4), no call
+     * when it is the conversation partner's own (inside newcomerAngleDeg), else it fills
+     * the slot or merges into the call there, the newest angle winning.
+     */
+    private void offerCall(long now, Ears.Cue c) {
+        if (c.alreadyCalled() && callAts.contains(c.at)) {
+            note("the end of a call's utterance: already called");
+            return;
+        }
+        callAts.remove(c.at);
+        callAts.addLast(c.at);
+        while (callAts.size() > CALL_ATS_KEPT) {
+            callAts.removeFirst();
+        }
+        if (partnersCall(c)) {
+            dropCue("a call from the partner's side during the conversation: theirs, no call");
+            return;
+        }
+        if (call == null) {
+            call = c;
+            callTaken = false;
+            callAnswered = false;
+            callWaitCounted = false;
+            note("a call from " + c.side + " in " + state);
+            if (state.chats() && chat != null && c.hasAngle()) {
+                // Outside the partner's angle: the newcomer's glance and "one sec" (R15).
+                chat.newcomer(sideOf(c));
+            }
+            return;
+        }
+        Ears.Cue merged = mergeCalls(call, c);
+        if (callTaken && state.cueSearch()) {
+            // The call's own search: a voice from the other side retargets once, as any strong cue does.
+            call = merged;
+            offerCueDuringSearch(now, c);
+            return;
+        }
+        call = merged;
+        note("a second call merged into the first, now from " + merged.side);
+    }
+
+    /** Two calls are one (KTD1): the newer one's angle, or side, wins when it has one. */
+    private static Ears.Cue mergeCalls(Ears.Cue older, Ears.Cue newer) {
+        boolean newerPlaces = newer.hasAngle() || (!older.hasAngle() && newer.side != Ears.Side.UNKNOWN);
+        Ears.Cue where = newerPlaces ? newer : older;
+        return new Ears.Cue(newer.kind, Ears.Tier.STRONG, where.side, where.angleDeg, newer.at);
+    }
+
+    /**
+     * In a conversation, a call whose angle is within newcomerAngleDeg of the partner is
+     * the partner's own and makes no call (KTD4). With no angle nobody can be told apart,
+     * so it waits as a call. A meeting without a look has nobody placed in front of him.
+     */
+    private boolean partnersCall(Ears.Cue c) {
+        if (!state.converses() || !c.hasAngle() || (wheellessMeeting && !state.chats())) {
+            return false;
+        }
+        return Math.abs(c.angleDeg) <= tuning.newcomerAngleDeg;
+    }
+
+    /** Each step: the call in the slot, waited out or taken by KTD2's order. */
+    private void callStep(long now) {
+        if (call == null || state == State.STOPPED) {
+            return;
+        }
+        if (callTaken) {
+            if (!state.inStop()) {
+                // Its search found nobody, or its meeting ended before a conversation opened.
+                note("the call's stop is over without a conversation: the call is done");
+                clearCall();
+            }
+            return;
+        }
+        CallVerdict v = callVerdict(now, call);
+        if (v == CallVerdict.WAIT) {
+            if (!callWaitCounted) {
+                callWaitCounted = true;
+                gauges.count(Gauges.Counter.CUES_HELD);
+                note("the call waits for " + state + " to finish");
+            }
+            return;
+        }
+        takeCall(now, v);
+    }
+
+    /**
+     * KTD2's order: a line playing, then a conversation, then the charger (checked before
+     * the back-off wait, since a docked robot keeps cycling through STARTLE and BACK_OFF),
+     * then this back-off, then no wheels or no camera, then the person he was going to.
+     */
+    private CallVerdict callVerdict(long now, Ears.Cue c) {
+        if (state == State.SPEAK && pendingLine == null) {
+            return CallVerdict.WAIT;
+        }
+        if (state.converses()) {
+            return CallVerdict.WAIT;
+        }
+        if (classifier.charger()) {
+            return CallVerdict.IN_PLACE;
+        }
+        if (state == State.STARTLE || state == State.BACK_OFF) {
+            return CallVerdict.WAIT;
+        }
+        if (state == State.EYES_ONLY || !leaseHeld || !camera.available() || now < curiosityOffUntil) {
+            return CallVerdict.IN_PLACE;
+        }
+        if ((state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK)
+                && (!c.hasAngle() || sameSideAsPerson(c))) {
+            return CallVerdict.CARRY_ON;
+        }
+        return CallVerdict.SEARCH;
+    }
+
+    /** Takes the call: the wheels stop and the answer plays in this step (KTD3), then what the verdict says. */
+    private void takeCall(long now, CallVerdict v) {
+        Ears.Cue c = call;
+        if (cueHeld != null) {
+            dropCue("the held cue gives way to the call");
+            cueHeld = null;
+        }
+        if (v != CallVerdict.CARRY_ON) {
+            leaveForCue();
+            backForTurn = false;
+            turnRetrying = false;
+        }
+        if (!callAnswered) {
+            answerCall(now);
+        }
+        if (!port.canAsk()) {
+            // KTD1: no conversation can open, so the answer is the whole response.
+            note("no Claude to talk with: the answer is the whole response");
+            clearCall();
+            if (v != CallVerdict.CARRY_ON && state != State.EYES_ONLY) {
+                enterPause(now, pauseMs(), false);
+            }
+            return;
+        }
+        callTaken = true;
+        switch (v) {
+            case IN_PLACE:
+                // On the charger (KTD5), in EYES_ONLY, without the lease or a camera: no turn, no drive.
+                meetWithoutLooking(now, c);
+                break;
+            case CARRY_ON:
+                note("a call from the person's side: answering and carrying on toward them");
+                break;
+            default:
+                startCallSearch(now, c);
+                break;
+        }
+    }
+
+    /** The answer (KTD3): the prepared clip from the answer group, inside a clip window. */
+    private void answerCall(long now) {
+        callAnswered = true;
+        note("answering the call");
+        port.clipWindow(tuning.answerClipMs);
+        sound.playReaction("answer");
+        ackUntil = now + tuning.answerClipMs + tuning.deafTailMs;
+    }
+
+    /**
+     * Finding the caller: the hand-off point U6 replaces with its own look plans. Until
+     * then the call enters the existing turn to the voice with its angle or side.
+     */
+    private void startCallSearch(long now, Ears.Cue c) {
+        enterCueSearch(now, c, false);
+    }
+
+    /**
+     * A hazard or a lost lease interrupts the call's stop (KTD1): during its search or its
+     * approach the call goes back to the slot, answered, to be retaken when the escape (or
+     * EYES_ONLY) allows; anywhere else (its meeting) the call is over.
+     */
+    private void handBackCall(String why) {
+        if (call == null || !callTaken) {
+            return;
+        }
+        if (state.cueSearch() || state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK) {
+            callTaken = false;
+            callWaitCounted = false;
+            note(why + " during the call's search or approach: the call waits in its slot");
+        } else {
+            note(why + " during the call's meeting: the call is done");
+            clearCall();
+        }
+    }
+
+    private void clearCall() {
+        call = null;
+        callTaken = false;
+        callAnswered = false;
+        callWaitCounted = false;
     }
 
     /** During a search (KTD3): a strong cue from the other side retargets once; everything else is ignored. */
@@ -5018,8 +5277,8 @@ final class ExploreBrain {
             return chatVerdict(c);
         }
         if (state == State.EYES_ONLY || !camera.available() || now < curiosityOffUntil) {
-            // He cannot move, or has no camera to decide with: only the wake word opens a meeting.
-            return c.kind == Ears.Kind.WAKE_WORD ? CueVerdict.TAKE : CueVerdict.DROP;
+            // He cannot move, or has no camera to decide with: only a call opens a meeting (callVerdict).
+            return CueVerdict.DROP;
         }
         switch (state) {
             case PAUSE: case HOP: case SCAN: case INSPECT: case REACT_HERE: case CORNERED: case ASK: case ORIENT:
@@ -5040,12 +5299,13 @@ final class ExploreBrain {
     }
 
     /**
-     * The CHAT states (KTD8): a strong utterance whose latched angle magnitude exceeds
-     * newcomerAngleDeg is held as a newcomer cue (kept until the conversation ends,
-     * however long it runs); one inside it, the wake word included, is the speaker's
-     * reply (the listen hears it) or dropped, since the listening look tells them
-     * when he hears; weak cues are ignored. Without an angle nobody can be told
-     * apart, so the voice is the speaker's.
+     * The CHAT states (KTD8), for cues that are not calls (a call waits the
+     * conversation out, callVerdict): a strong utterance whose latched angle magnitude
+     * exceeds newcomerAngleDeg is held as a newcomer cue (kept until the conversation
+     * ends, however long it runs); one inside it is the speaker's reply (the listen
+     * hears it) or dropped, since the listening look tells them when he hears; weak
+     * cues are ignored. Without an angle nobody can be told apart, so the voice is the
+     * speaker's.
      */
     private CueVerdict chatVerdict(Ears.Cue c) {
         if (!c.strong()) {
@@ -5139,12 +5399,8 @@ final class ExploreBrain {
         }
     }
 
-    /** Takes a cue: the search, or, when he cannot move or see, the wake word's meeting without a turn. */
+    /** Takes a cue that is not a call: the search (cueVerdict never takes one he cannot turn to). */
     private void takeCue(long now, Ears.Cue c) {
-        if (state == State.EYES_ONLY || !camera.available() || now < curiosityOffUntil) {
-            meetWithoutLooking(now, c);
-            return;
-        }
         leaveForCue();
         enterCueSearch(now, c, false);
     }
@@ -5402,16 +5658,13 @@ final class ExploreBrain {
     }
 
     /**
-     * The wake word while he cannot move or cannot look (KTD8): no turn and no face,
-     * so the meeting takes the stranger's text-only lines and the guards that would
-     * send him to EYES_ONLY hold off until it ends.
+     * A call while he cannot move or cannot look (KTD8; hey-miko plan KTD5: on the
+     * charger too): no turn and no face, so the meeting takes the stranger's text-only
+     * lines and the guards that would send him to EYES_ONLY hold off until it ends.
+     * takeCall has already checked that Claude is there to meet with.
      */
     private void meetWithoutLooking(long now, Ears.Cue c) {
-        if (!port.canAsk()) {
-            dropCue("wake word, but no Claude to meet anyone with");
-            return;
-        }
-        note("wake word while he cannot turn to it: meeting without a look");
+        note("a call while he cannot turn to it: meeting without a look");
         gauges.stamp(Gauges.Stage.CUE_AT, c.at);
         stopMotors();
         if (state.inStop()) {
@@ -5460,6 +5713,10 @@ final class ExploreBrain {
             port.touch();
         }
         note("the meeting becomes a conversation" + (faceless ? " with nobody in view" : "") + " (" + a.status + ")");
+        if (callTaken) {
+            // KTD1: the call is kept until the conversation opens.
+            clearCall();
+        }
         chat = new ChatSession(tuning, port, chatHost);
         state = State.CHAT_THINK;
         syncPark();
@@ -5504,7 +5761,10 @@ final class ExploreBrain {
             note("conversation with someone unnamed over: their side (" + chatSide + ") left alone for "
                     + (tuning.unnamedLeaveAloneMs / 1000) + " s");
         }
-        if (cueHeld != null) {
+        if (call != null) {
+            note("a call waited for the conversation: it is answered now");
+            awayLeg = null;
+        } else if (cueHeld != null) {
             note("the newcomer's held cue is taken now");
             cueHeld = new Ears.Cue(cueHeld.kind, cueHeld.tier, cueHeld.side, cueHeld.angleDeg, now);
             awayLeg = null;
@@ -5641,6 +5901,7 @@ final class ExploreBrain {
     // ---- entering states ----
 
     private void enterEyesOnly(String why) {
+        handBackCall("the lease or the sensors lost");
         stopMotors();
         cancelAsk();
         cancelWayOut();

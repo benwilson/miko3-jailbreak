@@ -68,7 +68,10 @@ final class ChatSession {
         /** "A face turned toward him" in this look (KTD4). */
         boolean facing(ExploreBrain.Look look);
 
-        /** The charger latch (KTD6): the conversation finishes and no resume leg is driven. */
+        /**
+         * The charger latch (KTD6): a conversation it arrives in finishes and no resume leg
+         * is driven; one opened on the charger (a call there, hey-miko plan KTD5) goes on.
+         */
         boolean charger();
     }
 
@@ -193,6 +196,8 @@ final class ChatSession {
 
     // ---- how it ends ----
     private boolean endOnCharger;
+    /** Opened on the charger (hey-miko plan KTD5, R11): he talks there without moving, so the latch ends nothing. */
+    private boolean startedOnCharger;
     private boolean finished;
     private boolean signedOff;
     private boolean walkedOff;
@@ -259,6 +264,7 @@ final class ChatSession {
     void start(long now, CuriosityPort.MatchAnswer a, boolean faceless, boolean checkOpen, String settled) {
         this.checkOpen = checkOpen;
         this.settledName = settled;
+        startedOnCharger = host.charger();
         this.faceless = faceless;
         persona = a.persona == null ? "" : a.persona;
         String stored = a.name == null ? "" : a.name.trim();
@@ -284,7 +290,7 @@ final class ChatSession {
         if (finished) {
             return;
         }
-        if (host.charger() && !endOnCharger) {
+        if (host.charger() && !endOnCharger && !startedOnCharger) {
             endOnCharger = true;
             host.note("charger connected: the conversation finishes and no resume leg is driven");
         }

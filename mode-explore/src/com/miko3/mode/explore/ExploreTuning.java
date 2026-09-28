@@ -221,6 +221,12 @@ final class ExploreTuning {
     final long bumpApologyMs;
     final long ackClipMs;
     /**
+     * The answer to a call (hey-miko plan KTD3): "Oh hi?", "What?" or "Yes?" from the
+     * answer group, about half a second each (react-answer-*.webm, 0.50 to 0.53 s);
+     * answerClipMs is the deaf window the port opens for it.
+     */
+    final long answerClipMs;
+    /**
      * The conversation (meeting plan Assumptions, KTD7, KTD9; U8 uses them). An
      * unanswered listen is unansweredListenMs with no utterance, kept by the
      * brain; two of them end the conversation. A sensor stall that persists
@@ -611,6 +617,7 @@ final class ExploreTuning {
         shoveBlankingMs = Math.max(0, b.shoveBlankingMs);
         bumpApologyMs = Math.max(0, b.bumpApologyMs);
         ackClipMs = Math.max(0, b.ackClipMs);
+        answerClipMs = Math.max(0, b.answerClipMs);
         unansweredListenMs = Math.max(1, b.unansweredListenMs);
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
@@ -880,6 +887,8 @@ final class ExploreTuning {
         private long shoveBlankingMs = 500;
         private long bumpApologyMs = 2000;
         private long ackClipMs = 600;
+        // Hey-miko plan KTD3: the answer clips run about half a second.
+        private long answerClipMs = 600;
         // Meeting plan Assumptions: an unanswered listen is 4 s; the chat sensor-stall grace 5 s;
         // a turn has 5 s plus a 3 s retry; two sentences; a window of 30 exchanges; a 500 ms deaf tail.
         private long unansweredListenMs = 4000;
@@ -1323,6 +1332,10 @@ final class ExploreTuning {
             this.shoveBlankingMs = shoveBlankingMs;
             this.bumpApologyMs = bumpApologyMs;
             this.ackClipMs = ackClipMs;
+            return this;
+        }
+        Builder answerClipMs(long ms) {
+            this.answerClipMs = ms;
             return this;
         }
         Builder chat(long unansweredListenMs, long stallGraceMs, long turnBudgetMs, long turnRetryMs, int sentenceCap,

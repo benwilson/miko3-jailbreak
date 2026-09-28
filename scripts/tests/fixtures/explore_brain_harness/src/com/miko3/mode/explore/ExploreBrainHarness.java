@@ -610,6 +610,8 @@ public final class ExploreBrainHarness {
 
         /** The fake Claude and speech: null claude means the port can't ask (today's behavior). */
         final Claude claude;
+        /** Claude unavailable on a rig wired with the port and the ears (hey-miko plan KTD1: the answer only). */
+        boolean askRefused;
         long claudeDelayMs = 1000;
         final List<CuriosityPort.LookRequest> asks = new ArrayList<CuriosityPort.LookRequest>();
         final List<Long> askTimeouts = new ArrayList<Long>();
@@ -892,6 +894,17 @@ public final class ExploreBrainHarness {
             });
         }
 
+        /**
+         * The end-of-utterance delivery of a call spotted early (hey-miko plan KTD4): delivered
+         * at t, keyed by the utterance's start at, and marked already called.
+         */
+        Rig calledCue(long t, long at, Ears.Kind kind, Ears.Side side, float angleDeg) {
+            return at(t, () -> {
+                cues.add(new Ears.Cue(kind, kind.tier, side, angleDeg, at, true));
+                log.add(new Event(t, "cue " + kind + " " + kind.tier + " " + side + " already called"));
+            });
+        }
+
         /** A cue of this tier: a greeting when strong, a voice burst when weak. */
         Rig cue(long t, Ears.Tier tier, Ears.Side side, float angleDeg) {
             return cue(t, tier == Ears.Tier.STRONG ? Ears.Kind.GREETING : Ears.Kind.VOICE, side, angleDeg);
@@ -1158,7 +1171,7 @@ public final class ExploreBrainHarness {
 
         @Override
         public boolean canAsk() {
-            return claude != null;
+            return claude != null && !askRefused;
         }
 
         @Override
@@ -2675,6 +2688,7 @@ public final class ExploreBrainHarness {
         earsAndChatScenarios();
         cueScenarios();
         chatScenarios();
+        callScenarios();
         faceMatchScenarios();
         faceMigrationScenarios();
         faceConfirmScenarios();
@@ -8124,12 +8138,12 @@ public final class ExploreBrainHarness {
                             && t.facingFaceMinRatio == 0.65f && t.facingFaceMinHeight == 0.12f
                             && t.unansweredListenMs == 4000 && t.chatStallGraceMs == 5000
                             && t.turnBudgetMs == 5000 && t.turnRetryMs == 3000 && t.sentenceCap == 2
-                            && t.transcriptWindow == 30 && t.deafTailMs == 500,
+                            && t.transcriptWindow == 30 && t.deafTailMs == 500 && t.answerClipMs == 600,
                     t.cueHoldMs + " " + t.leanInMs + " " + t.newcomerAngleDeg + " " + t.cueStopBandDeg + " "
                             + t.strongCueLooks + " " + t.weakCueLooks + " " + t.facingFaceMinRatio + " "
                             + t.facingFaceMinHeight + " " + t.unansweredListenMs + " " + t.chatStallGraceMs + " "
                             + t.turnBudgetMs + " " + t.turnRetryMs + " " + t.sentenceCap + " " + t.transcriptWindow
-                            + " " + t.deafTailMs);
+                            + " " + t.deafTailMs + " " + t.answerClipMs);
         });
         scenario("chat_session_starts_thinking_with_the_four_chat_states_and_no_behaviour", n -> {
             ExploreTuning t = tuning().build();
@@ -8236,7 +8250,9 @@ public final class ExploreBrainHarness {
             int stop = rig.firstAfter("stop", cueT);
             int glance = rig.firstAfter("eyes GLANCE LEFT", cueT);
             int turn = rig.firstAfter("turn", cueT);
+            // A name is a call: the wheels stop and the answer clip plays in the step that takes it (KTD3).
             check(n, hop > 0 && rig.timeOf(stop) == cueT && entered(rig, ExploreBrain.State.CUE_TURN, cueT) == cueT
+                            && answerAt(rig, cueT) == cueT && rig.timeOf(rig.firstAfter("clip 600", cueT)) == cueT
                             && rig.timeOf(glance) == cueT && turn >= 0 && rig.what(turn).equals("turn LEFT")
                             && rig.timeOf(turn) <= cueT + 700 && rig.countPrefix("hop", cueT + 1, cueT + 3001) == 0
                             && rig.stamped(ExploreBrain.Gauges.Stage.CUE_AT) == cueT
@@ -8355,7 +8371,7 @@ public final class ExploreBrainHarness {
             rig.runUntil(say + 3000);
             long search = entered(rig, ExploreBrain.State.CUE_TURN, cueT);
             check(n, say > 0 && search >= say + rig.speechMs && search <= say + rig.speechMs + 120
-                            && rig.count("say What a shiny lamp!") == 1
+                            && answerAt(rig, cueT) == search && rig.count("say What a shiny lamp!") == 1
                             && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1
                             && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1 && rig.violations.isEmpty(),
                     "say@" + say + " search@" + search + " " + gauges(rig) + " " + rig.tail());
@@ -8373,7 +8389,7 @@ public final class ExploreBrainHarness {
             rig.cue(cueT, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
             rig.runUntil(speak + 4000);
             check(n, speak > 0 && rig.count("say What a shiny lamp!") == 0
-                            && entered(rig, ExploreBrain.State.CUE_TURN, cueT) == cueT
+                            && entered(rig, ExploreBrain.State.CUE_TURN, cueT) == cueT && answerAt(rig, cueT) == cueT
                             && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 0 && rig.violations.isEmpty(),
                     "speak@" + speak + " " + gauges(rig) + " " + rig.tail());
         });
@@ -8393,10 +8409,11 @@ public final class ExploreBrainHarness {
                     "orient@" + orient + " " + rig.tail());
         });
         scenario("cue_during_startle_is_held_until_pause", n -> {
+            // A weak voice keeps the held-cue rule; a call waits only for the back-off (call_ae2_...).
             Rig rig = cueRig(cueTuning(), t -> t >= 1500 && t < 1700 ? edgeAhead(t) : clear(t), EMPTY_ROOM).started();
             long startle = runUntilState(rig, ExploreBrain.State.STARTLE, 0, 20000);
             long cueT = startle + 100;
-            rig.cue(cueT, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
+            rig.cue(cueT, Ears.Tier.WEAK, Ears.Side.LEFT, -60f);
             long search = runUntilState(rig, ExploreBrain.State.CUE_TURN, cueT, 30000);
             // The escape (startle, back-off, the turn away) runs to its end first; the cue is
             // taken in the very tick the escape's PAUSE begins, at the escape turn's stop.
@@ -8404,7 +8421,8 @@ public final class ExploreBrainHarness {
             int escapeStop = rig.firstAfter("stop", rig.timeOf(escapeTurn));
             check(n, startle > 0 && search > 0 && escapeTurn >= 0 && rig.timeOf(escapeTurn) < search
                             && rig.timeOf(escapeStop) == search && "TURN".equals(stateBefore(rig, ExploreBrain.State.CUE_TURN, cueT))
-                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1 && rig.violations.isEmpty(),
+                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1 && rig.count("react answer") == 0
+                            && rig.violations.isEmpty(),
                     "startle@" + startle + " escapeTurn@" + rig.timeOf(escapeTurn) + " search@" + search + " "
                             + gauges(rig) + " " + rig.tail());
         });
@@ -8432,6 +8450,7 @@ public final class ExploreBrainHarness {
             rig.runUntil(cueT + 12000);
             int match = rig.firstAfter("match", cueT);
             check(n, approach > 0 && entered(rig, ExploreBrain.State.CUE_TURN, cueT) < 0 && match > 0
+                            && answerAt(rig, cueT) == cueT
                             && rig.what(rig.firstAfter("say ", cueT)).equals("say Hi Sarah!")
                             && rig.counted(ExploreBrain.Gauges.Counter.CUES) == 1
                             && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 0 && rig.violations.isEmpty(),
@@ -8512,21 +8531,21 @@ public final class ExploreBrainHarness {
                             && rig.counted(ExploreBrain.Gauges.Counter.STRONG_CUES) == 0 && rig.violations.isEmpty(),
                     "startle@" + startle + " search@" + search + " " + gauges(rig) + " " + rig.tail());
         });
-        scenario("cue_charger_latch_closes_the_ears_and_reopening_takes_the_next_cue", n -> {
+        scenario("cue_charger_keeps_the_ears_open_and_a_call_there_is_answered_in_place", n -> {
+            // Hey-miko plan KTD5 replaces the meeting plan's KTD6 dock rule: the ears stay open on
+            // the charger, and a call there is answered and met where he sits.
             Rig rig = cueRig(cueTuning(), t -> t >= 3000 && t < 6000 ? charger(t) : clear(t), EMPTY_ROOM).started();
             rig.cue(4000, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
-            rig.cue(7000, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
-            rig.runUntil(6990);
-            long none = entered(rig, ExploreBrain.State.CUE_TURN, 0);
-            long search = runUntilState(rig, ExploreBrain.State.CUE_TURN, 7000, 20000);
-            int close = rig.firstAfter("ears close", 0);
-            int reopen = rig.firstAfter("ears open", 3000);
-            check(n, rig.timeOf(rig.first("ears open", 0)) <= 100 && rig.timeOf(close) == 3000
-                            && rig.timeOf(reopen) == 6000 && rig.earsOpens == 2 && rig.earsCloses == 1
-                            && none < 0 && search >= 7000 && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1
-                            && rig.violations.isEmpty(),
-                    "close@" + rig.timeOf(close) + " reopen@" + rig.timeOf(reopen) + " none=" + none + " search@" + search
-                            + " " + gauges(rig) + " " + rig.tail());
+            rig.runUntil(4000);
+            ExploreBrain.State after = rig.brain.state();
+            rig.runUntil(20000);
+            long over = stopOver(rig, 4000);
+            check(n, rig.timeOf(rig.first("ears open", 0)) <= 100 && rig.earsOpens == 1 && rig.earsCloses == 0
+                            && after == ExploreBrain.State.MEET && answerAt(rig, 4000) == 4000 && rig.count("lines") == 1
+                            && over > 4000 && wheelMoves(rig, 4000, over) == 0
+                            && entered(rig, ExploreBrain.State.CUE_TURN, 0) < 0 && rig.violations.isEmpty(),
+                    "after=" + after + " over@" + over + " opens=" + rig.earsOpens + " closes=" + rig.earsCloses + " "
+                            + gauges(rig) + " " + rig.tail());
         });
         scenario("ears_lost_reopens_with_backoff", n -> {
             // Lost at 5 s; the launcher refuses every bind until 20 s, so the retries at +2, +4 and +8 s
@@ -8584,53 +8603,47 @@ public final class ExploreBrainHarness {
                             + " closes=" + rig.earsCloses + " lost=" + notesWith(notes, "ears lost")
                             + " back=" + notesWith(notes, "ears back") + " " + rig.tail());
         });
-        scenario("ears_lost_on_the_charger_waits_for_the_latch", n -> {
-            // Lost at 2.5 s; the retry at 4.5 s fails (attempt 1, next look due at 8.5 s). The charger
-            // latch at 5 s closes the ears with that reopen pending and nothing binds until it clears at
-            // 8 s. A loss at 10 s then retries 2 s later, not 4: the latch reset the count and the stale
-            // due time, so there is exactly one "ears back" and no bind on the tick after the clear.
+        scenario("ears_lost_on_the_charger_reopens_on_the_same_backoff", n -> {
+            // The ears stay open on the charger (hey-miko plan KTD5), so the latch at 5-8 s closes
+            // nothing and the reopen ladder runs through it: lost at 2.5 s, the retry at 4.5 s is
+            // refused (the launcher refuses binds until 6 s), the one at 8.5 s binds, and it is
+            // found holding at 16.5 s.
             List<String> notes = new ArrayList<String>();
             Rig rig = cueRig(cueTuning(), t -> t >= 5000 && t < 8000 ? charger(t) : clear(t), EMPTY_ROOM);
             rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
             rig.started();
             rig.earsOpenRefusedUntil = 6000;
             rig.at(2500, () -> rig.earsListening = false);
-            rig.at(10000, () -> rig.earsListening = false);
             rig.runUntil(17000);
-            long close = rig.timeOf(rig.firstAfter("ears close", 0));
-            int latched = rig.countPrefix("ears open", 5000, 8000);
-            long reopen = rig.timeOf(rig.firstAfter("ears open", 8000));
-            long retry = rig.timeOf(rig.firstAfter("ears open", 10000));
-            int after = rig.countPrefix("ears open", retry + 10, 17001);
-            check(n, close == 5000 && latched == 0 && reopen == 8000 && withinTick(retry, 12000) && after == 0
-                            && rig.earsOpens == 4 && rig.earsCloses == 1 && rig.listening()
-                            && notesWith(notes, "ears lost: reopening in 2000ms (attempt 1)") == 2
-                            && notesWith(notes, "ears lost") == 2 && notesWith(notes, "ears back") == 1
-                            && notesWith(notes, "ears back after 1 attempt(s)") == 1
-                            && rig.violations.isEmpty(),
-                    "close@" + close + " latched=" + latched + " reopen@" + reopen + " retry@" + retry + " after=" + after
-                            + " opens=" + rig.earsOpens + " closes=" + rig.earsCloses + " listening=" + rig.listening()
-                            + " lost=" + notesWith(notes, "ears lost") + " back=" + notesWith(notes, "ears back")
-                            + " " + rig.tail());
+            long r1 = rig.timeOf(rig.firstAfter("ears open", 2500));
+            long r2 = rig.timeOf(rig.firstAfter("ears open", r1 + 10));
+            int after = rig.countPrefix("ears open", r2 + 10, 17001);
+            check(n, rig.earsCloses == 0 && withinTick(r1, 4500) && withinTick(r2, 8500) && after == 0
+                            && rig.earsOpens == 3 && rig.listening()
+                            && notesWith(notes, "ears lost: reopening in 2000ms (attempt 1)") == 1
+                            && notesWith(notes, "ears back after 2 attempt(s)") == 1 && rig.violations.isEmpty(),
+                    "retries@" + r1 + "," + r2 + " after=" + after + " opens=" + rig.earsOpens + " closes="
+                            + rig.earsCloses + " listening=" + rig.listening() + " " + rig.tail());
         });
-        scenario("cue_eyes_only_wake_word_enters_the_meeting_path_without_a_turn_and_a_name_cue_is_dropped", n -> {
-            // No lease ever: eyes only. Nobody can be seen, so the wake word takes the stranger path.
+        scenario("cue_eyes_only_a_name_call_is_answered_once_meets_without_moving_and_a_second_call_merges", n -> {
+            // No lease ever: eyes only. A name is a call (hey-miko plan KTD1): answered at once and
+            // met without a turn; the wake word a second later merges into it. Nobody can be seen,
+            // so the meeting takes the stranger path.
             Rig rig = cueRig(EMPTY_ROOM);
             rig.brain.start();
             rig.cue(1000, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
             rig.cue(2000, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 60f);
-            rig.runUntil(1500);
+            rig.runUntil(1000);
             ExploreBrain.State afterName = rig.brain.state();
-            rig.runUntil(2000);
-            ExploreBrain.State afterWake = rig.brain.state();
-            long ask = runUntilEvent(rig, "say Hello! What's your name?", 2000, 20000);
+            long ask = runUntilEvent(rig, "say Hello! What's your name?", 1000, 20000);
             rig.runUntil(ask + 12000);
-            check(n, afterName == ExploreBrain.State.EYES_ONLY && rig.counted(ExploreBrain.Gauges.Counter.CUES_DROPPED) == 1
-                            && afterWake == ExploreBrain.State.MEET && ask > 0 && rig.countPrefix("turn", 0, ask + 12001) == 0
-                            && rig.countPrefix("hop", 0, ask + 12001) == 0 && rig.count("listen") == 1
+            check(n, afterName == ExploreBrain.State.MEET && answerAt(rig, 1000) == 1000 && rig.count("react answer") == 1
+                            && rig.clipWindows.equals(java.util.Arrays.asList(600L)) && ask > 0
+                            && wheelMoves(rig, 0, ask + 12001) == 0 && rig.count("lines") == 1 && rig.count("listen") == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_DROPPED) == 0
                             && rig.count("camera open") == 0 && rig.brain.state() == ExploreBrain.State.EYES_ONLY
                             && rig.violations.isEmpty(),
-                    "afterName=" + afterName + " afterWake=" + afterWake + " ask@" + ask + " end=" + rig.brain.state()
+                    "afterName=" + afterName + " ask@" + ask + " end=" + rig.brain.state()
                             + " " + gauges(rig) + " " + rig.tail());
         });
         scenario("cue_held_strong_older_than_10_s_becomes_a_lean_in", n -> {
@@ -8641,7 +8654,9 @@ public final class ExploreBrainHarness {
             rig.speechMs = 12000;
             rig.started();
             long say = runUntilEvent(rig, "say What a shiny lamp!", 0, 30000);
-            rig.cue(say + 300, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
+            // A greeting is strong but not a call: it keeps the hold and the lean-in downgrade.
+            // A call never degrades (call_held_60_s_behind_a_long_conversation_...).
+            rig.cue(say + 300, Ears.Kind.GREETING, Ears.Side.LEFT, -60f);
             long search = runUntilState(rig, ExploreBrain.State.CUE_TURN, say, say + 20000);
             long pause = runUntilState(rig, ExploreBrain.State.PAUSE, search + 1, search + 40000);
             check(n, say > 0 && search >= say + 12000 && entries(rig, ExploreBrain.State.CUE_LOOK).size() == 2 && pause > 0
@@ -8656,7 +8671,8 @@ public final class ExploreBrainHarness {
             rig.cue(400, Ears.Kind.NAME, Ears.Side.LEFT, -90f);
             rig.runUntil(400);
             long say = runUntilEvent(rig, "say Hi Sarah!", 400, 30000);
-            int clip = rig.firstAfter("clip 600", 400);
+            // A name is a call (hey-miko plan U5): its answer clip opens a window at 400 first.
+            int clip = rig.firstAfter("clip 600", 401);
             int ack = rig.firstAfter("react acknowledge", 400);
             int match = rig.firstAfter("match", 400);
             long cueAt = rig.stamped(ExploreBrain.Gauges.Stage.CUE_AT);
@@ -8664,7 +8680,7 @@ public final class ExploreBrainHarness {
             long faceFound = rig.stamped(ExploreBrain.Gauges.Stage.FACE_FOUND);
             long matchAnswered = rig.stamped(ExploreBrain.Gauges.Stage.MATCH_ANSWERED);
             check(n, say > 0 && clip >= 0 && ack > clip && match > ack && rig.timeOf(clip) == faceFound
-                            && rig.clipWindows.equals(java.util.Arrays.asList(600L))
+                            && rig.clipWindows.equals(java.util.Arrays.asList(600L, 600L)) && answerAt(rig, 400) == 400
                             && cueAt == 400 && turnDone > cueAt && faceFound > turnDone && matchAnswered > faceFound
                             && matchAnswered == rig.timeOf(rig.firstAfter("match KNOWN", 400))
                             && rig.stamped(ExploreBrain.Gauges.Stage.LINE_REQUESTED) < 0
@@ -8726,6 +8742,268 @@ public final class ExploreBrainHarness {
     /** Turn 1 answers the first, turn 2 the second, ...; every turn past the script answers a plain line. */
     private static TurnScript turnsOf(CuriosityPort.Turn... perTurn) {
         return (rig, req, nth) -> nth <= perTurn.length ? perTurn[nth - 1] : turnLine(nth);
+    }
+
+    // ---- the call: slot, verdict and answer (hey-miko plan U5; R1-R4, R11; KTD1-KTD5; AE1-AE3, AE6) ----
+    //
+    // A strong WAKE_WORD or NAME cue is a call: answered with the "answer" clip in the
+    // step it is taken, never dropped, never a lean-in. These pin KTD2's order (a line
+    // playing, a conversation, the charger, the back-off, no wheels or camera, the person
+    // he was going to, everything else), the hand-back, and the charger's still meeting.
+
+    /** When the stop that began before `from` ended: the first state change after it into a non-stop state, or -1. */
+    private static long stopOver(Rig rig, long from) {
+        for (Event e : rig.stateLog) {
+            if (e.t > from && !ExploreBrain.State.valueOf(e.what).inStop()) {
+                return e.t;
+            }
+        }
+        return -1;
+    }
+
+    /** When the state first changed after `from`, or -1. */
+    private static long stateChangeAfter(Rig rig, long from) {
+        for (Event e : rig.stateLog) {
+            if (e.t > from) {
+                return e.t;
+            }
+        }
+        return -1;
+    }
+
+    /** Wheel commands in [from, to): hops, back-offs and turns (not the conversation's "turn" requests). */
+    private static int wheelMoves(Rig rig, long from, long to) {
+        return rig.countPrefix("hop", from, to) + rig.countPrefix("back", from, to)
+                + rig.countPrefix("turn LEFT", from, to) + rig.countPrefix("turn RIGHT", from, to);
+    }
+
+    /** When the turn to a voice began at or after from (CUE_TURN, or CUE_LOOK when there was nothing to turn), or -1. */
+    private static long searchFrom(Rig rig, long from) {
+        long turn = entered(rig, ExploreBrain.State.CUE_TURN, from);
+        long look = entered(rig, ExploreBrain.State.CUE_LOOK, from);
+        return turn < 0 ? look : look < 0 ? turn : Math.min(turn, look);
+    }
+
+    /** The time of the first answer clip at or after t, or -1. */
+    private static long answerAt(Rig rig, long t) {
+        return rig.timeOf(rig.firstAfter("react answer", t));
+    }
+
+    private static void callScenarios() {
+        scenario("call_ae1_met_two_minutes_ago_a_wake_word_is_still_answered_and_searched", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("hi"), hearWords("catch you later"));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long cueT = over + 120000;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -90f);
+            rig.runUntil(cueT + 100);
+            check(n, open > 0 && over > 0 && anyContains(notes, "conversation with someone named over")
+                            && cueT - over < rig.tuning.metLeaveAloneMs && answerAt(rig, cueT) == cueT
+                            && entered(rig, ExploreBrain.State.CUE_TURN, cueT) == cueT
+                            && rig.count("react answer") == 2 && rig.violations.isEmpty(),
+                    "over@" + over + " answer@" + answerAt(rig, cueT) + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_ae2_a_wake_word_during_the_back_off_waits_for_it_then_answers_and_searches", n -> {
+            Rig rig = cueRig(cueTuning(), t -> t >= 1500 && t < 1700 ? edgeAhead(t) : clear(t), EMPTY_ROOM).started();
+            long back = runUntilState(rig, ExploreBrain.State.BACK_OFF, 0, 20000);
+            long cueT = back + 50;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            rig.runUntil(back + 6000);
+            long search = searchFrom(rig, cueT);
+            long backEnd = stateChangeAfter(rig, back);
+            check(n, back > 0 && search > 0 && backEnd > cueT && search >= backEnd && search <= backEnd + 20
+                            && answerAt(rig, cueT) == search && rig.countPrefix("react answer", 0, search) == 0
+                            && rig.countPrefix("turn", cueT, search) == 0
+                            && rig.timeOf(rig.firstAfter("stop", cueT)) == backEnd
+                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.LEAN_INS) == 0 && rig.violations.isEmpty(),
+                    "back@" + back + " backEnd@" + backEnd + " search@" + search + " answer@" + answerAt(rig, cueT) + " "
+                            + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_two_calls_before_the_answer_merge_into_one_and_the_newer_angle_wins", n -> {
+            Rig rig = cueRig(cueTuning(), t -> t >= 1500 && t < 1700 ? edgeAhead(t) : clear(t), EMPTY_ROOM).started();
+            long back = runUntilState(rig, ExploreBrain.State.BACK_OFF, 0, 20000);
+            rig.cue(back + 50, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -60f);
+            rig.cue(back + 100, Ears.Kind.NAME, Ears.Side.RIGHT, 60f);
+            long search = runUntilState(rig, ExploreBrain.State.CUE_TURN, back + 50, 30000);
+            rig.runUntil(search + 1500);
+            int turn = rig.firstAfter("turn", search);
+            check(n, back > 0 && search > 0 && rig.count("react answer") == 1 && answerAt(rig, back) == search
+                            && rig.count("eyes GLANCE RIGHT") == 1 && rig.count("eyes GLANCE LEFT") == 0
+                            && rig.what(turn).equals("turn RIGHT") && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_DROPPED) == 0 && rig.violations.isEmpty(),
+                    "search@" + search + " turn=" + rig.what(turn) + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_docked_cycling_through_startle_and_back_off_answers_in_place_without_moving", n -> {
+            // An edge at 1.5 s: the startle, then the back-off from 1.9 s; the charger latch comes on
+            // 50 ms into it (the latch reads as motion refused), and the call lands 50 ms later.
+            Rig rig = cueRig(cueTuning(), t -> t >= 1500 && t < 1700 ? edgeAhead(t) : t >= 1950 ? charger(t) : clear(t),
+                    EMPTY_ROOM).started();
+            long back = runUntilState(rig, ExploreBrain.State.BACK_OFF, 0, 30000);
+            long cueT = back + 100;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -60f);
+            rig.runUntil(cueT);
+            ExploreBrain.State after = rig.brain.state();
+            long over = stopOver(rig, cueT);
+            long end = over > 0 ? over : rig.now;
+            rig.runUntil(cueT + 20000);
+            over = stopOver(rig, cueT);
+            end = over > 0 ? over : rig.now;
+            check(n, back > 0 && answerAt(rig, cueT) == cueT && after == ExploreBrain.State.MEET && rig.count("lines") == 1
+                            && wheelMoves(rig, cueT, end) == 0 && rig.count("ears close") == 0
+                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 0 && rig.violations.isEmpty(),
+                    "back@" + back + " after=" + after + " over@" + over + " motions=" + wheelMoves(rig, cueT, end) + " "
+                            + gauges(rig) + " states=" + rig.stateLog + " " + rig.tail());
+        });
+        scenario("call_ae3_no_angle_in_chat_listen_waits_for_the_conversation_then_answers_and_searches", n -> {
+            Rig rig = sarahRig(true);
+            rig.people.listen = ListenScript.turns(hearWords("yes").after(2500), hearWords("catch you later"));
+            long open = openChat(rig);
+            long listen = runUntilEvent(rig, "listen", open, open + 20000);
+            long cueT = listen + 300;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            long over = chatOver(rig, listen);
+            rig.runUntil(over + 100);
+            long search = searchFrom(rig, over);
+            check(n, open > 0 && over > cueT && search >= over && search <= over + 20
+                            && rig.countPrefix("react answer", cueT, over) == 0 && answerAt(rig, cueT) == search
+                            && rig.turnAsks.size() == 2 && rig.count("react sign-off") == 1
+                            && rig.count("react one-sec") == 0 && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_DROPPED) == 0 && rig.violations.isEmpty(),
+                    "listen@" + listen + " over@" + over + " search@" + search + " answer@" + answerAt(rig, cueT) + " "
+                            + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_docked_in_a_chat_waits_until_it_ends_then_answers_and_meets_without_moving", n -> {
+            long[] dock = {Long.MAX_VALUE};
+            Rig rig = chatRig(cueTuning(), t -> t >= dock[0] ? charger(t) : clear(t), personAt(bearingOf(-90f), 25), true);
+            rig.started();
+            rig.people.listen = ListenScript.turns(hearWords("hi"), hearWords("more"), hearWords("more again"));
+            long open = openChat(rig);
+            long say2 = runUntilEvent(rig, "say Line 2.", open, open + 30000);
+            dock[0] = say2 + 100;
+            long cueT = say2 + 300;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 60f);
+            long over = chatOver(rig, say2);
+            long meet = runUntilState(rig, ExploreBrain.State.MEET, over, over + 5000);
+            rig.runUntil(meet + 20000);
+            long done = stopOver(rig, meet);
+            long end = done > 0 ? done : rig.now;
+            check(n, open > 0 && over > cueT && meet >= over && meet <= over + 20 && answerAt(rig, cueT) == meet
+                            && rig.countPrefix("react answer", cueT, over) == 0 && wheelMoves(rig, cueT, end) == 0
+                            && entered(rig, ExploreBrain.State.CUE_TURN, cueT) < 0 && rig.count("ears close") == 0
+                            && rig.violations.isEmpty(),
+                    "over@" + over + " meet@" + meet + " done@" + done + " motions=" + wheelMoves(rig, cueT, end) + " "
+                            + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_with_claude_unavailable_plays_the_answer_once_and_clears_the_slot", n -> {
+            Rig rig = cueRig(EMPTY_ROOM);
+            rig.askRefused = true;
+            List<String> notes = traced(rig);
+            rig.started();
+            long hop = runUntilEvent(rig, "hop", 0, 20000);
+            long cueT = hop + 200;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -60f);
+            rig.runUntil(cueT + 20000);
+            check(n, hop > 0 && answerAt(rig, cueT) == cueT && rig.count("react answer") == 1
+                            && rig.timeOf(rig.firstAfter("stop", cueT)) == cueT
+                            && entered(rig, ExploreBrain.State.CUE_TURN, cueT) < 0 && rig.count("lines") == 0
+                            && rig.count("match") == 0 && wheelMoves(rig, cueT + 1, cueT + 20000) > 0
+                            && notesWith(notes, "the answer is the whole response") == 1 && rig.violations.isEmpty(),
+                    "answer@" + answerAt(rig, cueT) + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_lease_lost_during_its_search_is_retaken_in_eyes_only_without_a_second_answer", n -> {
+            Rig rig = cueRig(EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -90f);
+            rig.at(900, () -> rig.brain.onLeaseChanged(false));
+            rig.runUntil(900);
+            long meet = runUntilState(rig, ExploreBrain.State.MEET, 900, 5000);
+            rig.runUntil(meet + 10000);
+            check(n, entered(rig, ExploreBrain.State.CUE_TURN, 400) == 400 && answerAt(rig, 400) == 400
+                            && meet >= 900 && meet <= 920 && rig.count("react answer") == 1 && rig.count("lines") == 1
+                            && notesWith(notes, "during the call's search or approach: the call waits") == 1
+                            && wheelMoves(rig, meet, rig.now) == 0 && rig.violations.isEmpty(),
+                    "meet@" + meet + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_ae6_on_the_charger_answers_and_holds_the_conversation_without_leaving_the_dock", n -> {
+            Rig rig = chatRig(cueTuning(), t -> t >= 1000 ? charger(t) : clear(t), EMPTY_ROOM, false);
+            rig.people.lines = STRANGER.withConversation(PERSONA, null, null, null);
+            rig.turns = turnsOf(turnLine(1), turnLine(2));
+            rig.people.listen = ListenScript.turns(hearWords("i'm ben"), hearWords("bye"));
+            rig.started();
+            long cueT = 4000;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -60f);
+            rig.runUntil(cueT);
+            ExploreBrain.State after = rig.brain.state();
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, cueT, cueT + 20000);
+            long over = chatOver(rig, open);
+            check(n, after == ExploreBrain.State.MEET && answerAt(rig, cueT) == cueT && rig.count("react answer") == 1
+                            && open > 0 && over > 0 && wheelMoves(rig, cueT, over) == 0 && rig.count("camera open") >= 0
+                            && rig.turnAsks.size() == 2 && rig.count("ears close") == 0 && rig.earsOpens == 1
+                            && rig.violations.isEmpty(),
+                    "after=" + after + " open@" + open + " over@" + over + " motions=" + wheelMoves(rig, cueT, Math.max(cueT, over))
+                            + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_held_60_s_behind_a_long_conversation_is_still_answered_as_a_call_not_a_lean_in", n -> {
+            Rig rig = sarahRig(true);
+            Hearing[] replies = new Hearing[19];
+            for (int i = 0; i < 18; i++) {
+                replies[i] = hearWords("more");
+            }
+            replies[18] = hearWords("catch you later");
+            rig.people.listen = ListenScript.turns(replies);
+            long open = openChat(rig);
+            long cueT = open + 1000;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            long over = chatOver(rig, open);
+            rig.runUntil(over + 100);
+            long search = searchFrom(rig, over);
+            check(n, open > 0 && over - cueT >= 60000 && search >= over && search <= over + 20
+                            && answerAt(rig, cueT) == search && rig.counted(ExploreBrain.Gauges.Counter.LEAN_INS) == 0
+                            && rig.violations.isEmpty(),
+                    "open@" + open + " over@" + over + " search@" + search + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_during_an_escape_is_answered_at_once", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            long retrace = runUntilState(rig, ExploreBrain.State.RETRACE, 0, 60000);
+            long cueT = retrace + 10;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -60f);
+            rig.runUntil(cueT + 100);
+            check(n, retrace > 0 && answerAt(rig, cueT) == cueT && entered(rig, ExploreBrain.State.CUE_TURN, cueT) == cueT
+                            && "RETRACE".equals(stateBefore(rig, ExploreBrain.State.CUE_TURN, cueT)),
+                    "retrace@" + retrace + " answer@" + answerAt(rig, cueT) + " " + rig.tail());
+        });
+        scenario("call_in_approach_with_no_angle_answers_and_carries_on_the_same_approach", n -> {
+            Rig rig = cueRig(cueTuning(), CLEAR, personWhen(t -> true)).started();
+            long approach = runUntilState(rig, ExploreBrain.State.APPROACH, 0, 20000);
+            long cueT = approach + 300;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            rig.runUntil(cueT + 12000);
+            int match = rig.firstAfter("match", cueT);
+            check(n, approach > 0 && answerAt(rig, cueT) == cueT && entered(rig, ExploreBrain.State.CUE_TURN, cueT) < 0
+                            && match > 0 && rig.what(rig.firstAfter("say ", cueT)).equals("say Hi Sarah!")
+                            && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 0 && rig.violations.isEmpty(),
+                    "approach@" + approach + " match@" + rig.timeOf(match) + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_an_already_called_end_of_utterance_makes_no_second_call", n -> {
+            Rig rig = cueRig(EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -60f);
+            rig.calledCue(1400, 400, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 90f);
+            rig.runUntil(6000);
+            check(n, answerAt(rig, 400) == 400 && rig.count("react answer") == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.RETARGETS) == 0
+                            && rig.count("eyes GLANCE RIGHT") == 0 && rig.counted(ExploreBrain.Gauges.Counter.CUES) == 2
+                            && notesWith(notes, "already called") == 1 && rig.violations.isEmpty(),
+                    gauges(rig) + " " + rig.tail());
+        });
     }
 
     private static Rig chatRig(Vision v, boolean known) {
@@ -9104,6 +9382,8 @@ public final class ExploreBrainHarness {
             check(n, open > 0 && over > 0 && held.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1
                             && held.count("react one-sec") == 1 && held.countPrefix("eyes GLANCE RIGHT", listen, over) == 1
                             && held.turnAsks.size() == 2 && held.count("react sign-off") == 1 && search >= over
+                            && held.count("react answer") == 2 && answerAt(held, over) == search
+                            && inside.count("react answer") == 1
                             && open2 > 0 && over2 > 0 && inside.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 0
                             && inside.counted(ExploreBrain.Gauges.Counter.CUES_DROPPED) == 1
                             && inside.count("react one-sec") == 0 && inside.turnAsks.size() == 2
@@ -9191,7 +9471,7 @@ public final class ExploreBrainHarness {
             rig.runUntil(over + 15000);
             List<String> notes = rig.traceNotes;
             check(n, open > 0 && say2 > 0 && over > 0 && rig.count("react sign-off") == 1 && rig.turnAsks.size() == 2
-                            && closed >= 0 && rig.timeOf(closed) >= over && rig.notesDeltas.size() == 2
+                            && closed < 0 && rig.count("ears close") == 0 && rig.notesDeltas.size() == 2
                             && rig.countPrefix("turn RIGHT", over, over + 6000) == 0
                             && rig.countPrefix("hop", over, over + 6000) == 0
                             && anyContains(notes, "on the charger: no resume leg") && rig.violations.isEmpty(),

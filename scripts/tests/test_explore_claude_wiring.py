@@ -193,11 +193,13 @@ class EarsAdapterWiringTest(unittest.TestCase):
         brain = code_only(src("ExploreBrain.java"))
         self.assertIn("port.earsShoved(", brain)
 
-    def test_the_ears_follow_the_charger_latch(self):
+    def test_the_ears_stay_open_on_the_charger(self):
+        # Hey-miko plan KTD5 replaces the meeting plan's KTD6 dock rule: the brain no longer
+        # closes the ears on the charger latch; a call there is met without moving.
         brain = code_only(src("ExploreBrain.java"))
         sync = re.search(r"private void syncEars\(long now\)\s*\{(.*?)\n    \}", brain, re.S)
         self.assertIsNotNone(sync)
-        self.assertIn("classifier.charger()", sync.group(1))
+        self.assertNotIn("classifier.charger()", sync.group(1))
         self.assertIn("port.earsOpen()", sync.group(1))
         self.assertIn("port.earsClose()", sync.group(1))
         # A session the launcher dropped is noticed here too (the reopen backoff below).
