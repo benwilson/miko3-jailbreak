@@ -42,11 +42,17 @@ import java.util.Random;
  * too many names to hold a prepared player for each, so these are prepared on the
  * clip thread when asked and released when they finish. Only one plays at a time:
  * a new one cuts off the one still playing.
+ *
+ * The answer to a call (hey-miko plan KTD3) is the exception: it must start in
+ * the brain step that takes the call, so one answer variant is held prepared
+ * and the next is prepared after it plays.
  */
 final class ClipPlayer {
     private static final String TAG = "ClipPlayer";
     private static final String[] STARTLE_CLIPS = {"startle-1.wav", "startle-2.wav", "startle-3.wav"};
     private static final String[] SONG_CLIPS = {"song-1.wav", "song-2.wav", "song-3.wav", "song-4.wav"};
+    /** The reaction group held prepared, so a call's answer skips the prepare delay. */
+    static final String ANSWER_GROUP = "answer";
     /** Still for this long before the first phrase. */
     private static final long FIRST_SONG_DELAY_MS = 3000;
     /** Quiet gap between phrases, drawn from this range. */
@@ -64,6 +70,8 @@ final class ClipPlayer {
     /** Clip thread only: reaction group -> its variant assets, and the one-shot playing now. */
     private final Map<String, List<String>> reactions = new HashMap<>();
     private MediaPlayer currentOneShot;
+    /** Clip thread only: the next answer variant, prepared and waiting. */
+    private MediaPlayer readyAnswer;
     private final Random random = new Random();
 
     ClipPlayer(final Context context) {
@@ -80,6 +88,7 @@ final class ClipPlayer {
                     songs[i] = prepare(context, SONG_CLIPS[i]);
                 }
                 indexReactions();
+                prepareNextAnswer();
             }
         });
     }
@@ -143,6 +152,13 @@ final class ClipPlayer {
         handler.post(new Runnable() {
             @Override
             public void run() {
+                if (ANSWER_GROUP.equals(group) && readyAnswer != null) {
+                    MediaPlayer p = readyAnswer;
+                    readyAnswer = null;
+                    startOneShot(p, ANSWER_GROUP);
+                    prepareNextAnswer();
+                    return;
+                }
                 List<String> variants = reactions.get(group);
                 if (variants == null || variants.isEmpty()) {
                     Log.w(TAG, "no clips for reaction " + group + "; skipping");
@@ -185,14 +201,31 @@ final class ClipPlayer {
         }
     }
 
+    /** Clip thread: hold a random answer variant prepared for the next call. */
+    private void prepareNextAnswer() {
+        List<String> variants = reactions.get(ANSWER_GROUP);
+        if (variants == null || variants.isEmpty()) {
+            Log.w(TAG, "no clips for reaction " + ANSWER_GROUP + "; the answer will be skipped");
+            return;
+        }
+        readyAnswer = prepare(context, variants.get(random.nextInt(variants.size())));
+    }
+
     /** Clip thread: prepare an asset, play it once and release it when it ends (or
      * fails), cutting off any one-shot still playing. */
     private void playOneShot(String asset) {
-        stopOneShot();
-        final MediaPlayer p = prepare(context, asset);
+        MediaPlayer p = prepare(context, asset);
         if (p == null) {
+            stopOneShot();
             return;
         }
+        startOneShot(p, asset);
+    }
+
+    /** Clip thread: play a prepared player once and release it when it ends (or fails),
+     * cutting off any one-shot still playing. */
+    private void startOneShot(MediaPlayer p, String asset) {
+        stopOneShot();
         // Created on the clip thread, so these callbacks run on it too.
         p.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
             @Override
@@ -297,6 +330,10 @@ final class ClipPlayer {
                 handler.removeCallbacks(singPhrase);
                 currentSong = null;
                 stopOneShot();
+                if (readyAnswer != null) {
+                    readyAnswer.release();
+                    readyAnswer = null;
+                }
                 releaseAll(startles);
                 releaseAll(songs);
             }

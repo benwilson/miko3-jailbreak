@@ -180,7 +180,8 @@ class LineClipsTest(unittest.TestCase):
     model needs sherpa-onnx, so a missing asset is reported as pending generation
     rather than invented."""
 
-    GROUPS = ("acknowledge", "sign-off", "one-sec", "deflect", "nothing-kept")
+    GROUPS = ("acknowledge", "sign-off", "one-sec", "deflect", "nothing-kept", "answer", "where")
+    SESSION_GROUPS = ("sign-off", "one-sec", "deflect", "nothing-kept")
 
     def test_every_group_the_brain_plays_has_phrasings(self):
         self.assertEqual(tuple(voice.LINE_CLIPS), self.GROUPS)
@@ -194,8 +195,20 @@ class LineClipsTest(unittest.TestCase):
         brain = (REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore" / "ExploreBrain.java").read_text()
         session = (REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore" / "ChatSession.java").read_text()
         self.assertIn('playReaction("acknowledge")', brain)
-        for group in self.GROUPS[1:]:
+        for group in self.SESSION_GROUPS:
             self.assertIn(f'"{group}"', session, group)
+
+    def test_the_call_lines_are_the_owners_short_answers(self):
+        # A call is answered from a small set of short on-robot lines (R4), and a
+        # search that finds nobody asks where the caller went (R10).
+        self.assertEqual(voice.LINE_CLIPS["answer"], ["oh hi?", "what?", "yes?"])
+        self.assertEqual(voice.LINE_CLIPS["where"], ["where'd you go?"])
+
+    def test_the_call_clips_are_generated(self):
+        # Unlike older groups, the call clips must ship: the answer never waits for TTS.
+        for name, _ in voice.line_clips():
+            if name.startswith(("react-answer-", "react-where-")):
+                self.assertTrue((ASSETS / name).exists(), f"{name} missing: run scripts/gen-explore-voice.py")
 
     def test_clip_names_follow_the_reaction_index(self):
         names = [n for n, _ in voice.line_clips()]
@@ -208,6 +221,14 @@ class LineClipsTest(unittest.TestCase):
         player = (REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore" / "ClipPlayer.java").read_text()
         self.assertIn('name.endsWith(".webm")', player)
         self.assertIn('name.startsWith("react-")', player)
+
+    def test_clip_player_keeps_an_answer_prepared(self):
+        # The answer must start within the brain step that takes the call (KTD3), so
+        # ClipPlayer holds one answer variant prepared and prepares the next after it plays.
+        player = (REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore" / "ClipPlayer.java").read_text()
+        self.assertIn('ANSWER_GROUP = "answer"', player)
+        self.assertIn("readyAnswer", player)
+        self.assertIn("prepareNextAnswer()", player)
 
     def test_generate_writes_the_line_clips_after_the_names(self):
         src = SCRIPT.read_text()
