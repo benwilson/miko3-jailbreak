@@ -17,6 +17,13 @@ the run goes:
      see the debug-props note in docs/solutions and the memory about hooks
      left on).
 
+With the NC direction chip (hey-miko plan U1, U2) each row also carries the
+chip's raw 0..255 reading ("raw", or null), and the answer carries the chip's
+raw reply bytes as hex ("nc_reply"). The table and the CSVs print the raw value
+next to the angle, which is what the owner calibrates zero, sign and scale from
+(KTD12; scripts/qa-direction-chip.py --calibrate). An older launcher omits both
+and the output keeps its old shape.
+
 Rows carry counts and flags only. The route never sends transcript text, and
 this script refuses a dump that carries any (parse_answer), so nothing said
 near the robot lands in a terminal or a CSV.
@@ -72,6 +79,10 @@ MAX_SECONDS = 15
 ADB_TIMEOUT = 30
 HTTP_TIMEOUT = 60
 ROW_FIELDS = ("second", "angle", "rms", "decode_ms", "decode_max_ms", "chunks", "words", "matched")
+# Optional, from a launcher with the NC chip backend (U2): the chip's raw 0..255
+# direction reading that second (null when none), and the top-level raw reply hex.
+RAW_FIELD = "raw"
+NC_REPLY_FIELD = "nc_reply"
 
 # --- the measurement session (U2) ---
 # Explore's plain listener; /state answers {"state":..,"lookX":..,"lookY":..} (ModeApp.PORT).
@@ -98,7 +109,8 @@ FACE_TODO = ("TODO: Explore's /state exposes state and look only, not the face b
              "ratio and size KTD4 needs are recorded as a follow-up in docs/TODO.md")
 
 Response = namedtuple("Response", "status headers body")
-Answer = namedtuple("Answer", "backend seconds rows")
+# nc_reply: the NC chip's raw reply as hex (a string or a list of them), or None.
+Answer = namedtuple("Answer", "backend seconds rows nc_reply", defaults=(None,))
 Step = namedtuple("Step", "name kind instruction phrase")
 DecodeStats = namedtuple("DecodeStats", "per_chunk_ms p50_ms p95_ms max_p95_ms over_budget")
 ProcSample = namedtuple("ProcSample", "ticks rss_pages")
@@ -231,34 +243,48 @@ def parse_answer(text):
     for row in data["rows"]:
         if not isinstance(row, dict):
             raise ValueError("a row is not an object")
-        extra = set(row) - set(ROW_FIELDS)
+        extra = set(row) - set(ROW_FIELDS) - {RAW_FIELD}
         if extra:
             raise ValueError(f"a row carries unexpected fields: {', '.join(sorted(extra))}")
         missing = set(ROW_FIELDS) - set(row)
         if missing:
             raise ValueError(f"a row lacks: {', '.join(sorted(missing))}")
-        rows.append({k: row[k] for k in ROW_FIELDS})
-    return Answer(str(data.get("backend", "?")), int(data.get("seconds", len(rows))), rows)
+        raw = row.get(RAW_FIELD)
+        if raw is not None and (type(raw) is not int or not 0 <= raw <= 255):
+            raise ValueError(f"a row's {RAW_FIELD} is not a byte: {raw!r}")
+        rows.append({k: row[k] for k in row_fields([row])})
+    reply = data.get(NC_REPLY_FIELD)
+    if not (reply is None or isinstance(reply, str)
+            or (isinstance(reply, list) and all(isinstance(r, str) for r in reply))):
+        raise ValueError(f"the answer's {NC_REPLY_FIELD} is not hex text: {reply!r}")
+    return Answer(str(data.get("backend", "?")), int(data.get("seconds", len(rows))), rows, reply)
+
+
+def row_fields(rows):
+    """ROW_FIELDS, with the raw chip value right after the angle when any row carries it."""
+    if not any(RAW_FIELD in r for r in rows):
+        return ROW_FIELDS
+    at = ROW_FIELDS.index("angle") + 1
+    return ROW_FIELDS[:at] + (RAW_FIELD,) + ROW_FIELDS[at:]
 
 
 def format_rows(rows):
-    head = f"{'sec':>4} {'angle':>7} {'rms':>6} {'decode':>7} {'max':>5} {'chunks':>6} {'words':>5} match"
+    with_raw = RAW_FIELD in row_fields(rows)
+    raw_head = f" {'raw':>4}" if with_raw else ""
+    head = f"{'sec':>4} {'angle':>7}{raw_head} {'rms':>6} {'decode':>7} {'max':>5} {'chunks':>6} {'words':>5} match"
     lines = [head]
     for r in rows:
         angle = "-" if r["angle"] is None else f"{r['angle']:.1f}"
-        lines.append(f"{r['second']:>4} {angle:>7} {r['rms']:>6} {r['decode_ms']:>6}ms {r['decode_max_ms']:>5} "
+        raw = ""
+        if with_raw:
+            raw = f" {'-' if r.get(RAW_FIELD) is None else r[RAW_FIELD]:>4}"
+        lines.append(f"{r['second']:>4} {angle:>7}{raw} {r['rms']:>6} {r['decode_ms']:>6}ms {r['decode_max_ms']:>5} "
                      f"{r['chunks']:>6} {r['words']:>5} {'yes' if r['matched'] else 'no'}")
     return "\n".join(lines)
 
 
 def write_csv(rows, path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=ROW_FIELDS)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: ("" if r[k] is None else r[k]) for k in ROW_FIELDS})
+    write_dict_csv(rows, row_fields(rows), path)
 
 
 def write_dict_csv(rows, fields, path):
@@ -409,7 +435,7 @@ def step_rows(rows, cpu):
 
 
 def write_step_csv(rows, cpu, path):
-    write_dict_csv(step_rows(rows, cpu), ROW_FIELDS + STEP_EXTRA_FIELDS, path)
+    write_dict_csv(step_rows(rows, cpu), row_fields(rows) + STEP_EXTRA_FIELDS, path)
 
 
 def format_step_summary(rows, cpu):
@@ -422,6 +448,10 @@ def format_step_summary(rows, cpu):
              f"angle: {len(angles)} of {len(rows)} seconds reported one"
              + (f", median {percentile(angles, 50):.1f}, min {min(angles):.1f}, max {max(angles):.1f}" if angles else ""),
              f"matched: {'yes' if any(r['matched'] for r in rows) else 'no'}"]
+    if RAW_FIELD in row_fields(rows):
+        raws = [r[RAW_FIELD] for r in rows if r.get(RAW_FIELD) is not None]
+        lines.append(f"raw: {len(raws)} of {len(rows)} seconds reported one"
+                     + (f", median {percentile(raws, 50)}, min {min(raws)}, max {max(raws)}" if raws else ""))
     launcher = [c["cpu_launcher_pct"] for c in cpu if c.get("cpu_launcher_pct") is not None]
     explore = [c["cpu_explore_pct"] for c in cpu if c.get("cpu_explore_pct") is not None]
     if launcher or explore:
