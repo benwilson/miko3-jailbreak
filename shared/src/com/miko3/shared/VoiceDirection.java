@@ -3,6 +3,7 @@ package com.miko3.shared;
 import com.example.conexantapi.ConexantDSP;
 import com.example.conexantapi.NCDsp;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -79,6 +80,12 @@ public final class VoiceDirection {
             why.append("conexant init ").append(status);
         } catch (Throwable t) {
             why.append("conexant: ").append(t.getClass().getSimpleName());
+        }
+        if (!new File(NC_UART).exists()) {
+            // Without the node, createUART still answers a handle and initNCUART answers 1,
+            // and the next native call segfaults the whole process (seen live 2026-09-28).
+            why.append("; nc: no ").append(NC_UART);
+            return new VoiceDirection(Backend.NONE, why.toString(), null, null, 0);
         }
         try {
             NCDsp nc = new NCDsp();

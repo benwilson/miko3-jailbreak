@@ -695,6 +695,15 @@ class BuildScriptTest(unittest.TestCase):
         # KTD4: the angle is sampled on its own thread at a caller-set cadence.
         self.assertRegex(src, r"sample\(\s*(final\s+)?long\s+\w+")
 
+    def test_voice_direction_tries_nc_only_when_its_uart_exists(self):
+        # Seen live 2026-09-28: with no /dev/ttyMT2, createUART still answers a handle and
+        # initNCUART answers 1, so the next native call (getCurrentDOAStatus) segfaulted the
+        # whole launcher on the first speech the ears heard. The node must exist first.
+        src = _strip_comments(DIRECTION.read_text())
+        nc = src[src.index("new NCDsp()") - 400:src.index("createUART(")]
+        self.assertRegex(nc, r"new\s+File\(\s*NC_UART\s*\)\s*\.exists\(\)")
+        self.assertIn("import java.io.File;", DIRECTION.read_text())
+
     def test_built_apk_bundles_the_listen_model_when_present(self):
         apk = REPO / "launcher" / "miko3-launcher.apk"
         if not apk.exists() or apk.stat().st_mtime < BUILD_PY.stat().st_mtime:
