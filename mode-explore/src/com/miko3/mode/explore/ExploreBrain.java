@@ -247,7 +247,11 @@ import java.util.Set;
  * call (a strong wake word or name, hey-miko plan U5) has its own slot instead:
  * never dropped, answered with a local clip the moment KTD2's order allows, and,
  * on the charger or in EYES_ONLY, met without a turn. The ears stay open on the
- * charger. The conversation the meeting becomes is U8's (CHAT states).
+ * charger. The call's own search (hey-miko plan U6) runs in CUE_TURN and CUE_LOOK
+ * with its own plan (its bearing and the two neighbours, or eight looks round one
+ * circle), counts any person box tall enough as found, goes over to a far one
+ * through FACE and APPROACH, and when nobody is found says "Where'd you go?" and
+ * listens in CUE_WHERE. The conversation the meeting becomes is U8's (CHAT states).
  *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
@@ -421,7 +425,7 @@ final class ExploreBrain {
         ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP,
         CONFIRM, LAST_NAME,
         RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF,
-        CUE_TURN, CUE_LOOK,
+        CUE_TURN, CUE_LOOK, CUE_WHERE,
         CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES;
 
         /** A curiosity stop's looking states: the camera is always open in these (R2, AE6). */
@@ -450,7 +454,7 @@ final class ExploreBrain {
          * the camera is open in these, as in a curiosity stop's looking states.
          */
         boolean cueSearch() {
-            return this == CUE_TURN || this == CUE_LOOK;
+            return this == CUE_TURN || this == CUE_LOOK || this == CUE_WHERE;
         }
 
         /**
@@ -512,7 +516,10 @@ final class ExploreBrain {
 
         enum Stage {
             CUE_AT("cueAt"), TURN_DONE("turnDone"), FACE_FOUND("faceFound"), MATCH_ANSWERED("matchAnswered"),
-            LINE_REQUESTED("lineRequested"), FIRST_SOUND("firstSound");
+            LINE_REQUESTED("lineRequested"), FIRST_SOUND("firstSound"),
+            /** A call's cue (hey-miko plan U6): heard (its at), answered, a person found in front, the conversation open. */
+            CALL_HEARD("callHeard"), CALL_ANSWERED("callAnswered"), CALL_FACING("callFacing"),
+            CALL_ARRIVED("callArrived");
 
             final String key;
 
@@ -885,6 +892,19 @@ final class ExploreBrain {
     /** The utterance keys (Cue.at) of recent calls: an already-called delivery with one of them is absorbed (KTD4). */
     private final ArrayDeque<Long> callAts = new ArrayDeque<Long>();
     private static final int CALL_ATS_KEPT = 8;
+    /** The call's search (hey-miko plan KTD6): 45 deg steps, eight looks for one circle with no angle. */
+    private static final double CALL_STEP_DEG = 45;
+    private static final int CALL_CIRCLE_LOOKS = 8;
+    /** The bearing the call's search was planned round (searchRel's frame, right positive); NaN with no angle. */
+    private double callBearing = Double.NaN;
+    /** A reply after "Where'd you go?" restarted this call's search (KTD9: once per call). */
+    private boolean callReplied;
+    /** CUE_WHERE: when the listen after "Where'd you go?" ends. */
+    private long whereUntil;
+    /** The turn the wheels were last told to make (Heading.LEFT or RIGHT), 0 once stopped (KTD7's fallback). */
+    private int turnSign;
+    /** KTD7: his heading lately, to correct a call's angle for his own turning since it was heard. */
+    private final Heading.History headingHistory;
     /** The cue being searched for in CUE_TURN and CUE_LOOK, or null. */
     private Ears.Cue searchCue;
     /** A strong cue from the other side already retargeted this search (once only, KTD3). */
@@ -974,6 +994,7 @@ final class ExploreBrain {
         this.random = random;
         this.classifier = new HazardClassifier(tuning);
         this.compass = new Heading(tuning.gyro, tuning);
+        this.headingHistory = new Heading.History(tuning.headingHistoryMs, tuning.headingSampleMs);
         this.steer = new RoamSteer(tuning);
         this.coverage = new Coverage(tuning);
         this.planner = new EscapePlanner(tuning);
@@ -1032,6 +1053,9 @@ final class ExploreBrain {
         countEscapeWheels(reading);
         lastReading = reading;
         compass.offer(reading, moving);
+        headingHistory.offer(reading.timestampMs,
+                compass.usable(reading.timestampMs) ? compass.degrees() : Double.NaN,
+                moving ? turnSign : 0, 360.0 / Math.max(1, tuning.escapeSweepMaxMs));
         coverage.offer(reading, compass.degrees(), compass.usable(reading.timestampMs));
         teachFloor(reading);
         double[] turn = compass.takeTurnResult();
@@ -1297,6 +1321,9 @@ final class ExploreBrain {
             case CUE_TURN:
             case CUE_LOOK:
                 curiosityStep(now, fresh, hazard);
+                break;
+            case CUE_WHERE:
+                whereStep(now);
                 break;
             case CHAT_THINK:
             case CHAT_SPEAK:
@@ -2032,7 +2059,9 @@ final class ExploreBrain {
             return;
         }
         // Someone met in the last 10 minutes: the detector's fallback never approaches a person (KTD8).
-        boolean ignorePeople = now < peopleIgnoredUntil || anyoneMet(now) || leftAlone(now, look);
+        // Only SCAN asks: a call's FACE and APPROACH never pass the leave-alone checks (hey-miko KTD8).
+        boolean ignorePeople = state == State.SCAN
+                && (now < peopleIgnoredUntil || anyoneMet(now) || leftAlone(now, look));
         if (state == State.SCAN && claudeStop) {
             scanLook(now, look, ignorePeople);
             return;
@@ -2077,6 +2106,11 @@ final class ExploreBrain {
         lostLooks = 0;
         target = found;
         stare(target);
+        if (callsOwn() && CuriosityPort.Kind.of(target.label) == CuriosityPort.Kind.PERSON
+                && (polite(target) || Sighting.fillsFrame(target, tuning))) {
+            callArrive(now, look);
+            return;
+        }
         if (state == State.FACE) {
             face(now);
         } else if (Sighting.fillsFrame(target, tuning)) {
@@ -2149,7 +2183,7 @@ final class ExploreBrain {
             return;
         }
         moving = true;
-        motor.turn(heading);
+        turnWheels(heading);
         step = Step.TURNING;
         turnStartedAt = now;
         phaseUntil = now + turnMs;
@@ -2205,6 +2239,10 @@ final class ExploreBrain {
 
     /** Arrived (not a hazard, R6): inspect it. */
     private void arrive(long now) {
+        if (callsOwn() && target != null && CuriosityPort.Kind.of(target.label) == CuriosityPort.Kind.PERSON) {
+            callArrive(now, null);
+            return;
+        }
         stopMotors();
         hazardTimes.clear();
         if (pick != null) {
@@ -3838,7 +3876,7 @@ final class ExploreBrain {
                     heading = escDir;
                     turnDeg = escTurnAmount;
                     moving = true;
-                    motor.turn(escDir);
+                    turnWheels(escDir);
                     turnStartedAt = now;
                     phaseUntil = now + timedMs(escTurnAmount);
                     measureTurn(now, escTurnAmount);
@@ -5020,6 +5058,15 @@ final class ExploreBrain {
             offerCall(now, c);
             return;
         }
+        if (state == State.CUE_WHERE && callsOwn()) {
+            whereReply(now, c);
+            return;
+        }
+        if (callsOwn() && (state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK)) {
+            // The call's own approach (KTD8): only another call can turn him from it.
+            dropCue("cue " + c.tier + " " + c.side + " during the call's approach: ignored");
+            return;
+        }
         if (state.cueSearch()) {
             offerCueDuringSearch(now, c);
             return;
@@ -5085,6 +5132,8 @@ final class ExploreBrain {
             callTaken = false;
             callAnswered = false;
             callWaitCounted = false;
+            callReplied = false;
+            gauges.stamp(Gauges.Stage.CALL_HEARD, c.at);
             note("a call from " + c.side + " in " + state);
             if (state.chats() && chat != null && c.hasAngle()) {
                 // Outside the partner's angle: the newcomer's glance and "one sec" (R15).
@@ -5093,13 +5142,36 @@ final class ExploreBrain {
             return;
         }
         Ears.Cue merged = mergeCalls(call, c);
-        if (callTaken && state.cueSearch()) {
-            // The call's own search: a voice from the other side retargets once, as any strong cue does.
-            call = merged;
-            offerCueDuringSearch(now, c);
+        call = merged;
+        if (callTaken && state == State.CUE_WHERE) {
+            // KTD9: a new call after "Where'd you go?" looks again, every time, with no second answer.
+            note("a new call after nobody was found: looking again");
+            startCallSearch(now, merged, false);
             return;
         }
-        call = merged;
+        if (callTaken && state.cueSearch()) {
+            // KTD6: a new call with an angle retargets the search; one without is merged into it.
+            if (c.hasAngle()) {
+                note("a new call with an angle during its search: retargeting");
+                stopMotors();
+                startCallSearch(now, merged, true);
+            } else {
+                note("a new call with no angle during its search: merged into it");
+            }
+            return;
+        }
+        if (callTaken && (state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK)) {
+            // KTD8: merged into the call's own approach unless its angle is away from that person.
+            if (c.hasAngle() && !sameSideAsPerson(c)) {
+                note("a new call from away from the person during the call's approach: retargeting");
+                stopMotors();
+                clearStop();
+                startCallSearch(now, merged, true);
+            } else {
+                note("a new call from the person's side during the call's approach: merged into it");
+            }
+            return;
+        }
         note("a second call merged into the first, now from " + merged.side);
     }
 
@@ -5107,7 +5179,8 @@ final class ExploreBrain {
     private static Ears.Cue mergeCalls(Ears.Cue older, Ears.Cue newer) {
         boolean newerPlaces = newer.hasAngle() || (!older.hasAngle() && newer.side != Ears.Side.UNKNOWN);
         Ears.Cue where = newerPlaces ? newer : older;
-        return new Ears.Cue(newer.kind, Ears.Tier.STRONG, where.side, where.angleDeg, newer.at);
+        // The angle keeps the time it was sampled at: KTD7 corrects it for his turning since then.
+        return new Ears.Cue(newer.kind, Ears.Tier.STRONG, where.side, where.angleDeg, where.at);
     }
 
     /**
@@ -5169,7 +5242,7 @@ final class ExploreBrain {
             return CallVerdict.IN_PLACE;
         }
         if ((state == State.FACE || state == State.APPROACH || state == State.MEET_LOOK)
-                && (!c.hasAngle() || sameSideAsPerson(c))) {
+                && headingForAPerson() && (!c.hasAngle() || sameSideAsPerson(c))) {
             return CallVerdict.CARRY_ON;
         }
         return CallVerdict.SEARCH;
@@ -5207,6 +5280,7 @@ final class ExploreBrain {
                 break;
             case CARRY_ON:
                 note("a call from the person's side: answering and carrying on toward them");
+                carryOnAfterAnswer(now);
                 break;
             default:
                 startCallSearch(now, c);
@@ -5217,18 +5291,224 @@ final class ExploreBrain {
     /** The answer (KTD3): the prepared clip from the answer group, inside a clip window. */
     private void answerCall(long now) {
         callAnswered = true;
+        gauges.stamp(Gauges.Stage.CALL_ANSWERED, now);
         note("answering the call");
         port.clipWindow(tuning.answerClipMs);
         sound.playReaction("answer");
         ackUntil = now + tuning.answerClipMs + tuning.deafTailMs;
     }
 
-    /**
-     * Finding the caller: the hand-off point U6 replaces with its own look plans. Until
-     * then the call enters the existing turn to the voice with its angle or side.
-     */
     private void startCallSearch(long now, Ears.Cue c) {
-        enterCueSearch(now, c, false);
+        startCallSearch(now, c, false);
+    }
+
+    /**
+     * R4 wins over KTD2 step 6's wording: a call from the person he was going to stops
+     * the wheels for the answer, then the same approach goes on from a look taken after
+     * the clip (re-facing them if the stop left them off-centre).
+     */
+    private void carryOnAfterAnswer(long now) {
+        if (state != State.FACE && state != State.APPROACH) {
+            return;
+        }
+        stopMotors();
+        waitForLook(now);
+        lookAfter = Math.max(lookAfter, now + tuning.answerClipMs);
+        lookDeadline = Math.max(lookDeadline, lookAfter + tuning.lookTimeoutMs);
+    }
+
+    // ---- finding and reaching the caller (hey-miko plan U6; R5-R7, R9, R10; KTD6-KTD9) ----
+    //
+    // The call's search runs in CUE_TURN and CUE_LOOK with its own plan. With an angle:
+    // the bearing, corrected for his own turning since the voice was sampled (KTD7), then
+    // its two 45 deg neighbours. With none: eight 45 deg looks over one circle from
+    // straight ahead. Each look settles, then has callLookMs; any person box at least
+    // callPersonMinHeight tall is the caller (no facing-face gate), the one nearest the
+    // bearing when there is one. A far one (under callNearHeight) is faced and approached
+    // to politeHeight through FACE and APPROACH, a near one is met where it stands; either
+    // way the meeting opens with no leave-alone check. Nobody: "Where'd you go?" and a
+    // listen (CUE_WHERE); a new call looks again every time, a reply once, silence roams.
+
+    /** Whether this search or stop is the taken call's own. */
+    private boolean callsOwn() {
+        return callTaken && call != null;
+    }
+
+    /** The call's search from here (KTD6): the plan, then the first turn or look. A retarget counts as one. */
+    private void startCallSearch(long now, Ears.Cue c, boolean retarget) {
+        state = State.CUE_TURN;
+        searchCue = c;
+        searchRetargeted = retarget;
+        if (retarget) {
+            gauges.count(Gauges.Counter.RETARGETS);
+        } else {
+            gauges.count(Gauges.Counter.SEARCHES);
+            gauges.stamp(Gauges.Stage.CUE_AT, c.at);
+        }
+        double since = c.hasAngle() ? headingHistory.turnedSince(c.at) : Double.NaN;
+        double[] plan;
+        if (!Double.isNaN(since)) {
+            // KTD7: the angle is right positive and a turn left since the sample moves the voice right.
+            double bearing = Heading.delta(0, c.angleDeg + since);
+            plan = new double[]{bearing, bearing - CALL_STEP_DEG, bearing + CALL_STEP_DEG};
+            callBearing = bearing;
+        } else {
+            // R9: no angle (or one older than the heading history): one circle of looks from ahead,
+            // stepping toward the side the mics gave when they gave one.
+            double dir = c.side == Ears.Side.LEFT ? -1 : 1;
+            plan = new double[CALL_CIRCLE_LOOKS];
+            for (int i = 0; i < plan.length; i++) {
+                plan[i] = dir * CALL_STEP_DEG * i;
+            }
+            callBearing = Double.NaN;
+        }
+        searchPlan = plan;
+        searchLook = 0;
+        searchRel = 0;
+        searchTurnDoneStamped = false;
+        searchFirstTurn = true;
+        searchRemainingDeg = Math.abs(plan[0]);
+        searchTurnLeft = plan[0] < 0;
+        latestTrend = null;
+        trendSeenInStep = false;
+        show(EyeState.GLANCE, sideOf(c));
+        note("looking for the caller" + (Double.isNaN(callBearing) ? " with no angle" : " to the "
+                + (callBearing < 0 ? "left" : "right")) + ": " + plan.length + " looks");
+        if (searchRemainingDeg < 1) {
+            enterCueLook(now);
+            return;
+        }
+        // The camera may still be in its reopen gap: the turn starts now, the look waits for it.
+        startCueTurnStep(now, tuning.lookLeadMs);
+    }
+
+    /** A look during the call's search: a person box ends it (callFound); anything else waits for the next look. */
+    private void callLook(long now, Look look) {
+        Detection p = callPerson(look.detections);
+        if (p == null || look.jpeg == null) {
+            lookAfter = look.frameMs + 1;
+            return;
+        }
+        callFound(now, look, p);
+    }
+
+    /** KTD6's "found": a person box tall enough, with no aspect-ratio gate; nearest the bearing, else the tallest. */
+    private Detection callPerson(List<Detection> found) {
+        Detection best = null;
+        double bestOff = Double.MAX_VALUE;
+        for (Detection d : found) {
+            if (d.score < tuning.confidenceFloor || CuriosityPort.Kind.of(d.label) != CuriosityPort.Kind.PERSON
+                    || d.height() <= 0 || d.height() < tuning.callPersonMinHeight) {
+                continue;
+            }
+            double off = Double.isNaN(callBearing) ? -d.height()
+                    : Math.abs(Heading.delta(callBearing, searchRel + d.centerX() * tuning.cameraHalfFovDeg));
+            if (best == null || off < bestOff) {
+                best = d;
+                bestOff = off;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * The caller in front of him (KTD8): far, the call's FACE and APPROACH to politeHeight;
+     * near, the meeting here. The answer already played, so no acknowledgement.
+     */
+    private void callFound(long now, Look look, Detection p) {
+        gauges.stamp(Gauges.Stage.FACE_FOUND, now);
+        gauges.stamp(Gauges.Stage.CALL_FACING, now);
+        gauges.count(Gauges.Counter.FACES_FOUND);
+        Ears.Cue c = searchCue;
+        chatCueSide = c == null ? null : sideOf(c);
+        searchCue = null;
+        searchPlan = null;
+        beginPersonStop(now, look, p);
+        target = p;
+        remember(p.label, CuriosityPort.Kind.PERSON, now);
+        if (p.height() < tuning.callNearHeight) {
+            note("the caller is far: going over to them");
+            state = State.FACE;
+            faceTurns = 0;
+            lostLooks = 0;
+            firstLook = false;
+            face(now);
+            return;
+        }
+        note("the caller is near: meeting them here");
+        if (!port.canAsk()) {
+            nameClip(now);
+            return;
+        }
+        enterMeet(now, look.jpeg, p);
+    }
+
+    /** The call's look budget passed: the next look of its plan, or "Where'd you go?" once the plan is done. */
+    private void callLookOver(long now, boolean noLookAtAll) {
+        if (noLookAtAll) {
+            // No camera to find them with: the call is met where he is (KTD2), with no second answer.
+            note("camera gave no look in time during the call's search; curiosity off for "
+                    + tuning.cameraBackoffMs + " ms");
+            curiosityOffUntil = now + tuning.cameraBackoffMs;
+            callTaken = false;
+            takeCall(now, CallVerdict.IN_PLACE);
+            return;
+        }
+        if (searchLook + 1 >= searchPlan.length) {
+            enterWhere(now);
+            return;
+        }
+        nextSearchLook(now);
+    }
+
+    /** KTD9: nobody found. "Where'd you go?" in a clip window, then a listen of callListenMs after it. */
+    private void enterWhere(long now) {
+        stopMotors();
+        state = State.CUE_WHERE;
+        searchPlan = null;
+        searchCue = null;
+        show(EyeState.LISTENING, null);
+        note("nobody found for the call: asking where they went");
+        port.clipWindow(tuning.whereClipMs);
+        sound.playReaction("where");
+        ackUntil = now + tuning.whereClipMs + tuning.deafTailMs;
+        whereUntil = now + tuning.whereClipMs + tuning.callListenMs;
+    }
+
+    /** CUE_WHERE's step: silence for the whole listen resumes roaming, and the call is over. */
+    private void whereStep(long now) {
+        if (now < whereUntil) {
+            return;
+        }
+        note("no answer after asking where they went: carrying on");
+        clearCall();
+        quietResume(now);
+    }
+
+    /** A voice that is not a call after "Where'd you go?" (KTD9): the first looks again, any later one is dropped. */
+    private void whereReply(long now, Ears.Cue c) {
+        if (callReplied) {
+            dropCue("a reply after where, already looked again for this call");
+            return;
+        }
+        callReplied = true;
+        note("a reply after asking where they went: looking again");
+        boolean places = c.hasAngle() || (!call.hasAngle() && c.side != Ears.Side.UNKNOWN);
+        Ears.Cue where = places ? c : call;
+        call = new Ears.Cue(call.kind, Ears.Tier.STRONG, where.side, where.angleDeg, where.at);
+        startCallSearch(now, call, false);
+    }
+
+    /** The call's approach arrived (KTD8): the meeting opens on this look, not the curiosity line. */
+    private void callArrive(long now, Look look) {
+        stopMotors();
+        hazardTimes.clear();
+        note("arrived: a polite distance from the caller");
+        if (look != null && look.jpeg != null) {
+            enterMeet(now, look.jpeg, target);
+        } else {
+            enterMeetLook(now);
+        }
     }
 
     /**
@@ -5255,6 +5535,8 @@ final class ExploreBrain {
         callTaken = false;
         callAnswered = false;
         callWaitCounted = false;
+        callReplied = false;
+        callBearing = Double.NaN;
     }
 
     /** During a search (KTD3): a strong cue from the other side retargets once; everything else is ignored. */
@@ -5263,8 +5545,14 @@ final class ExploreBrain {
         Direction searching = searchCue == null ? null : sideOf(searchCue);
         if (c.strong() && side != null && searching != null && side != searching && !searchRetargeted) {
             note("strong cue from the other side during the search: retargeting once");
-            gauges.count(Gauges.Counter.RETARGETS);
             stopMotors();
+            if (callsOwn()) {
+                // The call's own search stays the call's, looking where this voice came from.
+                call = new Ears.Cue(call.kind, Ears.Tier.STRONG, c.side, c.angleDeg, c.at);
+                startCallSearch(now, call, true);
+                return;
+            }
+            gauges.count(Gauges.Counter.RETARGETS);
             enterCueSearch(now, c, true);
             return;
         }
@@ -5320,6 +5608,13 @@ final class ExploreBrain {
      * of where their box puts them; with only a side, a box near the centre counts as
      * either side and a voice with no side as theirs.
      */
+    /** Whether the stop is heading for a person (KTD2 step 6: only a person can be the caller
+     * he carries on toward; a call made while he approaches a thing still searches, R1). */
+    private boolean headingForAPerson() {
+        Detection box = target != null ? target : meetExpect != null ? meetExpect : pick != null ? pick.box : null;
+        return box != null && CuriosityPort.Kind.of(box.label) == CuriosityPort.Kind.PERSON;
+    }
+
     private boolean sameSideAsPerson(Ears.Cue c) {
         Detection box = target != null ? target : meetExpect != null ? meetExpect : pick != null ? pick.box : null;
         if (box == null) {
@@ -5568,12 +5863,23 @@ final class ExploreBrain {
         step = Step.WAIT_LOOK;
         lookAfter = now + tuning.lookSettleMs;
         long ready = Math.max(now, cameraClosedAt + tuning.reopenGapMs);
+        if (callsOwn()) {
+            // KTD6: settle, then a short budget; a camera just (re)opened has no look yet and gets the first-look time.
+            long budget = camera.latest() == null ? tuning.firstLookTimeoutMs : tuning.callLookMs;
+            lookDeadline = Math.max(lookAfter, ready) + budget;
+            note("looking for the caller (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
+            return;
+        }
         lookDeadline = ready + tuning.leanInMs;
         note("looking for a face turned toward him (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
     }
 
     /** A look during CUE_LOOK: a facing face ends the search in the meeting; anything else waits for the next look. */
     private void cueLook(long now, Look look) {
+        if (callsOwn()) {
+            callLook(now, look);
+            return;
+        }
         Detection face = facingFace(look.detections);
         if (face == null || look.jpeg == null) {
             lookAfter = look.frameMs + 1;
@@ -5625,17 +5931,26 @@ final class ExploreBrain {
 
     /** The look's budget passed with no facing face: the next look of the plan, or a quiet resume. */
     private void cueLookOver(long now, boolean noLookAtAll) {
+        if (callsOwn()) {
+            callLookOver(now, noLookAtAll);
+            return;
+        }
         if (noLookAtAll) {
             note("camera gave no look in time; curiosity off for " + tuning.cameraBackoffMs + " ms");
             curiosityOffUntil = now + tuning.cameraBackoffMs;
             quietResume(now);
             return;
         }
-        searchLook++;
-        if (searchLook >= searchPlan.length) {
+        if (searchLook + 1 >= searchPlan.length) {
             quietResume(now);
             return;
         }
+        nextSearchLook(now);
+    }
+
+    /** Turns to the plan's next look (or looks at once when it is where he already faces). */
+    private void nextSearchLook(long now) {
+        searchLook++;
         double delta = Heading.wrap(searchPlan[searchLook] - searchRel + 180) - 180;
         if (Math.abs(delta) < 1) {
             enterCueLook(now);
@@ -5715,6 +6030,7 @@ final class ExploreBrain {
         note("the meeting becomes a conversation" + (faceless ? " with nobody in view" : "") + " (" + a.status + ")");
         if (callTaken) {
             // KTD1: the call is kept until the conversation opens.
+            gauges.stamp(Gauges.Stage.CALL_ARRIVED, now);
             clearCall();
         }
         chat = new ChatSession(tuning, port, chatHost);
@@ -5976,7 +6292,7 @@ final class ExploreBrain {
         turnStartedAt = now;
         phaseUntil = now + turnMs;
         moving = true;
-        motor.turn(heading);
+        turnWheels(heading);
         measureTurn(now, turnDeg);
     }
 
@@ -6095,7 +6411,14 @@ final class ExploreBrain {
         }
     }
 
+    /** Starts the wheels turning d, noting the sign for KTD7's heading history. */
+    private void turnWheels(Direction d) {
+        turnSign = d == Direction.LEFT ? Heading.LEFT : Heading.RIGHT;
+        motor.turn(d);
+    }
+
     private void stopMotors() {
+        turnSign = 0;
         if (moving) {
             if (measured && heading != null && compass.turnReached()) {
                 // A turn that got there: that way turns again.

@@ -227,6 +227,26 @@ final class ExploreTuning {
      */
     final long answerClipMs;
     /**
+     * Finding the caller (hey-miko plan U6; KTD6-KTD9). Each look of the call's search
+     * waits lookSettleMs, then has callLookMs to see a person (the first look after the
+     * camera opens has firstLookTimeoutMs, since a camera just opened has no look yet).
+     * Found is a person box at least callPersonMinHeight of the frame tall, with no
+     * aspect-ratio gate; one shorter than callNearHeight (about 1.5 m) is approached to
+     * politeHeight, a taller one is met where it stands. After a search that finds
+     * nobody the "where" clip plays (about whereClipMs) and he listens for callListenMs.
+     * The call's angle is corrected for his own turning since it was heard from a
+     * heading history of headingHistoryMs, sampled every headingSampleMs.
+     * PLACEHOLDERS until the owner's QA (U7): callLookMs, callPersonMinHeight,
+     * callNearHeight and callListenMs.
+     */
+    final long callLookMs;
+    final float callPersonMinHeight;
+    final float callNearHeight;
+    final long callListenMs;
+    final long whereClipMs;
+    final long headingHistoryMs;
+    final long headingSampleMs;
+    /**
      * The conversation (meeting plan Assumptions, KTD7, KTD9; U8 uses them). An
      * unanswered listen is unansweredListenMs with no utterance, kept by the
      * brain; two of them end the conversation. A sensor stall that persists
@@ -618,6 +638,13 @@ final class ExploreTuning {
         bumpApologyMs = Math.max(0, b.bumpApologyMs);
         ackClipMs = Math.max(0, b.ackClipMs);
         answerClipMs = Math.max(0, b.answerClipMs);
+        callLookMs = Math.max(1, b.callLookMs);
+        callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
+        callNearHeight = Math.max(0f, b.callNearHeight);
+        callListenMs = Math.max(1, b.callListenMs);
+        whereClipMs = Math.max(0, b.whereClipMs);
+        headingHistoryMs = Math.max(0, b.headingHistoryMs);
+        headingSampleMs = Math.max(10, b.headingSampleMs);
         unansweredListenMs = Math.max(1, b.unansweredListenMs);
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
@@ -889,6 +916,18 @@ final class ExploreTuning {
         private long ackClipMs = 600;
         // Hey-miko plan KTD3: the answer clips run about half a second.
         private long answerClipMs = 600;
+        // Hey-miko plan U6, KTD6 and KTD9: PLACEHOLDERS until U7's QA on the robot. A 700 ms
+        // look after the settle; a person box an eighth of the frame tall is someone; under
+        // 0.35 of it (the facing box at about 1.5 m is 0.4) is far enough to go over to; a 4 s listen
+        // after "Where'd you go?" (react-where-1.webm is 0.8 s). KTD7's heading history
+        // keeps 30 s (a call handed back by an escape is retaken with it), a sample a reading.
+        private long callLookMs = 700;
+        private float callPersonMinHeight = 0.12f;
+        private float callNearHeight = 0.35f;
+        private long callListenMs = 4000;
+        private long whereClipMs = 900;
+        private long headingHistoryMs = 30000;
+        private long headingSampleMs = 100;
         // Meeting plan Assumptions: an unanswered listen is 4 s; the chat sensor-stall grace 5 s;
         // a turn has 5 s plus a 3 s retry; two sentences; a window of 30 exchanges; a 500 ms deaf tail.
         private long unansweredListenMs = 4000;
@@ -1336,6 +1375,22 @@ final class ExploreTuning {
         }
         Builder answerClipMs(long ms) {
             this.answerClipMs = ms;
+            return this;
+        }
+        Builder call(long lookMs, float personMinHeight, float nearHeight, long listenMs) {
+            this.callLookMs = lookMs;
+            this.callPersonMinHeight = personMinHeight;
+            this.callNearHeight = nearHeight;
+            this.callListenMs = listenMs;
+            return this;
+        }
+        Builder whereClipMs(long ms) {
+            this.whereClipMs = ms;
+            return this;
+        }
+        Builder headingHistory(long historyMs, long sampleMs) {
+            this.headingHistoryMs = historyMs;
+            this.headingSampleMs = sampleMs;
             return this;
         }
         Builder chat(long unansweredListenMs, long stallGraceMs, long turnBudgetMs, long turnRetryMs, int sentenceCap,

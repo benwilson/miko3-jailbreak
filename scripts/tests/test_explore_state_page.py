@@ -88,7 +88,8 @@ class ExploreStatePageTest(unittest.TestCase):
         gauges = self.holder["gauges"]
         counters = ["cues", "strongCues", "weakCues", "leanIns", "searches", "facesFound", "quietResumes",
                     "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats"]
-        stages = ["cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested", "firstSound"]
+        stages = ["cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested", "firstSound",
+                  "callHeard", "callAnswered", "callFacing", "callArrived"]
         self.assertEqual(sorted(k for k in gauges if k != "stages"), sorted(counters))
         self.assertEqual(sorted(gauges["stages"]), sorted(stages))
         self.assertEqual(gauges["cues"], 2)
@@ -97,6 +98,9 @@ class ExploreStatePageTest(unittest.TestCase):
         self.assertEqual(gauges["stages"]["cueAt"], 1234)
         self.assertEqual(gauges["stages"]["firstSound"], 5678)
         self.assertEqual(gauges["stages"]["turnDone"], 0)
+        # Hey-miko plan U6: the call's stamps for U7's QA script, 0 until a call reaches them.
+        self.assertEqual(gauges["stages"]["callHeard"], 2468)
+        self.assertEqual(gauges["stages"]["callArrived"], 0)
 
     def test_gaze_wrap_holds_the_look_direction(self):
         # R7: while looking, every glance goes to the published direction.

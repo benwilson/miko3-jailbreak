@@ -24,6 +24,7 @@ public final class ExploreStateDump {
         holder.count("not-a-counter");
         holder.stamp("cueAt", 1234);
         holder.stamp("firstSound", 5678);
+        holder.stamp("callHeard", 2468);
         holder.stamp("not-a-stage", 1);
         System.out.println("HOLDER " + holder.json());
     }

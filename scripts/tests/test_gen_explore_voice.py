@@ -196,6 +196,7 @@ class LineClipsTest(unittest.TestCase):
         session = (REPO / "mode-explore" / "src" / "com" / "miko3" / "mode" / "explore" / "ChatSession.java").read_text()
         self.assertIn('playReaction("acknowledge")', brain)
         self.assertIn('playReaction("answer")', brain)
+        self.assertIn('playReaction("where")', brain)
         for group in self.SESSION_GROUPS:
             self.assertIn(f'"{group}"', session, group)
 
