@@ -5268,7 +5268,10 @@ final class ExploreBrain {
             // KTD1: no conversation can open, so the answer is the whole response.
             note("no Claude to talk with: the answer is the whole response");
             clearCall();
-            if (v != CallVerdict.CARRY_ON && state != State.EYES_ONLY) {
+            if (v == CallVerdict.CARRY_ON) {
+                // R4: he still stops for the answer, then carries on the same approach.
+                carryOnAfterAnswer(now);
+            } else if (state != State.EYES_ONLY) {
                 enterPause(now, pauseMs(), false);
             }
             return;

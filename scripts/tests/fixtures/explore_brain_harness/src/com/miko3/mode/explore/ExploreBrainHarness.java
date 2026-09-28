@@ -8953,6 +8953,21 @@ public final class ExploreBrainHarness {
                             && notesWith(notes, "the answer is the whole response") == 1 && rig.violations.isEmpty(),
                     "answer@" + answerAt(rig, cueT) + " " + gauges(rig) + " " + rig.tail());
         });
+        scenario("call_in_approach_with_claude_unavailable_still_stops_for_the_answer", n -> {
+            // R4/KTD3: he stops for the answer even when no conversation can open (review #3).
+            Rig rig = cueRig(cueTuning(), CLEAR, personWhen(t -> true)).started();
+            long approach = runUntilState(rig, ExploreBrain.State.APPROACH, 0, 20000);
+            long leg = runUntilEvent(rig, "hop", approach, approach + 5000);
+            long cueT = leg + 100;
+            rig.askRefused = true;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            rig.runUntil(cueT + rig.tuning.answerClipMs);
+            check(n, approach > 0 && leg > 0 && answerAt(rig, cueT) == cueT
+                            && rig.timeOf(rig.firstAfter("stop", cueT)) == cueT
+                            && rig.countPrefix("hop", cueT + 1, cueT + rig.tuning.answerClipMs) == 0
+                            && rig.violations.isEmpty(),
+                    "approach@" + approach + " leg@" + leg + " " + gauges(rig) + " " + rig.tail());
+        });
         scenario("call_lease_lost_during_its_search_is_retaken_in_eyes_only_without_a_second_answer", n -> {
             Rig rig = cueRig(EMPTY_ROOM);
             List<String> notes = traced(rig);
