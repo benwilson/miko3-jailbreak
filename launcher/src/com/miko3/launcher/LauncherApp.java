@@ -26,7 +26,6 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
@@ -113,8 +112,9 @@ public class LauncherApp extends Application {
                     }
                     throw e;
                 }
-                Log.i(TAG, "ears probe: " + seconds + " s, " + rows.size() + " rows, direction "
-                        + VoiceDirection.open().backend() + " (" + VoiceDirection.open().detail() + ")");
+                VoiceDirection dir = VoiceDirection.open();
+                Log.i(TAG, "ears probe: " + seconds + " s, " + rows.size() + " rows, direction backend "
+                        + dir.backend() + " (" + dir.detail() + ") raw reply " + dir.firstReplyHex());
                 return rows;
             } finally {
                 probeDirection.stop();
@@ -131,7 +131,12 @@ public class LauncherApp extends Application {
 
         @Override
         public String backend() {
-            return VoiceDirection.open().backend().name().toLowerCase(Locale.ROOT);
+            return VoiceDirection.open().backend().name();
+        }
+
+        @Override
+        public String rawReply() {
+            return VoiceDirection.open().firstReplyHex();
         }
 
         synchronized void start() {

@@ -145,6 +145,7 @@ final class ListenEngine implements ListenSession.Ears {
                 return SpeechEngine.systemProperty(key);
             }
         });
+        configureDirection();
         // KTD11: the Settings page's "answers when spoken to" switch, read through
         // the launcher's settings (its one parser of the stored value) at classify time.
         CueClassifier.Switch earsSwitch = new CueClassifier.Switch() {
@@ -676,6 +677,22 @@ final class ListenEngine implements ListenSession.Ears {
             }
         }
     };
+
+    /** Explore plan U2 (KTD10, KTD12): the confirmed NC port and its calibration,
+     * read from their properties the way SpeechTuning reads its own, handed to
+     * VoiceDirection before its first open(). Unset, the chip is never tried. */
+    static void configureDirection() {
+        VoiceDirection.configure(VoiceDirection.Config.of(
+                SpeechEngine.systemProperty(VoiceDirection.PORT_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.ZERO_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.SIGN_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.SCALE_PROPERTY)), new VoiceDirection.Logger() {
+                    @Override
+                    public void log(String msg) {
+                        Log.i(TAG, msg);
+                    }
+                });
+    }
 
     /** KTD4: sampled on VoiceDirection's own thread, never the capture thread. */
     private final EarsSession.Direction earsDirection = new EarsSession.Direction() {

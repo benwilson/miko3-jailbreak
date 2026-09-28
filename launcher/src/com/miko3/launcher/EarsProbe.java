@@ -27,7 +27,9 @@ import java.util.Set;
  *   rms         the capture level in 16-bit terms,
  *   decode_ms   time spent in the recogniser that second (and its worst chunk),
  *   words       how many words the transcript holds so far, and
- *   matched     whether every word of the phrase the script sent is in it.
+ *   matched     whether every word of the phrase the script sent is in it,
+ * after the direction "backend" (NONE, CONEXANT or NC) and "raw_reply", the NC
+ * chip's first raw reply in lowercase hex ("58585542..."), or null.
  *
  * Gate: it answers only while the debug system property PROPERTY holds the
  * per-run nonce scripts/qa-ears-probe.py generated, and only for WINDOW_MS
@@ -67,7 +69,13 @@ final class EarsProbe {
 
     /** The direction backend: which one answered, and its samples since the last drain. */
     interface Direction {
+        /** The backend's name: NONE, CONEXANT or NC (VoiceDirection.Backend). */
         String backend();
+
+        /** The chip's first raw reply in hex, or null (explore plan U2: U1 places the reply CRC from it). */
+        default String rawReply() {
+            return null;
+        }
 
         /** Angle readings since the last call, oldest first; null for a failed read. */
         List<Float> drain();
@@ -280,16 +288,17 @@ final class EarsProbe {
                     "probe failed: " + e.getClass().getSimpleName() + "\n");
             return;
         }
-        res.sendText(200, "OK", "application/json; charset=utf-8", json(direction.backend(), seconds, rows));
+        res.sendText(200, "OK", "application/json; charset=utf-8", json(direction.backend(), direction.rawReply(), seconds, rows));
     }
 
     private static void notFound(HttpResponse res) throws IOException {
         res.sendText(404, "Not Found", "text/plain; charset=utf-8", "not found\n");
     }
 
-    static String json(String backend, int seconds, List<Row> rows) {
+    static String json(String backend, String rawReply, int seconds, List<Row> rows) {
         Map<String, Object> m = new LinkedHashMap<String, Object>();
         m.put("backend", backend);
+        m.put("raw_reply", rawReply);
         m.put("seconds", seconds);
         List<Object> out = new ArrayList<Object>();
         for (Row r : rows) {

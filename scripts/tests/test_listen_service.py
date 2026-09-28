@@ -689,20 +689,36 @@ class BuildScriptTest(unittest.TestCase):
         self.assertTrue(raw, "VoiceDirection.java missing")
         self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
         src = _strip_comments(raw)
-        for needle in ("enum Backend", "NONE", "CONEXANT", "NC", "getDSPRawDOA(", "getCurrentDOAStatus(",
+        for needle in ("enum Backend", "NONE", "CONEXANT", "NC", "getDSPRawDOA(", "NcFrames.doaQuery(",
                        "initDSPComm(", "createUART(", "initNCUART("):
             self.assertIn(needle, src)
         # KTD4: the angle is sampled on its own thread at a caller-set cadence.
         self.assertRegex(src, r"sample\(\s*(final\s+)?long\s+\w+")
 
-    def test_voice_direction_tries_nc_only_when_its_uart_exists(self):
+    def test_voice_direction_tries_nc_only_on_the_confirmed_port_property_and_node(self):
         # Seen live 2026-09-28: with no /dev/ttyMT2, createUART still answers a handle and
         # initNCUART answers 1, so the next native call (getCurrentDOAStatus) segfaulted the
-        # whole launcher on the first speech the ears heard. The node must exist first.
+        # whole launcher on the first speech the ears heard. Explore plan U2 (KTD10): the
+        # port now comes only from the owner-confirmed property, its node must exist before
+        # any NC native call, only 0 from initNCUART is success, and the vendor's blocking
+        # native reads are never made. The behaviour runs in scripts/tests/test_nc_frames.py.
         src = _strip_comments(DIRECTION.read_text())
-        nc = src[src.index("new NCDsp()") - 400:src.index("createUART(")]
-        self.assertRegex(nc, r"new\s+File\(\s*NC_UART\s*\)\s*\.exists\(\)")
-        self.assertIn("import java.io.File;", DIRECTION.read_text())
+        self.assertNotIn("/dev/ttyMT2", src)
+        self.assertIn('"persist.miko3.voice_dir.port"', src)
+        body = _method_body(src, "private static VoiceDirection openNc") or ""
+        port, node, native = body.find("isEmpty()"), body.find(".exists(node)"), body.find("createUART(")
+        self.assertGreaterEqual(port, 0, "the NC path never checks the port property")
+        self.assertGreater(node, port, "the NC path does not check the node after the property")
+        self.assertGreater(native, node, "an NC native call comes before the node check")
+        self.assertRegex(body, r"status\s*!=\s*0")
+        for vendor_read in ("getCurrentDOAStatus(", "toggleDOA(", "getFWVersion("):
+            self.assertNotIn(vendor_read, src)
+        self.assertIn("new File(path).exists()", src)
+        # The launcher reads the properties and hands them over before the first open().
+        engine = _read(ENGINE)
+        for prop in ("PORT_PROPERTY", "ZERO_PROPERTY", "SIGN_PROPERTY", "SCALE_PROPERTY"):
+            self.assertIn(f"SpeechEngine.systemProperty(VoiceDirection.{prop})", engine)
+        self.assertIn("VoiceDirection.configure(", engine)
 
     def test_built_apk_bundles_the_listen_model_when_present(self):
         apk = REPO / "launcher" / "miko3-launcher.apk"
