@@ -27,7 +27,11 @@ Tick items off here as they pass, and move anything that fails into `docs/TODO.m
 ## 1. Preflight
 
 - [ ] Connect: `adb connect 192.168.19.74:5555`, then `adb devices`.
-- [ ] Camera: a cold power-up can wedge the camera HAL. Run `python3 scripts/recover-camera.py --check-only`, and without `--check-only` if it reports a wedge. Never `kill -9` a camera service.
+- [ ] Camera: a cold power-up can wedge the camera HAL. The check reads the remote-control mode's video stream, so it reports `BROKEN` whenever that mode isn't running. Start it first, check, then leave it with Back:
+  - `adb shell am start -n com.miko3.mode.remotecontrol/.MainActivity`, then `python3 scripts/recover-camera.py --check-only`.
+  - `OK` means healthy. Press Back (`adb shell input keyevent KEYCODE_BACK`), and never force-stop the mode while its camera is open, which can itself wedge the HAL. `adb shell dumpsys media.camera` should then show `Device 0 is closed`.
+  - Still `BROKEN` with the mode running: restart the camera services with `adb shell setprop ctl.restart cameraserver` and `adb shell setprop ctl.restart camerahalserver`, then check again. If that fails, reboot the robot.
+  - Never run `recover-camera.py` without `--check-only`. Its recovery step restarts the camera services with `kill -9`, which can stop them restarting for good (`docs/solutions/runtime-errors/kill-9-on-watched-service-permanently-disables-restart.md`).
 - [ ] Clear leftover debug switches: `adb shell getprop | grep log.tag.MikoExplore`. Anything left on from an interrupted script changes Explore's behaviour. Set each to `INFO`.
 - [ ] Motors: if turns or reverse buzz without moving, the motor board has latched after stalled pushing. Only a full power cycle clears it.
 
@@ -36,10 +40,12 @@ Tick items off here as they pass, and move anything that fails into `docs/TODO.m
 This has to happen before the new build goes on, because the face PR's latency success criterion compares the Claude matcher against the on-device one. The robot currently runs Friday's build, which predates the stage stamps the measurement reads. So install the last pre-face `main` (commit `3e4151c`) first.
 
 - [ ] Make a worktree at that commit and link the gitignored vendor trees into it, as `docs/solutions/tooling-decisions/agent-worktrees-branch-from-main-pin-baseline-and-link-vendor-trees.md` describes:
-  `git worktree add ../miko3-baseline 3e4151c`, then symlink `tools/third_party` and `tools/serviceexam_jadx` into it.
-- [ ] From the worktree, install both APKs from one build with one quick check: `python3 scripts/qa-conversation.py --only charger`.
+  `git worktree add --detach ../miko3-baseline 3e4151c`, then symlink `tools/third_party` and `tools/serviceexam_jadx` into it, and build both APKs there with `python3 scripts/build-custom-launcher.py` and `python3 scripts/build-mode-explore.py`.
+- [ ] From the worktree, install both with that commit's own install routine. That is `install_both` in its `scripts/qa-conversation.py`: `install -r`, grant, start, then compare build ids. Running any `--only` check would install too, but then waits on an interactive prompt. Call the routine directly:
+  `python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("qa","scripts/qa-conversation.py"); qa=importlib.util.module_from_spec(s); sys.modules["qa"]=qa; s.loader.exec_module(qa); print(qa.install_both(qa.Robot("192.168.19.74:5555")))'`
+  It prints the one build id both APKs report.
 - [ ] Back in this checkout: `python3 scripts/qa-conversation.py --latency before`. That is five meetings, each started with "Hey Miko". It writes `tools/face-bench/latency-before.json` and installs nothing.
-- [ ] Remove the worktree: `git worktree remove ../miko3-baseline`.
+- [ ] Remove the worktree: delete its two symlinks first (`rm tools/third_party tools/serviceexam_jadx` inside it, which removes only the links), then `git worktree remove ../miko3-baseline`. Built APKs inside it are gitignored and go with it.
 
 ## 3. Install current `main` and measure the after latency
 
