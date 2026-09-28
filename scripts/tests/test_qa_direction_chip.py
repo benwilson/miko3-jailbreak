@@ -374,7 +374,7 @@ class ProbeExpectationTest(unittest.TestCase):
 
     def test_the_real_probe_route_output_reaches_the_expectation(self):
         """Through qa-ears-probe's run and parse_answer, as the script does on the robot."""
-        dump = json.dumps({"backend": "NC", "nc_reply": "58585542030103000000a620d0e70100", "seconds": 3,
+        dump = json.dumps({"backend": "NC", "raw_reply": "58585542030103000000a620d0e70100", "seconds": 3,
                            "rows": nc_answer().rows})
         page = b'<form><input type="hidden" name="t" value="feedfacefeedfacefeedfacefeedface"></form>'
 

@@ -243,7 +243,7 @@ class RunTest(unittest.TestCase):
 
 NC_DUMP = json.dumps({
     "backend": "NC",
-    "nc_reply": "58585542030103000000a620d0e70100",
+    "raw_reply": "58585542030103000000a620d0e70100",
     "seconds": 2,
     "rows": [
         {"second": 1, "angle": None, "raw": 138, "rms": 900, "decode_ms": 200, "decode_max_ms": 20, "chunks": 13,
@@ -279,11 +279,11 @@ class RawChipValueTest(unittest.TestCase):
 
     def test_the_nc_reply_must_be_a_string_or_list_of_strings(self):
         bad = json.loads(NC_DUMP)
-        bad["nc_reply"] = 42
+        bad["raw_reply"] = 42
         with self.assertRaises(ValueError):
             qa.parse_answer(json.dumps(bad))
         ok = json.loads(NC_DUMP)
-        ok["nc_reply"] = ["58585542aa", "58585542bb"]
+        ok["raw_reply"] = ["58585542aa", "58585542bb"]
         self.assertEqual(qa.parse_answer(json.dumps(ok)).nc_reply, ["58585542aa", "58585542bb"])
 
     def test_table_prints_the_raw_value_next_to_the_angle(self):

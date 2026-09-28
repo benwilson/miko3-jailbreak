@@ -19,7 +19,7 @@ the run goes:
 
 With the NC direction chip (hey-miko plan U1, U2) each row also carries the
 chip's raw 0..255 reading ("raw", or null), and the answer carries the chip's
-raw reply bytes as hex ("nc_reply"). The table and the CSVs print the raw value
+raw reply bytes as hex ("raw_reply"). The table and the CSVs print the raw value
 next to the angle, which is what the owner calibrates zero, sign and scale from
 (KTD12; scripts/qa-direction-chip.py --calibrate). An older launcher omits both
 and the output keeps its old shape.
@@ -82,7 +82,7 @@ ROW_FIELDS = ("second", "angle", "rms", "decode_ms", "decode_max_ms", "chunks", 
 # Optional, from a launcher with the NC chip backend (U2): the chip's raw 0..255
 # direction reading that second (null when none), and the top-level raw reply hex.
 RAW_FIELD = "raw"
-NC_REPLY_FIELD = "nc_reply"
+NC_REPLY_FIELD = "raw_reply"
 
 # --- the measurement session (U2) ---
 # Explore's plain listener; /state answers {"state":..,"lookX":..,"lookY":..} (ModeApp.PORT).

@@ -432,6 +432,7 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "ears_probe_is_404_with_a_wrong_nonce_or_no_token",
         "ears_probe_is_404_fifteen_minutes_after_the_property_was_first_read",
         "ears_probe_rows_carry_counts_and_match_flags_never_text",
+        "ears_probe_rows_carry_the_chips_raw_value_for_calibration",
         "ears_probe_clamps_seconds_and_reports_a_busy_microphone",
         "ears_probe_path_is_tls_only",
         "conversation_section_shows_default_persona_and_switch_on",

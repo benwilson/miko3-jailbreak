@@ -178,9 +178,19 @@ public final class SettingsPageHarness {
     /** Answers the scripted sample lists, one per drain, then nothing. */
     static final class FakeDirection implements EarsProbe.Direction {
         final List<List<Float>> drains = new ArrayList<List<Float>>();
+        Integer raw;
+        String reply;
 
         public String backend() {
             return "fake";
+        }
+
+        public Integer raw() {
+            return raw;
+        }
+
+        public String rawReply() {
+            return reply;
         }
 
         public List<Float> drain() {
@@ -1294,6 +1304,28 @@ public final class SettingsPageHarness {
                                 && "fake".equals(((Map<?, ?>) parsed).get("backend"))
                                 && p.runner.mic.closed && p.runner.rec.closed,
                         "code=" + r.code() + " body=" + r.body);
+            }
+        });
+        scenario("ears_probe_rows_carry_the_chips_raw_value_for_calibration", new Scenario() {
+            public void run(String n) throws Exception {
+                // hey-miko plan U1/KTD12: qa-direction-chip.py --calibrate fits zero, sign and
+                // scale from each row's raw chip value, and confirms the port from raw_reply.
+                Probe p = new Probe().armed("abc");
+                p.direction.raw = 138;
+                p.direction.reply = "58585542aa";
+                Resp r = probePost(p, "abc", 1, null);
+                Object parsed = r.code() == 200 ? Json.parse(r.body) : null;
+                List<?> rows = parsed instanceof Map ? (List<?>) ((Map<?, ?>) parsed).get("rows") : null;
+                Map<?, ?> row1 = rows != null && rows.size() == 1 ? (Map<?, ?>) rows.get(0) : null;
+                Probe none = new Probe().armed("abc");
+                Resp r2 = probePost(none, "abc", 1, null);
+                Object parsed2 = r2.code() == 200 ? Json.parse(r2.body) : null;
+                List<?> rows2 = parsed2 instanceof Map ? (List<?>) ((Map<?, ?>) parsed2).get("rows") : null;
+                Map<?, ?> row2 = rows2 != null && rows2.size() == 1 ? (Map<?, ?>) rows2.get(0) : null;
+                check(n, row1 != null && Long.valueOf(138).equals(row1.get("raw"))
+                                && "58585542aa".equals(((Map<?, ?>) parsed).get("raw_reply"))
+                                && row2 != null && !row2.containsKey("raw"),
+                        "body=" + r.body + " none=" + r2.body);
             }
         });
         scenario("ears_probe_clamps_seconds_and_reports_a_busy_microphone", new Scenario() {

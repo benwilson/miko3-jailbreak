@@ -291,10 +291,10 @@ def run_probe(robot, phrase=None, seconds=PROBE_SECONDS, http=None, sleep=time.s
 # The launcher's probe answer, as U2 is expected to shape it. This function is the
 # one place that decides whether it shows the chip; align it here after integration.
 #   {"backend": "NC",                  VoiceDirection.Backend.NC's name
-#    "nc_reply": "58585542...",        a raw chip reply as hex (spaces allowed), or a list of them
+#    "raw_reply": "58585542...",       a raw chip reply as hex (spaces allowed), or a list of them
 #    "seconds": 3,
 #    "rows": [{..., "raw": 138, ...}]} the chip's raw 0..255 reading that second, or null
-# qa-ears-probe.py's parse_answer reads nc_reply (NC_REPLY_FIELD) and raw (RAW_FIELD).
+# qa-ears-probe.py's parse_answer reads raw_reply (NC_REPLY_FIELD) and raw (RAW_FIELD).
 PROBE_NC_BACKEND = "NC"
 PROBE_REPLY_PREFIX = FRAME_MAGIC.hex()  # "58585542"
 

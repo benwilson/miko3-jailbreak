@@ -77,6 +77,12 @@ final class EarsProbe {
             return null;
         }
 
+        /** The chip's latest raw value (0 to 255), or null: each row carries it so
+         * qa-direction-chip.py --calibrate can fit zero, sign and scale (hey-miko plan KTD12). */
+        default Integer raw() {
+            return null;
+        }
+
         /** Angle readings since the last call, oldest first; null for a failed read. */
         List<Float> drain();
     }
@@ -98,9 +104,16 @@ final class EarsProbe {
         final int chunks;
         final int words;
         final boolean matched;
+        final Integer raw;
 
         Row(int second, Float angle, int rms, long decodeMs, long decodeMaxMs, int chunks, int words,
             boolean matched) {
+            this(second, angle, rms, decodeMs, decodeMaxMs, chunks, words, matched, null);
+        }
+
+        Row(int second, Float angle, int rms, long decodeMs, long decodeMaxMs, int chunks, int words,
+            boolean matched, Integer raw) {
+            this.raw = raw;
             this.second = second;
             this.angle = angle;
             this.rms = rms;
@@ -121,6 +134,9 @@ final class EarsProbe {
             m.put("chunks", chunks);
             m.put("words", words);
             m.put("matched", matched);
+            if (raw != null) {
+                m.put("raw", raw);
+            }
             return m;
         }
     }
@@ -220,7 +236,8 @@ final class EarsProbe {
             boolean matched = !phrase.isEmpty() && heard.containsAll(phrase);
             int rms = samples == 0 ? 0 : (int) Math.round(Math.sqrt(sumSquares / samples) * 32768);
             rows.add(new Row(++second, VoiceDirection.median(direction.drain()), rms, decodeNs / 1000000L,
-                    decodeMaxNs / 1000000L, chunks, heard.isEmpty() ? 0 : wordCount(text), matched));
+                    decodeMaxNs / 1000000L, chunks, heard.isEmpty() ? 0 : wordCount(text), matched,
+                    direction.raw()));
             sumSquares = 0;
             samples = 0;
             decodeNs = 0;

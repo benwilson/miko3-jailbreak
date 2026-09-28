@@ -139,6 +139,12 @@ public class LauncherApp extends Application {
             return VoiceDirection.open().firstReplyHex();
         }
 
+        @Override
+        public Integer raw() {
+            int raw = VoiceDirection.open().lastRaw();
+            return raw < 0 ? null : raw;
+        }
+
         synchronized void start() {
             stop();
             sampler = VoiceDirection.open().sample(PERIOD_MS);
