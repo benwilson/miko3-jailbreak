@@ -54,6 +54,11 @@ are cleared on exit, including on an interrupt.
   python3 scripts/qa-conversation.py --latency before    # current build, before installing the new one
   python3 scripts/qa-conversation.py --latency after     # installs, measures, prints before against after
   python3 scripts/qa-conversation.py --latency summary
+  python3 scripts/qa-conversation.py --only callmet,callbackoff,callchat,callbehind,callwhere,calldock,callfar,callten
+  python3 scripts/qa-conversation.py --chip --only callbehind   # after qa-direction-chip.py --calibrate
+
+The call checks (hey-miko plan U7) time each call from the /state call stamps:
+answered within 1 s, facing within 12 s (3 s with --chip), and the arrival.
 """
 import argparse
 import functools
@@ -100,7 +105,13 @@ HTTP_TIMEOUT = 10
 # ExploreState.Gauges (U7): the counters and the six stage stamps on /state.
 COUNTERS = ("cues", "strongCues", "weakCues", "leanIns", "searches", "facesFound", "quietResumes", "cuesHeld",
             "cuesDropped", "retargets", "shoves", "repeats")
-STAGES = ("cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested", "firstSound")
+STAGES = ("cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested", "firstSound",
+          "callHeard", "callAnswered", "callFacing", "callArrived")
+# The hey-miko plan's call stamps (U6) and its Success Criteria: the answer within
+# about 1 s, facing within about 3 s with the direction chip and 12 s without.
+CALL_ANSWER_BUDGET_S = 1.0
+CALL_FACING_CHIP_S = 3.0
+CALL_FACING_NO_CHIP_S = 12.0
 STAGE_LABELS = (("cueAt", "cue at"), ("turnDone", "turn done"), ("faceFound", "face found"),
                 ("matchAnswered", "match answered"), ("lineRequested", "line requested"),
                 ("firstSound", "first sound"))
@@ -190,7 +201,8 @@ CHECKS = {
     "wedge": Check(
         "AE10", "Put him facing into a nook (a wall and a plant) while he roams; once he is backing out, say his "
                 "name.",
-        "did he finish the escape first and only then turn toward you?", "ask", False, False),
+        "did he answer at once and turn toward you (only a back-off already under way may finish first)?",
+        "ask", False, False),
     "stranger": Check(
         "AE3", "Have someone he has never seen say 'Hey Miko', decline to give a name when he asks, chat for a "
                "turn or two and say goodbye.",
@@ -226,7 +238,40 @@ CHECKS = {
         "AE12", "On the Settings page, edit the persona (a new catchphrase, say) and save, then open a "
                 "conversation with 'Hey Miko'. Restore the persona afterwards if you want it back.",
         "was the change audible in his lines, with no reinstall?", "ask", False, True),
+    # ---- the hey-miko plan's calls (U7): the stamps time each against the Success Criteria ----
+    "callmet": Check(
+        "call AE1", "Meet him (let him greet you), walk off, and within two minutes say 'Hey Miko' from a few "
+                    "metres away while he roams.",
+        "did he answer out loud at once and turn to you?", None, False, False),
+    "callbackoff": Check(
+        "call AE2", "Let him back away from a table edge or a bump; say 'Hey Miko' while he is still backing.",
+        "did he finish backing first, then answer and turn (no turning during the back-off)?", None, False, False),
+    "callchat": Check(
+        "call AE3", "Talk with him; have a second person say 'Hey Miko' mid-conversation from the side.",
+        "did he stay with you, and when your conversation ended, answer the second person and turn to them?",
+        None, False, False),
+    "callbehind": Check(
+        "call AE4", "Stand behind him while he roams and say 'Hey Miko' once.",
+        "did he answer, turn in steps and stop facing you?", None, False, False),
+    "callwhere": Check(
+        "call AE5", "Say 'Hey Miko' and step out of sight before he finds you. When he asks 'Where'd you go?', "
+                    "say 'Hey Miko' again.",
+        "did he ask where you went, then search again?", None, False, False),
+    "calldock": Check(
+        "call AE6", "Put him on the charger and say 'Hey Miko'. Take him off again afterwards.",
+        "did he answer and hold the conversation without leaving the dock?", None, False, False),
+    "callfar": Check(
+        "", "Stand 3 m or more away, in his view, and say 'Hey Miko'.",
+        "did he come to about a metre from you, facing you, and start the conversation?", None, False, False),
+    "callten": Check(
+        "", "Say 'Hey Miko' ten times over a few minutes while he roams, escapes, searches or just after meeting "
+            "you; count the answers.",
+        "did all ten get an answer (the back-off and your own conversation may only delay one)?",
+        None, False, False),
 }
+# Checks timed by the call stamps, and whether a fresh arrival is part of passing.
+CALL_CHECKS = {"callmet": False, "callbackoff": False, "callchat": False, "callbehind": False,
+               "callwhere": False, "calldock": True, "callfar": True, "callten": False}
 FACE_QUESTION = "did he greet you by name (a face match)?"
 # The names each face check needs: --owner, --helper.
 FACE_NAMES = {"greet": ("owner",), "close": ("owner",), "notme": ("owner", "helper"), "samename": ("owner",),
@@ -529,13 +574,48 @@ def stamp_lines(before, after):
     return ["stamps: " + "; ".join(lines)], all_fresh
 
 
+def call_lines(before, after, facing_budget_s):
+    """The call's answer, facing and arrival relative to when it was heard, and whether
+    the call is fresh and inside the answer and facing budgets (a missing stage prints -)."""
+    if after is None:
+        return ["call: state page unreachable"], False
+    heard = after["stages"]["callHeard"]
+    if heard <= 0 or (before is not None and heard == before["stages"]["callHeard"]):
+        return ["call: no fresh call heard"], False
+    parts, ok = [], True
+    for key, label, budget in (("callAnswered", "answered", CALL_ANSWER_BUDGET_S),
+                               ("callFacing", "facing", facing_budget_s),
+                               ("callArrived", "arrived", None)):
+        v = after["stages"][key]
+        if v <= 0 or v < heard:
+            parts.append(f"{label} -")
+            continue
+        text = f"{label} +{(v - heard) / 1000:.1f} s"
+        if budget is not None and (v - heard) / 1000 > budget:
+            text += f" (over the {budget:.1f} s budget)"
+            ok = False
+        parts.append(text)
+    if after["stages"]["callAnswered"] < heard:
+        ok = False
+    return ["call: " + "; ".join(parts)], ok
+
+
 def names_of(people):
     return {p.id: p.name for p in people or []}
 
 
-def judge(name, d, before, after, people_before, people_after, notes):
+def judge(name, d, before, after, people_before, people_after, notes, facing_budget_s=CALL_FACING_NO_CHIP_S):
     """(ok, evidence lines) from the counters, stamps, People page and brain notes
     the check names; a check with no rule passes on the answer alone."""
+    if name in CALL_CHECKS:
+        lines, ok = call_lines(before, after, facing_budget_s)
+        if name == "calldock" and (d is None or d["searches"] > 0):
+            return False, lines + ["he searched instead of staying on the dock"]
+        if CALL_CHECKS[name] and (after is None or after["stages"]["callArrived"] <= after["stages"]["callHeard"]):
+            return False, lines + ["no conversation opened for the call"]
+        if name == "callten":
+            return True, lines
+        return ok, lines
     if name in ("hallway", "behind"):
         lines, fresh = stamp_lines(before, after)
         if name == "behind":
@@ -545,15 +625,22 @@ def judge(name, d, before, after, people_before, people_after, notes):
     if name == "leanin":
         ok = d is not None and d["leanIns"] >= 1 and d["facesFound"] == 0
         return ok, [] if ok else ["expected one lean-in counted and no face found"]
-    if name in ("wedge", "newcomer"):
+    if name == "wedge":
+        # The hey-miko plan's R2 supersedes meeting AE10: an escape yields to a call at once,
+        # and only a back-off in progress delays the answer.
+        lines, ok = call_lines(before, after, CALL_FACING_NO_CHIP_S)
+        return ok, lines
+    if name == "newcomer":
         ok = d is not None and d["cuesHeld"] >= 1
         return ok, [] if ok else ["expected the cue to be counted as held"]
     if name == "switch":
         ok = d is not None and d["strongCues"] >= 1
         return ok, [] if ok else ["expected the wake word counted as a strong cue"]
     if name == "charger":
-        ok = d is not None and d["cues"] == 0
-        return ok, [] if ok else ["a cue got through on the charger"]
+        # The ears stay open on the charger now (hey-miko plan KTD5): a weak cue is heard,
+        # but he must neither search nor leave the dock for it.
+        ok = d is not None and d["searches"] == 0
+        return ok, [] if ok else ["he searched although he was docked"]
     if name == "stranger":
         if people_before is None or people_after is None:
             return False, ["People page unreadable"]
@@ -682,7 +769,7 @@ def run_greet(robot, check, ask_fn, owner, count=GREET_MEETINGS):
     return n >= GREET_NEEDED and wrong == 0, greeted, wrong
 
 
-def run_checks(robot, names, ask_fn=None, owner=None, helper=None):
+def run_checks(robot, names, ask_fn=None, owner=None, helper=None, facing_budget_s=CALL_FACING_NO_CHIP_S):
     """Each named check in order; returns ([(name, ok)], summary) and prints the report.
     ask_fn defaults to ask(), looked up when called so a test can stand in for the owner."""
     ask_fn = ask_fn or ask
@@ -721,7 +808,7 @@ def run_checks(robot, names, ask_fn=None, owner=None, helper=None):
             print(f"   {delta_text(d)}")
             for k, v in d.items():
                 totals[k] += v
-        ok, evidence = judge(name, d, before, after, people_before, people_after, notes)
+        ok, evidence = judge(name, d, before, after, people_before, people_after, notes, facing_budget_s)
         if check.faces:
             face_ok, face_lines, _ = face_judge(name, faces_before, robot.face_state(), owner, helper)
             ok = ok and face_ok
@@ -857,6 +944,8 @@ def build_parser():
                     help="skip the install (the build ids are still compared)")
     ap.add_argument("--owner", help="the owner's name exactly as the People list has it (face checks)")
     ap.add_argument("--helper", help="a stored coworker's name exactly as the People list has it (face checks)")
+    ap.add_argument("--chip", action="store_true",
+                    help="the direction chip is confirmed and calibrated: calls must face you within 3 s, not 12 s")
     ap.add_argument("--latency", choices=("before", "after", "summary"),
                     help="measure stop-to-first-sound over five meetings: before (no install), after, or "
                          "summary (the two files only)")
@@ -895,7 +984,8 @@ def main(argv=None):
         if args.latency:
             results = [("latency", run_latency(robot, args.latency, build))]
         else:
-            results, _ = run_checks(robot, names, owner=args.owner, helper=args.helper)
+            results, _ = run_checks(robot, names, owner=args.owner, helper=args.helper,
+                                    facing_budget_s=CALL_FACING_CHIP_S if args.chip else CALL_FACING_NO_CHIP_S)
     except KeyboardInterrupt:
         print("\ninterrupted; the debug properties are cleared", file=sys.stderr)
         return 130

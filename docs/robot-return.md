@@ -10,6 +10,7 @@ What to do when the robot is back, in the order to do it. The robot was last rea
 | #20 nobody stored without a name | A nameless reply gets a hello and nothing is stored | One nameless reply |
 | #21 cue kind over the wire | "Excuse me" or "my bad" after a bump is a strong cue | One bump plus apology |
 | #23 on-device face recognition | Matching on the robot, "Is that you?", face checks on the Settings page | The thresholds bench (plan U9) and the QA with before/after latency (plan U10) |
+| Hey Miko always answers | "Hey Miko" is a call every state answers: an answer within a second, a turn to the caller, an approach if far, "Where'd you go?"; the NC direction chip on a confirmed port | Chip identification and calibration, and the call walkthrough (step 9) |
 
 Tick items off here as they pass, and move anything that fails into `docs/TODO.md` with what you saw.
 
@@ -95,6 +96,18 @@ Do this early. Three of its results can overturn design decisions, which changes
 - [ ] **Brightness.** After a face stop, open a face-check crop on the Settings page and compare it with the dark crop from 2026-09-25.
 - [ ] **Remote-control mode** still drives forward after the shared motor-driver change. Someone needs to watch the robot.
 
+## 9. Hey Miko always answers
+
+The plan is `docs/plans/2026-09-28-1427-feat-explore-hey-miko-always-answers-plan.md`. Do the chip first: with it confirmed and calibrated, the walkthrough holds calls to the 3 s facing budget; without it, to 12 s.
+
+- [ ] **Identify the direction chip (read-only).** `python3 scripts/qa-direction-chip.py`. It reads who holds `/dev/ttyS1`, the driver counters, `dmesg`, the device tree, the port settings and any vendor log, and listens passively; it never writes to the port. Expect `UNCONFIRMED`: the protocol only answers requests, and the vendor app that talks to the chip is disabled here.
+  - If the evidence satisfies you that `ttyS1` is the chip, rerun with `--owner-confirms`. It sets `persist.miko3.voice_dir.port`, restarts the launcher and probes once, and unsets the property unless the probe shows backend `NC` with an `XXUB` reply. A property the launcher cannot read shows up here too, as backend `NONE`.
+  - If you are not satisfied, stop here. Nothing writes to the port, and he finds callers by turning and looking.
+- [ ] **Calibrate.** `python3 scripts/qa-direction-chip.py --calibrate`: stand front, left, right and behind as asked. It sets the zero, sign and scale properties. Then `python3 scripts/qa-ears-probe.py --session` should show angles near 0, -90, +90 and 180.
+- [ ] **The call walkthrough.** `python3 scripts/qa-conversation.py --only callmet,callbackoff,callchat,callbehind,callwhere,calldock,callfar,callten`, adding `--chip` if the chip passed. Each check prints the answer, facing and arrival times.
+  - Record the times in the plan. The look budget per stop (`callLookMs`, 700 ms) is a placeholder: on the simulated clock a person behind is found in about 10 s with a frame every 500 ms, but never with one frame a second. If he circles past people, raise it and note the new time for someone behind.
+  - Note any false wake word on the dock: the ears now stay open there.
+
 ---
 
 ## After the session: record results and finish each plan
@@ -104,6 +117,7 @@ Do this early. Three of its results can overturn design decisions, which changes
 | Camera navigation (`docs/plans/2026-09-25-1030-feat-explore-camera-navigation-plan.md`) | Step 7 passes | The plan, and `docs/TODO.md` for anything that failed |
 | Meeting and small talk (`docs/plans/2026-09-25-1611-feat-explore-meeting-small-talk-plan.md`) | Step 4 numbers are recorded and no stop condition fired; step 6 meeting checks pass | The plan (its KTD13 asks for the U2 numbers), and `docs/TODO.md` |
 | On-device face recognition (`docs/plans/2026-09-26-2239-feat-explore-on-device-face-recognition-plan.md`) | Steps 2, 3, 5 and 6 face checks pass with no wrong names | PR #23 (merged; add a comment), `docs/hardware/camera-vision.md` section 12, and `docs/TODO.md` |
+| Hey Miko always answers (`docs/plans/2026-09-28-1427-feat-explore-hey-miko-always-answers-plan.md`) | Step 9's call checks pass; the chip is confirmed and calibrated, or the owner has decided it stays off | The plan, and `docs/TODO.md` for any placeholder the times contradict |
 | Explore on Claude (`docs/plans/2026-09-24-1545-feat-explore-on-claude-plan.md`) | The greet-by-name item in `docs/TODO.md` ticks off when `greet` passes | `docs/TODO.md` |
 
 Decisions the results may force:
