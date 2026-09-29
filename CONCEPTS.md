@@ -118,6 +118,10 @@ In Explore mode, the wake word or the robot's name, heard as a strong cue: someo
 
 The one long-lived microphone capture the launcher holds on behalf of an autonomous mode while it runs, on the charger too, as distinct from the one-shot listen used for a single short reply. It feeds the wake-word engine and the recogniser from the same audio, reports each utterance with its side and tier, is kept alive by the mode's renewals and released when the mode goes away. A session the launcher drops while the mode still wants it is reopened on the same backoff as the drive lease, 2 s doubling to 30 s, so a launcher restart brings the ears back with the wheels. It exists because the device allows one capture at a time and a robot that is addressable while roaming cannot open and close the microphone per question.
 
+## Direction chip
+
+The robot's voice-processing chip that reports which way a voice came from (its direction of arrival), as distinct from the side a cue carries, which is all the robot knows without it. The chip is opened only after the owner has confirmed which port it is on, gives a direction only once the owner has calibrated which reading means straight ahead, and is only ever read in a way that cannot hang or crash the process that holds the ears. Until both steps are done the robot has no direction, and a call is found by turning and looking instead. Only the chip's reported angle, corrected for the robot's own turning since the voice was heard, lets a call turn straight to the caller.
+
 ## Deaf window
 
 The stretch from the moment the robot starts a spoken line until playback goes idle plus a short tail, during which nothing said to it can be heard because its own voice ducks the microphone. Anything said inside the window is dropped by design, the recogniser is reset at its end so the ducked audio never becomes an utterance, and it is the reason the robot keeps its lines to two sentences and listens the instant a line ends.
