@@ -1,55 +1,77 @@
 #!/usr/bin/env python3
 """qa-direction-chip.py — identify the NC direction chip on /dev/ttyS1 without
-ever writing to it, and once the port is confirmed, set and calibrate the
-properties the launcher opens it from (hey-miko plan U1; R8, KTD10, KTD12, KTD13).
+ever writing to it, confirm the launcher opens it, and set the side thresholds
+the launcher turns its readings into left or right with (hey-miko plan U1; R8,
+KTD10, KTD12, KTD13).
 
-Identification (the default run) never opens /dev/ttyS1. Opening a tty can write
-to it: in cooked mode with echo on the kernel sends back what it receives, and on
-the robot (2026-09-29) an stty read of this port took its counters from tx 0 to
-tx 98. So over adb it only reads /proc, /sys and logs:
+What the chip does (robot, 2026-09-29): it STREAMS 19-byte frames by itself,
+about one or two a second, and nothing ever needs to write to it:
+  XXUB, a3, 03, a sequence byte, 01 05 00, CRC32 LE over bytes 0..9 at 10..13,
+  then a 5-byte payload whose byte 0 is the raw reading.
+It tells left from right only, not front from back: with the owner about 1 m
+away, right read 30-45, front about 80, behind 85-100, left 95-110. So no
+full-circle zero/sign/scale fits; the launcher's side mode uses two thresholds
+instead: persist.miko3.voice_dir.left (raw at or above is left) and
+persist.miko3.voice_dir.right (raw at or below is right), with zero, sign and
+scale unset.
+
+Identification (the default run) never opens /dev/ttyS1. It reads /proc, /sys
+and logs over adb:
   holder      which process, if any, holds /dev/ttyS1 open;
   driver      /proc/tty/driver/* and the port's tx/rx counters;
   dmesg       kernel lines about the UART, ttyS1 and the DSP;
   dtree       the device-tree serial1 alias and the gpio_dsp nodes;
   vendor_log  any vendor nc_dsp log lines (by logcat tag), or nc_dsp files.
-
-The verdict follows KTD13's rule, less the passive frame the port can no longer be
-read for. The port is CONFIRMED only when
-  (vendor log)  a vendor nc_dsp log line names ttyS1, or
-  (owner)       the owner passes --owner-confirms after reading the evidence.
-Otherwise it is UNCONFIRMED and nothing is written anywhere. The vendor app that
-talks to the chip has always been disabled here, so the owner's confirmation is
-the expected route.
+The port is CONFIRMED only when a vendor nc_dsp log line names ttyS1, or the
+owner passes --owner-confirms after reading the evidence. Otherwise nothing is
+written anywhere.
 
 On CONFIRMED it sets persist.miko3.voice_dir.port to /dev/ttyS1, restarts the
-launcher so it opens the chip afresh, and runs the launcher's ears probe once
-(scripts/qa-ears-probe.py's route). Unless that probe shows the NC backend with
-an XXUB reply (probe_shows_nc), it unsets the property again, on every exit
-including Ctrl-C.
+launcher and asks the owner to say something (the NC backend opens on the first
+speech). It keeps the property only if, within about 15 s of the restart, the
+restarted launcher logs `voice direction: backend NC` and nothing logs a
+`has died` or `SIG_DFL` for it. Otherwise it unsets the property and restarts
+the launcher again, on every exit including Ctrl-C. (The launcher's ears probe
+crashes the launcher every time, on main too, so nothing here uses it.)
 
---calibrate walks the owner through front, left, right and behind with the same
-probe, takes the chip's raw 0..255 reading at each, fits zero, sign and degrees
-per step, and sets persist.miko3.voice_dir.zero, .sign and .scale. The angle the
-launcher derives is sign * ((raw - zero) mod 256) * scale, wrapped to +-180,
-with his right at +90. --readings front=10 left=202 ... skips the probe and fits
-readings taken earlier (for example from qa-ears-probe.py --session's CSVs).
+--calibrate reads the chip's stream directly. First, once, it checks with a
+read-only `stty -F /dev/ttyS1 -g` that the launcher left the port raw: input
+flags 0 and no ECHO in the local flags. It refuses otherwise, because opening a
+tty that echoes writes back to it. Then for front, left, right and behind it
+asks the owner to stand there, press Enter and count aloud, and captures 11 s:
+  exec 3</dev/ttyS1; timeout 11 cat <&3 > /data/local/tmp/cal.bin; exec 3<&-
+which opens the node read-only; the file is pulled and parsed here. It prints
+each position's median and range and suggests
+  right = midpoint of the right median and the lowest front/behind median,
+  left  = midpoint of the left median and the highest front/behind median,
+each rounded to a multiple of 5. It refuses unless the medians order as
+right < front/behind < left with a gap of at least 10 on each side. With
+--apply it sets .left and .right, unsets .zero, .sign and .scale and restarts
+the launcher; without it, it only prints the suggestion. --readings
+front=80 left=95,100,110 ... skips the capture and uses given readings (one
+value, or several giving their median).
 
-The script never writes to the node. Its only property writes are the
-persist.miko3.voice_dir.* properties above, plus the ears probe's own debug
-nonce (debug.miko3.ears_probe, set and cleared by qa-ears-probe.py's run). The
-launcher's NC backend does talk to the chip once the port property is set; that
-is the point of confirming first.
+--watch captures the stream the same way (after the same check) for --seconds
+(default 10) and prints one line per frame: its sequence byte, the raw reading
+and the side under the thresholds set now.
+
+The script never writes to the node, and opens it only in the two read-only
+forms above. Its only property writes are persist.miko3.voice_dir.*.
 
 Usage:
   scripts/qa-direction-chip.py [--serial 192.168.19.74:5555] [--owner-confirms]
-  scripts/qa-direction-chip.py --calibrate [--seconds 5]
-  scripts/qa-direction-chip.py --calibrate --readings front=10 left=202 right=74 behind=138
+  scripts/qa-direction-chip.py --calibrate [--apply] [--seconds 11]
+  scripts/qa-direction-chip.py --calibrate --readings front=80 left=95,100,110 right=35 behind=90 [--apply]
+  scripts/qa-direction-chip.py --watch [--seconds 10]
 """
 import argparse
 import importlib.util
+import math
 import re
 import signal
+import statistics
 import sys
+import tempfile
 import time
 import zlib
 from collections import namedtuple
@@ -65,31 +87,46 @@ def _load_ears():
     return mod
 
 
-ears = _load_ears()
+ears = _load_ears()  # for Robot (adb), ProbeError and the defaults; never its probe
 
 NODE = "/dev/ttyS1"
 PORT_PROPERTY = "persist.miko3.voice_dir.port"
 ZERO_PROPERTY = "persist.miko3.voice_dir.zero"
 SIGN_PROPERTY = "persist.miko3.voice_dir.sign"
 SCALE_PROPERTY = "persist.miko3.voice_dir.scale"
+LEFT_PROPERTY = "persist.miko3.voice_dir.left"
+RIGHT_PROPERTY = "persist.miko3.voice_dir.right"
 LAUNCHER_PACKAGE = ears.LAUNCHER_PACKAGE
 LAUNCHER_ACTIVITY = f"{LAUNCHER_PACKAGE}/.MainActivity"
-LAUNCHER_SETTLE_S = 8
-PROBE_SECONDS = 3
-PROBE_ATTEMPTS = 3
-PROBE_RETRY_S = 5
-CALIBRATION_SECONDS = 5
-CALIBRATION_PHRASE = "hey miko"
+
+# The stream check after confirmation: how long after the restart to look.
+STREAM_CHECK_S = 15
+BACKEND_NC = re.compile(r"voice direction: backend NC\b")
+LAUNCHER_DEATH = re.compile(r"has died|SIG_DFL")
+THREADTIME = re.compile(r"^\d\d-\d\d \d\d:\d\d:\d\d\.\d+\s+(\d+)\s+\d+\s+[VDIWEFA]\s")
+START_PROC = (re.compile(r"Start proc (\d+):" + re.escape(LAUNCHER_PACKAGE) + r"(?:/|\s|$)"),
+              re.compile(r"Start proc " + re.escape(LAUNCHER_PACKAGE) + r"\b.*?\bpid=(\d+)"))
+ROBOT_TIME = re.compile(r"^\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}$")
+
+# Reading the stream: one read-only termios check, then a read-only capture.
+TERMIOS_COMMAND = f"stty -F {NODE} -g"
+ECHO = 0o10  # termios lflag ECHO
+CAPTURE_REMOTE = "/data/local/tmp/cal.bin"
+CAPTURE_SECONDS = 11
+WATCH_SECONDS = 10
+MAX_CAPTURE_SECONDS = 25  # adb's own timeout is ears.ADB_TIMEOUT (30 s)
 
 FRAME_MAGIC = b"XXUB"
-MIN_FRAME = 14  # a request: XXUB, module, op, param, three zeros, CRC32 LE over the first 10
-MAX_FRAME = 42  # a 38-byte reply plus a trailing CRC, if that is where its CRC sits
+STREAM_FRAME = 19
+STREAM_MODULE, STREAM_OP = 0xA3, 0x03
+STREAM_FIXED = b"\x01\x05\x00"  # bytes 7..9
 
-# The positions the owner stands at, and the angle each should read (his right is +90).
-POSITIONS = (("front", 0), ("left", 270), ("right", 90), ("behind", 180))
-MAX_FIT_ERROR_DEG = 45  # beyond this a reading sits nearer another quadrant than its own
+POSITIONS = ("front", "left", "right", "behind")
+MIDDLE = ("front", "behind")
+MIN_GAP = 10
+THRESHOLD_STEP = 5
 
-# Read-only evidence (KTD13). None of these may write to the node; the tests check.
+# Read-only evidence (KTD13). None of these may open the node, let alone write to it; the tests check.
 EVIDENCE_COMMANDS = {
     # One ls per process: a shell loop per open file timed out over 300+ processes on the robot.
     "holder": ("for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -q ' " + NODE + "$' && "
@@ -107,49 +144,66 @@ EVIDENCE_COMMANDS = {
 }
 
 Evidence = namedtuple("Evidence", "sections passive passive_note")
-Frame = namedtuple("Frame", "offset length hex")
+StreamFrame = namedtuple("StreamFrame", "offset seq raw hex")
 Verdict = namedtuple("Verdict", "confirmed reason detail")
-Fit = namedtuple("Fit", "zero sign scale max_error_deg")
+Sides = namedtuple("Sides", "left right")
 
 
 class CalibrationError(ValueError):
-    """The readings cannot give a trustworthy zero, sign and scale."""
+    """The readings cannot give trustworthy side thresholds."""
 
 
-# --- frames ---
+# --- the chip's stream ---
 
-def request_frame(module, op, param):
-    """A 14-byte request: XXUB, module, op, param, three zeros, CRC32 LE over the first 10."""
-    head = FRAME_MAGIC + bytes([module, op, param, 0, 0, 0])
-    return head + zlib.crc32(head).to_bytes(4, "little")
-
-
-def parse_od(text):
-    """The bytes `od -An -tx1 -v` printed; lines that are not all hex pairs are skipped."""
-    out = bytearray()
-    for line in text.splitlines():
-        tokens = line.split()
-        if tokens and all(re.fullmatch(r"[0-9a-fA-F]{2}", t) for t in tokens):
-            out.extend(int(t, 16) for t in tokens)
-    return bytes(out)
-
-
-def find_frames(data):
-    """XXUB frames with a valid CRC32 (LE) over every byte before it. The request
-    CRC sits at bytes 10..13; where a reply's sits is unverified (KTD11), so any
-    length up to MAX_FRAME with a trailing CRC counts. The shortest match wins."""
+def stream_frames(data):
+    """The chip's streamed direction frames in these bytes: XXUB a3 03 seq 01 05 00,
+    a CRC32 LE over bytes 0..9 at 10..13, then five payload bytes (byte 0 the raw).
+    Junk, torn frames and frames of any other shape are skipped."""
     frames = []
     at = data.find(FRAME_MAGIC)
-    while at >= 0:
-        for length in range(MIN_FRAME, MAX_FRAME + 1):
-            if at + length > len(data):
-                break
-            body, crc = data[at:at + length - 4], data[at + length - 4:at + length]
-            if zlib.crc32(body).to_bytes(4, "little") == crc:
-                frames.append(Frame(at, length, data[at:at + length].hex()))
-                break
-        at = data.find(FRAME_MAGIC, at + 1)
+    while at >= 0 and at + STREAM_FRAME <= len(data):
+        f = data[at:at + STREAM_FRAME]
+        if (f[4] == STREAM_MODULE and f[5] == STREAM_OP and f[7:10] == STREAM_FIXED
+                and zlib.crc32(f[:10]).to_bytes(4, "little") == f[10:14]):
+            frames.append(StreamFrame(at, f[6], f[14], f.hex()))
+            at = data.find(FRAME_MAGIC, at + STREAM_FRAME)
+        else:
+            at = data.find(FRAME_MAGIC, at + 1)
     return frames
+
+
+def termios_raw(g):
+    """(ok, why) for `stty -g` output: input flags 0 and no ECHO in the local flags."""
+    fields = g.strip().split(":")
+    if len(fields) < 4 or not all(re.fullmatch(r"[0-9a-fA-F]+", f) for f in fields[:4]):
+        return False, f"stty -g printed {g.strip()[:60]!r}, not a termios string"
+    iflag, lflag = int(fields[0], 16), int(fields[3], 16)
+    if iflag != 0:
+        return False, f"input flags are {fields[0]}, not 0: the launcher has not left {NODE} raw"
+    if lflag & ECHO:
+        return False, f"local flags {fields[3]} have ECHO set: opening {NODE} could echo back to the chip"
+    return True, f"input flags 0, echo off (local flags {fields[3]})"
+
+
+def port_is_raw(robot):
+    """The single pre-check before any capture: a read-only stty -g."""
+    return termios_raw(robot.adb("shell", TERMIOS_COMMAND, check=False))
+
+
+def capture_command(seconds):
+    """Reads the node read-only for this long into CAPTURE_REMOTE. Never writes to it."""
+    return f"exec 3<{NODE}; timeout {int(seconds)} cat <&3 > {CAPTURE_REMOTE}; exec 3<&-"
+
+
+def capture(robot, seconds):
+    """The stream's bytes over this many seconds (the port must already be checked raw)."""
+    robot.adb("shell", capture_command(seconds), check=False)  # timeout exits 124
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "cal.bin"
+        robot.adb("pull", CAPTURE_REMOTE, str(local), check=False)
+        data = local.read_bytes() if local.exists() else b""
+    robot.adb("shell", f"rm -f {CAPTURE_REMOTE}", check=False)
+    return data
 
 
 # --- evidence ---
@@ -249,57 +303,71 @@ def unset_prop(robot, key):
         print(f"{exc}\n!! unset it by hand: adb -s {robot.serial} shell setprop {key} '\"\"'", file=sys.stderr)
 
 
-def restart_launcher(robot, sleep=None):
+def get_prop(robot, key):
+    return robot.adb("shell", "getprop", key, check=False).strip()
+
+
+def restart_launcher(robot):
     """So the launcher reads the voice_dir properties afresh. HOME alone does not restart it."""
     robot.adb("shell", "am", "force-stop", LAUNCHER_PACKAGE, check=False)
     robot.adb("shell", "am", "start", "-n", LAUNCHER_ACTIVITY, check=False)
-    if sleep is not None:
-        sleep(LAUNCHER_SETTLE_S)
 
 
-def run_probe(robot, phrase=None, seconds=PROBE_SECONDS, http=None, sleep=time.sleep):
-    """One launcher ears probe (qa-ears-probe.py's run), retried while the launcher comes up."""
-    for attempt in range(1, PROBE_ATTEMPTS + 1):
-        try:
-            return ears.run(robot, seconds, phrase, http=http or ears.default_http)
-        except ears.ProbeError as exc:
-            if attempt == PROBE_ATTEMPTS:
-                raise
-            print(f"{exc}\n.. probe attempt {attempt} failed; retrying in {PROBE_RETRY_S} s")
-            sleep(PROBE_RETRY_S)
+# --- the stream check after confirmation ---
+
+def launcher_pids(log, pidof=""):
+    """The launcher's pids: from ActivityManager's Start proc lines, and pidof."""
+    pids = {int(p) for p in pidof.split() if p.isdigit()}
+    for line in log.splitlines():
+        for pattern in START_PROC:
+            m = pattern.search(line)
+            if m:
+                pids.add(int(m.group(1)))
+    return pids
 
 
-# The launcher's probe answer, as U2 is expected to shape it. This function is the
-# one place that decides whether it shows the chip; align it here after integration.
-#   {"backend": "NC",                  VoiceDirection.Backend.NC's name
-#    "raw_reply": "58585542...",       a raw chip reply as hex (spaces allowed), or a list of them
-#    "seconds": 3,
-#    "rows": [{..., "raw": 138, ...}]} the chip's raw 0..255 reading that second, or null
-# qa-ears-probe.py's parse_answer reads raw_reply (NC_REPLY_FIELD) and raw (RAW_FIELD).
-PROBE_NC_BACKEND = "NC"
-PROBE_REPLY_PREFIX = FRAME_MAGIC.hex()  # "58585542"
+def _line_pid(line):
+    m = THREADTIME.match(line)
+    return int(m.group(1)) if m else None
 
 
-def probe_shows_nc(answer):
-    """(ok, why): the probe reports the NC backend and at least one XXUB reply."""
-    backend = str(answer.backend).strip().upper()
-    if backend != PROBE_NC_BACKEND:
-        return False, f"the probe reports backend {answer.backend!r}, not {PROBE_NC_BACKEND}"
-    replies = answer.nc_reply
-    if isinstance(replies, str):
-        replies = [replies]
-    for reply in replies or []:
-        h = re.sub(r"[\s:]", "", reply).lower()
-        if re.fullmatch(r"(?:[0-9a-f]{2})+", h) and h.startswith(PROBE_REPLY_PREFIX):
-            return True, f"backend NC with an XXUB reply {h[:48]}{'...' if len(h) > 48 else ''}"
-    return False, f"the probe has no XXUB reply (nc_reply {answer.nc_reply!r})"
+def stream_check_verdict(log, pidof=""):
+    """(ok, why): the restarted launcher logged the NC backend and did not die."""
+    pids = launcher_pids(log, pidof)
+    lines = log.splitlines()
+    deaths = [l for l in lines if LAUNCHER_DEATH.search(l) and (LAUNCHER_PACKAGE in l or _line_pid(l) in pids)]
+    if deaths:
+        return False, f"the launcher died: {deaths[0].strip()}"
+    if not pids:
+        return False, "could not tell the restarted launcher's pid (no Start proc line, no pidof)"
+    nc = [l for l in lines if BACKEND_NC.search(l) and _line_pid(l) in pids]
+    if not nc:
+        other = [l for l in lines if "voice direction: backend" in l and _line_pid(l) in pids]
+        seen = f"; it logged: {other[-1].strip()}" if other else ""
+        return False, f"the launcher did not log 'voice direction: backend NC'{seen}"
+    return True, f"the launcher opened the chip: {nc[0].strip()}"
+
+
+def stream_check(robot, sleep=time.sleep):
+    """Restarts the launcher, asks the owner to speak, and reads the log since just
+    before the restart for the NC backend line and any launcher death."""
+    since = robot.adb("shell", "date '+%m-%d %H:%M:%S.000'", check=False).strip()
+    restart_launcher(robot)
+    print(f">> The launcher is restarting. SAY SOMETHING to the robot now (for example 'hey miko', "
+          f"then a few words): the chip opens on the first speech. Watching the log for {STREAM_CHECK_S} s.")
+    sleep(STREAM_CHECK_S)
+    if not ROBOT_TIME.match(since):
+        return False, f"could not read the robot's clock ({since!r}), so the log cannot be checked"
+    log = robot.adb("shell", f"logcat -d -v threadtime -b main,system,crash -T '{since}'", check=False)
+    pidof = robot.adb("shell", f"pidof {LAUNCHER_PACKAGE}", check=False)
+    return stream_check_verdict(log, pidof)
 
 
 # --- identification ---
 
-def identify(robot, owner_confirms, probe=run_probe, sleep=time.sleep):
+def identify(robot, owner_confirms, sleep=time.sleep):
     """Gathers the evidence, prints it and the verdict; on CONFIRMED sets the port,
-    restarts the launcher and probes once, unsetting the port unless it shows NC."""
+    restarts the launcher and keeps the port only if the launcher opens the chip."""
     evidence = gather(robot)
     print(format_evidence(evidence))
     verdict = decide(evidence, owner_confirms)
@@ -309,137 +377,182 @@ def identify(robot, owner_confirms, probe=run_probe, sleep=time.sleep):
               f"{NODE} is the NC chip, run again with --owner-confirms.")
         return 1
     set_prop(robot, PORT_PROPERTY, NODE)
-    print(f"set {PORT_PROPERTY}={NODE}; restarting the launcher and probing once")
+    print(f"set {PORT_PROPERTY}={NODE}")
     kept = False
     try:
-        restart_launcher(robot, sleep)
-        try:
-            answer = probe(robot)
-        except ears.ProbeError as exc:
-            print(f"{exc}\n!! the probe failed, so the port is not kept")
-            return 3
-        kept, why = probe_shows_nc(answer)
+        kept, why = stream_check(robot, sleep)
         print(("OK: " if kept else "!! ") + why)
     finally:
         if not kept:
             unset_prop(robot, PORT_PROPERTY)
             restart_launcher(robot)
+    if not kept:
+        return 3
     print(f"{PORT_PROPERTY} kept. Next: {Path(__file__).name} --calibrate")
-    return 0 if kept else 3
+    return 0
 
 
-# --- calibration ---
+# --- side calibration ---
 
-def _circular(a, b, period):
-    d = (a - b) % period
-    return min(d, period - d)
-
-
-def _wrap180(deg):
-    return (deg + 180.0) % 360.0 - 180.0
-
-
-def position_reading(raws):
-    """The raw reading that best stands for one position: the circular medoid of the
-    readings (the one nearest all the others round the 0..255 circle), or None."""
-    values = sorted(r for r in raws if r is not None)
-    if not values:
+def summarize(raws):
+    """(median, low, high) of the readings, or None when there are none."""
+    if not raws:
         return None
-    return min(values, key=lambda v: sum(_circular(v, w, 256) for w in values))
+    med = statistics.median(raws)
+    return (int(med) if med == int(med) else med), min(raws), max(raws)
 
 
-def fit_calibration(readings):
-    """zero is the front reading. For each sign, the degrees per step is the least-
-    squares fit through the origin of the steps from zero against the angles each
-    position should read; the sign with the smaller worst error wins."""
-    if "front" not in readings:
-        raise CalibrationError("no front reading: zero is where front reads")
-    if len(set(readings.values())) < 3:
-        raise CalibrationError(f"only {len(set(readings.values()))} distinct readings; at least three are needed")
-    zero = readings["front"]
-    targets = dict(POSITIONS)
-    pairs = [((raw - zero) % 256, targets[pos]) for pos, raw in readings.items() if pos != "front"]
-    best = None
-    for sign in (1, -1):
-        wanted = [(d, t if sign == 1 else (360 - t) % 360) for d, t in pairs]
-        denom = sum(d * d for d, _ in wanted)
-        if denom == 0:
-            continue
-        scale = sum(d * t for d, t in wanted) / denom
-        if scale <= 0:
-            continue
-        err = max(abs(_wrap180(d * scale - t)) for d, t in wanted)
-        if best is None or err < best.max_error_deg:
-            best = Fit(zero, sign, scale, err)
-    if best is None:
-        raise CalibrationError("the readings give no rotation at all")
-    if best.max_error_deg > MAX_FIT_ERROR_DEG:
-        raise CalibrationError(f"the best fit's worst error is {best.max_error_deg:.0f} deg (over "
-                               f"{MAX_FIT_ERROR_DEG}); a reading sits nearer another position than its own")
-    return best
+def round_to_step(x):
+    """To the nearest multiple of THRESHOLD_STEP, halves up."""
+    return int(math.floor(x / THRESHOLD_STEP + 0.5)) * THRESHOLD_STEP
 
 
-def calibration_props(fit):
-    scale = f"{fit.scale:.5f}".rstrip("0").rstrip(".")
-    return [(ZERO_PROPERTY, str(fit.zero)), (SIGN_PROPERTY, str(fit.sign)), (SCALE_PROPERTY, scale)]
+def suggest_sides(medians):
+    """Side thresholds from each position's median: right is the midpoint of the right
+    median and the lowest front/behind median, left the midpoint of the left median and
+    the highest, each rounded to a multiple of 5. Refuses unless the medians order as
+    right < front/behind < left with at least MIN_GAP on each side."""
+    missing = [p for p in ("right", "left") if p not in medians]
+    middle = [medians[p] for p in MIDDLE if p in medians]
+    if missing or not middle:
+        need = missing + ([] if middle else ["front or behind"])
+        raise CalibrationError(f"no reading for {', '.join(need)}")
+    right, left, low, high = medians["right"], medians["left"], min(middle), max(middle)
+    shown = ", ".join(f"{p} {medians[p]}" for p in POSITIONS if p in medians)
+    if right + MIN_GAP > low or high + MIN_GAP > left:
+        raise CalibrationError(f"the medians ({shown}) do not order as right < front/behind < left with a "
+                               f"gap of at least {MIN_GAP} on each side, so no thresholds separate the sides")
+    sides = Sides(left=round_to_step((left + high) / 2), right=round_to_step((right + low) / 2))
+    if not 0 <= sides.right < sides.left <= 255:
+        raise CalibrationError(f"the thresholds {sides} are out of order or range")
+    return sides
 
 
 def parse_readings(items):
-    """--readings front=10 left=202 ... as {position: raw}."""
-    names = dict(POSITIONS)
+    """--readings front=80 left=95,100,110 ... as {position: [raw, ...]}."""
     out = {}
     for item in items:
         pos, sep, value = item.partition("=")
-        if not sep or pos not in names:
-            raise ValueError(f"bad reading {item!r}; use position=raw with position one of {', '.join(names)}")
-        try:
-            raw = int(value)
-        except ValueError:
-            raise ValueError(f"bad reading {item!r}: {value!r} is not a number")
-        if not 0 <= raw <= 255:
-            raise ValueError(f"bad reading {item!r}: raw readings run 0..255")
-        out[pos] = raw
+        if not sep or pos not in POSITIONS:
+            raise ValueError(f"bad reading {item!r}; use position=raw[,raw...] with position one of "
+                             f"{', '.join(POSITIONS)}")
+        raws = []
+        for part in value.split(","):
+            try:
+                raw = int(part)
+            except ValueError:
+                raise ValueError(f"bad reading {item!r}: {part!r} is not a number")
+            if not 0 <= raw <= 255:
+                raise ValueError(f"bad reading {item!r}: raw readings run 0..255")
+            raws.append(raw)
+        out[pos] = raws
     return out
 
 
-def calibrate(robot, probe=run_probe, ask=None, readings=None, seconds=CALIBRATION_SECONDS):
-    """Walks the owner through the positions (or takes given readings), fits and sets
-    zero, sign and scale. Refuses, writing nothing, without a confirmed port."""
-    port = robot.adb("shell", "getprop", PORT_PROPERTY, check=False).strip()
-    if not port:
+def _fmt(x):
+    return f"{x:g}" if isinstance(x, float) else str(x)
+
+
+def calibrate(robot, ask=None, readings=None, apply=False, seconds=CAPTURE_SECONDS):
+    """Captures (or takes given) readings at each position, prints the median and range
+    of each, and suggests side thresholds; with apply, sets them and unsets the full
+    calibration. Writes nothing unless apply and every check passes."""
+    needs_port = apply or readings is None
+    if needs_port and not get_prop(robot, PORT_PROPERTY):
         print(f"!! {PORT_PROPERTY} is not set: identify and confirm the port first "
               f"({Path(__file__).name} [--owner-confirms]). Nothing was written.")
         return 1
     if readings is None:
+        ok, why = port_is_raw(robot)
+        if not ok:
+            print(f"!! refusing to read {NODE}: {why}. Let the launcher open the chip first (say something "
+                  f"to the robot), then try again. Nothing was read or written.")
+            return 1
+        print(f"{NODE}: {why}")
         if ask is None:
             ask = lambda text: input(text)  # noqa: E731
         readings = {}
-        for pos, angle in POSITIONS:
-            ask(f">> {pos.upper()}: stand 1.5 m to his {pos} ({angle} deg) and say '{CALIBRATION_PHRASE}' "
-                f"a few times over {seconds} s; press Enter to start ")
-            answer = probe(robot, phrase=CALIBRATION_PHRASE, seconds=seconds)
-            ok, why = probe_shows_nc(answer)
-            if not ok:
-                print(f"!! {why}. Nothing was written.")
-                return 1
-            raws = [r.get(ears.RAW_FIELD) for r in answer.rows]
-            reading = position_reading(raws)
-            got = len([r for r in raws if r is not None])
-            print(f"{pos}: {got} raw readings" + ("" if reading is None else f", taking {reading}"))
-            if reading is not None:
-                readings[pos] = reading
-    print("readings: " + ", ".join(f"{p}={r}" for p, r in readings.items()))
+        for pos in POSITIONS:
+            ask(f">> {pos.upper()}: stand about 1 m to the robot's {pos}, press Enter, then COUNT ALOUD "
+                f"steadily for {seconds} s ")
+            print(f".. capturing {seconds} s")
+            readings[pos] = [f.raw for f in stream_frames(capture(robot, seconds))]
+    medians = {}
+    for pos in POSITIONS:
+        if pos not in readings:
+            continue
+        summary = summarize(readings[pos])
+        if summary is None:
+            print(f"{pos}: no frames")
+            continue
+        med, lo, hi = summary
+        medians[pos] = med
+        print(f"{pos}: median {_fmt(med)} ({lo}..{hi}), {len(readings[pos])} readings")
     try:
-        fit = fit_calibration(readings)
+        sides = suggest_sides(medians)
     except CalibrationError as exc:
         print(f"!! {exc}. Nothing was written.")
         return 1
-    print(f"fit: zero {fit.zero}, sign {fit.sign:+d}, scale {fit.scale:.5f} deg/step, "
-          f"worst error {fit.max_error_deg:.1f} deg")
-    for key, value in calibration_props(fit):
-        set_prop(robot, key, value)
+    print(f"suggest: {RIGHT_PROPERTY}={sides.right} {LEFT_PROPERTY}={sides.left} "
+          f"(raw <= {sides.right} is right, raw >= {sides.left} is left)")
+    if not apply:
+        print("Nothing was written. Run again with --apply to set them (and unset zero, sign and scale).")
+        return 0
+    for key in (ZERO_PROPERTY, SIGN_PROPERTY, SCALE_PROPERTY):
+        set_prop(robot, key, "")
+        print(f"unset {key}")
+    for key, value in ((LEFT_PROPERTY, sides.left), (RIGHT_PROPERTY, sides.right)):
+        set_prop(robot, key, str(value))
         print(f"set {key}={value}")
     restart_launcher(robot)
+    print("restarted the launcher so it reads them")
+    return 0
+
+
+# --- watch ---
+
+def current_sides(robot):
+    """The side thresholds as the launcher would parse them now, or None."""
+    try:
+        left, right = int(get_prop(robot, LEFT_PROPERTY)), int(get_prop(robot, RIGHT_PROPERTY))
+    except ValueError:
+        return None
+    return Sides(left, right) if 0 <= right < left <= 255 else None
+
+
+def side_of(raw, sides):
+    if sides is None:
+        return "(no thresholds)"
+    if raw >= sides.left:
+        return "left"
+    if raw <= sides.right:
+        return "right"
+    return "ahead/behind"
+
+
+def watch(robot, seconds=WATCH_SECONDS):
+    """Captures the stream and prints one line per frame with its side."""
+    ok, why = port_is_raw(robot)
+    if not ok:
+        print(f"!! refusing to read {NODE}: {why}. Let the launcher open the chip first (say something "
+              f"to the robot), then try again.")
+        return 1
+    sides = current_sides(robot)
+    print(f"{NODE}: {why}; thresholds: " +
+          ("none set" if sides is None else f"left >= {sides.left}, right <= {sides.right}"))
+    if sides is not None and get_prop(robot, ZERO_PROPERTY):
+        print(f"note: {ZERO_PROPERTY} is set, so the launcher uses the full calibration, not these sides")
+    print(f".. capturing {seconds} s: speak from where you stand")
+    frames = stream_frames(capture(robot, seconds))
+    if not frames:
+        print(f"!! no frames in {seconds} s")
+        return 1
+    counts = {}
+    for f in frames:
+        side = side_of(f.raw, sides)
+        counts[side] = counts.get(side, 0) + 1
+        print(f"seq {f.seq:3d}  raw {f.raw:3d}  {side}")
+    print(f"{len(frames)} frames in {seconds} s: " + ", ".join(f"{n} {s}" for s, n in counts.items()))
     return 0
 
 
@@ -451,31 +564,45 @@ def build_parser():
     ap.add_argument("--owner-confirms", action="store_true",
                     help=f"the owner confirms from the evidence that {NODE} is the NC chip")
     ap.add_argument("--calibrate", action="store_true",
-                    help="fit and set zero, sign and scale from front, left, right and behind")
-    ap.add_argument("--readings", nargs="+", metavar="POS=RAW",
-                    help="with --calibrate: fit these raw readings instead of probing")
-    ap.add_argument("--seconds", type=int, default=CALIBRATION_SECONDS,
-                    help="with --calibrate: probe length per position")
+                    help="capture front, left, right and behind and suggest the side thresholds")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --calibrate: set the suggested thresholds and unset zero, sign and scale")
+    ap.add_argument("--readings", nargs="+", metavar="POS=RAW[,RAW...]",
+                    help="with --calibrate: use these raw readings instead of capturing")
+    ap.add_argument("--watch", action="store_true",
+                    help="capture the stream and print each frame's raw reading and side")
+    ap.add_argument("--seconds", type=int, default=None,
+                    help=f"capture length (--calibrate: {CAPTURE_SECONDS} per position, --watch: "
+                         f"{WATCH_SECONDS}; at most {MAX_CAPTURE_SECONDS})")
     return ap
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
-    if args.readings and not args.calibrate:
-        raise ears.ProbeError("!! --readings needs --calibrate")
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if (args.readings or args.apply) and not args.calibrate:
+        ap.error("--readings and --apply need --calibrate")
+    if args.watch and (args.calibrate or args.owner_confirms):
+        ap.error("--watch runs on its own")
+    if args.seconds is not None and not 1 <= args.seconds <= MAX_CAPTURE_SECONDS:
+        ap.error(f"--seconds runs 1..{MAX_CAPTURE_SECONDS}")
     readings = None
     if args.readings:
         try:
             readings = parse_readings(args.readings)
         except ValueError as exc:
-            raise ears.ProbeError(f"!! {exc}")
+            ap.error(str(exc))
     robot = ears.Robot(args.serial)
-    robot.ensure_reachable()
+    if not (readings and not args.apply):  # given readings, only suggested: no robot needed
+        robot.ensure_reachable()
     # A SIGTERM (a closed terminal, a kill) must reach the finally blocks like Ctrl-C does.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
+        if args.watch:
+            return watch(robot, args.seconds or WATCH_SECONDS)
         if args.calibrate:
-            return calibrate(robot, readings=readings, seconds=args.seconds)
+            return calibrate(robot, readings=readings, apply=args.apply,
+                             seconds=args.seconds or CAPTURE_SECONDS)
         return identify(robot, args.owner_confirms)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
