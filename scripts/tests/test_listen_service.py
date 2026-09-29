@@ -729,7 +729,7 @@ class BuildScriptTest(unittest.TestCase):
         self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
         src = _strip_comments(raw)
         for needle in ("enum Backend", "NONE", "CONEXANT", "NC", "getDSPRawDOA(", "NcFrames.doaQuery(",
-                       "initDSPComm(", "createUART(", "initNCUART("):
+                       "initDSPComm(", "stty"):
             self.assertIn(needle, src)
         # KTD4: the angle is sampled on its own thread at a caller-set cadence.
         self.assertRegex(src, r"sample\(\s*(final\s+)?long\s+\w+")
@@ -752,13 +752,16 @@ class BuildScriptTest(unittest.TestCase):
         self.assertNotIn("/dev/ttyMT2", src)
         self.assertIn('"persist.miko3.voice_dir.port"', src)
         body = _method_body(src, "private static VoiceDirection openNc") or ""
-        port, node, native = body.find("isEmpty()"), body.find(".exists(node)"), body.find("createUART(")
+        port, node, setup = body.find("isEmpty()"), body.find(".exists(node)"), body.find("configure(node)")
         self.assertGreaterEqual(port, 0, "the NC path never checks the port property")
         self.assertGreater(node, port, "the NC path does not check the node after the property")
-        self.assertGreater(native, node, "an NC native call comes before the node check")
+        self.assertGreater(setup, node, "the port is configured before the node check")
         self.assertRegex(body, r"status\s*!=\s*0")
-        for vendor_read in ("getCurrentDOAStatus(", "toggleDOA(", "getFWVersion("):
-            self.assertNotIn(vendor_read, src)
+        # 2026-09-29: with the vendor's createUART/initNCUART in the process the launcher
+        # segfaulted seconds after every chip open; the NC path now runs no vendor code.
+        for vendor_call in ("NCDsp", "createUART(", "initNCUART(", "getCurrentDOAStatus(", "toggleDOA(",
+                            "getFWVersion("):
+            self.assertNotIn(vendor_call, src)
         self.assertIn("new File(path).exists()", src)
         # The launcher reads the properties and hands them over before the first open().
         engine = _read(ENGINE)

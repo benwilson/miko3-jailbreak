@@ -1,7 +1,6 @@
 package com.miko3.shared;
 
 import com.example.conexantapi.ConexantDSP;
-import com.example.conexantapi.NCDsp;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -27,13 +26,12 @@ import java.util.concurrent.TimeUnit;
  *
  * The NC chip is tried only on the port the owner confirmed (KTD10): the
  * property PORT_PROPERTY, passed in through configure(). With the property
- * unset, or naming a node that does not exist, no NC native call is made at
- * all: a vendor call on a missing UART segfaulted the launcher
+ * unset, or naming a node that does not exist, nothing touches a port. No
+ * vendor code runs on the NC path: its calls segfaulted the launcher, first on a
+ * missing UART and then seconds after every open of the real one
  * (docs/solutions/runtime-errors/vendor-dsp-direction-open-segfaults-launcher-miko3.md).
- * The vendor library only configures the port (initNCUART: 115200 8N1 raw;
- * 0 is success, 1 failure). The protocol then runs here in Java on our own
- * streams with a deadline on every reply (KTD11), because the vendor's native
- * reads block forever. Reads never block: buffered bytes are discarded before
+ * stty sets the port to 115200 raw with echo off (KTD11's fallback), and the
+ * protocol runs here in Java on our own streams with a deadline on every reply. Reads never block: buffered bytes are discarded before
  * each query, and the reply is polled with available() until it is in or the
  * deadline passes. Three misses in a row close the NC backend for the life of
  * the process. The raw value becomes signed degrees only once the calibration
@@ -61,8 +59,8 @@ public final class VoiceDirection {
     public static final String ZERO_PROPERTY = "persist.miko3.voice_dir.zero";
     public static final String SIGN_PROPERTY = "persist.miko3.voice_dir.sign";
     public static final String SCALE_PROPERTY = "persist.miko3.voice_dir.scale";
-    /** The vendor's NC buffer size (DSPSettings.openNCUART). */
-    static final int NC_BUFFER = 500;
+    /** How long stty may take to configure the port. */
+    static final long STTY_TIMEOUT_MS = 2000;
     /** How long a query waits for its reply, and how often it looks. */
     static final long REPLY_DEADLINE_MS = 80;
     static final long POLL_MS = 2;
@@ -101,11 +99,11 @@ public final class VoiceDirection {
         void log(String msg);
     }
 
-    /** The vendor calls the NC path makes: they only allocate and configure the port. */
-    interface NcNative {
-        long createUART(int buffer, String node);
-
-        int initNCUART(long handle);
+    /** Sets the port to 115200 raw with echo off; 0 is success. No vendor code: with the
+     * vendor's createUART/initNCUART in the process the launcher segfaulted seconds after
+     * every chip open on the robot (2026-09-29). */
+    interface PortSetup {
+        int configure(String node);
     }
 
     /** Our own streams on the port node. */
@@ -198,31 +196,29 @@ public final class VoiceDirection {
         } catch (Throwable t) {
             why.append("conexant: ").append(t.getClass().getSimpleName());
         }
-        return openNc(cfg, VENDOR, FILES, REPLY_DEADLINE_MS, log, why.append("; "));
+        return openNc(cfg, STTY, FILES, REPLY_DEADLINE_MS, log, why.append("; "));
     }
 
     /** The NC path alone on the given native layer and nodes: the host tests' entry. */
-    static VoiceDirection openWith(Config cfg, NcNative natives, Nodes nodes, long deadlineMs, Logger log) {
-        return openNc(cfg, natives, nodes, deadlineMs, log == null ? QUIET : log, new StringBuilder());
+    static VoiceDirection openWith(Config cfg, PortSetup setup, Nodes nodes, long deadlineMs, Logger log) {
+        return openNc(cfg, setup, nodes, deadlineMs, log == null ? QUIET : log, new StringBuilder());
     }
 
-    private static VoiceDirection openNc(Config cfg, NcNative natives, Nodes nodes, long deadlineMs, Logger log,
+    private static VoiceDirection openNc(Config cfg, PortSetup setup, Nodes nodes, long deadlineMs, Logger log,
                                          StringBuilder why) {
         String node = cfg == null ? "" : cfg.port;
         if (node.isEmpty()) {
             return none(why.append("nc: no ").append(PORT_PROPERTY).toString(), log);
         }
         if (!nodes.exists(node)) {
-            // Without the node, createUART still answers a handle and initNCUART answers 1,
-            // and the next native call segfaults the whole process (seen live 2026-09-28).
+            // A property naming a missing node (the old /dev/ttyMT2 case) opens nothing.
             return none(why.append("nc: no ").append(node).toString(), log);
         }
         Port p = null;
         try {
-            // The vendor call only configures the port; 1 is failure (the old >= 0 check read it as success).
-            int status = natives.initNCUART(natives.createUART(NC_BUFFER, node));
+            int status = setup.configure(node);
             if (status != 0) {
-                return none(why.append("nc init ").append(status).toString(), log);
+                return none(why.append("nc stty ").append(status).toString(), log);
             }
             p = nodes.open(node);
             VoiceDirection d = new VoiceDirection(Backend.NC, "nc on " + node + ", "
@@ -382,25 +378,29 @@ public final class VoiceDirection {
         }
     }
 
-    /** The vendor library, loaded on the first NC call only. */
-    private static final NcNative VENDOR = new NcNative() {
-        private NCDsp nc;
+    /** The stty the port is configured with: 115200 8N1 raw, echo off, no modem control. */
+    static List<String> sttyCommand(String node) {
+        return java.util.Arrays.asList("stty", "-F", node, "115200", "raw", "-echo", "-echoe", "-echok",
+                "cs8", "-cstopb", "-parenb", "clocal", "-crtscts", "-ixon", "-ixoff");
+    }
 
-        private NCDsp nc() {
-            if (nc == null) {
-                nc = new NCDsp();
+    /** The real port setup: runs stty, waits up to STTY_TIMEOUT_MS for it. */
+    private static final PortSetup STTY = new PortSetup() {
+        @Override
+        public int configure(String node) {
+            try {
+                Process p = new ProcessBuilder(sttyCommand(node)).redirectErrorStream(true).start();
+                if (!p.waitFor(STTY_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    p.destroy();
+                    return -1;
+                }
+                return p.exitValue();
+            } catch (IOException e) {
+                return -2;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return -3;
             }
-            return nc;
-        }
-
-        @Override
-        public long createUART(int buffer, String node) {
-            return nc().createUART(buffer, node);
-        }
-
-        @Override
-        public int initNCUART(long handle) {
-            return nc().initNCUART(handle);
         }
     };
 

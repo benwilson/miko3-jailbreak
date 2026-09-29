@@ -41,7 +41,6 @@ public final class NcFramesHarness {
         return out;
     }
 
-    /** A 38-byte reply with reporting on and raw value raw at byte 0x21. */
     /** A 19-byte reply frame as the chip sends it (seen on the robot, 2026-09-29): XXUB,
      * six header bytes, CRC32 LE over the first 10, then a 5-byte payload. */
     static byte[] frame(int module, int op, int h6, int h7, int h8, int h9, int p0) {
@@ -87,20 +86,17 @@ public final class NcFramesHarness {
 
     // ---- fakes ----
 
-    static final class FakeNative implements VoiceDirection.NcNative {
+    /** The port setup (stty): counts calls, answers initStatus (0 = configured). */
+    static final class FakeNative implements VoiceDirection.PortSetup {
         int creates;
         int inits;
         int initStatus;
         String node;
 
-        public long createUART(int buffer, String path) {
+        public int configure(String path) {
             creates++;
-            node = path;
-            return 42;
-        }
-
-        public int initNCUART(long handle) {
             inits++;
+            node = path;
             return initStatus;
         }
     }
@@ -351,14 +347,14 @@ public final class NcFramesHarness {
                         "backend=" + d.backend() + " creates=" + nat.creates + " detail=" + d.detail());
             }
         });
-        scenario("init_returning_one_is_none", new Scenario() {
+        scenario("a_failed_stty_is_none", new Scenario() {
             public void run(String n) {
                 FakeNative nat = new FakeNative();
                 nat.initStatus = 1;
                 FakeNodes nodes = new FakeNodes(new FakePort(steady(100)), PORT);
                 VoiceDirection d = open(uncalibrated(), nat, nodes, new Lines());
                 check(n, d.backend() == VoiceDirection.Backend.NONE && nat.inits == 1 && nodes.opens == 0
-                                && PORT.equals(nat.node) && d.detail().contains("init 1"),
+                                && PORT.equals(nat.node) && d.detail().contains("stty 1"),
                         "backend=" + d.backend() + " opens=" + nodes.opens + " detail=" + d.detail());
             }
         });
@@ -608,6 +604,16 @@ public final class NcFramesHarness {
                 check(n, startMs < 20 && whileBlocked == 0 && after > 0
                                 && "voice-direction".equals(openedOn[0]),
                         "start=" + startMs + "ms blocked=" + whileBlocked + " after=" + after + " on=" + openedOn[0]);
+            }
+        });
+        scenario("stty_setup_sets_115200_raw_without_echo", new Scenario() {
+            public void run(String n) {
+                java.util.List<String> cmd = VoiceDirection.sttyCommand("/dev/ttyS1");
+                String joined = String.join(" ", cmd);
+                check(n, cmd.contains("-F") && cmd.contains("/dev/ttyS1") && cmd.contains("115200")
+                                && cmd.contains("raw") && cmd.contains("-echo") && cmd.contains("clocal")
+                                && !joined.contains(">"),
+                        joined);
             }
         });
         scenario("config_reads_port_and_calibration", new Scenario() {
