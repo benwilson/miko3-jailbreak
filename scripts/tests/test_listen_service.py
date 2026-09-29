@@ -728,7 +728,7 @@ class BuildScriptTest(unittest.TestCase):
         self.assertTrue(raw, "VoiceDirection.java missing")
         self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
         src = _strip_comments(raw)
-        for needle in ("enum Backend", "NONE", "CONEXANT", "NC", "getDSPRawDOA(", "NcFrames.doaQuery(",
+        for needle in ("enum Backend", "NONE", "CONEXANT", "NC", "getDSPRawDOA(", "NcFrames.parseStream(",
                        "initDSPComm(", "stty"):
             self.assertIn(needle, src)
         # KTD4: the angle is sampled on its own thread at a caller-set cadence.
@@ -763,6 +763,20 @@ class BuildScriptTest(unittest.TestCase):
                             "getFWVersion("):
             self.assertNotIn(vendor_call, src)
         self.assertIn("new File(path).exists()", src)
+        # 2026-09-29: the chip streams a direction frame a second by itself, so the NC path
+        # only reads: no GET, no toggle, no write of any kind on the port.
+        for gone in ("doaQuery(", "doaToggle(", "parseDoa("):
+            self.assertNotIn(gone, src)
+        files_at = src.find("Nodes FILES")
+        files_end = src.find("public Sampler sample(", files_at)
+        self.assertGreater(files_at, 0, "the real node implementation moved")
+        nc_path = src[:files_at] + src[files_end:]
+        self.assertNotIn(".write(", nc_path, "the NC path writes to the port")
+        # toybox 0.7.6 stty: `raw` sets icrnl/ixon/ixoff/inpck, so the input flags are zeroed
+        # through the -g string and checked afterwards.
+        self.assertNotIn('"raw"', src)
+        self.assertIn('"-g"', src)
+        self.assertIn("inputFlagsZero(", src)
         # The launcher reads the properties and hands them over before the first open().
         engine = _read(ENGINE)
         for prop in ("PORT_PROPERTY", "ZERO_PROPERTY", "SIGN_PROPERTY", "SCALE_PROPERTY"):

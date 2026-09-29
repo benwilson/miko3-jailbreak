@@ -8,13 +8,19 @@ import java.util.Set;
 
 /**
  * Host harness for the NC direction chip (explore plan U2; KTD10 to KTD12):
- * NcFrames' byte format and calibration, and VoiceDirection's NC backend on a
- * fake native layer and a fake port node. Prints "PASS name" or
+ * NcFrames' stream format and calibration, and VoiceDirection's NC backend on a
+ * fake port setup and a fake port node that streams frames by time, as the chip
+ * does on the robot (2026-09-29). Prints "PASS name" or
  * "FAIL name: detail" per scenario (scripts/tests/test_nc_frames.py).
  */
 public final class NcFramesHarness {
     static final String PORT = "/dev/ttyS1";
-    static final long DEADLINE_MS = 60;
+    /** Frames captured on the robot (2026-09-29), CRCs valid. */
+    static final String RAW_85 = "58585542a30344010500de9c7afe55f64a03c9";
+    static final String RAW_85_NEXT = "58585542a303470105003033cfec55f64a03c9";
+    static final String RAW_50 = "58585542a3038f010500d9f5365f320dbed51a";
+    /** The other frame type, seen once right after vendor setup: module 03, op 02. */
+    static final String OTHER = "58585542030200010500ea6b70ce011bdf05a5";
 
     interface Scenario {
         void run(String n) throws Exception;
@@ -62,26 +68,23 @@ public final class NcFramesHarness {
         return f;
     }
 
-    /** Reporting on, with a direction: the status frame, then the direction frame. */
-    static byte[] onReply(int raw) {
-        byte[] r = new byte[38];
-        System.arraycopy(ackOnly(), 0, r, 0, 19);
-        System.arraycopy(frame(0xa3, 3, 0x8f, 1, 5, 0, raw), 0, r, 19, 19);
-        return r;
+    /** A direction frame with raw value p0 and sequence number seq. */
+    static byte[] direction(int seq, int raw) {
+        return frame(0xa3, 3, seq, 1, 5, 0, raw);
     }
 
-    /** Reporting on, but no direction frame yet (nobody talking): the status frame alone. */
-    static byte[] ackOnly() {
-        return frame(3, 2, 0, 1, 5, 0, 1);
-    }
-
-    /** A 15-byte reply with reporting off (status byte 14 = 0). */
-    static byte[] offReply() {
-        byte[] r = new byte[15];
-        System.arraycopy(hex("58585542"), 0, r, 0, 4);
-        r[4] = 3;
-        r[5] = 1;
-        return r;
+    static byte[] concat(byte[]... parts) {
+        int n = 0;
+        for (byte[] b : parts) {
+            n += b.length;
+        }
+        byte[] out = new byte[n];
+        int at = 0;
+        for (byte[] b : parts) {
+            System.arraycopy(b, 0, out, at, b.length);
+            at += b.length;
+        }
+        return out;
     }
 
     // ---- fakes ----
@@ -101,33 +104,35 @@ public final class NcFramesHarness {
         }
     }
 
-    /** What the fake chip answers to a write: the bytes, and after how long. */
-    interface Chip {
-        byte[] answer(byte[] frame, int writeNo);
-
-        long delayMs(int writeNo);
-    }
-
+    /** A port that streams: bytes fed with a due time become readable once it passes.
+     * Every write is recorded (and must never happen). */
     static final class FakePort implements VoiceDirection.Port {
-        final Chip chip;
+        final long t0 = System.nanoTime();
         final List<byte[]> writes = new ArrayList<byte[]>();
         final List<Byte> pending = new ArrayList<Byte>();
         final List<Long> due = new ArrayList<Long>();
         boolean closed;
-        int flushed;
+        boolean failReads;
 
-        FakePort(Chip chip) {
-            this.chip = chip;
-        }
-
-        synchronized void preload(byte[] bytes) {
+        /** Bytes readable atMs after the port was made; feed in time order. */
+        synchronized FakePort feedAt(long atMs, byte[] bytes) {
+            long at = t0 + atMs * 1000000L;
             for (byte b : bytes) {
                 pending.add(b);
-                due.add(0L);
+                due.add(at);
             }
+            return this;
         }
 
-        public synchronized int available() {
+        /** Bytes readable now. */
+        synchronized FakePort feed(byte[] bytes) {
+            return feedAt((System.nanoTime() - t0) / 1000000L, bytes);
+        }
+
+        public synchronized int available() throws IOException {
+            if (failReads) {
+                throw new IOException("gone");
+            }
             long now = System.nanoTime();
             int n = 0;
             while (n < due.size() && due.get(n) <= now) {
@@ -136,7 +141,7 @@ public final class NcFramesHarness {
             return n;
         }
 
-        public synchronized int read(byte[] b, int off, int len) {
+        public synchronized int read(byte[] b, int off, int len) throws IOException {
             int n = Math.min(len, available());
             for (int i = 0; i < n; i++) {
                 b[off + i] = pending.remove(0);
@@ -146,32 +151,14 @@ public final class NcFramesHarness {
         }
 
         public synchronized void write(byte[] frame) throws IOException {
+            writes.add(frame.clone());
             if (closed) {
                 throw new IOException("closed");
-            }
-            writes.add(frame.clone());
-            byte[] a = chip.answer(frame, writes.size());
-            if (a != null) {
-                long at = System.nanoTime() + chip.delayMs(writes.size()) * 1000000L;
-                for (byte b : a) {
-                    pending.add(b);
-                    due.add(at);
-                }
             }
         }
 
         public synchronized void close() {
             closed = true;
-        }
-
-        synchronized int count(byte[] frame) {
-            int n = 0;
-            for (byte[] w : writes) {
-                if (java.util.Arrays.equals(w, frame)) {
-                    n++;
-                }
-            }
-            return n;
         }
     }
 
@@ -218,17 +205,23 @@ public final class NcFramesHarness {
         }
     }
 
-    /** A chip that answers every GET with raw at once. */
-    static Chip steady(final int raw) {
-        return new Chip() {
-            public byte[] answer(byte[] frame, int writeNo) {
-                return java.util.Arrays.equals(frame, NcFrames.doaQuery()) ? onReply(raw) : null;
-            }
+    /** A port with one direction frame (raw) readable at once. */
+    static FakePort streaming(int raw) {
+        return new FakePort().feedAt(0, direction(1, raw));
+    }
 
-            public long delayMs(int writeNo) {
-                return 0;
+    /** The raw values of every direction frame in buf, and how many bytes the parse consumed. */
+    static List<Integer> raws(byte[] buf, int[] consumed) {
+        final List<Integer> out = new ArrayList<Integer>();
+        int used = NcFrames.parseStream(buf, buf.length, new NcFrames.Sink() {
+            public void direction(byte[] b, int at, int raw) {
+                out.add(raw);
             }
-        };
+        });
+        if (consumed != null) {
+            consumed[0] = used;
+        }
+        return out;
     }
 
     static VoiceDirection.Config uncalibrated() {
@@ -236,7 +229,7 @@ public final class NcFramesHarness {
     }
 
     static VoiceDirection open(VoiceDirection.Config cfg, FakeNative nat, FakeNodes nodes, Lines log) {
-        return VoiceDirection.openWith(cfg, nat, nodes, DEADLINE_MS, log);
+        return VoiceDirection.openWith(cfg, nat, nodes, VoiceDirection.FIRST_FRAME_MS, VoiceDirection.FRESH_MS, log);
     }
 
     static boolean near(float a, float b) {
@@ -244,49 +237,164 @@ public final class NcFramesHarness {
     }
 
     public static void main(String[] args) {
-        scenario("query_frame_matches_the_decoded_bytes", new Scenario() {
+        scenario("robot_frames_parse_to_85_and_50_and_the_03_02_frame_is_ignored", new Scenario() {
             public void run(String n) {
-                byte[] q = NcFrames.doaQuery();
-                check(n, java.util.Arrays.equals(q, hex("58585542 03 01 03 000000 a620d0e7"))
-                                && java.util.Arrays.equals(NcFrames.request(3, 1, 3), q),
-                        "got " + NcFrames.hex(q, q.length));
+                List<Integer> a = raws(hex(RAW_85), null);
+                List<Integer> b = raws(hex(RAW_85_NEXT), null);
+                List<Integer> c = raws(hex(RAW_50), null);
+                int[] used = new int[1];
+                List<Integer> other = raws(hex(OTHER), used);
+                List<Integer> mixed = raws(hex(OTHER + RAW_50), null);
+                check(n, a.equals(java.util.Arrays.asList(85)) && b.equals(java.util.Arrays.asList(85))
+                                && c.equals(java.util.Arrays.asList(50)) && other.isEmpty() && used[0] == 19
+                                && mixed.equals(java.util.Arrays.asList(50)),
+                        "a=" + a + " b=" + b + " c=" + c + " other=" + other + " mixed=" + mixed);
             }
         });
-        scenario("toggle_frame_matches_the_decoded_bytes", new Scenario() {
+        scenario("junk_a_torn_frame_and_a_bad_crc_are_skipped", new Scenario() {
             public void run(String n) {
-                byte[] t = NcFrames.doaToggle();
-                check(n, java.util.Arrays.equals(t, hex("58585542 03 03 02 000000 a314ac25")),
-                        "got " + NcFrames.hex(t, t.length));
+                byte[] bad = hex(RAW_85_NEXT);
+                bad[12] ^= 1;
+                byte[] torn = java.util.Arrays.copyOf(hex(RAW_50), 10);
+                byte[] buf = concat(hex("0102035858"), hex(RAW_85), bad, hex(OTHER), direction(9, 70), torn);
+                int[] used = new int[1];
+                List<Integer> got = raws(buf, used);
+                // Across reads: the torn frame's tail arrives later and completes it.
+                FakePort port = new FakePort().feedAt(0, buf);
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
+                int before = d.lastRaw();
+                port.feed(java.util.Arrays.copyOfRange(hex(RAW_50), 10, 19));
+                d.degrees();
+                check(n, got.equals(java.util.Arrays.asList(85, 70)) && used[0] == buf.length - 10
+                                && d.backend() == VoiceDirection.Backend.NC && before == 70 && d.lastRaw() == 50,
+                        "got=" + got + " used=" + used[0] + "/" + buf.length + " before=" + before
+                                + " after=" + d.lastRaw() + " backend=" + d.backend());
             }
         });
-        scenario("status_on_reply_parses_to_raw_138", new Scenario() {
+        scenario("the_newest_frame_wins", new Scenario() {
             public void run(String n) {
-                byte[] r = onReply(138);
-                int p = NcFrames.parseDoa(r, r.length);
-                check(n, p == 138 && NcFrames.rawOrNaN(r, r.length) == 138f, "parsed " + p);
+                FakePort port = new FakePort().feedAt(0, concat(hex(RAW_85), hex(RAW_50)));
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
+                int first = d.lastRaw();
+                port.feed(concat(direction(10, 60), direction(11, 65), direction(12, 90)));
+                d.degrees();
+                check(n, first == 50 && d.lastRaw() == 90, "first=" + first + " then=" + d.lastRaw());
             }
         });
-        scenario("status_off_reply_reports_off", new Scenario() {
-            public void run(String n) {
-                byte[] r = offReply();
-                int p = NcFrames.parseDoa(r, r.length);
-                check(n, p == NcFrames.OFF && Float.isNaN(NcFrames.rawOrNaN(r, r.length)), "parsed " + p);
+        scenario("a_stale_reading_is_nan_and_a_fresh_one_is_degrees", new Scenario() {
+            public void run(String n) throws Exception {
+                FakePort port = streaming(74);
+                VoiceDirection d = open(VoiceDirection.Config.of(PORT, "10", "-1", "360/256"), new FakeNative(),
+                        new FakeNodes(port, PORT), new Lines());
+                float fresh = d.degrees();
+                Thread.sleep(VoiceDirection.FRESH_MS + 150);
+                float stale = d.degrees();
+                Float boxed = d.angle();
+                port.feed(direction(2, 74));
+                float again = d.degrees();
+                check(n, d.backend() == VoiceDirection.Backend.NC && near(fresh, -90f) && Float.isNaN(stale)
+                                && boxed == null && near(again, -90f) && d.lastRaw() == 74,
+                        "fresh=" + fresh + " stale=" + stale + " again=" + again);
             }
         });
-        scenario("truncated_or_unprefixed_reply_is_nan", new Scenario() {
+        scenario("no_frame_within_first_frame_ms_is_none", new Scenario() {
             public void run(String n) {
-                byte[] on = onReply(138);
-                byte[] bad = onReply(138);
-                bad[0] = 0x59;
-                boolean ok = Float.isNaN(NcFrames.rawOrNaN(on, 37))
-                        && Float.isNaN(NcFrames.rawOrNaN(on, 15))
-                        && Float.isNaN(NcFrames.rawOrNaN(on, 14))
-                        && Float.isNaN(NcFrames.rawOrNaN(bad, bad.length))
-                        && Float.isNaN(NcFrames.rawOrNaN(new byte[0], 0))
-                        && Float.isNaN(NcFrames.rawOrNaN(null, 0))
-                        && NcFrames.parseDoa(on, 20) == NcFrames.MALFORMED
-                        && NcFrames.parseDoa(bad, bad.length) == NcFrames.MALFORMED;
-                check(n, ok, "a malformed reply parsed");
+                // Junk and the other frame type only: no direction frame ever comes.
+                FakePort port = new FakePort().feedAt(0, hex("0102")).feedAt(300, hex(OTHER));
+                Lines log = new Lines();
+                long t0 = System.nanoTime();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), log);
+                long ms = (System.nanoTime() - t0) / 1000000L;
+                check(n, d.backend() == VoiceDirection.Backend.NONE && port.closed
+                                && d.detail().contains("nc: no frames on " + PORT) && d.firstReplyHex() == null
+                                && ms >= VoiceDirection.FIRST_FRAME_MS - 20 && ms < VoiceDirection.FIRST_FRAME_MS + 500
+                                && Float.isNaN(d.degrees()),
+                        "backend=" + d.backend() + " detail=" + d.detail() + " ms=" + ms);
+            }
+        });
+        scenario("a_frame_at_200_ms_opens_nc_with_it_as_the_first_reply", new Scenario() {
+            public void run(String n) {
+                FakePort port = new FakePort().feedAt(100, hex(OTHER)).feedAt(200, hex(RAW_85));
+                long t0 = System.nanoTime();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
+                long ms = (System.nanoTime() - t0) / 1000000L;
+                check(n, d.backend() == VoiceDirection.Backend.NC && RAW_85.equals(d.firstReplyHex())
+                                && d.lastRaw() == 85 && !port.closed && ms >= 150 && ms < 1000,
+                        "backend=" + d.backend() + " first=" + d.firstReplyHex() + " ms=" + ms);
+            }
+        });
+        scenario("the_port_is_never_written_to", new Scenario() {
+            public void run(String n) throws Exception {
+                FakePort port = new FakePort();
+                for (int i = 0; i < 20; i++) {
+                    port.feedAt(50L * i, direction(i, 55 + (i % 8) * 5));
+                }
+                VoiceDirection d = open(VoiceDirection.Config.of(PORT, "10", "1", "1"), new FakeNative(),
+                        new FakeNodes(port, PORT), new Lines());
+                for (int i = 0; i < 20; i++) {
+                    d.degrees();
+                    Thread.sleep(20);
+                }
+                check(n, d.backend() == VoiceDirection.Backend.NC && port.writes.isEmpty(),
+                        "backend=" + d.backend() + " writes=" + port.writes.size());
+            }
+        });
+        scenario("a_read_error_closes_the_backend_and_logs_once", new Scenario() {
+            public void run(String n) {
+                FakePort port = streaming(80);
+                Lines log = new Lines();
+                VoiceDirection d = open(VoiceDirection.Config.of(PORT, "10", "1", "1"), new FakeNative(),
+                        new FakeNodes(port, PORT), log);
+                boolean wasNc = d.backend() == VoiceDirection.Backend.NC;
+                port.failReads = true;
+                boolean nan = true;
+                for (int i = 0; i < 3; i++) {
+                    nan &= Float.isNaN(d.degrees());
+                }
+                check(n, wasNc && nan && d.backend() == VoiceDirection.Backend.NONE && port.closed
+                                && log.count("nc read failed") == 1,
+                        "wasNc=" + wasNc + " backend=" + d.backend() + " log=" + log.lines);
+            }
+        });
+        scenario("stty_input_flags_are_zeroed_from_the_g_string", new Scenario() {
+            public void run(String n) {
+                String g = "ffffff14:0:18b2:0:0:0:0:0:0:0:1:0:0:0:0:0:0:0:0:0:0:0:0";
+                String z = VoiceDirection.zeroInputFlags(g);
+                String zn = VoiceDirection.zeroInputFlags(g + "\n");
+                boolean ok = "0:0:18b2:0:0:0:0:0:0:0:1:0:0:0:0:0:0:0:0:0:0:0:0".equals(z) && z.equals(zn)
+                        && VoiceDirection.inputFlagsZero(z) && VoiceDirection.inputFlagsZero(z + "\n")
+                        && !VoiceDirection.inputFlagsZero(g)
+                        && VoiceDirection.zeroInputFlags(null) == null
+                        && VoiceDirection.zeroInputFlags("") == null
+                        && VoiceDirection.zeroInputFlags("ff:0:18b2") == null
+                        && VoiceDirection.zeroInputFlags("ff:zz:18b2:0") == null
+                        && VoiceDirection.zeroInputFlags("ff::18b2:0") == null
+                        && VoiceDirection.zeroInputFlags("stty: /dev/ttyS1: No such file") == null
+                        && !VoiceDirection.inputFlagsZero(null)
+                        && !VoiceDirection.inputFlagsZero("0:0")
+                        && !VoiceDirection.inputFlagsZero("0:zz:1:2")
+                        && !VoiceDirection.inputFlagsZero("00:0:18b2:0");
+                check(n, ok, "z=" + z);
+            }
+        });
+        scenario("stty_setup_sets_115200_8n1_without_echo_or_the_raw_keyword", new Scenario() {
+            // toybox 0.7.6 stty's `raw` sets icrnl/ixon/ixoff/inpck and cannot clear them by
+            // flag (robot, 2026-09-29): the input flags are zeroed through -g instead.
+            public void run(String n) {
+                java.util.List<String> cmd = VoiceDirection.sttyCommand("/dev/ttyS1");
+                String joined = String.join(" ", cmd);
+                java.util.List<String> read = VoiceDirection.sttyReadCommand("/dev/ttyS1");
+                java.util.List<String> write = VoiceDirection.sttyWriteCommand("/dev/ttyS1", "0:0:18b2:0");
+                boolean ok = cmd.subList(0, 3).equals(java.util.Arrays.asList("stty", "-F", "/dev/ttyS1"));
+                for (String f : new String[]{"115200", "cs8", "-cstopb", "-parenb", "clocal", "-crtscts", "-hupcl",
+                        "-opost", "-isig", "-icanon", "-iexten", "-echo", "-echoe", "-echok", "-echonl"}) {
+                    ok &= cmd.contains(f);
+                }
+                check(n, ok && !cmd.contains("raw") && !cmd.contains("-ixon") && !cmd.contains("-icrnl")
+                                && !joined.contains(">")
+                                && read.equals(java.util.Arrays.asList("stty", "-F", "/dev/ttyS1", "-g"))
+                                && write.equals(java.util.Arrays.asList("stty", "-F", "/dev/ttyS1", "0:0:18b2:0")),
+                        joined + " | " + read + " | " + write);
             }
         });
         scenario("calibration_maps_raw_to_signed_degrees", new Scenario() {
@@ -321,14 +429,14 @@ public final class NcFramesHarness {
                         && NcFrames.Calibration.parse("x", "1", "1.4") == null
                         && NcFrames.Calibration.parse("10", "1", "1/0") == null
                         && Float.isNaN(NcFrames.degrees(74, null))
-                        && Float.isNaN(NcFrames.degrees(NcFrames.OFF, NcFrames.Calibration.parse("10", "1", "1")));
+                        && Float.isNaN(NcFrames.degrees(-1, NcFrames.Calibration.parse("10", "1", "1")));
                 check(n, ok, "an uncalibrated mapping gave an angle");
             }
         });
         scenario("unset_port_is_none_with_no_native_call", new Scenario() {
             public void run(String n) {
                 FakeNative nat = new FakeNative();
-                FakeNodes nodes = new FakeNodes(new FakePort(steady(100)), PORT);
+                FakeNodes nodes = new FakeNodes(streaming(100), PORT);
                 VoiceDirection d = open(VoiceDirection.Config.of("", "10", "1", "1"), nat, nodes, new Lines());
                 VoiceDirection d2 = open(VoiceDirection.Config.of(null, "10", "1", "1"), nat, nodes, new Lines());
                 check(n, d.backend() == VoiceDirection.Backend.NONE && d2.backend() == VoiceDirection.Backend.NONE
@@ -340,7 +448,7 @@ public final class NcFramesHarness {
         scenario("missing_node_is_none_with_no_native_call", new Scenario() {
             public void run(String n) {
                 FakeNative nat = new FakeNative();
-                FakeNodes nodes = new FakeNodes(new FakePort(steady(100)));
+                FakeNodes nodes = new FakeNodes(streaming(100));
                 VoiceDirection d = open(uncalibrated(), nat, nodes, new Lines());
                 check(n, d.backend() == VoiceDirection.Backend.NONE && nat.creates == 0 && nat.inits == 0
                                 && nodes.opens == 0 && d.detail().contains(PORT),
@@ -351,7 +459,7 @@ public final class NcFramesHarness {
             public void run(String n) {
                 FakeNative nat = new FakeNative();
                 nat.initStatus = 1;
-                FakeNodes nodes = new FakeNodes(new FakePort(steady(100)), PORT);
+                FakeNodes nodes = new FakeNodes(streaming(100), PORT);
                 VoiceDirection d = open(uncalibrated(), nat, nodes, new Lines());
                 check(n, d.backend() == VoiceDirection.Backend.NONE && nat.inits == 1 && nodes.opens == 0
                                 && PORT.equals(nat.node) && d.detail().contains("stty 1"),
@@ -361,231 +469,50 @@ public final class NcFramesHarness {
         scenario("confirmed_port_opens_nc_and_reports_calibrated_degrees", new Scenario() {
             public void run(String n) {
                 FakeNative nat = new FakeNative();
-                FakePort port = new FakePort(steady(74));
+                FakePort port = streaming(74);
                 VoiceDirection d = open(VoiceDirection.Config.of(PORT, "10", "-1", "360/256"), nat,
                         new FakeNodes(port, PORT), new Lines());
                 float a = d.degrees();
                 Float boxed = d.angle();
                 check(n, d.backend() == VoiceDirection.Backend.NC && near(a, -90f) && boxed != null
-                                && near(boxed, -90f) && d.lastRaw() == 74 && port.count(NcFrames.doaToggle()) == 0,
+                                && near(boxed, -90f) && d.lastRaw() == 74 && nat.inits == 1,
                         "backend=" + d.backend() + " a=" + a + " detail=" + d.detail());
             }
         });
         scenario("uncalibrated_nc_gives_nan_but_keeps_the_raw_value", new Scenario() {
             public void run(String n) {
-                FakePort port = new FakePort(steady(138));
-                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
+                FakePort port = streaming(138);
+                Lines log = new Lines();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), log);
                 float a = d.degrees();
+                d.degrees();
                 check(n, d.backend() == VoiceDirection.Backend.NC && Float.isNaN(a) && d.angle() == null
-                                && d.lastRaw() == 138,
-                        "backend=" + d.backend() + " a=" + a + " raw=" + d.lastRaw());
+                                && d.lastRaw() == 138 && log.count("voice direction: nc raw 138 (uncalibrated)") == 1,
+                        "backend=" + d.backend() + " a=" + a + " raw=" + d.lastRaw() + " log=" + log.lines);
             }
         });
-        scenario("status_off_toggles_once_per_open", new Scenario() {
+        scenario("first_frames_are_logged_in_hex", new Scenario() {
             public void run(String n) {
-                FakePort port = new FakePort(new Chip() {
-                    public byte[] answer(byte[] frame, int writeNo) {
-                        return java.util.Arrays.equals(frame, NcFrames.doaQuery()) ? offReply() : null;
-                    }
-
-                    public long delayMs(int writeNo) {
-                        return 0;
-                    }
-                });
-                VoiceDirection d = open(VoiceDirection.Config.of(PORT, "10", "1", "1"), new FakeNative(),
-                        new FakeNodes(port, PORT), new Lines());
-                boolean nan = true;
-                for (int i = 0; i < 5; i++) {
-                    nan &= Float.isNaN(d.degrees());
-                }
-                check(n, d.backend() == VoiceDirection.Backend.NC && nan && port.count(NcFrames.doaToggle()) == 1
-                                && d.backend() == VoiceDirection.Backend.NC,
-                        "backend=" + d.backend() + " toggles=" + port.count(NcFrames.doaToggle()));
-            }
-        });
-        scenario("a_status_on_reply_never_toggles", new Scenario() {
-            public void run(String n) {
-                FakePort port = new FakePort(steady(20));
-                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
-                for (int i = 0; i < 3; i++) {
-                    d.degrees();
-                }
-                check(n, port.count(NcFrames.doaToggle()) == 0, "toggles=" + port.count(NcFrames.doaToggle()));
-            }
-        });
-        scenario("silent_node_returns_nan_within_the_deadline", new Scenario() {
-            public void run(String n) {
-                // Answers the opening GET, then nothing until write 4, which answers again.
-                FakePort port = new FakePort(new Chip() {
-                    public byte[] answer(byte[] frame, int writeNo) {
-                        return writeNo == 1 ? onReply(90) : writeNo == 4 ? onReply(91) : null;
-                    }
-
-                    public long delayMs(int writeNo) {
-                        return 0;
-                    }
-                });
-                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
-                long t0 = System.nanoTime();
-                float a = d.degrees();
-                long ms = (System.nanoTime() - t0) / 1000000L;
-                long t1 = System.nanoTime();
-                float b = d.degrees();
-                long ms2 = (System.nanoTime() - t1) / 1000000L;
-                d.degrees();
-                int raw = d.lastRaw();
-                check(n, Float.isNaN(a) && Float.isNaN(b) && ms >= DEADLINE_MS - 5 && ms < DEADLINE_MS + 40
-                                && ms2 < DEADLINE_MS + 40 && raw == 91 && d.backend() == VoiceDirection.Backend.NC,
-                        "a=" + a + " took " + ms + " ms, then " + ms2 + " ms, raw=" + raw);
-            }
-        });
-        scenario("stale_bytes_are_discarded_before_the_next_get", new Scenario() {
-            public void run(String n) throws Exception {
-                // Write 2's reply lands after the deadline (a late 50); write 3 answers 138 at once.
-                FakePort port = new FakePort(new Chip() {
-                    public byte[] answer(byte[] frame, int writeNo) {
-                        return onReply(writeNo == 2 ? 50 : 138);
-                    }
-
-                    public long delayMs(int writeNo) {
-                        return writeNo == 2 ? DEADLINE_MS + 40 : 0;
-                    }
-                });
-                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
-                d.degrees(); // write 2: misses its deadline
-                Thread.sleep(DEADLINE_MS + 80); // its 38 bytes are now buffered
-                boolean stale = port.available() == 38;
-                port.preload(new byte[]{1, 2, 3}); // and some line noise behind them
-                d.degrees(); // write 3
-                check(n, stale && d.lastRaw() == 138 && port.available() == 0,
-                        "stale=" + stale + " raw=" + d.lastRaw() + " left=" + port.available());
-            }
-        });
-        scenario("three_misses_close_the_backend", new Scenario() {
-            public void run(String n) {
-                FakePort port = new FakePort(new Chip() {
-                    public byte[] answer(byte[] frame, int writeNo) {
-                        return writeNo == 1 ? onReply(90) : null;
-                    }
-
-                    public long delayMs(int writeNo) {
-                        return 0;
-                    }
-                });
-                Lines log = new Lines();
-                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), log);
-                for (int i = 0; i < 3; i++) {
-                    d.degrees();
-                }
-                int writes = port.writes.size();
-                long t0 = System.nanoTime();
-                float a = d.degrees();
-                d.degrees();
-                long ms = (System.nanoTime() - t0) / 1000000L;
-                check(n, writes == 4 && port.writes.size() == 4 && Float.isNaN(a) && ms < 10 && port.closed
-                                && log.count("closed") == 1 && d.backend() == VoiceDirection.Backend.NONE,
-                        "writes=" + port.writes.size() + " ms=" + ms + " closed=" + port.closed + " log=" + log.lines);
-            }
-        });
-        scenario("a_reply_resets_the_miss_count", new Scenario() {
-            public void run(String n) {
-                FakePort port = new FakePort(new Chip() {
-                    public byte[] answer(byte[] frame, int writeNo) {
-                        return writeNo == 1 || writeNo == 4 ? onReply(90) : null;
-                    }
-
-                    public long delayMs(int writeNo) {
-                        return 0;
-                    }
-                });
-                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
-                for (int i = 0; i < 4; i++) {
-                    d.degrees(); // miss, miss, answer, miss
-                }
-                check(n, !port.closed && d.backend() == VoiceDirection.Backend.NC, "closed after non-consecutive misses");
-            }
-        });
-        scenario("silent_node_at_open_is_none", new Scenario() {
-            public void run(String n) {
-                FakePort port = new FakePort(new Chip() {
-                    public byte[] answer(byte[] frame, int writeNo) {
-                        return null;
-                    }
-
-                    public long delayMs(int writeNo) {
-                        return 0;
-                    }
-                });
-                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
-                check(n, d.backend() == VoiceDirection.Backend.NONE && port.closed && d.detail().contains("no reply"),
-                        "backend=" + d.backend() + " detail=" + d.detail());
-            }
-        });
-        scenario("first_raw_replies_are_logged_in_hex", new Scenario() {
-            public void run(String n) {
-                FakePort port = new FakePort(steady(138));
+                FakePort port = new FakePort().feedAt(0, hex(RAW_85));
                 Lines log = new Lines();
                 VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), log);
                 for (int i = 0; i < 10; i++) {
+                    port.feed(direction(i, 60));
                     d.degrees();
                 }
-                byte[] r = onReply(138);
-                String h = NcFrames.hex(r, r.length);
-                String first = d.firstReplyHex();
-                check(n, h.startsWith("58585542") && h.equals(first) && log.count(h) >= 1
-                                && log.count(h) <= VoiceDirection.LOGGED_REPLIES,
-                        "first=" + first + " logged=" + log.count(h));
-            }
-        });
-        scenario("the_reply_captured_on_the_robot_parses_to_raw_50", new Scenario() {
-            public void run(String n) {
-                byte[] r = hex("58585542030200010500ea6b70ce011bdf05a5" + "58585542a3038f010500d9f5365f320dbed51a");
-                byte[] ack = hex("58585542030200010500ea6b70ce011bdf05a5");
-                check(n, NcFrames.parseDoa(r, r.length) == 50
-                                && NcFrames.parseDoa(ack, ack.length) == NcFrames.NO_READING,
-                        "full=" + NcFrames.parseDoa(r, r.length) + " ack=" + NcFrames.parseDoa(ack, ack.length));
-            }
-        });
-        scenario("a_frame_with_a_bad_crc_is_malformed", new Scenario() {
-            public void run(String n) {
-                byte[] r = onReply(50);
-                r[12] ^= 1;
-                byte[] d = onReply(50);
-                d[19 + 12] ^= 1;
-                check(n, NcFrames.parseDoa(r, r.length) == NcFrames.MALFORMED
-                                && NcFrames.parseDoa(d, d.length) == NcFrames.MALFORMED,
-                        "status=" + NcFrames.parseDoa(r, r.length) + " doa=" + NcFrames.parseDoa(d, d.length));
-            }
-        });
-        scenario("a_quiet_room_is_no_reading_never_a_miss", new Scenario() {
-            // Seen on the robot (2026-09-29): with nobody talking the chip answers the status
-            // frame alone, and three of those closed the backend for the life of the process.
-            public void run(String n) {
-                FakePort port = new FakePort(new Chip() {
-                    public byte[] answer(byte[] frame, int writeNo) {
-                        return java.util.Arrays.equals(frame, NcFrames.doaQuery()) ? ackOnly() : null;
-                    }
-
-                    public long delayMs(int writeNo) {
-                        return 0;
-                    }
-                });
-                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
-                for (int i = 0; i < 10; i++) {
-                    d.degrees();
-                }
-                check(n, d.backend() == VoiceDirection.Backend.NC && Float.isNaN(d.degrees()),
-                        "backend=" + d.backend());
+                check(n, RAW_85.equals(d.firstReplyHex()) && log.count("voice direction: nc frame " + RAW_85) == 1
+                                && log.count("voice direction: nc frame ") == VoiceDirection.LOGGED_FRAMES,
+                        "first=" + d.firstReplyHex() + " log=" + log.lines);
             }
         });
         scenario("lazy_sampler_opens_on_its_own_thread_and_never_blocks_the_caller", new Scenario() {
             // Review P1 (2026-09-29): the first open ran on the ears capture thread holding
-            // feedLock, so a tty that blocked on open or write would stall the ears.
+            // feedLock, so a tty that blocked on open or read would stall the ears.
             public void run(String n) throws Exception {
                 final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
                 final String[] openedOn = new String[1];
                 final VoiceDirection ready = open(uncalibrated(), new FakeNative(),
-                        new FakeNodes(new FakePort(steady(138)), PORT), new Lines());
+                        new FakeNodes(streaming(138), PORT), new Lines());
                 long t0 = System.nanoTime();
                 VoiceDirection.Sampler s = VoiceDirection.sampleLazily(20, new java.util.concurrent.Callable<VoiceDirection>() {
                     public VoiceDirection call() throws Exception {
@@ -604,16 +531,6 @@ public final class NcFramesHarness {
                 check(n, startMs < 20 && whileBlocked == 0 && after > 0
                                 && "voice-direction".equals(openedOn[0]),
                         "start=" + startMs + "ms blocked=" + whileBlocked + " after=" + after + " on=" + openedOn[0]);
-            }
-        });
-        scenario("stty_setup_sets_115200_raw_without_echo", new Scenario() {
-            public void run(String n) {
-                java.util.List<String> cmd = VoiceDirection.sttyCommand("/dev/ttyS1");
-                String joined = String.join(" ", cmd);
-                check(n, cmd.contains("-F") && cmd.contains("/dev/ttyS1") && cmd.contains("115200")
-                                && cmd.contains("raw") && cmd.contains("-echo") && cmd.contains("clocal")
-                                && !joined.contains(">"),
-                        joined);
             }
         });
         scenario("config_reads_port_and_calibration", new Scenario() {

@@ -1,12 +1,15 @@
 """Host-side tests for the NC direction chip (explore plan U2; R7, R8, KTD10
 to KTD12).
 
-NcFrames (the 14-byte request frames, reply parsing, the calibration from raw
-0 to 255 to signed degrees) and VoiceDirection's NC backend run under a JVM
-harness with a fake native layer and a fake port node, so the gating (the
-confirmed-port property, the node, initNCUART's 0 = success), the reply
-deadline, the stale-byte flush, the one toggle per open and the three-miss
-close are all proven without the robot or the vendor library.
+The chip streams one 19-byte direction frame a second by itself (robot,
+2026-09-29). NcFrames (the stream parse, the calibration from raw 0 to 255 to
+signed degrees) and VoiceDirection's NC backend run under a JVM harness with a
+fake port setup and a fake port node that streams frames by time, so the gating
+(the confirmed-port property, the node, stty's 0 = success), the first-frame
+wait at open, the freshness window, the skipping of junk, torn and bad-CRC
+frames, the close on a read error, and that the port is never written to are
+all proven without the robot. The stty -g input-flag rewrite (toybox 0.7.6
+cannot clear icrnl/ixon/ixoff/inpck by flag) is checked as pure functions.
 """
 import subprocess
 import sys
@@ -29,32 +32,26 @@ FRAMES = SHARED / "NcFrames.java"
 
 class NcFramesHarnessTest(unittest.TestCase):
     SCENARIOS = (
-        "query_frame_matches_the_decoded_bytes",
-        "toggle_frame_matches_the_decoded_bytes",
-        "status_on_reply_parses_to_raw_138",
-        "status_off_reply_reports_off",
-        "truncated_or_unprefixed_reply_is_nan",
+        "robot_frames_parse_to_85_and_50_and_the_03_02_frame_is_ignored",
+        "junk_a_torn_frame_and_a_bad_crc_are_skipped",
+        "the_newest_frame_wins",
+        "a_stale_reading_is_nan_and_a_fresh_one_is_degrees",
+        "no_frame_within_first_frame_ms_is_none",
+        "a_frame_at_200_ms_opens_nc_with_it_as_the_first_reply",
+        "the_port_is_never_written_to",
+        "a_read_error_closes_the_backend_and_logs_once",
+        "stty_input_flags_are_zeroed_from_the_g_string",
+        "stty_setup_sets_115200_8n1_without_echo_or_the_raw_keyword",
         "calibration_maps_raw_to_signed_degrees",
         "calibration_wraps_to_plus_minus_180",
         "uncalibrated_is_nan",
         "unset_port_is_none_with_no_native_call",
-        "lazy_sampler_opens_on_its_own_thread_and_never_blocks_the_caller",
-        "the_reply_captured_on_the_robot_parses_to_raw_50",
-        "a_frame_with_a_bad_crc_is_malformed",
-        "a_quiet_room_is_no_reading_never_a_miss",
-        "stty_setup_sets_115200_raw_without_echo",
         "missing_node_is_none_with_no_native_call",
         "a_failed_stty_is_none",
         "confirmed_port_opens_nc_and_reports_calibrated_degrees",
         "uncalibrated_nc_gives_nan_but_keeps_the_raw_value",
-        "status_off_toggles_once_per_open",
-        "a_status_on_reply_never_toggles",
-        "silent_node_returns_nan_within_the_deadline",
-        "stale_bytes_are_discarded_before_the_next_get",
-        "three_misses_close_the_backend",
-        "a_reply_resets_the_miss_count",
-        "silent_node_at_open_is_none",
-        "first_raw_replies_are_logged_in_hex",
+        "first_frames_are_logged_in_hex",
+        "lazy_sampler_opens_on_its_own_thread_and_never_blocks_the_caller",
         "config_reads_port_and_calibration",
     )
 

@@ -30,17 +30,22 @@ import java.util.concurrent.TimeUnit;
  * vendor code runs on the NC path: its calls segfaulted the launcher, first on a
  * missing UART and then seconds after every open of the real one
  * (docs/solutions/runtime-errors/vendor-dsp-direction-open-segfaults-launcher-miko3.md).
- * stty sets the port to 115200 raw with echo off (KTD11's fallback), and the
- * protocol runs here in Java on our own streams with a deadline on every reply. Reads never block: buffered bytes are discarded before
- * each query, and the reply is polled with available() until it is in or the
- * deadline passes. Three misses in a row close the NC backend for the life of
- * the process. The raw value becomes signed degrees only once the calibration
+ *
+ * Verified on the robot (2026-09-29): the chip streams one direction frame a
+ * second by itself (NcFrames), so the NC backend only reads; it never writes to
+ * the port. stty sets the port to 115200 8N1 with echo and line discipline off,
+ * and because toybox 0.7.6 stty cannot clear icrnl/ixon/ixoff/inpck by flag (and
+ * its `raw` sets them) the input flags are zeroed by writing back the -g string
+ * with its first field set to 0, then checked. open() waits up to FIRST_FRAME_MS
+ * for the first direction frame; each read drains what is buffered without
+ * blocking, keeps the newest raw value and when it came, and a reading older
+ * than FRESH_MS gives no angle. A read error closes the NC backend for the life
+ * of the process. The raw value becomes signed degrees only once the calibration
  * properties are set (KTD12); until then the angle is NaN.
  *
  * The angle is meant to be sampled at a caller-set cadence on its own thread
  * (sample()), never from the capture thread, and reduced to a median over an
- * utterance rather than read once at its endpoint. Beyond turning DOA
- * reporting on once when the chip says it is off, nothing here sets DSP modes
+ * utterance rather than read once at its endpoint. Nothing here sets DSP modes
  * or gains.
  *
  * Plain Java with no android.* imports. On a host JVM the stubs' static
@@ -59,17 +64,18 @@ public final class VoiceDirection {
     public static final String ZERO_PROPERTY = "persist.miko3.voice_dir.zero";
     public static final String SIGN_PROPERTY = "persist.miko3.voice_dir.sign";
     public static final String SCALE_PROPERTY = "persist.miko3.voice_dir.scale";
-    /** How long stty may take to configure the port. */
+    /** How long each stty run may take. */
     static final long STTY_TIMEOUT_MS = 2000;
-    /** How long a query waits for its reply, and how often it looks. */
-    static final long REPLY_DEADLINE_MS = 80;
-    static final long POLL_MS = 2;
-    /** Misses in a row that close the NC backend. */
-    static final int MAX_MISSES = 3;
-    /** How many raw replies are logged in full (hex), so the robot session can place the reply CRC. */
-    static final int LOGGED_REPLIES = 3;
-    /** The DOA GET frame, built once; Port.write only reads it. */
-    private static final byte[] DOA_QUERY = NcFrames.doaQuery();
+    /** How long open() waits for the first direction frame (the chip sends one a second). */
+    static final long FIRST_FRAME_MS = 1500;
+    /** How old the newest reading may be and still give an angle. */
+    static final long FRESH_MS = 1500;
+    /** How often open() looks for the first frame. */
+    static final long POLL_MS = 10;
+    /** The rolling read buffer; the parse leaves at most one torn frame in it between reads. */
+    static final int BUFFER_BYTES = 512;
+    /** How many direction frames are logged in full (hex). */
+    static final int LOGGED_FRAMES = 3;
     /** While uncalibrated, a raw value is logged at most this often, for calibration. */
     static final long RAW_LOG_PERIOD_MS = 1000;
 
@@ -99,14 +105,14 @@ public final class VoiceDirection {
         void log(String msg);
     }
 
-    /** Sets the port to 115200 raw with echo off; 0 is success. No vendor code: with the
-     * vendor's createUART/initNCUART in the process the launcher segfaulted seconds after
-     * every chip open on the robot (2026-09-29). */
+    /** Sets the port to 115200 8N1 with echo off and input flags 0; 0 is success. No vendor
+     * code: with the vendor's createUART/initNCUART in the process the launcher segfaulted
+     * seconds after every chip open on the robot (2026-09-29). */
     interface PortSetup {
         int configure(String node);
     }
 
-    /** Our own streams on the port node. */
+    /** Our own streams on the port node. The NC backend only reads (the chip streams). */
     interface Port {
         int available() throws IOException;
 
@@ -137,27 +143,32 @@ public final class VoiceDirection {
     private final String detail;
     private final ConexantDSP cx;
     private final Logger log;
-    // The NC backend's state; query() and its helpers hold this.
+    // The NC backend's state; drain() and its callers hold this.
     private final Port port;
     private final NcFrames.Calibration calibration;
-    private final long deadlineMs;
-    private final byte[] reply = new byte[NcFrames.LONG_REPLY];
-    private final byte[] sink = new byte[64];
-    private boolean toggled;
-    private int misses;
+    private final long freshNs;
+    private final byte[] buf = new byte[BUFFER_BYTES];
+    private int have;
     private int logged;
     private int lastRaw = -1;
+    private long lastRawAt;
     private String firstReplyHex;
     private long rawLoggedAt;
+    private final NcFrames.Sink frames = new NcFrames.Sink() {
+        @Override
+        public void direction(byte[] b, int at, int raw) {
+            onFrame(b, at, raw);
+        }
+    };
 
     private VoiceDirection(Backend backend, String detail, ConexantDSP cx, Port port,
-                           NcFrames.Calibration calibration, long deadlineMs, Logger log) {
+                           NcFrames.Calibration calibration, long freshMs, Logger log) {
         this.backend = backend;
         this.detail = detail;
         this.cx = cx;
         this.port = port;
         this.calibration = calibration;
-        this.deadlineMs = deadlineMs;
+        this.freshNs = freshMs * 1000000L;
         this.log = log;
     }
 
@@ -196,16 +207,17 @@ public final class VoiceDirection {
         } catch (Throwable t) {
             why.append("conexant: ").append(t.getClass().getSimpleName());
         }
-        return openNc(cfg, STTY, FILES, REPLY_DEADLINE_MS, log, why.append("; "));
+        return openNc(cfg, STTY, FILES, FIRST_FRAME_MS, FRESH_MS, log, why.append("; "));
     }
 
-    /** The NC path alone on the given native layer and nodes: the host tests' entry. */
-    static VoiceDirection openWith(Config cfg, PortSetup setup, Nodes nodes, long deadlineMs, Logger log) {
-        return openNc(cfg, setup, nodes, deadlineMs, log == null ? QUIET : log, new StringBuilder());
+    /** The NC path alone on the given port setup and nodes: the host tests' entry. */
+    static VoiceDirection openWith(Config cfg, PortSetup setup, Nodes nodes, long firstFrameMs, long freshMs,
+                                   Logger log) {
+        return openNc(cfg, setup, nodes, firstFrameMs, freshMs, log == null ? QUIET : log, new StringBuilder());
     }
 
-    private static VoiceDirection openNc(Config cfg, PortSetup setup, Nodes nodes, long deadlineMs, Logger log,
-                                         StringBuilder why) {
+    private static VoiceDirection openNc(Config cfg, PortSetup setup, Nodes nodes, long firstFrameMs, long freshMs,
+                                         Logger log, StringBuilder why) {
         String node = cfg == null ? "" : cfg.port;
         if (node.isEmpty()) {
             return none(why.append("nc: no ").append(PORT_PROPERTY).toString(), log);
@@ -218,23 +230,32 @@ public final class VoiceDirection {
         try {
             int status = setup.configure(node);
             if (status != 0) {
-                return none(why.append("nc stty ").append(status).toString(), log);
+                return none(why.append("nc stty ").append(status).append(sttyStep(status)).toString(), log);
             }
             p = nodes.open(node);
             VoiceDirection d = new VoiceDirection(Backend.NC, "nc on " + node + ", "
                     + (cfg.calibration == null ? "uncalibrated" : "calibrated"), null, p, cfg.calibration,
-                    deadlineMs, log);
-            synchronized (d) {
-                if (d.query() == NcFrames.MALFORMED) {
-                    p.close();
-                    VoiceDirection silent = none(why.append("nc: no reply on ").append(node).toString(), log);
-                    silent.firstReplyHex = d.firstReplyHex;
-                    return silent;
+                    freshMs, log);
+            // The chip streams a frame a second: wait for the first one without blocking.
+            long deadline = System.nanoTime() + firstFrameMs * 1000000L;
+            while (true) {
+                synchronized (d) {
+                    d.drain();
+                    if (d.lastRaw >= 0) {
+                        return d;
+                    }
                 }
-                d.misses = 0;
+                if (System.nanoTime() >= deadline) {
+                    break;
+                }
+                Thread.sleep(POLL_MS);
             }
-            return d;
+            p.close();
+            return none(why.append("nc: no frames on ").append(node).toString(), log);
         } catch (Throwable t) {
+            if (t instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             if (p != null) {
                 p.close();
             }
@@ -242,7 +263,7 @@ public final class VoiceDirection {
         }
     }
 
-    /** Which backend answered, or NONE (also once the NC backend has closed after misses). */
+    /** Which backend answered, or NONE (also once the NC backend has closed on a read error). */
     public Backend backend() {
         return backend;
     }
@@ -252,18 +273,18 @@ public final class VoiceDirection {
         return detail;
     }
 
-    /** The first raw NC reply in hex (lowercase, no separators), or null when none came. */
+    /** The first NC direction frame in hex (lowercase, no separators), or null when none came. */
     public synchronized String firstReplyHex() {
         return firstReplyHex;
     }
 
-    /** The last raw NC value 0 to 255 read, or -1 when none has been. */
+    /** The newest raw NC value 0 to 255 read, or -1 when none has been. */
     public synchronized int lastRaw() {
         return lastRaw;
     }
 
     /** The direction of arrival in degrees right now, or null when there is no
-     * backend, reporting is off, the chip is uncalibrated or the read failed. */
+     * backend, no fresh reading, the chip is uncalibrated or the read failed. */
     public Float angle() {
         float a = degrees();
         return Float.isNaN(a) ? null : Float.valueOf(a);
@@ -277,7 +298,7 @@ public final class VoiceDirection {
                 case CONEXANT:
                     return cx.getDSPRawDOA();
                 case NC:
-                    return NcFrames.degrees(query(), calibration);
+                    return NcFrames.degrees(freshRaw(), calibration);
                 default:
                     return Float.NaN;
             }
@@ -286,121 +307,189 @@ public final class VoiceDirection {
         }
     }
 
-    /** One GET on the NC port: the raw value, OFF, or MALFORMED (a miss).
-     * Never waits past the deadline. */
-    private synchronized int query() {
+    /** The newest raw value if it is at most FRESH_MS old, else -1. Reads only. */
+    private synchronized int freshRaw() {
         if (port == null || backend != Backend.NC) {
-            return NcFrames.MALFORMED;
+            return -1;
         }
-        int have = 0;
         try {
-            // Anything already buffered is a late reply or line noise, never this GET's answer.
-            int stale;
-            while ((stale = port.available()) > 0) {
-                if (port.read(sink, 0, Math.min(stale, sink.length)) <= 0) {
-                    break;
-                }
-            }
-            port.write(DOA_QUERY);
-            long deadline = System.nanoTime() + deadlineMs * 1000000L;
-            while (true) {
-                int need = NcFrames.replyLength(reply, have);
-                if (have >= need) {
-                    break;
-                }
-                int ready = port.available();
-                if (ready > 0) {
-                    int n = port.read(reply, have, Math.min(ready, need - have));
-                    if (n > 0) {
-                        have += n;
-                        continue;
-                    }
-                }
-                if (System.nanoTime() >= deadline) {
-                    break;
-                }
-                Thread.sleep(POLL_MS);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            drain();
         } catch (IOException e) {
-            have = 0;
+            backend = Backend.NONE;
+            port.close();
+            log.log("voice direction: nc read failed (" + e.getClass().getSimpleName() + "), closed");
+            return -1;
         }
-        if (have > 0 && (firstReplyHex == null || logged < LOGGED_REPLIES)) {
-            String hex = NcFrames.hex(reply, have);
+        if (lastRaw < 0 || System.nanoTime() - lastRawAt > freshNs) {
+            return -1;
+        }
+        return lastRaw;
+    }
+
+    /** Reads everything buffered on the port, never blocking, and parses every frame in it. */
+    private void drain() throws IOException {
+        int ready;
+        while ((ready = port.available()) > 0) {
+            int n = port.read(buf, have, Math.min(ready, buf.length - have));
+            if (n <= 0) {
+                break;
+            }
+            have += n;
+            int used = NcFrames.parseStream(buf, have, frames);
+            // What is left is shorter than a frame: a frame still arriving, kept for the next read.
+            System.arraycopy(buf, used, buf, 0, have - used);
+            have -= used;
+        }
+    }
+
+    private void onFrame(byte[] b, int at, int raw) {
+        if (firstReplyHex == null || logged < LOGGED_FRAMES) {
+            String hex = NcFrames.hex(b, at, NcFrames.FRAME_LENGTH);
             if (firstReplyHex == null) {
                 firstReplyHex = hex;
             }
-            if (logged < LOGGED_REPLIES) {
+            if (logged < LOGGED_FRAMES) {
                 logged++;
-                log.log("voice direction: nc reply " + have + " bytes " + hex);
+                log.log("voice direction: nc frame " + hex);
             }
-        }
-        int raw = NcFrames.parseDoa(reply, have);
-        if (raw == NcFrames.MALFORMED) {
-            miss(have);
-            return raw;
-        }
-        misses = 0;
-        if (raw == NcFrames.NO_READING) {
-            return raw;
-        }
-        if (raw == NcFrames.OFF) {
-            if (!toggled) {
-                // Each toggle flips the state, so at most one per open.
-                toggled = true;
-                try {
-                    port.write(NcFrames.doaToggle());
-                    log.log("voice direction: nc reporting was off, toggled once");
-                } catch (IOException e) {
-                    miss(0);
-                }
-            }
-            return raw;
         }
         lastRaw = raw;
-        if (calibration == null) {
-            long now = System.nanoTime();
-            if (rawLoggedAt == 0 || now - rawLoggedAt >= RAW_LOG_PERIOD_MS * 1000000L) {
-                rawLoggedAt = now;
-                log.log("voice direction: nc raw " + raw + " (uncalibrated)");
+        long now = System.nanoTime();
+        lastRawAt = now;
+        if (calibration == null && (rawLoggedAt == 0 || now - rawLoggedAt >= RAW_LOG_PERIOD_MS * 1000000L)) {
+            rawLoggedAt = now;
+            log.log("voice direction: nc raw " + raw + " (uncalibrated)");
+        }
+    }
+
+    /** stty step 1: 115200 8N1, no modem control, no output processing, echo and line
+     * discipline off. Not `raw`: toybox 0.7.6's raw sets icrnl/ixon/ixoff/inpck. */
+    static List<String> sttyCommand(String node) {
+        return java.util.Arrays.asList("stty", "-F", node, "115200", "cs8", "-cstopb", "-parenb", "clocal",
+                "-crtscts", "-hupcl", "-opost", "-isig", "-icanon", "-iexten", "-echo", "-echoe", "-echok",
+                "-echonl");
+    }
+
+    /** stty steps 2 and 4: print the settings as one colon-separated -g string. */
+    static List<String> sttyReadCommand(String node) {
+        return java.util.Arrays.asList("stty", "-F", node, "-g");
+    }
+
+    /** stty step 3: write a -g string back, as one argument. */
+    static List<String> sttyWriteCommand(String node, String g) {
+        return java.util.Arrays.asList("stty", "-F", node, g);
+    }
+
+    /** The -g string with its first field (the input flags) set to 0, or null when it is
+     * malformed (fewer than 4 fields, or a field that is not hex). */
+    static String zeroInputFlags(String g) {
+        if (g == null) {
+            return null;
+        }
+        String[] fields = g.trim().split(":", -1);
+        if (fields.length < 4) {
+            return null;
+        }
+        for (String f : fields) {
+            if (!f.matches("[0-9a-fA-F]+")) {
+                return null;
             }
         }
-        return raw;
+        StringBuilder sb = new StringBuilder("0");
+        for (int i = 1; i < fields.length; i++) {
+            sb.append(':').append(fields[i]);
+        }
+        return sb.toString();
     }
 
-    private void miss(int have) {
-        misses++;
-        if (misses >= MAX_MISSES && backend == Backend.NC) {
-            backend = Backend.NONE;
-            port.close();
-            log.log("voice direction: nc closed after " + misses + " misses in a row (last " + have + " bytes)");
+    /** Whether a well-formed -g string has input flags 0. */
+    static boolean inputFlagsZero(String g) {
+        return zeroInputFlags(g) != null && g.trim().startsWith("0:");
+    }
+
+    /** The real setup's status: STEP * step number + the step's code. */
+    static final int STEP = 1000;
+    static final int STEP_FLAGS = 1;
+    static final int STEP_READ = 2;
+    static final int STEP_WRITE = 3;
+    static final int STEP_VERIFY = 4;
+    /** Step codes past any exit value: stty timed out, failed to start, was interrupted,
+     * printed a malformed -g string, or left the input flags set. */
+    static final int TIMED_OUT = 997;
+    static final int NO_PROCESS = 998;
+    static final int INTERRUPTED = 999;
+    static final int MALFORMED_G = 996;
+    static final int FLAGS_SET = 995;
+
+    /** " at <step>" for a real setup status, "" for any other. */
+    static String sttyStep(int status) {
+        switch (status / STEP) {
+            case STEP_FLAGS:
+                return " at set flags";
+            case STEP_READ:
+                return " at read -g";
+            case STEP_WRITE:
+                return " at write -g";
+            case STEP_VERIFY:
+                return " at verify -g";
+            default:
+                return "";
         }
     }
 
-    /** The stty the port is configured with: 115200 8N1 raw, echo off, no modem control. */
-    static List<String> sttyCommand(String node) {
-        return java.util.Arrays.asList("stty", "-F", node, "115200", "raw", "-echo", "-echoe", "-echok",
-                "cs8", "-cstopb", "-parenb", "clocal", "-crtscts", "-ixon", "-ixoff");
+    /** One stty run: its exit value (or a code above), and its output in out[0]. */
+    private static int stty(List<String> cmd, String[] out) {
+        try {
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            if (!p.waitFor(STTY_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                p.destroy();
+                return TIMED_OUT;
+            }
+            if (out != null) {
+                // -g prints one line.
+                java.io.BufferedReader in = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(p.getInputStream(), "US-ASCII"));
+                try {
+                    out[0] = in.readLine();
+                } finally {
+                    in.close();
+                }
+            }
+            return p.exitValue();
+        } catch (IOException e) {
+            return NO_PROCESS;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return INTERRUPTED;
+        }
     }
 
-    /** The real port setup: runs stty, waits up to STTY_TIMEOUT_MS for it. */
+    /** The real port setup: the flags, then input flags 0 through -g, then a check. */
     private static final PortSetup STTY = new PortSetup() {
         @Override
         public int configure(String node) {
-            try {
-                Process p = new ProcessBuilder(sttyCommand(node)).redirectErrorStream(true).start();
-                if (!p.waitFor(STTY_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                    p.destroy();
-                    return -1;
-                }
-                return p.exitValue();
-            } catch (IOException e) {
-                return -2;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return -3;
+            int status = stty(sttyCommand(node), null);
+            if (status != 0) {
+                return STEP * STEP_FLAGS + status;
             }
+            String[] g = new String[1];
+            status = stty(sttyReadCommand(node), g);
+            if (status != 0) {
+                return STEP * STEP_READ + status;
+            }
+            String zeroed = zeroInputFlags(g[0]);
+            if (zeroed == null) {
+                return STEP * STEP_READ + MALFORMED_G;
+            }
+            status = stty(sttyWriteCommand(node, zeroed), null);
+            if (status != 0) {
+                return STEP * STEP_WRITE + status;
+            }
+            status = stty(sttyReadCommand(node), g);
+            if (status != 0) {
+                return STEP * STEP_VERIFY + status;
+            }
+            return inputFlagsZero(g[0]) ? 0 : STEP * STEP_VERIFY + FLAGS_SET;
         }
     };
 
