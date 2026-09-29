@@ -38,6 +38,7 @@ class NcFramesHarnessTest(unittest.TestCase):
         "calibration_wraps_to_plus_minus_180",
         "uncalibrated_is_nan",
         "unset_port_is_none_with_no_native_call",
+        "lazy_sampler_opens_on_its_own_thread_and_never_blocks_the_caller",
         "missing_node_is_none_with_no_native_call",
         "init_returning_one_is_none",
         "confirmed_port_opens_nc_and_reports_calibrated_degrees",

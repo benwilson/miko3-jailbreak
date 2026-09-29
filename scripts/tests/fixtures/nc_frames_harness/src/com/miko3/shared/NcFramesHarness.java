@@ -517,6 +517,34 @@ public final class NcFramesHarness {
                         "first=" + first + " logged=" + log.count(h));
             }
         });
+        scenario("lazy_sampler_opens_on_its_own_thread_and_never_blocks_the_caller", new Scenario() {
+            // Review P1 (2026-09-29): the first open ran on the ears capture thread holding
+            // feedLock, so a tty that blocked on open or write would stall the ears.
+            public void run(String n) throws Exception {
+                final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+                final String[] openedOn = new String[1];
+                final VoiceDirection ready = open(uncalibrated(), new FakeNative(),
+                        new FakeNodes(new FakePort(steady(138)), PORT), new Lines());
+                long t0 = System.nanoTime();
+                VoiceDirection.Sampler s = VoiceDirection.sampleLazily(20, new java.util.concurrent.Callable<VoiceDirection>() {
+                    public VoiceDirection call() throws Exception {
+                        openedOn[0] = Thread.currentThread().getName();
+                        release.await();
+                        return ready;
+                    }
+                });
+                long startMs = (System.nanoTime() - t0) / 1000000L;
+                Thread.sleep(100);
+                int whileBlocked = s.drain().size();
+                release.countDown();
+                Thread.sleep(150);
+                int after = s.drain().size();
+                s.stop();
+                check(n, startMs < 20 && whileBlocked == 0 && after > 0
+                                && "voice-direction".equals(openedOn[0]),
+                        "start=" + startMs + "ms blocked=" + whileBlocked + " after=" + after + " on=" + openedOn[0]);
+            }
+        });
         scenario("config_reads_port_and_calibration", new Scenario() {
             public void run(String n) {
                 VoiceDirection.Config c = VoiceDirection.Config.of(" /dev/ttyS1 ", "10", "-1", "1.40625");

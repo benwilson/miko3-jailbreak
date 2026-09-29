@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -457,6 +458,22 @@ public final class VoiceDirection {
         return new Sampler(this, Math.max(1, periodMs));
     }
 
+    /** Like open().sample(periodMs), but the first open() runs on the sampler's own
+     * thread, so a caller holding a lock (the ears capture thread) never waits on a tty
+     * open or write that blocks (review P1, 2026-09-29). drain() is empty until it opens. */
+    public static Sampler sampleLazily(long periodMs) {
+        return sampleLazily(periodMs, new Callable<VoiceDirection>() {
+            @Override
+            public VoiceDirection call() {
+                return open();
+            }
+        });
+    }
+
+    static Sampler sampleLazily(long periodMs, Callable<VoiceDirection> opener) {
+        return new Sampler(opener, Math.max(1, periodMs));
+    }
+
     /** The median of the non-null values, or null with none. */
     public static Float median(List<Float> values) {
         List<Float> sorted = new ArrayList<Float>();
@@ -491,12 +508,23 @@ public final class VoiceDirection {
         /** Readings kept between drains; a stuck caller never grows this without bound. */
         static final int CAP = 600;
 
-        private final VoiceDirection source;
+        /** Opened on the scheduler thread by the first tick when the sampler was started lazily. */
+        private final Callable<VoiceDirection> opener;
+        private VoiceDirection source;
         private final List<Float> samples = new ArrayList<Float>();
         private final ScheduledFuture<?> ticks;
 
         Sampler(VoiceDirection source, long periodMs) {
+            this(source, null, periodMs);
+        }
+
+        Sampler(Callable<VoiceDirection> opener, long periodMs) {
+            this(null, opener, periodMs);
+        }
+
+        private Sampler(VoiceDirection source, Callable<VoiceDirection> opener, long periodMs) {
             this.source = source;
+            this.opener = opener;
             ticks = SCHEDULER.scheduleAtFixedRate(new Runnable() {
                 @Override
                 public void run() {
@@ -505,7 +533,15 @@ public final class VoiceDirection {
             }, 0, periodMs, TimeUnit.MILLISECONDS);
         }
 
+        /** Scheduler thread only. */
         private void sampleOnce() {
+            if (source == null) {
+                try {
+                    source = opener.call();
+                } catch (Exception e) {
+                    return;
+                }
+            }
             Float a = source.angle();
             synchronized (samples) {
                 if (samples.size() < CAP) {

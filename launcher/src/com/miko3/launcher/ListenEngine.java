@@ -698,7 +698,7 @@ final class ListenEngine implements ListenSession.Ears {
     private final EarsSession.Direction earsDirection = new EarsSession.Direction() {
         @Override
         public EarsSession.Sampling start() {
-            final VoiceDirection.Sampler sampler = VoiceDirection.open().sample(EarsSession.DIRECTION_PERIOD_MS);
+            final VoiceDirection.Sampler sampler = VoiceDirection.sampleLazily(EarsSession.DIRECTION_PERIOD_MS);
             return new EarsSession.Sampling() {
                 @Override
                 public List<Float> drain() {

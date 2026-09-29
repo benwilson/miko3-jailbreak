@@ -147,7 +147,7 @@ public class LauncherApp extends Application {
 
         synchronized void start() {
             stop();
-            sampler = VoiceDirection.open().sample(PERIOD_MS);
+            sampler = VoiceDirection.sampleLazily(PERIOD_MS);
         }
 
         @Override

@@ -349,7 +349,7 @@ class EngineWiringTest(unittest.TestCase):
 
     def test_ears_feed_the_wake_word_engine_a_silero_gate_and_the_direction_sampler(self):
         for needle in ("new WakeWord(", "processChunk(", "SileroVadModelConfig", "new Vad(", "isSpeechDetected()",
-                       "VoiceDirection.open()", ".sample(EarsSession.DIRECTION_PERIOD_MS)", "setSpeaking(",
+                       "VoiceDirection.sampleLazily(EarsSession.DIRECTION_PERIOD_MS)", "setSpeaking(",
                        "new EarsSession("):
             self.assertIn(needle, self.src)
         # The switch (KTD11) is read at classify time through ClaudeSettings, the
@@ -733,6 +733,13 @@ class BuildScriptTest(unittest.TestCase):
             self.assertIn(needle, src)
         # KTD4: the angle is sampled on its own thread at a caller-set cadence.
         self.assertRegex(src, r"sample\(\s*(final\s+)?long\s+\w+")
+
+    def test_the_ears_never_open_the_direction_chip_on_the_capture_thread(self):
+        # Review P1 (2026-09-29): EarsSession.feed starts direction sampling while holding
+        # feedLock, so the first chip open must happen on VoiceDirection's own thread.
+        engine = _strip_comments(ENGINE.read_text())
+        self.assertIn("VoiceDirection.sampleLazily(", engine)
+        self.assertNotIn("VoiceDirection.open().sample(", engine)
 
     def test_voice_direction_tries_nc_only_on_the_confirmed_port_property_and_node(self):
         # Seen live 2026-09-28: with no /dev/ttyMT2, createUART still answers a handle and
