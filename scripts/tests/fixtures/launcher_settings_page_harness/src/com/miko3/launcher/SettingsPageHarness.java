@@ -229,6 +229,11 @@ public final class SettingsPageHarness {
         }
 
         public String text() {
+            // The real one reads a native stream that close() released: reading it after
+            // close segfaulted the launcher on the robot (2026-09-29).
+            if (closed) {
+                throw new IllegalStateException("text() after close(): use after free");
+            }
             return samples < 20000 ? "hello" : "hello robot friend";
         }
 
@@ -244,7 +249,8 @@ public final class SettingsPageHarness {
      * ListenSession.capture, the very loop the real listen uses. */
     static final class FakeRunner implements EarsProbe.Runner {
         final FakeMic mic = new FakeMic();
-        final FakeRecognizer rec = new FakeRecognizer();
+        /** The last capture's recogniser: the launcher creates a fresh one per capture. */
+        FakeRecognizer rec = new FakeRecognizer();
         int seconds = -1;
         RuntimeException fail;
 
@@ -253,6 +259,7 @@ public final class SettingsPageHarness {
             if (fail != null) {
                 throw fail;
             }
+            rec = new FakeRecognizer();
             ListenSession.Mic m = tap.mic(mic);
             ListenSession.Recognizer r = tap.recognizer(rec);
             ListenSession.capture(m, r, seconds * 1000L);

@@ -212,14 +212,24 @@ final class EarsProbe {
 
                 @Override
                 public void close() {
+                    // Close the last partial second while the recogniser can still be read:
+                    // after real.close() its native stream is released, and reading it in
+                    // rows() segfaulted the launcher on the robot (2026-09-29).
+                    synchronized (Tap.this) {
+                        if (chunks > 0) {
+                            closeRow();
+                        }
+                        rec = null;
+                    }
                     real.close();
                 }
             };
         }
 
-        /** The rows so far, with the partial last second closed if it heard anything. */
+        /** The rows so far, with the partial last second closed if it heard anything;
+         * after the recogniser closed, the last second was already closed by close(). */
         synchronized List<Row> rows() {
-            if (chunks > 0) {
+            if (chunks > 0 && rec != null) {
                 closeRow();
             }
             return new ArrayList<Row>(rows);
