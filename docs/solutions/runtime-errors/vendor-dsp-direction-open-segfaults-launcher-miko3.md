@@ -1,7 +1,7 @@
 ---
 title: "The vendor NC direction DSP's failure code reads as success, then its next call segfaults the launcher"
 date: 2026-09-28
-last_updated: 2026-09-28
+last_updated: 2026-09-29
 category: runtime-errors
 module: "Miko 3 launcher ears: voice direction (shared VoiceDirection + NcFrames, vendor libconexant_dsp_lib.so, scripts/qa-direction-chip.py)"
 problem_type: runtime_error
@@ -53,23 +53,17 @@ The first time the launcher's ears hear speech, `VoiceDirection.open()` probes t
 
 ## Solution
 
-The node guard is superseded on branch `feat/explore-hey-miko-always-answers`, unmerged as of this writing, so the design below is pending. It has been checked by the host tests only.
+The design below is on branch `feat/explore-hey-miko-always-answers` (PR #29, unmerged as of this writing) and was run on the robot on 2026-09-29. No vendor code runs on the NC path any more.
 
-**The port comes only from the owner.** The NC backend runs only when `persist.miko3.voice_dir.port` names an existing node (`shared/src/com/miko3/shared/VoiceDirection.java:211-218`). The launcher reads the property and hands it to `VoiceDirection.configure()` before the first `open()` (`launcher/src/com/miko3/launcher/ListenEngine.java:684-695`). With the property unset, or naming a missing node, no NC native call is made at all. The owner confirms the port with `scripts/qa-direction-chip.py`. Its identification run is read-only and never writes to the port: it runs a passive read only when the tty's echo is off, and uses `timeout` to bound the blocking open (`scripts/qa-direction-chip.py:2-17`). It sets the property only on a confirmed port. If the launcher's probe then doesn't show the NC backend with an `XXUB` reply, it unsets the property again (`:28-32`).
+**The port comes only from the owner.** The NC backend runs only when `persist.miko3.voice_dir.port` names an existing node (`VoiceDirection.openNc`). The owner confirms the port with `scripts/qa-direction-chip.py`, whose identification reads only `/proc`, `/sys` and logs and never opens the port. On this robot the owner confirmed `/dev/ttyS1` after its counters showed a device talking on it.
 
-**The vendor library only configures the port.** `createUART` plus `initNCUART` run once, and only a status of `0` counts as success (`VoiceDirection.java:222-226`). Nothing else in the vendor's NC API (`NCDsp`) is called: the `NcNative` interface exposes just those two calls (`VoiceDirection.java:103-108`). The Conexant backend in the same library (`ConexantDSP.initDSPComm`) is still tried first (`VoiceDirection.java:190-193`).
+**The chip streams; the launcher only listens.** On the robot, the chip on `/dev/ttyS1` sends a 19-byte frame by itself about once or twice a second, whether anyone speaks or not: `XXUB`, module `a3`, op `03`, a sequence byte, `01 05 00`, a CRC32 little-endian over the first 10 bytes, then a 5-byte payload whose first byte is the raw value (for example `58585542a30344010500de9c7afe55f64a03c9`, raw 85). `NcFrames.parseStream` keeps CRC-valid `a3`/`03` frames and skips everything else, and `VoiceDirection` keeps the newest, fresh for 1.5 s. It never writes to the chip: the query/toggle protocol the disassembly suggested (below) turned out to be unnecessary, and the chip's replies to it were just more stream frames.
 
-**The protocol runs in Java on our own streams**, in `shared/src/com/miko3/shared/NcFrames.java` and `VoiceDirection.java`:
+**The port is configured with `stty`, not the vendor library,** because with the vendor's `createUART`/`initNCUART` handle in the process the launcher died seconds after each open (this is suspected, not bisected: the probe crash below muddied it). toybox 0.7.6's `stty` has its own trap, recorded in `docs/solutions/tooling-decisions/toybox-stty-cannot-clear-input-flags-miko3.md`.
 
-- The request is 14 bytes: `XXUB`, module, op, param, three zeros, then a CRC32 over the first 10 bytes, little-endian (`NcFrames.java:47-60`).
-- Replies are validated the way the vendor validates them: the `XXUB` prefix and at least 15 bytes, with byte 14 as the status (`0` means reporting is off). With reporting on, the reply runs to 38 bytes, with the raw value at `0x21` (`NcFrames.java:82-98`). Where a reply's own CRC sits is unverified, so the CRC isn't checked. The first three replies are logged in hex so a robot session can place it (`NcFrames.java:14-16`, `VoiceDirection.java:332-341`).
-- Reads never block. Bytes already buffered are flushed before each GET (`VoiceDirection.java:301-306`). The reply is then polled with `available()` every 2 ms until it is complete or the 80 ms deadline passes (`:66-67`, `:308-325`).
-- Three misses in a row close the NC backend for the life of the process (`VoiceDirection.java:69`, `:372-378`). A node that is silent at `open()` gives `Backend.NONE` straight away (`:231-236`).
-- If the chip reports that reporting is off, the toggle is sent at most once per open, because each toggle flips the state (`VoiceDirection.java:349-358`).
-- The raw value becomes signed degrees only once the three calibration properties are set. Until then the angle is NaN (`NcFrames.java:108-115`).
+**The chip gives a side, not a direction.** With the owner about 1 m away counting aloud, the raw value read right about 35, front 80, behind 90 and left 100: it separates left from right but not front from back, so no full-circle calibration fits. `persist.miko3.voice_dir.left` and `.right` (100 and 60 on this robot) map raw values to left, right or neither, and the cue carries the side with no angle (`NcFrames.sideDegrees`, `EarsSession.Direction.sideOnly`).
 
-With no direction, the meeting plan's stop condition 1 applies: no turn to the voice, and the camera meeting look decides.
-
+With no direction the camera meeting look decides, as before.
 ## Why This Works
 
 The crash chain, confirmed with step logs inside `open()` on the robot:
@@ -86,24 +80,23 @@ Disassembly of `libconexant_dsp_lib.so` explained more of this:
 - **`initNCUART` sets VMIN=1/VTIME=0**, so the vendor's native reads block until a byte arrives. On a peer that never answers, they hang forever, and a blocking read can't be timed out or woken from Java. That is a second crash-or-hang path, separate from the segfault. The disassembly points to a heap overflow as the segfault's cause (not re-checked for this doc). The Java protocol avoids both paths because it never calls the vendor's reads.
 - **The frames:** `getCurrentDOAStatus` sends `58 58 55 42 03 01 03 00 00 00 a6 20 d0 e7`, and `toggleDOA` sends `58 58 55 42 03 03 02 00 00 00 a3 14 ac 25`. Both CRCs recompute with `zlib.crc32` over the first 10 bytes. `toggleDOA` isn't idempotent: every send flips reporting. The vendor sends it only after reading the current status (`DSPSettings.java:94-105`), and so do we.
 
-The vendor app never reached the crash state. `DSPSettings` opens NC only when its caller has already set `isNC`, and it picks `/dev/ttyS1` on "JoyAR" units (`DSPSettings.java:41`, `:177`). `/dev/ttyS1` exists on this robot, but it was deliberately not probed with writes: writing DSP commands to an unidentified UART could hit another peripheral. That is why the port is now an owner-confirmed property with a read-only identification script, not a guess in code.
+The vendor app never reached the crash state. `DSPSettings` opens NC only when its caller has already set `isNC`, and it picks `/dev/ttyS1` on "JoyAR" units (`DSPSettings.java:41`, `:177`). That turned out right: the chip is on `/dev/ttyS1` on this robot.
 
 ## Prevention
 
 - Before any vendor native `init`/`open` call, check what the call needs on this unit yourself: the device node exists, and the vendor's own detection flag is set. Treat a vendor return code as unproven until the disassembly says what it means: here 0 is success and 1 is failure, and both our `>= 0` check and the vendor's own `< 0` check read the failure as success.
-- Don't call vendor native reads on a tty the vendor opened blocking (VMIN=1/VTIME=0). Let the vendor configure the port, then read it yourself with a deadline.
-- Never send a non-idempotent command such as `toggleDOA` blind. Read the state first, and send it at most once per open.
+- Listen before you speak to an unknown serial peripheral: this chip streams by itself, and the request/reply protocol read out of the disassembly was never needed.
+- Never open an unconfirmed tty "read-only" in cooked mode: with echo on, the kernel sends received bytes back out. An `stty -a < /dev/ttyS1` for evidence took this port's counters from tx 0 to tx 98.
+- Keep a separate diagnostic tool from the thing it diagnoses: the launcher's ears probe (`scripts/qa-ears-probe.py`) crashes the launcher on `main` too, and every chip test routed through it looked like a chip crash until the probe was run with the chip off (`docs/TODO.md`).
 - For a native crash on this robot with no tombstone, find the component by bisection on the device rather than reading crash sites:
   - Build a diagnostic-only launcher in a worktree (never committed) whose ears components each check a debug property, for example `debug.miko3.ears.off=wake,vad,rec,dir`. Toggle them live with `setprop`, with 5-minute survival windows.
   - Then add step logs around each native call, plus a startup hook that calls the suspect `open()` once, so the reproduction doesn't depend on someone speaking.
   - Start with all four off for five minutes, then halve.
 - Confirm the ears are actually open before trusting a quiet window: `ListenEngine: ears: chunks=` should be climbing. Bringing the launcher's activity to the front stops Explore, and with it the ears.
 - Tests:
-  - `test_voice_direction_tries_nc_only_on_the_confirmed_port_property_and_node` in `scripts/tests/test_listen_service.py:737` pins the source shape: no `/dev/ttyMT2`, the port property, and only 0 as success.
-  - `scripts/tests/test_nc_frames.py` runs a JVM harness through `VoiceDirection.openWith()` (`VoiceDirection.java:204`) with a fake native layer and a fake node. It covers the frames and CRC, the reply deadline, a silent node (at open and mid-session), stale bytes, one toggle per open, the three-miss close, and an unset port or missing node making no native call (`scripts/tests/test_nc_frames.py:32-53`).
-  - The vendor natives don't load on the Mac, so the robot is still the behavioural check for the real library.
-- **Open item (from this branch's code review, not yet fixed):** the first `open()` still runs on the ears capture thread while it holds `feedLock`. `EarsSession.feed` takes the lock (`EarsSession.java:500`) and calls `direction.start()` inside it (`:532`), which runs `VoiceDirection.open()`. Nothing bounds the blocking tty open or the first write in `open()`. A node that blocks on open or write would stall the ears' capture thread. Move the first `open()` off the capture thread, or bound it, before relying on NC on the robot.
-
+  - `test_voice_direction_tries_nc_only_on_the_confirmed_port_property_and_node` in `scripts/tests/test_listen_service.py` pins the source shape: no `/dev/ttyMT2`, the port property before the node check before `configure(node)`, no vendor NC calls, and no port writes.
+  - `scripts/tests/test_nc_frames.py` runs a JVM harness through `VoiceDirection.openWith()` with a fake port setup and a fake streaming node, using frames captured on the robot: parsing, junk and torn frames, freshness, the `stty -g` rewrite, side mapping, no writes, and the lazy open off the capture thread.
+  - The robot is still the behavioural check: the counters in `/proc/tty/driver/serial` show whether anything wrote to the port.
 - **Keep a direction port away from the motor board's UART** (session history): the drive talks over a UART too, and the PR #28 session checked that a candidate direction port was not the drive's before going further. Any code or script that opens a direction port must not collide with it.
 
 ## Related Issues
