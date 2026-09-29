@@ -96,10 +96,10 @@ MAX_FIT_ERROR_DEG = 45  # beyond this a reading sits nearer another quadrant tha
 
 # Read-only evidence (KTD13). None of these may write to the node; the tests check.
 EVIDENCE_COMMANDS = {
-    "holder": ("for p in /proc/[0-9]*; do for f in $p/fd/*; do "
-               "[ \"$(readlink $f 2>/dev/null)\" = " + NODE + " ] && "
+    # One ls per process: a shell loop per open file timed out over 300+ processes on the robot.
+    "holder": ("for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -q ' " + NODE + "$' && "
                "echo \"${p#/proc/} $(tr '\\0' ' ' < $p/cmdline 2>/dev/null)\"; "
-               "done; done 2>/dev/null; true"),
+               "done; true"),
     "driver": "for f in /proc/tty/driver/*; do echo \"== $f\"; cat \"$f\" 2>&1; done 2>&1 | head -60",
     "dmesg": "dmesg 2>&1 | grep -iE 'ttyS1|uart|nc_?dsp|gpio_dsp|mid_dsp' | tail -40",
     "dtree": ("tr '\\0' '\\n' < /proc/device-tree/aliases/serial1 2>&1; "
@@ -181,15 +181,20 @@ NC_NAME = re.compile(r"nc_?dsp", re.IGNORECASE)
 TTYS1 = re.compile(r"ttyS1\b")
 
 
+# A logcat threadtime line whose tag is the vendor's nc_dsp: date, time, pid, tid, level, tag.
+NC_LOGCAT_LINE = re.compile(r"^\S+\s+\S+\s+\d+\s+\d+\s+[VDIWEF]\s+nc_?dsp\s*:", re.IGNORECASE)
+
+
 def vendor_log_lines(text):
-    """Lines of an nc_dsp log (a logcat line naming nc_dsp, or a line of a file
-    whose name does) that name ttyS1."""
+    """Lines of an nc_dsp log that name ttyS1: a logcat line whose tag is nc_dsp, or a
+    line of a file whose name says nc_dsp. Matching the tag, not free text, keeps the
+    evidence command's own logged echo (ADB_SERVICES) from confirming anything."""
     out, in_nc_file = [], False
     for line in text.splitlines():
         if line.startswith("== "):
             in_nc_file = bool(NC_NAME.search(line))
             continue
-        if TTYS1.search(line) and (in_nc_file or NC_NAME.search(line)):
+        if TTYS1.search(line) and (in_nc_file or NC_LOGCAT_LINE.search(line)):
             out.append(line)
     return out
 
@@ -199,7 +204,11 @@ def gather(robot):
     sections = {}
     for name, script in EVIDENCE_COMMANDS.items():
         print(f".. {name}")
-        sections[name] = robot.adb("shell", script, check=False)
+        try:
+            sections[name] = robot.adb("shell", script, check=False)
+        except ears.ProbeError as exc:
+            # One slow or failed step is missing evidence, not a reason to drop the rest.
+            sections[name] = f"(unavailable: {exc})"
     echo = echo_on(sections["settings"])
     if echo is None:
         return Evidence(sections, None, "skipped: the port settings could not be read, so echo may be on")

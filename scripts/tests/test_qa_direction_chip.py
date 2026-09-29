@@ -70,8 +70,9 @@ class FakeRobot(ears.Robot):
     """Answers each evidence command from a canned output, keeps a property table
     for setprop and getprop, and records every adb call in order."""
 
-    def __init__(self, outputs=None, props=None, setprop_sticks=True):
+    def __init__(self, outputs=None, props=None, setprop_sticks=True, timeouts=()):
         super().__init__("fake:5555")
+        self.timeouts = set(timeouts)
         self.calls = []
         self.outputs = dict(outputs or {})
         self.props = dict(props or {})
@@ -89,6 +90,8 @@ class FakeRobot(ears.Robot):
         if args[:1] == ("shell",) and len(args) == 2:
             for name, script in chip.EVIDENCE_COMMANDS.items():
                 if args[1] == script:
+                    if name in self.timeouts:
+                        raise ears.ProbeError(f"!! adb timed out: adb shell {script}")
                     return self.outputs.get(name, "")
             if args[1] == chip.PASSIVE_READ:
                 return self.outputs.get("passive", "")
@@ -183,6 +186,17 @@ class DecideTest(unittest.TestCase):
         log = "== /sdcard/nc_dsp.log\nopen /dev/ttyS1 115200 ok\n"
         self.assertEqual(chip.decide(self.evidence(vendor_log=log), owner_confirms=False).reason, "vendor log")
 
+    def test_the_logged_evidence_command_itself_never_confirms(self):
+        """Seen on the robot (2026-09-29): logcat records the adb shell command, whose text
+        names both nc_dsp and ttyS1, and the check confirmed the port from its own echo."""
+        log = ("09-29 10:39:38.411   376   376 I ADB_SERVICES: service_to_fd shell,v2,raw:"
+               + chip.EVIDENCE_COMMANDS["vendor_log"] + "\n")
+        self.assertFalse(chip.decide(self.evidence(vendor_log=log), owner_confirms=False).confirmed)
+
+    def test_a_line_from_another_tag_mentioning_nc_dsp_does_not_confirm(self):
+        log = "09-28 10:00:00.000  1 1 I SomeApp : looked for nc_dsp on /dev/ttyS1\n"
+        self.assertFalse(chip.decide(self.evidence(vendor_log=log), owner_confirms=False).confirmed)
+
     def test_an_nc_dsp_line_about_another_port_does_not_confirm(self):
         log = "09-28 10:00:00.000  1 1 I nc_dsp  : createUART /dev/ttyMT2 failed\n"
         self.assertFalse(chip.decide(self.evidence(vendor_log=log), owner_confirms=False).confirmed)
@@ -224,6 +238,22 @@ class GatherTest(unittest.TestCase):
             self.assertIn(name, chip.EVIDENCE_COMMANDS)
         self.assertIn("/dev/ttyS1", chip.PASSIVE_READ)
         self.assertIn("timeout", chip.PASSIVE_READ)
+
+    def test_a_timed_out_evidence_step_is_recorded_and_the_rest_still_run(self):
+        """Seen on the robot (2026-09-29): the holder scan timed out and aborted the whole run."""
+        robot = FakeRobot(evidence_outputs(passive=""), timeouts={"holder"})
+        ev = quiet(chip.gather, robot)
+        self.assertIn("unavailable", ev.sections["holder"])
+        self.assertIn("timed out", ev.sections["holder"])
+        for name in ("driver", "dmesg", "dtree", "settings", "vendor_log"):
+            self.assertIn(("shell", chip.EVIDENCE_COMMANDS[name]), robot.calls, name)
+        self.assertEqual(ev.sections["driver"], DRIVER)
+
+    def test_the_holder_scan_lists_each_process_once(self):
+        """One ls per process, not a shell loop per open file: 300+ processes timed out on the robot."""
+        script = chip.EVIDENCE_COMMANDS["holder"]
+        self.assertNotIn("readlink", script)
+        self.assertIn("ls -l", script)
 
     def test_the_passive_read_runs_only_with_echo_off(self):
         """An open tty with echo on sends what it receives back out: that would be a write."""
