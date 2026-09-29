@@ -41,6 +41,7 @@ On 2026-09-28 the owner could not get his attention. He heard the wake word, but
 - **The wake word overrides every leave-alone rule.** Calling him is the one time being left alone does not apply. Governs R3.
 - **The first answer is an on-robot clip, not Claude.** A Claude round trip takes seconds, and the answer has to come within a second. Claude takes over once he is facing the speaker. Governs R4.
 - **With no direction, he turns in steps and looks, rather than asking "where are you?" first or refusing to ship without direction.** Governs R9. (session-settled: user-directed — chosen over ask-then-look and direction-only: it is the fastest path that works without the chip.)
+- **The chip is used for which side a voice came from, not its angle.** On the robot the chip told left from right but not front from back (right about 35, front 80, behind 90, left 100), so no full-circle angle exists to turn to. Governs R7, R8. (session-settled: user-directed — chosen over a lateral angle with a mirrored look behind, and over parking the chip: a clear side is reliable and uses the side search that already exists.)
 - **False wake words are accepted for now.** The owner will deal with them if they become a problem. (session-settled: user-directed — chosen over rate-limiting or going quiet after false alarms: not a problem yet.)
 - **On the charger he talks but does not move.** Governs R11. (session-settled: user-directed — chosen over staying silent on the dock: a docked robot should still hold a conversation.)
 
@@ -60,8 +61,8 @@ On 2026-09-28 the owner could not get his attention. He heard the wake word, but
 
 **Finding the speaker**
 
-- R7. When the direction chip gives an angle, he turns to that angle, and the camera confirms a face.
-- R8. The NC direction chip on `/dev/ttyS1` is identified and opened safely on this robot, and its direction of arrival reaches Explore as an angle. It is never opened by writing to a port that has not been confirmed as the chip.
+- R7. When the direction chip gives a side, his search looks to that side first, and the camera confirms a face.
+- R8. The NC direction chip on `/dev/ttyS1` is identified and opened safely on this robot, and the side it reports reaches Explore. It is never opened by writing to a port that has not been confirmed as the chip.
 - R9. With no angle, he turns in steps of about 45°, checking the camera for a face at each stop, for at most one full circle.
 - R10. If he finds nobody, he says "Where'd you go?" and listens briefly. A new wake word or a reply starts the search again from R5. Silence sends him back to roaming.
 
@@ -132,7 +133,7 @@ Owner-judged on the robot:
 - `docs/solutions/integration-issues/soundpool-plays-silently-on-miko3-use-mediaplayer.md`: clips must use MediaPlayer.
 - `docs/hardware/boot-hal-reference.md` (the OEM `init.mt8168.rc` block): `ttyS1` and `ttyS2` are opened to 0666 next to a `gpio_dsp/mid_dsp` node. This is circumstantial evidence that `ttyS1` is the chip.
 
-**Product Contract preservation:** Product Contract unchanged, except that the Outstanding Questions deferred to planning are now answered in place and cite the KTDs that settle them.
+**Product Contract preservation:** changed: R7 and R8 — the owner decided on 2026-09-29, after the robot showed the chip reports only a side, that the chip gives a side rather than an angle (new Key Decision above). The Outstanding Questions deferred to planning are answered in place and cite the KTDs that settle them.
 
 ---
 
@@ -179,21 +180,15 @@ Owner-judged on the robot:
   - A weak voice reply restarts it once per call, so noise cannot loop him.
   - Silence resumes roaming.
 - KTD10. **The chip is used only on a port the owner has confirmed.** Cites R8. The port comes from the property `persist.miko3.voice_dir.port`, which U1's script writes only after confirmation. If the property is unset or its node is missing, the backend is NONE. The hard-coded `/dev/ttyMT2` NC path goes. The Conexant attempt stays as it is.
-- KTD11. **The protocol runs in Java with deadlines; the vendor library only configures the port.** Cites R8.
-  - Request frames are 14 bytes: `XXUB`, then module, op and param bytes, then three zeros and a CRC32, little-endian, over the first 10 bytes (`java.util.zip.CRC32`).
-  - Replies are validated as the vendor library does it: an `XXUB` prefix and at least 15 bytes. Byte 14 is the status, and 0 means reporting is off. When the status is non-zero, the reply runs to 38 bytes and the raw value is byte 0x21 (0 to 255). Where a reply's CRC sits is unverified. The first raw replies are logged in full so U1 can establish it, and until then a reply CRC is neither checked nor counted as a miss.
-  - Reads never block. Before each GET, any bytes already buffered are discarded. After the write, the sampler polls `available()` in short sleeps until the reply length is buffered or the deadline passes. `initNCUART` leaves the port blocking (VMIN=1, VTIME=0), and a blocking Java read cannot be timed out or woken.
-  - Plain Java cannot set the port speed, and `SensorModule` is fixed at 460800 for the motor board. So the vendor's `initNCUART` configures the confirmed node once, at 115200 raw. It returns 0 on success; 1 means failure, which our old `>= 0` check read as success.
-  - All reads and writes then go through our own file descriptor, on a dedicated thread, with a deadline on every reply. The vendor's native read calls are never made: their reads block forever, and a failed open corrupts the heap.
-  - DOA reporting is toggled on only when a reply's status byte says it is off, and at most once per open, because each toggle flips it.
-  - If the robot shows that the second open or the vendor configure does not work, `ce-work` falls back to toybox `stty` on the node and records which one worked.
-- KTD12. **Calibration comes from properties, and there is no angle until it is set.** Cites R7, R8. The zero, sign and degrees per step of the raw 0 to 255 value come from `persist.miko3.voice_dir.zero`, `.sign` and `.scale`, measured with the `qa-ears-probe.py` session (front, left, right, behind). While uncalibrated, the angle is NaN and the brain uses the no-angle plan.
-- KTD13. **Identification is read-only, and a fixed rule decides confirmation.** Cites R8.
-  - U1's script gathers the evidence: which process holds `ttyS1`, the `/proc/tty/driver` counters, `dmesg`, the device-tree alias and `gpio_dsp` nodes, the port settings, any vendor `nc_dsp` log, and a passive five-second read looking for frames.
-  - The port counts as confirmed only if one of these holds: a passive read shows an `XXUB` frame with a valid CRC, a vendor log shows NC traffic on `ttyS1`, or the owner confirms from the evidence shown.
-  - Nothing is written before confirmation, and op 03 (set or toggle) is never sent until then.
-  - The first two rules are expected to find nothing on this robot. The protocol is request and reply only, and the vendor app that talks to the chip has been disabled here all along. So the owner's confirmation is the expected route.
-  - After the owner confirms and the property is set, the launcher's probe runs once. The script unsets the property unless the probe shows the backend is NC with an `XXUB` reply. This also shows whether the launcher can read `persist.miko3.*` properties at all.
+- KTD11. **The launcher only listens to the chip's own stream; no vendor code runs on the chip path.** Cites R8. Verified on the robot, 2026-09-29:
+  - The chip sends a 19-byte frame by itself about once or twice a second: `XXUB`, module `a3`, op `03`, a sequence byte, `01 05 00`, a CRC32 little-endian over the first 10 bytes, then a 5-byte payload whose first byte is the raw value. The launcher never writes to it: no query, no toggle.
+  - Each sample drains the port and keeps the newest CRC-valid frame; a reading older than 1.5 s gives no direction. Open waits up to 1.5 s for a first frame and is NONE without one. It runs on the voice-direction thread, never the ears capture thread.
+  - The port is configured with toybox `stty`, not the vendor library: with the vendor's `createUART`/`initNCUART` in the process the launcher died soon after each open. toybox 0.7.6 cannot clear `icrnl`/`ixon`/`ixoff`/`inpck` by flag and its `raw` keyword sets them, which strips bit 7 and rewrites bytes, so the setup sets speed and modes by flag, writes the `stty -g` settings back with the input flags zeroed, and verifies them before trusting the port.
+- KTD12. **Side thresholds come from properties.** Cites R7, R8. `persist.miko3.voice_dir.left` and `.right` hold raw thresholds: at or above left means his left, at or below right means his right, and in between means ahead or behind. A cue then carries that side and no angle, and the call search looks that way first. The first thresholds are left 100 and right 60, from the owner counting aloud at each position. The full-circle zero/sign/scale calibration is kept for a chip that could use it, and wins when set.
+- KTD13. **Identification never opens the port, and the owner decides.** Cites R8.
+  - U1's script reads only `/proc`, `/sys` and logs: which process holds `ttyS1`, its tx/rx counters, `dmesg`, the device tree, and `nc_dsp`-tagged vendor log lines. An earlier `stty` read of the port echoed bytes back to the chip, so opening it for evidence is out.
+  - The port counts as confirmed only on a vendor log line naming `ttyS1` or the owner's `--owner-confirms`. On this robot the owner confirmed after the counters showed a device talking on the port.
+  - After confirmation the script keeps the property only if the launcher then reports the NC backend and does not die. The launcher's ears probe is not used: it crashes the launcher on `main` too (`docs/TODO.md`).
 
 ### High-Level Technical Design
 
@@ -246,18 +241,16 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-  P{persist.miko3.voice_dir.port set?} -->|no| N[Backend NONE: no-angle plan]
+  P{persist.miko3.voice_dir.port set?} -->|no| N[Backend NONE: no-side plan]
   P -->|yes| E{node exists?}
   E -->|no| N
-  E -->|yes| C[initNCUART configures 115200 raw; 0 = success]
-  C -->|failure| N
-  C -->|success| J[Java fd: GET frame, reply deadline]
-  J -->|no reply or bad CRC| N
-  J -->|status off| T[toggle once, re-read]
-  J -->|status on| K{calibrated?}
-  T --> K
-  K -->|no| U[angle NaN, log raw values for calibration]
-  K -->|yes| A[signed degrees to the ears median]
+  E -->|yes| C[stty: speed and modes, then -g with input flags zeroed]
+  C -->|verify fails| N
+  C -->|verified| J[our fd: wait up to 1.5 s for a CRC-valid a3/03 frame]
+  J -->|none| N
+  J -->|frame| K{thresholds set?}
+  K -->|no| U[no direction; raw values logged]
+  K -->|yes| A[newest fresh raw: left, right or none; cue carries the side, no angle]
 ```
 
 ### Assumptions
@@ -280,7 +273,9 @@ These are bets made without the scoping confirmation, since the run was hands-of
 | The eight-look search takes more than about 12 s (estimated 10 to 17 s) | `callLookMs` and the settle time are tunable. U7 measures the real times. Changing the step size is a product question for the owner. |
 | The person-box thresholds miss seated or distant people, or catch posters | Placeholders are measured in U7. With an angle, the box nearest the bearing wins. |
 | Ears open on the charger pick up charger hum as speech | False wake words are accepted for now (Key Decision). U7 notes any seen on the dock. |
-| The vendor configure call misbehaves on `ttyS1` | It runs only on a confirmed, existing node, and only its return value 0 counts as success. The fallback is `stty` (KTD11). |
+| The side thresholds (left 100, right 60) come from one session: behind read 85 to 100 and can cross the left threshold | A wrong side costs one extra look (side, behind, other side). The chip script's side calibration re-measures them; the side test in `docs/robot-return.md` step 9 checks them. |
+| The chip's stream settings may differ after a cold boot | Open waits for a CRC-valid frame and is NONE without one; the side test runs after the next boot. |
+| The launcher's ears probe crashes the launcher (on `main` too) | Nothing on the chip path uses it. A diagnostic bisection build is prepared for the robot (`docs/TODO.md`). |
 | Escapes interrupted by a call leave him near a hazard | The call search turns in place. The approach uses the existing hazard-checked APPROACH legs. |
 
 ### Sequencing
@@ -328,43 +323,43 @@ U1 and U2 (the chip) run independently of U3 to U6 (the call). The brain work ru
 
 ### U2. The NC chip in Java behind the confirmed-port property
 
-**Goal:** `VoiceDirection` reads the chip on the confirmed port through a Java protocol with deadlines and returns signed, calibrated degrees or NaN.
+**Goal:** `VoiceDirection` listens to the chip's own stream on the confirmed port and reports which side a voice came from, or nothing.
 
 **Requirements:** R7, R8; KTD10, KTD11, KTD12.
 
 **Dependencies:** None.
 
 **Files:**
-- Create: `shared/src/com/miko3/shared/NcFrames.java` (plain Java: frame building, CRC, reply parsing, calibration mapping)
+- Create: `shared/src/com/miko3/shared/NcFrames.java` (plain Java: stream parsing, CRC, side and calibration mapping)
 - Modify: `shared/src/com/miko3/shared/VoiceDirection.java`
-- Modify: `launcher/src/com/miko3/launcher/ListenEngine.java` (reads the properties and passes them to `VoiceDirection`)
+- Modify: `launcher/src/com/miko3/launcher/ListenEngine.java` (reads the properties; the ears sample it lazily; side-only cues carry no angle)
+- Modify: `launcher/src/com/miko3/launcher/EarsSession.java` (a side-only direction sends the side without an angle)
 - Create: `scripts/tests/test_nc_frames.py`, a JVM harness in the style of `scripts/tests/jvm_harness.py`
-- Modify: `scripts/tests/test_listen_service.py`: replace `test_voice_direction_tries_nc_only_when_its_uart_exists` with property-and-node gating
+- Modify: `scripts/tests/test_listen_service.py`: property-and-node gating, no vendor NC calls, no port writes
 
 **Approach:**
-1. `NcFrames` owns the byte format and the mapping from raw value to degrees. It uses no Android or file I/O, so the host tests run it directly.
-2. `VoiceDirection.tryOpen` keeps the Conexant attempt. The NC path runs only when the port property names an existing node. It calls `initNCUART` once and treats only 0 as success, then opens its own streams on the node.
-3. `angle()` discards any buffered bytes, writes the GET frame, and polls for the reply without blocking until the deadline (KTD11). A missed deadline or a malformed reply gives NaN. Three misses in a row close the backend for the life of the process and log it once. The first raw replies are logged in full.
-4. Logs carry only counts, raw values and status codes, never audio or text.
+1. `NcFrames` owns the frame format (KTD11), stream parsing and the raw-to-side mapping (KTD12). It uses no Android or file I/O, so the host tests run it directly.
+2. `VoiceDirection.tryOpen` keeps the Conexant attempt. The NC path runs only when the port property names an existing node. It configures the port with `stty` (KTD11), opens its own read stream, and waits for a first valid frame.
+3. Each sample drains the stream and keeps the newest valid frame; a stale reading gives no direction. The first frames are logged in hex, and raw values at most once a second.
+4. The open runs on the voice-direction thread through a lazy sampler, so a stalled port never holds the ears capture thread.
+5. Logs carry only raw values, sides and status codes, never audio or text.
 
-**Execution note:** Implement `NcFrames` test-first against the frames the research decoded: DOA query `58585542 03 01 03 000000 a620d0e7`.
+**Execution note:** Build the fixtures from the frames captured on the robot on 2026-09-29, for example `58585542a30344010500de9c7afe55f64a03c9` (raw 85).
 
-**Patterns to follow:** `VoiceDirection`'s existing guard and single-open shape, and the PR #28 learning in `docs/solutions/runtime-errors/`.
+**Patterns to follow:** `VoiceDirection`'s existing guard and single-open shape, and `docs/solutions/runtime-errors/vendor-dsp-direction-open-segfaults-launcher-miko3.md`.
 
 **Test scenarios:**
-- The built DOA query equals the decoded reference bytes, CRC included.
-- A reply with status byte 14 non-zero and byte 0x21 = 138 parses to raw 138.
-- A reply with status byte 14 = 0 reports "off", and the toggle frame is produced only once per open.
-- A truncated reply, or one without the `XXUB` prefix, parses to NaN without an exception.
-- A fake node that never answers returns NaN within the deadline, and the sampler thread is free for the next call.
-- Stale bytes from a late reply are discarded before the next GET and never parsed as its reply.
-- Calibration: raw 10 with zero 10 gives 0°. Raw 74 with scale 360/256 and sign −1 gives −90°. Values wrap to ±180°.
-- Uncalibrated gives NaN.
-- The property is unset, or names a missing node: the backend is NONE and no native NC call is reached. This is a harness assertion on a fake native layer.
-- `initNCUART` returning 1 gives NONE, where the old code accepted it.
-- Three deadline misses close the backend, and later `angle()` calls return NaN at once.
+- The captured frames parse to their raw values; frames of another module or op, bad CRCs, junk and a torn tail are skipped.
+- The newest of several frames wins, and a reading older than the freshness window gives none.
+- Side mapping: raw at or above left is his left, at or below right is his right, anything between is no side; full calibration, when set, wins.
+- The `stty -g` rewrite zeroes the input flags, and a string that fails the check gives NONE.
+- The property is unset, or names a missing node: the backend is NONE and nothing touches a port.
+- No frame within the open window gives NONE; the port is never written to across open and sampling.
+- A read error closes the backend and logs once.
+- The lazy sampler returns at once while the open blocks, and opens on its own thread.
+- A side-only direction sends the side with no angle, for both the early wake cue and the end of the utterance.
 
-**Verification:** The harness tests pass. The launcher builds with the unchanged vendor library.
+**Verification:** The harness tests pass, and on the robot the launcher reports the NC backend in side mode and stays up.
 
 ### U3. The launcher delivers the wake word early and listens on the charger
 
