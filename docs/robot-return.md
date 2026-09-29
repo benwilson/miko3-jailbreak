@@ -98,15 +98,20 @@ Do this early. Three of its results can overturn design decisions, which changes
 
 ## 9. Hey Miko always answers
 
-The plan is `docs/plans/2026-09-28-1427-feat-explore-hey-miko-always-answers-plan.md`. Do the chip first: with it confirmed and calibrated, the walkthrough holds calls to the 3 s facing budget; without it, to 12 s.
+The plan is `docs/plans/2026-09-28-1427-feat-explore-hey-miko-always-answers-plan.md` (PR #29, unmerged). On 2026-09-29 the chip on `/dev/ttyS1` was confirmed and put in side mode (`persist.miko3.voice_dir.port=/dev/ttyS1`, `.left=100`, `.right=60`). It tells left from right but not front from back, and it streams frames by itself; the launcher only listens.
 
-- [ ] **Identify the direction chip (read-only).** `python3 scripts/qa-direction-chip.py`. It reads who holds `/dev/ttyS1`, the driver counters, `dmesg`, the device tree, the port settings and any vendor log, and listens passively; it never writes to the port. Expect `UNCONFIRMED`: the protocol only answers requests, and the vendor app that talks to the chip is disabled here.
-  - If the evidence satisfies you that `ttyS1` is the chip, rerun with `--owner-confirms`. It sets `persist.miko3.voice_dir.port`, restarts the launcher and probes once, and unsets the property unless the probe shows backend `NC` with an `XXUB` reply. A property the launcher cannot read shows up here too, as backend `NONE`.
-  - If you are not satisfied, stop here. Nothing writes to the port, and he finds callers by turning and looking.
-- [ ] **Calibrate.** `python3 scripts/qa-direction-chip.py --calibrate`: stand front, left, right and behind as asked. It sets the zero, sign and scale properties. Then `python3 scripts/qa-ears-probe.py --session` should show angles near 0, -90, +90 and 180.
-- [ ] **The call walkthrough.** `python3 scripts/qa-conversation.py --only callmet,callbackoff,callchat,callbehind,callwhere,calldock,callfar,callten`, adding `--chip` if the chip passed. Each check prints the answer, facing and arrival times.
-  - Record the times in the plan. The look budget per stop (`callLookMs`, 700 ms) is a placeholder: on the simulated clock a person behind is found in about 10 s with a frame every 500 ms, but never with one frame a second. If he circles past people, raise it and note the new time for someone behind.
-  - Note any false wake word on the dock: the ears now stay open there.
+- [ ] **Install the branch build.** From the branch: `python3 scripts/build-custom-launcher.py` and `python3 scripts/build-mode-explore.py`, then `adb install -r` both APKs and `adb shell am start -n com.miko3.launcher/.MainActivity` (the HOME key won't restart the launcher). Both `versionName`s must match the branch head.
+- [ ] **The ears probe no longer crashes the launcher.** `python3 scripts/qa-ears-probe.py --seconds 3` should print rows, and `adb logcat -d | grep -E 'has died|SIG_DFL'` should show nothing new. It used to segfault every time, on `main` too (a use-after-free, fixed on this branch).
+  - If it still crashes, bisect with the diagnostic build kept in `.claude/worktrees/agent-a4ced16e8c78cdffb/` (`diag-launcher.apk` and `PROBE-BISECTION.md`; never merge that branch), then reinstall the branch launcher.
+- [ ] **The chip still streams after a cold boot.** Say something to him, then `adb logcat -d | grep 'voice direction'` should show `backend NC (nc on /dev/ttyS1, side)` and `nc raw <v> (side)` lines. `NONE ... no frames` means the chip needs something after a boot that we haven't seen yet: record it in `docs/TODO.md`.
+- [ ] **Re-check the side thresholds (optional).** `python3 scripts/qa-direction-chip.py --calibrate`: stand front, left, right and behind, press Enter and count aloud. It suggests left/right thresholds; add `--apply` to set them. Yesterday's numbers suggest left 95 and right 60.
+- [ ] **Side test on the stream.** On the charger, `python3 scripts/qa-direction-chip.py --watch --seconds 15` while you talk from his left, then his right: the frames should read `left`, then `right`.
+- [ ] **Side test in Explore.** Off the charger, on open floor: call "Hey Miko" from his left side. He should answer, then look left first. Repeat from his right. From ahead or behind he has no side and uses the full circle.
+- [ ] **The call walkthrough.** `python3 scripts/qa-conversation.py --only callmet,callbackoff,callchat,callbehind,callwhere,calldock,callfar,callten`. Leave out `--chip`: that flag is for a chip that gives an angle, and side mode keeps the 12 s facing budget. Each check prints the answer, facing and arrival times.
+  - `callchat` now also checks the fix for a second caller during the first caller's meeting: the second call must be answered when the first conversation ends.
+  - Record the times in the plan. The look budget per stop (`callLookMs`, 700 ms) is a placeholder: the chip showed frames once or twice a second and the camera is similar, so if he circles past people, raise it and note the new time for someone behind.
+  - Note any false wake word on the dock: the ears stay open there.
+- [ ] **Floor sensor fault.** On 2026-09-29 Explore dropped to eyes-only with `tof at fault value 16383`. If it recurs, note when (cold start, after docking) in `docs/TODO.md`.
 
 ---
 
