@@ -3,27 +3,23 @@
 ever writing to it, and once the port is confirmed, set and calibrate the
 properties the launcher opens it from (hey-miko plan U1; R8, KTD10, KTD12, KTD13).
 
-Identification (the default run) is read-only. Over adb it gathers:
+Identification (the default run) never opens /dev/ttyS1. Opening a tty can write
+to it: in cooked mode with echo on the kernel sends back what it receives, and on
+the robot (2026-09-29) an stty read of this port took its counters from tx 0 to
+tx 98. So over adb it only reads /proc, /sys and logs:
   holder      which process, if any, holds /dev/ttyS1 open;
   driver      /proc/tty/driver/* and the port's tx/rx counters;
   dmesg       kernel lines about the UART, ttyS1 and the DSP;
   dtree       the device-tree serial1 alias and the gpio_dsp nodes;
-  settings    the port's termios (stty -a, reading through a read-only redirect);
-  vendor_log  any vendor nc_dsp log lines, in logcat or in files;
-  passive     five seconds of whatever the chip sends, read through `cat` under
-              `timeout` and parsed for XXUB frames with a valid CRC32.
-The passive read runs only when the settings show echo off: a tty with echo on
-sends every byte it receives back out, which would be a write to the chip.
-Toybox has no non-blocking open, so `timeout` bounds the open and the read.
+  vendor_log  any vendor nc_dsp log lines (by logcat tag), or nc_dsp files.
 
-The verdict follows KTD13's fixed rule. The port is CONFIRMED only when
-  (frame)       the passive read holds an XXUB frame with a valid CRC,
+The verdict follows KTD13's rule, less the passive frame the port can no longer be
+read for. The port is CONFIRMED only when
   (vendor log)  a vendor nc_dsp log line names ttyS1, or
   (owner)       the owner passes --owner-confirms after reading the evidence.
-Otherwise it is UNCONFIRMED and nothing is written anywhere. The first two are
-expected to find nothing on this robot (the chip only answers requests, and the
-vendor app that talks to it has always been disabled here), so the owner's
-confirmation is the expected route.
+Otherwise it is UNCONFIRMED and nothing is written anywhere. The vendor app that
+talks to the chip has always been disabled here, so the owner's confirmation is
+the expected route.
 
 On CONFIRMED it sets persist.miko3.voice_dir.port to /dev/ttyS1, restarts the
 launcher so it opens the chip afresh, and runs the launcher's ears probe once
@@ -84,7 +80,6 @@ PROBE_ATTEMPTS = 3
 PROBE_RETRY_S = 5
 CALIBRATION_SECONDS = 5
 CALIBRATION_PHRASE = "hey miko"
-PASSIVE_SECONDS = 5
 
 FRAME_MAGIC = b"XXUB"
 MIN_FRAME = 14  # a request: XXUB, module, op, param, three zeros, CRC32 LE over the first 10
@@ -105,13 +100,11 @@ EVIDENCE_COMMANDS = {
     "dtree": ("tr '\\0' '\\n' < /proc/device-tree/aliases/serial1 2>&1; "
               "ls /sys/devices/platform/odm/odm:gpio_dsp 2>&1; "
               "find /proc/device-tree -maxdepth 3 -iname '*dsp*' 2>/dev/null | head -20"),
-    "settings": f"timeout 3 sh -c 'stty -a < {NODE}' 2>&1",
     "vendor_log": ("logcat -d -b all 2>/dev/null | grep -iE 'nc_?dsp|ncdsp' | tail -50; "
                    "for f in $(find /sdcard /data/local/tmp /data/vendor /data/misc -maxdepth 4 "
                    "-iname '*nc*dsp*' 2>/dev/null | head -10); do echo \"== $f\"; "
                    "grep -iE 'ttyS1' \"$f\" 2>/dev/null | tail -20; done"),
 }
-PASSIVE_READ = f"timeout {PASSIVE_SECONDS} cat {NODE} 2>/dev/null | od -An -tx1 -v"
 
 Evidence = namedtuple("Evidence", "sections passive passive_note")
 Frame = namedtuple("Frame", "offset length hex")
@@ -161,16 +154,6 @@ def find_frames(data):
 
 # --- evidence ---
 
-def echo_on(settings):
-    """True or False from `stty -a` output, None when it is not stty output."""
-    tokens = set(re.split(r"[\s;]+", settings))
-    if "echo" in tokens:
-        return True
-    if "-echo" in tokens:
-        return False
-    return None
-
-
 def port_counters(driver_text):
     """ttyS1's tx/rx counters from /proc/tty/driver (the line for port 1), or None."""
     m = re.search(r"^\s*1:\s.*?\btx:(\d+)\s+rx:(\d+)", driver_text, re.MULTILINE)
@@ -200,7 +183,7 @@ def vendor_log_lines(text):
 
 
 def gather(robot):
-    """Runs the read-only evidence commands; the passive read only with echo off."""
+    """Runs the evidence commands, none of which opens the node."""
     sections = {}
     for name, script in EVIDENCE_COMMANDS.items():
         print(f".. {name}")
@@ -209,27 +192,17 @@ def gather(robot):
         except ears.ProbeError as exc:
             # One slow or failed step is missing evidence, not a reason to drop the rest.
             sections[name] = f"(unavailable: {exc})"
-    echo = echo_on(sections["settings"])
-    if echo is None:
-        return Evidence(sections, None, "skipped: the port settings could not be read, so echo may be on")
-    if echo:
-        return Evidence(sections, None, "skipped: the port has echo on, so reading would send bytes back out")
-    print(f".. passive read, {PASSIVE_SECONDS} s")
-    data = parse_od(robot.adb("shell", PASSIVE_READ, check=False))
-    return Evidence(sections, data, f"{len(data)} bytes in {PASSIVE_SECONDS} s")
+    return Evidence(sections, None, "not run: the port is never opened, since opening a tty can write to it")
 
 
 def decide(evidence, owner_confirms):
-    """KTD13's rule: a valid frame, then a vendor log naming ttyS1, then the owner."""
-    frames = find_frames(evidence.passive) if evidence.passive else []
-    if frames:
-        return Verdict(True, "frame", [f"frame at byte {f.offset}, {f.length} bytes: {f.hex}" for f in frames])
+    """KTD13's rule without the passive frame: a vendor log naming ttyS1, then the owner."""
     lines = vendor_log_lines(evidence.sections.get("vendor_log", ""))
     if lines:
         return Verdict(True, "vendor log", lines)
     if owner_confirms:
         return Verdict(True, "owner", ["the owner confirmed from the evidence shown (--owner-confirms)"])
-    return Verdict(False, None, ["no XXUB frame with a valid CRC and no nc_dsp log naming ttyS1"])
+    return Verdict(False, None, ["no nc_dsp log naming ttyS1"])
 
 
 def format_verdict(verdict):
@@ -249,7 +222,6 @@ def format_evidence(evidence):
              f"  ttyS1 counters: {'unreadable' if counters is None else 'tx %(tx)d rx %(rx)d' % counters}",
              "== dmesg", block(s.get("dmesg", "")),
              "== device tree", block(s.get("dtree", "")),
-             "== port settings", block(s.get("settings", "")),
              "== vendor nc_dsp log", block(s.get("vendor_log", "")),
              f"== passive read: {evidence.passive_note}"]
     if evidence.passive:

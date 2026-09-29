@@ -34,16 +34,6 @@ ears = chip.ears
 # The DOA query from the plan: XXUB, module 03, op 01, param 03, three zeros, CRC32 LE.
 DOA_QUERY = bytes.fromhex("58585542030103000000a620d0e7")
 
-STTY_RAW = ("speed 115200 baud; line = 0;\n"
-            "intr = ^C; quit = ^\\; erase = ^?; kill = ^U; eof = ^D;\n"
-            "-parenb -parodd cs8 -hupcl -cstopb cread clocal -crtscts\n"
-            "-ignbrk -brkint -ignpar -parmrk -inpck -istrip -inlcr -igncr -icrnl -ixon -ixoff\n"
-            "-opost -onlcr\n"
-            "-isig -icanon -iexten -echo -echoe -echok -echonl -noflsh -tostop\n")
-STTY_COOKED = ("speed 9600 baud; line = 0;\n"
-               "-parenb cs8 hupcl cread -clocal\n"
-               "icrnl ixon opost onlcr\n"
-               "isig icanon iexten echo echoe echok -echonl\n")
 DRIVER = ("== /proc/tty/driver/serial\n"
           "serinfo:1.0 driver revision:\n"
           "0: uart:MTK mmio:0x11002000 irq:91 tx:18231 rx:4410 RTS|DTR\n"
@@ -93,8 +83,6 @@ class FakeRobot(ears.Robot):
                     if name in self.timeouts:
                         raise ears.ProbeError(f"!! adb timed out: adb shell {script}")
                     return self.outputs.get(name, "")
-            if args[1] == chip.PASSIVE_READ:
-                return self.outputs.get("passive", "")
         return ""
 
     @contextlib.contextmanager
@@ -108,8 +96,7 @@ class FakeRobot(ears.Robot):
 
 
 def evidence_outputs(**over):
-    out = {"holder": "", "driver": DRIVER, "dmesg": DMESG, "dtree": DTREE, "settings": STTY_RAW,
-           "vendor_log": "", "passive": ""}
+    out = {"holder": "", "driver": DRIVER, "dmesg": DMESG, "dtree": DTREE, "vendor_log": ""}
     out.update(over)
     return out
 
@@ -127,6 +114,8 @@ def quiet(fn, *args, **kw):
 
 # Writes aimed at the node: redirections, dd of=, tee, and a read-write open.
 NODE_WRITE = re.compile(r"(>>?\s*|of=|tee\s+(-a\s+)?)/dev/ttyS1\b|<>\s*/dev/ttyS1\b")
+# Any form that opens the node: a redirect from it, a program reading it, stty on it.
+NODE_OPEN = re.compile(r"<\s*/dev/ttyS1|\b(?:cat|od|dd|hexdump|stty|timeout)\b[^;|]*/dev/ttyS1")
 
 
 def node_writes(calls):
@@ -163,18 +152,6 @@ class FrameTest(unittest.TestCase):
 class DecideTest(unittest.TestCase):
     def evidence(self, **over):
         return quiet(chip.gather, FakeRobot(evidence_outputs(**over)))
-
-    def test_a_passive_frame_with_a_valid_crc_confirms(self):
-        verdict = chip.decide(self.evidence(passive=od(b"\x00" + DOA_QUERY)), owner_confirms=False)
-        self.assertTrue(verdict.confirmed)
-        self.assertEqual(verdict.reason, "frame")
-        self.assertEqual(chip.format_verdict(verdict).splitlines()[0], "CONFIRMED (frame)")
-
-    def test_a_passive_frame_with_a_bad_crc_stays_unconfirmed(self):
-        bad = DOA_QUERY[:-1] + b"\x00"
-        verdict = chip.decide(self.evidence(passive=od(bad)), owner_confirms=False)
-        self.assertFalse(verdict.confirmed)
-        self.assertEqual(chip.format_verdict(verdict).splitlines()[0], "UNCONFIRMED")
 
     def test_an_nc_dsp_log_line_naming_ttys1_confirms(self):
         verdict = chip.decide(self.evidence(vendor_log=NC_LOG), owner_confirms=False)
@@ -217,10 +194,6 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(verdict.reason, "owner")
         self.assertEqual(chip.format_verdict(verdict).splitlines()[0], "CONFIRMED (owner)")
 
-    def test_a_frame_outranks_the_owner(self):
-        verdict = chip.decide(self.evidence(passive=od(DOA_QUERY)), owner_confirms=True)
-        self.assertEqual(verdict.reason, "frame")
-
     def test_ttys1_driver_counters_are_parsed(self):
         self.assertEqual(chip.port_counters(DRIVER), {"tx": 0, "rx": 0})
         self.assertIsNone(chip.port_counters("cat: /proc/tty/driver/serial: Permission denied\n"))
@@ -228,24 +201,38 @@ class DecideTest(unittest.TestCase):
 
 class GatherTest(unittest.TestCase):
     def test_every_evidence_command_is_read_only(self):
-        for name, script in list(chip.EVIDENCE_COMMANDS.items()) + [("passive", chip.PASSIVE_READ)]:
+        for name, script in chip.EVIDENCE_COMMANDS.items():
             self.assertIsNone(NODE_WRITE.search(script), name)
             self.assertNotIn("setprop", script, name)
-            self.assertNotIn("stty -F", script, name)  # stty reads through a read-only redirect
 
-    def test_gather_covers_ktd13s_list(self):
-        for name in ("holder", "driver", "dmesg", "dtree", "settings", "vendor_log"):
+    def test_no_evidence_step_ever_opens_the_node(self):
+        """Seen on the robot (2026-09-29): an stty read opened ttyS1 in cooked mode with echo
+        on while the chip was talking; the counters went from tx 0 to tx 98. Opening a tty
+        at all can write to it, so identification only reads /proc, /sys and logs."""
+        for name, script in chip.EVIDENCE_COMMANDS.items():
+            self.assertIsNone(NODE_OPEN.search(script), f"{name}: {script}")
+        self.assertFalse(hasattr(chip, "PASSIVE_READ"))
+        self.assertNotIn("settings", chip.EVIDENCE_COMMANDS)
+
+    def test_gather_covers_ktd13s_read_only_list(self):
+        for name in ("holder", "driver", "dmesg", "dtree", "vendor_log"):
             self.assertIn(name, chip.EVIDENCE_COMMANDS)
-        self.assertIn("/dev/ttyS1", chip.PASSIVE_READ)
-        self.assertIn("timeout", chip.PASSIVE_READ)
+
+    def test_gather_runs_only_the_evidence_commands(self):
+        robot = FakeRobot(evidence_outputs())
+        ev = quiet(chip.gather, robot)
+        self.assertEqual([c for c in robot.calls if c[:1] == ("shell",)],
+                         [("shell", s) for s in chip.EVIDENCE_COMMANDS.values()])
+        self.assertIsNone(ev.passive)
+        self.assertIn("never opened", ev.passive_note)
 
     def test_a_timed_out_evidence_step_is_recorded_and_the_rest_still_run(self):
         """Seen on the robot (2026-09-29): the holder scan timed out and aborted the whole run."""
-        robot = FakeRobot(evidence_outputs(passive=""), timeouts={"holder"})
+        robot = FakeRobot(evidence_outputs(), timeouts={"holder"})
         ev = quiet(chip.gather, robot)
         self.assertIn("unavailable", ev.sections["holder"])
         self.assertIn("timed out", ev.sections["holder"])
-        for name in ("driver", "dmesg", "dtree", "settings", "vendor_log"):
+        for name in ("driver", "dmesg", "dtree", "vendor_log"):
             self.assertIn(("shell", chip.EVIDENCE_COMMANDS[name]), robot.calls, name)
         self.assertEqual(ev.sections["driver"], DRIVER)
 
@@ -255,36 +242,10 @@ class GatherTest(unittest.TestCase):
         self.assertNotIn("readlink", script)
         self.assertIn("ls -l", script)
 
-    def test_the_passive_read_runs_only_with_echo_off(self):
-        """An open tty with echo on sends what it receives back out: that would be a write."""
-        robot = FakeRobot(evidence_outputs(settings=STTY_COOKED, passive=od(DOA_QUERY)))
-        ev = quiet(chip.gather, robot)
-        self.assertNotIn(("shell", chip.PASSIVE_READ), robot.calls)
-        self.assertIsNone(ev.passive)
-        self.assertIn("echo", ev.passive_note)
-        self.assertFalse(chip.decide(ev, owner_confirms=False).confirmed)
-
-    def test_the_passive_read_is_skipped_when_the_settings_are_unreadable(self):
-        robot = FakeRobot(evidence_outputs(settings="sh: /dev/ttyS1: Permission denied\n"))
-        ev = quiet(chip.gather, robot)
-        self.assertNotIn(("shell", chip.PASSIVE_READ), robot.calls)
-        self.assertIsNone(ev.passive)
-
-    def test_the_passive_read_runs_with_echo_off(self):
-        robot = FakeRobot(evidence_outputs(passive=od(DOA_QUERY)))
-        ev = quiet(chip.gather, robot)
-        self.assertIn(("shell", chip.PASSIVE_READ), robot.calls)
-        self.assertEqual(ev.passive, DOA_QUERY)
-
-    def test_echo_state_parsing(self):
-        self.assertIs(chip.echo_on(STTY_RAW), False)
-        self.assertIs(chip.echo_on(STTY_COOKED), True)
-        self.assertIsNone(chip.echo_on("Permission denied"))
-
-    def test_the_report_shows_every_section(self):
+    def test_the_report_shows_every_section_and_the_traffic_counters(self):
         ev = quiet(chip.gather, FakeRobot(evidence_outputs(holder="812 /vendor/bin/dspd\n")))
         text = chip.format_evidence(ev)
-        for needle in ("holder", "812 /vendor/bin/dspd", "tx 0 rx 0", "serial@11003000", "-echo", "passive"):
+        for needle in ("holder", "812 /vendor/bin/dspd", "tx 0 rx 0", "serial@11003000", "never opened"):
             self.assertIn(needle, text)
 
 
@@ -361,11 +322,10 @@ class IdentifyTest(unittest.TestCase):
     def test_no_run_ever_writes_to_the_node_and_only_voice_dir_props_are_set(self):
         runs = [
             dict(robot=FakeRobot(evidence_outputs()), owner_confirms=False, probe_answer=nc_answer()),
-            dict(robot=FakeRobot(evidence_outputs(passive=od(DOA_QUERY))), probe_answer=nc_answer()),
+            dict(robot=FakeRobot(evidence_outputs(vendor_log=NC_LOG)), probe_answer=nc_answer()),
             dict(robot=FakeRobot(evidence_outputs()), owner_confirms=True,
                  probe_answer=nc_answer(backend="NONE", reply=None)),
-            dict(robot=FakeRobot(evidence_outputs(settings=STTY_COOKED)), owner_confirms=True,
-                 probe_answer=nc_answer()),
+            dict(robot=FakeRobot(evidence_outputs()), owner_confirms=True, probe_answer=nc_answer()),
         ]
         for spec in runs:
             robot = spec.pop("robot")
@@ -378,7 +338,7 @@ class IdentifyTest(unittest.TestCase):
         for cmd in ("echo -n x > /dev/ttyS1", "dd if=/tmp/f of=/dev/ttyS1", "cat f >> /dev/ttyS1",
                     "printf x | tee /dev/ttyS1", "exec 3<> /dev/ttyS1"):
             self.assertTrue(node_writes([("shell", cmd)]), cmd)
-        self.assertFalse(node_writes([("shell", chip.PASSIVE_READ)]))
+        self.assertFalse(node_writes([("shell", chip.EVIDENCE_COMMANDS["holder"])]))
 
 
 class ProbeExpectationTest(unittest.TestCase):
