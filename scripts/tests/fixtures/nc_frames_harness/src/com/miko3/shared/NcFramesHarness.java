@@ -42,14 +42,38 @@ public final class NcFramesHarness {
     }
 
     /** A 38-byte reply with reporting on and raw value raw at byte 0x21. */
+    /** A 19-byte reply frame as the chip sends it (seen on the robot, 2026-09-29): XXUB,
+     * six header bytes, CRC32 LE over the first 10, then a 5-byte payload. */
+    static byte[] frame(int module, int op, int h6, int h7, int h8, int h9, int p0) {
+        byte[] f = new byte[19];
+        System.arraycopy(hex("58585542"), 0, f, 0, 4);
+        f[4] = (byte) module;
+        f[5] = (byte) op;
+        f[6] = (byte) h6;
+        f[7] = (byte) h7;
+        f[8] = (byte) h8;
+        f[9] = (byte) h9;
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(f, 0, 10);
+        long c = crc.getValue();
+        for (int i = 0; i < 4; i++) {
+            f[10 + i] = (byte) (c >>> (8 * i));
+        }
+        f[14] = (byte) p0;
+        return f;
+    }
+
+    /** Reporting on, with a direction: the status frame, then the direction frame. */
     static byte[] onReply(int raw) {
         byte[] r = new byte[38];
-        System.arraycopy(hex("58585542"), 0, r, 0, 4);
-        r[4] = 3;
-        r[5] = 1;
-        r[14] = 1;
-        r[0x21] = (byte) raw;
+        System.arraycopy(ackOnly(), 0, r, 0, 19);
+        System.arraycopy(frame(0xa3, 3, 0x8f, 1, 5, 0, raw), 0, r, 19, 19);
         return r;
+    }
+
+    /** Reporting on, but no direction frame yet (nobody talking): the status frame alone. */
+    static byte[] ackOnly() {
+        return frame(3, 2, 0, 1, 5, 0, 1);
     }
 
     /** A 15-byte reply with reporting off (status byte 14 = 0). */
@@ -515,6 +539,47 @@ public final class NcFramesHarness {
                 check(n, h.startsWith("58585542") && h.equals(first) && log.count(h) >= 1
                                 && log.count(h) <= VoiceDirection.LOGGED_REPLIES,
                         "first=" + first + " logged=" + log.count(h));
+            }
+        });
+        scenario("the_reply_captured_on_the_robot_parses_to_raw_50", new Scenario() {
+            public void run(String n) {
+                byte[] r = hex("58585542030200010500ea6b70ce011bdf05a5" + "58585542a3038f010500d9f5365f320dbed51a");
+                byte[] ack = hex("58585542030200010500ea6b70ce011bdf05a5");
+                check(n, NcFrames.parseDoa(r, r.length) == 50
+                                && NcFrames.parseDoa(ack, ack.length) == NcFrames.NO_READING,
+                        "full=" + NcFrames.parseDoa(r, r.length) + " ack=" + NcFrames.parseDoa(ack, ack.length));
+            }
+        });
+        scenario("a_frame_with_a_bad_crc_is_malformed", new Scenario() {
+            public void run(String n) {
+                byte[] r = onReply(50);
+                r[12] ^= 1;
+                byte[] d = onReply(50);
+                d[19 + 12] ^= 1;
+                check(n, NcFrames.parseDoa(r, r.length) == NcFrames.MALFORMED
+                                && NcFrames.parseDoa(d, d.length) == NcFrames.MALFORMED,
+                        "status=" + NcFrames.parseDoa(r, r.length) + " doa=" + NcFrames.parseDoa(d, d.length));
+            }
+        });
+        scenario("a_quiet_room_is_no_reading_never_a_miss", new Scenario() {
+            // Seen on the robot (2026-09-29): with nobody talking the chip answers the status
+            // frame alone, and three of those closed the backend for the life of the process.
+            public void run(String n) {
+                FakePort port = new FakePort(new Chip() {
+                    public byte[] answer(byte[] frame, int writeNo) {
+                        return java.util.Arrays.equals(frame, NcFrames.doaQuery()) ? ackOnly() : null;
+                    }
+
+                    public long delayMs(int writeNo) {
+                        return 0;
+                    }
+                });
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), new Lines());
+                for (int i = 0; i < 10; i++) {
+                    d.degrees();
+                }
+                check(n, d.backend() == VoiceDirection.Backend.NC && Float.isNaN(d.degrees()),
+                        "backend=" + d.backend());
             }
         });
         scenario("lazy_sampler_opens_on_its_own_thread_and_never_blocks_the_caller", new Scenario() {

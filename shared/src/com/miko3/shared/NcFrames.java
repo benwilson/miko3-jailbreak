@@ -29,8 +29,15 @@ public final class NcFrames {
 
     /** parseDoa: the reply says reporting is off. */
     public static final int OFF = -1;
-    /** parseDoa: no reply, a short one, or one without the prefix. */
+    /** parseDoa: no reply, a short one, one without the prefix, or a frame with a bad CRC. */
     public static final int MALFORMED = -2;
+    /** parseDoa: reporting is on but only the status frame came (no direction yet,
+     * nobody talking). An answer, not a miss. */
+    public static final int NO_READING = -3;
+    /** A reply frame (seen on the robot, 2026-09-29): XXUB, six header bytes, CRC32 LE
+     * over the first 10, then a 5-byte payload. A reply with a direction is the status
+     * frame followed by a direction frame whose first payload byte is the raw value. */
+    public static final int FRAME_LENGTH = 19;
 
     static final int MODULE_DOA = 3;
     static final int OP_GET = 1;
@@ -70,7 +77,8 @@ public final class NcFrames {
     }
 
     /** How many bytes the reply in buf[0..have) needs in all: SHORT_REPLY until
-     * the status byte is in, then LONG_REPLY when reporting is on. */
+     * the status byte is in, then LONG_REPLY when reporting is on (the direction frame
+     * may never come; the caller's deadline ends the wait). */
     public static int replyLength(byte[] buf, int have) {
         if (have <= STATUS_INDEX) {
             return SHORT_REPLY;
@@ -78,23 +86,47 @@ public final class NcFrames {
         return buf[STATUS_INDEX] == 0 ? SHORT_REPLY : LONG_REPLY;
     }
 
-    /** The raw direction 0 to 255, OFF, or MALFORMED; never throws. */
+    /** The raw direction 0 to 255, OFF, NO_READING, or MALFORMED; never throws. */
     public static int parseDoa(byte[] reply, int length) {
-        if (reply == null || length < SHORT_REPLY || length > reply.length) {
+        if (reply == null || length < SHORT_REPLY || length > reply.length || !prefixed(reply, 0)) {
             return MALFORMED;
-        }
-        for (int i = 0; i < PREFIX.length; i++) {
-            if (reply[i] != PREFIX[i]) {
-                return MALFORMED;
-            }
         }
         if (reply[STATUS_INDEX] == 0) {
             return OFF;
         }
+        if (length >= FRAME_LENGTH && !crcOk(reply, 0)) {
+            return MALFORMED;
+        }
         if (length < LONG_REPLY) {
+            // The status frame alone is an answer; a frame torn off mid-way is not.
+            return length == FRAME_LENGTH ? NO_READING : MALFORMED;
+        }
+        if (!prefixed(reply, FRAME_LENGTH) || !crcOk(reply, FRAME_LENGTH)) {
             return MALFORMED;
         }
         return reply[RAW_INDEX] & 0xff;
+    }
+
+    private static boolean prefixed(byte[] b, int at) {
+        for (int i = 0; i < PREFIX.length; i++) {
+            if (b[at + i] != PREFIX[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The frame at `at` carries CRC32 LE of its first 10 bytes at bytes 10 to 13. */
+    private static boolean crcOk(byte[] b, int at) {
+        CRC32 crc = new CRC32();
+        crc.update(b, at, 10);
+        long c = crc.getValue();
+        for (int i = 0; i < 4; i++) {
+            if (b[at + 10 + i] != (byte) (c >>> (8 * i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** The raw direction as a float, or NaN for a reply that is off or malformed. */

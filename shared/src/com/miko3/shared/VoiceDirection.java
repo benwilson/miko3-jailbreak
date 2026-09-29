@@ -346,6 +346,9 @@ public final class VoiceDirection {
             return raw;
         }
         misses = 0;
+        if (raw == NcFrames.NO_READING) {
+            return raw;
+        }
         if (raw == NcFrames.OFF) {
             if (!toggled) {
                 // Each toggle flips the state, so at most one per open.
