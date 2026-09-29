@@ -541,5 +541,105 @@ public final class NcFramesHarness {
                         "port=" + c.port);
             }
         });
+        // Robot finding (2026-09-29): the chip tells only left from right (right ~35,
+        // front ~80, behind ~90, left ~100), so the owner uses it for the side alone.
+        scenario("side_thresholds_map_raw_to_left_right_or_neither", new Scenario() {
+            public void run(String n) {
+                NcFrames.Sides s = NcFrames.Sides.parse("100", "60");
+                StringBuilder got = new StringBuilder();
+                boolean ok = s != null;
+                if (ok) {
+                    int[] raws = {35, 60, 61, 80, 99, 100, 110, -1};
+                    float[] want = {90f, 90f, Float.NaN, Float.NaN, Float.NaN, -90f, -90f, Float.NaN};
+                    for (int i = 0; i < raws.length; i++) {
+                        float d = NcFrames.sideDegrees(raws[i], s);
+                        got.append(raws[i]).append("->").append(d).append(' ');
+                        ok &= Float.isNaN(want[i]) ? Float.isNaN(d) : near(d, want[i]);
+                    }
+                    ok &= Float.isNaN(NcFrames.sideDegrees(35, null));
+                }
+                check(n, ok, "sides=" + s + " " + got);
+            }
+        });
+        scenario("config_of_six_arguments_parses_both_thresholds", new Scenario() {
+            public void run(String n) {
+                VoiceDirection.Config c = VoiceDirection.Config.of(" /dev/ttyS1 ", "", "", "", " 100 ", "60");
+                VoiceDirection.Config four = VoiceDirection.Config.of(PORT, "", "", "");
+                check(n, PORT.equals(c.port) && c.calibration == null && c.sides != null && c.sides.left == 100
+                                && c.sides.right == 60 && four.sides == null,
+                        "port=" + c.port + " sides=" + c.sides + " four=" + four.sides);
+            }
+        });
+        scenario("calibration_wins_over_side_thresholds", new Scenario() {
+            public void run(String n) {
+                VoiceDirection.Config c = VoiceDirection.Config.of(PORT, "10", "-1", "360/256", "100", "60");
+                Lines log = new Lines();
+                VoiceDirection d = open(c, new FakeNative(), new FakeNodes(streaming(35), PORT), log);
+                float a = d.degrees(); // calibrated: -(35 - 10) * 1.40625; side mode would say +90
+                check(n, c.calibration != null && c.sides == null && d.backend() == VoiceDirection.Backend.NC
+                                && near(a, -35.15625f) && !d.sideOnly() && d.detail().endsWith("calibrated")
+                                && log.count("side mode") == 0 && log.count("(side)") == 0,
+                        "a=" + a + " sideOnly=" + d.sideOnly() + " detail=" + d.detail() + " log=" + log.lines);
+            }
+        });
+        scenario("bad_side_thresholds_give_no_side_mode", new Scenario() {
+            public void run(String n) {
+                boolean parse = NcFrames.Sides.parse("60", "100") == null
+                        && NcFrames.Sides.parse("100", "100") == null
+                        && NcFrames.Sides.parse("x", "60") == null
+                        && NcFrames.Sides.parse("100", "y") == null
+                        && NcFrames.Sides.parse("256", "60") == null
+                        && NcFrames.Sides.parse("100", "-1") == null
+                        && NcFrames.Sides.parse("100.5", "60") == null
+                        && NcFrames.Sides.parse("", "") == null
+                        && NcFrames.Sides.parse(null, null) == null
+                        && NcFrames.Sides.parse("255", "0") != null;
+                VoiceDirection.Config c = VoiceDirection.Config.of(PORT, "", "", "", "60", "100");
+                Lines log = new Lines();
+                VoiceDirection d = open(c, new FakeNative(), new FakeNodes(streaming(35), PORT), log);
+                check(n, parse && c.sides == null && d.backend() == VoiceDirection.Backend.NC && !d.sideOnly()
+                                && Float.isNaN(d.degrees()) && log.count("nc raw 35 (uncalibrated)") == 1
+                                && log.count("side mode") == 0,
+                        "parse=" + parse + " sides=" + c.sides + " sideOnly=" + d.sideOnly() + " log=" + log.lines);
+            }
+        });
+        scenario("side_mode_nc_gives_plus_minus_90_and_logs_its_raw_values", new Scenario() {
+            public void run(String n) throws Exception {
+                FakePort port = streaming(35);
+                Lines log = new Lines();
+                VoiceDirection d = open(VoiceDirection.Config.of(PORT, "", "", "", "100", "60"), new FakeNative(),
+                        new FakeNodes(port, PORT), log);
+                float right = d.degrees();
+                Float boxed = d.angle();
+                port.feed(direction(2, 100));
+                float left = d.degrees();
+                port.feed(direction(3, 80));
+                float ahead = d.degrees();
+                port.feed(direction(4, 105));
+                d.degrees();
+                Thread.sleep(VoiceDirection.FRESH_MS + 150);
+                float stale = d.degrees();
+                check(n, d.backend() == VoiceDirection.Backend.NC && d.sideOnly() && near(right, 90f)
+                                && boxed != null && near(boxed, 90f) && near(left, -90f) && Float.isNaN(ahead)
+                                && Float.isNaN(stale) && ("nc on " + PORT + ", side").equals(d.detail())
+                                && log.count("voice direction: nc side mode (left >= 100, right <= 60)") == 1
+                                && log.count("voice direction: nc raw 35 (side)") == 1
+                                && log.count("(uncalibrated)") == 0 && log.count("voice direction: nc raw ") == 1,
+                        "right=" + right + " left=" + left + " ahead=" + ahead + " stale=" + stale + " detail="
+                                + d.detail() + " log=" + log.lines);
+            }
+        });
+        scenario("side_only_is_false_without_an_nc_backend", new Scenario() {
+            public void run(String n) {
+                VoiceDirection missing = open(VoiceDirection.Config.of(PORT, "", "", "", "100", "60"), new FakeNative(),
+                        new FakeNodes(streaming(35)), new Lines());
+                VoiceDirection plain = open(uncalibrated(), new FakeNative(), new FakeNodes(streaming(35), PORT),
+                        new Lines());
+                // The process instance was never opened here.
+                check(n, missing.backend() == VoiceDirection.Backend.NONE && !missing.sideOnly() && !plain.sideOnly()
+                                && !VoiceDirection.sideOnlyConfigured(),
+                        "missing=" + missing.sideOnly() + " plain=" + plain.sideOnly());
+            }
+        });
     }
 }

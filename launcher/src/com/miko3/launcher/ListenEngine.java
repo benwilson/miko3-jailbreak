@@ -680,13 +680,17 @@ final class ListenEngine implements ListenSession.Ears {
 
     /** Explore plan U2 (KTD10, KTD12): the confirmed NC port and its calibration,
      * read from their properties the way SpeechTuning reads its own, handed to
-     * VoiceDirection before its first open(). Unset, the chip is never tried. */
+     * VoiceDirection before its first open(). Unset, the chip is never tried. The
+     * left/right thresholds put the chip in side mode (robot, 2026-09-29: it cannot
+     * tell front from back) when no calibration is set. */
     static void configureDirection() {
         VoiceDirection.configure(VoiceDirection.Config.of(
                 SpeechEngine.systemProperty(VoiceDirection.PORT_PROPERTY),
                 SpeechEngine.systemProperty(VoiceDirection.ZERO_PROPERTY),
                 SpeechEngine.systemProperty(VoiceDirection.SIGN_PROPERTY),
-                SpeechEngine.systemProperty(VoiceDirection.SCALE_PROPERTY)), new VoiceDirection.Logger() {
+                SpeechEngine.systemProperty(VoiceDirection.SCALE_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.LEFT_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.RIGHT_PROPERTY)), new VoiceDirection.Logger() {
                     @Override
                     public void log(String msg) {
                         Log.i(TAG, msg);
@@ -710,6 +714,11 @@ final class ListenEngine implements ListenSession.Ears {
                     sampler.stop();
                 }
             };
+        }
+
+        @Override
+        public boolean sideOnly() {
+            return VoiceDirection.sideOnlyConfigured();
         }
     };
 

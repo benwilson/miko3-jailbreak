@@ -43,6 +43,13 @@ import java.util.concurrent.TimeUnit;
  * of the process. The raw value becomes signed degrees only once the calibration
  * properties are set (KTD12); until then the angle is NaN.
  *
+ * Side mode (robot, 2026-09-29): the chip measures only how far left or right a
+ * voice is and cannot tell front from back (right about 35, front about 80, behind
+ * about 90, left about 100), so no full calibration fits it. With the LEFT and
+ * RIGHT threshold properties set and no calibration, the angle is -90 (left) or
+ * +90 (right) or NaN (ahead or behind), and sideOnly() says so: callers must use
+ * it as a side, never a bearing. A full calibration, if set, wins.
+ *
  * The angle is meant to be sampled at a caller-set cadence on its own thread
  * (sample()), never from the capture thread, and reduced to a median over an
  * utterance rather than read once at its endpoint. Nothing here sets DSP modes
@@ -64,6 +71,9 @@ public final class VoiceDirection {
     public static final String ZERO_PROPERTY = "persist.miko3.voice_dir.zero";
     public static final String SIGN_PROPERTY = "persist.miko3.voice_dir.sign";
     public static final String SCALE_PROPERTY = "persist.miko3.voice_dir.scale";
+    /** Side mode's raw thresholds (integers): at or above LEFT is left, at or below RIGHT is right. */
+    public static final String LEFT_PROPERTY = "persist.miko3.voice_dir.left";
+    public static final String RIGHT_PROPERTY = "persist.miko3.voice_dir.right";
     /** How long each stty run may take. */
     static final long STTY_TIMEOUT_MS = 2000;
     /** How long open() waits for the first direction frame (the chip sends one a second). */
@@ -76,7 +86,7 @@ public final class VoiceDirection {
     static final int BUFFER_BYTES = 512;
     /** How many direction frames are logged in full (hex). */
     static final int LOGGED_FRAMES = 3;
-    /** While uncalibrated, a raw value is logged at most this often, for calibration. */
+    /** While uncalibrated or in side mode, a raw value is logged at most this often: the owner's evidence. */
     static final long RAW_LOG_PERIOD_MS = 1000;
 
     /** The launcher's settings for the NC chip, from the properties above. */
@@ -85,15 +95,24 @@ public final class VoiceDirection {
         public final String port;
         /** The calibration, or null while uncalibrated. */
         public final NcFrames.Calibration calibration;
+        /** Side mode's thresholds, or null when not in side mode (always null with a calibration). */
+        public final NcFrames.Sides sides;
 
-        private Config(String port, NcFrames.Calibration calibration) {
+        private Config(String port, NcFrames.Calibration calibration, NcFrames.Sides sides) {
             this.port = port;
             this.calibration = calibration;
+            this.sides = calibration == null ? sides : null;
         }
 
-        /** From the four property values ("" or null when unset). */
+        /** From the four property values ("" or null when unset), with no side thresholds. */
         public static Config of(String port, String zero, String sign, String scale) {
-            return new Config(port == null ? "" : port.trim(), NcFrames.Calibration.parse(zero, sign, scale));
+            return of(port, zero, sign, scale, null, null);
+        }
+
+        /** From the six property values ("" or null when unset). A full calibration wins over the thresholds. */
+        public static Config of(String port, String zero, String sign, String scale, String left, String right) {
+            return new Config(port == null ? "" : port.trim(), NcFrames.Calibration.parse(zero, sign, scale),
+                    NcFrames.Sides.parse(left, right));
         }
 
         static final Config NONE = of("", "", "", "");
@@ -137,7 +156,8 @@ public final class VoiceDirection {
 
     private static Config config = Config.NONE;
     private static Logger logger = QUIET;
-    private static VoiceDirection opened;
+    /** Volatile so sideOnlyConfigured() reads it without the class lock open() holds. */
+    private static volatile VoiceDirection opened;
 
     private volatile Backend backend;
     private final String detail;
@@ -146,6 +166,7 @@ public final class VoiceDirection {
     // The NC backend's state; drain() and its callers hold this.
     private final Port port;
     private final NcFrames.Calibration calibration;
+    private final NcFrames.Sides sides;
     private final long freshNs;
     private final byte[] buf = new byte[BUFFER_BYTES];
     private int have;
@@ -162,18 +183,19 @@ public final class VoiceDirection {
     };
 
     private VoiceDirection(Backend backend, String detail, ConexantDSP cx, Port port,
-                           NcFrames.Calibration calibration, long freshMs, Logger log) {
+                           NcFrames.Calibration calibration, NcFrames.Sides sides, long freshMs, Logger log) {
         this.backend = backend;
         this.detail = detail;
         this.cx = cx;
         this.port = port;
         this.calibration = calibration;
+        this.sides = calibration == null ? sides : null;
         this.freshNs = freshMs * 1000000L;
         this.log = log;
     }
 
     private static VoiceDirection none(String why, Logger log) {
-        return new VoiceDirection(Backend.NONE, why, null, null, null, 0, log);
+        return new VoiceDirection(Backend.NONE, why, null, null, null, null, 0, log);
     }
 
     /** Sets the NC port, the calibration and the log before the first open();
@@ -194,6 +216,14 @@ public final class VoiceDirection {
         return opened;
     }
 
+    /** Whether the process's instance is open on the NC backend in side mode; false
+     * before open() has run or with no backend. Never opens anything and takes no lock:
+     * the ears call it on the capture thread, which must never wait on open()'s tty. */
+    public static boolean sideOnlyConfigured() {
+        VoiceDirection d = opened;
+        return d != null && d.sideOnly();
+    }
+
     private static VoiceDirection tryOpen(Config cfg, Logger log) {
         StringBuilder why = new StringBuilder();
         try {
@@ -201,7 +231,7 @@ public final class VoiceDirection {
             int status = cx.initDSPComm();
             if (status >= 0) {
                 return new VoiceDirection(Backend.CONEXANT, "conexant firmware " + cx.getDSPFirmwareVersion(),
-                        cx, null, null, 0, log);
+                        cx, null, null, null, 0, log);
             }
             why.append("conexant init ").append(status);
         } catch (Throwable t) {
@@ -233,15 +263,18 @@ public final class VoiceDirection {
                 return none(why.append("nc stty ").append(status).append(sttyStep(status)).toString(), log);
             }
             p = nodes.open(node);
-            VoiceDirection d = new VoiceDirection(Backend.NC, "nc on " + node + ", "
-                    + (cfg.calibration == null ? "uncalibrated" : "calibrated"), null, p, cfg.calibration,
-                    freshMs, log);
+            String mode = cfg.calibration != null ? "calibrated" : cfg.sides != null ? "side" : "uncalibrated";
+            VoiceDirection d = new VoiceDirection(Backend.NC, "nc on " + node + ", " + mode, null, p,
+                    cfg.calibration, cfg.sides, freshMs, log);
             // The chip streams a frame a second: wait for the first one without blocking.
             long deadline = System.nanoTime() + firstFrameMs * 1000000L;
             while (true) {
                 synchronized (d) {
                     d.drain();
                     if (d.lastRaw >= 0) {
+                        if (d.sides != null) {
+                            log.log("voice direction: nc side mode (" + d.sides + ")");
+                        }
                         return d;
                     }
                 }
@@ -273,6 +306,12 @@ public final class VoiceDirection {
         return detail;
     }
 
+    /** Whether this is the NC backend in side mode: its angle is -90 (left), +90 (right)
+     * or none, a side and never a bearing. */
+    public boolean sideOnly() {
+        return backend == Backend.NC && sides != null;
+    }
+
     /** The first NC direction frame in hex (lowercase, no separators), or null when none came. */
     public synchronized String firstReplyHex() {
         return firstReplyHex;
@@ -291,14 +330,15 @@ public final class VoiceDirection {
     }
 
     /** As angle(), with NaN for no angle. The NC backend's degrees are signed
-     * and calibrated, within [-180, 180). */
+     * and calibrated, within [-180, 180), or in side mode -90 or +90. */
     public float degrees() {
         try {
             switch (backend) {
                 case CONEXANT:
                     return cx.getDSPRawDOA();
                 case NC:
-                    return NcFrames.degrees(freshRaw(), calibration);
+                    return calibration != null ? NcFrames.degrees(freshRaw(), calibration)
+                            : NcFrames.sideDegrees(freshRaw(), sides);
                 default:
                     return Float.NaN;
             }
@@ -358,7 +398,7 @@ public final class VoiceDirection {
         lastRawAt = now;
         if (calibration == null && (rawLoggedAt == 0 || now - rawLoggedAt >= RAW_LOG_PERIOD_MS * 1000000L)) {
             rawLoggedAt = now;
-            log.log("voice direction: nc raw " + raw + " (uncalibrated)");
+            log.log("voice direction: nc raw " + raw + (sides != null ? " (side)" : " (uncalibrated)"));
         }
     }
 

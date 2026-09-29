@@ -403,12 +403,19 @@ public final class ListenServiceHarness {
         List<Float> angles = new ArrayList<Float>();
         int starts;
         FakeSampling last;
+        /** Like the NC chip in side mode: its angle is a side, not a bearing. */
+        boolean sideOnly;
 
         @Override
         public EarsSession.Sampling start() {
             starts++;
             last = new FakeSampling(angles);
             return last;
+        }
+
+        @Override
+        public boolean sideOnly() {
+            return sideOnly;
         }
     }
 
@@ -1159,6 +1166,34 @@ public final class ListenServiceHarness {
                 EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
                 check(n, r.client.heard.size() == 1 && u != null && "".equals(u.text) && !u.called
                         && u.at == r.clock.now && u.kind == CueClassifier.KIND_WAKE_WORD, "heard=" + r.heard());
+            }
+        });
+        scenario("ears_side_only_direction_sends_the_side_without_an_angle", new Scenario() {
+            // Robot (2026-09-29): the NC chip tells only left from right, so its -90/+90
+            // is a side, not a bearing. The brain's side search needs a side and no angle.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.direction.sideOnly = true;
+                r.direction.angles = new ArrayList<Float>(Arrays.asList(-90f, null, -90f));
+                r.chunk(true);
+                r.rec.text = "HEY MIKO";
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                EarsSession.Utterance e = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                r.direction.angles.add(-90f);
+                r.utter("HEY MIKO WHAT'S UP", 2);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                // A plain word burst with a side and no words is still delivered on the side.
+                r.direction.angles = new ArrayList<Float>(Arrays.asList(90f, 90f));
+                r.utter("", 4);
+                EarsSession.Utterance b = r.client.heard.size() < 3 ? null : r.client.heard.get(2);
+                check(n, e != null && e.kind == CueClassifier.KIND_WAKE_WORD && e.side == CueClassifier.SIDE_LEFT
+                                && e.angle == null && f != null && f.called && f.side == CueClassifier.SIDE_LEFT
+                                && f.angle == null && b != null && b.side == CueClassifier.SIDE_RIGHT && b.angle == null,
+                        "heard=" + r.heard() + (e == null ? "" : " early=" + e.side + "/" + e.angle)
+                                + (f == null ? "" : " end=" + f.side + "/" + f.angle)
+                                + (b == null ? "" : " burst=" + b.side + "/" + b.angle));
             }
         });
         scenario("ears_direction_sampled_only_while_speech", new Scenario() {

@@ -94,6 +94,23 @@ public final class NcFrames {
         return (float) d;
     }
 
+    /** Side mode: -90 (left, since negative is left) for raw at or above the left
+     * threshold, +90 (right) for raw at or below the right one, and NaN between them
+     * (ahead or behind: the chip cannot tell which), with no thresholds (sides null)
+     * or when raw is negative (no reading). */
+    public static float sideDegrees(int raw, Sides sides) {
+        if (sides == null || raw < 0) {
+            return Float.NaN;
+        }
+        if (raw >= sides.left) {
+            return -90f;
+        }
+        if (raw <= sides.right) {
+            return 90f;
+        }
+        return Float.NaN;
+    }
+
     /** Lowercase hex of buf[0..length), no separators. */
     public static String hex(byte[] buf, int length) {
         return hex(buf, 0, length);
@@ -150,6 +167,45 @@ public final class NcFrames {
         @Override
         public String toString() {
             return "zero " + zero + " sign " + sign + " scale " + scale;
+        }
+    }
+
+    /**
+     * Side mode's raw thresholds. Verified on the robot (2026-09-29), the owner
+     * talking about 1 m away: right reads 30 to 45, front about 80, behind 85 to
+     * 100 and left 95 to 110. The chip measures only how far left or right a voice
+     * is, never front from back, so no full-circle calibration fits it; these two
+     * thresholds give the side alone.
+     */
+    public static final class Sides {
+        /** Raw at or above this is on the left. */
+        public final int left;
+        /** Raw at or below this is on the right. */
+        public final int right;
+
+        private Sides(int left, int right) {
+            this.left = left;
+            this.right = right;
+        }
+
+        /** The thresholds from the property values, or null when either is unset,
+         * not an integer, or not 0 <= right < left <= 255. */
+        public static Sides parse(String left, String right) {
+            try {
+                int l = Integer.parseInt(left.trim());
+                int r = Integer.parseInt(right.trim());
+                if (r < 0 || r >= l || l > 255) {
+                    return null;
+                }
+                return new Sides(l, r);
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "left >= " + left + ", right <= " + right;
         }
     }
 }

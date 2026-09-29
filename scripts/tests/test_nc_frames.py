@@ -53,6 +53,13 @@ class NcFramesHarnessTest(unittest.TestCase):
         "first_frames_are_logged_in_hex",
         "lazy_sampler_opens_on_its_own_thread_and_never_blocks_the_caller",
         "config_reads_port_and_calibration",
+        # Side mode: the chip tells only left from right (robot, 2026-09-29).
+        "side_thresholds_map_raw_to_left_right_or_neither",
+        "config_of_six_arguments_parses_both_thresholds",
+        "calibration_wins_over_side_thresholds",
+        "bad_side_thresholds_give_no_side_mode",
+        "side_mode_nc_gives_plus_minus_90_and_logs_its_raw_values",
+        "side_only_is_false_without_an_nc_backend",
     )
 
     @classmethod

@@ -109,6 +109,15 @@ final class EarsSession {
     /** The direction library: one sampling per utterance, on its own thread. */
     interface Direction {
         Sampling start();
+
+        /** True when the angle is a side and not a bearing: the NC chip in side mode
+         * (robot, 2026-09-29) measures only how far left or right a voice is and
+         * cannot tell front from back, so its -90/+90 says which side, never where.
+         * The utterance then carries the side and no angle, and the brain's side
+         * search looks toward that side first, then behind, then the other side. */
+        default boolean sideOnly() {
+            return false;
+        }
     }
 
     interface Sampling {
@@ -541,8 +550,13 @@ final class EarsSession {
                         wake = true;
                         utterances++;
                         Float so = latchAngle();
+                        int soSide = CueClassifier.side(so);
+                        // A side-only chip's angle is not a bearing: send the side alone.
+                        if (direction.sideOnly()) {
+                            so = null;
+                        }
                         // It leaves a conversation listen armed: the words at the end are the reply.
-                        deliver(new Utterance("", CueClassifier.side(so), so, CueClassifier.TIER_STRONG, speechStartMs,
+                        deliver(new Utterance("", soSide, so, CueClassifier.TIER_STRONG, speechStartMs,
                                 false, CueClassifier.KIND_WAKE_WORD), false);
                     }
                 } else {
@@ -585,6 +599,10 @@ final class EarsSession {
         }
         int tier = classifier.tier(text, wasWake, listening, at);
         int side = CueClassifier.side(angle);
+        if (direction.sideOnly()) {
+            // The chip's -90/+90 is a side, not a bearing: the brain searches that side.
+            angle = null;
+        }
         if (tier == CueClassifier.TIER_NONE || (text.isEmpty() && !wasWake && side == CueClassifier.SIDE_NONE)) {
             return;
         }

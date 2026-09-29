@@ -126,6 +126,7 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_wake_inside_the_deaf_window_delivers_nothing",
         "ears_early_cue_keeps_the_conversation_listen_for_the_words",
         "ears_bare_wake_with_the_gate_closed_is_unchanged",
+        "ears_side_only_direction_sends_the_side_without_an_angle",
         "ears_direction_sampled_only_while_speech",
         "ears_burst_without_words_or_side_is_dropped",
         "ears_shove_then_sorry_is_strong",
@@ -779,9 +780,14 @@ class BuildScriptTest(unittest.TestCase):
         self.assertIn("inputFlagsZero(", src)
         # The launcher reads the properties and hands them over before the first open().
         engine = _read(ENGINE)
-        for prop in ("PORT_PROPERTY", "ZERO_PROPERTY", "SIGN_PROPERTY", "SCALE_PROPERTY"):
+        for prop in ("PORT_PROPERTY", "ZERO_PROPERTY", "SIGN_PROPERTY", "SCALE_PROPERTY", "LEFT_PROPERTY",
+                     "RIGHT_PROPERTY"):
             self.assertIn(f"SpeechEngine.systemProperty(VoiceDirection.{prop})", engine)
         self.assertIn("VoiceDirection.configure(", engine)
+        # Side mode (robot, 2026-09-29): the ears are told the chip's angle is a side only.
+        self.assertIn("VoiceDirection.sideOnlyConfigured()", engine)
+        self.assertIn('LEFT_PROPERTY = "persist.miko3.voice_dir.left"', src)
+        self.assertIn('RIGHT_PROPERTY = "persist.miko3.voice_dir.right"', src)
 
     def test_built_apk_bundles_the_listen_model_when_present(self):
         apk = REPO / "launcher" / "miko3-launcher.apk"
