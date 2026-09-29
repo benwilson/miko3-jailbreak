@@ -890,6 +890,12 @@ final class ExploreBrain {
     private Ears.Cue call;
     /** The call is being acted on (its search, the approach it carries on, its meeting). */
     private boolean callTaken;
+    /**
+     * A second caller's call (KTD4), heard during the taken call's own meeting or
+     * conversation and not the partner's: it waits here, never merged into the taken
+     * call, and becomes the slot's fresh, unanswered call when that one clears.
+     */
+    private Ears.Cue nextCall;
     /** The answer clip has played for this call: a call handed back is retaken without a second one. */
     private boolean callAnswered;
     /** The call's wait was counted (CUES_HELD once per call). */
@@ -5142,6 +5148,18 @@ final class ExploreBrain {
             }
             return;
         }
+        if (callTaken && state != State.CUE_WHERE && !state.cueSearch() && !state.approachesPerson()) {
+            // KTD4: the taken call's own meeting or conversation. Someone else's call waits
+            // for it to end; merged into the taken call, it would clear with it (R1).
+            if (nextCall == null) {
+                nextCall = c;
+                note("a call from " + c.side + " during the call's own meeting: it waits for the next turn");
+            } else {
+                nextCall = mergeCalls(c.kind, nextCall, c);
+                note("a repeat of the waiting call merged into it, now from " + nextCall.side);
+            }
+            return;
+        }
         Ears.Cue merged = mergeCalls(c.kind, call, c);
         call = merged;
         if (callTaken && state == State.CUE_WHERE) {
@@ -5202,12 +5220,16 @@ final class ExploreBrain {
             return;
         }
         if (callTaken) {
-            if (!state.inStop()) {
-                // Its search found nobody, or its meeting ended before a conversation opened.
-                note("the call's stop is over without a conversation: the call is done");
-                clearCall();
+            if (state.inStop()) {
+                return;
             }
-            return;
+            // Its search found nobody, or its meeting ended before a conversation opened.
+            note("the call's stop is over without a conversation: the call is done");
+            clearCall();
+            if (call == null) {
+                return;
+            }
+            // A caller who waited through that meeting (KTD4) is taken in this same step.
         }
         CallVerdict v = callVerdict(now, call);
         if (v == CallVerdict.WAIT) {
@@ -5536,6 +5558,13 @@ final class ExploreBrain {
         callWaitCounted = false;
         callReplied = false;
         callBearing = Double.NaN;
+        if (nextCall != null) {
+            // The waiting caller's turn: a fresh, untaken, unanswered call that callStep's verdict takes.
+            call = nextCall;
+            nextCall = null;
+            gauges.stamp(Gauges.Stage.CALL_HEARD, call.at);
+            note("the waiting call from " + call.side + " takes the slot");
+        }
     }
 
     /** During a search (KTD3): a strong cue from the other side retargets once; everything else is ignored. */
