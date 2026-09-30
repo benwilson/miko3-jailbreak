@@ -10,7 +10,9 @@ import java.util.Set;
  * Host harness for the NC direction chip (explore plan U2; KTD10 to KTD12):
  * NcFrames' stream format and calibration, and VoiceDirection's NC backend on a
  * fake port setup and a fake port node that streams frames by time, as the chip
- * does on the robot (2026-09-29). Prints "PASS name" or
+ * does on the robot (2026-09-29). After a cold boot the chip's reporting is off
+ * (robot, 2026-09-30): FakeChip answers the vendor's status query and starts
+ * streaming only once the reporting toggle is written. Prints "PASS name" or
  * "FAIL name: detail" per scenario (scripts/tests/test_nc_frames.py).
  */
 public final class NcFramesHarness {
@@ -19,8 +21,15 @@ public final class NcFramesHarness {
     static final String RAW_85 = "58585542a30344010500de9c7afe55f64a03c9";
     static final String RAW_85_NEXT = "58585542a303470105003033cfec55f64a03c9";
     static final String RAW_50 = "58585542a3038f010500d9f5365f320dbed51a";
-    /** The other frame type, seen once right after vendor setup: module 03, op 02. */
+    /** The other frame type, seen once right after vendor setup: module 03, op 02. It is the
+     * status frame with reporting ON (payload byte 0 = 01), as the chip answered on 2026-09-29. */
     static final String OTHER = "58585542030200010500ea6b70ce011bdf05a5";
+    static final String STATUS_ON = OTHER;
+    /** The status frame after a cold boot (robot, 2026-09-30): payload byte 0 = 00, reporting OFF. */
+    static final String STATUS_OFF = "58585542030200010500ea6b70ce008def02d2";
+    /** The vendor's status query and reporting toggle, as sent on the robot (2026-09-30). */
+    static final String QUERY = "58585542030103000000a620d0e7";
+    static final String TOGGLE = "58585542030302000000a314ac25";
 
     interface Scenario {
         void run(String n) throws Exception;
@@ -105,8 +114,8 @@ public final class NcFramesHarness {
     }
 
     /** A port that streams: bytes fed with a due time become readable once it passes.
-     * Every write is recorded (and must never happen). */
-    static final class FakePort implements VoiceDirection.Port {
+     * Every write is recorded (open may write only the status query and the toggle). */
+    static class FakePort implements VoiceDirection.Port {
         final long t0 = System.nanoTime();
         final List<byte[]> writes = new ArrayList<byte[]>();
         final List<Byte> pending = new ArrayList<Byte>();
@@ -159,6 +168,41 @@ public final class NcFramesHarness {
 
         public synchronized void close() {
             closed = true;
+        }
+    }
+
+    /** The chip after a cold boot: answers the status query with `status` (or not at all when
+     * null) after 30 ms, and once the toggle is written streams direction frames from sequence
+     * 0, one a second from 300 ms after it (when streamsOnToggle). */
+    static final class FakeChip extends FakePort {
+        final String status;
+        final boolean streamsOnToggle;
+
+        FakeChip(String status, boolean streamsOnToggle) {
+            this.status = status;
+            this.streamsOnToggle = streamsOnToggle;
+        }
+
+        @Override
+        public synchronized void write(byte[] frame) throws IOException {
+            super.write(frame);
+            long now = (System.nanoTime() - t0) / 1000000L;
+            if (java.util.Arrays.equals(frame, hex(QUERY)) && status != null) {
+                feedAt(now + 30, hex(status));
+            } else if (java.util.Arrays.equals(frame, hex(TOGGLE)) && streamsOnToggle) {
+                for (int i = 0; i < 10; i++) {
+                    feedAt(now + 300 + 1000L * i, direction(i, 55 + (i % 8) * 5));
+                }
+            }
+        }
+
+        /** The writes in hex, oldest first. */
+        synchronized List<String> written() {
+            List<String> out = new ArrayList<String>();
+            for (byte[] w : writes) {
+                out.add(NcFrames.hex(w, w.length));
+            }
+            return out;
         }
     }
 
@@ -299,17 +343,20 @@ public final class NcFramesHarness {
         });
         scenario("no_frame_within_first_frame_ms_is_none", new Scenario() {
             public void run(String n) {
-                // Junk and the other frame type only: no direction frame ever comes.
+                // Junk and a status frame before any query only: no direction frame ever comes,
+                // so open asks the chip once (2026-09-30), and nothing answers the query.
                 FakePort port = new FakePort().feedAt(0, hex("0102")).feedAt(300, hex(OTHER));
                 Lines log = new Lines();
                 long t0 = System.nanoTime();
                 VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(port, PORT), log);
                 long ms = (System.nanoTime() - t0) / 1000000L;
+                long want = VoiceDirection.FIRST_FRAME_MS + VoiceDirection.STATUS_REPLY_MS;
                 check(n, d.backend() == VoiceDirection.Backend.NONE && port.closed
-                                && d.detail().contains("nc: no frames on " + PORT) && d.firstReplyHex() == null
-                                && ms >= VoiceDirection.FIRST_FRAME_MS - 20 && ms < VoiceDirection.FIRST_FRAME_MS + 500
-                                && Float.isNaN(d.degrees()),
-                        "backend=" + d.backend() + " detail=" + d.detail() + " ms=" + ms);
+                                && ("nc: no answer on " + PORT).equals(d.detail()) && d.firstReplyHex() == null
+                                && port.writes.size() == 1 && java.util.Arrays.equals(port.writes.get(0), hex(QUERY))
+                                && ms >= want - 20 && ms < want + 500 && Float.isNaN(d.degrees()),
+                        "backend=" + d.backend() + " detail=" + d.detail() + " ms=" + ms + " writes="
+                                + port.writes.size());
             }
         });
         scenario("a_frame_at_200_ms_opens_nc_with_it_as_the_first_reply", new Scenario() {
@@ -323,7 +370,8 @@ public final class NcFramesHarness {
                         "backend=" + d.backend() + " first=" + d.firstReplyHex() + " ms=" + ms);
             }
         });
-        scenario("the_port_is_never_written_to", new Scenario() {
+        scenario("after_an_nc_open_twenty_samples_add_no_writes", new Scenario() {
+            // Only open may write, and only when no frame came (2026-09-30); sampling only reads.
             public void run(String n) throws Exception {
                 FakePort port = new FakePort();
                 for (int i = 0; i < 20; i++) {
@@ -639,6 +687,128 @@ public final class NcFramesHarness {
                 check(n, missing.backend() == VoiceDirection.Backend.NONE && !missing.sideOnly() && !plain.sideOnly()
                                 && !VoiceDirection.sideOnlyConfigured(),
                         "missing=" + missing.sideOnly() + " plain=" + plain.sideOnly());
+            }
+        });
+
+        // Robot finding (2026-09-30): after a cold boot the chip's reporting is OFF. open asks
+        // once with the vendor's status query and, only when the answer is OFF, toggles once.
+        scenario("the_robot_status_and_direction_frames_parse", new Scenario() {
+            public void run(String n) {
+                final List<String> seen = new ArrayList<String>();
+                NcFrames.Sink sink = new NcFrames.Sink() {
+                    public void direction(byte[] b, int at, int raw) {
+                        seen.add("dir " + raw);
+                    }
+
+                    public void status(boolean on) {
+                        seen.add("status " + on);
+                    }
+                };
+                byte[] badOn = hex(STATUS_ON);
+                badOn[11] ^= 1;
+                byte[] buf = concat(hex("00"), hex(STATUS_OFF), hex(RAW_85), badOn, hex(STATUS_ON));
+                int used = NcFrames.parseStream(buf, buf.length, sink);
+                // A Sink that only takes directions still compiles and ignores status frames.
+                List<Integer> plain = raws(concat(hex(STATUS_OFF), hex(RAW_50)), null);
+                check(n, seen.equals(java.util.Arrays.asList("status false", "dir 85", "status true"))
+                                && used == buf.length && plain.equals(java.util.Arrays.asList(50)),
+                        "seen=" + seen + " used=" + used + "/" + buf.length + " plain=" + plain);
+            }
+        });
+        scenario("the_request_frames_are_the_vendors_and_never_shared", new Scenario() {
+            public void run(String n) {
+                byte[] q = NcFrames.statusQuery();
+                byte[] t = NcFrames.reportingToggle();
+                boolean same = QUERY.equals(NcFrames.hex(q, q.length)) && TOGGLE.equals(NcFrames.hex(t, t.length));
+                q[0] = 0;
+                t[0] = 0;
+                byte[] q2 = NcFrames.statusQuery();
+                byte[] t2 = NcFrames.reportingToggle();
+                check(n, same && QUERY.equals(NcFrames.hex(q2, q2.length)) && TOGGLE.equals(NcFrames.hex(t2, t2.length))
+                                && q.length == 14 && t.length == 14,
+                        "query=" + NcFrames.hex(q2, q2.length) + " toggle=" + NcFrames.hex(t2, t2.length));
+            }
+        });
+        scenario("reporting_already_on_opens_nc_with_no_writes", new Scenario() {
+            public void run(String n) {
+                FakeChip chip = new FakeChip(STATUS_ON, true);
+                chip.feedAt(0, direction(0, 80));
+                Lines log = new Lines();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(chip, PORT), log);
+                check(n, d.backend() == VoiceDirection.Backend.NC && d.lastRaw() == 80 && chip.writes.isEmpty()
+                                && log.count("switched on") == 0,
+                        "backend=" + d.backend() + " writes=" + chip.written() + " log=" + log.lines);
+            }
+        });
+        scenario("off_after_boot_queries_then_toggles_once_and_opens_nc", new Scenario() {
+            public void run(String n) {
+                FakeChip chip = new FakeChip(STATUS_OFF, true);
+                Lines log = new Lines();
+                long t0 = System.nanoTime();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(chip, PORT), log);
+                long ms = (System.nanoTime() - t0) / 1000000L;
+                check(n, d.backend() == VoiceDirection.Backend.NC && d.lastRaw() == 55 && !chip.closed
+                                && chip.written().equals(java.util.Arrays.asList(QUERY, TOGGLE))
+                                && log.count("voice direction: nc reporting was off, switched on") == 1
+                                && d.firstReplyHex() != null && d.firstReplyHex().startsWith("58585542a30300")
+                                && ms < VoiceDirection.FIRST_FRAME_MS + 1000,
+                        "backend=" + d.backend() + " writes=" + chip.written() + " ms=" + ms + " log=" + log.lines);
+            }
+        });
+        scenario("status_on_but_silent_is_none_without_a_toggle", new Scenario() {
+            public void run(String n) {
+                FakeChip chip = new FakeChip(STATUS_ON, true);
+                Lines log = new Lines();
+                long t0 = System.nanoTime();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(chip, PORT), log);
+                long ms = (System.nanoTime() - t0) / 1000000L;
+                long min = 2 * VoiceDirection.FIRST_FRAME_MS;
+                check(n, d.backend() == VoiceDirection.Backend.NONE && chip.closed
+                                && ("nc: reporting on but no frames on " + PORT).equals(d.detail())
+                                && chip.written().equals(java.util.Arrays.asList(QUERY))
+                                && log.count("switched on") == 0 && ms >= min - 20
+                                && ms < min + VoiceDirection.STATUS_REPLY_MS + 500,
+                        "backend=" + d.backend() + " detail=" + d.detail() + " writes=" + chip.written() + " ms=" + ms);
+            }
+        });
+        scenario("no_status_reply_is_none_after_one_write", new Scenario() {
+            public void run(String n) {
+                FakeChip chip = new FakeChip(null, true);
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(chip, PORT), new Lines());
+                check(n, d.backend() == VoiceDirection.Backend.NONE && chip.closed
+                                && ("nc: no answer on " + PORT).equals(d.detail())
+                                && chip.written().equals(java.util.Arrays.asList(QUERY)),
+                        "backend=" + d.backend() + " detail=" + d.detail() + " writes=" + chip.written());
+            }
+        });
+        scenario("a_toggle_with_no_frames_after_is_none_after_one_toggle", new Scenario() {
+            public void run(String n) {
+                FakeChip chip = new FakeChip(STATUS_OFF, false);
+                Lines log = new Lines();
+                long t0 = System.nanoTime();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(chip, PORT), log);
+                long ms = (System.nanoTime() - t0) / 1000000L;
+                long min = VoiceDirection.FIRST_FRAME_MS + VoiceDirection.WAKE_FRAME_MS;
+                check(n, d.backend() == VoiceDirection.Backend.NONE && chip.closed
+                                && ("nc: no frames after switching reporting on, on " + PORT).equals(d.detail())
+                                && chip.written().equals(java.util.Arrays.asList(QUERY, TOGGLE))
+                                && log.count("voice direction: nc reporting was off, switched on") == 1
+                                && ms >= min - 20 && ms < min + VoiceDirection.STATUS_REPLY_MS + 500,
+                        "backend=" + d.backend() + " detail=" + d.detail() + " writes=" + chip.written() + " ms=" + ms);
+            }
+        });
+        scenario("after_an_off_boot_open_twenty_samples_add_no_writes", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeChip chip = new FakeChip(STATUS_OFF, true);
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(chip, PORT), new Lines());
+                int after = chip.writes.size();
+                for (int i = 0; i < 20; i++) {
+                    d.degrees();
+                    d.lastRaw();
+                    Thread.sleep(20);
+                }
+                check(n, d.backend() == VoiceDirection.Backend.NC && after == 2 && chip.writes.size() == 2,
+                        "backend=" + d.backend() + " after open=" + after + " now=" + chip.writes.size());
             }
         });
     }

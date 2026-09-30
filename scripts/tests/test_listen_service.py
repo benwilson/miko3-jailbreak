@@ -764,15 +764,25 @@ class BuildScriptTest(unittest.TestCase):
                             "getFWVersion("):
             self.assertNotIn(vendor_call, src)
         self.assertIn("new File(path).exists()", src)
-        # 2026-09-29: the chip streams a direction frame a second by itself, so the NC path
-        # only reads: no GET, no toggle, no write of any kind on the port.
+        # 2026-09-29: the chip streams a direction frame a second by itself, and the vendor's
+        # DOA calls are gone.
         for gone in ("doaQuery(", "doaToggle(", "parseDoa("):
             self.assertNotIn(gone, src)
+        # 2026-09-30: after a cold boot the chip's reporting is off. The only port writes are
+        # the vendor's status query and its reporting toggle, one each, both inside openNc;
+        # sampling never writes.
         files_at = src.find("Nodes FILES")
         files_end = src.find("public Sampler sample(", files_at)
         self.assertGreater(files_at, 0, "the real node implementation moved")
         nc_path = src[:files_at] + src[files_end:]
-        self.assertNotIn(".write(", nc_path, "the NC path writes to the port")
+        writes = re.findall(r"\.write\(([^;]*)\);", nc_path)
+        self.assertEqual(sorted(writes), ["NcFrames.reportingToggle()", "NcFrames.statusQuery()"],
+                         "the NC path writes something other than the status query and the toggle")
+        self.assertEqual(nc_path.count(".write("), 2)
+        self.assertEqual(body.count(".write(NcFrames.statusQuery())"), 1, "the status query is not written in openNc")
+        self.assertEqual(body.count(".write(NcFrames.reportingToggle())"), 1, "the toggle is not written in openNc")
+        self.assertGreater(body.find(".write(NcFrames.statusQuery())"), setup,
+                           "the status query is written before the port is configured")
         # toybox 0.7.6 stty: `raw` sets icrnl/ixon/ixoff/inpck, so the input flags are zeroed
         # through the -g string and checked afterwards.
         self.assertNotIn('"raw"', src)

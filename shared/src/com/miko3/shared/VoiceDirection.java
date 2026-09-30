@@ -31,15 +31,24 @@ import java.util.concurrent.TimeUnit;
  * missing UART and then seconds after every open of the real one
  * (docs/solutions/runtime-errors/vendor-dsp-direction-open-segfaults-launcher-miko3.md).
  *
- * Verified on the robot (2026-09-29): the chip streams one direction frame a
- * second by itself (NcFrames), so the NC backend only reads; it never writes to
- * the port. stty sets the port to 115200 8N1 with echo and line discipline off,
- * and because toybox 0.7.6 stty cannot clear icrnl/ixon/ixoff/inpck by flag (and
- * its `raw` sets them) the input flags are zeroed by writing back the -g string
- * with its first field set to 0, then checked. open() waits up to FIRST_FRAME_MS
- * for the first direction frame; each read drains what is buffered without
- * blocking, keeps the newest raw value and when it came, and a reading older
- * than FRESH_MS gives no angle. A read error closes the NC backend for the life
+ * Verified on the robot (2026-09-29): with its reporting on, the chip streams one
+ * direction frame a second (NcFrames). stty sets the port to 115200 8N1 with echo
+ * and line discipline off, and because toybox 0.7.6 stty cannot clear
+ * icrnl/ixon/ixoff/inpck by flag (and its `raw` sets them) the input flags are
+ * zeroed by writing back the -g string with its first field set to 0, then
+ * checked.
+ *
+ * Verified on the robot (2026-09-30): after a cold boot the chip's reporting is
+ * OFF and nothing streams. open() follows the vendor's own sequence, once per
+ * open: it waits up to FIRST_FRAME_MS for a direction frame and, when one comes,
+ * writes nothing. Otherwise it writes the vendor's status query once and waits up
+ * to STATUS_REPLY_MS for the status frame. Off: it writes the vendor's reporting
+ * toggle once and waits up to WAKE_FRAME_MS for a direction frame. On but silent:
+ * it waits FIRST_FRAME_MS once more and never toggles (the toggle would switch
+ * reporting off). No answer, or still no frame: NONE. Those two frames, at most
+ * once each, are the only writes; after open, sampling only reads. Each read
+ * drains what is buffered without blocking, keeps the newest raw value and when
+ * it came, and a reading older than FRESH_MS gives no angle. A read error closes the NC backend for the life
  * of the process. The raw value becomes signed degrees only once the calibration
  * properties are set (KTD12); until then the angle is NaN.
  *
@@ -78,6 +87,10 @@ public final class VoiceDirection {
     static final long STTY_TIMEOUT_MS = 2000;
     /** How long open() waits for the first direction frame (the chip sends one a second). */
     static final long FIRST_FRAME_MS = 1500;
+    /** How long open() waits for the status frame after writing the status query. */
+    static final long STATUS_REPLY_MS = 500;
+    /** How long open() waits for the first direction frame after switching reporting on. */
+    static final long WAKE_FRAME_MS = 3000;
     /** How old the newest reading may be and still give an angle. */
     static final long FRESH_MS = 1500;
     /** How often open() looks for the first frame. */
@@ -131,7 +144,8 @@ public final class VoiceDirection {
         int configure(String node);
     }
 
-    /** Our own streams on the port node. The NC backend only reads (the chip streams). */
+    /** Our own streams on the port node. Only open() writes, and only the status query and
+     * the reporting toggle, at most once each; sampling only reads. */
     interface Port {
         int available() throws IOException;
 
@@ -175,10 +189,17 @@ public final class VoiceDirection {
     private long lastRawAt;
     private String firstReplyHex;
     private long rawLoggedAt;
+    /** The newest status frame's answer since open() last cleared it: -1 none, 0 off, 1 on. */
+    private int status = -1;
     private final NcFrames.Sink frames = new NcFrames.Sink() {
         @Override
         public void direction(byte[] b, int at, int raw) {
             onFrame(b, at, raw);
+        }
+
+        @Override
+        public void status(boolean on) {
+            status = on ? 1 : 0;
         }
     };
 
@@ -266,25 +287,40 @@ public final class VoiceDirection {
             String mode = cfg.calibration != null ? "calibrated" : cfg.sides != null ? "side" : "uncalibrated";
             VoiceDirection d = new VoiceDirection(Backend.NC, "nc on " + node + ", " + mode, null, p,
                     cfg.calibration, cfg.sides, freshMs, log);
-            // The chip streams a frame a second: wait for the first one without blocking.
-            long deadline = System.nanoTime() + firstFrameMs * 1000000L;
-            while (true) {
-                synchronized (d) {
-                    d.drain();
-                    if (d.lastRaw >= 0) {
-                        if (d.sides != null) {
-                            log.log("voice direction: nc side mode (" + d.sides + ")");
-                        }
-                        return d;
-                    }
+            // With reporting on the chip streams a frame a second: wait for one, writing nothing.
+            if (d.awaitFrame(firstFrameMs)) {
+                return d.opened();
+            }
+            // Reporting is off after a cold boot (2026-09-30): ask the chip, once.
+            synchronized (d) {
+                d.status = -1;
+                p.write(NcFrames.statusQuery());
+            }
+            int on = d.awaitStatus(STATUS_REPLY_MS);
+            if (d.lastRaw >= 0) {
+                return d.opened();
+            }
+            if (on < 0) {
+                p.close();
+                return none(why.append("nc: no answer on ").append(node).toString(), log);
+            }
+            if (on > 0) {
+                // On but silent: a toggle would switch it off, so only listen once more.
+                if (d.awaitFrame(firstFrameMs)) {
+                    return d.opened();
                 }
-                if (System.nanoTime() >= deadline) {
-                    break;
-                }
-                Thread.sleep(POLL_MS);
+                p.close();
+                return none(why.append("nc: reporting on but no frames on ").append(node).toString(), log);
+            }
+            synchronized (d) {
+                p.write(NcFrames.reportingToggle());
+            }
+            log.log("voice direction: nc reporting was off, switched on");
+            if (d.awaitFrame(WAKE_FRAME_MS)) {
+                return d.opened();
             }
             p.close();
-            return none(why.append("nc: no frames on ").append(node).toString(), log);
+            return none(why.append("nc: no frames after switching reporting on, on ").append(node).toString(), log);
         } catch (Throwable t) {
             if (t instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
@@ -294,6 +330,49 @@ public final class VoiceDirection {
             }
             return none(why.append("nc: ").append(t.getClass().getSimpleName()).toString(), log);
         }
+    }
+
+    /** Open's wait: drains without blocking until a direction frame has come or ms pass. */
+    private boolean awaitFrame(long ms) throws IOException, InterruptedException {
+        long deadline = System.nanoTime() + ms * 1000000L;
+        while (true) {
+            synchronized (this) {
+                drain();
+                if (lastRaw >= 0) {
+                    return true;
+                }
+            }
+            if (System.nanoTime() >= deadline) {
+                return false;
+            }
+            Thread.sleep(POLL_MS);
+        }
+    }
+
+    /** Open's wait for the status frame: 1 on, 0 off, or -1 when none came within ms
+     * (returns early, too, once a direction frame has come). */
+    private int awaitStatus(long ms) throws IOException, InterruptedException {
+        long deadline = System.nanoTime() + ms * 1000000L;
+        while (true) {
+            synchronized (this) {
+                drain();
+                if (status >= 0 || lastRaw >= 0) {
+                    return status;
+                }
+            }
+            if (System.nanoTime() >= deadline) {
+                return -1;
+            }
+            Thread.sleep(POLL_MS);
+        }
+    }
+
+    /** Open's success: logs side mode when set and hands back this instance. */
+    private VoiceDirection opened() {
+        if (sides != null) {
+            log.log("voice direction: nc side mode (" + sides + ")");
+        }
+        return this;
     }
 
     /** Which backend answered, or NONE (also once the NC backend has closed on a read error). */

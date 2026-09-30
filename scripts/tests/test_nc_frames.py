@@ -1,14 +1,16 @@
 """Host-side tests for the NC direction chip (explore plan U2; R7, R8, KTD10
 to KTD12).
 
-The chip streams one 19-byte direction frame a second by itself (robot,
-2026-09-29). NcFrames (the stream parse, the calibration from raw 0 to 255 to
+The chip streams one 19-byte direction frame a second (robot, 2026-09-29), but
+only once reporting is on, and after a cold boot it is off (robot, 2026-09-30):
+open then sends the vendor's status query once and, if the answer is off, the
+reporting toggle once. NcFrames (the stream parse, the calibration from raw 0 to 255 to
 signed degrees) and VoiceDirection's NC backend run under a JVM harness with a
 fake port setup and a fake port node that streams frames by time, so the gating
 (the confirmed-port property, the node, stty's 0 = success), the first-frame
 wait at open, the freshness window, the skipping of junk, torn and bad-CRC
-frames, the close on a read error, and that the port is never written to are
-all proven without the robot. The stty -g input-flag rewrite (toybox 0.7.6
+frames, the close on a read error, the query/toggle sequence at open, and that
+sampling never writes are all proven without the robot. The stty -g input-flag rewrite (toybox 0.7.6
 cannot clear icrnl/ixon/ixoff/inpck by flag) is checked as pure functions.
 """
 import subprocess
@@ -38,7 +40,7 @@ class NcFramesHarnessTest(unittest.TestCase):
         "a_stale_reading_is_nan_and_a_fresh_one_is_degrees",
         "no_frame_within_first_frame_ms_is_none",
         "a_frame_at_200_ms_opens_nc_with_it_as_the_first_reply",
-        "the_port_is_never_written_to",
+        "after_an_nc_open_twenty_samples_add_no_writes",
         "a_read_error_closes_the_backend_and_logs_once",
         "stty_input_flags_are_zeroed_from_the_g_string",
         "stty_setup_sets_115200_8n1_without_echo_or_the_raw_keyword",
@@ -60,6 +62,15 @@ class NcFramesHarnessTest(unittest.TestCase):
         "bad_side_thresholds_give_no_side_mode",
         "side_mode_nc_gives_plus_minus_90_and_logs_its_raw_values",
         "side_only_is_false_without_an_nc_backend",
+        # Reporting is off after a cold boot (robot, 2026-09-30): the vendor's query, then its toggle.
+        "the_robot_status_and_direction_frames_parse",
+        "the_request_frames_are_the_vendors_and_never_shared",
+        "reporting_already_on_opens_nc_with_no_writes",
+        "off_after_boot_queries_then_toggles_once_and_opens_nc",
+        "status_on_but_silent_is_none_without_a_toggle",
+        "no_status_reply_is_none_after_one_write",
+        "a_toggle_with_no_frames_after_is_none_after_one_toggle",
+        "after_an_off_boot_open_twenty_samples_add_no_writes",
     )
 
     @classmethod
