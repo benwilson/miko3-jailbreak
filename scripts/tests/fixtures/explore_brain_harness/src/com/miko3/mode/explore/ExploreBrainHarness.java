@@ -328,6 +328,11 @@ public final class ExploreBrainHarness {
         Openness.Profile at(Rig rig, long t);
     }
 
+    /** The place print of a frame captured at t (visual place memory); null = none. */
+    interface PlaceView {
+        PlaceMemory.Print at(Rig rig, long t);
+    }
+
     /**
      * The scripted Claude (explore on Claude U4), shaped like Vision: the answer to
      * the rig's nth ask() (1-based, counted over the whole run), or null for a
@@ -610,6 +615,8 @@ public final class ExploreBrainHarness {
         final Vision vision;
         /** Each look's openness, scripted per heading (explore nav plan U4); null: looks carry none. */
         OpenView openView;
+        /** Each look's place print; null: looks carry none (as the camera gave before place memory). */
+        PlaceView placeView;
         /** How often a look arrives (captured 200 ms before it does); the live camera gives one every 1-2 s. */
         long lookEveryMs = 500;
         /** How long before it arrives each look was captured: the detector's time (the robot: 1.8-4.7 s). */
@@ -881,7 +888,8 @@ public final class ExploreBrainHarness {
                         }
                         latestLook = new ExploreBrain.Look(staleLooks ? openedAt - 1000 : shot, seen,
                                 ("jpeg@" + shot).getBytes(java.nio.charset.StandardCharsets.US_ASCII),
-                                openView == null ? null : openView.at(this, shot));
+                                openView == null ? null : openView.at(this, shot),
+                                placeView == null ? null : placeView.at(this, shot));
                     }
                 }
                 if (now % 100 == 0) {
@@ -2756,6 +2764,7 @@ public final class ExploreBrainHarness {
         headingScenarios();
         navScenarios();
         coverageScenarios();
+        placeScenarios();
         escapeScenarios();
         pinnedScenarios();
         jamScenarios();
@@ -5618,6 +5627,160 @@ public final class ExploreBrainHarness {
             check(n, before > 3 && counted > 0 && numbersOnly && rig.brain.coverage().cells() == 0
                             && !rig.brain.coverage().tracking(),
                     "before=" + before + " counted=" + counted + " numbersOnly=" + numbersOnly + " " + notes);
+        });
+    }
+
+    // ---- a visual place memory (owner 2026-10-01: somewhere else than the last 30 minutes) ----
+
+    /** A textured 80x60 scene: random 5x5 colour blocks from the seed (PlaceMemoryHarness's scenes). */
+    static PlaceMemory.Print scene(long seed) {
+        java.util.Random r = new java.util.Random(seed);
+        int[] rgb = new int[80 * 60];
+        int[] cells = new int[16 * 12];
+        for (int i = 0; i < cells.length; i++) {
+            cells[i] = (r.nextInt(256) << 16) | (r.nextInt(256) << 8) | r.nextInt(256);
+        }
+        for (int y = 0; y < 60; y++) {
+            for (int x = 0; x < 80; x++) {
+                rgb[y * 80 + x] = cells[(y / 5) * 16 + x / 5];
+            }
+        }
+        return PlaceMemory.Print.of(rgb, 80, 60);
+    }
+
+    /** A plain grey frame: no texture, so no evidence. */
+    static PlaceMemory.Print plainScene() {
+        int[] rgb = new int[80 * 60];
+        java.util.Arrays.fill(rgb, 0x606060);
+        return PlaceMemory.Print.of(rgb, 80, 60);
+    }
+
+    /** Whether a heading (0..360) is in the half of the room that always looks the same. */
+    private static boolean familiarHalf(double deg) {
+        double d = Heading.wrap(deg);
+        return d >= 180;
+    }
+
+    private static void placeScenarios() {
+        scenario("place_a_familiar_view_is_noted_and_its_novelty_lowered", n -> {
+            // The same scene wherever he looks: after a minute every look is seen before, and
+            // a leg decision on open ground facing it turns him (to ground the grid calls new).
+            Rig rig = navRig(coverageTuning(navTuning().gyro(robotGyro())), CLEAR, ALL_OPEN);
+            rig.simWheels = true;
+            rig.placeView = (r, t) -> scene(1);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(150000);
+            long first = -1;
+            int seen = 0;
+            boolean format = true;
+            int turnsAfterSeen = 0;
+            int straightAfterSeen = 0;
+            int earlyTurns = 0;
+            boolean afterSeen = false;
+            for (String note : notes) {
+                long at = Long.parseLong(note.substring(0, note.indexOf(' ')));
+                String text = note.substring(note.indexOf(' ') + 1);
+                if (text.startsWith("place:")) {
+                    seen++;
+                    afterSeen = true;
+                    if (first < 0) {
+                        first = at;
+                    }
+                    format &= text.matches("place: seen before \\(sim \\d\\.\\d\\d, \\d+ min ago\\)");
+                } else if (text.startsWith("steer:")) {
+                    if (at < 60000 && text.contains("turn only")) {
+                        earlyTurns++;
+                    }
+                    if (afterSeen) {
+                        if (text.contains("turn only")) {
+                            turnsAfterSeen++;
+                        } else {
+                            straightAfterSeen++;
+                        }
+                        afterSeen = false;
+                    }
+                }
+            }
+            check(n, first >= 60000 && seen >= 2 && seen <= 20 && format && turnsAfterSeen == seen
+                            && straightAfterSeen == 0 && earlyTurns == 0 && rig.violations.isEmpty(),
+                    "first=" + first + " seen=" + seen + " format=" + format + " turnsAfterSeen=" + turnsAfterSeen
+                            + " straightAfterSeen=" + straightAfterSeen + " earlyTurns=" + earlyTurns + " " + notes);
+        });
+        scenario("place_the_steer_spends_more_time_facing_the_unfamiliar_half", n -> {
+            // An 8 x 6 m room: one half of the compass always shows the same scene; the other a new one each look.
+            int[] fresh = new int[2];
+            int[] all = new int[2];
+            StringBuilder each = new StringBuilder();
+            for (int i = 0; i < 2; i++) {
+                for (long seed = 1; seed <= 5; seed++) {
+                    Rig rig = roomRig(true, seed);
+                    if (i == 0) {
+                        rig.placeView = (r, t) -> familiarHalf(r.yaw.trueDeg) ? scene(1) : scene(1000 + t);
+                    }
+                    int[] counts = new int[2];
+                    rig.started();
+                    for (long t = 1000; t <= 600000; t += 1000) {
+                        rig.runUntil(t);
+                        if (t >= 120000) {
+                            counts[familiarHalf(rig.yaw.trueDeg) ? 0 : 1]++;
+                        }
+                    }
+                    fresh[i] += counts[1];
+                    all[i] += counts[0] + counts[1];
+                    each.append(i == 0 ? " on " : " off ").append(counts[1]).append('/').append(counts[0] + counts[1]);
+                }
+            }
+            double on = (double) fresh[0] / all[0];
+            double off = (double) fresh[1] / all[1];
+            check(n, on >= off + 0.1, "fresh share on=" + f1(on) + " off=" + f1(off) + each);
+        });
+        scenario("place_an_unusable_heading_still_lowers_the_view_it_has_seen", n -> {
+            // No gyro: no grid, but the same scene for a minute still reads seen before.
+            Rig rig = navRig(coverageTuning(navTuning()), CLEAR, ALL_OPEN);
+            rig.simWheels = true;
+            rig.placeView = (r, t) -> scene(1);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(150000);
+            boolean seen = false;
+            boolean lowAfter = false;
+            for (String note : notes) {
+                long at = Long.parseLong(note.substring(0, note.indexOf(' ')));
+                String text = note.substring(note.indexOf(' ') + 1);
+                seen |= text.startsWith("place: seen before");
+                lowAfter |= at >= 60000 && text.startsWith("steer:") && text.matches(".*, new 0\\.[0-4]\\d$");
+            }
+            check(n, seen && lowAfter && rig.violations.isEmpty(),
+                    "seen=" + seen + " lowAfter=" + lowAfter + " " + notes.subList(Math.max(0, notes.size() - 8),
+                            notes.size()));
+        });
+        scenario("place_plain_frames_roam_exactly_as_with_no_prints", n -> {
+            List<String> logs = new ArrayList<String>();
+            for (int i = 0; i < 2; i++) {
+                Rig rig = navRig(coverageTuning(navTuning().gyro(robotGyro()).hopTicks(16, 40).turnChance(0.7)), CLEAR,
+                        (r, t) -> r.now % 3000 < 1500 ? null : prof(0.9f, 0.3f, 0.9f, 0.6f));
+                rig.simWheels = true;
+                if (i == 0) {
+                    rig.placeView = (r, t) -> plainScene();
+                }
+                rig.started();
+                rig.runUntil(120000);
+                logs.add(rig.log.toString());
+            }
+            check(n, logs.get(0).equals(logs.get(1)), "differ");
+        });
+        scenario("place_memory_is_forgotten_at_shutdown", n -> {
+            Rig rig = navRig(coverageTuning(navTuning().gyro(robotGyro())), CLEAR, ALL_OPEN);
+            rig.simWheels = true;
+            rig.placeView = (r, t) -> scene(r.now / 7000);
+            rig.at(60000, () -> rig.brain.shutdown());
+            rig.started();
+            rig.runUntil(59990);
+            int before = rig.brain.places().size();
+            rig.runUntil(61000);
+            check(n, before > 3 && rig.brain.places().size() == 0, "before=" + before + " after="
+                    + rig.brain.places().size());
         });
     }
 

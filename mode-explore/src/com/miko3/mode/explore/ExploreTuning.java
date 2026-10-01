@@ -625,6 +625,28 @@ final class ExploreTuning {
     final int coverageLongTicksMax;
     final float coverageNovelAhead;
     final double coverageTurnScale;
+    /**
+     * A visual place memory (owner, 2026-10-01: "if he's been somewhere in the last
+     * 30 minutes, he should try and find somewhere else to go"), the complement to
+     * the drifting grid. Each look's print (PlaceMemory) is kept for placeFadeMs, at
+     * most one per placeRecordMs and placeMax in all (oldest dropped first). A look's
+     * similarity is its best match among prints at least placeMinAgeMs old taken
+     * within placeHeadingDeg of its heading (any heading when either is unusable).
+     * Similarity placeSimLow or less is new (novelty 1), placeSimHigh or more is
+     * familiar (novelty 0), linear between; placeSeenSim or more is noted as seen
+     * before. A look's novelty also stands for its heading for placeGlanceMs (a scan's
+     * looks score the headings it turned through). The steer takes the lower of this
+     * and the grid's novelty. placeMax 0 turns it off.
+     */
+    final long placeFadeMs;
+    final int placeMax;
+    final long placeRecordMs;
+    final long placeMinAgeMs;
+    final double placeHeadingDeg;
+    final double placeSimLow;
+    final double placeSeenSim;
+    final double placeSimHigh;
+    final long placeGlanceMs;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -839,6 +861,15 @@ final class ExploreTuning {
         coverageLongTicksMax = Math.max(0, b.coverageLongTicksMax);
         coverageNovelAhead = b.coverageNovelAhead;
         coverageTurnScale = Math.max(0, Math.min(1, b.coverageTurnScale));
+        placeFadeMs = Math.max(1, b.placeFadeMs);
+        placeMax = Math.max(0, b.placeMax);
+        placeRecordMs = Math.max(0, b.placeRecordMs);
+        placeMinAgeMs = Math.max(0, b.placeMinAgeMs);
+        placeHeadingDeg = b.placeHeadingDeg;
+        placeSimLow = b.placeSimLow;
+        placeSeenSim = b.placeSeenSim;
+        placeSimHigh = Math.max(b.placeSimLow + 1e-3, b.placeSimHigh);
+        placeGlanceMs = Math.max(0, b.placeGlanceMs);
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
@@ -1211,7 +1242,7 @@ final class ExploreTuning {
         // 30 minutes (owner, 2026-10-01: "if he's been somewhere in the last 30 minutes,
         // he should try and find somewhere else to go"; was a few minutes under R18).
         // Dead-reckoning drift builds up over that long, so the grid is only a rough
-        // guide; a visual place memory is the planned complement.
+        // guide; the visual place memory (PlaceMemory, place* below) is its complement.
         private long coverageFadeMs = 1800000;
         // The next leg or two.
         private double coverageLookaheadM = 1.5;
@@ -1228,6 +1259,21 @@ final class ExploreTuning {
         private float coverageNovelAhead = 0.7f;
         // turnChance 0.7 becomes ~0.2 while the way ahead is new ground.
         private double coverageTurnScale = 0.3;
+        // The same 30 minutes as the grid. 300 prints of ~1 KB; one every 6 s fills 30 min.
+        private long placeFadeMs = 1800000;
+        private int placeMax = 300;
+        private long placeRecordMs = 6000;
+        // Looks a minute apart: the view he just had is not a revisit.
+        private long placeMinAgeMs = 60000;
+        private double placeHeadingDeg = 45;
+        // Set on 624 real frames from the 2026-10-01 roam (113 hand-labelled pairs, and 42
+        // looks' best matches): at 0.75, 0.78 precision and 0.74 recall; nearly every pair
+        // at 0.85 or more was the same place, and pairs at 0.65 or less hardly ever were.
+        private double placeSimLow = 0.65;
+        private double placeSeenSim = 0.75;
+        private double placeSimHigh = 0.85;
+        // A scan's looks stand for their headings about as long as a stop and the next leg.
+        private long placeGlanceMs = 120000;
 
         /** A fixed leg length. */
         Builder hopTicks(int v) { hopTicks = v; hopTicksMax = v; return this; }
@@ -1488,6 +1534,21 @@ final class ExploreTuning {
             coverageStaleNovelty = staleNovelty;
             coverageMinGain = minGain;
             coverageLongTicksMax = longTicksMax;
+            return this;
+        }
+        Builder placeMemory(long fadeMs, int max, long recordMs, long minAgeMs) {
+            placeFadeMs = fadeMs;
+            placeMax = max;
+            placeRecordMs = recordMs;
+            placeMinAgeMs = minAgeMs;
+            return this;
+        }
+        Builder placeMatch(double headingDeg, double simLow, double seenSim, double simHigh, long glanceMs) {
+            placeHeadingDeg = headingDeg;
+            placeSimLow = simLow;
+            placeSeenSim = seenSim;
+            placeSimHigh = simHigh;
+            placeGlanceMs = glanceMs;
             return this;
         }
         /** Novelty steering and long legs off: the roaming before U10 (the grid is still kept). */

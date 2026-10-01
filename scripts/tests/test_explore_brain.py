@@ -32,7 +32,7 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ExploreBrainHar
 PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java", "ExploreTuning.java",
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
-              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "Ears.java", "ChatSession.java",
+              "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "PlaceMemory.java", "Ears.java", "ChatSession.java",
               "FaceMigration.java", "FaceMatcher.java", "AnswerParser.java", "NameResolver.java")
 
 
@@ -343,6 +343,12 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "coverage_no_look_turns_less_while_the_way_ahead_is_new",
         "coverage_uncalibrated_roams_exactly_as_before",
         "coverage_trace_notes_carry_counts_only_and_are_forgotten_at_shutdown",
+        # A visual place memory (owner 2026-10-01: somewhere else than the last 30 minutes)
+        "place_a_familiar_view_is_noted_and_its_novelty_lowered",
+        "place_the_steer_spends_more_time_facing_the_unfamiliar_half",
+        "place_an_unusable_heading_still_lowers_the_view_it_has_seen",
+        "place_plain_frames_roam_exactly_as_with_no_prints",
+        "place_memory_is_forgotten_at_shutdown",
         # The leg decision waits for a look to steer by (explore nav plan KTD9, live 2026-09-25)
         "steer_waits_for_a_look_after_a_turn_and_uses_the_legs_own_looks",
         "steer_wait_times_out_to_todays_leg_and_never_waits_with_the_camera_backed_off",

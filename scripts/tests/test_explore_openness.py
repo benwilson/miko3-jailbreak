@@ -214,7 +214,7 @@ class OpennessIsPrivateTest(unittest.TestCase):
     def test_the_camera_scores_each_look_and_attaches_it(self):
         cam = code_only(src("ExploreCamera.java"))
         self.assertIn("openness.score(", cam)
-        self.assertIn("new ExploreBrain.Look(frameMs, found, jpeg, profile)", cam)
+        self.assertIn("new ExploreBrain.Look(frameMs, found, jpeg, profile, lastPrint)", cam)
         # The flag rides with each captured frame, read on the camera thread.
         self.assertRegex(cam, r"recognize\(jpeg, clock\.nowMs\(\), wallMs, generation, floorClear\)")
 

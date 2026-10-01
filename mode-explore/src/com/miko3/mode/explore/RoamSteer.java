@@ -38,7 +38,10 @@ final class RoamSteer {
     static final int RIGHT = Heading.RIGHT;
     static final int STRAIGHT = 0;
 
-    /** How new the ground is along a heading bearingDeg off his facing (left positive): 0..1, NaN unknown. */
+    /**
+     * How new the ground is along a heading bearingDeg off his facing (left positive):
+     * 0..1, NaN unknown. The brain's is the lower of Coverage's and PlaceMemory's.
+     */
     interface Novelty {
         double at(double bearingDeg);
     }

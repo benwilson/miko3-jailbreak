@@ -219,6 +219,16 @@ import java.util.Set;
  * The hazard's side, a blocked side, the floor sensor, stalls, CPL and escapes rule
  * as before; with no usable heading nothing changes. Notes carry counts only.
  *
+ * Somewhere he has not looked lately (owner 2026-10-01; PlaceMemory): a look whose
+ * camera made a place print is scored against the prints of the last 30 minutes
+ * from roughly the same heading (any, with the heading unusable) and kept. Its
+ * novelty stands for the bands in view, and for its heading for a while (a scan's
+ * looks score the headings it turned through); the steer takes the lower of that
+ * and the grid's, and a scan turns toward the less familiar side. A look that
+ * matches notes "place: seen before (sim X.XX, N min ago)", each memory once in a
+ * row. It only lowers novelty: blocked bands and every safety stop rule as before;
+ * looks without a print (or plain ones) change nothing.
+ *
  * People while roaming (explore nav plan U7, R9, R10, KTD4, KTD8): a detector person
  * box in a leg decision's look, with Claude set up, becomes a synthetic PERSON pick
  * (the look is its frame 0): FACE, APPROACH until the box is politeHeight of the
@@ -358,13 +368,15 @@ final class ExploreBrain {
      * One recognized camera frame: when it was captured (brain clock), what was in
      * it, and the frame's JPEG (null when the camera didn't keep it), which the
      * look request sends to Claude (explore on Claude U4), and its openness profile
-     * (explore nav plan U3; null when the camera didn't score it).
+     * (explore nav plan U3; null when the camera didn't score it), and its place
+     * print (PlaceMemory; null when the camera didn't make one).
      */
     static final class Look {
         final long frameMs;
         final List<Detection> detections;
         final byte[] jpeg;
         final Openness.Profile openness;
+        final PlaceMemory.Print place;
 
         Look(long frameMs, List<Detection> detections) {
             this(frameMs, detections, null);
@@ -375,10 +387,16 @@ final class ExploreBrain {
         }
 
         Look(long frameMs, List<Detection> detections, byte[] jpeg, Openness.Profile openness) {
+            this(frameMs, detections, jpeg, openness, null);
+        }
+
+        Look(long frameMs, List<Detection> detections, byte[] jpeg, Openness.Profile openness,
+             PlaceMemory.Print place) {
             this.frameMs = frameMs;
             this.detections = detections;
             this.jpeg = jpeg;
             this.openness = openness;
+            this.place = place;
         }
     }
 
@@ -574,6 +592,13 @@ final class ExploreBrain {
     /** Where he has been this session (explore nav plan U10), forgotten at shutdown. */
     private final Coverage coverage;
     private int coverageNoted = -1;
+    /** What he has looked at in the last 30 minutes (visual place memory). */
+    private final PlaceMemory places;
+    /** The newest look scored against it, and its novelty (NaN: plain, or no print). */
+    private Look placeLook;
+    private double placeLookNovelty = Double.NaN;
+    /** The print the last "seen before" note was about: each memory is noted once in a row. */
+    private Object placeNoted;
     /** Times of the hazard reactions since the last successful hop, for the cornered cap. */
     private final ArrayDeque<Long> hazardTimes = new ArrayDeque<Long>();
 
@@ -1105,12 +1130,18 @@ final class ExploreBrain {
         this.headingHistory = new Heading.History(tuning.headingHistoryMs, tuning.headingSampleMs);
         this.steer = new RoamSteer(tuning);
         this.coverage = new Coverage(tuning);
+        this.places = new PlaceMemory(tuning);
         this.planner = new EscapePlanner(tuning);
     }
 
     /** Where he has been this session (explore nav plan U10), for tests. */
     Coverage coverage() {
         return coverage;
+    }
+
+    /** What he has looked at lately (visual place memory), for tests. */
+    PlaceMemory places() {
+        return places;
     }
 
     /** The heading tracker, for the navigation that builds on it (explore nav plan U2, U5). */
@@ -1202,6 +1233,9 @@ final class ExploreBrain {
         cancelMetCheck();
         planner.reset();
         coverage.clear();
+        places.clear();
+        placeLook = null;
+        placeNoted = null;
         probing = false;
         state = State.STOPPED;
         syncCamera();
@@ -1640,8 +1674,8 @@ final class ExploreBrain {
             forgetDoorway();
             door = Double.NaN;
         }
-        RoamSteer.Novelty novelty = novelty(now);
-        if (novelty != null && coverage.cells(now) != coverageNoted) {
+        RoamSteer.Novelty novelty = novelty(now, look);
+        if (novelty != null && coverage.tracking() && coverage.cells(now) != coverageNoted) {
             coverageNoted = coverage.cells(now);
             note("coverage: " + coverageNoted + " cells");
         }
@@ -1715,22 +1749,69 @@ final class ExploreBrain {
     }
 
     /**
-     * How new the ground is along each bearing off his facing (explore nav plan U10),
-     * or null (as before U10) with the heading not usable, no position kept yet, or
-     * coverageWeight 0.
+     * How new each bearing off his facing is: the lower of the grid's novelty
+     * (explore nav plan U10; none with the heading not usable or no position kept
+     * yet) and the place memory's (in view, look's; out of view, the newest look at
+     * that heading). Null (as before U10) with coverageWeight 0, or when neither
+     * knows anything.
      */
-    private RoamSteer.Novelty novelty(final long now) {
-        if (tuning.coverageWeight <= 0 || !compass.usable(now) || !coverage.tracking()) {
+    private RoamSteer.Novelty novelty(final long now, Look look) {
+        if (tuning.coverageWeight <= 0) {
             return null;
         }
+        boolean usable = compass.usable(now);
         final double facing = compass.degrees();
-        // An anonymous class, not a lambda: the Android build's bootclasspath has no LambdaMetafactory.
-        return new RoamSteer.Novelty() {
-            @Override
-            public double at(double bearing) {
-                return coverage.novelty(Heading.wrap(facing + bearing), now);
+        RoamSteer.Novelty grid = null;
+        if (usable && coverage.tracking()) {
+            // An anonymous class, not a lambda: the Android build's bootclasspath has no LambdaMetafactory.
+            grid = new RoamSteer.Novelty() {
+                @Override
+                public double at(double bearing) {
+                    return coverage.novelty(Heading.wrap(facing + bearing), now);
+                }
+            };
+        }
+        return places.steer(grid, facing, usable, placeNovelty(now, look), now);
+    }
+
+    /**
+     * Scores a look against the place memory once, and keeps its print (visual place
+     * memory): its heading at capture is the compass less what he has turned since
+     * (NaN when not usable). Notes a match placeSeenSim or better, each memory once
+     * in a row. The look's novelty, NaN for none (no look, no print, a plain view).
+     */
+    private double placeNovelty(long now, Look look) {
+        if (look == null || look.place == null) {
+            return Double.NaN;
+        }
+        if (look != placeLook) {
+            double heading = Double.NaN;
+            if (compass.usable(now)) {
+                double turned = headingHistory.turnedSince(look.frameMs);
+                heading = Double.isNaN(turned) ? Double.NaN : Heading.wrap(compass.degrees() - turned);
             }
-        };
+            PlaceMemory.Match m = places.look(look.place, labels(look), heading, look.frameMs);
+            placeLook = look;
+            placeLookNovelty = m.novelty;
+            if (m.seen() && m.print != placeNoted) {
+                placeNoted = m.print;
+                note(m.note());
+            }
+        }
+        return placeLookNovelty;
+    }
+
+    /** The detector's labels in a look (its boxes are already above the detector's floor). */
+    private static List<String> labels(Look look) {
+        List<String> out = new ArrayList<String>();
+        if (look.detections != null) {
+            for (Detection d : look.detections) {
+                if (!out.contains(d.label)) {
+                    out.add(d.label);
+                }
+            }
+        }
+        return out;
     }
 
     /** turnChance, cut by coverageTurnScale while the way ahead is new ground (U10). */
@@ -1811,7 +1892,7 @@ final class ExploreBrain {
         if (left < tuning.reaimMinTicks) {
             return false;
         }
-        double deg = steer.reaimDeg(look.openness, doorwayBearing(now), novelty(now));
+        double deg = steer.reaimDeg(look.openness, doorwayBearing(now), novelty(now, look));
         if (Math.abs(deg) < tuning.reaimMinDeg) {
             return false;
         }
@@ -2076,7 +2157,7 @@ final class ExploreBrain {
         scheduleCuriosity(now);
         state = State.SCAN;
         scanLooksLeft = tuning.scanLooks;
-        scanDir = unblocked(randomDirection());
+        scanDir = unblocked(scanSide(now, randomDirection()));
         target = null;
         roamingPick = false;
         cuePick = false;
@@ -2090,6 +2171,34 @@ final class ExploreBrain {
         firstLook = true;
         show(EyeState.IDLE, null);
         waitForLook(now);
+    }
+
+    /**
+     * The way to scan: toward the side whose recent looks were less familiar (visual
+     * place memory), by at least coverageMinGain over the headings the scan would
+     * face; else the given (random) way.
+     */
+    private Direction scanSide(long now, Direction random) {
+        if (tuning.coverageWeight <= 0 || !compass.usable(now)) {
+            return random;
+        }
+        double left = 0;
+        double right = 0;
+        int n = 0;
+        for (int i = 1; i < tuning.scanLooks; i++) {
+            double l = places.noveltyAt(compass.degrees() + i * tuning.scanTurnDeg, now);
+            double r = places.noveltyAt(compass.degrees() - i * tuning.scanTurnDeg, now);
+            if (Double.isNaN(l) || Double.isNaN(r)) {
+                continue;
+            }
+            left += l;
+            right += r;
+            n++;
+        }
+        if (n == 0 || Math.abs(left - right) / n < tuning.coverageMinGain) {
+            return random;
+        }
+        return left > right ? Direction.LEFT : Direction.RIGHT;
     }
 
     /** Stand still until a look taken after now + settle arrives. */
@@ -2579,6 +2688,7 @@ final class ExploreBrain {
         Look look = camera.latest();
         if (look != null && look != lastLook) {
             lastLook = look;
+            placeNovelty(now, look);
             roamLookDeadline = now + tuning.lookTimeoutMs;
             teachQueue.addLast(new long[]{look.frameMs, forwardCounts});
             while (teachQueue.size() > TEACH_QUEUE_MAX) {

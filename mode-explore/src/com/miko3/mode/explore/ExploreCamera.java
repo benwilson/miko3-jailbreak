@@ -146,6 +146,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private final BitmapFactory.Options decode = new BitmapFactory.Options();
     private final BitmapFactory.Options small = new BitmapFactory.Options();
     private int[] smallPixels = new int[0];
+    /** The newest look's place-memory fingerprint, from scoreOpenness; null when it failed. */
+    private PlaceMemory.Print lastPrint;
     /** halve()'s output, reused frame to frame (Openness keeps no pixels). */
     private int[] halfPixels = new int[0];
     /** Holds the floor model; used on the detect thread (the brain's calls are posted there). */
@@ -645,7 +647,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                         adjustBrightness(frameMs, gen);
                         if (gen == generation) {
                             // The JPEG rides along for Claude's look request (explore on Claude U4, R1).
-                            latest = new ExploreBrain.Look(frameMs, found, jpeg, profile);
+                            latest = new ExploreBrain.Look(frameMs, found, jpeg, profile, lastPrint);
                             debugNav(jpeg, profile);
                         }
                     }
@@ -665,6 +667,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
      */
     private Openness.Profile scoreOpenness(byte[] jpeg, List<Detection> found, long frameMs, boolean teachable) {
         decodedLuma = Double.NaN;
+        lastPrint = null;
         try {
             Bitmap bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, small);
             if (bmp == null) {
@@ -680,11 +683,15 @@ final class ExploreCamera implements ExploreBrain.Camera {
             decodedLuma = Brightness.meanLuma(smallPixels, w * h);
             int first = Math.min(h - 1, (int) (Openness.HORIZON * h));
             Openness.Frame floorBand = new Openness.Frame(smallPixels, w, h - first, (float) first / h, 1f, first);
-            return openness.score(halve(smallPixels, w, h), floorBand, found, frameMs, teachable);
+            Openness.Frame whole = halve(smallPixels, w, h);
+            // The place memory's fingerprint of this view, from the same halved frame.
+            lastPrint = PlaceMemory.Print.of(whole.rgb, whole.width, whole.height);
+            return openness.score(whole, floorBand, found, frameMs, teachable);
         } catch (RuntimeException | OutOfMemoryError e) {
             Log.w(TAG, "openness decode failed: " + e.getClass().getSimpleName());
             small.inBitmap = null;
             decodedLuma = Double.NaN;
+            lastPrint = null;
             return null;
         }
     }
