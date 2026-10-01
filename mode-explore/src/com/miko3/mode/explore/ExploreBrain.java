@@ -670,6 +670,11 @@ final class ExploreBrain {
     private int seekLegs;
     private long seekFromCounts;
     private boolean seekTurned;
+    /** The seek heads for a doorway Claude reported (not a frame it picked). */
+    private boolean seekToDoor;
+    /** The last open doorway Claude reported and when, NaN once a seek has taken it (seekDoorwayMs). */
+    private double seekDoorway = Double.NaN;
+    private long seekDoorwayAt;
     /** No seek starts before this (seekGapMs after the last one ended). */
     private long seekNextAt;
     /**
@@ -1054,8 +1059,16 @@ final class ExploreBrain {
     // ---- boxed in (robot 2026-10-01: minutes under a desk, forward refused, turning in place) ----
     /** The controller's forward refusals (CPL hiccups and hazards) within boxedInWindowMs. */
     private final ArrayDeque<Long> cplRefusals = new ArrayDeque<Long>();
-    /** Leg decisions in a row whose steer read open boxedInOpen or less. */
-    private int lowOpenRun;
+    /** A full look-around just found no heading open over boxedInOpen (boxedIn's second trigger). */
+    private boolean aroundFoundNothing;
+    // ---- look around (robot 2026-10-01 15:55: three closed looks only covered the half in front) ----
+    /** The look-around under way, null for none: per look {facing, most open, its heading}. */
+    private List<double[]> around;
+    private Direction aroundDir;
+    /** A remembered doorway one of its looks read open, NaN for none. */
+    private double aroundDoor = Double.NaN;
+    /** It has ended, turning to its most open heading: the next leg decision goes on as a normal leg. */
+    private boolean aroundFaced;
     /** His last clean forward leg: its heading (NaN: none) and length (counts, one wheel). */
     private double inHeading = Double.NaN;
     private long inCounts;
@@ -1469,6 +1482,7 @@ final class ExploreBrain {
             again = true;
             return;
         }
+        aroundStep();
         stepping = true;
         roamClock(clock.nowMs());
         boolean wasInStop = state.inStop();
@@ -1801,10 +1815,12 @@ final class ExploreBrain {
     /** A roaming leg ended without a hazard or stall (its time, or the camera saw the way blocked). */
     private void legDriven(long now) {
         stopMotors();
-        if (!Double.isNaN(seekTarget)) {
+        boolean nowhere = legWentNowhere(now);
+        if (!Double.isNaN(seekTarget) && !nowhere) {
+            // Only a leg that drove counts toward seekMaxLegs (robot 16:00: turns only, "leg 0" three times).
             seekLegs++;
         }
-        if (legWentNowhere(now)) {
+        if (nowhere) {
             // Too short for the stall watch to rule, but the encoders say he never moved:
             // not a drive-off, so the blocked ways stay avoided.
             aheadBlocked();
@@ -1845,7 +1861,8 @@ final class ExploreBrain {
         } else if (seekAsking) {
             // Claude is choosing where to go (seekStep): he stands and thinks.
             return;
-        } else if (!hopNext && !seeking() && camera.available() && now >= curiosityAt && now >= curiosityOffUntil) {
+        } else if (!hopNext && !seeking() && around == null && camera.available() && now >= curiosityAt
+                && now >= curiosityOffUntil) {
             enterScan(now);
         } else if (hopNext) {
             startHop(now);
@@ -1913,6 +1930,10 @@ final class ExploreBrain {
      * is confident, else as before the camera roamed: a random turn or a hop.
      */
     private void chooseLeg(long now, Look look) {
+        if (around != null) {
+            aroundLook(now, look);
+            return;
+        }
         if (!Double.isNaN(seekTarget) && seekLook(now, look)) {
             return;
         }
@@ -1943,10 +1964,22 @@ final class ExploreBrain {
         }
         doorwayLeg = false;
         if (plan != null) {
-            note("steer: " + plan);
-            lowOpenRun = plan.open <= tuning.boxedInOpen ? lowOpenRun + 1 : 0;
-            if (boxedIn(now)) {
+            String said = plan.toString();
+            note("steer: " + (seek && !seekToDoor ? said.replace(", toward the doorway", ", toward the seek target") : said));
+            boolean faced = aroundFaced;
+            aroundFaced = false;
+            boolean closed = steer.mostOpen(look.openness) <= tuning.steerBlocked;
+            if (closed && !faced && !plan.towardDoorway && tuning.lookAroundLooks > 1 && compass.usable(now)) {
+                // Nothing in view open: look all the way round before choosing, rather
+                // than a blind 60 deg guess (robot 2026-10-01 15:55).
+                startAround(now, look, plan.side == RoamSteer.RIGHT ? Direction.RIGHT : Direction.LEFT);
                 return;
+            }
+            if (closed && faced && plan.turnOnly && !plan.towardDoorway) {
+                // Facing the look-around's best, still under steerBlocked: a short leg there,
+                // guarded by the floor sensor, not another blind turn.
+                plan = new RoamSteer.Plan(RoamSteer.STRAIGHT, 0, plan.open, false, true, 0f);
+                note("facing the look-around's best: a short leg");
             }
             if (plan.towardDoorway && !plan.turnOnly && !plan.shortLeg && plan.open >= tuning.steerOpen) {
                 double after = compass.degrees() + (plan.side == RoamSteer.LEFT ? plan.bendDeg
@@ -4479,6 +4512,139 @@ final class ExploreBrain {
         circleDir = unblocked(escapeSide != null ? escapeSide : Direction.LEFT);
     }
 
+    // ---- look around (robot 2026-10-01 15:55) ----
+
+    /** Everything in view reads closed: the look-around begins with this look, turning d first. */
+    private void startAround(long now, Look look, Direction d) {
+        around = new ArrayList<double[]>();
+        aroundDir = d;
+        aroundDoor = Double.NaN;
+        note("everything ahead closed: looking around (" + tuning.lookAroundLooks + " looks)");
+        aroundLook(now, look);
+    }
+
+    /** One look of the look-around (null: none came in time): read it, then step on, or end. */
+    private void aroundLook(long now, Look look) {
+        int k = around.size() + 1;
+        float open = -1f;
+        if (look != null && steer.confident(look.openness) && compass.usable(now)) {
+            double at = compass.degrees();
+            open = steer.mostOpen(look.openness);
+            around.add(new double[]{at, open, Heading.wrap(at + steer.mostOpenBearing(look.openness))});
+            if (!Double.isNaN(doorway) && Double.isNaN(aroundDoor)) {
+                double b = steer.openBandNear(look.openness, Heading.delta(at, doorway), tuning.doorwayFacingDeg);
+                if (!Double.isNaN(b)) {
+                    aroundDoor = Heading.wrap(at + b);
+                }
+            }
+            note("look-around look " + k + " of " + tuning.lookAroundLooks + " at " + Math.round(at) + " deg: open "
+                    + String.format(java.util.Locale.US, "%.2f", open));
+        } else {
+            around.add(new double[]{Double.NaN, -1, Double.NaN});
+            note("look-around look " + k + " of " + tuning.lookAroundLooks + ": no usable look");
+        }
+        boolean stale = false;
+        if (open >= tuning.lookAroundOpen) {
+            // Open, but ground he has just covered (the steer's own staleness): look on for newer.
+            RoamSteer.Novelty nov = novelty(now, look);
+            double v = nov == null ? Double.NaN : nov.at(steer.mostOpenBearing(look.openness));
+            stale = !Double.isNaN(v) && v <= tuning.coverageStaleNovelty;
+        }
+        if ((open >= tuning.lookAroundOpen && !stale) || around.size() >= tuning.lookAroundLooks) {
+            endAround(now, look);
+            return;
+        }
+        // The next step, the same way round (the unblocked way, if that side is blocked).
+        aroundDir = unblocked(aroundDir);
+        plannedTicks = 0;
+        lastHazardSide = null;
+        double deg = tuning.lookAroundStepDeg;
+        enterLook(now, aroundDir, false, timedMs(deg), compass.usable(now) ? deg : 0);
+    }
+
+    /** The look-around is over: boxed in when it found nothing open all round, else face its most open heading. */
+    private void endAround(long now, Look look) {
+        List<double[]> looks = around;
+        around = null;
+        double[] best = null;
+        for (double[] l : looks) {
+            if (!Double.isNaN(l[2]) && (best == null || l[1] > best[1])) {
+                best = l;
+            }
+        }
+        RoamSteer.Novelty nov = best == null || best[1] <= tuning.steerBlocked ? null : novelty(now, null);
+        if (nov != null) {
+            // Of the looks reading open, the one facing the newest ground by the steer's own
+            // weighting (coverageWeight), so the look-around still favours somewhere new.
+            double facing = compass.degrees();
+            double bestScore = Double.NEGATIVE_INFINITY;
+            for (double[] l : looks) {
+                if (Double.isNaN(l[2]) || l[1] <= tuning.steerBlocked) {
+                    continue;
+                }
+                double v = nov.at(Heading.delta(facing, l[2]));
+                double score = l[1] + (Double.isNaN(v) ? 0 : tuning.coverageWeight * v);
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = l;
+                }
+            }
+        }
+        double door = aroundDoor;
+        aroundDoor = Double.NaN;
+        String of = looks.size() + " of " + tuning.lookAroundLooks + " looks";
+        if (best == null) {
+            note("looked around: no usable look (" + of + ")");
+            return;
+        }
+        if (Double.isNaN(door) && best[1] <= tuning.boxedInOpen && looks.size() >= tuning.lookAroundLooks) {
+            aroundFoundNothing = true;
+            boolean boxed = boxedIn(now);
+            aroundFoundNothing = false;
+            if (boxed) {
+                return;
+            }
+        }
+        double face = Double.isNaN(door) ? best[2] : door;
+        note("looked around: " + (Double.isNaN(door) ? "most open at " + Math.round(face) + " deg"
+                : "the doorway at " + Math.round(face) + " deg reads open; most open at " + Math.round(best[2]) + " deg")
+                + " (open " + String.format(java.util.Locale.US, "%.2f", best[1]) + "); " + of);
+        aroundFaced = true;
+        lastHazardSide = null;
+        double bearing = compass.usable(now) ? Heading.delta(compass.degrees(), face) : 0;
+        if (Math.abs(bearing) < tuning.turnToleranceDeg) {
+            // Facing it already: a normal leg from this look.
+            chooseLeg(now, look);
+            return;
+        }
+        // Face it, then look again from there: that look plans the normal leg.
+        plannedTicks = 0;
+        Direction d = bearing > 0 ? Direction.LEFT : Direction.RIGHT;
+        double deg = Math.abs(bearing);
+        if (unblocked(d) != d) {
+            d = d.opposite();
+            deg = 360 - deg;
+        }
+        enterLook(now, d, false, timedMs(deg), deg);
+    }
+
+    /** A look-around (or its facing turn) cut short by anything but its own turns and pauses. */
+    private void aroundStep() {
+        if (around == null && !aroundFaced) {
+            return;
+        }
+        boolean roaming = state == State.PAUSE || state == State.LOOK || state == State.TURN;
+        if (roaming && !escape) {
+            return;
+        }
+        if (around != null) {
+            note("look-around dropped: " + state + (escape ? " (an escape turn)" : ""));
+        }
+        around = null;
+        aroundDoor = Double.NaN;
+        aroundFaced = false;
+    }
+
     /** A forward refusal by the controller (a CPL hiccup or hazard): boxedInRefusals in boxedInWindowMs is boxed in. */
     private void recordRefusal(long now) {
         cplRefusals.addLast(now);
@@ -4490,8 +4656,8 @@ final class ExploreBrain {
     /**
      * Boxed in (robot 2026-10-01: under a desk for minutes, turns working, forward refused,
      * the steer reading "open 0.00"): at a leg decision in PAUSE, boxedInRefusals forward
-     * refusals within boxedInWindowMs, or boxedInOpenDecisions steer readings in a row of
-     * boxedInOpen or less. He leaves the way he came: the ladder's retrace move, facing the
+     * refusals within boxedInWindowMs, or a full look-around that found no heading open
+     * over boxedInOpen (robot 15:55: closed looks one way only are not enough). He leaves the way he came: the ladder's retrace move, facing the
      * reverse of his last clean forward leg and driving its length back. Refused, the
      * ladder goes on (circle, way out, drive off). Never with the heading unusable, while
      * jammed, or with an escape under way. True when the retrace has started.
@@ -4501,15 +4667,15 @@ final class ExploreBrain {
             cplRefusals.pollFirst();
         }
         boolean refused = tuning.boxedInRefusals > 0 && cplRefusals.size() >= tuning.boxedInRefusals;
-        boolean closed = tuning.boxedInOpenDecisions > 0 && lowOpenRun >= tuning.boxedInOpenDecisions;
+        boolean closed = tuning.boxedInLookAround && aroundFoundNothing;
         if (!(refused || closed) || state != State.PAUSE || !compass.usable(now) || jammed || planner.active()) {
             return false;
         }
         String why = refused
                 ? cplRefusals.size() + " forward refusals in " + Math.round((now - cplRefusals.peekFirst()) / 1000.0) + " s"
-                : "the steer read open " + tuning.boxedInOpen + " or less for " + lowOpenRun + " decisions in a row";
+                : "a full look-around found no heading with open over " + tuning.boxedInOpen;
         cplRefusals.clear();
-        lowOpenRun = 0;
+        aroundFoundNothing = false;
         boolean way = !Double.isNaN(inHeading);
         double exit = way ? Heading.wrap(inHeading + 180) : Double.NaN;
         note("boxed in: " + why + (way ? "; leaving the way he came (facing " + Math.round(exit) + " deg)"
@@ -5593,6 +5759,12 @@ final class ExploreBrain {
             doorwaySetCounts = forwardCounts;
             doorwayLeg = false;
             note("Claude sees an " + a + ": remembered at " + Math.round(doorway) + " deg");
+            seekDoorway = doorway;
+            seekDoorwayAt = now;
+            if (seeking() && !seekToDoor) {
+                // Robot 16:00:24: reported just after Claude's pick; the doorway wins.
+                headForDoorway(now);
+            }
         } else if (a.status == CuriosityPort.Doorway.Status.NONE) {
             note("Claude sees no open doorway");
         } else {
@@ -5749,6 +5921,10 @@ final class ExploreBrain {
 
     /** Ask Claude which of the stop's frames to go to; without Claude, the least familiar one. */
     private void startSeek(long now) {
+        if (doorwayRecent(now)) {
+            headForDoorway(now);
+            return;
+        }
         seekFrames.clear();
         List<CuriosityPort.SeekFrame> frames = new ArrayList<CuriosityPort.SeekFrame>();
         for (SeekView v : seekScan) {
@@ -5840,7 +6016,16 @@ final class ExploreBrain {
             bestX = x;
         }
         if (best == null) {
-            endSeek(now, false, why + "; nowhere he hasn't been lately");
+            String over = why + "; no least familiar frame with anything open (" + seekScan.size()
+                    + " looks): nowhere he hasn't been lately";
+            if (seeking()) {
+                endSeek(now, false, over);
+            } else {
+                // The seek ended before it began (robot 15:59:40: NONE, nothing logged, re-asked
+                // 42 s later): still the gap and the seek clock restart.
+                note("seeking: " + over + "; no seek for " + span(tuning.seekGapMs));
+                seekClockRestart(now);
+            }
             return;
         }
         aimSeek(now, best, bestX, String.format(java.util.Locale.US, "seeking: %s: least familiar frame %d x %.2f",
@@ -5929,11 +6114,24 @@ final class ExploreBrain {
             return false;
         }
         double found = seekFind(look, expected);
-        if (Double.isNaN(found)) {
-            note("seeking: leg " + seekLegs + ", nothing to re-centre on: keeping heading " + degrees(seekTarget) + " deg");
+        int leg = seekLegs + 1;
+        if (Double.isNaN(found) && Math.abs(expected) <= tuning.cameraHalfFovDeg && steer.confident(look.openness)) {
+            // Facing the target and it reads blocked (robot 16:00:30, open 0.21): the most open
+            // band within seekBlockedAimDeg of it instead; nothing open there ends the seek.
+            double alt = steer.openBandNear(look.openness, expected, tuning.seekBlockedAimDeg);
+            if (Double.isNaN(alt)) {
+                endSeek(now, false, "the target reads blocked, nothing open within "
+                        + Math.round(tuning.seekBlockedAimDeg) + " deg of it");
+                return false;
+            }
+            seekTarget = Heading.wrap(compass.degrees() + alt);
+            note("seeking: leg " + leg + ", the target reads blocked: aiming at the open band "
+                    + Math.round(alt - expected) + " deg off it (heading " + degrees(seekTarget) + " deg)");
+        } else if (Double.isNaN(found)) {
+            note("seeking: leg " + leg + ", nothing to re-centre on: keeping heading " + degrees(seekTarget) + " deg");
         } else {
             seekTarget = Heading.wrap(compass.degrees() + found);
-            note("seeking: leg " + seekLegs + ", re-centred by " + Math.round(found - expected) + " deg");
+            note("seeking: leg " + leg + ", re-centred by " + Math.round(found - expected) + " deg");
         }
         return false;
     }
@@ -6000,9 +6198,38 @@ final class ExploreBrain {
         seekPrint = null;
         seekFrames.clear();
         seekLegs = 0;
+        seekToDoor = false;
+        seekClockRestart(now);
+    }
+
+    /** No seek for seekGapMs, and seekEveryMs counts from now. */
+    private void seekClockRestart(long now) {
         familiarStops = 0;
         seekNextAt = now + tuning.seekGapMs;
         roamedSinceSeekMs = 0;
+    }
+
+    /** Claude reported an open doorway within seekDoorwayMs that no seek has taken yet. */
+    private boolean doorwayRecent(long now) {
+        return !Double.isNaN(seekDoorway) && now - seekDoorwayAt <= tuning.seekDoorwayMs;
+    }
+
+    /** The seek's target becomes the reported doorway (robot 16:00: "there's a door in his view"). */
+    private void headForDoorway(long now) {
+        if (seekAsking) {
+            seekAsking = false;
+            port.cancelSeek();
+        }
+        seekTarget = seekDoorway;
+        seekDoorway = Double.NaN;
+        seekToDoor = true;
+        seekLabel = null;
+        seekPrint = null;
+        seekLegs = 0;
+        seekFromCounts = forwardCounts;
+        seekTurned = false;
+        seekFrames.clear();
+        note("seeking: heading for the doorway at " + degrees(seekTarget) + " deg");
     }
 
     // ---- people while roaming (explore nav plan U7, R9, R10, KTD4, KTD8) ----

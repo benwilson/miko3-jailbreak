@@ -224,8 +224,10 @@ final class ExploreTuning {
     /**
      * Boxed in (robot 2026-10-01: minutes under a desk, turns working, forward refused):
      * boxedInRefusals or more forward refusals by the controller (CPL hiccups and CPL
-     * hazards) within boxedInWindowMs, or boxedInOpenDecisions leg decisions in a row
-     * whose steer reads open at most boxedInOpen. He then leaves the way he came: faces
+     * hazards) within boxedInWindowMs, or (boxedInLookAround) a full look-around that
+     * found no heading open over boxedInOpen (robot 2026-10-01 15:55: three closed
+     * readings looking one way only covered the half in front of him, with the open
+     * floor behind). He then leaves the way he came: faces
      * the reverse of his last clean forward leg and drives it back (the escape ladder's
      * retrace move; refused, the ladder goes on). Once out, the view there counts as
      * where a seek went, and the novelty steer reads 0 within boxedAvoidDeg of the way
@@ -234,7 +236,20 @@ final class ExploreTuning {
     final int boxedInRefusals;
     final long boxedInWindowMs;
     final double boxedInOpen;
-    final int boxedInOpenDecisions;
+    final boolean boxedInLookAround;
+    /**
+     * Look around (robot 2026-10-01 15:55): a leg decision whose whole view reads
+     * closed (no band over steerBlocked) turns lookAroundStepDeg at a time, the
+     * same way, and reads each look, up to lookAroundLooks looks in all (the first
+     * is the closed one), stopping early on a look whose most open band reads
+     * lookAroundOpen or more. He then faces the most open heading found (a
+     * remembered doorway seen open in a look first) and goes on as a normal leg.
+     * Only with the heading usable. lookAroundLooks under 2: off (the steer's
+     * blind turns as before).
+     */
+    final int lookAroundLooks;
+    final double lookAroundStepDeg;
+    final float lookAroundOpen;
     final long boxedAvoidMs;
     final double boxedAvoidDeg;
     final float newcomerAngleDeg;
@@ -760,6 +775,15 @@ final class ExploreTuning {
     final double seekArriveNovelty;
     final float seekWeight;
     /**
+     * The first real seek (robot 2026-10-01 16:00). An open doorway Claude reported in
+     * the last seekDoorwayMs (any heading) is the seek's target, before asking Claude
+     * where to go or in place of the frame it picked (likely the most unexplored way
+     * out), once per report. A target that reads blocked when faced is re-aimed at the
+     * most open band within seekBlockedAimDeg of it; nothing open there ends the seek.
+     */
+    final long seekDoorwayMs;
+    final double seekBlockedAimDeg;
+    /**
      * Seeking somewhere new by time and ground (owner, 2026-10-01: "if he's been somewhere
      * in the last 30 minutes, he should try and find somewhere else to go"). Live, Claude
      * had a remark at almost every stop and the place memory read most views as new, so the
@@ -861,7 +885,10 @@ final class ExploreTuning {
         boxedInRefusals = Math.max(0, b.boxedInRefusals);
         boxedInWindowMs = Math.max(0, b.boxedInWindowMs);
         boxedInOpen = b.boxedInOpen;
-        boxedInOpenDecisions = Math.max(0, b.boxedInOpenDecisions);
+        boxedInLookAround = b.boxedInLookAround;
+        lookAroundLooks = Math.max(0, b.lookAroundLooks);
+        lookAroundStepDeg = Math.max(1, b.lookAroundStepDeg);
+        lookAroundOpen = b.lookAroundOpen;
         boxedAvoidMs = Math.max(0, b.boxedAvoidMs);
         boxedAvoidDeg = Math.max(0, b.boxedAvoidDeg);
         newcomerAngleDeg = Math.max(0f, b.newcomerAngleDeg);
@@ -1027,6 +1054,8 @@ final class ExploreTuning {
         seekMaxLegs = Math.max(1, b.seekMaxLegs);
         seekMaxCounts = Math.max(1, b.seekMaxCounts);
         seekRecentreDeg = Math.max(0, b.seekRecentreDeg);
+        seekDoorwayMs = Math.max(0, b.seekDoorwayMs);
+        seekBlockedAimDeg = Math.max(0, b.seekBlockedAimDeg);
         seekArriveNovelty = b.seekArriveNovelty;
         seekWeight = Math.max(0f, b.seekWeight);
         seekEveryMs = Math.max(0, b.seekEveryMs);
@@ -1220,7 +1249,10 @@ final class ExploreTuning {
         private int boxedInRefusals = 3;
         private long boxedInWindowMs = 60000;
         private double boxedInOpen = 0.1;
-        private int boxedInOpenDecisions = 3;
+        private boolean boxedInLookAround = true;
+        private int lookAroundLooks = 6;
+        private double lookAroundStepDeg = 60;
+        private float lookAroundOpen = 0.5f;
         private long boxedAvoidMs = 60000;
         private double boxedAvoidDeg = 45;
         private float newcomerAngleDeg = 45f;
@@ -1496,6 +1528,8 @@ final class ExploreTuning {
         private int seekMaxLegs = 6;
         private long seekMaxCounts = 9000;
         private double seekRecentreDeg = 20;
+        private long seekDoorwayMs = 180000;
+        private double seekBlockedAimDeg = 45;
         // As coverageNovelAhead: a view at least this new is somewhere else.
         private double seekArriveNovelty = 0.7;
         // Twice the doorway's pull: the target beats an equally open band anywhere in view,
@@ -1614,16 +1648,24 @@ final class ExploreTuning {
             leanInMinGapMs = minGapMs;
             return this;
         }
-        Builder boxedIn(int refusals, long windowMs, double open, int openDecisions) {
+        Builder boxedIn(int refusals, long windowMs, double open, boolean lookAround) {
             boxedInRefusals = refusals;
             boxedInWindowMs = windowMs;
             boxedInOpen = open;
-            boxedInOpenDecisions = openDecisions;
+            boxedInLookAround = lookAround;
             return this;
         }
+        Builder lookAround(int looks, double stepDeg, float open) {
+            lookAroundLooks = looks;
+            lookAroundStepDeg = stepDeg;
+            lookAroundOpen = open;
+            return this;
+        }
+        /** No look-around: a closed view gets the steer's blind turns, as before 2026-10-01 15:55. */
+        Builder lookAroundOff() { lookAroundLooks = 0; return this; }
         Builder boxedAvoid(long ms, double deg) { boxedAvoidMs = ms; boxedAvoidDeg = deg; return this; }
-        /** Never boxed in: the refusals and closed steer readings run as before 2026-10-01. */
-        Builder boxedInOff() { boxedInRefusals = 0; boxedInOpenDecisions = 0; return this; }
+        /** Never boxed in: the refusals and closed look-arounds run as before 2026-10-01. */
+        Builder boxedInOff() { boxedInRefusals = 0; boxedInLookAround = false; return this; }
         Builder callSeenRetargetsMax(int v) { callSeenRetargetsMax = v; return this; }
         Builder callBlockedTurns(int max, double deg) { callBlockedTurnsMax = max; callBlockedTurnDeg = deg; return this; }
         Builder jam(double turnDeg, long restMs, long helpEveryMs, int probeTicks) {
@@ -1842,6 +1884,11 @@ final class ExploreTuning {
             return this;
         }
         Builder seekAskTimeoutMs(long v) { seekAskTimeoutMs = v; return this; }
+        Builder seekDoorway(long ms, double blockedAimDeg) {
+            seekDoorwayMs = ms;
+            seekBlockedAimDeg = blockedAimDeg;
+            return this;
+        }
         /** Never seeks the unfamiliar: roaming as before it. */
         Builder seekOff() {
             seekFamiliarScans = 0;

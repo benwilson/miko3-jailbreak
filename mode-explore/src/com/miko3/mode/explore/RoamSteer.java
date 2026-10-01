@@ -371,6 +371,19 @@ final class RoamSteer {
     }
 
     /**
+     * The raw openness of the most open band in p (no doorway, new-ground or seek
+     * weight; ties to the band nearest straight ahead), -1 when p is not confident.
+     */
+    float mostOpen(Openness.Profile p) {
+        return confident(p) ? best(p, false, 0, null, 0f).score : -1f;
+    }
+
+    /** That band's centre as a bearing off his facing (left positive), NaN when p is not confident. */
+    double mostOpenBearing(Openness.Profile p) {
+        return confident(p) ? bearing(best(p, false, 0, null, 0f).offset) : Double.NaN;
+    }
+
+    /**
      * The exact bearing of the most open band in p whose centre lies within maxDeg of
      * expectedDeg (both off his facing, left positive), ties going to the band nearest
      * expectedDeg; NaN when p is not confident or no band there is open.

@@ -2836,6 +2836,8 @@ public final class ExploreBrainHarness {
         cueScenarios();
         leanInCooldownScenarios();
         boxedInScenarios();
+        lookAroundScenarios();
+        robotSeekScenarios();
         chatScenarios();
         callScenarios();
         callFindScenarios();
@@ -9960,9 +9962,12 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     "boxed@" + boxed + " retrace@" + retrace + " circle@" + circle + " notes=" + lastNotes(notes, 25));
         });
-        scenario("boxed_in_steer_reading_open_under_0_1_three_times_leaves_the_way_he_came", n -> {
+        scenario("boxed_in_a_full_look_around_finding_nothing_open_leaves_the_way_he_came", n -> {
             // Nothing refuses him, but every look after the way in reads closed all round
-            // ("open 0.00", "turn only" under the desk): three such decisions in a row.
+            // ("open 0.00" under the desk). Three closed decisions are no longer enough
+            // (robot 2026-10-01 15:55: those only covered the half in front of him): he
+            // looks all the way round first, and only a full look-around with no heading
+            // open over boxedInOpen is boxed in.
             List<String> notes = new ArrayList<String>();
             Rig[] h = new Rig[1];
             Rig rig = escRig(escTuning().hopTicks(8).escapeRetrace(1500, 40), h, CLEAR,
@@ -9977,10 +9982,224 @@ public final class ExploreBrainHarness {
             rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
             rig.started();
             runUntil(rig, 90000, r -> notedAt(notes, "free after") >= 0);
-            long boxed = notedAt(notes, "boxed in: the steer read open");
+            long around = notedAt(notes, "everything ahead closed: looking around (6 looks)");
+            List<Long> looks = notedTimes(notes, "look-around look ");
+            long boxed = notedAt(notes, "boxed in: a full look-around found no heading with open over 0.1");
             long retrace = notedAt(notes, "retrace: facing 180 deg for ");
-            check(n, boxed > 0 && retrace >= boxed && notedAt(notes, "free after") > retrace && rig.violations.isEmpty(),
-                    "boxed@" + boxed + " retrace@" + retrace + " notes=" + lastNotes(notes, 25));
+            int turns = around < 0 || boxed < 0 ? -1 : turnCommands(rig, around, boxed).size();
+            check(n, around > 0 && looks.size() >= 6 && boxed >= looks.get(5) && turns == 5
+                            && notedAt(notes, "boxed in: the steer read") < 0
+                            && retrace >= boxed && notedAt(notes, "free after") > retrace && rig.violations.isEmpty(),
+                    "around@" + around + " looks=" + looks + " turns=" + turns + " boxed@" + boxed + " retrace@" + retrace
+                            + " notes=" + lastNotes(notes, 25));
+        });
+    }
+
+    // ---- look around when everything in view reads closed (robot 2026-10-01 15:55) ----
+
+    /**
+     * A view fixed to the room: each bin reads open(h) for the world heading it looks along
+     * (his true yaw plus the bin's bearing, left positive); confident.
+     */
+    private static OpenView worldView(java.util.function.DoubleUnaryOperator open) {
+        return (r, t) -> {
+            float[] b = new float[Openness.BINS];
+            for (int i = 0; i < b.length; i++) {
+                double x = (i + 0.5) / b.length * 2 - 1;
+                b[i] = (float) open.applyAsDouble(Heading.wrap(r.yaw.trueDeg - x * r.tuning.cameraHalfFovDeg));
+            }
+            return new Openness.Profile(b, 0.9f);
+        };
+    }
+
+    /** The heading in a "looked around: most open at H deg" note, NaN for none. */
+    private static double lookedAroundAt(List<String> notes) {
+        String x = firstNote(notes, "looked around: most open at ");
+        if (x == null) {
+            return Double.NaN;
+        }
+        String rest = x.substring(x.indexOf("most open at ") + 13);
+        return Double.parseDouble(rest.substring(0, rest.indexOf(' ')));
+    }
+
+    private static void lookAroundScenarios() {
+        scenario("look_around_walls_across_the_front_half_turns_to_face_the_open_side_and_drives_there", n -> {
+            // Robot 15:55: a wall fills the view and the front 180 deg are closed; behind him
+            // the floor is open, with a doorway Claude reports when he faces it.
+            Rig rig = doorRig(doorTuning(), CLEAR,
+                    worldView(hd -> Math.abs(Heading.delta(hd, 0)) < 90 ? 0.02 : 0.9),
+                    (r, k) -> Math.abs(Heading.delta(r.yaw.wrapped(), 180)) <= 60 ? CuriosityPort.Doorway.door(0f)
+                            : CuriosityPort.Doorway.none());
+            List<String> notes = traced(rig);
+            rig.started();
+            double[] hopYaw = {Double.NaN};
+            long[] hopAt = {-1};
+            while (rig.now < 60000 && hopAt[0] < 0) {
+                rig.runUntil(rig.now + 10);
+                long looked = notedAt(notes, "looked around: most open at ");
+                if (looked >= 0) {
+                    int hop = rig.firstAfter("hop", looked);
+                    if (hop >= 0) {
+                        hopAt[0] = rig.timeOf(hop);
+                        hopYaw[0] = rig.yaw.wrapped();
+                    }
+                }
+            }
+            long around = notedAt(notes, "everything ahead closed: looking around (6 looks)");
+            double most = lookedAroundAt(notes);
+            check(n, around > 0 && !Double.isNaN(most) && Math.abs(Heading.delta(most, 0)) >= 60
+                            && hopAt[0] > around && Math.abs(Heading.delta(hopYaw[0], 0)) > 90
+                            && notedAt(notes, "boxed in") < 0 && rig.violations.isEmpty(),
+                    "around@" + around + " most=" + f1(most) + " hop@" + hopAt[0] + " yaw=" + f1(hopYaw[0])
+                            + " notes=" + lastNotes(notes, 25));
+        });
+        scenario("look_around_stops_early_on_the_first_step_that_reads_open", n -> {
+            // Closed within 40 deg of where he faces; open beyond: the first 60 deg step sees it.
+            Rig rig = doorRig(doorTuning(), CLEAR,
+                    worldView(hd -> Math.abs(Heading.delta(hd, 0)) < 40 ? 0.02 : 0.9),
+                    (r, k) -> CuriosityPort.Doorway.none());
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 30000, r -> notedAt(notes, "looked around: most open at ") >= 0);
+            long around = notedAt(notes, "everything ahead closed: looking around (6 looks)");
+            long looked = notedAt(notes, "looked around: most open at ");
+            String note = firstNote(notes, "looked around: most open at ");
+            int turns = around < 0 || looked < 0 ? -1 : turnCommands(rig, around, looked + 1).size();
+            check(n, around > 0 && looked > around && note != null && note.contains("2 of 6 looks") && turns == 1
+                            && notedTimes(notes, "look-around look ").size() == 2
+                            && notedAt(notes, "boxed in") < 0 && rig.violations.isEmpty(),
+                    "around@" + around + " looked@" + looked + " turns=" + turns + " notes=" + lastNotes(notes, 20));
+        });
+        scenario("look_around_a_floor_hazard_mid_turn_drops_it_and_the_hazard_rules", n -> {
+            // A floor edge reads during the look-around's first turn: the wheels stop on that
+            // step as always, and the look-around is dropped (the hazard's escape takes over).
+            long[] edgeFrom = {Long.MAX_VALUE};
+            Rig[] h = new Rig[1];
+            Rig rig = doorRig(doorTuning(), t -> t >= edgeFrom[0] && t < edgeFrom[0] + 300 ? edgeAhead(t) : clear(t),
+                    worldView(hd -> 0.02), (r, k) -> CuriosityPort.Doorway.none());
+            h[0] = rig;
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 30000, r -> {
+                long a = notedAt(notes, "everything ahead closed: looking around");
+                if (a >= 0 && edgeFrom[0] == Long.MAX_VALUE && r.brain.state() == ExploreBrain.State.TURN) {
+                    edgeFrom[0] = r.now + 10;
+                }
+                return edgeFrom[0] != Long.MAX_VALUE && r.now > edgeFrom[0] + 3000;
+            });
+            int stop = rig.firstAfter("stop", edgeFrom[0]);
+            long dropped = notedAt(notes, "look-around dropped");
+            check(n, edgeFrom[0] != Long.MAX_VALUE && stop >= 0 && rig.timeOf(stop) <= edgeFrom[0] + 100
+                            && dropped >= edgeFrom[0] && notedAt(notes, "looked around: most open at ") < 0
+                            && rig.violations.isEmpty(),
+                    "edge@" + edgeFrom[0] + " stop@" + (stop < 0 ? -1 : rig.timeOf(stop)) + " dropped@" + dropped
+                            + " notes=" + lastNotes(notes, 20));
+        });
+    }
+
+    // ---- the first real seek on the robot (2026-10-01 15:59-16:00) ----
+
+    /** The first forward drive at or after from, else null. */
+    private static Drive firstHop(Rig rig, long from) {
+        for (Drive d : rig.drives) {
+            if (d.t >= from && "hop".equals(d.kind)) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    /** The whole degrees in a note after part ("... at 54 deg"), NaN for none. */
+    private static double degAfter(List<String> notes, String part) {
+        String x = null;
+        for (String y : notes) {
+            if (y.contains(part)) {
+                x = y;
+                break;
+            }
+        }
+        if (x == null) {
+            return Double.NaN;
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(part) + "(-?\\d+) deg")
+                .matcher(x);
+        return m.find() ? Double.parseDouble(m.group(1)) : Double.NaN;
+    }
+
+    private static void robotSeekScenarios() {
+        scenario("seek_a_doorway_reported_during_the_seek_becomes_its_target_and_he_drives_toward_it", n -> {
+            // Robot 16:00:23-24: Claude picked a frame, then reported an open doorway; he
+            // should head for the doorway, not argue between the two.
+            Rig rig = seekRig(seekTuning().doorwayAsk(5000, 3000), (r, t) -> scene(1),
+                    (r, req, k) -> CuriosityPort.WayOut.way(2, 0f));
+            rig.doorways = (r, k) -> r.brain.seeking() ? CuriosityPort.Doorway.door(0.77f) : CuriosityPort.Doorway.none();
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 400000, r -> {
+                long at = notedAt(notes, "seeking: heading for the doorway at ");
+                return at >= 0 && firstHop(r, at) != null || notedAt(notes, "seeking: gave up") >= 0;
+            });
+            double remembered = degAfter(notes, "remembered at ");
+            double target = degAfter(notes, "seeking: heading for the doorway at ");
+            long at = notedAt(notes, "seeking: heading for the doorway at ");
+            Drive hop = at < 0 ? null : firstHop(rig, at);
+            long gaveUp = notedAt(notes, "seeking: gave up");
+            check(n, !Double.isNaN(target) && near(target, remembered, 1.5) && hop != null
+                            && near(hop.heading, target, 20) && (gaveUp < 0 || gaveUp > hop.t) && rig.violations.isEmpty(),
+                    "remembered=" + f1(remembered) + " target=" + f1(target) + " hop=" + (hop == null ? "none"
+                            : hop.t + "@" + f1(hop.heading)) + " gaveUp@" + gaveUp + " notes=" + lastNotes(notes, 25));
+        });
+        scenario("seek_a_none_answer_logs_the_fallback_and_no_second_seek_within_seek_gap_ms", n -> {
+            // Robot 15:59:40: Claude answered NONE, no fallback was logged and no gap applied,
+            // so he asked again 42 s later. Every stop's looks read closed: the fallback finds
+            // nowhere, says so, and the gap (60 s here) holds.
+            Rig rig = seekRig(seekTuning(), (r, t) -> scene(1), (r, req, k) -> CuriosityPort.WayOut.none());
+            rig.openView = (r, t) -> r.brain.state() == ExploreBrain.State.SCAN ? prof(0.9f, 0.1f, 0.1f, 0.1f)
+                    : prof(0.9f, 0.9f, 0.9f, 0.9f);
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 400000, r -> notedAt(notes, "seeking: asking Claude where to go") >= 0);
+            long asked = notedAt(notes, "seeking: asking Claude where to go");
+            rig.runUntil(asked + 59000);
+            long fell = notedAt(notes, "seeking: Claude sees nowhere new");
+            int asks = notedTimes(notes, "seeking: asking Claude where to go").size();
+            check(n, asked > 0 && fell >= asked && asks == 1 && rig.violations.isEmpty(),
+                    "asked@" + asked + " fell@" + fell + " asks=" + asks + " notes=" + lastNotes(notes, 20));
+        });
+        scenario("seek_the_target_blocked_with_an_open_band_30_deg_left_drives_that_band", n -> {
+            // The target heading reads blocked when he faces it; open floor lies 30 deg left
+            // of it (in view at its edge): he aims at that band and drives it, no giving up.
+            double[] w = {Double.NaN};
+            Rig rig = seekRig(seekTuning(), (r, t) -> scene(1), (r, req, k) -> CuriosityPort.WayOut.way(1, 0f));
+            rig.openView = (r, t) -> {
+                double sh = r.brain.seekHeading();
+                if (Double.isNaN(sh) && Double.isNaN(w[0])) {
+                    return prof(0.9f, 0.9f, 0.9f, 0.9f);
+                }
+                if (Double.isNaN(w[0])) {
+                    w[0] = Heading.wrap(sh + 30);
+                }
+                float[] b = new float[Openness.BINS];
+                for (int i = 0; i < b.length; i++) {
+                    double offset = (i + 0.5) / b.length * 2 - 1;
+                    double world = r.yaw.wrapped() + exactBearing(offset);
+                    b[i] = Math.abs(Heading.delta(world, w[0])) <= 6 ? 0.9f : 0.1f;
+                }
+                return new Openness.Profile(b, 0.9f);
+            };
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 400000, r -> {
+                long at = notedAt(notes, "the target reads blocked: aiming at the open band");
+                return at >= 0 && firstHop(r, at) != null || notedAt(notes, "seeking: gave up") >= 0;
+            });
+            long at = notedAt(notes, "the target reads blocked: aiming at the open band");
+            Drive hop = at < 0 ? null : firstHop(rig, at);
+            long gaveUp = notedAt(notes, "seeking: gave up");
+            check(n, at > 0 && hop != null && near(hop.heading, w[0], 12) && (gaveUp < 0 || gaveUp > hop.t)
+                            && rig.violations.isEmpty(),
+                    "open=" + f1(w[0]) + " at@" + at + " hop=" + (hop == null ? "none" : hop.t + "@" + f1(hop.heading))
+                            + " gaveUp@" + gaveUp + " notes=" + lastNotes(notes, 25));
         });
     }
 

@@ -536,7 +536,15 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         # Boxed in: leave the way he came (robot 2026-10-01: minutes under a desk)
         "boxed_in_three_cpl_refusals_in_60_s_leaves_the_way_he_came",
         "boxed_in_a_refused_retrace_falls_back_to_the_escape_ladder",
-        "boxed_in_steer_reading_open_under_0_1_three_times_leaves_the_way_he_came",
+        "boxed_in_a_full_look_around_finding_nothing_open_leaves_the_way_he_came",
+        # Look around when everything in view reads closed (robot 2026-10-01 15:55)
+        "look_around_walls_across_the_front_half_turns_to_face_the_open_side_and_drives_there",
+        "look_around_stops_early_on_the_first_step_that_reads_open",
+        "look_around_a_floor_hazard_mid_turn_drops_it_and_the_hazard_rules",
+        # The first real seek on the robot (2026-10-01 15:59-16:00)
+        "seek_a_doorway_reported_during_the_seek_becomes_its_target_and_he_drives_toward_it",
+        "seek_a_none_answer_logs_the_fallback_and_no_second_seek_within_seek_gap_ms",
+        "seek_the_target_blocked_with_an_open_band_30_deg_left_drives_that_band",
         "call_wake_word_with_no_face_still_opens_with_the_crouch_opener",
         # The caller talks while he looks for them (owner 2026-09-30): the conversation opens at once
         "call_caller_talking_during_the_search_opens_the_conversation_before_the_search_ends",
