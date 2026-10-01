@@ -86,7 +86,55 @@ final class ClaudeCuriosity implements CuriosityPort {
     private static final int FRAME_H = 480;
 
     private final Context app;
-    private final ClaudeApi claude = new ClaudeApi(new ClaudeHttpsTransport());
+    private final ClaudeApi api = new ClaudeApi(new ClaudeHttpsTransport());
+    /**
+     * Robot 2026-10-01: the key hit 429s, and each was retried 0.6 s later. One back-off
+     * clock for every request kind: a 429 or 529 pauses them all for its retry-after (else
+     * 30 s doubling to 5 min, reset by a success). While it runs canAsk() is false, so each
+     * kind takes its no-Claude path, and the gate below sends nothing.
+     */
+    private final ClaudeApi.Backoff backoff = new ClaudeApi.Backoff();
+    private final Gated claude = new Gated();
+
+    /** ClaudeApi's two requests behind the back-off clock: held while it runs, every result recorded. */
+    private final class Gated {
+        ClaudeApi.MessageResult messages(ClaudeAccess access, String system, List<Map<String, Object>> content,
+                Map<String, ?> schema, int timeoutMs) {
+            if (held()) {
+                return ClaudeApi.MessageResult.paused();
+            }
+            return recorded(api.messages(access, system, content, schema, timeoutMs));
+        }
+
+        ClaudeApi.MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
+                Map<String, ?> schema, String effort, int timeoutMs) {
+            if (held()) {
+                return ClaudeApi.MessageResult.paused();
+            }
+            return recorded(api.conversation(access, system, messages, schema, effort, timeoutMs));
+        }
+    }
+
+    /** True (and logged) when the back-off clock holds this request back: it is not sent. */
+    private boolean held() {
+        long left = backoff.remainingMs(System.currentTimeMillis());
+        if (left <= 0) {
+            return false;
+        }
+        Log.i(TAG, "Claude request not sent: requests paused for " + ((left + 999) / 1000) + " s more");
+        return true;
+    }
+
+    /** Records a result on the clock; a 429 or 529 that starts a pause is logged, once per pause. */
+    private ClaudeApi.MessageResult recorded(ClaudeApi.MessageResult r) {
+        long pause = backoff.record(r, System.currentTimeMillis());
+        if (pause > 0) {
+            Log.w(TAG, (r.reason == ClaudeApi.Reason.OVERLOADED ? "Claude overloaded" : "Claude rate-limited")
+                    + " (HTTP " + r.httpStatus + "): pausing Claude requests for " + ((pause + 999) / 1000) + " s"
+                    + (r.retryAfterMs >= 0 ? " (retry-after)" : ""));
+        }
+        return r;
+    }
     private final RobotSpeechClient speech;
     private final RobotListenClient ears;
     /** The continuous ears session (meeting plan U7, KTD1), set by ModeApp; null means the one-shot listen only. */
@@ -229,7 +277,12 @@ final class ClaudeCuriosity implements CuriosityPort {
     public boolean canAsk() {
         refreshSettings();
         ClaudeAccess a = access;
-        return !released && a != null && a.isSetUp();
+        return !released && a != null && a.isSetUp() && backoff.remainingMs(System.currentTimeMillis()) <= 0;
+    }
+
+    @Override
+    public long claudePausedMs() {
+        return backoff.remainingMs(System.currentTimeMillis());
     }
 
     /** Fetch the settings in the background (one fetch at a time); canAsk() reads the last answer. */

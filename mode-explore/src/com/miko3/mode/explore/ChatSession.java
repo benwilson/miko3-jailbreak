@@ -147,6 +147,16 @@ final class ChatSession {
     private CuriosityPort.TurnRequest request;
     private int attempt;
     private long turnDeadline;
+    /**
+     * Robot 2026-10-01: a turn held back by Claude's rate-limit pause, sent at turnHeldUntil
+     * with heldBudget; heldSince is when this turn first waited (the whole wait stays within
+     * chatPauseWaitMs) and secSaid that its "one sec" has played.
+     */
+    private boolean turnHeld;
+    private long turnHeldUntil;
+    private long heldBudget;
+    private long heldSince;
+    private boolean secSaid;
     private boolean reRequested;
     private boolean opener = true;
     /** Turn 1 failed for a known person: the local greeting is playing, then the sign-off (U6, KTD7). */
@@ -384,12 +394,46 @@ final class ChatSession {
         reRequested = false;
         request = new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
                 .face(openedFaceless, faceSeen && name == null);
-        turnDeadline = now + tuning.turnBudgetMs;
+        turnHeld = false;
+        secSaid = false;
+        heldSince = -1;
         host.eyes(ExploreBrain.EyeState.THINKING, null);
         if (opener) {
             host.stamp(ExploreBrain.Gauges.Stage.LINE_REQUESTED, now);
         }
-        port.turn(request, tuning.turnBudgetMs);
+        sendTurn(now, tuning.turnBudgetMs);
+    }
+
+    /**
+     * Sends the turn with this budget, unless Claude is paused after a 429 or 529 (robot
+     * 2026-10-01): a pause the turn can wait out within chatPauseWaitMs gets "one sec" (once
+     * per turn) and holds the turn until it ends; a longer one ends the conversation politely.
+     */
+    private void sendTurn(long now, long budget) {
+        long paused = port.claudePausedMs();
+        if (paused > 0) {
+            if (heldSince < 0) {
+                heldSince = now;
+            }
+            if (now + paused - heldSince > tuning.chatPauseWaitMs) {
+                turnHeld = false;
+                host.note("Claude is paused for " + paused + " ms: too long to wait, the sign-off ends the conversation");
+                turnFailed(now);
+                return;
+            }
+            host.note("Claude is paused for " + paused + " ms: one sec, and the turn waits");
+            if (!secSaid) {
+                secSaid = true;
+                openClip(now, CLIP_ONE_SEC);
+            }
+            turnHeld = true;
+            turnHeldUntil = now + paused;
+            heldBudget = budget;
+            return;
+        }
+        turnHeld = false;
+        turnDeadline = now + budget;
+        port.turn(request, budget);
     }
 
     /** The transcript window (KTD9): the last transcriptWindow exchanges, oldest dropped first. */
@@ -404,6 +448,12 @@ final class ChatSession {
             return;
         }
         if (phase != Phase.WAIT_TURN) {
+            return;
+        }
+        if (turnHeld) {
+            if (now >= turnHeldUntil) {
+                sendTurn(now, heldBudget);
+            }
             return;
         }
         CuriosityPort.Turn t = port.turnAnswer();
@@ -454,9 +504,10 @@ final class ChatSession {
     private void retryOrSignOff(long now, String why) {
         if (attempt == 1 && tuning.turnRetryMs > 0) {
             attempt = 2;
-            host.note("turn attempt 1 failed (" + why + "): retrying once");
-            turnDeadline = now + tuning.turnRetryMs;
-            port.turn(request, tuning.turnRetryMs);
+            // Robot 2026-10-01: never straight back into a rate limit; sendTurn waits out a short pause.
+            host.note("turn attempt 1 failed (" + why + "): "
+                    + (port.claudePausedMs() > 0 ? "a retry once Claude's pause is over" : "retrying once"));
+            sendTurn(now, tuning.turnRetryMs);
             return;
         }
         host.note("turn attempt " + attempt + " failed (" + why + "): the local sign-off ends the conversation");

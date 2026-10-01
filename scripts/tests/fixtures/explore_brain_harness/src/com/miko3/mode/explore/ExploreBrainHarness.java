@@ -647,6 +647,10 @@ public final class ExploreBrainHarness {
         final Claude claude;
         /** Claude unavailable on a rig wired with the port and the ears (hey-miko plan KTD1: the answer only). */
         boolean askRefused;
+        /** ClaudeCuriosity's rate-limit pause (robot 2026-10-01), on the rig's clock: canAsk() is false until then. */
+        long claudePausedUntil;
+        /** An UNREACHABLE turn answer starts a pause this long (a 429 behind it), when above 0. */
+        long pauseOnUnreachableMs;
         long claudeDelayMs = 1000;
         final List<CuriosityPort.LookRequest> asks = new ArrayList<CuriosityPort.LookRequest>();
         final List<Long> askTimeouts = new ArrayList<Long>();
@@ -1255,7 +1259,12 @@ public final class ExploreBrainHarness {
 
         @Override
         public boolean canAsk() {
-            return claude != null && !askRefused;
+            return claude != null && !askRefused && now >= claudePausedUntil;
+        }
+
+        @Override
+        public long claudePausedMs() {
+            return Math.max(0, claudePausedUntil - now);
         }
 
         @Override
@@ -1573,6 +1582,9 @@ public final class ExploreBrainHarness {
             }
             CuriosityPort.Turn t = pendingTurn;
             pendingTurn = null;
+            if (t.status == CuriosityPort.Turn.Status.UNREACHABLE && pauseOnUnreachableMs > 0) {
+                claudePausedUntil = now + pauseOnUnreachableMs;
+            }
             log.add(new Event(now, "turn " + t.status));
             return t;
         }
@@ -4011,6 +4023,90 @@ public final class ExploreBrainHarness {
             check(n, failed >= 0 && rig.timeOf(ask2) == rig.timeOf(failed) && say > ask2
                             && rig.countPrefix("name", 0, 9001) == 0 && rig.violations.isEmpty(),
                     rig.tail());
+        });
+        // ---- rate limits (robot 2026-10-01: a 429, retried 0.6 s later) ----
+        scenario("claude_rate_limited_ask_is_not_retried_and_stops_skip_claude_until_the_pause_ends", n -> {
+            // ClaudeCuriosity's pause starts as the 429 comes back: canAsk() is false for 20 s.
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, (r, t) -> list(), true,
+                    (r, req, nth) -> {
+                        if (nth == 1) {
+                            r.claudePausedUntil = r.now + 1000 + 20000;
+                            return CuriosityPort.Answer.failed();
+                        }
+                        return CuriosityPort.Answer.nothing();
+                    });
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(45000);
+            int failed = rig.first("answer FAILED", 0);
+            long at = rig.timeOf(failed);
+            int next = rig.first("ask", failed);
+            int scans = 0;
+            for (String x : notes) {
+                long t = Long.parseLong(x.substring(0, x.indexOf(' ')));
+                if (t > at && t < at + 20000 && x.contains("curiosity stop")) {
+                    scans++;
+                }
+            }
+            check(n, failed >= 0 && next > failed && rig.timeOf(next) >= at + 20000
+                            && noted(notes, "Claude is paused: no second try") && noted(notes, "no answer from Claude")
+                            && rig.violations.isEmpty(),
+                    "failed=" + at + " next=" + (next < 0 ? -1 : rig.timeOf(next)) + " stopsInPause=" + scans + " "
+                            + rig.tail());
+        });
+        scenario("claude_look_budget_caps_asks_per_minute_and_the_excess_stops_use_the_detector", n -> {
+            Rig rig = new Rig(claudeTuning().claudeLooksPerMinute(2).build(), CLEAR, (r, t) -> list(), true,
+                    (r, req, nth) -> CuriosityPort.Answer.nothing());
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(130000);
+            List<Long> times = new ArrayList<Long>();
+            for (int i = rig.first("ask", 0); i >= 0; i = rig.first("ask", i + 1)) {
+                times.add(rig.timeOf(i));
+            }
+            boolean capped = true;
+            for (int i = 2; i < times.size(); i++) {
+                capped &= times.get(i) - times.get(i - 2) >= 60000;
+            }
+            ExploreTuning d = tuning().build();
+            check(n, times.size() >= 3 && capped && noted(notes, "Claude look budget spent")
+                            && d.claudeLooksPerMinute == 4 && d.chatPauseWaitMs == 10000 && rig.violations.isEmpty(),
+                    "asks at " + times + " defaults " + d.claudeLooksPerMinute + "/" + d.chatPauseWaitMs);
+        });
+        scenario("chat_turn_in_a_short_claude_pause_says_one_sec_waits_and_carries_on", n -> {
+            Rig rig = sarahRig(false);
+            rig.turns = turnsOf(turnLine(1), CuriosityPort.Turn.unreachable(), turnLine(2));
+            rig.pauseOnUnreachableMs = 6000;
+            rig.people.listen = ListenScript.turns(hearWords("I like trains"), hearWords("bye"));
+            long open = openChat(rig);
+            List<String> notes = traced(rig);
+            long over = chatOver(rig, open);
+            int unreachable = rig.first("turn UNREACHABLE", 0);
+            long at = rig.timeOf(unreachable);
+            int sec = rig.firstAfter("react one-sec", at);
+            int retry = rig.first("turn", unreachable + 1);
+            int line2 = rig.first("say Line 2.", unreachable);
+            int signOff = rig.firstAfter("react sign-off", at);
+            check(n, open > 0 && unreachable >= 0 && sec >= 0 && rig.timeOf(sec) < at + 6000
+                            && retry > unreachable && rig.timeOf(retry) >= at + 6000 && line2 > retry
+                            && (signOff < 0 || signOff > line2) && rig.turnAsks.size() >= 3
+                            && noted(notes, "Claude is paused for 6000 ms") && rig.violations.isEmpty(),
+                    "unreachable=" + at + " sec=" + (sec < 0 ? -1 : rig.timeOf(sec)) + " retry="
+                            + (retry < 0 ? -1 : rig.timeOf(retry)) + " over=" + over + " " + rig.tail());
+        });
+        scenario("chat_turn_in_a_long_claude_pause_signs_off_without_another_request", n -> {
+            Rig rig = sarahRig(false);
+            rig.turns = turnsOf(turnLine(1), CuriosityPort.Turn.unreachable(), turnLine(2));
+            rig.pauseOnUnreachableMs = 30000;
+            rig.people.listen = ListenScript.turns(hearWords("I like trains"), hearWords("bye"));
+            long open = openChat(rig);
+            List<String> notes = traced(rig);
+            long over = chatOver(rig, open);
+            int unreachable = rig.first("turn UNREACHABLE", 0);
+            int signOff = rig.firstAfter("react sign-off", rig.timeOf(unreachable));
+            check(n, open > 0 && over > 0 && unreachable >= 0 && signOff >= 0 && rig.turnAsks.size() == 2
+                            && noted(notes, "Claude is paused for 30000 ms") && rig.violations.isEmpty(),
+                    "asks=" + rig.turnAsks.size() + " " + rig.tail());
         });
         scenario("claude_reopen_gap_counts_in_the_first_look_budget", n -> {
             Rig rig = new Rig(claudeTuning().reopenGapMs(3000).build(), CLEAR, cupIn(2), true, MUG_ON_THE_CUP);
@@ -8359,7 +8455,9 @@ public final class ExploreBrainHarness {
     // room whose every view is the same reads familiar from the first stop.
 
     private static ExploreTuning.Builder seekTuning() {
+        // A stop every 15 s plus doorway asks would spend the look budget; these pin the seek itself.
         return navTuning().gyro(robotGyro())
+                .claudeLooksPerMinute(0)
                 .curiosityMs(15000, 15000)
                 .scan(3, 500).scanTurnDeg(40)
                 .ask(1, 4000)

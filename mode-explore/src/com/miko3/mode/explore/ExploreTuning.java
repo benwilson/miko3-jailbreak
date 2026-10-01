@@ -169,6 +169,12 @@ final class ExploreTuning {
      */
     final int askAttempts;
     final long askTimeoutMs;
+    /**
+     * Robot 2026-10-01 (the key hit 429s): a soft cap on Claude look requests (a curiosity
+     * stop's ask and its second try, a seek, a doorway ask, a way-out ask) in any 60 s.
+     * One past it takes that kind's no-Claude path. 0: no cap.
+     */
+    final int claudeLooksPerMinute;
     final long sayTimeoutMs;
     /** A line waits at most this long for the camera and detector to go quiet (R6; a detector run is ~1 s). */
     final long quietWaitMs;
@@ -431,6 +437,11 @@ final class ExploreTuning {
     final long chatStallGraceMs;
     final long turnBudgetMs;
     final long turnRetryMs;
+    /**
+     * Robot 2026-10-01: a turn that meets a Claude rate-limit pause this long or shorter
+     * says "one sec" and waits it out; a longer pause ends the conversation with the sign-off.
+     */
+    final long chatPauseWaitMs;
     final int sentenceCap;
     final int transcriptWindow;
     final long deafTailMs;
@@ -867,6 +878,7 @@ final class ExploreTuning {
         peopleCooldownMs = b.peopleCooldownMs;
         phantomPersonCooldownMs = Math.max(0, b.phantomPersonCooldownMs);
         askAttempts = Math.max(1, b.askAttempts);
+        claudeLooksPerMinute = Math.max(0, b.claudeLooksPerMinute);
         askTimeoutMs = b.askTimeoutMs;
         sayTimeoutMs = b.sayTimeoutMs;
         quietWaitMs = Math.max(0, b.quietWaitMs);
@@ -942,6 +954,7 @@ final class ExploreTuning {
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
         turnRetryMs = Math.max(0, b.turnRetryMs);
+        chatPauseWaitMs = Math.max(0, b.chatPauseWaitMs);
         sentenceCap = Math.max(1, b.sentenceCap);
         transcriptWindow = Math.max(1, b.transcriptWindow);
         deafTailMs = Math.max(0, b.deafTailMs);
@@ -1220,6 +1233,7 @@ final class ExploreTuning {
         // within ~20 s (AE4). Owner's call after live tests: a look usually takes ~3 s,
         // and a slow one is retried rather than waited on longer.
         private int askAttempts = 2;
+        private int claudeLooksPerMinute = 4;
         private long askTimeoutMs = 10000;
         // A few seconds of speech (R5), plus the launcher's synthesis; only a backstop.
         private long sayTimeoutMs = 15000;
@@ -1338,6 +1352,7 @@ final class ExploreTuning {
         private long chatStallGraceMs = 5000;
         private long turnBudgetMs = 5000;
         private long turnRetryMs = 3000;
+        private long chatPauseWaitMs = 10000;
         private int sentenceCap = 2;
         private int transcriptWindow = 30;
         private long deafTailMs = 500;
@@ -1703,6 +1718,7 @@ final class ExploreTuning {
         /** No recovery wait: the escape runs at once after a stall, as before 2026-10-01's cutouts. */
         Builder stallRecoverOff() { stallRecoverProbesMs = new long[0]; return this; }
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
+        Builder claudeLooksPerMinute(int v) { claudeLooksPerMinute = v; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
         Builder quietWaitMs(long v) { quietWaitMs = v; return this; }
         Builder heldLineFreshMs(long v) { heldLineFreshMs = v; return this; }
@@ -1967,6 +1983,7 @@ final class ExploreTuning {
             this.headingSampleMs = sampleMs;
             return this;
         }
+        Builder chatPauseWaitMs(long v) { chatPauseWaitMs = v; return this; }
         Builder chat(long unansweredListenMs, long stallGraceMs, long turnBudgetMs, long turnRetryMs, int sentenceCap,
                      int transcriptWindow, long deafTailMs) {
             this.unansweredListenMs = unansweredListenMs;

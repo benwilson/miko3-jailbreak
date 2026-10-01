@@ -559,6 +559,55 @@ class ClaudeLatencyIsLoggedTest(unittest.TestCase):
             self.assertRegex(logs[0], r'" ms"', f"call {i + 1}: its first Log has no latency: {logs[0]}")
 
 
+class ClaudeRateLimitWiringTest(unittest.TestCase):
+    """Robot 2026-10-01: the key hit 429s and each was retried 0.6 s later. One back-off
+    clock (ClaudeApi.Backoff, host-tested in test_claude_api) gates every Claude request
+    the adapter makes; the brain's side runs in the brain harness."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.a = code_only(src("ClaudeCuriosity.java"))
+
+    def body(self, signature):
+        m = re.search(signature + r"\s*\{(.*?)\n    \}", self.a, re.S)
+        self.assertIsNotNone(m, signature)
+        return m.group(1)
+
+    def test_one_clock_and_every_request_goes_through_the_gate(self):
+        self.assertEqual(self.a.count("new ClaudeApi.Backoff()"), 1)
+        self.assertEqual(self.a.count("new ClaudeApi("), 1)
+        self.assertRegex(self.a, r"private final ClaudeApi api = new ClaudeApi\(")
+        self.assertRegex(self.a, r"private final Gated claude = new Gated\(\)")
+        self.assertEqual(self.a.count("api.messages("), 1)
+        self.assertEqual(self.a.count("api.conversation("), 1)
+        gated = re.search(r"private final class Gated \{(.*?)\n    \}", self.a, re.S)
+        self.assertIsNotNone(gated)
+        for call in ("api.messages(", "api.conversation("):
+            i = gated.group(1).index(call)
+            before = gated.group(1)[max(0, i - 300):i]
+            self.assertIn("if (held())", before, call)
+            self.assertIn("return ClaudeApi.MessageResult.paused();", before, call)
+            self.assertIn("recorded(" + call, gated.group(1), call)
+
+    def test_the_pause_closes_can_ask_and_is_what_claude_paused_ms_reports(self):
+        self.assertIn("backoff.remainingMs(", self.body(r"public boolean canAsk\(\)"))
+        self.assertIn("return backoff.remainingMs(", self.body(r"public long claudePausedMs\(\)"))
+        self.assertIn("backoff.remainingMs(", self.body(r"private boolean held\(\)"))
+
+    def test_every_result_is_recorded_and_a_new_pause_is_logged_once(self):
+        rec = self.body(r"private ClaudeApi\.MessageResult recorded\(ClaudeApi\.MessageResult r\)")
+        self.assertIn("backoff.record(r,", rec)
+        self.assertRegex(rec, r"if \(pause > 0\)\s*\{\s*Log\.w\(")
+        self.assertIn('"Claude rate-limited"', rec)
+        self.assertIn('" (HTTP "', rec)
+        self.assertIn('"): pausing Claude requests for "', rec)
+
+    def test_a_rate_limited_or_paused_turn_is_unreachable_so_the_conversation_can_wait(self):
+        turn_of = self.body(r"private static Turn turnOf\(ClaudeApi\.MessageResult r\)")
+        m = re.search(r"case OVERLOADED:\s*case RATE_LIMITED:.*?return Turn\.unreachable\(\);", turn_of, re.S)
+        self.assertIsNotNone(m)
+
+
 class FaceCropStoresOnlyFacesTest(unittest.TestCase):
     """Owner report: a stored face showed the wall. The top quarter of a loose or
     small person box stood in whenever FaceDetector found nothing, and was stored."""

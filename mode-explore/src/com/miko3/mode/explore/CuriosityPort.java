@@ -19,8 +19,18 @@ import java.util.List;
  */
 interface CuriosityPort extends AnswerParser.Names {
 
-    /** False when Claude isn't set up or reachable at all: the stop runs as it did before U4. */
+    /**
+     * False when Claude isn't set up or reachable at all, or while its requests are
+     * paused after a rate limit (claudePausedMs() above 0): the stop runs as it did before U4.
+     */
     boolean canAsk();
+
+    /**
+     * Robot 2026-10-01: how long Claude requests stay paused after a 429 or 529 (its
+     * retry-after, else 30 s doubling to 5 min), or 0 when they may go. No request of
+     * any kind is sent meanwhile; a conversation turn waits out a short one.
+     */
+    long claudePausedMs();
 
     // ---- the look request (KTD2) ----
 
@@ -327,6 +337,10 @@ interface CuriosityPort extends AnswerParser.Names {
     CuriosityPort NONE = new CuriosityPort() {
         public boolean canAsk() {
             return false;
+        }
+
+        public long claudePausedMs() {
+            return 0;
         }
 
         public void ask(LookRequest request, long timeoutMs) {

@@ -37,6 +37,11 @@ public final class ClaudeApiHarness {
             return this;
         }
 
+        FakeTransport reply(int status, String body, String retryAfter) {
+            outcomes.add(new ClaudeApi.Response(status, body, retryAfter));
+            return this;
+        }
+
         FakeTransport fail(IOException e) {
             outcomes.add(e);
             return this;
@@ -91,6 +96,7 @@ public final class ClaudeApiHarness {
         secrecy();
         messages();
         conversation();
+        rateLimits();
     }
 
     private static void normalization() {
@@ -733,5 +739,87 @@ public final class ClaudeApiHarness {
                 !shown.contains("long weekend") && !shown.contains("PREFIX") && !shown.contains("Hi Sam")
                         && !shown.contains(KEY) && !shown.contains("something else"),
                 shown);
+    }
+
+    // ---- rate limits (robot 2026-10-01: a 429 retried 0.6 s later) ----
+
+    private static ClaudeApi.MessageResult ask(int status, String body, String retryAfter) {
+        return new ClaudeApi(new FakeTransport().reply(status, body, retryAfter))
+                .messages(ACCESS, null, Collections.singletonList(ClaudeApi.textBlock("hi")), null, 5000);
+    }
+
+    private static void rateLimits() {
+        // retry-after (seconds) reaches both result kinds; absent or unreadable is -1.
+        ClaudeApi.MessageResult m20 = ask(429, error("rate_limit_error", "slow"), "20");
+        ClaudeApi.Result r20 = new ClaudeApi(new FakeTransport().reply(429, error("rate_limit_error", "slow"), " 20 "))
+                .testConnection(BASE, KEY, MODEL);
+        check("retry_after_seconds_reaches_both_results",
+                m20.reason == ClaudeApi.Reason.RATE_LIMITED && m20.retryAfterMs == 20000 && r20.retryAfterMs == 20000,
+                m20.retryAfterMs + " " + r20.retryAfterMs);
+        ClaudeApi.MessageResult none = ask(429, error("rate_limit_error", "slow"), null);
+        ClaudeApi.MessageResult date = ask(529, error("overloaded_error", "busy"), "Wed, 21 Oct 2026 07:28:00 GMT");
+        ClaudeApi.MessageResult neg = ask(429, "", "-5");
+        ClaudeApi.MessageResult ok = ask(200, reply("{\"a\":1}"), "20");
+        check("retry_after_missing_or_unreadable_is_minus_one",
+                none.retryAfterMs == -1 && date.retryAfterMs == -1 && neg.retryAfterMs == -1 && ok.retryAfterMs == -1
+                        && date.reason == ClaudeApi.Reason.OVERLOADED,
+                none.retryAfterMs + " " + date.retryAfterMs + " " + neg.retryAfterMs + " " + ok.retryAfterMs);
+        // The client itself never retries a 429 or a 529: one request each.
+        FakeTransport t429 = new FakeTransport().reply(429, error("rate_limit_error", "slow"), "1");
+        new ClaudeApi(t429).conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000);
+        FakeTransport t529 = new FakeTransport().reply(529, error("overloaded_error", "busy"));
+        new ClaudeApi(t529).messages(ACCESS, null, Collections.singletonList(ClaudeApi.textBlock("hi")), schema(), 5000);
+        check("rate_limited_and_overloaded_are_never_retried_by_the_client",
+                t429.requests.size() == 1 && t529.requests.size() == 1,
+                t429.requests.size() + " " + t529.requests.size());
+
+        // The back-off clock: retry-after when given.
+        ClaudeApi.Backoff b = new ClaudeApi.Backoff();
+        long started = b.record(m20, 1000);
+        check("backoff_honours_retry_after",
+                started == 20000 && b.remainingMs(1000) == 20000 && b.remainingMs(20999) == 1
+                        && b.remainingMs(21000) == 0 && b.remainingMs(50000) == 0,
+                started + " " + b.remainingMs(20999) + " " + b.remainingMs(21000));
+        // Without it: 30 s, doubling to a 5 min cap, and back to 30 s after a success.
+        ClaudeApi.Backoff e = new ClaudeApi.Backoff();
+        long now = 0;
+        List<Long> got = new ArrayList<Long>();
+        for (int i = 0; i < 6; i++) {
+            long p = e.record(none, now);
+            got.add(p);
+            now += p;
+        }
+        long afterOk = e.record(ok, now);
+        long again = e.record(none, now);
+        check("backoff_without_retry_after_doubles_to_a_5_min_cap_and_resets_after_a_success",
+                got.equals(Arrays.asList(30000L, 60000L, 120000L, 240000L, 300000L, 300000L))
+                        && afterOk == 0 && again == 30000,
+                got + " afterOk=" + afterOk + " again=" + again);
+        // A 529 pauses too; other failures don't.
+        ClaudeApi.Backoff o = new ClaudeApi.Backoff();
+        long p529 = o.record(date, 0);
+        ClaudeApi.Backoff x = new ClaudeApi.Backoff();
+        long p500 = x.record(ask(500, error("api_error", "boom"), "20"), 0);
+        long pTimeout = x.record(new ClaudeApi(new FakeTransport().fail(new SocketTimeoutException("read")))
+                .messages(ACCESS, null, Collections.singletonList(ClaudeApi.textBlock("hi")), null, 5000), 0);
+        check("backoff_pauses_on_529_but_not_on_other_failures",
+                p529 == 30000 && o.remainingMs(0) == 30000 && p500 == 0 && pTimeout == 0 && x.remainingMs(0) == 0,
+                p529 + " " + p500 + " " + pTimeout);
+        // A second 429 inside a running pause (a request already in flight) starts nothing new and doesn't double.
+        ClaudeApi.Backoff d = new ClaudeApi.Backoff();
+        d.record(none, 0);
+        long inside = d.record(none, 5000);
+        long left = d.remainingMs(5000);
+        long next = d.record(none, 30000);
+        check("backoff_a_429_inside_a_pause_starts_no_new_pause",
+                inside == 0 && left == 25000 && next == 60000,
+                inside + " " + left + " next=" + next);
+        // The stand-in result for a request the pause kept from being sent: rate limited, no status, not a new pause.
+        ClaudeApi.MessageResult held = ClaudeApi.MessageResult.paused();
+        ClaudeApi.Backoff q = new ClaudeApi.Backoff();
+        check("a_paused_result_is_rate_limited_without_a_status_and_starts_no_pause",
+                !held.ok() && held.reason == ClaudeApi.Reason.RATE_LIMITED && held.httpStatus == 0
+                        && q.record(held, 0) == 0 && q.remainingMs(0) == 0,
+                held.describe());
     }
 }

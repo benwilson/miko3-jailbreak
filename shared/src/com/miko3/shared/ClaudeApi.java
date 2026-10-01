@@ -81,19 +81,26 @@ public final class ClaudeApi {
         public final int httpStatus;
         /** Model ids in the endpoint's order; empty unless a listing succeeded. */
         public final List<String> models;
+        /** A failure's retry-after header in ms, or -1 when it had none (or one that isn't whole seconds). */
+        public final long retryAfterMs;
 
-        private Result(Reason reason, int httpStatus, List<String> models) {
+        private Result(Reason reason, int httpStatus, List<String> models, long retryAfterMs) {
             this.reason = reason;
             this.httpStatus = httpStatus;
             this.models = Collections.unmodifiableList(models);
+            this.retryAfterMs = retryAfterMs;
         }
 
         static Result success(List<String> models) {
-            return new Result(null, 0, models);
+            return new Result(null, 0, models, -1);
         }
 
         static Result failure(Reason reason, int httpStatus) {
-            return new Result(reason, httpStatus, new ArrayList<String>());
+            return failure(reason, httpStatus, -1);
+        }
+
+        static Result failure(Reason reason, int httpStatus, long retryAfterMs) {
+            return new Result(reason, httpStatus, new ArrayList<String>(), retryAfterMs);
         }
 
         public boolean ok() {
@@ -147,10 +154,17 @@ public final class ClaudeApi {
         public final int status;
         /** The body as text, from the error stream for a failure; never null. */
         public final String body;
+        /** The raw retry-after header, or null when there was none. */
+        public final String retryAfter;
 
         public Response(int status, String body) {
+            this(status, body, null);
+        }
+
+        public Response(int status, String body, String retryAfter) {
             this.status = status;
             this.body = body == null ? "" : body;
+            this.retryAfter = retryAfter;
         }
     }
 
@@ -161,15 +175,30 @@ public final class ClaudeApi {
         public final int httpStatus;
         /** The parsed reply; empty unless ok(). */
         public final Map<String, Object> json;
+        /** A failure's retry-after header in ms, or -1 when it had none (or one that isn't whole seconds). */
+        public final long retryAfterMs;
 
-        private MessageResult(Reason reason, int httpStatus, Map<String, Object> json) {
+        private MessageResult(Reason reason, int httpStatus, Map<String, Object> json, long retryAfterMs) {
             this.reason = reason;
             this.httpStatus = httpStatus;
             this.json = Collections.unmodifiableMap(json);
+            this.retryAfterMs = retryAfterMs;
         }
 
         static MessageResult failure(Reason reason, int httpStatus) {
-            return new MessageResult(reason, httpStatus, new LinkedHashMap<String, Object>());
+            return failure(reason, httpStatus, -1);
+        }
+
+        static MessageResult failure(Reason reason, int httpStatus, long retryAfterMs) {
+            return new MessageResult(reason, httpStatus, new LinkedHashMap<String, Object>(), retryAfterMs);
+        }
+
+        /**
+         * The stand-in for a request a running Backoff kept from being sent: RATE_LIMITED
+         * with no HTTP status, so it reads as a rate limit and never starts a pause of its own.
+         */
+        public static MessageResult paused() {
+            return failure(Reason.RATE_LIMITED, 0);
         }
 
         public boolean ok() {
@@ -188,6 +217,73 @@ public final class ClaudeApi {
         public String toString() {
             return describe();
         }
+    }
+
+    /**
+     * One back-off clock for rate limits (robot 2026-10-01: a 429 retried 0.6 s later made
+     * it worse). A 429 or 529 (RATE_LIMITED or OVERLOADED with a status) pauses requests for
+     * its retry-after, or without one for FIRST_MS, doubling on each header-less pause up to
+     * CAP_MS; a success sets the doubling back to FIRST_MS. A rate limit that lands inside a
+     * running pause (a request already in flight) starts nothing new. Thread-safe; the caller
+     * owns the clock and decides what a pause holds back.
+     */
+    public static final class Backoff {
+        public static final long FIRST_MS = 30000;
+        public static final long CAP_MS = 300000;
+        /** A retry-after above this is taken as this: an hour is already "not today". */
+        private static final long RETRY_AFTER_CAP_MS = 3600000;
+
+        private long until = Long.MIN_VALUE;
+        private long next = FIRST_MS;
+
+        /** Records one result at nowMs; returns the pause it started in ms, or 0 when it started none. */
+        public synchronized long record(MessageResult r, long nowMs) {
+            return record(r.ok(), r.reason, r.httpStatus, r.retryAfterMs, nowMs);
+        }
+
+        /** As record(MessageResult), for a listing or connection test's Result. */
+        public synchronized long record(Result r, long nowMs) {
+            return record(r.ok(), r.reason, r.httpStatus, r.retryAfterMs, nowMs);
+        }
+
+        private long record(boolean ok, Reason reason, int status, long retryAfterMs, long nowMs) {
+            if (ok) {
+                next = FIRST_MS;
+                return 0;
+            }
+            if (status <= 0 || (reason != Reason.RATE_LIMITED && reason != Reason.OVERLOADED)) {
+                return 0;
+            }
+            if (nowMs < until) {
+                return 0;
+            }
+            long pause;
+            if (retryAfterMs >= 0) {
+                pause = Math.min(retryAfterMs, RETRY_AFTER_CAP_MS);
+            } else {
+                pause = next;
+                next = Math.min(CAP_MS, next * 2);
+            }
+            until = nowMs + pause;
+            return pause;
+        }
+
+        /** How much of the pause is left at nowMs; 0 when requests may go. */
+        public synchronized long remainingMs(long nowMs) {
+            return nowMs < until ? until - nowMs : 0;
+        }
+    }
+
+    /** A retry-after header as ms: whole (or decimal) seconds, 0 or more; -1 for none or an HTTP date. */
+    static long retryAfterMs(String header) {
+        if (header == null) {
+            return -1;
+        }
+        String h = header.trim();
+        if (h.length() > 12 || !h.matches("[0-9]+(\\.[0-9]+)?")) {
+            return -1;
+        }
+        return (long) Math.ceil(Double.parseDouble(h) * 1000);
     }
 
     private final Transport transport;
@@ -306,7 +402,7 @@ public final class ClaudeApi {
                 return Result.failure(forException(e), 0);
             }
             if (resp.status < 200 || resp.status > 299) {
-                return Result.failure(forStatus(resp, true), resp.status);
+                return Result.failure(forStatus(resp, true), resp.status, retryAfterMs(resp.retryAfter));
             }
             Map<?, ?> body = parseObject(resp.body);
             if (body == null || !(body.get("data") instanceof List)) {
@@ -364,7 +460,7 @@ public final class ClaudeApi {
         if (resp.status >= 200 && resp.status <= 299) {
             return Result.success(new ArrayList<String>());
         }
-        return Result.failure(forStatus(resp, false), resp.status);
+        return Result.failure(forStatus(resp, false), resp.status, retryAfterMs(resp.retryAfter));
     }
 
     /**
@@ -481,7 +577,7 @@ public final class ClaudeApi {
     /** The last response of messages() or conversation(): a non-2xx maps to its reason, a 2xx is read. */
     private static MessageResult reply(Response resp) {
         if (resp.status < 200 || resp.status > 299) {
-            return MessageResult.failure(forStatus(resp, false), resp.status);
+            return MessageResult.failure(forStatus(resp, false), resp.status, retryAfterMs(resp.retryAfter));
         }
         return readReply(resp);
     }
@@ -612,7 +708,7 @@ public final class ClaudeApi {
         for (Map.Entry<?, ?> e : ((Map<?, ?>) parsed).entrySet()) {
             json.put(String.valueOf(e.getKey()), e.getValue());
         }
-        return new MessageResult(null, 0, json);
+        return new MessageResult(null, 0, json, -1);
     }
 
     /** NOT_SET_UP, BAD_BASE_URL or BAD_KEY_FORMAT before any request is made; null if fine.

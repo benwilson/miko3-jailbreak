@@ -806,6 +806,8 @@ final class ExploreBrain {
     // ---- asking Claude (explore on Claude U4) ----
     /** This stop asks Claude: decided as the scan starts. */
     private boolean claudeStop;
+    /** When each Claude look request of the last minute went out (claudeLooksPerMinute), oldest first. */
+    private final ArrayDeque<Long> claudeLookTimes = new ArrayDeque<Long>();
     /** The scan's looks in order, and the first detector sighting among them (the fallback). */
     private final List<Look> scanned = new ArrayList<Look>();
     /** The heading each scan look was taken at (NaN: not measured), for ORIENT (explore nav plan U2, R4). */
@@ -2497,6 +2499,12 @@ final class ExploreBrain {
         roamingPick = false;
         cuePick = false;
         claudeStop = port.canAsk();
+        if (!claudeStop && port.claudePausedMs() > 0) {
+            note("Claude is paused for " + port.claudePausedMs() + " ms: a detector-only stop");
+        } else if (claudeStop && !lookBudgetLeft(now)) {
+            claudeStop = false;
+            note("Claude look budget spent (" + tuning.claudeLooksPerMinute + " a minute): a detector-only stop");
+        }
         heldPick = null;
         scanned.clear();
         scanHeadings.clear();
@@ -3151,6 +3159,7 @@ final class ExploreBrain {
     }
 
     private void startAsk(long now) {
+        spendLook(now);
         askTries++;
         asking = true;
         askDeadline = now + tuning.askTimeoutMs;
@@ -3192,12 +3201,38 @@ final class ExploreBrain {
                 && (usable(a.line) || (!a.kind.isLiving() && seenLoosely(a.box.label)));
     }
 
+    /**
+     * Another try, unless the tries are spent or (robot 2026-10-01) Claude has since paused
+     * after a 429 or 529, or the look budget is spent: never a request straight into a rate limit.
+     */
     private void retryOrFallback(long now) {
-        if (askTries < tuning.askAttempts) {
-            startAsk(now);
-        } else {
+        if (askTries >= tuning.askAttempts) {
             fallback(now);
+        } else if (!port.canAsk()) {
+            note(port.claudePausedMs() > 0 ? "Claude is paused: no second try" : "Claude unreachable: no second try");
+            fallback(now);
+        } else if (!lookBudgetLeft(now)) {
+            note("Claude look budget spent: no second try");
+            fallback(now);
+        } else {
+            startAsk(now);
         }
+    }
+
+    /** Robot 2026-10-01: another Claude look request fits in the last minute's claudeLooksPerMinute (0: no cap). */
+    private boolean lookBudgetLeft(long now) {
+        if (tuning.claudeLooksPerMinute <= 0) {
+            return true;
+        }
+        while (!claudeLookTimes.isEmpty() && now - claudeLookTimes.peekFirst() >= 60000) {
+            claudeLookTimes.pollFirst();
+        }
+        return claudeLookTimes.size() < tuning.claudeLooksPerMinute;
+    }
+
+    /** One Claude look request goes out now: it counts against claudeLooksPerMinute. */
+    private void spendLook(long now) {
+        claudeLookTimes.addLast(now);
     }
 
     /** Claude picked something: face it, approaching only if the detector boxed it too (KTD7). */
@@ -4775,8 +4810,9 @@ final class ExploreBrain {
                 break;
             case SECOND_ASK:
                 state = State.WAY_OUT;
-                if (!port.canAsk() || !cameraWanted(now)) {
-                    note("no second way-out ask: " + (port.canAsk() ? "no camera" : "Claude unreachable"));
+                if (!port.canAsk() || !cameraWanted(now) || !lookBudgetLeft(now)) {
+                    note("no second way-out ask: " + (!port.canAsk() ? "Claude unreachable or paused"
+                            : !cameraWanted(now) ? "no camera" : "Claude look budget spent"));
                     planner.next(now);
                     escapePhase(now);
                     return;
@@ -5419,14 +5455,15 @@ final class ExploreBrain {
     /** Claude's way out from escAsked (the circle's frames, or the second ask's one), within the step's budget. */
     private void askWayOut(long now) {
         boolean second = planner.phase() == EscapePlanner.Phase.SECOND_ASK;
-        if (escAsked.isEmpty() || !port.canAsk()) {
-            note("no way-out ask (" + escAsked.size() + " frames, Claude " + (port.canAsk() ? "set up" : "unreachable")
-                    + ")");
+        if (escAsked.isEmpty() || !port.canAsk() || !lookBudgetLeft(now)) {
+            note("no way-out ask (" + escAsked.size() + " frames, Claude " + (!port.canAsk() ? "unreachable or paused"
+                    : lookBudgetLeft(now) ? "set up" : "look budget spent") + ")");
             wayOutFailed(now);
             return;
         }
         show(EyeState.THINKING, null);
         note("asking Claude the way out (" + escAsked.size() + " frames" + (second ? ", second ask" : "") + ")");
+        spendLook(now);
         port.wayOut(new CuriosityPort.WayOutRequest(new ArrayList<CuriosityPort.Frame>(escAsked), second),
                 Math.max(1, planner.stepUntil() - now));
         wayOutAsking = true;
@@ -5737,7 +5774,7 @@ final class ExploreBrain {
      */
     private void askDoorway(long now) {
         if (!(state == State.PAUSE || state == State.HOP) || lookForLeg || escape || !cameraOpen
-                || !compass.usable(now) || !port.canAsk()) {
+                || !compass.usable(now) || !port.canAsk() || !lookBudgetLeft(now)) {
             return;
         }
         Look look = roamLook(now);
@@ -5748,6 +5785,7 @@ final class ExploreBrain {
         doorwayAskAt = now;
         doorwayAsking = true;
         note("asking Claude for an open doorway (facing " + Math.round(doorwayAskFacing) + " deg)");
+        spendLook(now);
         port.doorway(look.jpeg, tuning.doorwayAskTimeoutMs);
     }
 
@@ -5938,13 +5976,18 @@ final class ExploreBrain {
             seekFrames.add(v);
         }
         if (!port.canAsk() || frames.isEmpty()) {
-            seekFallback(now, "no Claude");
+            seekFallback(now, port.claudePausedMs() > 0 ? "Claude paused" : "no Claude");
+            return;
+        }
+        if (!lookBudgetLeft(now)) {
+            seekFallback(now, "Claude look budget spent");
             return;
         }
         seekAsking = true;
         seekAskAt = now;
         show(EyeState.THINKING, null);
         note("seeking: asking Claude where to go (" + frames.size() + " frames)");
+        spendLook(now);
         port.seek(new CuriosityPort.SeekRequest(frames), tuning.seekAskTimeoutMs);
     }
 

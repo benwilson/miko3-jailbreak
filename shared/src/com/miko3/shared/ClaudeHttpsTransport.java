@@ -60,7 +60,7 @@ public final class ClaudeHttpsTransport implements ClaudeApi.Transport {
             }
             int status = conn.getResponseCode();
             InputStream in = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            return new ClaudeApi.Response(status, readBody(in));
+            return new ClaudeApi.Response(status, readBody(in), conn.getHeaderField("retry-after"));
         } catch (RuntimeException e) {
             // HttpURLConnection throws unchecked exceptions for some bad input and
             // broken connections; ClaudeApi only maps IOExceptions. Message dropped:

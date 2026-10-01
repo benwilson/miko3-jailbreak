@@ -70,6 +70,9 @@ class HttpsTransportWiringTest(unittest.TestCase):
     def test_only_https_connections(self):
         self.assertIn("HttpsURLConnection", self.src)
 
+    def test_retry_after_header_is_passed_on(self):
+        self.assertRegex(self.src, r"new ClaudeApi\.Response\(\s*status\s*,\s*readBody\(in\)\s*,\s*conn\.getHeaderField\(\s*\"retry-after\"\s*\)\s*\)")
+
     def test_no_logging(self):
         # R14: nothing about a request (and so nothing near the key) reaches logcat.
         self.assertNotIn("Log.", self.src)
@@ -159,6 +162,14 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "conversation_without_effort_sends_only_the_format_and_the_retry_budget",
         "conversation_timeout_overload_rate_limit_and_refusal_map_to_their_reasons",
         "conversation_error_output_carries_no_transcript_prefix_or_key",
+        "retry_after_seconds_reaches_both_results",
+        "retry_after_missing_or_unreadable_is_minus_one",
+        "rate_limited_and_overloaded_are_never_retried_by_the_client",
+        "backoff_honours_retry_after",
+        "backoff_without_retry_after_doubles_to_a_5_min_cap_and_resets_after_a_success",
+        "backoff_pauses_on_529_but_not_on_other_failures",
+        "backoff_a_429_inside_a_pause_starts_no_new_pause",
+        "a_paused_result_is_rate_limited_without_a_status_and_starts_no_pause",
     )
 
     @classmethod

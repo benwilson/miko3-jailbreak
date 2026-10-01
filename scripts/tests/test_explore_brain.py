@@ -76,6 +76,10 @@ class ExploreBrainHarnessTest(unittest.TestCase):
     """One harness run, one assertion per scenario."""
 
     SCENARIOS = (
+        "claude_rate_limited_ask_is_not_retried_and_stops_skip_claude_until_the_pause_ends",
+        "claude_look_budget_caps_asks_per_minute_and_the_excess_stops_use_the_detector",
+        "chat_turn_in_a_short_claude_pause_says_one_sec_waits_and_carries_on",
+        "chat_turn_in_a_long_claude_pause_signs_off_without_another_request",
         # HazardClassifier (KTD3, KTD9)
         "classifier_uncalibrated_is_unavailable",
         "classifier_incomplete_calibration_is_unavailable",
