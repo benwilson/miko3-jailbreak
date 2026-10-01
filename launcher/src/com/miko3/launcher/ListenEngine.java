@@ -63,7 +63,9 @@ import java.util.concurrent.TimeUnit;
  * thread; listens are refused until then. The one recogniser decodes with
  * modified_beam_search, the hotwords file, bpe modelling with its vocabulary,
  * 2 threads and 2 active paths, and ends an utterance 0.8 s after its last
- * word or after about 2 s of nothing decoded.
+ * word or after about 2 s of nothing decoded. EarsTuning's properties (all off
+ * by default) switch the decoding, paths and threads, and the ears' wake gate,
+ * for the CPU measurements in scripts/qa-ears-cpu.py.
  *
  * The one-shot listen runs on the "listen" thread as before. The ears
  * session runs its capture on its own "ears" thread, samples the direction
@@ -81,9 +83,6 @@ final class ListenEngine implements ListenSession.Ears {
     private static final String WAKE_MODEL_ASSET = "miko_wakeword_model.tflite";
     /** How long a listen waits for the robot to finish speaking. */
     static final long IDLE_TIMEOUT_MS = 20000;
-    /** KTD2: threads and active paths for the one recogniser. */
-    private static final int THREADS = 2;
-    private static final int MAX_ACTIVE_PATHS = 2;
     private static final float HOTWORDS_SCORE = 2.0f;
     /** The wake-word thresholds voice mode measured (VoiceEngine). */
     private static final float HEY_THRESHOLD = 0.65f;
@@ -108,6 +107,8 @@ final class ListenEngine implements ListenSession.Ears {
     private final ListenSession session;
     private final EarsSession ears;
     private final SpeechTuning tuning;
+    /** KTD2's threads, active paths and decoding unless a property switches them. */
+    private final EarsTuning earsTuning;
     private volatile OnlineRecognizer recognizer;
     private volatile Vad vad;
     private volatile WakeWord wakeWord;
@@ -139,12 +140,14 @@ final class ListenEngine implements ListenSession.Ears {
                 return speech.awaitIdle(timeoutMs);
             }
         }, this, IDLE_TIMEOUT_MS);
-        this.tuning = SpeechTuning.from(new SpeechTuning.Props() {
+        SpeechTuning.Props props = new SpeechTuning.Props() {
             @Override
             public String get(String key) {
                 return SpeechEngine.systemProperty(key);
             }
-        });
+        };
+        this.tuning = SpeechTuning.from(props);
+        this.earsTuning = EarsTuning.from(props);
         configureDirection();
         // KTD11: the Settings page's "answers when spoken to" switch, read through
         // the launcher's settings (its one parser of the stored value) at classify time.
@@ -165,7 +168,7 @@ final class ListenEngine implements ListenSession.Ears {
                     public void log(String note) {
                         Log.i(TAG, "ears: " + note);
                     }
-                });
+                }, earsTuning.gateWake);
         // KTD1: the deaf window follows the speech queue's line start and idle.
         speech.setSpeaking(new SpeechQueue.Speaking() {
             @Override
@@ -290,7 +293,7 @@ final class ListenEngine implements ListenSession.Ears {
             File dir = installAssets(context, MODEL_ASSETS);
             hotwordsPath = copyAsset(context, HOTWORDS_ASSET).getAbsolutePath();
             long copied = SystemClock.elapsedRealtime();
-            OnlineRecognizer r = new OnlineRecognizer(config(dir, hotwordsPath));
+            OnlineRecognizer r = new OnlineRecognizer(config(dir, hotwordsPath, earsTuning));
             long loaded = SystemClock.elapsedRealtime();
             // One short decode first, so the first real listen doesn't pay ONNX
             // Runtime's first-run allocations while someone is answering.
@@ -305,7 +308,7 @@ final class ListenEngine implements ListenSession.Ears {
             recognizer = r;
             Log.i(TAG, "recognizer ready in " + (SystemClock.elapsedRealtime() - t0) + " ms (files "
                     + (copied - t0) + " ms, load " + (loaded - copied) + " ms, warm-up and VAD "
-                    + (SystemClock.elapsedRealtime() - loaded) + " ms)");
+                    + (SystemClock.elapsedRealtime() - loaded) + " ms; " + earsTuning + ")");
         } catch (Throwable t) {
             Log.e(TAG, "recognizer failed to load; the robot cannot listen", t);
         }
@@ -334,8 +337,9 @@ final class ListenEngine implements ListenSession.Ears {
         }
     }
 
-    /** KTD2: the one configuration that serves roaming and the conversation. */
-    private static OnlineRecognizerConfig config(File dir, String hotwords) {
+    /** KTD2: the one configuration that serves roaming and the conversation; t's
+     * switches, unset, leave it exactly as KTD2 chose. */
+    private static OnlineRecognizerConfig config(File dir, String hotwords, EarsTuning t) {
         OnlineTransducerModelConfig transducer = OnlineTransducerModelConfig.builder()
                 .setEncoder(new File(dir, "encoder.onnx").getAbsolutePath())
                 .setDecoder(new File(dir, "decoder.onnx").getAbsolutePath())
@@ -346,7 +350,7 @@ final class ListenEngine implements ListenSession.Ears {
                 .setTokens(new File(dir, "tokens.txt").getAbsolutePath())
                 .setModelingUnit("bpe")
                 .setBpeVocab(new File(dir, BPE_VOCAB).getAbsolutePath())
-                .setNumThreads(THREADS)
+                .setNumThreads(t.threads)
                 .setDebug(false)
                 .setProvider("cpu")
                 .build();
@@ -362,17 +366,19 @@ final class ListenEngine implements ListenSession.Ears {
                 .setRule3(EndpointRule.builder().setMustContainNonSilence(false)
                         .setMinTrailingSilence(0f).setMinUtteranceLength(20f).build())
                 .build();
-        return OnlineRecognizerConfig.builder()
+        OnlineRecognizerConfig.Builder b = OnlineRecognizerConfig.builder()
                 .setFeatureConfig(FeatureConfig.builder().setSampleRate(ListenSession.SAMPLE_RATE)
                         .setFeatureDim(80).build())
                 .setOnlineModelConfig(model)
                 .setEndpointConfig(endpoint)
                 .setEnableEndpoint(true)
-                .setDecodingMethod("modified_beam_search")
-                .setMaxActivePaths(MAX_ACTIVE_PATHS)
-                .setHotwordsFile(hotwords)
-                .setHotwordsScore(HOTWORDS_SCORE)
-                .build();
+                .setDecodingMethod(t.decoding)
+                .setMaxActivePaths(t.paths);
+        // sherpa-onnx's config check refuses a hotwords file without modified_beam_search.
+        if (t.hotwords()) {
+            b.setHotwordsFile(hotwords).setHotwordsScore(HOTWORDS_SCORE);
+        }
+        return b.build();
     }
 
     private static VadModelConfig vadConfig(File dir) {

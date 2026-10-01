@@ -39,7 +39,17 @@ import java.util.List;
  * called so the mode makes no second call from it. The engine firing with the
  * gate closed still sends a bare wake cue at once, as before.
  *
- * Logs counters through Diag, never words.
+ * The wake gate (EarsTuning, off by default): while it is on and the
+ * classifier would ignore the words anyway (CueClassifier.wordsMatter: no
+ * conversation listen and the "answers when spoken to" switch off), the
+ * utterance's audio is held instead of decoded; the recogniser gets the held
+ * audio and then every chunk as soon as the wake engine fires in the utterance
+ * or a listen opens, so it hears what it would have heard. Shut, the
+ * recogniser's endpoint cannot end the utterance; the hangover does.
+ *
+ * Logs counters through Diag, never words, and the recogniser's cost: each
+ * utterance's decode milliseconds per 80 ms chunk fed, as p50 and p95 over the
+ * utterances since the last summary, with the worst single chunk.
  */
 final class EarsSession {
     static final int SAMPLE_RATE = ListenSession.SAMPLE_RATE;
@@ -58,12 +68,21 @@ final class EarsSession {
     /** Speech already present this soon after the deaf window closed lost its head. */
     static final long PARTIAL_HEAD_MS = 120;
     static final long SUMMARY_MS = 60000;
+    /** The wake gate holds at most this much of an utterance (the oldest goes first). */
+    static final int HELD_MAX_SAMPLES = SAMPLE_RATE * 10;
+    /** Utterance decode costs kept for one summary's percentiles. */
+    static final int DECODE_SAMPLES_MAX = 256;
 
     static final String REFUSE_HELD = "ears held by another app";
     static final String REFUSE_EARS_OPEN = "ears session open";
 
     interface Clock {
         long nowMs();
+
+        /** For the decode timing only. */
+        default long nanoTime() {
+            return System.nanoTime();
+        }
     }
 
     /** An open microphone handing out 16 kHz mono PCM. */
@@ -183,6 +202,7 @@ final class EarsSession {
     private final long deafTailMs;
     private final Diag diag;
     private final LeaseKeeper keeper;
+    private final boolean gateWake;
 
     // Guarded by this.
     private Client client;
@@ -209,6 +229,18 @@ final class EarsSession {
     private Sampling sampling;
     /** Every angle drained during the utterance so far: the early cue's median takes some, the end all. */
     private final List<Float> angles = new ArrayList<Float>();
+    /** False while the wake gate holds this utterance's audio instead of decoding it. */
+    private boolean recognising;
+    private float[] held = new float[0];
+    private int heldLen;
+    private long uttDecodeNs;
+    private long uttFed;
+
+    // Decode cost per utterance (ms per chunk) and the worst chunk, since the last summary.
+    private final Object statsLock = new Object();
+    private final double[] decodeMs = new double[DECODE_SAMPLES_MAX];
+    private int decodeCount;
+    private double decodeMaxMs;
 
     // Counters, for Diag.
     private long chunks;
@@ -220,9 +252,17 @@ final class EarsSession {
     private long wakes;
     private long strong;
     private long weak;
+    private long fed;
+    private long gated;
 
     EarsSession(Clock clock, Capture capture, Spotter spotter, Gate gate, Recognizer recognizer, Direction direction,
                 CueClassifier classifier, long deafTailMs, Diag diag) {
+        this(clock, capture, spotter, gate, recognizer, direction, classifier, deafTailMs, diag, false);
+    }
+
+    /** gateWake: EarsTuning's wake gate (see the class comment); false is the plain session. */
+    EarsSession(Clock clock, Capture capture, Spotter spotter, Gate gate, Recognizer recognizer, Direction direction,
+                CueClassifier classifier, long deafTailMs, Diag diag, boolean gateWake) {
         this.clock = clock;
         this.capture = capture;
         this.spotter = spotter;
@@ -232,6 +272,7 @@ final class EarsSession {
         this.classifier = classifier;
         this.deafTailMs = deafTailMs;
         this.diag = diag;
+        this.gateWake = gateWake;
         this.keeper = new LeaseKeeper(TTL_MS, new LeaseKeeper.Released() {
             @Override
             public void released(String holder, String reason) {
@@ -539,6 +580,10 @@ final class EarsSession {
                     speechStartMs = now;
                     partialHead = now - hearingSince < PARTIAL_HEAD_MS;
                     sampling = direction.start();
+                    recognising = !gateWake || wordsMatter();
+                    heldLen = 0;
+                    uttDecodeNs = 0;
+                    uttFed = 0;
                 }
                 lastSpeechMs = now;
             }
@@ -567,17 +612,90 @@ final class EarsSession {
                 }
             }
             if (inSpeech) {
-                recognizer.accept(samples, n);
-                if (recognizer.isEndpoint() || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
+                if (!recognising && (wake || wordsMatter())) {
+                    recognising = true;
+                    if (heldLen > 0) {
+                        decode(held, heldLen);
+                        heldLen = 0;
+                    }
+                }
+                if (recognising) {
+                    decode(samples, n);
+                } else {
+                    hold(samples, n);
+                }
+                boolean endpoint = recognising && recognizer.isEndpoint();
+                if (endpoint || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
                     endUtterance(now, false);
                 }
             }
         }
     }
 
+    /** Caller holds feedLock. Whether the classifier could use this utterance's words (the wake gate). */
+    private boolean wordsMatter() {
+        boolean listening;
+        synchronized (this) {
+            listening = listenUntil != 0;
+        }
+        return classifier.wordsMatter(listening);
+    }
+
+    /** Caller holds feedLock. Hands audio to the recogniser, timing it for the summary. */
+    private void decode(float[] buf, int n) {
+        long t0 = clock.nanoTime();
+        recognizer.accept(buf, n);
+        long dt = clock.nanoTime() - t0;
+        int chunksIn = Math.max(1, (n + CHUNK_SAMPLES - 1) / CHUNK_SAMPLES);
+        uttDecodeNs += dt;
+        uttFed += chunksIn;
+        fed += chunksIn;
+        double ms = dt / 1e6 / chunksIn; // a held utterance's catch-up counts per chunk
+        synchronized (statsLock) {
+            if (ms > decodeMaxMs) {
+                decodeMaxMs = ms;
+            }
+        }
+    }
+
+    /** Caller holds feedLock. The wake gate keeps the chunk for a later decode; past the cap the oldest goes. */
+    private void hold(float[] buf, int n) {
+        gated++;
+        if (held.length < HELD_MAX_SAMPLES) {
+            held = java.util.Arrays.copyOf(held, Math.min(HELD_MAX_SAMPLES, Math.max(heldLen + n, held.length * 2)));
+        }
+        int over = heldLen + n - held.length;
+        if (over > 0) {
+            System.arraycopy(held, over, held, 0, heldLen - over);
+            heldLen -= over;
+        }
+        System.arraycopy(buf, 0, held, heldLen, n);
+        heldLen += n;
+    }
+
+    /** Caller holds feedLock. Records the utterance's decode cost per chunk fed, if it was decoded. */
+    private void recordDecode() {
+        if (uttFed > 0) {
+            double perChunk = uttDecodeNs / 1e6 / uttFed;
+            synchronized (statsLock) {
+                if (decodeCount < decodeMs.length) {
+                    decodeMs[decodeCount++] = perChunk;
+                }
+            }
+        }
+        uttDecodeNs = 0;
+        uttFed = 0;
+        heldLen = 0;
+    }
+
     /** Caller holds feedLock. Closes the utterance in progress and delivers it if it earns a tier. */
     private void endUtterance(long now, boolean cutShort) {
-        String text = recognizer.text();
+        if (!recognising && heldLen > 0 && (wake || wordsMatter())) {
+            recognising = true; // a listen opened in this very chunk
+            decode(held, heldLen);
+        }
+        recordDecode();
+        String text = recognising ? recognizer.text() : "";
         text = text == null ? "" : text.trim();
         Float angle = latchAngle();
         if (sampling != null) {
@@ -631,6 +749,7 @@ final class EarsSession {
         inSpeech = false;
         wake = false;
         angles.clear();
+        recordDecode();
         recognizer.reset();
     }
 
@@ -667,6 +786,34 @@ final class EarsSession {
     private String summary() {
         return "chunks=" + chunks + " utterances=" + utterances + " delivered=" + delivered + " strong=" + strong
                 + " weak=" + weak + " partial=" + partials + " dropped=" + dropped + " resets=" + resets
-                + " wakes=" + wakes;
+                + " wakes=" + wakes + " " + decodeSummary() + " fed=" + fed + " gated=" + gated;
+    }
+
+    /** "decode_p50=… decode_p95=… decode_max=… decoded=N" (ms per 80 ms chunk) since the last summary, then cleared. */
+    private String decodeSummary() {
+        synchronized (statsLock) {
+            String out;
+            if (decodeCount == 0) {
+                out = "decode_p50=- decode_p95=- decode_max=- decoded=0";
+            } else {
+                double[] sorted = java.util.Arrays.copyOf(decodeMs, decodeCount);
+                java.util.Arrays.sort(sorted);
+                out = "decode_p50=" + ms(percentile(sorted, 50)) + " decode_p95=" + ms(percentile(sorted, 95))
+                        + " decode_max=" + ms(decodeMaxMs) + " decoded=" + decodeCount;
+            }
+            decodeCount = 0;
+            decodeMaxMs = 0;
+            return out;
+        }
+    }
+
+    /** Nearest-rank percentile of an ascending, non-empty array. */
+    static double percentile(double[] sorted, int p) {
+        int rank = (int) Math.ceil(p / 100.0 * sorted.length);
+        return sorted[Math.max(0, Math.min(sorted.length - 1, rank - 1))];
+    }
+
+    private static String ms(double v) {
+        return String.valueOf(Math.round(v * 10) / 10.0);
     }
 }

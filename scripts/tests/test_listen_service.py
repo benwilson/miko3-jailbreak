@@ -52,6 +52,7 @@ KEEPER = LAUNCHER / "LeaseKeeper.java"
 DRIVE_LEASE = LAUNCHER / "DriveLeaseService.java"
 QUEUE = LAUNCHER / "SpeechQueue.java"
 TUNING = LAUNCHER / "SpeechTuning.java"
+EARS_TUNING = LAUNCHER / "EarsTuning.java"
 EARS_INTERFACE = SHARED / "RobotEars.java"
 EARS_CLIENT = SHARED / "RobotEarsClient.java"
 HOTWORDS = REPO / "launcher" / "assets" / "hotwords.txt"
@@ -132,6 +133,15 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_shove_then_sorry_is_strong",
         "ears_listen_expires_at_its_cap",
         "ears_logs_counters_not_words",
+        # Ears CPU switches (2026-09-30): off by default, KTD2 unchanged.
+        "ears_tuning_unset_is_ktd2",
+        "ears_tuning_switches_and_clamps",
+        "ears_gate_off_decodes_every_speech_chunk",
+        "ears_gate_holds_audio_while_the_words_cannot_matter",
+        "ears_gate_feeds_the_held_utterance_when_the_engine_fires",
+        "ears_gate_stays_open_with_the_switch_on",
+        "ears_gate_opens_for_a_conversation_listen",
+        "ears_summary_reports_decode_ms_per_chunk",
         "keeper_acquire_renew_release",
         "keeper_ttl_expiry",
         "keeper_death_and_stale_death_ignored",
@@ -340,13 +350,35 @@ class EngineWiringTest(unittest.TestCase):
         """Meeting plan KTD2: modified_beam_search with the hotwords file at the
         asset root, bpe modelling unit with the vocabulary beside tokens.txt, 2
         threads, 2 active paths, endpoints 0.8 s after words and 2 s of nothing."""
-        for needle in ('"modified_beam_search"', "setMaxActivePaths(MAX_ACTIVE_PATHS)", "setHotwordsFile(",
+        for needle in ("setDecodingMethod(t.decoding)", "setMaxActivePaths(t.paths)", "setHotwordsFile(",
                        'setModelingUnit("bpe")', "setBpeVocab(", '"bpe.vocab"', '"hotwords.txt"',
-                       "setMinTrailingSilence(0.8f)", "setMinTrailingSilence(2.0f)", "setNumThreads(THREADS)"):
+                       "setMinTrailingSilence(0.8f)", "setMinTrailingSilence(2.0f)", "setNumThreads(t.threads)",
+                       "EarsTuning.from("):
             self.assertIn(needle, self.src)
-        self.assertRegex(self.src, r"\bTHREADS\s*=\s*2;")
-        self.assertRegex(self.src, r"MAX_ACTIVE_PATHS\s*=\s*2;")
+        # Ears CPU switches: unset, EarsTuning is exactly KTD2.
+        tuning = _read(EARS_TUNING)
+        self.assertRegex(tuning, r'BEAM\s*=\s*"modified_beam_search";')
+        self.assertRegex(tuning, r"DEFAULT_DECODING\s*=\s*BEAM;")
+        self.assertRegex(tuning, r"DEFAULT_THREADS\s*=\s*2;")
+        self.assertRegex(tuning, r"DEFAULT_PATHS\s*=\s*2;")
         self.assertEqual(self.src.count("new OnlineRecognizer("), 1, "one recogniser serves both listens")
+
+    def test_hotwords_only_with_beam_search(self):
+        """sherpa-onnx's config check refuses a hotwords file with greedy_search."""
+        body = _method_body(self.src, "config")
+        self.assertIsNotNone(body)
+        guard = body.find("if (t.hotwords())")
+        self.assertGreaterEqual(guard, 0, "the hotwords file is not guarded by the decoding")
+        self.assertGreater(body.find("setHotwordsFile("), guard)
+        self.assertIn("BEAM.equals(decoding)", _read(EARS_TUNING))
+
+    def test_ears_switch_properties_and_gate_wiring(self):
+        tuning = _read(EARS_TUNING)
+        for prop, name in (("DECODING_PROP", "decoding"), ("PATHS_PROP", "paths"), ("THREADS_PROP", "threads"),
+                           ("GATE_PROP", "gate")):
+            self.assertRegex(tuning, prop + r'\s*=\s*"persist\.miko3\.ears\.' + name + '"')
+        self.assertIn("earsTuning.gateWake)", self.src)
+        self.assertIn("earsTuning + \")\")", self.src, "the ready line names the switches for the QA script")
 
     def test_ears_feed_the_wake_word_engine_a_silero_gate_and_the_direction_sampler(self):
         for needle in ("new WakeWord(", "processChunk(", "SileroVadModelConfig", "new Vad(", "isSpeechDetected()",

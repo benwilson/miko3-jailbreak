@@ -252,10 +252,16 @@ public final class ListenServiceHarness {
 
     static final class FakeClock implements EarsSession.Clock {
         long now = 1000;
+        long nanos;
 
         @Override
         public long nowMs() {
             return now;
+        }
+
+        @Override
+        public long nanoTime() {
+            return nanos;
         }
     }
 
@@ -352,10 +358,19 @@ public final class ListenServiceHarness {
         boolean endpoint;
         int resets;
         int accepted;
+        /** Every sample handed over, held catch-up included. */
+        long samples;
+        /** When set, each 80 ms of audio "costs" decodeNsPerChunk on this clock. */
+        FakeClock clock;
+        long decodeNsPerChunk;
 
         @Override
         public void accept(float[] samples, int n) {
             accepted++;
+            this.samples += n;
+            if (clock != null) {
+                clock.nanos += decodeNsPerChunk * ((n + CHUNK - 1) / CHUNK);
+            }
         }
 
         @Override
@@ -504,6 +519,12 @@ public final class ListenServiceHarness {
 
         Rig() {
             session = new EarsSession(clock, capture, spotter, gate, rec, direction, new CueClassifier(sw), TAIL, diag);
+        }
+
+        /** With EarsTuning's wake gate on or off. */
+        Rig(boolean gateWake) {
+            session = new EarsSession(clock, capture, spotter, gate, rec, direction, new CueClassifier(sw), TAIL, diag,
+                    gateWake);
         }
 
         void open(boolean charger) {
@@ -1257,6 +1278,137 @@ public final class ListenServiceHarness {
                 boolean summary = r.diag.mention("utterances");
                 check(n, summary && !r.diag.mention("SARAH") && !r.diag.mention("HELLO") && !r.diag.mention("sarah"),
                         String.valueOf(r.diag.lines));
+            }
+        });
+
+        // ---- Ears CPU switches (2026-09-30): EarsTuning, the wake gate, the decode timing ----
+        scenario("ears_tuning_unset_is_ktd2", new Scenario() {
+            public void run(String n) {
+                final java.util.Map<String, String> p = new java.util.HashMap<String, String>();
+                SpeechTuning.Props props = new SpeechTuning.Props() {
+                    public String get(String key) {
+                        return p.get(key);
+                    }
+                };
+                EarsTuning d = EarsTuning.from(props);
+                p.put(EarsTuning.DECODING_PROP, "nonsense");
+                p.put(EarsTuning.PATHS_PROP, "x");
+                p.put(EarsTuning.THREADS_PROP, "");
+                p.put(EarsTuning.GATE_PROP, "maybe");
+                EarsTuning junk = EarsTuning.from(props);
+                String want = "decoding=modified_beam_search paths=2 threads=2 hotwords=on gate=off";
+                check(n, want.equals(d.toString()) && want.equals(junk.toString())
+                        && want.equals(EarsTuning.defaults().toString()), d + " / " + junk);
+            }
+        });
+        scenario("ears_tuning_switches_and_clamps", new Scenario() {
+            public void run(String n) {
+                final java.util.Map<String, String> p = new java.util.HashMap<String, String>();
+                SpeechTuning.Props props = new SpeechTuning.Props() {
+                    public String get(String key) {
+                        return p.get(key);
+                    }
+                };
+                p.put(EarsTuning.DECODING_PROP, " greedy_search ");
+                p.put(EarsTuning.PATHS_PROP, "64");
+                p.put(EarsTuning.THREADS_PROP, "1");
+                p.put(EarsTuning.GATE_PROP, "WAKE");
+                EarsTuning a = EarsTuning.from(props);
+                p.put(EarsTuning.THREADS_PROP, "0");
+                p.put(EarsTuning.PATHS_PROP, "0");
+                EarsTuning b = EarsTuning.from(props);
+                check(n, "decoding=greedy_search paths=8 threads=1 hotwords=off gate=wake".equals(a.toString())
+                        && !a.hotwords() && a.gateWake && b.threads == 1 && b.paths == 1, a + " / " + b);
+            }
+        });
+        scenario("ears_gate_off_decodes_every_speech_chunk", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(false);
+                r.sw.on = false;
+                r.open(false);
+                r.utter("SO ANYWAY THE PRINTER", 4);
+                r.session.close("10001");
+                check(n, r.rec.samples == 5L * CHUNK && r.client.heard.isEmpty() && r.diag.mention("fed=5 gated=0"),
+                        "samples=" + r.rec.samples + " " + r.diag.lines);
+            }
+        });
+        scenario("ears_gate_holds_audio_while_the_words_cannot_matter", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true);
+                r.sw.on = false;
+                r.open(false);
+                r.utter("SO ANYWAY THE PRINTER", 4); // the endpoint is not heard while shut
+                r.silence(1200);                    // the hangover ends it
+                r.session.close("10001");
+                check(n, r.rec.samples == 0 && r.client.heard.isEmpty() && r.diag.mention("fed=0 gated=")
+                        && r.diag.mention("decoded=0") && !r.session.listening(),
+                        "samples=" + r.rec.samples + " heard=" + r.heard() + " " + r.diag.lines);
+            }
+        });
+        scenario("ears_gate_feeds_the_held_utterance_when_the_engine_fires", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true);
+                r.sw.on = false;
+                r.open(false);
+                r.chunk(true);
+                r.chunk(true);
+                long before = r.rec.samples;
+                r.spotter.hitNext = true;
+                r.chunk(true); // the early cue, then the two held chunks and this one
+                long caught = r.rec.samples;
+                r.rec.text = "HEY MIKO COME HERE";
+                r.rec.endpoint = true;
+                r.chunk(true);
+                EarsSession.Utterance end = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, before == 0 && caught == 3L * CHUNK && r.rec.samples == 4L * CHUNK && end != null && end.called
+                        && "HEY MIKO COME HERE".equals(end.text) && end.tier == CueClassifier.TIER_STRONG,
+                        "before=" + before + " caught=" + caught + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_gate_stays_open_with_the_switch_on", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true); // the switch defaults on, as in the launcher
+                r.open(false);
+                r.utter("MIKO COME HERE", 3);
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, r.rec.samples == 4L * CHUNK && u != null && u.tier == CueClassifier.TIER_STRONG
+                        && u.kind == CueClassifier.KIND_NAME && !u.called, "samples=" + r.rec.samples
+                        + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_gate_opens_for_a_conversation_listen", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true);
+                r.sw.on = false;
+                r.open(false);
+                r.chunk(true);
+                r.chunk(true); // held: no listen yet
+                long before = r.rec.samples;
+                r.session.listen("10001", 6000);
+                r.rec.text = "I'M SAM";
+                r.rec.endpoint = true;
+                r.chunk(true);
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, before == 0 && r.rec.samples == 3L * CHUNK && u != null && "I'M SAM".equals(u.text)
+                        && !r.session.listening(), "before=" + before + " samples=" + r.rec.samples
+                        + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_summary_reports_decode_ms_per_chunk", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.rec.clock = r.clock;
+                r.rec.decodeNsPerChunk = 12000000L; // 12 ms per 80 ms chunk
+                r.open(false);
+                r.utter("HELLO THERE", 3);
+                r.rec.decodeNsPerChunk = 40000000L;
+                r.utter("HELLO AGAIN", 3);
+                r.session.close("10001");
+                // Released: the summary (nearest-rank p50 of {12, 40} is 12), then cleared.
+                boolean first = r.diag.mention("decode_p50=12.0 decode_p95=40.0 decode_max=40.0 decoded=2 fed=8");
+                double[] five = {1, 2, 3, 4, 100};
+                check(n, first && EarsSession.percentile(five, 95) == 100 && EarsSession.percentile(five, 50) == 3
+                        && EarsSession.percentile(new double[] {7}, 95) == 7, String.valueOf(r.diag.lines));
             }
         });
 
