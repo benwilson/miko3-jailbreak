@@ -595,6 +595,12 @@ public final class ExploreBrainHarness {
         OpenView openView;
         /** How often a look arrives (captured 200 ms before it does); the live camera gives one every 1-2 s. */
         long lookEveryMs = 500;
+        /** How long before it arrives each look was captured: the detector's time (the robot: 1.8-4.7 s). */
+        long detectMs = 200;
+        /** Looks arrive when (now - lookPhaseMs) is a multiple of lookEveryMs (0: the old phase). */
+        long lookPhaseMs;
+        /** His true heading every 10 ms of the last 20 s, {t, yaw}: where a look was captured from. */
+        private final java.util.ArrayDeque<double[]> yawLog = new java.util.ArrayDeque<double[]>();
         final boolean cameraAvailable;
         boolean cameraOpen;
         long openedAt;
@@ -759,6 +765,8 @@ public final class ExploreBrainHarness {
         final java.util.Set<ExploreBrain.State> openStates = new java.util.TreeSet<ExploreBrain.State>();
         /** Every state change, in order, kept apart from the call log so its indices stay put. */
         final List<Event> stateLog = new ArrayList<Event>();
+        /** His true heading (yaw frame, left positive) at each entry to CUE_LOOK. */
+        final List<Double> cueLookYaws = new ArrayList<Double>();
         ExploreBrain.State lastState;
 
         Rig(ExploreTuning tuning, Feed feed) {
@@ -838,15 +846,23 @@ public final class ExploreBrainHarness {
                         a.run.run();
                     }
                 }
-                if (cameraOpen && !parked && vision != null && now % lookEveryMs == 0 && now >= looksFrom) {
-                    List<Detection> seen = vision.see(this, now - 200);
+                if (yaw != null) {
+                    yawLog.addLast(new double[]{now, yaw.wrapped()});
+                    while (now - (long) yawLog.peekFirst()[0] > 20000) {
+                        yawLog.pollFirst();
+                    }
+                }
+                if (cameraOpen && !parked && vision != null && Math.floorMod(now - lookPhaseMs, lookEveryMs) == 0
+                        && now >= looksFrom) {
+                    long shot = now - detectMs;
+                    List<Detection> seen = vision.see(this, shot);
                     if (seen != null) {
                         if (yaw != null) {
-                            lookHeadings.put(now - 200, yaw.wrapped());
+                            lookHeadings.put(shot, yaw.wrapped());
                         }
-                        latestLook = new ExploreBrain.Look(staleLooks ? openedAt - 1000 : now - 200, seen,
-                                ("jpeg@" + (now - 200)).getBytes(java.nio.charset.StandardCharsets.US_ASCII),
-                                openView == null ? null : openView.at(this, now - 200));
+                        latestLook = new ExploreBrain.Look(staleLooks ? openedAt - 1000 : shot, seen,
+                                ("jpeg@" + shot).getBytes(java.nio.charset.StandardCharsets.US_ASCII),
+                                openView == null ? null : openView.at(this, shot));
                     }
                 }
                 if (now % 100 == 0) {
@@ -879,6 +895,9 @@ public final class ExploreBrainHarness {
                         circleFrom = yaw.wrapped();
                     }
                     stateLog.add(new Event(now, lastState.name()));
+                    if (lastState == ExploreBrain.State.CUE_LOOK && yaw != null) {
+                        cueLookYaws.add(yaw.wrapped());
+                    }
                 }
                 if (cameraOpen) {
                     openStates.add(brain.state());
@@ -1795,6 +1814,19 @@ public final class ExploreBrainHarness {
             return i < 0 ? "none" : log.get(i).what;
         }
 
+        /** His true heading (yaw frame, left positive) at t, from the last 20 s; the current one if t is older or later. */
+        double yawAt(long t) {
+            double at = yaw.wrapped();
+            for (java.util.Iterator<double[]> it = yawLog.descendingIterator(); it.hasNext(); ) {
+                double[] e = it.next();
+                at = e[1];
+                if ((long) e[0] <= t) {
+                    break;
+                }
+            }
+            return at;
+        }
+
         String tail() {
             int from = Math.max(0, log.size() - 14);
             return "log=" + log.subList(from, log.size()) + " violations=" + violations;
@@ -2704,6 +2736,7 @@ public final class ExploreBrainHarness {
         chatScenarios();
         callScenarios();
         callFindScenarios();
+        callSideScenarios();
         faceMatchScenarios();
         faceMigrationScenarios();
         faceConfirmScenarios();
@@ -8155,7 +8188,10 @@ public final class ExploreBrainHarness {
                             && t.turnBudgetMs == 5000 && t.turnRetryMs == 3000 && t.sentenceCap == 2
                             && t.transcriptWindow == 30 && t.deafTailMs == 500 && t.answerClipMs == 600
                             // Hey-miko plan U6: the placeholders and the heading history.
-                            && t.callLookMs == 700 && t.callPersonMinHeight == 0.12f && t.callNearHeight == 0.35f
+                            // Robot QA 2026-09-30: looks took 1.4-2.4 s, later 1.8-4.7 s (detection); a
+                            // floor-level caller scored 0.27-0.32; a stale caller counts within 30 deg.
+                            && t.callLookMs == 5000 && t.callStaleLookDeg == 30 && t.callPersonMinHeight == 0.12f && t.callNearHeight == 0.35f
+                            && t.callPersonMinScore == 0.25f && t.confidenceFloor == 0.35f
                             && t.callListenMs == 4000 && t.whereClipMs == 900 && t.headingHistoryMs == 30000
                             && t.headingSampleMs == 100,
                     t.cueHoldMs + " " + t.leanInMs + " " + t.newcomerAngleDeg + " " + t.cueStopBandDeg + " "
@@ -8163,7 +8199,7 @@ public final class ExploreBrainHarness {
                             + t.facingFaceMinHeight + " " + t.unansweredListenMs + " " + t.chatStallGraceMs + " "
                             + t.turnBudgetMs + " " + t.turnRetryMs + " " + t.sentenceCap + " " + t.transcriptWindow
                             + " " + t.deafTailMs + " " + t.answerClipMs + " " + t.callLookMs + " "
-                            + t.callPersonMinHeight + " " + t.callNearHeight + " " + t.callListenMs + " " + t.whereClipMs
+                            + t.callPersonMinScore + " " + t.confidenceFloor + " " + t.callPersonMinHeight + " " + t.callNearHeight + " " + t.callListenMs + " " + t.whereClipMs
                             + " " + t.headingHistoryMs + " " + t.headingSampleMs);
         });
         scenario("chat_session_starts_thinking_with_the_four_chat_states_and_no_behaviour", n -> {
@@ -8340,17 +8376,20 @@ public final class ExploreBrainHarness {
                             && rig.counted(ExploreBrain.Gauges.Counter.QUIET_RESUMES) == 0 && rig.violations.isEmpty(),
                     "match@" + match + " looks=" + looks + " facing=" + f1(facing) + " " + gauges(rig) + " " + rig.tail());
         });
-        scenario("cue_miko_miko_800_ms_apart_is_one_search", n -> {
+        scenario("cue_miko_miko_800_ms_apart_is_one_search_and_the_second_is_the_caller_talking", n -> {
             Rig rig = cueRig(EMPTY_ROOM).started();
             rig.cue(400, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
             rig.cue(1200, Ears.Kind.NAME, Ears.Side.LEFT, -60f);
             rig.runUntil(6000);
-            // One search, one answer: a name is a call, and a second call with an angle during its
-            // search re-aims it with the fresher angle (hey-miko plan KTD6), the same way here.
+            // One search, one answer: a name is a call, and a second call from the same side during
+            // the turn toward it is the caller talking (owner 2026-09-30): the turn finishes, then the
+            // call's meeting opens, where it used to re-aim the search (KTD6).
+            long meet = entered(rig, ExploreBrain.State.MEET, 1200);
             check(n, rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1 && rig.count("react answer") == 1
                             && rig.counted(ExploreBrain.Gauges.Counter.CUES) == 2
                             && rig.counted(ExploreBrain.Gauges.Counter.CUES_DROPPED) == 0
-                            && rig.counted(ExploreBrain.Gauges.Counter.RETARGETS) == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.RETARGETS) == 0
+                            && meet > 1200 && entered(rig, ExploreBrain.State.CUE_LOOK, 400) < 0
                             && rig.countPrefix("turn LEFT", 400, 3500) > 0 && rig.countPrefix("turn RIGHT", 400, 3500) == 0
                             && rig.count("eyes GLANCE RIGHT") == 0 && rig.violations.isEmpty(),
                     "turns=" + entries(rig, ExploreBrain.State.CUE_TURN) + " " + gauges(rig) + " " + rig.tail());
@@ -8908,7 +8947,9 @@ public final class ExploreBrainHarness {
                     "back@" + back + " after=" + after + " over@" + over + " motions=" + wheelMoves(rig, cueT, end) + " "
                             + gauges(rig) + " states=" + rig.stateLog + " " + rig.tail());
         });
-        scenario("call_ae3_no_angle_in_chat_listen_waits_for_the_conversation_then_answers_and_searches", n -> {
+        scenario("call_ae3_no_angle_in_chat_listen_is_the_partner_speaking_and_makes_no_call", n -> {
+            // Owner 2026-09-30: with no angle nobody can be told apart from the partner, so a wake
+            // word in the conversation is them speaking: no call waits, none is answered after.
             Rig rig = sarahRig(true);
             rig.people.listen = ListenScript.turns(hearWords("yes").after(2500), hearWords("catch you later"));
             long open = openChat(rig);
@@ -8916,15 +8957,13 @@ public final class ExploreBrainHarness {
             long cueT = listen + 300;
             rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
             long over = chatOver(rig, listen);
-            rig.runUntil(over + 100);
-            long search = searchFrom(rig, over);
-            check(n, open > 0 && over > cueT && search >= over && search <= over + 20
-                            && rig.countPrefix("react answer", cueT, over) == 0 && answerAt(rig, cueT) == search
+            rig.runUntil(over + 20000);
+            check(n, open > 0 && over > cueT && searchFrom(rig, over) < 0 && rig.count("react answer") == 1
                             && rig.turnAsks.size() == 2 && rig.count("react sign-off") == 1
-                            && rig.count("react one-sec") == 0 && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1
+                            && rig.count("react one-sec") == 0 && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 0
                             && rig.counted(ExploreBrain.Gauges.Counter.CUES_DROPPED) == 0 && rig.violations.isEmpty(),
-                    "listen@" + listen + " over@" + over + " search@" + search + " answer@" + answerAt(rig, cueT) + " "
-                            + gauges(rig) + " " + rig.tail());
+                    "listen@" + listen + " over@" + over + " search@" + searchFrom(rig, over) + " " + gauges(rig) + " "
+                            + rig.tail());
         });
         scenario("call_a_second_caller_during_the_first_calls_meeting_waits_for_the_conversation_then_is_answered", n -> {
             // Review P1 (PR #29): Sarah's call is met; Sam calls from 150 deg before the chat opens.
@@ -9108,7 +9147,8 @@ public final class ExploreBrainHarness {
             rig.people.listen = ListenScript.turns(replies);
             long open = openChat(rig);
             long cueT = open + 1000;
-            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            // Clearly someone else's (behind him, Sarah in view): a no-angle one is Sarah speaking now.
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 150f);
             long over = chatOver(rig, open);
             rig.runUntil(over + 100);
             long search = searchFrom(rig, over);
@@ -9306,7 +9346,9 @@ public final class ExploreBrainHarness {
                     "where1@" + where1 + " search2@" + search2 + " where2@" + where2 + " search3@" + search3 + " "
                             + gauges(rig) + " " + rig.tail());
         });
-        scenario("call_after_where_one_reply_restarts_the_search_a_second_does_not_and_silence_resumes_roaming", n -> {
+        scenario("call_after_where_a_reply_opens_the_meeting_and_silence_resumes_roaming", n -> {
+            // Owner 2026-09-30: a reply after "Where'd you go?" is the caller answering, so the call's
+            // meeting opens (here with no conversation to become: the stranger's lines), not a search.
             Rig rig = cueRig(EMPTY_ROOM).started();
             rig.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
             rig.runUntil(400);
@@ -9314,17 +9356,20 @@ public final class ExploreBrainHarness {
             long r1 = where1 + 2000;
             rig.cue(r1, Ears.Tier.WEAK, Ears.Side.UNKNOWN, Float.NaN);
             rig.runUntil(r1);
-            long search2 = searchFrom(rig, r1);
-            long where2 = runUntilEvent(rig, "react where", r1, r1 + 60000);
-            long r2 = where2 + 2000;
-            rig.cue(r2, Ears.Tier.WEAK, Ears.Side.UNKNOWN, Float.NaN);
-            long pause = runUntilState(rig, ExploreBrain.State.PAUSE, where2, where2 + 20000);
-            long listenEnd = where2 + rig.tuning.whereClipMs + rig.tuning.callListenMs;
-            check(n, where1 > 0 && search2 == r1 && where2 > r1 && searchFrom(rig, where2 + 1) < 0
-                            && pause >= listenEnd && pause <= listenEnd + 20 && rig.count("react answer") == 1
-                            && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 2
-                            && rig.counted(ExploreBrain.Gauges.Counter.LEAN_INS) == 0 && rig.violations.isEmpty(),
-                    "where1@" + where1 + " search2@" + search2 + " where2@" + where2 + " pause@" + pause + " "
+            String inReply = rig.brain.state().name();
+            Rig quiet = cueRig(EMPTY_ROOM).started();
+            quiet.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            quiet.runUntil(400);
+            long where2 = runUntilEvent(quiet, "react where", 400, 60000);
+            long pause = runUntilState(quiet, ExploreBrain.State.PAUSE, where2, where2 + 20000);
+            long listenEnd = where2 + quiet.tuning.whereClipMs + quiet.tuning.callListenMs;
+            check(n, where1 > 0 && "MEET".equals(inReply) && rig.count("lines") == 1 && searchFrom(rig, r1) < 0
+                            && rig.count("react answer") == 1 && rig.count("react where") == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1
+                            && pause >= listenEnd && pause <= listenEnd + 20 && quiet.count("react answer") == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.LEAN_INS) == 0 && rig.violations.isEmpty()
+                            && quiet.violations.isEmpty(),
+                    "where1@" + where1 + " in " + inReply + " where2@" + where2 + " pause@" + pause + " "
                             + gauges(rig) + " " + rig.tail());
         });
         scenario("call_angle_plus_90_with_no_turn_since_the_sample_turns_90_right", n -> {
@@ -9495,7 +9540,7 @@ public final class ExploreBrainHarness {
                     "leg@" + leg + " back@" + back + " retaken@" + retaken + " look@" + look + " meet@" + meet + " "
                             + gauges(rig) + " " + rig.tail());
         });
-        scenario("call_during_its_search_a_call_with_an_angle_retargets_and_one_without_merges_silently", n -> {
+        scenario("call_during_its_search_a_call_from_the_other_side_retargets_and_one_with_no_angle_opens_the_meeting", n -> {
             Rig re = cueRig(EMPTY_ROOM).started();
             re.cue(400, Ears.Kind.NAME, Ears.Side.LEFT, -90f);
             re.cue(1400, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 60f);
@@ -9510,7 +9555,8 @@ public final class ExploreBrainHarness {
                             && merged.counted(ExploreBrain.Gauges.Counter.RETARGETS) == 0
                             && merged.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1
                             && merged.count("react answer") == 1 && merged.count("eyes GLANCE LEFT") == 1
-                            && merged.countPrefix("turn RIGHT", 1400, 4000) == 0 && re.violations.isEmpty()
+                            && merged.countPrefix("turn RIGHT", 1400, 4000) == 0 && merged.count("lines") == 1
+                            && entered(merged, ExploreBrain.State.MEET, 1400) > 1400 && re.violations.isEmpty()
                             && merged.violations.isEmpty(),
                     "re: " + gauges(re) + " " + re.tail() + " | merged: " + gauges(merged) + " " + merged.tail());
         });
@@ -9563,19 +9609,551 @@ public final class ExploreBrainHarness {
                     "ask@" + ask + " close@" + close + " turn@" + rig.timeOf(turn) + " match@" + match + " frame@" + frame
                             + " notes=" + notes + " " + rig.tail());
         });
-        scenario("call_search_time_for_a_person_directly_behind_is_reported_and_within_the_facing_budget", n -> {
-            // The 12 s is the Success Criteria's "facing within about 12 s when he has to turn and
-            // look", at the rig's 60 deg/s turns. The slow-camera figures are for U7, not bounded:
-            // with a look only every 1 s the 700 ms placeholder can pass with no frame at all.
-            long fast = behindSearchMs(500, 200, 700);
-            long settled = behindSearchMs(500, 400, 700);
-            long slowCamera = behindSearchMs(1000, 400, 700);
-            long slowCameraLonger = behindSearchMs(1000, 400, 1300);
+        scenario("call_search_time_for_a_person_directly_behind_is_reported_and_found_at_the_robots_look_rate", n -> {
+            // Robot QA (2026-09-30) measured live looks of 1.4-2.4 s, so the looks-every-2000 ms
+            // figure is the robot's and callLookMs is now 2500; the old 700 ms placeholder is
+            // reported alongside (it never found them at that rate). An empty look ends at its first
+            // fresh frame, so the Success Criteria's "facing within about 12 s" holds at the robot's rate.
+            long budget = new ExploreTuning.Builder().build().callLookMs;
+            long fast = behindSearchMs(500, 200, budget);
+            long settled = behindSearchMs(500, 400, budget);
+            long slowCamera = behindSearchMs(1000, 400, budget);
+            long robotCamera = behindSearchMs(2000, 400, budget);
+            long robotCameraOld = behindSearchMs(2000, 400, 700);
             System.out.println("REPORT call search, a person directly behind: " + fast + " ms (looks every 500 ms, settle"
-                    + " 200 ms, callLookMs 700), " + settled + " ms (settle 400 ms), " + slowCamera + " ms (looks every"
-                    + " 1000 ms, settle 400 ms; -1 is never found), " + slowCameraLonger + " ms (the same, callLookMs 1300)");
-            check(n, fast > 0 && fast <= 12000 && settled > 0 && settled <= 12000,
-                    "fast=" + fast + " settled=" + settled + " slowCamera=" + slowCamera + " longer=" + slowCameraLonger);
+                    + " 200 ms, callLookMs " + budget + "), " + settled + " ms (settle 400 ms), " + slowCamera
+                    + " ms (looks every 1000 ms), " + robotCamera + " ms (looks every 2000 ms), " + robotCameraOld
+                    + " ms (looks every 2000 ms, callLookMs 700; -1 is never found)");
+            check(n, fast > 0 && settled > 0 && slowCamera > 0 && robotCamera > 0 && robotCamera <= 12000,
+                    "fast=" + fast + " settled=" + settled + " slowCamera=" + slowCamera + " robot=" + robotCamera
+                            + " old=" + robotCameraOld);
+        });
+    }
+
+    // ---- a call with a side but no angle (hey-miko plan R7, robot QA 2026-09-30) ----
+    //
+    // The direction chip gives LEFT or RIGHT with no angle: he looks to that side first,
+    // at 90 deg, then its two 45 deg neighbours (45 and 135), then the rest of the circle
+    // (ahead, the other side, behind). The robot's live looks took 1.4-2.4 s each and the
+    // detector scored a floor-level caller 0.27-0.32, so the call has its own longer look
+    // budget and its own lower person floor.
+
+    /** A call of this side and no angle at 410 ms; the heading (yaw frame, left positive) it was heard at. */
+    private static double sideCall(Rig rig, Ears.Side side) {
+        rig.runUntil(400);
+        double start = rig.yaw.wrapped();
+        rig.cue(410, Ears.Kind.WAKE_WORD, side, Float.NaN);
+        return start;
+    }
+
+    /** Where each look of the call's search faced, relative to the heading at the call (left positive). */
+    private static List<Long> lookBearings(Rig rig, double start) {
+        List<Long> out = new ArrayList<Long>();
+        for (double y : rig.cueLookYaws) {
+            out.add(Math.round(Heading.delta(start, y)));
+        }
+        return out;
+    }
+
+    /** Whether each bearing is within tol of the expected one (yaw frame; 180 and -180 are the same). */
+    private static boolean bearingsNear(List<Long> got, int tol, int... expected) {
+        if (got.size() != expected.length) {
+            return false;
+        }
+        for (int i = 0; i < expected.length; i++) {
+            if (Math.abs(Heading.delta(expected[i], got.get(i))) > tol) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** A side call with no angle and a person at this bearing: cue to CALL_FACING in ms, or -1 if never found. */
+    private static long sideSearchMs(Ears.Side side, double bearingLeftDeg, long lookEveryMs, ExploreTuning.Builder b) {
+        Rig rig = cueRig(b, CLEAR, personAt(bearingLeftDeg, 25));
+        rig.lookEveryMs = lookEveryMs;
+        rig.started();
+        sideCall(rig, side);
+        rig.runUntil(40000);
+        long facing = rig.stamped(ExploreBrain.Gauges.Stage.CALL_FACING);
+        return facing < 0 ? -1 : facing - 410;
+    }
+
+    private static void callSideScenarios() {
+        scenario("call_left_side_no_angle_turns_about_90_left_first_and_finds_a_person_there_on_look_1", n -> {
+            Rig rig = cueRig(personAt(90, 25)).started();
+            double start = sideCall(rig, Ears.Side.LEFT);
+            long match = runUntilEvent(rig, "match", 410, 30000);
+            List<Long> looks = lookBearings(rig, start);
+            check(n, match > 0 && rig.what(rig.firstAfter("turn", 410)).equals("turn LEFT")
+                            && bearingsNear(looks, 12, 90) && rig.count("react answer") == 1
+                            && rig.count("react where") == 0 && rig.violations.isEmpty(),
+                    "match@" + match + " looks=" + looks + " " + rig.tail());
+        });
+        scenario("call_left_side_no_angle_finds_a_person_at_135_left_on_look_2_or_3", n -> {
+            Rig rig = cueRig(personAt(135, 25)).started();
+            double start = sideCall(rig, Ears.Side.LEFT);
+            long match = runUntilEvent(rig, "match", 410, 30000);
+            List<Long> looks = lookBearings(rig, start);
+            check(n, match > 0 && looks.size() >= 2 && looks.size() <= 3
+                            && Math.abs(Heading.delta(135, looks.get(looks.size() - 1))) <= 12
+                            && rig.count("react where") == 0 && rig.violations.isEmpty(),
+                    "match@" + match + " looks=" + looks + " " + rig.tail());
+        });
+        scenario("call_right_side_no_angle_mirrors_the_left_side_first_search", n -> {
+            Rig at90 = cueRig(personAt(-90, 25)).started();
+            double s90 = sideCall(at90, Ears.Side.RIGHT);
+            long m90 = runUntilEvent(at90, "match", 410, 30000);
+            List<Long> l90 = lookBearings(at90, s90);
+            Rig at135 = cueRig(personAt(-135, 25)).started();
+            double s135 = sideCall(at135, Ears.Side.RIGHT);
+            long m135 = runUntilEvent(at135, "match", 410, 30000);
+            List<Long> l135 = lookBearings(at135, s135);
+            check(n, m90 > 0 && at90.what(at90.firstAfter("turn", 410)).equals("turn RIGHT")
+                            && bearingsNear(l90, 12, -90) && m135 > 0 && l135.size() >= 2 && l135.size() <= 3
+                            && Math.abs(Heading.delta(-135, l135.get(l135.size() - 1))) <= 12
+                            && at90.violations.isEmpty() && at135.violations.isEmpty(),
+                    "90: match@" + m90 + " looks=" + l90 + " 135: match@" + m135 + " looks=" + l135 + " "
+                            + at135.tail());
+        });
+        scenario("call_side_no_angle_and_nobody_looks_side_neighbours_then_the_rest_of_one_circle", n -> {
+            Rig left = cueRig(EMPTY_ROOM).started();
+            double sl = sideCall(left, Ears.Side.LEFT);
+            long whereL = runUntilEvent(left, "react where", 410, 60000);
+            List<Long> ll = lookBearings(left, sl);
+            Rig right = cueRig(EMPTY_ROOM).started();
+            double sr = sideCall(right, Ears.Side.RIGHT);
+            long whereR = runUntilEvent(right, "react where", 410, 60000);
+            List<Long> lr = lookBearings(right, sr);
+            System.out.println("REPORT call search order, LEFT side no angle: " + ll + "; RIGHT: " + lr
+                    + " (deg, left positive)");
+            check(n, whereL > 0 && bearingsNear(ll, 15, 90, 135, 45, 0, -45, -90, -135, 180)
+                            && whereR > 0 && bearingsNear(lr, 15, -90, -135, -45, 0, 45, 90, 135, 180)
+                            && left.count("react answer") == 1 && right.count("react answer") == 1
+                            && left.violations.isEmpty() && right.violations.isEmpty(),
+                    "left where@" + whereL + " looks=" + ll + " right where@" + whereR + " looks=" + lr);
+        });
+        scenario("call_with_no_side_and_no_angle_still_starts_straight_ahead", n -> {
+            Rig rig = cueRig(EMPTY_ROOM).started();
+            double start = sideCall(rig, Ears.Side.UNKNOWN);
+            long where = runUntilEvent(rig, "react where", 410, 60000);
+            List<Long> looks = lookBearings(rig, start);
+            Rig ahead = cueRig(personAt(0, 25)).started();
+            double s0 = sideCall(ahead, Ears.Side.UNKNOWN);
+            long match = runUntilEvent(ahead, "match", 410, 30000);
+            check(n, where > 0 && looks.size() == 8 && Math.abs(looks.get(0)) <= 8
+                            && Math.abs(Math.abs(looks.get(1)) - 45) <= 12 && match > 0
+                            && bearingsNear(lookBearings(ahead, s0), 8, 0) && ahead.firstAfter("turn", 410) < 0
+                            && rig.violations.isEmpty() && ahead.violations.isEmpty(),
+                    "where@" + where + " looks=" + looks + " match@" + match + " " + ahead.tail());
+        });
+        scenario("call_a_person_box_scoring_0_28_counts_during_a_call_search", n -> {
+            Detection dim = box("person", 0.28f, 0.5f, 0.5f, 0.3f, 0.4f);
+            Rig rig = cueRig(boxAt(90, 25, dim)).started();
+            rig.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -90f);
+            long match = runUntilEvent(rig, "match", 400, 20000);
+            check(n, rig.tuning.callPersonMinScore == 0.25f && dim.score < rig.tuning.confidenceFloor
+                            && match > 0 && rig.matchBoxes.size() == 1 && rig.matchBoxes.get(0) == dim
+                            && rig.count("react where") == 0 && rig.violations.isEmpty(),
+                    "match@" + match + " floor=" + rig.tuning.confidenceFloor + " " + rig.tail());
+        });
+        scenario("call_score_floor_does_not_loosen_a_roaming_person_pick", n -> {
+            // The same 0.28 person box ahead while roaming: under confidenceFloor, so no meeting.
+            Rig dim = peopleRig(peopleTuning(), (r, t) -> list(box("person", 0.28f, 0.5f, 0.5f, 0.3f, 0.4f)));
+            dim.started();
+            dim.runUntil(15000);
+            Rig clear = peopleRig(peopleTuning(), (r, t) -> list(box("person", 0.9f, 0.5f, 0.5f, 0.3f, 0.4f)));
+            clear.started();
+            clear.runUntil(15000);
+            check(n, dim.tuning.confidenceFloor > 0.28f && dim.count("match") == 0
+                            && entered(dim, ExploreBrain.State.FACE, 0) < 0
+                            && entered(dim, ExploreBrain.State.APPROACH, 0) < 0
+                            && clear.count("match") == 1 && dim.violations.isEmpty(),
+                    "dim=" + dim.tail() + " clear matches=" + clear.count("match"));
+        });
+        scenario("call_full_height_box_on_the_first_look_goes_straight_to_the_meeting", n -> {
+            // The robot's own sighting: a seated person's jeans filling the frame, person 0.32 [0,0,0.38,1].
+            Detection jeans = new Detection("person", 0.32f, 0f, 0f, 0.38f, 1f);
+            Rig rig = cueRig(boxAt(90, 25, jeans)).started();
+            double start = sideCall(rig, Ears.Side.LEFT);
+            long meet = runUntilState(rig, ExploreBrain.State.MEET, 410, 30000);
+            check(n, meet > 0 && bearingsNear(lookBearings(rig, start), 12, 90)
+                            && entered(rig, ExploreBrain.State.FACE, 410) < 0
+                            && entered(rig, ExploreBrain.State.APPROACH, 410) < 0
+                            && rig.countPrefix("hop", 410, meet + 1) == 0 && rig.matchBoxes.size() == 1
+                            && rig.matchBoxes.get(0) == jeans && rig.violations.isEmpty(),
+                    "meet@" + meet + " looks=" + lookBearings(rig, start) + " " + rig.tail());
+        });
+        scenario("call_looks_every_2000_ms_a_person_at_90_left_is_found", n -> {
+            // The robot's looks took 1.4-2.4 s; at the old 700 ms budget most stops ended with no frame.
+            ExploreTuning d = new ExploreTuning.Builder().build();
+            long slow = sideSearchMs(Ears.Side.LEFT, 90, 2000, cueTuning());
+            long fast = sideSearchMs(Ears.Side.LEFT, 90, 500, cueTuning());
+            long old = sideSearchMs(Ears.Side.LEFT, 90, 2000, cueTuning()
+                    .call(700, d.callPersonMinHeight, d.callNearHeight, d.callListenMs));
+            long behind = sideSearchMs(Ears.Side.LEFT, 180, 2000, cueTuning());
+            System.out.println("REPORT call search, a LEFT call with no angle and a person directly behind: " + behind
+                    + " ms (looks every 2000 ms; the eighth look)");
+            System.out.println("REPORT call search, a LEFT call with no angle and a person at 90 deg left: " + slow
+                    + " ms (looks every 2000 ms, callLookMs " + d.callLookMs + "), " + fast + " ms (looks every 500 ms), "
+                    + old + " ms (looks every 2000 ms, callLookMs 700; -1 is never found)");
+            check(n, d.callLookMs == 5000 && slow > 0 && fast > 0 && slow <= 12000,
+                    "slow=" + slow + " fast=" + fast + " old=" + old);
+        });
+        callEmptyLookScenarios();
+    }
+
+    /** How long each CUE_LOOK stop lasted (until the next state). */
+    private static List<Long> cueLookLengths(Rig rig) {
+        List<Long> out = new ArrayList<Long>();
+        for (long t : entries(rig, ExploreBrain.State.CUE_LOOK)) {
+            out.add(restLength(rig, t));
+        }
+        return out;
+    }
+
+    // An empty call look ends at its first fresh frame (a frame captured after the settle
+    // with no caller in it); callLookMs is only the cap for a stop that gets no fresh frame.
+    private static void callEmptyLookScenarios() {
+        scenario("call_empty_circle_with_looks_every_2000_ms_ends_each_empty_stop_at_its_first_fresh_frame", n -> {
+            Rig rig = cueRig(EMPTY_ROOM);
+            rig.lookEveryMs = 2000;
+            rig.started();
+            rig.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            rig.runUntil(400);
+            long where = runUntilEvent(rig, "react where", 400, 60000);
+            List<Long> stops = cueLookLengths(rig);
+            boolean short_ = stops.size() == 8;
+            for (long s : stops) {
+                // The settle, then at most one camera interval for the next frame (plus a tick).
+                short_ &= s > 0 && s <= rig.tuning.lookSettleMs + 2000 + 20;
+            }
+            System.out.println("REPORT call search, a full empty circle with looks every 2000 ms: " + (where - 400)
+                    + " ms to the where clip (stops " + stops + " ms)");
+            check(n, where > 0 && where - 400 <= 20000 && short_ && rig.count("react answer") == 1
+                            && rig.count("match") == 0 && rig.violations.isEmpty(),
+                    "where@" + where + " stops=" + stops + " " + rig.tail());
+        });
+        scenario("call_a_stop_with_no_fresh_frame_still_waits_out_call_look_ms", n -> {
+            // The camera delivers looks until 1000 ms, then nothing: every stop waits callLookMs (a call's
+            // stop takes frames captured once the turn stopped, so there is no settle wait).
+            Rig rig = cueRig((r, t) -> t < 1000 ? list() : null);
+            rig.started();
+            rig.cue(1500, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            rig.runUntil(1500);
+            runUntilEvent(rig, "react where", 1500, 60000);
+            List<Long> stops = cueLookLengths(rig);
+            long full = rig.tuning.callLookMs;
+            boolean capped = stops.size() >= 2;
+            for (int i = 1; i < stops.size(); i++) {
+                capped &= Math.abs(stops.get(i) - full) <= 20;
+            }
+            check(n, capped && rig.violations.isEmpty(), "stops=" + stops + " full=" + full + " " + rig.tail());
+        });
+        roamingPhantomScenarios();
+    }
+
+    // ---- a roaming person pick with no face in its box (robot 2026-09-30) ----
+    //
+    // While roaming, motion-blurred frames scored "person" about 0.5; the face check then
+    // found no face and the meeting still opened a conversation with nobody in view, four
+    // times in four minutes. A roaming pick whose match finds no face is now dropped quietly
+    // and roaming person picks are ignored for phantomPersonCooldownMs. A call's meeting
+    // (someone asked for him) keeps the faceless conversation.
+
+    /** No face in the person box, as the adapter answers it: faceless, no band, a conversation attached. */
+    private static CuriosityPort.MatchAnswer noFace(Rig r) {
+        return CuriosityPort.MatchAnswer.faceless().withMatch(null, null, Float.NaN, 9L)
+                .withConversation(r.people.persona, null, null, null);
+    }
+
+    /** Roaming with Claude and a conversation possible; a person straight ahead whenever visible(t). */
+    private static Rig roamRig(java.util.function.LongPredicate visible, boolean face) {
+        Rig rig = cueRig(cueTuning(), CLEAR, personWhen(visible));
+        rig.people.persona = PERSONA;
+        rig.people.match = face
+                ? (r, k) -> STRANGER.withMatch(FaceMatcher.Band.WEAK, null, 0.2f, 3L)
+                        .withConversation(r.people.persona, null, null, null)
+                : (r, k) -> noFace(r);
+        return rig;
+    }
+
+    /** Events spoken or played after from: say, react or clip lines. */
+    private static int spokenAfter(Rig rig, long from) {
+        return rig.countPrefix("say ", from, Long.MAX_VALUE) + rig.countPrefix("react ", from, Long.MAX_VALUE)
+                + rig.countPrefix("clip ", from, Long.MAX_VALUE);
+    }
+
+    private static void roamingPhantomScenarios() {
+        scenario("roaming_person_pick_with_no_face_drops_the_meeting_quietly_and_roams_on", n -> {
+            Rig rig = roamRig(t -> t < 12000, false).started();
+            long match = runUntilEvent(rig, "match", 0, 12000);
+            rig.runUntil(match + 12000);
+            long chat = entered(rig, ExploreBrain.State.CHAT_THINK, 0);
+            long pause = entered(rig, ExploreBrain.State.PAUSE, match);
+            check(n, match > 0 && chat < 0 && rig.count("match") == 1 && spokenAfter(rig, match) == 0
+                            && pause > 0 && pause <= match + 1000 && rig.countPrefix("hop", pause, Long.MAX_VALUE) > 0
+                            && rig.violations.isEmpty(),
+                    "match@" + match + " chat@" + chat + " pause@" + pause + " " + rig.tail());
+        });
+        scenario("roaming_blur_seen_again_within_the_phantom_cooldown_is_ignored", n -> {
+            Rig rig = roamRig(t -> true, false).started();
+            long first = runUntilEvent(rig, "match", 0, 12000);
+            long cool = rig.tuning.phantomPersonCooldownMs;
+            rig.runUntil(first + cool + 20000);
+            List<Long> matches = new ArrayList<Long>();
+            for (Event e : rig.log) {
+                if (e.what.equals("match")) {
+                    matches.add(e.t);
+                }
+            }
+            // The next pick waits out the cooldown from the dropped meeting (about a second after the request).
+            check(n, first > 0 && cool == 20000 && matches.size() >= 2 && matches.get(1) > first + cool
+                            && entered(rig, ExploreBrain.State.CHAT_THINK, 0) < 0 && rig.violations.isEmpty(),
+                    "first@" + first + " matches=" + matches + " " + rig.tail());
+        });
+        scenario("roaming_person_pick_with_a_face_still_meets_and_converses", n -> {
+            Rig rig = roamRig(t -> true, true).started();
+            long match = runUntilEvent(rig, "match", 0, 12000);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, match, match + 10000);
+            check(n, match > 0 && chat > 0 && rig.violations.isEmpty(), "match@" + match + " chat@" + chat + " "
+                    + rig.tail());
+        });
+        scenario("call_started_faceless_meeting_still_converses", n -> {
+            Rig rig = cueRig(personAt(90, 25));
+            rig.people.persona = PERSONA;
+            rig.people.match = (r, k) -> noFace(r);
+            rig.started();
+            rig.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -90f);
+            rig.runUntil(400);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 30000);
+            check(n, chat > 0 && rig.count("match") == 1 && rig.violations.isEmpty(), "chat@" + chat + " "
+                    + rig.tail());
+        });
+        callerTalksScenarios();
+    }
+
+    // ---- the caller talks while he looks for them (owner, 2026-09-30) ----
+    //
+    // "He needs to start talking to people even when he's looking for them." On the robot a
+    // caller at his left said "Hey Miko" and kept talking; every word during the search was
+    // ignored or merged, he did the whole circle and said "Where'd you go?", a reply to that
+    // started another silent search, and when a conversation did open the caller's own
+    // "Hey Miko ..." was queued as a new call and the listen ended as "walked off". Now the
+    // caller's voice during the search opens the conversation at once (the call's meeting
+    // with nobody in view), a reply after "Where'd you go?" does too, and in a conversation a
+    // call that cannot be told apart from the partner is the partner speaking.
+
+    /** A rig where a meeting with nobody in view can become a conversation (the lines carry one). */
+    private static Rig talkRig(Vision v) {
+        Rig rig = chatRig(cueTuning(), CLEAR, v, false);
+        rig.people.lines = STRANGER.withConversation(PERSONA, null, null, null);
+        return rig;
+    }
+
+    /** Whether any trace note contains this text. */
+    private static boolean noted(List<String> notes, String text) {
+        for (String x : notes) {
+            if (x.contains(text)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void callerTalksScenarios() {
+        scenario("call_caller_talking_during_the_search_opens_the_conversation_before_the_search_ends", n -> {
+            Rig rig = talkRig(EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("over here"), hearWords("bye"));
+            rig.started();
+            sideCall(rig, Ears.Side.LEFT);
+            long look1 = runUntilState(rig, ExploreBrain.State.CUE_LOOK, 410, 20000);
+            // The caller keeps talking, weak voice from the left, through looks 1 and 2.
+            for (long t = look1 + 100; t < look1 + 3000; t += 700) {
+                rig.cue(t, Ears.Tier.WEAK, Ears.Side.LEFT, Float.NaN);
+            }
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, look1, look1 + 20000);
+            rig.runUntil(Math.max(chat, look1) + 15000);
+            check(n, look1 > 0 && chat > 0 && chat <= look1 + 100 + 1500 && rig.count("react where") == 0
+                            && rig.cueLookYaws.size() == 1 && rig.count("react answer") == 1 && rig.count("lines") == 1
+                            && rig.turnAsks.size() >= 1 && searchFrom(rig, chat) < 0 && rig.count("match") == 0
+                            && noted(notes, "the caller is talking to him") && rig.violations.isEmpty(),
+                    "look1@" + look1 + " chat@" + chat + " looks=" + rig.cueLookYaws.size() + " turns=" + rig.turnAsks
+                            + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_a_repeated_wake_word_during_the_search_opens_the_conversation", n -> {
+            Rig rig = talkRig(EMPTY_ROOM);
+            rig.people.listen = ListenScript.turns(hearWords("over here"), hearWords("bye"));
+            rig.started();
+            sideCall(rig, Ears.Side.LEFT);
+            long look1 = runUntilState(rig, ExploreBrain.State.CUE_LOOK, 410, 20000);
+            long again = look1 + 200;
+            rig.cue(again, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            // Its end-of-utterance delivery, already called: absorbed, nothing more.
+            rig.calledCue(again + 900, again, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, look1, look1 + 20000);
+            rig.runUntil(Math.max(chat, look1) + 15000);
+            check(n, look1 > 0 && chat > again && chat <= again + 1500 && rig.count("react where") == 0
+                            && rig.count("react answer") == 1 && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1
+                            && searchFrom(rig, chat) < 0 && rig.violations.isEmpty(),
+                    "look1@" + look1 + " chat@" + chat + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_a_reply_after_where_opens_the_conversation_not_another_search", n -> {
+            Rig rig = talkRig(EMPTY_ROOM);
+            rig.people.listen = ListenScript.turns(hearWords("over here"), hearWords("bye"));
+            rig.started();
+            rig.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            rig.runUntil(400);
+            long where = runUntilEvent(rig, "react where", 400, 60000);
+            long reply = where + 1500;
+            rig.cue(reply, Ears.Tier.WEAK, Ears.Side.UNKNOWN, Float.NaN);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, where, where + 20000);
+            rig.runUntil(Math.max(chat, reply) + 15000);
+            check(n, where > 0 && chat > reply && chat <= reply + 1500 && searchFrom(rig, reply) < 0
+                            && rig.count("react where") == 1 && rig.count("react answer") == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.SEARCHES) == 1 && rig.violations.isEmpty(),
+                    "where@" + where + " chat@" + chat + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_wake_word_in_chat_listen_of_a_call_opened_conversation_keeps_it_going", n -> {
+            Rig rig = talkRig(EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            // The first conversation listen hears no words (the launcher took the "Hey Miko ..."
+            // as a wake word); the next one hears them.
+            rig.people.listen = (r, nth) -> nth == 1 ? hearSilence() : nth == 2 ? hearWords("still here")
+                    : hearWords("bye");
+            rig.started();
+            sideCall(rig, Ears.Side.LEFT);
+            long look1 = runUntilState(rig, ExploreBrain.State.CUE_LOOK, 410, 20000);
+            rig.cue(look1 + 100, Ears.Tier.WEAK, Ears.Side.LEFT, Float.NaN);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, look1, look1 + 20000);
+            long listen = runUntilEvent(rig, "listen", Math.max(chat, 0), Math.max(chat, 0) + 20000);
+            long cueT = listen + 300;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, Float.NaN);
+            long over = chatOver(rig, listen);
+            rig.runUntil(Math.max(over, rig.now) + 20000);
+            check(n, chat > 0 && listen > 0 && "CHAT_LISTEN".equals(stateAt(rig, cueT)) && over > cueT
+                            && !noted(notes, "walked off") && !noted(notes, "a call waited for the conversation")
+                            && rig.turnAsks.size() >= 2 && searchFrom(rig, cueT) < 0
+                            && rig.count("react answer") == 1 && rig.violations.isEmpty(),
+                    "chat@" + chat + " listen@" + listen + " cue in " + stateAt(rig, cueT) + " over@" + over
+                            + " turns=" + rig.turnAsks + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_a_silent_caller_still_gets_the_full_search_and_where", n -> {
+            Rig rig = talkRig(EMPTY_ROOM).started();
+            double start = sideCall(rig, Ears.Side.LEFT);
+            // The call's own end-of-utterance delivery during the first turn opens nothing.
+            rig.calledCue(900, 410, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, Float.NaN);
+            long where = runUntilEvent(rig, "react where", 410, 90000);
+            check(n, where > 0 && bearingsNear(lookBearings(rig, start), 15, 90, 135, 45, 0, -45, -90, -135, 180)
+                            && entered(rig, ExploreBrain.State.MEET, 410) < 0
+                            && entered(rig, ExploreBrain.State.CHAT_THINK, 410) < 0 && rig.violations.isEmpty(),
+                    "where@" + where + " looks=" + lookBearings(rig, start) + " " + rig.tail());
+        });
+        slowDetectorScenarios();
+    }
+
+    // ---- a slow detector during the call's search (robot 2026-09-30) ----
+    //
+    // Detection took 1.8-4.7 s a frame and the camera skips frames while one is detected, so
+    // the first frame taken after a stop was often published 2-5 s later; frames taken during
+    // the turn or before lookSettleMs were thrown away even with the caller in them, and he
+    // turned past someone he was looking straight at. A frame taken once the turn stopped is
+    // fresh now, callLookMs is 5000, a stale look with the caller in it counts when it was
+    // taken within callStaleLookDeg of where he faces, and a stale look arriving during the
+    // stop means the frame taken since is on its way.
+
+    /** A cue rig whose detector takes detectMs a frame, one frame at a time, arriving on this phase. */
+    private static Rig slowRig(Vision v, long detectMs, long phaseMs) {
+        // The robot's own settle (400 ms), not the test rigs' 200 ms.
+        Rig rig = cueRig(cueTuning().lookTiming(ROBOT_SETTLE_MS, 3000, 2000), CLEAR, v);
+        rig.lookEveryMs = detectMs;
+        rig.detectMs = detectMs;
+        rig.lookPhaseMs = phaseMs;
+        return rig;
+    }
+
+    private static final long ROBOT_SETTLE_MS = new ExploreTuning.Builder().build().lookSettleMs;
+
+    /** A person at this bearing (yaw frame, left positive), seen from where the frame was taken. */
+    private static Vision personAtShot(double bearingLeftDeg, double halfViewDeg) {
+        return (r, t) -> r.yaw != null && Math.abs(Heading.delta(r.yawAt(t), Heading.wrap(bearingLeftDeg)))
+                <= halfViewDeg ? list(facingPerson()) : list();
+    }
+
+    private static void slowDetectorScenarios() {
+        scenario("call_detect_2500_ms_a_frame_taken_200_ms_after_the_turn_ends_is_fresh_and_found_with_no_more_looks", n -> {
+            Rig probe = slowRig(EMPTY_ROOM, 2500, 0).started();
+            sideCall(probe, Ears.Side.LEFT);
+            long stop = runUntilState(probe, ExploreBrain.State.CUE_LOOK, 410, 20000);
+            long shot = stop + 200;
+            long phase = Math.floorMod(shot + 2500, 2500);
+            Rig rig = slowRig((r, t) -> Math.abs(t - shot) <= 50 ? list(facingPerson()) : list(), 2500, phase);
+            rig.started();
+            sideCall(rig, Ears.Side.LEFT);
+            long stop2 = runUntilState(rig, ExploreBrain.State.CUE_LOOK, 410, 20000);
+            long meet = runUntilState(rig, ExploreBrain.State.MEET, stop2, stop2 + 20000);
+            rig.runUntil(Math.max(meet, stop2) + 5000);
+            check(n, stop > 0 && stop2 == stop && meet > 0 && meet <= shot + 2500 + 200 && rig.cueLookYaws.size() == 1
+                            && rig.matchBoxes.size() == 1 && rig.count("react where") == 0 && rig.violations.isEmpty(),
+                    "stop@" + stop + " stop2@" + stop2 + " shot@" + shot + " meet@" + meet + " looks="
+                            + rig.cueLookYaws.size() + " " + rig.tail());
+        });
+        scenario("call_a_person_in_a_stale_look_20_deg_from_the_stop_is_found", n -> {
+            Rig probe = slowRig(EMPTY_ROOM, 2500, 0).started();
+            double start = sideCall(probe, Ears.Side.LEFT);
+            long stop = runUntilState(probe, ExploreBrain.State.CUE_LOOK, 410, 20000);
+            // When, in the turn into the first stop, he faced 70 deg left (20 deg short of it).
+            long at70 = -1;
+            for (double[] e : probe.yawLog) {
+                if (e[0] > 410 && e[0] <= stop && Heading.delta(start, e[1]) >= 70) {
+                    at70 = (long) e[0];
+                    break;
+                }
+            }
+            long shot = at70;
+            Rig rig = slowRig(personAtShot(start + 70, 10), 2500, Math.floorMod(shot + 2500, 2500));
+            rig.started();
+            sideCall(rig, Ears.Side.LEFT);
+            long stop2 = runUntilState(rig, ExploreBrain.State.CUE_LOOK, 410, 20000);
+            long meet = runUntilState(rig, ExploreBrain.State.MEET, stop2, stop2 + 30000);
+            rig.runUntil(Math.max(meet, stop2) + 5000);
+            System.out.println("REPORT call search, a person seen 20 deg short of the first stop in a frame taken"
+                    + " during the turn (detection 2500 ms): stop at " + stop2 + " ms, met at " + meet + " ms");
+            check(n, at70 > 0 && stop2 == stop && shot + 2500 >= stop2 && meet > 0 && meet <= shot + 2500 + 200
+                            && rig.cueLookYaws.size() == 1 && rig.count("react where") == 0 && rig.violations.isEmpty(),
+                    "at70@" + at70 + " stop@" + stop + " stop2@" + stop2 + " meet@" + meet + " looks="
+                            + rig.cueLookYaws.size() + " " + rig.tail());
+        });
+        scenario("call_detect_4500_ms_a_caller_at_90_left_is_found_on_look_1", n -> {
+            StringBuilder got = new StringBuilder();
+            boolean all = true;
+            for (long phase : new long[]{0, 1500, 3000}) {
+                // The heading at the call, from a probe run (the same up to the call).
+                Rig probe = slowRig(EMPTY_ROOM, 4500, phase).started();
+                probe.runUntil(400);
+                double start = probe.yaw.wrapped();
+                Rig real = slowRig(personAtShot(start + 90, 25), 4500, phase).started();
+                sideCall(real, Ears.Side.LEFT);
+                long stop = runUntilState(real, ExploreBrain.State.CUE_LOOK, 410, 20000);
+                long meet = runUntilState(real, ExploreBrain.State.MEET, 410, 40000);
+                got.append(" phase ").append(phase).append(": stop@").append(stop).append(" met@").append(meet)
+                        .append(" looks=").append(real.cueLookYaws.size());
+                all &= meet > 0 && real.cueLookYaws.size() == 1 && real.count("react where") == 0
+                        && real.violations.isEmpty();
+            }
+            System.out.println("REPORT call search, detection 4500 ms, a caller 90 deg left:" + got);
+            check(n, all, got.toString());
+        });
+        scenario("call_detect_4500_ms_an_empty_circle_still_reaches_where", n -> {
+            Rig rig = slowRig(EMPTY_ROOM, 4500, 0).started();
+            double start = sideCall(rig, Ears.Side.LEFT);
+            long where = runUntilEvent(rig, "react where", 410, 200000);
+            System.out.println("REPORT call search, an empty circle with detection 4500 ms: " + (where - 410)
+                    + " ms from the call to the where clip (stops " + cueLookLengths(rig) + " ms)");
+            check(n, where > 0 && bearingsNear(lookBearings(rig, start), 15, 90, 135, 45, 0, -45, -90, -135, 180)
+                            && rig.count("react answer") == 1 && rig.count("match") == 0 && rig.violations.isEmpty(),
+                    "where@" + where + " looks=" + lookBearings(rig, start) + " " + rig.tail());
         });
     }
 

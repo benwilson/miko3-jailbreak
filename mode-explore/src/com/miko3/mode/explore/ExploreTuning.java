@@ -150,6 +150,13 @@ final class ExploreTuning {
     /** After greeting a person or pet, people and pets are ignored this long (R12). */
     final long peopleCooldownMs;
     /**
+     * A roaming person pick whose face check found no face is a phantom (robot 2026-09-30:
+     * motion-blurred frames scored person about 0.5 while roaming): the meeting is dropped
+     * quietly and roaming person picks are ignored this long, so he does not go straight
+     * back to the same blur.
+     */
+    final long phantomPersonCooldownMs;
+    /**
      * Asking Claude (explore on Claude KTD6): askAttempts tries of askTimeoutMs
      * each before falling back to the detector (R7, R8). A spoken line is given
      * up on after sayTimeoutMs if the finished callback never comes (KTD8). The
@@ -228,8 +235,12 @@ final class ExploreTuning {
     final long answerClipMs;
     /**
      * Finding the caller (hey-miko plan U6; KTD6-KTD9). Each look of the call's search
-     * waits lookSettleMs, then has callLookMs to see a person (the first look after the
-     * camera opens has firstLookTimeoutMs, since a camera just opened has no look yet).
+     * takes any frame captured once the turn stopped (no lookSettleMs wait) and has
+     * callLookMs to see a person when no such frame arrives (the first look after the
+     * camera opens has firstLookTimeoutMs, since a camera just opened has no look yet);
+     * a stale look arriving during the stop means the frame captured since is on its way,
+     * so the stop waits for it too. A person in a stale look counts when the heading it
+     * was captured at is within callStaleLookDeg of where he faces now.
      * Found is a person box at least callPersonMinHeight of the frame tall, with no
      * aspect-ratio gate; one shorter than callNearHeight (about 1.5 m) is approached to
      * politeHeight, a taller one is met where it stands. After a search that finds
@@ -240,7 +251,14 @@ final class ExploreTuning {
      * callNearHeight and callListenMs.
      */
     final long callLookMs;
+    final double callStaleLookDeg;
     final float callPersonMinHeight;
+    /**
+     * The call search's own person-score floor, used instead of confidenceFloor only
+     * when looking for a caller (robot QA 2026-09-30: from the floor the detector scored
+     * a caller 0.27 and 0.32, below the curiosity floor). Curiosity keeps confidenceFloor.
+     */
+    final float callPersonMinScore;
     final float callNearHeight;
     final long callListenMs;
     final long whereClipMs;
@@ -614,6 +632,7 @@ final class ExploreTuning {
         disappointedMs = b.disappointedMs;
         puzzledMs = b.puzzledMs;
         peopleCooldownMs = b.peopleCooldownMs;
+        phantomPersonCooldownMs = Math.max(0, b.phantomPersonCooldownMs);
         askAttempts = Math.max(1, b.askAttempts);
         askTimeoutMs = b.askTimeoutMs;
         sayTimeoutMs = b.sayTimeoutMs;
@@ -639,7 +658,9 @@ final class ExploreTuning {
         ackClipMs = Math.max(0, b.ackClipMs);
         answerClipMs = Math.max(0, b.answerClipMs);
         callLookMs = Math.max(1, b.callLookMs);
+        callStaleLookDeg = Math.max(0, b.callStaleLookDeg);
         callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
+        callPersonMinScore = Math.max(0f, b.callPersonMinScore);
         callNearHeight = Math.max(0f, b.callNearHeight);
         callListenMs = Math.max(1, b.callListenMs);
         whereClipMs = Math.max(0, b.whereClipMs);
@@ -875,6 +896,8 @@ final class ExploreTuning {
         private long disappointedMs = 1400;
         private long puzzledMs = 1100;
         private long peopleCooldownMs = 120000;
+        // Robot 2026-09-30: four phantom meetings in four minutes; 20 s lets him roam off the blur.
+        private long phantomPersonCooldownMs = 20000;
         // Two tries of about 10 s (R7): a stop with Claude unreachable falls back
         // within ~20 s (AE4). Owner's call after live tests: a look usually takes ~3 s,
         // and a slow one is retried rather than waited on longer.
@@ -916,13 +939,21 @@ final class ExploreTuning {
         private long ackClipMs = 600;
         // Hey-miko plan KTD3: the answer clips run about half a second.
         private long answerClipMs = 600;
-        // Hey-miko plan U6, KTD6 and KTD9: PLACEHOLDERS until U7's QA on the robot. A 700 ms
-        // look after the settle; a person box an eighth of the frame tall is someone; under
+        // Hey-miko plan U6, KTD6 and KTD9: PLACEHOLDERS until U7's QA on the robot. A 5000 ms
+        // cap on a look with no fresh frame (robot 2026-09-30: detection took 1.8-4.7 s a frame and
+        // the camera skips frames while one is detected, so the first frame captured after a stop
+        // was often published 2-5 s later; QA earlier the same day saw "look in 2353 ms", "look in
+        // 1392 ms", "look in 1984 ms", when the old 700 ms ended most stops before any fresh frame);
+        // a stale look with the caller in it counts when captured within 30 deg of where he faces
+        // (the plan's looks are 45 deg apart); a person box an eighth of the frame tall is someone; under
         // 0.35 of it (the facing box at about 1.5 m is 0.4) is far enough to go over to; a 4 s listen
         // after "Where'd you go?" (react-where-1.webm is 0.8 s). KTD7's heading history
         // keeps 30 s (a call handed back by an escape is retaken with it), a sample a reading.
-        private long callLookMs = 700;
+        private long callLookMs = 5000;
+        private double callStaleLookDeg = 30;
         private float callPersonMinHeight = 0.12f;
+        // Robot QA 2026-09-30: a floor-level caller scored person 0.27 and 0.32.
+        private float callPersonMinScore = 0.25f;
         private float callNearHeight = 0.35f;
         private long callListenMs = 4000;
         private long whereClipMs = 900;
@@ -1187,6 +1218,7 @@ final class ExploreTuning {
             return this;
         }
         Builder peopleCooldownMs(long v) { peopleCooldownMs = v; return this; }
+        Builder phantomPersonCooldownMs(long v) { phantomPersonCooldownMs = v; return this; }
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
         Builder quietWaitMs(long v) { quietWaitMs = v; return this; }
@@ -1382,6 +1414,10 @@ final class ExploreTuning {
             this.callPersonMinHeight = personMinHeight;
             this.callNearHeight = nearHeight;
             this.callListenMs = listenMs;
+            return this;
+        }
+        Builder callPersonMinScore(float score) {
+            this.callPersonMinScore = score;
             return this;
         }
         Builder whereClipMs(long ms) {
