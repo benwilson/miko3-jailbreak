@@ -11,6 +11,10 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.Face;
+import android.graphics.Rect;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
@@ -79,6 +83,11 @@ final class ExploreCamera implements ExploreBrain.Camera {
      * last-nav.txt), overwritten each time. Never shared storage, never the log.
      */
     static final String NAV_DEBUG_TAG = "MikoExploreNavDebug";
+    /** Spike (2026-09-30): log.tag.MikoExploreHwFace=DEBUG turns on the camera's own
+     * face detection (SIMPLE) and logs the faces it reports, twice a second at most. */
+    static final String HW_FACE_TAG = "MikoExploreHwFace";
+    private Rect activeArray;
+    private long hwFaceLoggedMs;
     static final String LAST_NAV = "last-nav.jpg";
     static final String LAST_NAV_PROFILE = "last-nav.txt";
     /** The openness decode: a quarter of the camera's 640x480 (160x120). */
@@ -363,6 +372,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
             final Range<Integer> fps = fixedFpsRange(c);
             final int ev = maxCompensation(c);
             manualExposure = manualExposureRanges(c);
+            activeArray = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
             Size size = jpegSize(c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP));
             reader = ImageReader.newInstance(size.getWidth(), size.getHeight(), android.graphics.ImageFormat.JPEG, 2);
             reader.setOnImageAvailableListener(onImage, cameraHandler);
@@ -466,6 +476,32 @@ final class ExploreCamera implements ExploreBrain.Camera {
      * either these manual settings (AE off, as remote-control's CameraCapture) or,
      * when null, auto exposure at the largest compensation. False when it failed.
      */
+    /** The spike's per-frame result reader: faces as boxes 0..1 of the active array. */
+    private final CameraCaptureSession.CaptureCallback hwFaces = new CameraCaptureSession.CaptureCallback() {
+        @Override
+        public void onCaptureCompleted(CameraCaptureSession s, CaptureRequest r, TotalCaptureResult result) {
+            Face[] found = result.get(CaptureResult.STATISTICS_FACES);
+            Integer mode = result.get(CaptureResult.STATISTICS_FACE_DETECT_MODE);
+            long now = SystemClock.elapsedRealtime();
+            int n = found == null ? -1 : found.length;
+            if (n <= 0 && now - hwFaceLoggedMs < 2000 || n > 0 && now - hwFaceLoggedMs < 500) {
+                return;
+            }
+            hwFaceLoggedMs = now;
+            StringBuilder sb = new StringBuilder("hw faces mode=" + mode + " n=" + n);
+            if (found != null && activeArray != null) {
+                float w = activeArray.width(), h = activeArray.height();
+                for (Face f : found) {
+                    Rect b = f.getBounds();
+                    sb.append(String.format(java.util.Locale.US, " [%.2f,%.2f,%.2f,%.2f s=%d]",
+                            (b.left - activeArray.left) / w, (b.top - activeArray.top) / h,
+                            (b.right - activeArray.left) / w, (b.bottom - activeArray.top) / h, f.getScore()));
+                }
+            }
+            Log.i(HW_FACE_TAG, sb.toString());
+        }
+    };
+
     private boolean repeat(Brightness.Settings manual) {
         try {
             CaptureRequest.Builder b = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
@@ -483,7 +519,13 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
                 b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, sessionEv);
             }
-            session.setRepeatingRequest(b.build(), null, cameraHandler);
+            CameraCaptureSession.CaptureCallback faces = null;
+            if (Log.isLoggable(HW_FACE_TAG, Log.DEBUG)) {
+                b.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE);
+                faces = hwFaces;
+                Log.i(HW_FACE_TAG, "hardware face detection on (SIMPLE), active array " + activeArray);
+            }
+            session.setRepeatingRequest(b.build(), faces, cameraHandler);
             return true;
         } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
             Log.e(TAG, "setRepeatingRequest failed", e);
