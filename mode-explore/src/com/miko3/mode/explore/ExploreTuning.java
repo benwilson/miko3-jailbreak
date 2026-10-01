@@ -1206,9 +1206,11 @@ final class ExploreTuning {
         private double coverageCountsPerMetre = 3000;
         // About two of his body lengths: coarse enough that gyro drift barely moves a cell.
         private double coverageCellM = 0.5;
-        // A few minutes (R18): the 4 ft area the owner saw on 2026-09-25 took 15; after
-        // this an old area is fair game again, and dead-reckoning drift is forgotten.
-        private long coverageFadeMs = 180000;
+        // 30 minutes (owner, 2026-10-01: "if he's been somewhere in the last 30 minutes,
+        // he should try and find somewhere else to go"; was a few minutes under R18).
+        // Dead-reckoning drift builds up over that long, so the grid is only a rough
+        // guide; a visual place memory is the planned complement.
+        private long coverageFadeMs = 1800000;
         // The next leg or two.
         private double coverageLookaheadM = 1.5;
         // Like doorwayWeight: a fully new open band beats an equally open visited one by
