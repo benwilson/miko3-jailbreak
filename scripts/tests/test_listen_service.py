@@ -132,6 +132,13 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_burst_without_words_or_side_is_dropped",
         "ears_shove_then_sorry_is_strong",
         "ears_listen_expires_at_its_cap",
+        # Robot 2026-10-01: maxMs is the window to start answering; an answer begun
+        # in it (or just before it) runs to its endpoint, up to the hard cap.
+        "ears_answer_started_in_the_window_runs_past_max",
+        "ears_silent_listen_still_ends_at_max",
+        "ears_endless_answer_is_cut_at_the_hard_cap",
+        "ears_answer_begun_just_before_the_listen_is_its_answer",
+        "ears_wake_word_inside_a_long_answer_keeps_the_early_cue",
         "ears_logs_counters_not_words",
         # Ears CPU switches (2026-09-30): off by default, KTD2 unchanged.
         "ears_tuning_unset_is_ktd2",

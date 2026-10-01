@@ -555,6 +555,20 @@ public final class ListenServiceHarness {
             }
         }
 
+        /** One chunk, the client's renew and the session's tick, as the engine's ticker would run it. */
+        void step(boolean speech) {
+            chunk(speech);
+            session.renew("10001", false);
+            session.tick();
+        }
+
+        /** step()s for ms of audio. */
+        void steps(boolean speech, long ms) {
+            for (long t = 0; t < ms; t += 80) {
+                step(speech);
+            }
+        }
+
         boolean awaitMic(boolean open) throws InterruptedException {
             for (int i = 0; i < 200; i++) {
                 if (session.capturing() == open) {
@@ -1267,6 +1281,136 @@ public final class ListenServiceHarness {
                 r.clock.now += 200;
                 r.session.tick();
                 check(n, started && stillOn && !r.session.listening(), started + " " + stillOn + " " + r.session.listening());
+            }
+        });
+        // ---- Robot 2026-10-01: a conversation listen's maxMs is the window to START answering ----
+        scenario("ears_answer_started_in_the_window_runs_past_max", new Scenario() {
+            // Speech from 2.5 s for 4 s into a 4 s listen: the whole answer at about 7.3 s
+            // (6.5 s plus the recogniser's 0.8 s trailing silence), once, as the listen's.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false; // only a listen gives words a tier: a cue would be dropped
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 2480);
+                long start = r.clock.now + 80;
+                for (int i = 0; i < 50; i++) { // 4 s of speech
+                    r.step(true);
+                    r.rec.text = i < 25 ? "WE WENT" : "WE WENT TO THE BEACH WITH MY SISTER";
+                }
+                boolean pastMax = r.clock.now - t0 > 4000 && r.session.listening() && r.client.heard.isEmpty();
+                r.steps(false, 720);
+                r.rec.endpoint = true;
+                r.step(false);
+                long doneAt = r.clock.now - t0;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                r.steps(false, 1000);
+                check(n, pastMax && r.client.heard.size() == 1 && u != null
+                                && "WE WENT TO THE BEACH WITH MY SISTER".equals(u.text) && u.at == start && !u.partial
+                                && u.tier != CueClassifier.TIER_NONE && doneAt >= 7200 && doneAt <= 7500
+                                && !r.session.listening(),
+                        "pastMax=" + pastMax + " doneAt=" + doneAt + " start=" + start + " heard=" + r.heard()
+                                + " listening=" + r.session.listening());
+            }
+        });
+        scenario("ears_silent_listen_still_ends_at_max", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 3920);
+                boolean before = r.session.listening();
+                long at = r.clock.now - t0;
+                r.steps(false, 160);
+                check(n, before && at < 4000 && !r.session.listening() && r.client.heard.isEmpty(),
+                        "before=" + before + " at=" + at + " after=" + r.session.listening() + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_endless_answer_is_cut_at_the_hard_cap", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                r.step(true);
+                r.rec.text = "AND THEN AND THEN";
+                while (r.clock.now - t0 < EarsSession.LISTEN_HARD_CAP_MS - 80) {
+                    r.step(true);
+                }
+                boolean held = r.session.listening() && r.client.heard.isEmpty();
+                while (r.client.heard.isEmpty() && r.clock.now - t0 < EarsSession.LISTEN_HARD_CAP_MS + 1000) {
+                    r.step(true);
+                }
+                long cutAt = r.clock.now - t0;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, EarsSession.LISTEN_HARD_CAP_MS == 20000 && held && u != null
+                                && "AND THEN AND THEN".equals(u.text) && !u.partial && u.tier != CueClassifier.TIER_NONE
+                                && cutAt >= 20000 && cutAt <= 20160 && !r.session.listening(),
+                        "held=" + held + " cutAt=" + cutAt + " heard=" + r.heard() + " listening="
+                                + r.session.listening());
+            }
+        });
+        scenario("ears_answer_begun_just_before_the_listen_is_its_answer", new Scenario() {
+            // He finishes his question and they are already answering: speech that began
+            // within LISTEN_EARLY_START_MS of the listen opening is the listen's answer.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.step(true);
+                long start = r.clock.now;
+                r.rec.text = "YES I";
+                r.steps(true, 400);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(true, 4400);
+                r.rec.text = "YES I HAVE BEEN THERE TWICE";
+                boolean pastMax = r.clock.now - t0 > 4000 && r.session.listening();
+                r.rec.endpoint = true;
+                r.step(false);
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                // Speech begun well before the listen is not held open past maxMs.
+                Rig q = new Rig();
+                q.sw.on = false;
+                q.open(false);
+                q.steps(true, 1040);
+                long q0 = q.clock.now;
+                q.session.listen("10001", 4000);
+                q.steps(true, 4080);
+                boolean early = q.session.listening();
+                check(n, EarsSession.LISTEN_EARLY_START_MS == 500 && pastMax && r.client.heard.size() == 1
+                                && u != null && "YES I HAVE BEEN THERE TWICE".equals(u.text) && u.at == start
+                                && !r.session.listening() && !early && q.clock.now - q0 > 4000,
+                        "pastMax=" + pastMax + " heard=" + r.heard() + " stillOnForAnOldUtterance=" + early);
+            }
+        });
+        scenario("ears_wake_word_inside_a_long_answer_keeps_the_early_cue", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 2480);
+                r.step(true);
+                r.rec.text = "HEY MIKO";
+                r.spotter.hitNext = true;
+                r.step(true);
+                int early = r.client.heard.size();
+                r.rec.text = "HEY MIKO I SAW A WHALE";
+                r.steps(true, 3200);
+                boolean pastMax = r.clock.now - t0 > 4000 && r.session.listening() && r.client.heard.size() == 1;
+                r.rec.endpoint = true;
+                r.step(false);
+                EarsSession.Utterance e = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, early == 1 && e != null && e.kind == CueClassifier.KIND_WAKE_WORD && "".equals(e.text)
+                                && pastMax && r.client.heard.size() == 2 && f != null && f.called
+                                && "HEY MIKO I SAW A WHALE".equals(f.text) && f.at == e.at && !r.session.listening(),
+                        "early=" + early + " pastMax=" + pastMax + " heard=" + r.heard());
             }
         });
         scenario("ears_logs_counters_not_words", new Scenario() {

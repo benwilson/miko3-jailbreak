@@ -67,6 +67,11 @@ final class EarsSession {
     static final long DIRECTION_PERIOD_MS = 100;
     /** Speech already present this soon after the deaf window closed lost its head. */
     static final long PARTIAL_HEAD_MS = 120;
+    /** Robot 2026-10-01: a conversation listen's maxMs is the window to start answering; an
+     * answer begun in it runs to its endpoint, but never past this long after the listen opened. */
+    static final long LISTEN_HARD_CAP_MS = 20000;
+    /** Speech that began this soon before a listen opened (they answered as his question ended) is its answer. */
+    static final long LISTEN_EARLY_START_MS = 500;
     static final long SUMMARY_MS = 60000;
     /** The wake gate holds at most this much of an utterance (the oldest goes first). */
     static final int HELD_MAX_SAMPLES = SAMPLE_RATE * 10;
@@ -206,7 +211,10 @@ final class EarsSession {
 
     // Guarded by this.
     private Client client;
-    private long listenUntil; // 0 when no conversation listen is active
+    private long listenUntil; // 0 when no conversation listen is active; else the end of its start window
+    private long listenOpenedAt;
+    private long listenCapAt; // listenOpenedAt + LISTEN_HARD_CAP_MS
+    private boolean answering; // the utterance in progress is the open listen's answer
     private Thread captureThread;
     private boolean captureWanted;
     private long captureFailedAt = Long.MIN_VALUE / 4;
@@ -235,6 +243,8 @@ final class EarsSession {
     private int heldLen;
     private long uttDecodeNs;
     private long uttFed;
+    /** When the utterance in progress, a listen's answer, is cut; Long.MAX_VALUE when it is no answer. */
+    private long uttCapAt = Long.MAX_VALUE;
 
     // Decode cost per utterance (ms per chunk) and the worst chunk, since the last summary.
     private final Object statsLock = new Object();
@@ -302,7 +312,7 @@ final class EarsSession {
             throw new IllegalStateException("client already dead");
         }
         this.client = client;
-        this.listenUntil = 0;
+        closeListen();
         this.lastSummaryMs = clock.nowMs();
         diag.log("opened by uid " + holder + (chargerLatched ? " (charger latched)" : ""));
         reconcile();
@@ -328,19 +338,62 @@ final class EarsSession {
     }
 
     /**
-     * A conversation listen: for up to maxMs (clamped as a one-shot listen's
-     * cap) the switch does not apply. Ends at the first utterance delivered
-     * with words or strong (an early wake cue does not end it), or at the cap.
-     * False for a non-holder.
+     * A conversation listen: the switch does not apply while it is open. maxMs
+     * (clamped as a one-shot listen's cap) is the window to start answering
+     * (robot 2026-10-01): an utterance that starts inside it, or at most
+     * LISTEN_EARLY_START_MS before it opened, is its answer and holds it open
+     * to the utterance's own end (the endpoint or the hangover), cut at
+     * LISTEN_HARD_CAP_MS after the listen opened with the words so far. Ends
+     * at the first utterance delivered with words or strong (an early wake cue
+     * does not end it), at an answer's end once the start window is over, or,
+     * with no answer, at maxMs. False for a non-holder.
      */
     synchronized boolean listen(String holder, long maxMs) {
         if (!isHolder(holder)) {
             diag.log("listen refused from uid " + holder);
             return false;
         }
-        listenUntil = clock.nowMs() + ListenSession.clampCap(maxMs);
+        long now = clock.nowMs();
+        listenOpenedAt = now;
+        listenUntil = now + ListenSession.clampCap(maxMs);
+        listenCapAt = now + LISTEN_HARD_CAP_MS;
+        answering = false; // the next chunk claims an utterance in progress if it started in time
         reconcile();
         return true;
+    }
+
+    /** Caller holds the lock. No conversation listen. */
+    private void closeListen() {
+        listenUntil = 0;
+        answering = false;
+    }
+
+    /**
+     * Caller holds feedLock. Whether the utterance that started at startMs is
+     * the open listen's answer: its hard cap if so (marking the listen as
+     * answering), else Long.MAX_VALUE.
+     */
+    private long claimAnswer(long startMs) {
+        synchronized (this) {
+            if (listenUntil != 0 && startMs >= listenOpenedAt - LISTEN_EARLY_START_MS && startMs < listenUntil) {
+                answering = true;
+                return listenCapAt;
+            }
+            return Long.MAX_VALUE;
+        }
+    }
+
+    /** Caller holds feedLock. The answer in progress ended; past its start window the listen ends with it. */
+    private void answerEnded(long now) {
+        synchronized (this) {
+            if (!answering) {
+                return;
+            }
+            answering = false;
+            if (listenUntil != 0 && now >= listenUntil) {
+                closeListen();
+            }
+        }
     }
 
     /** Opens the deaf window for durationMs plus the tail, as a spoken line would. */
@@ -381,8 +434,11 @@ final class EarsSession {
     synchronized void tick() {
         long now = clock.nowMs();
         keeper.check(now);
-        if (listenUntil != 0 && now >= listenUntil) {
-            listenUntil = 0;
+        // An answer in progress holds the listen open; the capture cuts it at the hard
+        // cap, and this backstop ends the listen should the capture stall.
+        if (listenUntil != 0 && now >= listenUntil
+                && (!answering || now >= listenCapAt + ListenSession.BACKSTOP_MS)) {
+            closeListen();
         }
         reconcile();
         if (keeper.holder() != null && now - lastSummaryMs >= SUMMARY_MS) {
@@ -431,7 +487,7 @@ final class EarsSession {
         synchronized (this) {
             diag.log("released uid " + holder + ": " + reason + "; " + summary());
             client = null;
-            listenUntil = 0;
+            closeListen();
             reconcile();
         }
     }
@@ -587,6 +643,10 @@ final class EarsSession {
                 }
                 lastSpeechMs = now;
             }
+            if (inSpeech) {
+                // Every chunk: a listen opened mid-utterance claims it if it began in time.
+                uttCapAt = claimAnswer(speechStartMs);
+            }
             if (hit) {
                 wakes++;
                 if (inSpeech) {
@@ -625,7 +685,8 @@ final class EarsSession {
                     hold(samples, n);
                 }
                 boolean endpoint = recognising && recognizer.isEndpoint();
-                if (endpoint || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
+                // A listen's answer that will not stop is cut at the hard cap with the words so far.
+                if (endpoint || now >= uttCapAt || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
                     endUtterance(now, false);
                 }
             }
@@ -715,6 +776,11 @@ final class EarsSession {
         synchronized (this) {
             listening = listenUntil != 0;
         }
+        if (uttCapAt != Long.MAX_VALUE) {
+            // The listen's answer: tiered as heard in it, and the listen ends with it once its window is over.
+            uttCapAt = Long.MAX_VALUE;
+            answerEnded(now);
+        }
         int tier = classifier.tier(text, wasWake, listening, at);
         int side = CueClassifier.side(angle);
         if (direction.sideOnly()) {
@@ -751,6 +817,10 @@ final class EarsSession {
         angles.clear();
         recordDecode();
         recognizer.reset();
+        if (uttCapAt != Long.MAX_VALUE) {
+            uttCapAt = Long.MAX_VALUE;
+            answerEnded(clock.nowMs());
+        }
     }
 
     private void deliver(Utterance u) {
@@ -768,7 +838,7 @@ final class EarsSession {
                 weak++;
             }
             if (endsListen && listenUntil != 0 && (!u.text.isEmpty() || u.tier == CueClassifier.TIER_STRONG)) {
-                listenUntil = 0;
+                closeListen();
                 reconcile();
             }
         }
