@@ -234,6 +234,66 @@ final class ExplorePrompts {
             "open_doorway", type("boolean"),
             "x", type("integer"));
 
+    // ---- seeking the unfamiliar (owner 2026-10-01): a familiar curiosity stop's frames ----
+
+    /** The text before the frames: what they are, and why he asks. */
+    static String seekIntro(int frames, int width, int height) {
+        return "Miko is exploring the house, and everything around him looks familiar: he has been here lately"
+                + " and wants to go somewhere new. He turned in steps, taking " + frames + " photos in order,"
+                + " labelled Frame 1 to Frame " + frames + ". Each is " + width + " x " + height + " pixels.";
+    }
+
+    /**
+     * The label before frame i (0-based): which way it faces from Frame 1, how familiar
+     * it looked, whether his last search went there, and the detector's labels in it.
+     * Numbers and labels only, never a name (R15).
+     */
+    static String seekFrame(CuriosityPort.SeekFrame f, int i) {
+        StringBuilder b = new StringBuilder("Frame ").append(i + 1).append(" (");
+        long deg = Math.round(Math.abs(f.bearingDeg));
+        if (i == 0) {
+            b.append("his first look");
+        } else if (deg == 0) {
+            b.append("the same way as Frame 1");
+        } else {
+            b.append(deg).append(" deg ").append(f.bearingDeg > 0 ? "left" : "right").append(" of Frame 1");
+        }
+        if (Double.isNaN(f.novelty)) {
+            b.append("; too plain to tell whether he has seen it");
+        } else if (f.novelty > 0.5 || f.seenAgoMs < 0) {
+            b.append("; it looks new to him");
+        } else {
+            long min = Math.round(f.seenAgoMs / 60000.0);
+            b.append("; he saw this view ").append(min < 1 ? "under a minute" : min == 1 ? "1 minute" : min + " minutes")
+                    .append(" ago");
+        }
+        if (f.wentThere) {
+            b.append("; he went there on his last search, so somewhere else is better");
+        }
+        if (!f.labels.isEmpty()) {
+            b.append("; things in it: ");
+            for (int k = 0; k < f.labels.size(); k++) {
+                b.append(k == 0 ? "" : ", ").append(f.labels.get(k));
+            }
+        }
+        return b.append("):").toString();
+    }
+
+    /** The text after the frames: what counts as unexplored, and what to answer. */
+    static String seekAsk(int frames) {
+        return "Which frame and x position shows the most unexplored-looking place to go: an open doorway, a corridor,"
+                + " or a part of the room he hasn't been to? It must be open floor he can drive to; avoid walls,"
+                + " furniture, a closed door, stairs or a drop. Answer unexplored true with the frame number"
+                + (frames > 1 ? " (1 to " + frames + ")" : " (1)")
+                + " and x, the pixel column in that frame of the place to go (0 is the left edge)."
+                + " Answer unexplored false if nowhere looks worth going to.";
+    }
+
+    static final Map<String, Object> SEEK_SCHEMA = object(
+            "unexplored", type("boolean"),
+            "frame", type("integer"),
+            "x", type("integer"));
+
     // ---- schema building ----
 
     // ---- the conversation (meeting plan U8, KTD9, KTD11): the frozen system prefix and the turns ----

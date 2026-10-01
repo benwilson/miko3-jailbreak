@@ -149,6 +149,22 @@ interface CuriosityPort extends AnswerParser.Names {
     /** Abandon the running doorway(), if any: its late answer must never be returned. */
     void cancelDoorway();
 
+    // ---- seeking the unfamiliar (owner 2026-10-01) ----
+
+    /**
+     * Ask which of a familiar curiosity stop's frames shows the most unexplored-looking
+     * place to go, and where across it: answered like the way-out ask (WAY with the frame,
+     * an index into request.frames, and x; NONE; FAILED). The frames leave the robot only
+     * inside this request, described by numbers and detector labels, never a name (R15).
+     */
+    void seek(SeekRequest request, long timeoutMs);
+
+    /** The answer to the last seek(), or null while it is running. */
+    WayOut seekAnswer();
+
+    /** Abandon the running seek(), if any: its late answer must never be returned. */
+    void cancelSeek();
+
     // ---- people while roaming: the recently-met check (explore nav plan U7, KTD4, KTD8) ----
 
     /**
@@ -404,6 +420,16 @@ interface CuriosityPort extends AnswerParser.Names {
         }
 
         public void cancelDoorway() {
+        }
+
+        public void seek(SeekRequest request, long timeoutMs) {
+        }
+
+        public WayOut seekAnswer() {
+            return WayOut.failed();
+        }
+
+        public void cancelSeek() {
         }
 
         public void recentlyMet(RecentlyMetRequest request, long timeoutMs) {
@@ -892,6 +918,42 @@ interface CuriosityPort extends AnswerParser.Names {
             return status == Status.WAY
                     ? String.format(java.util.Locale.US, "way out in frame %d at x %.2f", frame, x)
                     : status.toString();
+        }
+    }
+
+    /** The seek request: a familiar stop's frames, in the order he took them. */
+    final class SeekRequest {
+        final List<SeekFrame> frames;
+
+        SeekRequest(List<SeekFrame> frames) {
+            this.frames = Collections.unmodifiableList(frames);
+        }
+    }
+
+    /**
+     * One frame of a seek request and what he knows about it: its bearing from the
+     * first frame (left positive), its place novelty (0 familiar .. 1 new; NaN: too
+     * plain to tell), how long ago he saw that view (-1: not seen), whether it looks
+     * like where his last seek went, and the detector's labels in it. Numbers and
+     * labels only (R15).
+     */
+    final class SeekFrame {
+        final Frame frame;
+        final double bearingDeg;
+        final double novelty;
+        final long seenAgoMs;
+        final boolean wentThere;
+        final List<String> labels;
+
+        SeekFrame(Frame frame, double bearingDeg, double novelty, long seenAgoMs, boolean wentThere,
+                  List<String> labels) {
+            this.frame = frame;
+            this.bearingDeg = bearingDeg;
+            this.novelty = novelty;
+            this.seenAgoMs = seenAgoMs;
+            this.wentThere = wentThere;
+            this.labels = labels == null ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(labels));
         }
     }
 

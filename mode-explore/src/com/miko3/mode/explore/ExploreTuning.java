@@ -683,6 +683,38 @@ final class ExploreTuning {
     final double placeSeenSim;
     final double placeSimHigh;
     final long placeGlanceMs;
+    /**
+     * The camera's upward pitch (measured on the robot, 2026-10-01): a frame position
+     * x (-1 left .. 1 right) lies atan2(x tan(cameraHalfFovDeg), cos(cameraPitchDeg))
+     * off his facing (RoamSteer.bearingOf), used where an exact bearing matters (the seek).
+     */
+    final double cameraPitchDeg;
+    /**
+     * Seeking the unfamiliar (owner, 2026-10-01: "if everything around him is familiar,
+     * he should find something that's unfamiliar and drive towards it"). A curiosity
+     * stop that ends with nothing new to react to is familiar when at least seekMinLooks
+     * of its looks were scored by the place memory and every one of them had novelty
+     * seekFamiliarNovelty or less; seekFamiliarScans such stops in a row (0: off) start
+     * a seek, at most one per seekGapMs (from the last seek's end). Claude picks the
+     * most unexplored-looking place among the stop's frames (seekAskTimeoutMs; offline,
+     * none or late: the least familiar frame's most open band). He turns to it and
+     * drives legs toward it, the steer adding up to seekWeight to the open bands nearest
+     * it, re-centring after each leg on the box Claude named or the most open band
+     * within seekRecentreDeg of where it should be. It ends on arrival (a look after a
+     * leg with novelty seekArriveNovelty or more, or through a remembered doorway), after
+     * seekMaxLegs legs or seekMaxCounts forward counts, when blocked, or when anything
+     * takes him out of roaming (a call, a person, a stop).
+     */
+    final int seekFamiliarScans;
+    final double seekFamiliarNovelty;
+    final int seekMinLooks;
+    final long seekGapMs;
+    final long seekAskTimeoutMs;
+    final int seekMaxLegs;
+    final long seekMaxCounts;
+    final double seekRecentreDeg;
+    final double seekArriveNovelty;
+    final float seekWeight;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -916,6 +948,17 @@ final class ExploreTuning {
         placeSeenSim = b.placeSeenSim;
         placeSimHigh = Math.max(b.placeSimLow + 1e-3, b.placeSimHigh);
         placeGlanceMs = Math.max(0, b.placeGlanceMs);
+        cameraPitchDeg = b.cameraPitchDeg;
+        seekFamiliarScans = Math.max(0, b.seekFamiliarScans);
+        seekFamiliarNovelty = b.seekFamiliarNovelty;
+        seekMinLooks = Math.max(1, b.seekMinLooks);
+        seekGapMs = Math.max(0, b.seekGapMs);
+        seekAskTimeoutMs = Math.max(1, b.seekAskTimeoutMs);
+        seekMaxLegs = Math.max(1, b.seekMaxLegs);
+        seekMaxCounts = Math.max(1, b.seekMaxCounts);
+        seekRecentreDeg = Math.max(0, b.seekRecentreDeg);
+        seekArriveNovelty = b.seekArriveNovelty;
+        seekWeight = Math.max(0f, b.seekWeight);
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
@@ -1207,6 +1250,7 @@ final class ExploreTuning {
         // frame, with the camera pitched up about 18 deg. Half of 62.6; the linear
         // centerX x halfFov mapping is within about 2 deg of the exact bearing.
         private double cameraHalfFovDeg = 31.3;
+        private double cameraPitchDeg = 18;
         private int legsMax = 16;
         private Navigation navigation = Navigation.CONTINUOUS;
         // A live look takes ~0.6 s and up to ~2.5 s; older than this he has moved on.
@@ -1348,6 +1392,24 @@ final class ExploreTuning {
         private double placeSimLow = 0.65;
         private double placeSeenSim = 0.75;
         private double placeSimHigh = 0.85;
+        // Seeking the unfamiliar: two familiar stops in a row (one scan can be a wall or a
+        // corner), every scored look at 0.3 or less (similarity 0.79 or more: nearly always
+        // the same place on the 2026-10-01 frames), at most once every three minutes.
+        private int seekFamiliarScans = 2;
+        private double seekFamiliarNovelty = 0.3;
+        private int seekMinLooks = 2;
+        private long seekGapMs = 180000;
+        // As the doorway ask: a few frames take Claude ~3-10 s live.
+        private long seekAskTimeoutMs = 15000;
+        // About 3 m (coverageCountsPerMetre 3000) or six legs, whichever comes first.
+        private int seekMaxLegs = 6;
+        private long seekMaxCounts = 9000;
+        private double seekRecentreDeg = 20;
+        // As coverageNovelAhead: a view at least this new is somewhere else.
+        private double seekArriveNovelty = 0.7;
+        // Twice the doorway's pull: the target beats an equally open band anywhere in view,
+        // but a blocked band never gains.
+        private float seekWeight = 0.6f;
         // A scan's looks stand for their headings about as long as a stop and the next leg.
         private long placeGlanceMs = 120000;
 
@@ -1647,6 +1709,25 @@ final class ExploreTuning {
             placeGlanceMs = glanceMs;
             return this;
         }
+        Builder cameraPitchDeg(double v) { cameraPitchDeg = v; return this; }
+        Builder seekTrigger(int familiarScans, double familiarNovelty, int minLooks, long gapMs) {
+            seekFamiliarScans = familiarScans;
+            seekFamiliarNovelty = familiarNovelty;
+            seekMinLooks = minLooks;
+            seekGapMs = gapMs;
+            return this;
+        }
+        Builder seekDrive(int maxLegs, long maxCounts, double recentreDeg, double arriveNovelty, float weight) {
+            seekMaxLegs = maxLegs;
+            seekMaxCounts = maxCounts;
+            seekRecentreDeg = recentreDeg;
+            seekArriveNovelty = arriveNovelty;
+            seekWeight = weight;
+            return this;
+        }
+        Builder seekAskTimeoutMs(long v) { seekAskTimeoutMs = v; return this; }
+        /** Never seeks the unfamiliar: roaming as before it. */
+        Builder seekOff() { seekFamiliarScans = 0; return this; }
         /** Novelty steering and long legs off: the roaming before U10 (the grid is still kept). */
         Builder coverageOff() { coverageWeight = 0f; return this; }
         Builder coverageTurns(float novelAhead, double turnScale) {

@@ -234,6 +234,25 @@ import java.util.Set;
  * row. It only lowers novelty: blocked bands and every safety stop rule as before;
  * looks without a print (or plain ones) change nothing.
  *
+ * Seeking the unfamiliar (owner 2026-10-01: "if everything around him is familiar,
+ * he should find something that's unfamiliar and drive towards it"): a curiosity stop
+ * that ends with nothing new to react to, whose scored looks were all familiar
+ * (seekFamiliarNovelty), for the seekFamiliarScans-th stop in a row and at most once
+ * per seekGapMs, starts a seek. Claude gets the stop's frames with their headings
+ * and how familiar each looked (labels and numbers only) and answers a frame and x,
+ * or none; offline, none, late or where the last seek went: the least familiar frame's
+ * most open band. Its heading is the frame's capture heading plus the exact bearing of
+ * x (RoamSteer.bearingOf). He stands thinking in PAUSE while Claude chooses, turns to
+ * it (measured), looks again, and drives roaming legs toward it (the steer pulls by
+ * seekWeight; no curiosity stops meanwhile), re-centring after each leg on the box
+ * Claude named or the most open band near where it should be. It ends on arrival (a
+ * look after a leg new enough, or through a remembered doorway), after seekMaxLegs or
+ * seekMaxCounts, on any hazard, stall or wedge (blocked), or when anything takes him
+ * out of roaming (a call, a person, the sensors or lease); the place is then marked in
+ * the place memory, so the next seek goes elsewhere. Notes start "seeking:" and carry
+ * numbers and detector labels only. It never moves him any way roaming would not: every
+ * stop rule above still holds.
+ *
  * People while roaming (explore nav plan U7, R9, R10, KTD4, KTD8): a detector person
  * box in a leg decision's look, with Claude set up, becomes a synthetic PERSON pick
  * (the look is its frame 0): FACE, APPROACH until the box is politeHeight of the
@@ -605,6 +624,44 @@ final class ExploreBrain {
     private double placeLookNovelty = Double.NaN;
     /** The print the last "seen before" note was about: each memory is noted once in a row. */
     private Object placeNoted;
+    /** How long ago the newest scored look's best match was taken (-1: none). */
+    private long placeLookAgeMs = -1;
+
+    // ---- seeking the unfamiliar (owner 2026-10-01) ----
+    /** One look of a curiosity stop's scan: its heading at capture (NaN: unusable) and how familiar it looked. */
+    private static final class SeekView {
+        final Look look;
+        final double heading;
+        final double novelty;
+        final long seenAgoMs;
+
+        SeekView(Look look, double heading, double novelty, long seenAgoMs) {
+            this.look = look;
+            this.heading = heading;
+            this.novelty = novelty;
+            this.seenAgoMs = seenAgoMs;
+        }
+    }
+
+    /** The current (or last) curiosity stop's looks, in order. */
+    private final List<SeekView> seekScan = new ArrayList<SeekView>();
+    /** Stops in a row that ended with nothing new and looked familiar; whether the last one ended with nothing. */
+    private int familiarStops;
+    private boolean lastStopNothing = true;
+    /** The seek request is out (sent at seekAskAt, with these frames, in order). */
+    private boolean seekAsking;
+    private long seekAskAt;
+    private List<SeekView> seekFrames = new ArrayList<SeekView>();
+    /** The heading the seek drives toward (NaN: no seek under way), and what it is aiming at. */
+    private double seekTarget = Double.NaN;
+    private String seekLabel;
+    private PlaceMemory.Print seekPrint;
+    /** Legs driven toward it, the forward counts at its start, and whether the first turn to face it was made. */
+    private int seekLegs;
+    private long seekFromCounts;
+    private boolean seekTurned;
+    /** No seek starts before this (seekGapMs after the last one ended). */
+    private long seekNextAt;
     /** Times of the hazard reactions since the last successful hop, for the cornered cap. */
     private final ArrayDeque<Long> hazardTimes = new ArrayDeque<Long>();
 
@@ -1214,6 +1271,16 @@ final class ExploreBrain {
         return compass;
     }
 
+    /** The heading a seek is driving toward, NaN for none (seeking the unfamiliar), for tests and logs. */
+    double seekHeading() {
+        return seekTarget;
+    }
+
+    /** A seek is under way: asking Claude where to go, or heading there. */
+    boolean seeking() {
+        return seekAsking || !Double.isNaN(seekTarget);
+    }
+
     /** The remembered open doorway's heading, NaN for none (explore nav plan U6), for tests and logs. */
     double doorwayHeading() {
         return doorway;
@@ -1301,6 +1368,16 @@ final class ExploreBrain {
         cancelMetCheck();
         planner.reset();
         coverage.clear();
+        if (seekAsking) {
+            port.cancelSeek();
+        }
+        seekAsking = false;
+        seekTarget = Double.NaN;
+        seekPrint = null;
+        seekLabel = null;
+        seekFrames.clear();
+        seekScan.clear();
+        familiarStops = 0;
         places.clear();
         placeLook = null;
         placeNoted = null;
@@ -1416,6 +1493,7 @@ final class ExploreBrain {
         boolean hazard = s == HazardClassifier.Status.HAZARD;
         watchLooks(now);
         doorwayStep(now);
+        seekStep(now);
         metCheckStep(now);
         takeHeldCue(now);
         switch (state) {
@@ -1482,6 +1560,7 @@ final class ExploreBrain {
                     if (doorwayLeg) {
                         note("through the doorway at " + Math.round(doorway) + " deg");
                         forgetDoorway();
+                        endSeek(now, true, "through the doorway");
                     }
                     legDriven(now);
                 } else if (blockedAheadInLeg()) {
@@ -1656,6 +1735,9 @@ final class ExploreBrain {
     /** A roaming leg ended without a hazard or stall (its time, or the camera saw the way blocked). */
     private void legDriven(long now) {
         stopMotors();
+        if (!Double.isNaN(seekTarget)) {
+            seekLegs++;
+        }
         if (legWentNowhere(now)) {
             // Too short for the stall watch to rule, but the encoders say he never moved:
             // not a drive-off, so the blocked ways stay avoided.
@@ -1686,7 +1768,10 @@ final class ExploreBrain {
             awayLeg = null;
             note("first leg after the conversation: turning " + d + ", away from them");
             enterLook(now, d, false, timedMs(tuning.chatAwayDeg), tuning.chatAwayDeg);
-        } else if (!hopNext && camera.available() && now >= curiosityAt && now >= curiosityOffUntil) {
+        } else if (seekAsking) {
+            // Claude is choosing where to go (seekStep): he stands and thinks.
+            return;
+        } else if (!hopNext && !seeking() && camera.available() && now >= curiosityAt && now >= curiosityOffUntil) {
             enterScan(now);
         } else if (hopNext) {
             startHop(now);
@@ -1754,18 +1839,34 @@ final class ExploreBrain {
      * is confident, else as before the camera roamed: a random turn or a hop.
      */
     private void chooseLeg(long now, Look look) {
-        double door = doorwayBearing(now);
-        if (look != null && steer.doorwayReadsBlocked(look.openness, door)) {
+        if (!Double.isNaN(seekTarget) && seekLook(now, look)) {
+            return;
+        }
+        boolean seek = !Double.isNaN(seekTarget);
+        double door = seek ? seekBearing(now) : doorwayBearing(now);
+        if (!seek && look != null && steer.doorwayReadsBlocked(look.openness, door)) {
             note("the doorway at " + Math.round(doorway) + " deg reads blocked now: forgotten");
             forgetDoorway();
             door = Double.NaN;
         }
-        RoamSteer.Novelty novelty = novelty(now, look);
+        // Seeking, the target alone pulls: every way around him is familiar anyway.
+        RoamSteer.Novelty novelty = seek ? null : novelty(now, look);
         if (novelty != null && coverage.tracking() && coverage.cells(now) != coverageNoted) {
             coverageNoted = coverage.cells(now);
             note("coverage: " + coverageNoted + " cells");
         }
-        RoamSteer.Plan plan = look == null ? null : steer.plan(look.openness, door, novelty);
+        RoamSteer.Plan plan = look == null ? null
+                : steer.plan(look.openness, door, novelty, seek ? tuning.seekWeight : tuning.doorwayWeight);
+        if (plan == null && seek && !Double.isNaN(door)) {
+            // No look to steer by: straight on toward it, after a turn if it is off to a side.
+            if (Math.abs(door) >= tuning.turnToleranceDeg) {
+                plannedTicks = drawTicks();
+                turnToward(now, door);
+            } else {
+                startHop(now);
+            }
+            return;
+        }
         doorwayLeg = false;
         if (plan != null) {
             note("steer: " + plan);
@@ -1879,6 +1980,7 @@ final class ExploreBrain {
             PlaceMemory.Match m = places.look(look.place, labels(look), heading, look.frameMs);
             placeLook = look;
             placeLookNovelty = m.novelty;
+            placeLookAgeMs = m.ageMs;
             if (m.seen() && m.print != placeNoted) {
                 placeNoted = m.print;
                 note(m.note());
@@ -1911,6 +2013,7 @@ final class ExploreBrain {
     private void refuse(long now) {
         HazardClassifier.Hazard h = classifier.hazard();
         note("hazard at start: " + h);
+        endSeek(now, false, "blocked: " + h);
         aheadBlocked();
         leaveStopForHazard();
         hopNext = false;
@@ -1978,7 +2081,9 @@ final class ExploreBrain {
         if (left < tuning.reaimMinTicks) {
             return false;
         }
-        double deg = steer.reaimDeg(look.openness, doorwayBearing(now), novelty(now, look));
+        boolean seek = !Double.isNaN(seekTarget);
+        double deg = seek ? steer.reaimDeg(look.openness, seekBearing(now), null, tuning.seekWeight)
+                : steer.reaimDeg(look.openness, doorwayBearing(now), novelty(now, look));
         if (Math.abs(deg) < tuning.reaimMinDeg) {
             return false;
         }
@@ -2007,6 +2112,7 @@ final class ExploreBrain {
     /** As above, for a hazard the classifier did not see (h null: side unknown). */
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
         recoverAfterStartle = false;
+        endSeek(now, false, h == null ? "blocked: wheels stalled" : "blocked: " + h);
         if (drivingForward() && (h == null || h.kind == HazardClassifier.Kind.OBSTACLE)) {
             stampBump(now);
         }
@@ -2240,6 +2346,12 @@ final class ExploreBrain {
 
     private void enterScan(long now) {
         note("curiosity stop: scanning");
+        if (!lastStopNothing) {
+            // The last stop found something to react to: not all familiar.
+            familiarStops = 0;
+        }
+        lastStopNothing = false;
+        seekScan.clear();
         // The next stop is scheduled now, so one cut short by a hazard is not retried at once.
         scheduleCuriosity(now);
         state = State.SCAN;
@@ -2409,13 +2521,13 @@ final class ExploreBrain {
             return;
         }
         if (state == State.SCAN) {
+            seekRecord(now, look);
             Sighting sighting = Sighting.choose(look.detections, tuning, ignorePeople);
             if (sighting.kind == Sighting.Kind.NOTHING) {
                 if (--scanLooksLeft > 0) {
                     startCuriosityTurn(now, scanDir, tuning.scanTurnMs, tuning.scanTurnDeg, false);
                 } else {
-                    note("nothing interesting here");
-                    endCuriosity(now);
+                    nothing(now, "nothing interesting here");
                 }
                 return;
             }
@@ -2852,6 +2964,7 @@ final class ExploreBrain {
 
     /** A Claude stop's scan look: keep it (and the detector's first sighting), and take them all (R1). */
     private void scanLook(long now, Look look, boolean ignorePeople) {
+        seekRecord(now, look);
         scanned.add(look);
         scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
         if (detectorPick == null) {
@@ -3034,6 +3147,8 @@ final class ExploreBrain {
     private void nothing(long now, String why) {
         note(why);
         endCuriosity(now);
+        lastStopNothing = true;
+        maybeSeek(now);
     }
 
     /** A thing he reacted to: into seen, and to the front of the request's reacted list. */
@@ -3156,8 +3271,7 @@ final class ExploreBrain {
     private void fallback(long now) {
         pick = null;
         if (detectorPick == null) {
-            note("no answer from Claude and the detector saw nothing; carrying on");
-            endCuriosity(now);
+            nothing(now, "no answer from Claude and the detector saw nothing; carrying on");
             return;
         }
         note("no answer from Claude; falling back to the detector's " + detectorPick);
@@ -5284,6 +5398,308 @@ final class ExploreBrain {
         doorwayLeg = false;
     }
 
+    // ---- seeking the unfamiliar (owner 2026-10-01) ----
+
+    /** A scan's look, for a seek: its heading at capture and how familiar it looked (scored once). */
+    private void seekRecord(long now, Look look) {
+        double novelty = placeNovelty(now, look);
+        seekScan.add(new SeekView(look, captureHeading(now, look), novelty, Double.isNaN(novelty) ? -1 : placeLookAgeMs));
+    }
+
+    /** The heading a look was captured at: the compass less what he has turned since; NaN when not usable. */
+    private double captureHeading(long now, Look look) {
+        if (!compass.usable(now)) {
+            return Double.NaN;
+        }
+        double turned = headingHistory.turnedSince(look.frameMs);
+        return Double.isNaN(turned) ? Double.NaN : Heading.wrap(compass.degrees() - turned);
+    }
+
+    /**
+     * A curiosity stop ended with nothing new (in PAUSE now): when its looks were familiar
+     * (at least seekMinLooks scored, every one seekFamiliarNovelty or less) for the
+     * seekFamiliarScans-th stop in a row, and none has run for seekGapMs, he seeks.
+     */
+    private void maybeSeek(long now) {
+        if (tuning.seekFamiliarScans <= 0 || seeking() || state != State.PAUSE) {
+            return;
+        }
+        int scored = 0;
+        double most = 0;
+        for (SeekView v : seekScan) {
+            if (!Double.isNaN(v.novelty)) {
+                scored++;
+                most = Math.max(most, v.novelty);
+            }
+        }
+        familiarStops = scored >= tuning.seekMinLooks && most <= tuning.seekFamiliarNovelty ? familiarStops + 1 : 0;
+        if (familiarStops < tuning.seekFamiliarScans || now < seekNextAt || !compass.usable(now)) {
+            return;
+        }
+        note(String.format(java.util.Locale.US,
+                "seeking: surroundings familiar (%d stops in a row, every look's novelty %.2f or less)", familiarStops,
+                most));
+        familiarStops = 0;
+        startSeek(now);
+    }
+
+    /** Ask Claude which of the stop's frames to go to; without Claude, the least familiar one. */
+    private void startSeek(long now) {
+        seekFrames.clear();
+        List<CuriosityPort.SeekFrame> frames = new ArrayList<CuriosityPort.SeekFrame>();
+        for (SeekView v : seekScan) {
+            if (Double.isNaN(v.heading) || v.look.jpeg == null) {
+                continue;
+            }
+            double from = seekFrames.isEmpty() ? v.heading : seekFrames.get(0).heading;
+            frames.add(new CuriosityPort.SeekFrame(new CuriosityPort.Frame(frames.size(), v.look.jpeg),
+                    Heading.delta(from, v.heading), v.novelty, v.seenAgoMs, places.soughtBefore(v.look.place, now),
+                    labels(v.look)));
+            seekFrames.add(v);
+        }
+        if (!port.canAsk() || frames.isEmpty()) {
+            seekFallback(now, "no Claude");
+            return;
+        }
+        seekAsking = true;
+        seekAskAt = now;
+        show(EyeState.THINKING, null);
+        note("seeking: asking Claude where to go (" + frames.size() + " frames)");
+        port.seek(new CuriosityPort.SeekRequest(frames), tuning.seekAskTimeoutMs);
+    }
+
+    /**
+     * Each step: the answer to take or give up on, and a seek that something took him
+     * away from (a call, a person, a stop, an escape) ends.
+     */
+    private void seekStep(long now) {
+        if (!seeking()) {
+            return;
+        }
+        if (!state.roams()) {
+            endSeek(now, false, state.cueSearch() ? (callsOwn() ? "a call" : "a voice")
+                    : "interrupted: " + state.name().toLowerCase(java.util.Locale.US));
+            return;
+        }
+        if (!seekAsking) {
+            return;
+        }
+        CuriosityPort.WayOut a = port.seekAnswer();
+        if (a != null) {
+            seekAsking = false;
+            seekAnswered(now, a);
+        } else if (now - seekAskAt >= tuning.seekAskTimeoutMs) {
+            seekAsking = false;
+            port.cancelSeek();
+            seekFallback(now, "no answer from Claude in " + tuning.seekAskTimeoutMs + " ms");
+        }
+    }
+
+    /** Claude's frame and x become the target; none, a failure or where he went last time: the fallback. */
+    private void seekAnswered(long now, CuriosityPort.WayOut a) {
+        if (a.status != CuriosityPort.WayOut.Status.WAY || a.frame < 0 || a.frame >= seekFrames.size()
+                || !(a.x >= -1f && a.x <= 1f)) {
+            seekFallback(now, a.status == CuriosityPort.WayOut.Status.NONE ? "Claude sees nowhere new"
+                    : "Claude's answer failed");
+            return;
+        }
+        SeekView v = seekFrames.get(a.frame);
+        if (places.soughtBefore(v.look.place, now)) {
+            seekFallback(now, "Claude picked where he went last time");
+            return;
+        }
+        aimSeek(now, v, a.x, String.format(java.util.Locale.US, "seeking: Claude picked frame %d x %.2f",
+                a.frame + 1, a.x));
+    }
+
+    /**
+     * Without a pick: the stop's least familiar look (by place novelty; plain views and
+     * where his last seek went don't count), aimed at its most open band (straight
+     * ahead when its openness isn't trusted; a look with nothing open is skipped).
+     */
+    private void seekFallback(long now, String why) {
+        SeekView best = null;
+        int bestAt = -1;
+        double bestX = 0;
+        for (int i = 0; i < seekScan.size(); i++) {
+            SeekView v = seekScan.get(i);
+            if (Double.isNaN(v.heading) || Double.isNaN(v.novelty) || places.soughtBefore(v.look.place, now)
+                    || (best != null && v.novelty <= best.novelty)) {
+                continue;
+            }
+            double x = steer.confident(v.look.openness) ? steer.mostOpenX(v.look.openness) : 0;
+            if (Double.isNaN(x)) {
+                continue;
+            }
+            best = v;
+            bestAt = i;
+            bestX = x;
+        }
+        if (best == null) {
+            endSeek(now, false, why + "; nowhere he hasn't been lately");
+            return;
+        }
+        aimSeek(now, best, bestX, String.format(java.util.Locale.US, "seeking: %s: least familiar frame %d x %.2f",
+                why, bestAt + 1, bestX));
+    }
+
+    /**
+     * The target: the look's heading at capture plus the exact bearing of x in it
+     * (RoamSteer.bearingOf, with the camera's measured pitch); the detector's box
+     * there, if any, is what a re-look re-centres on.
+     */
+    private void aimSeek(long now, SeekView v, double x, String what) {
+        double bearing = RoamSteer.bearingOf(x, tuning.cameraHalfFovDeg, tuning.cameraPitchDeg);
+        seekTarget = Heading.wrap(v.heading + bearing);
+        seekLabel = boxAt(v.look, x);
+        seekPrint = v.look.place;
+        seekLegs = 0;
+        seekFromCounts = forwardCounts;
+        seekTurned = false;
+        seekFrames.clear();
+        note(what + ": heading " + degrees(seekTarget) + " deg (bearing " + Math.round(bearing) + ")"
+                + (seekLabel == null ? "" : ", at a " + seekLabel));
+    }
+
+    /** The label of the detector's box (not a person) spanning x in the look, else null. */
+    private String boxAt(Look look, double x) {
+        if (look.detections == null) {
+            return null;
+        }
+        for (Detection d : look.detections) {
+            if (d.score >= tuning.confidenceFloor && CuriosityPort.Kind.of(d.label) != CuriosityPort.Kind.PERSON
+                    && x >= 2 * d.x0 - 1 && x <= 2 * d.x1 - 1) {
+                return d.label;
+            }
+        }
+        return null;
+    }
+
+    /** A heading as whole degrees, 0..359. */
+    private static long degrees(double heading) {
+        return Math.floorMod(Math.round(heading), 360L);
+    }
+
+    /** The seek target's bearing from his facing (left positive), NaN for none or no usable heading. */
+    private double seekBearing(long now) {
+        if (Double.isNaN(seekTarget) || !compass.usable(now)) {
+            return Double.NaN;
+        }
+        return Heading.delta(compass.degrees(), seekTarget);
+    }
+
+    /**
+     * A leg decision while seeking: arrived (a look after a leg that is new enough),
+     * out of legs or distance, the first turn to face it (true: started), or a re-centre
+     * on what the look shows there (the box Claude named, else the most open band
+     * within seekRecentreDeg of where the target should be).
+     */
+    private boolean seekLook(long now, Look look) {
+        if (seekLegs > 0 && look != null) {
+            double nov = placeNovelty(now, look);
+            if (!Double.isNaN(nov) && nov >= tuning.seekArriveNovelty) {
+                endSeek(now, true, String.format(java.util.Locale.US, "the place looks new, novelty %.2f", nov));
+                return false;
+            }
+        }
+        long driven = forwardCounts - seekFromCounts;
+        if (seekLegs >= tuning.seekMaxLegs || driven >= tuning.seekMaxCounts) {
+            endSeek(now, false, seekLegs + " legs, " + driven + " counts, nowhere new yet");
+            return false;
+        }
+        double expected = seekBearing(now);
+        if (Double.isNaN(expected)) {
+            endSeek(now, false, "heading not usable");
+            return false;
+        }
+        if (!seekTurned) {
+            seekTurned = true;
+            if (Math.abs(expected) >= tuning.turnToleranceDeg) {
+                // Turn only, then look again from there (the confirming look).
+                plannedTicks = 0;
+                turnToward(now, expected);
+                return true;
+            }
+        }
+        if (look == null) {
+            return false;
+        }
+        double found = seekFind(look, expected);
+        if (Double.isNaN(found)) {
+            note("seeking: leg " + seekLegs + ", nothing to re-centre on: keeping heading " + degrees(seekTarget) + " deg");
+        } else {
+            seekTarget = Heading.wrap(compass.degrees() + found);
+            note("seeking: leg " + seekLegs + ", re-centred by " + Math.round(found - expected) + " deg");
+        }
+        return false;
+    }
+
+    /** Where the target is in this look, as a bearing off his facing; NaN: not in view or not recognisable. */
+    private double seekFind(Look look, double expected) {
+        if (Math.abs(expected) > tuning.cameraHalfFovDeg) {
+            return Double.NaN;
+        }
+        if (seekLabel != null && look.detections != null) {
+            double best = Double.NaN;
+            for (Detection d : look.detections) {
+                if (d.score < tuning.confidenceFloor || !seekLabel.equals(d.label)) {
+                    continue;
+                }
+                double deg = RoamSteer.bearingOf(d.centerX(), tuning.cameraHalfFovDeg, tuning.cameraPitchDeg);
+                if (Math.abs(deg - expected) <= tuning.seekRecentreDeg
+                        && (Double.isNaN(best) || Math.abs(deg - expected) < Math.abs(best - expected))) {
+                    best = deg;
+                }
+            }
+            if (!Double.isNaN(best)) {
+                return best;
+            }
+        }
+        return steer.openBandNear(look.openness, expected, tuning.seekRecentreDeg);
+    }
+
+    /** A measured (or timed) turn toward a bearing, the long way round when that side is blocked. */
+    private void turnToward(long now, double bearing) {
+        Direction d = bearing > 0 ? Direction.LEFT : Direction.RIGHT;
+        double deg = Math.abs(bearing);
+        if (unblocked(d) != d) {
+            note("the " + d + " side is blocked: turning the long way round");
+            d = d.opposite();
+            deg = 360 - deg;
+        }
+        note("seeking: turning " + d + " " + Math.round(deg) + " deg to face it");
+        lastHazardSide = null;
+        enterLook(now, d, false, timedMs(deg), compass.usable(now) ? deg : 0);
+    }
+
+    /**
+     * The seek is over (why: numbers and reasons only): the place it went to is marked
+     * in the place memory (the target's view, and on arrival the view now), so the next
+     * seek goes elsewhere; the grid marked the ground he drove. No seek for seekGapMs.
+     */
+    private void endSeek(long now, boolean arrived, String why) {
+        if (!seeking()) {
+            return;
+        }
+        if (seekAsking) {
+            seekAsking = false;
+            port.cancelSeek();
+        }
+        note("seeking: " + (arrived ? "arrived" : "gave up") + " (" + why + ")");
+        places.markSought(seekPrint, now);
+        Look look = camera.latest();
+        if (arrived && look != null) {
+            places.markSought(look.place, now);
+        }
+        seekTarget = Double.NaN;
+        seekLabel = null;
+        seekPrint = null;
+        seekFrames.clear();
+        seekLegs = 0;
+        familiarStops = 0;
+        seekNextAt = now + tuning.seekGapMs;
+    }
+
     // ---- people while roaming (explore nav plan U7, R9, R10, KTD4, KTD8) ----
 
     /**
@@ -7146,6 +7562,7 @@ final class ExploreBrain {
         backForTurn = false;
         turnRetrying = false;
         cancelDoorway(clock.nowMs(), "lease or sensors lost");
+        endSeek(clock.nowMs(), false, "lease or sensors lost");
         cancelMetCheck();
         closeMeeting();
         gatedPick = null;

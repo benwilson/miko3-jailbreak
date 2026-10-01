@@ -416,6 +416,66 @@ class DoorwayRequestTest(unittest.TestCase):
             self.assertIn(words, ask)
 
 
+class SeekRequestTest(unittest.TestCase):
+    """Seeking the unfamiliar (owner 2026-10-01): the scan's frames with their headings
+    and how familiar each looked go to Claude in one small request, answered with a
+    frame and x or none, polled like the way-out ask, never written to disk. Only
+    numbers and detector labels describe the frames: never a name (R15)."""
+
+    def test_the_port_and_its_no_claude_stand_in_have_the_request(self):
+        port = code_only(src("CuriosityPort.java"))
+        for sig in (r"void seek\(SeekRequest request, long timeoutMs\);", r"WayOut seekAnswer\(\);",
+                    r"void cancelSeek\(\);"):
+            self.assertRegex(port, sig)
+        none = port[port.index("CuriosityPort NONE = new CuriosityPort()"):]
+        body = re.search(r"public WayOut seekAnswer\(\)\s*\{(.*?)\}", none, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn("WayOut.failed()", body.group(1))
+        frame = port[port.index("final class SeekFrame"):]
+        frame = frame[:frame.index("\n    }\n")]
+        for field in ("final Frame frame;", "final double bearingDeg;", "final double novelty;", "final long seenAgoMs;",
+                      "final boolean wentThere;", "final List<String> labels;"):
+            self.assertIn(field, frame)
+        self.assertNotRegex(frame, r"\bname\b")
+
+    def test_the_adapter_polls_a_slot_with_generations(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertIn("Slot<WayOut> seeks = new Slot<WayOut>()", a)
+        ask = re.search(r"public void seek\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("seeks.start()", ask)
+        self.assertIn("seeks.finish(g,", ask)
+        self.assertRegex(a, r"public WayOut seekAnswer\(\)\s*\{\s*return seeks\.poll\(\);")
+        self.assertRegex(a, r"public void cancelSeek\(\)\s*\{\s*seeks\.cancel\(\);")
+
+    def test_the_request_sends_the_frames_with_their_schema_and_writes_nothing(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        body = a[a.index("private WayOut findSeek("):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("ExplorePrompts.SEEK_SCHEMA", body)
+        self.assertIn("ExplorePrompts.seekFrame(", body)
+        self.assertIn("ClaudeReplies.seek(", body)
+        self.assertIn("ExplorePrompts.NAV_SYSTEM", body)
+        self.assertIn("ClaudeApi.jpegBlock(", body)
+        for disk in ("debugFace", "write(", "FileOutputStream", "getFilesDir"):
+            self.assertNotIn(disk, body, disk)
+
+    def test_the_prompt_asks_for_the_most_unexplored_place_by_frame_and_x(self):
+        p = src("ExplorePrompts.java")
+        schema = p[p.index("SEEK_SCHEMA = object("):]
+        schema = schema[:schema.index(");")]
+        for field in ("unexplored", "frame", "x"):
+            self.assertIn('"' + field + '"', schema)
+        ask = p[p.index("static String seekAsk("):]
+        ask = ask[:ask.index("\n    }\n")]
+        for words in ("unexplored", "open doorway", "corridor", "hasn't been", "frame number", "x, the pixel column",
+                      "unexplored false"):
+            self.assertIn(words, ask)
+        label = p[p.index("static String seekFrame("):]
+        label = label[:label.index("\n    }\n")]
+        self.assertIn("f.labels", label)
+        self.assertNotRegex(code_only(label), r"\bname\b")
+
+
 class RecentlyMetCheckTest(unittest.TestCase):
     """The recently-met check (explore nav plan U7, KTD4, KTD8): the roaming face crop
     against the faces of everyone met in the last 10 minutes, modelled on the match
@@ -491,7 +551,7 @@ class ClaudeLatencyIsLoggedTest(unittest.TestCase):
     def test_every_claude_call_logs_its_latency(self):
         body = code_only(src("ClaudeCuriosity.java"))
         calls = body.split("claude.messages(")[1:]
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(calls), 9)
         for i, after in enumerate(calls):
             window = after[:900]
             logs = re.findall(r"Log\.[diwe]\((.*?)\);", window, re.S)

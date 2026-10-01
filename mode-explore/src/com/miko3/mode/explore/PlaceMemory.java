@@ -271,6 +271,8 @@ final class PlaceMemory {
     /** Oldest first. */
     private final ArrayDeque<Glance> glances = new ArrayDeque<Glance>();
     private long lastKeptMs = Long.MIN_VALUE / 4;
+    /** Where his seeks went (seeking the unfamiliar): {print, when}, oldest first, kept for placeFadeMs. */
+    private final ArrayDeque<Kept> sought = new ArrayDeque<Kept>();
 
     PlaceMemory(ExploreTuning tuning) {
         this.tuning = tuning;
@@ -366,6 +368,37 @@ final class PlaceMemory {
         return !glances.isEmpty() && nowMs - glances.peekLast().atMs <= tuning.placeGlanceMs;
     }
 
+    /**
+     * A seek went to the place in this view (its target frame, or the view on arrival):
+     * the next seek's frames that look like it (placeSeenSim or more, whatever their
+     * age or heading) are where he went, and he picks somewhere else. Plain or null: nothing.
+     */
+    void markSought(Print p, long atMs) {
+        if (p == null || p.plain() || tuning.placeMax <= 0) {
+            return;
+        }
+        forget(atMs);
+        sought.addLast(new Kept(p, Double.NaN, atMs, Collections.<String>emptyList()));
+        while (sought.size() > tuning.placeMax) {
+            sought.pollFirst();
+        }
+    }
+
+    /** Whether this view looks like where a seek in the last placeFadeMs went. */
+    boolean soughtBefore(Print p, long nowMs) {
+        if (p == null || p.plain()) {
+            return false;
+        }
+        forget(nowMs);
+        for (Kept k : sought) {
+            double s = similarity(p, k.print);
+            if (!Double.isNaN(s) && s >= tuning.placeSeenSim) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Prints kept now. */
     int size() {
         return kept.size();
@@ -375,12 +408,16 @@ final class PlaceMemory {
     void clear() {
         kept.clear();
         glances.clear();
+        sought.clear();
         lastKeptMs = Long.MIN_VALUE / 4;
     }
 
     private void forget(long nowMs) {
         while (!kept.isEmpty() && nowMs - kept.peekFirst().atMs >= tuning.placeFadeMs) {
             kept.pollFirst();
+        }
+        while (!sought.isEmpty() && nowMs - sought.peekFirst().atMs >= tuning.placeFadeMs) {
+            sought.pollFirst();
         }
         while (!glances.isEmpty() && nowMs - glances.peekFirst().atMs > tuning.placeGlanceMs) {
             glances.pollFirst();

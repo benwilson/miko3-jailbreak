@@ -134,6 +134,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Answer> welcomes = new Slot<Answer>();
     private final Slot<WayOut> wayOuts = new Slot<WayOut>();
     private final Slot<Doorway> doorways = new Slot<Doorway>();
+    private final Slot<WayOut> seeks = new Slot<WayOut>();
     private final Slot<Recently> recents = new Slot<Recently>();
     /** The conversation (meeting plan U8): one turn, a notes delta, a forget and a keep at a time. */
     private final Slot<Turn> turns = new Slot<Turn>();
@@ -366,6 +367,60 @@ final class ClaudeCuriosity implements CuriosityPort {
         String outcome = r.ok() ? a.status.toString() : r.describe();
         Log.i(TAG, (request.second ? "second " : "") + "way-out request with " + n + " frames: " + outcome + " in "
                 + (System.currentTimeMillis() - t0) + " ms");
+        return a;
+    }
+
+    // ---- seeking the unfamiliar (owner 2026-10-01) ----
+
+    @Override
+    public void seek(final SeekRequest request, final long timeoutMs) {
+        final int g = seeks.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                seeks.finish(g, findSeek(request, timeoutMs));
+            }
+        }, seeks, g, WayOut.failed());
+    }
+
+    @Override
+    public WayOut seekAnswer() {
+        return seeks.poll();
+    }
+
+    @Override
+    public void cancelSeek() {
+        seeks.cancel();
+    }
+
+    /** The frames go only into this request (R15): nothing is kept, written or logged but counts. */
+    private WayOut findSeek(SeekRequest request, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        int n = request.frames.size();
+        if (n == 0) {
+            return WayOut.failed();
+        }
+        int[] w = new int[n];
+        int firstHeight = 0;
+        for (int i = 0; i < n; i++) {
+            int[] size = jpegSize(request.frames.get(i).frame.jpeg);
+            w[i] = size[0];
+            if (i == 0) {
+                firstHeight = size[1];
+            }
+        }
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        content.add(ClaudeApi.textBlock(ExplorePrompts.seekIntro(n, w[0], firstHeight)));
+        for (int i = 0; i < n; i++) {
+            content.add(ClaudeApi.textBlock(ExplorePrompts.seekFrame(request.frames.get(i), i)));
+            content.add(ClaudeApi.jpegBlock(request.frames.get(i).frame.jpeg));
+        }
+        content.add(ClaudeApi.textBlock(ExplorePrompts.seekAsk(n)));
+        ClaudeApi.MessageResult r = claude.messages(fetchSettings(), ExplorePrompts.NAV_SYSTEM, content,
+                ExplorePrompts.SEEK_SCHEMA, (int) timeoutMs);
+        WayOut a = r.ok() ? ClaudeReplies.seek(r.json, w) : WayOut.failed();
+        String outcome = r.ok() ? a.status.toString() : r.describe();
+        Log.i(TAG, "seek request with " + n + " frames: " + outcome + " in " + (System.currentTimeMillis() - t0) + " ms");
         return a;
     }
 

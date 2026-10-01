@@ -352,6 +352,11 @@ public final class ExploreBrainHarness {
         CuriosityPort.Doorway answer(Rig rig, int nth);
     }
 
+    /** The scripted seek answers (seeking the unfamiliar): the nth seek()'s answer, or null for none ever. */
+    interface SeekScript {
+        CuriosityPort.WayOut answer(Rig rig, CuriosityPort.SeekRequest request, int nth);
+    }
+
     /** One doorway ask as the fake Claude saw it: when, in which brain state, and the frame it carried. */
     static final class DoorAsk {
         final long t;
@@ -691,6 +696,13 @@ public final class ExploreBrainHarness {
         CuriosityPort.Doorway pendingDoorway;
         long pendingDoorwayAt;
         int doorwayCancels;
+        /** The fake seek request (seeking the unfamiliar): null script means every request fails. */
+        SeekScript seeks;
+        long seekDelayMs = 1000;
+        final List<CuriosityPort.SeekRequest> seekRequests = new ArrayList<CuriosityPort.SeekRequest>();
+        CuriosityPort.WayOut pendingSeek;
+        long pendingSeekAt;
+        int seekCancels;
         /** The fake recently-met check (explore nav plan U7): null script means every check fails. */
         MetScript metChecks;
         long metCheckDelayMs = 1000;
@@ -1472,6 +1484,31 @@ public final class ExploreBrainHarness {
         public void cancelDoorway() {
             pendingDoorway = null;
             doorwayCancels++;
+        }
+
+        @Override
+        public void seek(CuriosityPort.SeekRequest request, long timeoutMs) {
+            seekRequests.add(request);
+            pendingSeek = seeks == null ? CuriosityPort.WayOut.failed() : seeks.answer(this, request, seekRequests.size());
+            pendingSeekAt = now + seekDelayMs;
+            log.add(new Event(now, "seek " + request.frames.size() + " frames"));
+        }
+
+        @Override
+        public CuriosityPort.WayOut seekAnswer() {
+            if (pendingSeek == null || now < pendingSeekAt) {
+                return null;
+            }
+            CuriosityPort.WayOut a = pendingSeek;
+            pendingSeek = null;
+            log.add(new Event(now, "seek answer " + a.status));
+            return a;
+        }
+
+        @Override
+        public void cancelSeek() {
+            pendingSeek = null;
+            seekCancels++;
         }
 
         @Override
@@ -2790,6 +2827,7 @@ public final class ExploreBrainHarness {
         sideScenarios();
         backUpFirstScenarios();
         doorwayScenarios();
+        seekScenarios();
         peopleScenarios();
         steerWaitScenarios();
         cplHiccupScenarios();
@@ -8169,6 +8207,348 @@ public final class ExploreBrainHarness {
             }
         }
         return true;
+    }
+
+    // ---- seeking the unfamiliar (owner 2026-10-01: "find something that's unfamiliar and drive towards it") ----
+    //
+    // Continuous roaming with the gyro, curiosity stops every 15 s (three looks 40 deg
+    // apart, Claude finds nothing), prints kept every 0.5 s and counting after 5 s, so a
+    // room whose every view is the same reads familiar from the first stop.
+
+    private static ExploreTuning.Builder seekTuning() {
+        return navTuning().gyro(robotGyro())
+                .curiosityMs(15000, 15000)
+                .scan(3, 500).scanTurnDeg(40)
+                .ask(1, 4000)
+                .placeMemory(1800000, 300, 500, 5000)
+                .seekTrigger(2, 0.3, 2, 60000)
+                .seekDrive(4, 100000, 20, 0.7, 0.6f)
+                .seekAskTimeoutMs(5000);
+    }
+
+    private static Rig seekRig(ExploreTuning.Builder b, PlaceView place, SeekScript seeks) {
+        Rig rig = new Rig(b.build(), CLEAR, NOTHING, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+        rig.openView = ALL_OPEN;
+        rig.placeView = place;
+        rig.seeks = seeks;
+        rig.simWheels = true;
+        return rig;
+    }
+
+    /** The exact bearing (left positive) of a frame position x (-1 left .. 1 right): 31.3 deg half view, 18 deg up. */
+    private static double exactBearing(double x) {
+        return -Math.toDegrees(Math.atan2(x * Math.tan(Math.toRadians(31.3)), Math.cos(Math.toRadians(18))));
+    }
+
+    /** scene(1) with its first k colour blocks changed: a view a little unlike the familiar one. */
+    static PlaceMemory.Print blend(int k) {
+        return blend(k, 0);
+    }
+
+    /** As above, the changed blocks' colours drawn from seed: blends of different seeds differ as much. */
+    static PlaceMemory.Print blend(int k, long seed) {
+        java.util.Random r = new java.util.Random(1);
+        java.util.Random o = new java.util.Random(99 + seed);
+        int[] cells = new int[16 * 12];
+        for (int i = 0; i < cells.length; i++) {
+            cells[i] = (r.nextInt(256) << 16) | (r.nextInt(256) << 8) | r.nextInt(256);
+            if (i < k) {
+                cells[i] = (o.nextInt(256) << 16) | (o.nextInt(256) << 8) | o.nextInt(256);
+            }
+        }
+        int[] rgb = new int[80 * 60];
+        for (int y = 0; y < 60; y++) {
+            for (int x = 0; x < 80; x++) {
+                rgb[y * 80 + x] = cells[(y / 5) * 16 + x / 5];
+            }
+        }
+        return PlaceMemory.Print.of(rgb, 80, 60);
+    }
+
+    /** The first traced note starting with prefix, or null. */
+    private static String firstNote(List<String> notes, String prefix) {
+        for (String x : notes) {
+            if (x.startsWith(prefix, x.indexOf(' ') + 1)) {
+                return x;
+            }
+        }
+        return null;
+    }
+
+    /** The number after "re-centred by " in a note. */
+    private static double recentredBy(String note) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("re-centred by (-?\\d+) deg").matcher(note);
+        return m.find() ? Double.parseDouble(m.group(1)) : Double.NaN;
+    }
+
+    private static void seekScenarios() {
+        scenario("seek_bearing_is_exact_at_the_centre_the_edge_and_a_quarter_of_the_width", n -> {
+            ExploreTuning t = new ExploreTuning.Builder().build();
+            double c = RoamSteer.bearingOf(0, t.cameraHalfFovDeg, t.cameraPitchDeg);
+            double right = RoamSteer.bearingOf(1, t.cameraHalfFovDeg, t.cameraPitchDeg);
+            double left = RoamSteer.bearingOf(-1, t.cameraHalfFovDeg, t.cameraPitchDeg);
+            // Pixel 160 of 640 (a quarter of the width) is x -0.5; pixel 480 is x 0.5. The linear
+            // x * halfFov is "within about 2 deg" (2.1 at a quarter of the width).
+            double quarter = RoamSteer.bearingOf(-0.5, t.cameraHalfFovDeg, t.cameraPitchDeg);
+            double threeQ = RoamSteer.bearingOf(0.5, t.cameraHalfFovDeg, t.cameraPitchDeg);
+            check(n, t.cameraHalfFovDeg == 31.3 && t.cameraPitchDeg == 18 && Math.abs(c) < 1e-9
+                            && Math.abs(right - (-32.59)) < 0.05 && Math.abs(left - 32.59) < 0.05
+                            && Math.abs(quarter - 17.73) < 0.05 && Math.abs(threeQ + 17.73) < 0.05
+                            && Math.abs(quarter - exactBearing(-0.5)) < 1e-9
+                            && Math.abs(quarter - 0.5 * 31.3) <= 2.2 && Math.abs(right + 31.3) <= 2.2,
+                    "centre=" + c + " right=" + right + " left=" + left + " quarter=" + quarter + " 3q=" + threeQ);
+        });
+        scenario("seek_tuning_defaults_familiar_two_scans_every_three_minutes", n -> {
+            ExploreTuning t = new ExploreTuning.Builder().build();
+            check(n, t.seekFamiliarScans == 2 && t.seekFamiliarNovelty == 0.3 && t.seekMinLooks == 2
+                            && t.seekGapMs == 180000 && t.seekAskTimeoutMs == 15000 && t.seekMaxLegs == 6
+                            && t.seekMaxCounts == 9000 && t.seekRecentreDeg == 20 && t.seekArriveNovelty == 0.7
+                            && t.seekWeight == 0.6f && new ExploreTuning.Builder().seekOff().build().seekFamiliarScans == 0,
+                    "scans=" + t.seekFamiliarScans + " novelty=" + t.seekFamiliarNovelty + " gap=" + t.seekGapMs);
+        });
+        scenario("seek_familiar_room_triggers_and_claudes_frame_and_x_give_the_heading", n -> {
+            Rig rig = seekRig(seekTuning(), (r, t) -> scene(1), (r, req, k) -> CuriosityPort.WayOut.way(1, 0.5f));
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 300000, r -> !Double.isNaN(r.brain.seekHeading()));
+            double heading = rig.brain.seekHeading();
+            CuriosityPort.SeekRequest req = rig.seekRequests.isEmpty() ? null : rig.seekRequests.get(0);
+            Double at = req == null ? null : rig.lookHeadings.get(captured(req.frames.get(1).frame));
+            boolean familiarFrames = req != null && req.frames.size() == 3;
+            for (int i = 0; familiarFrames && i < 3; i++) {
+                CuriosityPort.SeekFrame f = req.frames.get(i);
+                familiarFrames = f.novelty <= 0.3 && f.seenAgoMs >= 0 && !f.wentThere && f.labels.isEmpty();
+            }
+            boolean bearings = req != null && Math.abs(req.frames.get(0).bearingDeg) < 1
+                    && Math.abs(Math.abs(req.frames.get(1).bearingDeg) - 40) < 8;
+            String why = firstNote(notes, "seeking: surroundings familiar");
+            String picked = firstNote(notes, "seeking: Claude picked frame 2 x 0.50: heading ");
+            long pickedAt = notedAt(notes, "seeking: Claude picked");
+            // He turns to it (measured), then looks again before any leg.
+            rig.runUntil(rig.now + 6000);
+            int turn = rig.firstAfter("turn", pickedAt);
+            int hop = rig.firstAfter("hop", pickedAt);
+            double after = rig.yaw.wrapped();
+            check(n, at != null && near(heading, Heading.wrap(at + exactBearing(0.5)), 3) && familiarFrames && bearings
+                            && why != null && picked != null && picked.endsWith("(bearing -18)")
+                            && turn >= 0 && hop > turn && near(after, heading, 8) && rig.violations.isEmpty(),
+                    "at=" + at + " heading=" + f1(heading) + " after=" + f1(after) + " why=" + why + " picked=" + picked
+                            + " frames=" + familiarFrames + " bearings=" + bearings + " " + rig.tail());
+        });
+        scenario("seek_legs_follow_the_heading_and_a_relook_recentres_it", n -> {
+            double[] w = {Double.NaN};
+            Rig rig = seekRig(seekTuning(), (r, t) -> scene(1), (r, req, k) -> CuriosityPort.WayOut.way(1, 0f));
+            // Once he seeks: only the floor 10 deg left of the target reads fully open.
+            rig.openView = (r, t) -> {
+                double sh = r.brain.seekHeading();
+                if (Double.isNaN(sh)) {
+                    return Double.isNaN(w[0]) ? prof(0.9f, 0.9f, 0.9f, 0.9f) : prof(0.9f, 0.5f, 0.5f, 0.5f);
+                }
+                if (Double.isNaN(w[0])) {
+                    w[0] = Heading.wrap(sh + 10);
+                }
+                float[] b = new float[Openness.BINS];
+                for (int i = 0; i < b.length; i++) {
+                    double offset = (i + 0.5) / b.length * 2 - 1;
+                    double world = r.yaw.wrapped() + exactBearing(offset);
+                    b[i] = Math.abs(Heading.delta(world, w[0])) <= 9 ? 0.95f : 0.5f;
+                }
+                return new Openness.Profile(b, 0.9f);
+            };
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 400000, r -> notedAt(notes, "seeking: gave up") >= 0 || notedAt(notes, "seeking: arrived") >= 0);
+            String recentred = firstNote(notes, "seeking: leg ");
+            double by = recentred == null ? Double.NaN : recentredBy(recentred);
+            long start = notedAt(notes, "seeking: Claude picked");
+            long end = notedAt(notes, "seeking: gave up");
+            String gaveUp = firstNote(notes, "seeking: gave up");
+            // Every forward leg during the seek drives within 15 deg of the open floor he was sent to.
+            int legs = 0;
+            boolean onCourse = true;
+            for (Drive d : rig.drives) {
+                if (d.t >= start && d.t < end && "hop".equals(d.kind)) {
+                    legs++;
+                    onCourse &= near(d.heading, w[0], 15);
+                }
+            }
+            check(n, start > 0 && end > start && Math.abs(by - 10) <= 5 && legs >= 3 && onCourse
+                            && gaveUp != null && gaveUp.contains("4 legs") && notesStarting(notes, "seeking: leg ") >= 3
+                            && rig.violations.isEmpty(),
+                    "by=" + f1(by) + " legs=" + legs + " onCourse=" + onCourse + " w=" + f1(w[0]) + " gaveUp=" + gaveUp
+                            + " drives=" + rig.drives + " " + notes.subList(Math.max(0, notes.size() - 12), notes.size()));
+        });
+        scenario("seek_without_claude_falls_back_to_the_least_familiar_frame", n -> {
+            // A view somewhat unlike the familiar one (84 of its 192 blocks changed, a fresh set of
+            // colours each stop: novelty about 0.05-0.7), counted familiar here (0.8 or less), but
+            // always the least familiar of its stop.
+            ExploreTuning.Builder b = seekTuning().seekTrigger(1, 0.8, 2, 60000);
+            PlaceMemory pm = new PlaceMemory(b.build());
+            int blendK = 84;
+            List<Long> blendShots = new ArrayList<Long>();
+            Rig rig = new Rig(b.build(), CLEAR, NOTHING, true);
+            rig.openView = ALL_OPEN;
+            rig.simWheels = true;
+            List<String> notes = traced(rig);
+            // Each scan's second look (after its first turn) shows a fresh blend; every other view is the same.
+            rig.placeView = (r, t) -> {
+                long scanAt = -1;
+                for (String x : notes) {
+                    if (x.contains("curiosity stop: scanning")) {
+                        scanAt = Long.parseLong(x.substring(0, x.indexOf(' ')));
+                    }
+                }
+                if (scanAt >= 0 && r.brain.state() == ExploreBrain.State.SCAN && r.countPrefix("turn", scanAt, t) == 1) {
+                    blendShots.add(t);
+                    return blend(blendK, scanAt);
+                }
+                return scene(1);
+            };
+            rig.started();
+            runUntil(rig, 400000, r -> !Double.isNaN(r.brain.seekHeading()));
+            double heading = rig.brain.seekHeading();
+            Double at = blendShots.isEmpty() ? null : rig.lookHeadings.get(blendShots.get(blendShots.size() - 1));
+            String fell = firstNote(notes, "seeking: no Claude: least familiar frame 2 ");
+            double nov = pm.novelty(PlaceMemory.similarity(scene(1), blend(blendK)));
+            check(n, at != null && near(heading, at, 3) && fell != null && rig.seekRequests.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "k=" + blendK + " nov=" + f1(nov) + " at=" + at + " heading=" + f1(heading) + " fell=" + fell + " "
+                            + notes.subList(Math.max(0, notes.size() - 10), notes.size()));
+        });
+        scenario("seek_a_blocked_leg_ends_the_seek_cleanly", n -> {
+            long[] blockAt = {Long.MAX_VALUE};
+            Rig[] h = new Rig[1];
+            Rig rig = new Rig(seekTuning().build(), t -> t >= blockAt[0] && t < blockAt[0] + 300 ? obstacle(t) : clear(t),
+                    NOTHING, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+            h[0] = rig;
+            rig.openView = ALL_OPEN;
+            rig.placeView = (r, t) -> scene(1);
+            rig.seeks = (r, req, k) -> CuriosityPort.WayOut.way(0, 0f);
+            rig.simWheels = true;
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 300000, r -> notedAt(notes, "seeking: Claude picked") >= 0);
+            long picked = rig.now;
+            runUntil(rig, picked + 30000, r -> r.firstAfter("hop", picked) >= 0);
+            blockAt[0] = rig.now + 300;
+            rig.runUntil(rig.now + 30000);
+            String end = firstNote(notes, "seeking: ");
+            String gaveUp = firstNote(notes, "seeking: gave up");
+            long endAt = notedAt(notes, "seeking: gave up");
+            check(n, gaveUp != null && gaveUp.contains("blocked") && endAt >= blockAt[0] && endAt < blockAt[0] + 300
+                            && !rig.brain.seeking() && Double.isNaN(rig.brain.seekHeading())
+                            && rig.firstAfter("hop", blockAt[0] + 3000) >= 0 && notedAt(notes, "seeking: arrived") < 0
+                            && rig.violations.isEmpty(),
+                    "blockAt=" + blockAt[0] + " end=" + end + " gaveUp=" + gaveUp + "@" + endAt + " " + rig.tail());
+        });
+        scenario("seek_after_arrival_the_next_seek_chooses_a_different_place", n -> {
+            // Three looks 120 deg apart: each faces its own third of the room, and each third
+            // always looks the same, until a seek's first leg reaches somewhere new.
+            List<String> holder = new ArrayList<String>();
+            ExploreTuning.Builder b = seekTuning().scanTurnDeg(120).seekTrigger(1, 0.3, 2, 20000);
+            // Claude goes back to where he went if it can: the brain must not.
+            Rig rig = seekRig(b, null, (r, req, k) -> {
+                for (int i = 0; i < req.frames.size(); i++) {
+                    if (req.frames.get(i).wentThere) {
+                        return CuriosityPort.WayOut.way(i, 0f);
+                    }
+                }
+                return CuriosityPort.WayOut.way(0, 0f);
+            });
+            List<String> notes = traced(rig);
+            rig.placeView = (r, t) -> {
+                long pickedAt = notedAt(notes, "seeking: Claude picked");
+                if (r.brain.seeking() && pickedAt >= 0 && r.countPrefix("hop", pickedAt, t) > 0
+                        && notesStarting(notes, "seeking: arrived") == 0) {
+                    return scene(5000 + t);
+                }
+                return scene(1 + (int) (Heading.wrap(r.yaw.wrapped()) / 120));
+            };
+            rig.started();
+            runUntil(rig, 200000, r -> notesStarting(notes, "seeking: arrived") >= 1);
+            boolean visited = rig.seekRequests.size() == 1;
+            CuriosityPort.SeekRequest first = visited ? rig.seekRequests.get(0) : null;
+            Double firstAt = first == null ? null : rig.lookHeadings.get(captured(first.frames.get(0).frame));
+            runUntil(rig, rig.now + 200000, r -> r.seekRequests.size() >= 2 && !Double.isNaN(r.brain.seekHeading()));
+            CuriosityPort.SeekRequest second = rig.seekRequests.size() >= 2 ? rig.seekRequests.get(1) : null;
+            int went = 0;
+            int wentFrame = -1;
+            for (int i = 0; second != null && i < second.frames.size(); i++) {
+                if (second.frames.get(i).wentThere) {
+                    went++;
+                    wentFrame = i;
+                }
+            }
+            Double wentAt = wentFrame < 0 ? null : rig.lookHeadings.get(captured(second.frames.get(wentFrame).frame));
+            double target = rig.brain.seekHeading();
+            int third = (int) (Heading.wrap(target) / 120);
+            boolean sameThirdAsWent = wentAt != null && third == (int) (Heading.wrap(wentAt) / 120);
+            boolean sameThirdAsFirst = firstAt != null && third == (int) (Heading.wrap(firstAt) / 120);
+            PlaceMemory.Print firstView = firstAt == null ? null : scene(1 + (int) (Heading.wrap(firstAt) / 120));
+            boolean marked = firstView != null && rig.brain.places().soughtBefore(firstView, rig.now);
+            rig.brain.shutdown();
+            boolean forgotten = firstView != null && !rig.brain.places().soughtBefore(firstView, rig.now);
+            check(n, visited && marked && forgotten && firstAt != null && second != null && went == 1 && wentAt != null
+                            && (int) (Heading.wrap(wentAt) / 120) == (int) (Heading.wrap(firstAt) / 120)
+                            && !Double.isNaN(target) && !sameThirdAsWent && !sameThirdAsFirst
+                            && notedAt(notes, "seeking: arrived (the place looks new") >= 0
+                            && notedAt(notes, "seeking: Claude picked where he went last time: least familiar frame") >= 0
+                            && rig.brain.places().size() == 0 && rig.violations.isEmpty(),
+                    "firstAt=" + firstAt + " went=" + went + " wentAt=" + wentAt + " target=" + f1(target) + " "
+                            + notes.subList(Math.max(0, notes.size() - 12), notes.size()));
+        });
+        scenario("seek_never_in_a_room_that_looks_new", n -> {
+            Rig rig = seekRig(seekTuning(), (r, t) -> scene(100000 + t), (r, req, k) -> CuriosityPort.WayOut.way(0, 0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(200000);
+            check(n, notesStarting(notes, "curiosity stop") >= 6 && notesStarting(notes, "seeking:") == 0
+                            && rig.seekRequests.isEmpty() && rig.violations.isEmpty(),
+                    "stops=" + notesStarting(notes, "curiosity stop") + " seeks=" + notesStarting(notes, "seeking:"));
+        });
+        scenario("seek_a_call_during_a_seek_is_answered", n -> {
+            Rig rig = seekRig(seekTuning().cueTurn(45, 90, 500, 2000, 600), (r, t) -> scene(1),
+                    (r, req, k) -> CuriosityPort.WayOut.way(0, 0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 300000, r -> notedAt(notes, "seeking: Claude picked") >= 0);
+            long picked = rig.now;
+            runUntil(rig, picked + 30000, r -> r.firstAfter("hop", picked) >= 0);
+            long cueT = rig.now + 200;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 70f);
+            rig.runUntil(cueT + 4000);
+            String gaveUp = firstNote(notes, "seeking: gave up");
+            long answered = answerAt(rig, cueT);
+            check(n, answered >= cueT && answered <= cueT + 500 && entered(rig, ExploreBrain.State.CUE_TURN, cueT) >= cueT
+                            && gaveUp != null && gaveUp.contains("a call") && !rig.brain.seeking() && rig.violations.isEmpty(),
+                    "answered=" + answered + " gaveUp=" + gaveUp + " " + rig.tail());
+        });
+        scenario("replies_seek_reads_frame_and_x_or_none_and_the_prompt_carries_numbers_and_labels_only", n -> {
+            int[] w = {640, 640, 640};
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("unexplored", Boolean.TRUE);
+            json.put("frame", 2L);
+            json.put("x", 160L);
+            CuriosityPort.WayOut ok = ClaudeReplies.seek(json, w);
+            json.put("frame", 4L);
+            CuriosityPort.WayOut fourth = ClaudeReplies.seek(json, w);
+            json.put("unexplored", Boolean.FALSE);
+            CuriosityPort.WayOut none = ClaudeReplies.seek(json, w);
+            json.remove("unexplored");
+            CuriosityPort.WayOut missing = ClaudeReplies.seek(json, w);
+            CuriosityPort.SeekFrame f = new CuriosityPort.SeekFrame(new CuriosityPort.Frame(1, new byte[]{1}), -40, 0.1,
+                    720000, true, java.util.Arrays.asList("chair", "desk"));
+            String label = ExplorePrompts.seekFrame(f, 1);
+            String ask = ExplorePrompts.seekAsk(3);
+            check(n, ok.status == CuriosityPort.WayOut.Status.WAY && ok.frame == 1 && Math.abs(ok.x + 0.5f) < 0.01
+                            && fourth.status == CuriosityPort.WayOut.Status.FAILED
+                            && none.status == CuriosityPort.WayOut.Status.NONE
+                            && missing.status == CuriosityPort.WayOut.Status.FAILED
+                            && label.startsWith("Frame 2") && label.contains("40 deg right of Frame 1")
+                            && label.contains("12 minutes ago") && label.contains("went there") && label.contains("chair, desk")
+                            && ask.contains("1 to 3") && ask.contains("open doorway") && ask.contains("corridor"),
+                    "ok=" + ok + " label=" + label + " ask=" + ask);
+        });
     }
 
     private static void doorwayScenarios() {

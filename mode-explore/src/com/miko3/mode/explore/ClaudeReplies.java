@@ -67,7 +67,21 @@ final class ClaudeReplies {
      * or anything missing is a failure; way_out false is NONE.
      */
     static CuriosityPort.WayOut wayOut(Map<String, Object> json, int[] widths) {
-        Object way = json.get("way_out");
+        return framePick(json, "way_out", widths);
+    }
+
+    /**
+     * The seek reply (seeking the unfamiliar): read like the way-out reply, with
+     * "unexplored" in place of "way_out": the frame and x of the most unexplored-looking
+     * place to go, or NONE.
+     */
+    static CuriosityPort.WayOut seek(Map<String, Object> json, int[] widths) {
+        return framePick(json, "unexplored", widths);
+    }
+
+    /** A frame and x behind a yes/no flag (the way-out and seek replies). */
+    private static CuriosityPort.WayOut framePick(Map<String, Object> json, String flag, int[] widths) {
+        Object way = json.get(flag);
         if (Boolean.FALSE.equals(way)) {
             return CuriosityPort.WayOut.none();
         }

@@ -94,6 +94,18 @@ class PlaceMemoryIsPlainJavaTest(unittest.TestCase):
         self.assertNotIn("import android", src)
         self.assertNotIn("com.miko3.shared", src)
 
+    def test_where_seeks_went_fades_and_is_forgotten_with_the_rest(self):
+        """Seeking the unfamiliar marks where a seek went; it is kept no longer than any
+        print (placeFadeMs) and goes at shutdown with everything else."""
+        src = code_only((PKG / "PlaceMemory.java").read_text())
+        clear = re.search(r"void clear\(\) \{(.*?)\n    \}", src, re.S).group(1)
+        self.assertIn("sought.clear()", clear)
+        forget = re.search(r"private void forget\(long nowMs\) \{(.*?)\n    \}", src, re.S).group(1)
+        self.assertIn("sought.peekFirst().atMs >= tuning.placeFadeMs", forget)
+        mark = re.search(r"void markSought\(Print p, long atMs\) \{(.*?)\n    \}", src, re.S).group(1)
+        self.assertIn("p.plain()", mark)
+        self.assertIn("tuning.placeMax", mark)
+
     def test_real_frames_are_present(self):
         self.assertEqual(len(list(FRAMES.glob("*.rgb"))), 9)
         self.assertIn("pair ", (FRAMES / "expected.txt").read_text())

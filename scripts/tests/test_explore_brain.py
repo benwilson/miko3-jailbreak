@@ -362,6 +362,17 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "place_an_unusable_heading_still_lowers_the_view_it_has_seen",
         "place_plain_frames_roam_exactly_as_with_no_prints",
         "place_memory_is_forgotten_at_shutdown",
+        # Seeking the unfamiliar (owner 2026-10-01: "find something that's unfamiliar and drive towards it")
+        "seek_bearing_is_exact_at_the_centre_the_edge_and_a_quarter_of_the_width",
+        "seek_tuning_defaults_familiar_two_scans_every_three_minutes",
+        "seek_familiar_room_triggers_and_claudes_frame_and_x_give_the_heading",
+        "seek_legs_follow_the_heading_and_a_relook_recentres_it",
+        "seek_without_claude_falls_back_to_the_least_familiar_frame",
+        "seek_a_blocked_leg_ends_the_seek_cleanly",
+        "seek_after_arrival_the_next_seek_chooses_a_different_place",
+        "seek_never_in_a_room_that_looks_new",
+        "seek_a_call_during_a_seek_is_answered",
+        "replies_seek_reads_frame_and_x_or_none_and_the_prompt_carries_numbers_and_labels_only",
         # The leg decision waits for a look to steer by (explore nav plan KTD9, live 2026-09-25)
         "steer_waits_for_a_look_after_a_turn_and_uses_the_legs_own_looks",
         "steer_wait_times_out_to_todays_leg_and_never_waits_with_the_camera_backed_off",
