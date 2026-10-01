@@ -393,6 +393,16 @@ final class ExploreTuning {
      */
     final long blockedTurnWaitMs;
     final long stallRecoverWindowMs;
+    /**
+     * Robot 2026-10-01 16:42: the cutout re-arms on every attempt that reads zero (a measured
+     * turn under stallRecoverProbeDeg with still wheels, a back-up stalled at 0, a forward
+     * stall), so each such attempt waits in RECOVER again, up to this many waits a stuck
+     * spell (until he drives off cleanly). A wait whose probes never move tries the escape
+     * again while waits are left; only after the cap (or a probe that found the board alive
+     * but the way blocked) do the jam, wriggle and help path run. After each recovery the
+     * first move is still the straight back-out.
+     */
+    final int recoverMaxPerSpell;
     final float callPersonMinHeight;
     /**
      * The call search's own person-score floor, used instead of confidenceFloor only
@@ -791,9 +801,22 @@ final class ExploreTuning {
      * where to go or in place of the frame it picked (likely the most unexplored way
      * out), once per report. A target that reads blocked when faced is re-aimed at the
      * most open band within seekBlockedAimDeg of it; nothing open there ends the seek.
+     *
+     * Openness never vetoes Claude's target (robot 2026-10-01 16:35: open hallway carpet
+     * read 0.00, a white wall 0.81). A target Claude chose (its pick, or a doorway it
+     * reported; not the least familiar fallback) that reads blocked is driven anyway, in
+     * legs of steerShortTicks at most, so the floor sensor, CPL, stall and RECOVER rules
+     * get a fresh say often; up to seekTrustedLegsMax such legs per seek (they don't count
+     * toward seekMaxLegs; seekMaxCounts still caps the distance). A real hazard or CPL
+     * refusal toward it (or a hazard there just now) turns the seek seekBlockedAimDeg off
+     * the target, away from the hazard, once; the next one ends it. The same short leg
+     * goes toward a remembered doorway outside a seek that reads blocked, and toward a
+     * doorway Claude reported in the last seekDoorwayMs when a look-around finds nothing
+     * open (instead of boxed in).
      */
     final long seekDoorwayMs;
     final double seekBlockedAimDeg;
+    final int seekTrustedLegsMax;
     /**
      * Seeking somewhere new by time and ground (owner, 2026-10-01: "if he's been somewhere
      * in the last 30 minutes, he should try and find somewhere else to go"). Live, Claude
@@ -939,6 +962,7 @@ final class ExploreTuning {
         blockedTurnWaitMs = Math.max(0, b.blockedTurnWaitMs);
         jamProbeAtMs = positiveSorted(b.jamProbeAtMs);
         stallRecoverWindowMs = Math.max(0, b.stallRecoverWindowMs);
+        recoverMaxPerSpell = Math.max(1, b.recoverMaxPerSpell);
         callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
         callPersonMinScore = Math.max(0f, b.callPersonMinScore);
         callNearHeight = Math.max(0f, b.callNearHeight);
@@ -1069,6 +1093,7 @@ final class ExploreTuning {
         seekRecentreDeg = Math.max(0, b.seekRecentreDeg);
         seekDoorwayMs = Math.max(0, b.seekDoorwayMs);
         seekBlockedAimDeg = Math.max(0, b.seekBlockedAimDeg);
+        seekTrustedLegsMax = Math.max(1, b.seekTrustedLegsMax);
         seekArriveNovelty = b.seekArriveNovelty;
         seekWeight = Math.max(0f, b.seekWeight);
         seekEveryMs = Math.max(0, b.seekEveryMs);
@@ -1332,6 +1357,7 @@ final class ExploreTuning {
         private long[] jamProbeAtMs = {30000, 60000, 120000};
         // Just past the longest cutout seen (29 s).
         private long stallRecoverWindowMs = 30000;
+        private int recoverMaxPerSpell = 3;
         private float callPersonMinHeight = 0.12f;
         // Robot QA 2026-09-30: a floor-level caller scored person 0.27 and 0.32.
         private float callPersonMinScore = 0.25f;
@@ -1545,6 +1571,7 @@ final class ExploreTuning {
         private double seekRecentreDeg = 20;
         private long seekDoorwayMs = 180000;
         private double seekBlockedAimDeg = 45;
+        private int seekTrustedLegsMax = 16;
         // As coverageNovelAhead: a view at least this new is somewhere else.
         private double seekArriveNovelty = 0.7;
         // Twice the doorway's pull: the target beats an equally open band anywhere in view,
@@ -1711,6 +1738,7 @@ final class ExploreTuning {
             return this;
         }
         Builder stallRecoverWindowMs(long v) { stallRecoverWindowMs = v; return this; }
+        Builder recoverMaxPerSpell(int v) { recoverMaxPerSpell = v; return this; }
         Builder stallRecoverProbeBackTicks(int v) { stallRecoverProbeBackTicks = v; return this; }
         Builder blockedTurnWaitMs(long v) { blockedTurnWaitMs = v; return this; }
         /** The jammed rest's probe times, in ms after he was found jammed; then every jammedRestMs. */
@@ -1905,6 +1933,7 @@ final class ExploreTuning {
             seekBlockedAimDeg = blockedAimDeg;
             return this;
         }
+        Builder seekTrustedLegsMax(int v) { seekTrustedLegsMax = v; return this; }
         /** Never seeks the unfamiliar: roaming as before it. */
         Builder seekOff() {
             seekFamiliarScans = 0;

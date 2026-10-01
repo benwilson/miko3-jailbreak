@@ -331,12 +331,23 @@ final class RoamSteer {
         if (!confident(p) || Double.isNaN(doorwayDeg) || Math.abs(doorwayDeg) > tuning.doorwayFacingDeg) {
             return false;
         }
+        return openAt(p, doorwayDeg) <= tuning.steerBlocked;
+    }
+
+    /**
+     * The mean openness of the band centred bearingDeg off his facing (left positive;
+     * clamped to the frame), -1 when p is not confident or bearingDeg is NaN.
+     */
+    float openAt(Openness.Profile p, double bearingDeg) {
+        if (!confident(p) || Double.isNaN(bearingDeg)) {
+            return -1f;
+        }
         int n = p.bins.length;
         int w = Math.min(tuning.steerBandBins, n);
-        double x = offsetOf(doorwayDeg);
+        double x = offsetOf(bearingDeg);
         int start = (int) Math.round((x + 1) / 2 * n - w / 2.0);
         start = Math.max(0, Math.min(n - w, start));
-        return mean(p.bins, start, w) <= tuning.steerBlocked;
+        return mean(p.bins, start, w);
     }
 
     /** The doorway's pull on a band: full at its column, none a band's width away or on a blocked band. */

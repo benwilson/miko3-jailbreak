@@ -288,7 +288,8 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "wriggle_the_1408_chair_episode_wedge_turn_stalled_back_up_blocked_retrace_is_caught",
         # The post-stall recovery wait (robot 2026-10-01: the motor board refused all motion for 9-29 s)
         "recover_a_12s_cutout_probes_find_nothing_until_20s_then_the_normal_escape",
-        "recover_motors_that_never_come_back_probe_then_wriggle_then_the_help_line",
+        "recover_motors_that_never_come_back_three_recoveries_then_wriggle_then_the_help_line",
+        "recover_robot_16_42_a_blocked_turn_after_the_back_out_recovers_again_and_he_gets_free",
         "recover_no_cutout_the_first_probe_moves_and_the_escape_goes_on",
         "recover_a_call_while_waiting_is_answered_where_he_stands",
         "recover_a_shove_while_waiting_probes_at_once",
@@ -335,7 +336,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "doorway_ae7_offline_ask_fails_quietly_and_roaming_continues",
         "doorway_ae3_floor_edge_at_the_doorway_stops_and_escapes_as_today",
         "doorway_heading_expires_by_time_or_distance_and_steering_returns_to_openness",
-        "doorway_closed_since_reads_blocked_when_faced_and_is_dropped",
+        "doorway_reading_blocked_when_faced_takes_a_short_leg_toward_it_and_an_obstacle_there_drops_it",
         "doorway_passed_through_after_a_leg_toward_it_is_forgotten",
         "doorway_ask_carries_one_roaming_frame_and_notes_carry_numbers_only",
         "roam_steer_doorway_weights_open_bands_and_turns_to_face_one_out_of_view",
@@ -378,6 +379,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "seek_a_blocked_leg_ends_the_seek_cleanly",
         "seek_after_arrival_the_next_seek_chooses_a_different_place",
         "seek_never_in_a_room_that_looks_new",
+        "seek_a_person_box_mid_seek_is_passed_by_and_the_seek_reaches_its_target",
         "seek_a_call_during_a_seek_is_answered",
         # Seeking somewhere new by time and area (owner 2026-10-01: "if he's been somewhere in the
         # last 30 minutes, he should try and find somewhere else to go")
@@ -544,11 +546,16 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         # Look around when everything in view reads closed (robot 2026-10-01 15:55)
         "look_around_walls_across_the_front_half_turns_to_face_the_open_side_and_drives_there",
         "look_around_stops_early_on_the_first_step_that_reads_open",
+        "look_around_nothing_open_with_a_doorway_reported_faces_it_and_takes_a_short_leg",
         "look_around_a_floor_hazard_mid_turn_drops_it_and_the_hazard_rules",
         # The first real seek on the robot (2026-10-01 15:59-16:00)
         "seek_a_doorway_reported_during_the_seek_becomes_its_target_and_he_drives_toward_it",
         "seek_a_none_answer_logs_the_fallback_and_no_second_seek_within_seek_gap_ms",
-        "seek_the_target_blocked_with_an_open_band_30_deg_left_drives_that_band",
+        "seek_claudes_target_blocked_with_an_open_band_30_deg_left_still_drives_the_target",
+        # Openness never vetoes Claude's pick (robot 2026-10-01 16:35: 0.00 on open hallway carpet)
+        "seek_claudes_doorway_reading_open_zero_with_clear_floor_drives_to_it_and_arrives",
+        "seek_claudes_doorway_reading_blocked_with_a_tof_obstacle_at_1_m_stops_on_the_hazard_then_the_seek_blocked_handling_runs",
+        "seek_the_least_familiar_fallback_target_reading_blocked_still_gives_up",
         "call_wake_word_with_no_face_still_opens_with_the_crouch_opener",
         # The caller talks while he looks for them (owner 2026-09-30): the conversation opens at once
         "call_caller_talking_during_the_search_opens_the_conversation_before_the_search_ends",

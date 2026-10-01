@@ -678,6 +678,24 @@ final class ExploreBrain {
     /** No seek starts before this (seekGapMs after the last one ended). */
     private long seekNextAt;
     /**
+     * The target is Claude's (its pick, or a doorway it reported), not the least familiar
+     * fallback: openness never vetoes it (robot 2026-10-01 16:35).
+     */
+    private boolean seekTrusted;
+    /** "a person while seeking" was noted for this seek. */
+    private boolean seekPersonNoted;
+    /** A hazard toward the trusted target has turned the seek seekBlockedAimDeg off it; the next one ends it. */
+    private boolean seekDetoured;
+    /** Short legs driven toward a target that read blocked (seekTrustedLegsMax). */
+    private int seekTrustLegs;
+    /** The leg under way (or about to start) is a trusted short leg: openness neither ends nor re-aims it. */
+    private boolean trustLeg;
+    /** That leg heads for a doorway Claude reported, outside a seek: a hazard on it drops the doorway. */
+    private boolean trustLegDoor;
+    /** The last open doorway Claude reported and when (NaN: none, or since passed or blocked by a hazard). */
+    private double doorwayReported = Double.NaN;
+    private long doorwayReportedAt;
+    /**
      * A roaming curiosity stop is under way (begun in enterScan): as it ends, after its remark if
      * it had one, a seek may start. Anything that clears the stop otherwise (a voice, a hazard)
      * clears it too.
@@ -1028,7 +1046,8 @@ final class ExploreBrain {
     /** The last stall (forward, or a back-up that went nowhere) or collision stop: a cutout may run from here. */
     private long stallStampAt = NEVER;
     /** A wait ran to its verdict this stuck spell: no second one until he drives off cleanly or is freed. */
-    private boolean recoverSpent;
+    /** RECOVER waits entered this stuck spell (recoverMaxPerSpell); the cap once the jam path ran. */
+    private int recoverCount;
     /** This STARTLE follows a drive stall: the wait comes before the escape. */
     private boolean recoverAfterStartle;
     /** The wait counts from recoverFrom (the stall); probes at each of recoverProbes, next recoverNext. */
@@ -1444,6 +1463,11 @@ final class ExploreBrain {
         seekTarget = Double.NaN;
         seekPrint = null;
         seekLabel = null;
+        seekTrusted = false;
+        seekPersonNoted = false;
+        trustLeg = false;
+        trustLegDoor = false;
+        doorwayReported = Double.NaN;
         seekFrames.clear();
         seekScan.clear();
         familiarStops = 0;
@@ -1633,16 +1657,17 @@ final class ExploreBrain {
                     if (doorwayLeg) {
                         note("through the doorway at " + Math.round(doorway) + " deg");
                         forgetDoorway();
+                        doorwayReported = Double.NaN;
                         endSeek(now, true, "through the doorway");
                     }
                     legDriven(now);
-                } else if (blockedAheadInLeg()) {
+                } else if (!trustLeg && blockedAheadInLeg()) {
                     // He never stops for the camera alone (KTD9): the leg just ends here,
                     // like a short one, and the next decision bends away.
                     note("camera reads the way ahead blocked: ending the leg early");
                     doorwayLeg = false;
                     legDriven(now);
-                } else if (reaimInLeg(now)) {
+                } else if (!trustLeg && reaimInLeg(now)) {
                     break;
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
@@ -1819,9 +1844,16 @@ final class ExploreBrain {
         stopMotors();
         boolean nowhere = legWentNowhere(now);
         if (!Double.isNaN(seekTarget) && !nowhere) {
-            // Only a leg that drove counts toward seekMaxLegs (robot 16:00: turns only, "leg 0" three times).
-            seekLegs++;
+            // Only a leg that drove counts toward seekMaxLegs (robot 16:00: turns only, "leg 0" three times);
+            // a trusted short leg counts toward seekTrustedLegsMax instead.
+            if (trustLeg) {
+                seekTrustLegs++;
+            } else {
+                seekLegs++;
+            }
         }
+        trustLeg = false;
+        trustLegDoor = false;
         if (nowhere) {
             // Too short for the stall watch to rule, but the encoders say he never moved:
             // not a drive-off, so the blocked ways stay avoided.
@@ -1932,6 +1964,8 @@ final class ExploreBrain {
      * is confident, else as before the camera roamed: a random turn or a hop.
      */
     private void chooseLeg(long now, Look look) {
+        trustLeg = false;
+        trustLegDoor = false;
         if (around != null) {
             aroundLook(now, look);
             return;
@@ -1941,10 +1975,23 @@ final class ExploreBrain {
         }
         boolean seek = !Double.isNaN(seekTarget);
         double door = seek ? seekBearing(now) : doorwayBearing(now);
-        if (!seek && look != null && steer.doorwayReadsBlocked(look.openness, door)) {
-            note("the doorway at " + Math.round(doorway) + " deg reads blocked now: forgotten");
-            forgetDoorway();
-            door = Double.NaN;
+        if (!seek && look != null && !Double.isNaN(door) && Math.abs(door) <= tuning.cameraHalfFovDeg
+                && steer.confident(look.openness) && steer.openAt(look.openness, door) <= tuning.steerBlocked) {
+            if (hazardToward(now, doorway)) {
+                // Blocked by a hazard there, not just the camera: that still blocks.
+                note("the doorway at " + Math.round(doorway) + " deg reads blocked and a hazard was there just now: forgotten");
+                forgetDoorway();
+                doorwayReported = Double.NaN;
+                door = Double.NaN;
+            } else {
+                // Robot 2026-10-01 16:35: openness read open hallway carpet 0.00. Claude's doorway
+                // is trusted over it; the floor sensor, CPL and stall rules guard the short leg.
+                note(String.format(java.util.Locale.US,
+                        "the doorway at %d deg reads blocked (open %.2f); trusting Claude: a short leg toward it",
+                        Math.round(doorway), steer.openAt(look.openness, door)));
+                trustedLeg(now, door, true);
+                return;
+            }
         }
         // Seeking, the target alone pulls: every way around him is familiar anyway.
         RoamSteer.Novelty novelty = seek ? null : novelty(now, look);
@@ -2143,7 +2190,10 @@ final class ExploreBrain {
         if (h != null && h.kind == HazardClassifier.Kind.CPL) {
             recordRefusal(now);
         }
-        endSeek(now, false, "blocked: " + h);
+        trustLegHazard();
+        if (seeking()) {
+            seekDetour(now, "blocked: " + h, escapeSide(h));
+        }
         aheadBlocked();
         leaveStopForHazard();
         hopNext = false;
@@ -2246,7 +2296,12 @@ final class ExploreBrain {
         if (h != null && h.kind == HazardClassifier.Kind.CPL) {
             recordRefusal(now);
         }
-        endSeek(now, false, h == null ? "blocked: wheels stalled" : "blocked: " + h);
+        trustLegHazard();
+        if (h == null) {
+            endSeek(now, false, "blocked: wheels stalled");
+        } else if (seeking()) {
+            seekDetour(now, "blocked: " + h, escapeSide(h));
+        }
         if (drivingForward() && (h == null || h.kind == HazardClassifier.Kind.OBSTACLE)) {
             stampBump(now);
         }
@@ -4413,7 +4468,17 @@ final class ExploreBrain {
         stopMotors();
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
                 + " deg in " + (now - turnStartedAt) + " ms");
-        if (state == State.TURN && turnWheelsStill() && recoverDue(now)) {
+        if (state == State.TURN && zeroTurn() && recoverCount > 0 && recoverCount < recoverCap()) {
+            // Robot 16:42:39: within a stuck spell, a turn reading 0 deg and no counts is a fresh
+            // cutout, even after a recovery: it waits again (up to recoverMaxPerSpell).
+            stampStall(now);
+        }
+        if (state == State.TURN && zeroTurn() && recoverDue(now)) {
+            if (recoverCount > 0) {
+                // After the board came back: a cutout or a side blocked for real; either way try
+                // the other side next (cleared on a clean drive-off).
+                blockSide(heading);
+            }
             turnRetrying = false;
             if (escapeDir == null) {
                 escapeDir = heading;
@@ -4525,6 +4590,7 @@ final class ExploreBrain {
 
     /** The ladder's state for a new escape, at its first step (RETRACE), not yet entered. */
     private void beginLadder(long now, boolean turnBlocked) {
+        endSeek(now, false, "an escape");
         boxedLadder = false;
         hazardTimes.clear();
         escapeFailures.clear();
@@ -4630,6 +4696,22 @@ final class ExploreBrain {
         String of = looks.size() + " of " + tuning.lookAroundLooks + " looks";
         if (best == null) {
             note("looked around: no usable look (" + of + ")");
+            return;
+        }
+        float mostOpen = -1f;
+        for (double[] l : looks) {
+            mostOpen = Math.max(mostOpen, (float) l[1]);
+        }
+        if (Double.isNaN(door) && mostOpen < tuning.lookAroundOpen && reportedDoorwayRecent(now)
+                && !hazardToward(now, doorwayReported) && compass.usable(now)) {
+            // Robot 2026-10-01 16:35: every look read 0.38 or less on open carpet. Claude's
+            // doorway is trusted over the camera: face it and take a short leg, not boxed in.
+            note(String.format(java.util.Locale.US, "looked around: nothing open (best open %.2f, %d of %d looks); "
+                            + "Claude reported a doorway at %d deg %d s ago: facing it for a short leg",
+                    mostOpen, looks.size(), tuning.lookAroundLooks, Math.round(doorwayReported),
+                    (now - doorwayReportedAt) / 1000));
+            aroundFaced = false;
+            trustedLeg(now, Heading.delta(compass.degrees(), doorwayReported), true);
             return;
         }
         if (Double.isNaN(door) && best[1] <= tuning.boxedInOpen && looks.size() >= tuning.lookAroundLooks) {
@@ -5271,7 +5353,13 @@ final class ExploreBrain {
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
                 + " deg in " + (now - turnStartedAt) + " ms (" + escDir + ")");
         boolean nowhere = measured && Math.abs(compass.turned()) < tuning.jamTurnDeg;
-        if (nowhere && turnWheelsStill() && recoverDue(now)) {
+        if (nowhere && zeroTurn() && recoverCount > 0 && recoverCount < recoverCap()) {
+            stampStall(now);
+        }
+        if (nowhere && zeroTurn() && recoverDue(now)) {
+            if (recoverCount > 0) {
+                blockSide(escDir);
+            }
             stopMotors();
             enterRecover(now, true, "an escape turn that would not turn");
             return;
@@ -5797,6 +5885,8 @@ final class ExploreBrain {
             doorwaySetCounts = forwardCounts;
             doorwayLeg = false;
             note("Claude sees an " + a + ": remembered at " + Math.round(doorway) + " deg");
+            doorwayReported = doorway;
+            doorwayReportedAt = now;
             seekDoorway = doorway;
             seekDoorwayAt = now;
             if (seeking() && !seekToDoor) {
@@ -6031,7 +6121,7 @@ final class ExploreBrain {
             seekFallback(now, "Claude picked where he went last time");
             return;
         }
-        aimSeek(now, v, a.x, String.format(java.util.Locale.US, "seeking: Claude picked frame %d x %.2f",
+        aimSeek(now, v, a.x, true, String.format(java.util.Locale.US, "seeking: Claude picked frame %d x %.2f",
                 a.frame + 1, a.x));
     }
 
@@ -6071,7 +6161,7 @@ final class ExploreBrain {
             }
             return;
         }
-        aimSeek(now, best, bestX, String.format(java.util.Locale.US, "seeking: %s: least familiar frame %d x %.2f",
+        aimSeek(now, best, bestX, false, String.format(java.util.Locale.US, "seeking: %s: least familiar frame %d x %.2f",
                 why, bestAt + 1, bestX));
     }
 
@@ -6080,12 +6170,15 @@ final class ExploreBrain {
      * (RoamSteer.bearingOf, with the camera's measured pitch); the detector's box
      * there, if any, is what a re-look re-centres on.
      */
-    private void aimSeek(long now, SeekView v, double x, String what) {
+    private void aimSeek(long now, SeekView v, double x, boolean trusted, String what) {
         double bearing = RoamSteer.bearingOf(x, tuning.cameraHalfFovDeg, tuning.cameraPitchDeg);
         seekTarget = Heading.wrap(v.heading + bearing);
         seekLabel = boxAt(v.look, x);
         seekPrint = v.look.place;
         seekLegs = 0;
+        seekTrustLegs = 0;
+        seekTrusted = trusted;
+        seekDetoured = false;
         seekFromCounts = forwardCounts;
         seekTurned = false;
         seekFrames.clear();
@@ -6127,7 +6220,7 @@ final class ExploreBrain {
      * within seekRecentreDeg of where the target should be).
      */
     private boolean seekLook(long now, Look look) {
-        if (seekLegs > 0 && look != null) {
+        if (seekLegs + seekTrustLegs > 0 && look != null) {
             double nov = placeNovelty(now, look);
             if (!Double.isNaN(nov) && nov >= tuning.seekArriveNovelty) {
                 endSeek(now, true, String.format(java.util.Locale.US, "the place looks new, novelty %.2f", nov));
@@ -6135,8 +6228,10 @@ final class ExploreBrain {
             }
         }
         long driven = forwardCounts - seekFromCounts;
-        if (seekLegs >= tuning.seekMaxLegs || driven >= tuning.seekMaxCounts) {
-            endSeek(now, false, seekLegs + " legs, " + driven + " counts, nowhere new yet");
+        if (seekLegs >= tuning.seekMaxLegs || seekTrustLegs >= tuning.seekTrustedLegsMax
+                || driven >= tuning.seekMaxCounts) {
+            endSeek(now, false, seekLegs + " legs" + (seekTrustLegs > 0 ? " and " + seekTrustLegs + " short trusted legs" : "")
+                    + ", " + driven + " counts, nowhere new yet");
             return false;
         }
         double expected = seekBearing(now);
@@ -6157,7 +6252,33 @@ final class ExploreBrain {
             return false;
         }
         double found = seekFind(look, expected);
-        int leg = seekLegs + 1;
+        int leg = seekLegs + seekTrustLegs + 1;
+        if (seekTrusted && Math.abs(expected) <= tuning.cameraHalfFovDeg && steer.confident(look.openness)) {
+            double aim = Double.isNaN(found) ? expected : found;
+            float open = steer.openAt(look.openness, aim);
+            if (open <= tuning.steerBlocked) {
+                // Robot 2026-10-01 16:35: the scorer read open hallway carpet 0.00 and gave up on
+                // Claude's doorway. Openness never vetoes Claude's target; hazards still do.
+                if (!Double.isNaN(found)) {
+                    seekTarget = Heading.wrap(compass.degrees() + found);
+                    note("seeking: leg " + leg + ", re-centred by " + Math.round(found - expected) + " deg");
+                }
+                if (hazardToward(now, seekTarget)) {
+                    if (!seekDetour(now, "a hazard toward it just now", unblocked(escapeSide != null ? escapeSide
+                            : Direction.LEFT))) {
+                        return false;
+                    }
+                    seekTurned = true;
+                    plannedTicks = 0;
+                    turnToward(now, seekBearing(now));
+                    return true;
+                }
+                note(String.format(java.util.Locale.US,
+                        "seeking: openness reads the target blocked (open %.2f); trusting Claude's pick and driving", open));
+                trustedLeg(now, Heading.delta(compass.degrees(), seekTarget), false);
+                return true;
+            }
+        }
         if (Double.isNaN(found) && Math.abs(expected) <= tuning.cameraHalfFovDeg && steer.confident(look.openness)) {
             // Facing the target and it reads blocked (robot 16:00:30, open 0.21): the most open
             // band within seekBlockedAimDeg of it instead; nothing open there ends the seek.
@@ -6218,6 +6339,95 @@ final class ExploreBrain {
     }
 
     /**
+     * Something real (a hazard, a CPL refusal, or one there just now) blocks the way to
+     * the seek target. Claude's target, the first time: the target moves seekBlockedAimDeg
+     * off it toward side (away from the hazard; chosen by the hazard, not the camera) and
+     * the seek goes on. Otherwise the seek ends. True when it goes on.
+     */
+    private boolean seekDetour(long now, String why, Direction side) {
+        if (Double.isNaN(seekTarget)) {
+            endSeek(now, false, why);
+            return false;
+        }
+        if (!seekTrusted || seekDetoured || tuning.seekBlockedAimDeg <= 0 || !compass.usable(now)) {
+            endSeek(now, false, why);
+            return false;
+        }
+        seekDetoured = true;
+        double off = side == Direction.RIGHT ? -tuning.seekBlockedAimDeg : tuning.seekBlockedAimDeg;
+        seekTarget = Heading.wrap(seekTarget + off);
+        seekTurned = false;
+        seekLabel = null;
+        note("seeking: blocked toward the target (" + why + "): trying " + Math.round(Math.abs(off)) + " deg "
+                + (off < 0 ? "right" : "left") + " of it (heading " + degrees(seekTarget) + " deg), by the hazard, not the camera");
+        return true;
+    }
+
+    /**
+     * A hazard (or one there just now) within escapeProbeClearDeg of heading, or the way
+     * back under a box he got out of: real evidence, which openness never overrides.
+     */
+    private boolean hazardToward(long now, double heading) {
+        if (Double.isNaN(heading)) {
+            return false;
+        }
+        if (!Double.isNaN(blockedAheadAt) && Math.abs(Heading.delta(heading, blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return true;
+        }
+        return now < boxedAvoidUntil && !Double.isNaN(boxedAvoidHeading)
+                && Math.abs(Heading.delta(heading, boxedAvoidHeading)) <= tuning.boxedAvoidDeg;
+    }
+
+    /** Claude reported an open doorway within seekDoorwayMs (taken by a seek or not). */
+    private boolean reportedDoorwayRecent(long now) {
+        return !Double.isNaN(doorwayReported) && now - doorwayReportedAt <= tuning.seekDoorwayMs;
+    }
+
+    /**
+     * A short leg (steerShortTicks at most) toward bearing (off his facing, left positive),
+     * after a turn to face it if it is off to a side: a target Claude chose that the camera
+     * reads blocked. The camera neither ends nor re-aims it; the floor sensor, CPL, stall
+     * and RECOVER rules stop it as on any leg.
+     */
+    private void trustedLeg(long now, double bearing, boolean toDoor) {
+        trustLeg = true;
+        trustLegDoor = toDoor;
+        doorwayLeg = false;
+        lastHazardSide = null;
+        plannedTicks = Math.max(1, Math.min(tuning.steerShortTicks, drawTicks()));
+        if (Double.isNaN(bearing) || Math.abs(bearing) < tuning.turnToleranceDeg || !compass.usable(now)) {
+            startHop(now);
+            return;
+        }
+        if (seeking()) {
+            turnToward(now, bearing);
+            return;
+        }
+        Direction d = bearing > 0 ? Direction.LEFT : Direction.RIGHT;
+        double deg = Math.abs(bearing);
+        if (unblocked(d) != d) {
+            d = d.opposite();
+            deg = 360 - deg;
+        }
+        note("turning " + d + " " + Math.round(deg) + " deg to face the doorway");
+        enterLook(now, d, false, timedMs(deg), deg);
+    }
+
+    /** A hazard or CPL refusal on a trusted leg toward a doorway: it is blocked for real, so forgotten. */
+    private void trustLegHazard() {
+        boolean door = trustLeg && trustLegDoor;
+        trustLeg = false;
+        trustLegDoor = false;
+        if (!door) {
+            return;
+        }
+        note("the doorway at " + Math.round(Double.isNaN(doorway) ? doorwayReported : doorway)
+                + " deg: a hazard on the leg toward it: forgotten");
+        forgetDoorway();
+        doorwayReported = Double.NaN;
+    }
+
+    /**
      * The seek is over (why: numbers and reasons only): the place it went to is marked
      * in the place memory (the target's view, and on arrival the view now), so the next
      * seek goes elsewhere; the grid marked the ground he drove. No seek for seekGapMs.
@@ -6241,6 +6451,10 @@ final class ExploreBrain {
         seekPrint = null;
         seekFrames.clear();
         seekLegs = 0;
+        seekTrustLegs = 0;
+        seekTrusted = false;
+        seekDetoured = false;
+        seekPersonNoted = false;
         seekToDoor = false;
         seekClockRestart(now);
     }
@@ -6269,6 +6483,9 @@ final class ExploreBrain {
         seekLabel = null;
         seekPrint = null;
         seekLegs = 0;
+        seekTrustLegs = 0;
+        seekTrusted = true;
+        seekDetoured = false;
         seekFromCounts = forwardCounts;
         seekTurned = false;
         seekFrames.clear();
@@ -6289,6 +6506,16 @@ final class ExploreBrain {
             return false;
         }
         Detection p = personBox(look.detections);
+        if (p != null && seeking()) {
+            // Robot 16:46:30: a roaming person pick ended a seek 0.7 s in; in a busy office that
+            // cut nearly every seek, and most such meetings dropped for lack of a usable face.
+            // Calls still interrupt a seek; Claude's picks at a stop don't arise (no stops while seeking).
+            if (!seekPersonNoted) {
+                seekPersonNoted = true;
+                note("a person while seeking: carrying on to the target");
+            }
+            return false;
+        }
         if (p == null || !port.canAsk() || now < phantomsIgnoredUntil) {
             return false;
         }
@@ -8709,13 +8936,21 @@ final class ExploreBrain {
      * stallRecoverWindowMs of the last stall or collision stop (the cutout lasted 9-29 s live).
      */
     private boolean recoverDue(long now) {
-        return tuning.stallRecoverProbesMs.length > 0 && !recoverSpent && stallStampAt != NEVER
-                && now - stallStampAt <= tuning.stallRecoverWindowMs;
+        return tuning.stallRecoverProbesMs.length > 0 && recoverCount < recoverCap()
+                && stallStampAt != NEVER && now - stallStampAt <= tuning.stallRecoverWindowMs;
+    }
+
+    /**
+     * RECOVER waits a stuck spell: recoverMaxPerSpell, before the jam path runs; one with
+     * jam detection off (no jam path to hold back: the escape as before the wait).
+     */
+    private int recoverCap() {
+        return tuning.jamTurnDeg > 0 ? tuning.recoverMaxPerSpell : 1;
     }
 
     /** Out of the stuck spell (drove off cleanly, freed): the next stall waits again. */
     private void recoverDone() {
-        recoverSpent = false;
+        recoverCount = 0;
         stallStampAt = NEVER;
     }
 
@@ -8744,6 +8979,7 @@ final class ExploreBrain {
         escBlockedRun = 0;
         recoverWedged = wedgedAfter;
         recoverWhy = why;
+        recoverCount++;
         recoverBackStill = 0;
         recoverBlockedWay = null;
         retryWaiting = false;
@@ -8765,7 +9001,8 @@ final class ExploreBrain {
         for (long ms : recoverProbes) {
             at.append(at.length() == 0 ? "" : ", ").append(Math.round(ms / 1000.0));
         }
-        note("stall: waiting for the motor board to recover (probes at " + at + " s)");
+        note("stall: waiting for the motor board to recover (probes at " + at + " s)"
+                + (recoverCap() > 1 ? " (recovery " + recoverCount + " of " + recoverCap() + ")" : ""));
     }
 
     /** RECOVER: still until the next probe (or a shove), each probe's verdict, or the wriggle after none moved. */
@@ -8849,6 +9086,14 @@ final class ExploreBrain {
         recoverFromReading = r;
     }
 
+    /**
+     * A zero attempt (robot 16:42): this turn turned under stallRecoverProbeDeg with its
+     * wheels still. One that turned that much, or moved its wheels, is not.
+     */
+    private boolean zeroTurn() {
+        return Math.abs(compass.turned()) < tuning.stallRecoverProbeDeg && turnWheelsStill();
+    }
+
     /** This turn's wheels moved under stallMinCounts (both wheels): no power, not just no heading. */
     private boolean turnWheelsStill() {
         return turnCountFrom != null && turnCounts < tuning.stallMinCounts;
@@ -8891,6 +9136,14 @@ final class ExploreBrain {
             note("recover probe at " + at + " s: nothing");
         }
         if (recoverProbeScheduled && recoverNext >= recoverProbes.length) {
+            if (recoverBlockedWay == null && recoverCount < recoverCap()) {
+                // Robot 16:42: the cutout re-arms on each attempt that reads zero. Nothing moved, but
+                // the board may yet come back: the escape again, and its next zero attempt waits again.
+                note("no recovery after " + at + " s (recovery " + recoverCount + " of " + recoverCap()
+                        + "): trying the escape again");
+                resumeEscape(now);
+                return;
+            }
             note("no recovery after " + at + " s: a real jam");
             realJam(now, "no recovery after " + at + " s");
         }
@@ -8898,7 +9151,7 @@ final class ExploreBrain {
 
     /** The wait's verdict is a real jam: the wriggle, then the jam path. */
     private void realJam(long now, String why) {
-        recoverSpent = true;
+        recoverCount = Math.max(recoverCount, recoverCap());
         if (tuning.jamTurnDeg <= 0) {
             // Jam detection off: the escape as it ran before the wait.
             resumeEscape(now);
@@ -8914,7 +9167,6 @@ final class ExploreBrain {
 
     /** The board is back: the normal escape, judged only on what it does from now. */
     private void recovered(long now) {
-        recoverSpent = true;
         recoverBackFirst = true;
         if (recoverBlockedWay != null) {
             // Turn away from the way a probe found blocked, once he has backed up.

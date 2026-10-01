@@ -6522,11 +6522,13 @@ public final class ExploreBrainHarness {
             // the escape stops the moment the back-up and both turns have gone nowhere, he asks
             // for help once, then one short back-up at 30, 60 and 120 s after the jam (robot
             // 15:19), then one every jammedRestMs (120 s). No more ladders, way-out asks, turns
-            // or forward pushes; no 30 s ladder-rest loop.
+            // or forward pushes; no 30 s ladder-rest loop. Since robot 16:42 each zero attempt
+            // waits for the board first, three times a spell, so the jam comes after ~70 s.
             List<String> notes = new ArrayList<String>();
             Rig rig = pinnedRig(notes);
             rig.started();
-            rig.runUntil(290000);
+            runUntil(rig, 120000, r -> notedAt(notes, "fully jammed") >= 0);
+            rig.runUntil(Math.max(rig.now, notedAt(notes, "fully jammed")) + 250000);
             long jamAt = notedAt(notes, "fully jammed");
             List<Long> rests = entries(rig, ExploreBrain.State.CORNERED);
             List<Long> helps = helpLines(rig, 0);
@@ -6541,7 +6543,8 @@ public final class ExploreBrainHarness {
             boolean probesSpaced = probes.size() == 4 && withinTick(probes.get(0), jamAt + 30000)
                     && withinTick(probes.get(1), jamAt + 60000) && withinTick(probes.get(2), jamAt + 120000)
                     && probes.get(3) - probes.get(2) >= 120000;
-            check(n, jamAt > 0 && jamAt < 30000 && helps.size() == 1 && helps.get(0) >= jamAt
+            check(n, jamAt > 0 && jamAt < 80000 && notesWith(notes, "(recovery 3 of 3)") == 1
+                            && helps.size() == 1 && helps.get(0) >= jamAt
                             && helps.get(0) - jamAt < 2000 && !rests.isEmpty() && rests.get(0) >= jamAt
                             && rests.get(0) - jamAt < 100 && rests.size() == 1
                             && probesSpaced && pushes == 0 && laddersAfter == 0 && rig.wayOutRequests.size() <= 1
@@ -6680,11 +6683,12 @@ public final class ExploreBrainHarness {
         });
         scenario("wriggle_nothing_moves_each_way_stops_within_1500ms_then_the_help_line", n -> {
             // Every wheel wedged: no counts at all. Each way stops after one 1.5 s window, never
-            // 10 s of grinding against stalled wheels, then the existing jam path.
+            // 10 s of grinding against stalled wheels, then the existing jam path (after three
+            // waits for the board since robot 16:42).
             List<String> notes = new ArrayList<String>();
             Rig rig = pinnedRig(notes);
             rig.started();
-            runUntil(rig, 60000, r -> notedAt(notes, "fully jammed") >= 0);
+            runUntil(rig, 120000, r -> notedAt(notes, "fully jammed") >= 0);
             rig.runUntil(rig.now + 5000);
             long left = notedAt(notes, "wriggle LEFT: up to 10000 ms");
             long leftStop = notedAt(notes, "wriggle LEFT: wheels not moving; stopping");
@@ -6773,11 +6777,13 @@ public final class ExploreBrainHarness {
             // nowhere, the RETRACE turn would not turn, then CORNERED. The spin at 14:09:41 moved
             // fine, so that was the motor board's cutout: now the back-up that went nowhere waits
             // for the board (no retrace inside the window), and only with no recovery by the last
-            // probe does the wriggle run, then the jam path.
+            // probe does the wriggle run, then the jam path. Since robot 16:42 a wait with no
+            // recovery tries the escape again, and its next zero attempt waits again, three
+            // waits a spell before the wriggle.
             List<String> notes = new ArrayList<String>();
             Rig rig = chairRig(notes, escTuning());
             rig.started();
-            runUntil(rig, 90000, r -> notedAt(notes, "fully jammed") >= 0);
+            runUntil(rig, 150000, r -> notedAt(notes, "fully jammed") >= 0);
             rig.runUntil(rig.now + 3000);
             long wedged = notedAt(notes, "wedged: a turn that would not turn");
             long nowhere = notedAt(notes, "back-up went nowhere");
@@ -6789,7 +6795,11 @@ public final class ExploreBrainHarness {
             long rest = entered(rig, ExploreBrain.State.CORNERED, 0);
             check(n, wedged > 0 && nowhere > wedged && wait >= nowhere && real > wait && wriggle >= real
                             && failed > wriggle && jam >= failed && rest >= jam && helpLines(rig, 0).size() == 1
-                            && entered(rig, ExploreBrain.State.RETRACE, nowhere + 1) < 0
+                            && notesWith(notes, "stall: waiting for the motor board to recover") == 3
+                            && notesWith(notes, "(recovery 3 of 3)") == 1
+                            && (entered(rig, ExploreBrain.State.RETRACE, nowhere + 1) < 0
+                                || entered(rig, ExploreBrain.State.RETRACE, nowhere + 1)
+                                    >= notedAt(notes, "(recovery 1 of 3): trying the escape again"))
                             && notesWith(notes, "cornered: ") == 0 && rig.violations.isEmpty(),
                     "wedged@" + wedged + " nowhere@" + nowhere + " wait@" + wait + " real@" + real + " wriggle@" + wriggle
                             + " failed@" + failed + " jam@" + jam + " rest@" + rest + " notes="
@@ -6884,33 +6894,99 @@ public final class ExploreBrainHarness {
                     "stall@" + stall + " wait@" + wait + " probes=" + probes.size() + " pushes=" + pushes + " escBacks="
                             + escBacks + " turn@" + turn + " hop@" + hop + " notes=" + lastNotes(notes, 25));
         });
-        scenario("recover_motors_that_never_come_back_probe_then_wriggle_then_the_help_line", n -> {
-            // Every wheel wedged for good: four probes give nothing, then the wriggle (no
-            // ladder, no retrace in between), then the fully-jammed path and its help line.
+        scenario("recover_motors_that_never_come_back_three_recoveries_then_wriggle_then_the_help_line", n -> {
+            // Every wheel wedged for good (robot 16:42: a zero attempt re-enters RECOVER, up to
+            // recoverMaxPerSpell = 3 a spell). The stall waits; its probes give nothing; the next
+            // attempt reads zero and waits again; after the third wait's probes give nothing, the
+            // jam path: the wriggle, then fully jammed and its help line. No fourth wait.
             List<String> notes = new ArrayList<String>();
             Rig rig = cutoutRig(notes, escTuning().hopTicks(20), -1);
             rig.started();
-            runUntil(rig, 90000, r -> notedAt(notes, "fully jammed") >= 0);
+            runUntil(rig, 200000, r -> notedAt(notes, "fully jammed") >= 0);
             rig.runUntil(rig.now + 3000);
             long stall = notedAt(notes, "wheels stalled while driving");
-            long wait = notedAt(notes, "stall: waiting for the motor board to recover");
+            List<Long> waits = notedTimes(notes, "stall: waiting for the motor board to recover");
             int nothing = notesWith(notes, ": nothing");
-            long real = notedAt(notes, "no recovery after 20 s: a real jam");
+            long real = notedAt(notes, "a real jam");
             long wriggle = notedAt(notes, "wriggle LEFT: up to");
             long failed = notedAt(notes, "wriggle failed both ways");
             long jam = notedAt(notes, "fully jammed");
             List<Long> helps = helpLines(rig, 0);
-            int turnsBefore = turnCommands(rig, stall, real).size();
-            // Since robot 15:19: two back-up probes, then two turn probes.
-            check(n, stall > 0 && wait >= stall && nothing == 4 && real - stall >= 20000 && real - stall <= 21500
-                            && backDrives(rig, stall + 1, real + 1).size() == 2 && turnsBefore == 2
+            // Between waits: one zero attempt each (the escape's back-off or turn reading nothing).
+            boolean attemptsBetween = waits.size() == 3;
+            for (int i = 0; attemptsBetween && i < 2; i++) {
+                attemptsBetween = rig.motions(waits.get(i), waits.get(i + 1)) > 4;
+            }
+            check(n, stall > 0 && waits.size() == 3 && waits.get(0) >= stall && attemptsBetween && nothing == 12
+                            && notesWith(notes, "(recovery 3 of 3)") == 1 && real > waits.get(2)
                             && wriggle >= real && wriggle - real <= 200 && failed > wriggle && jam >= failed
                             && helps.size() == 1 && helps.get(0) >= jam
-                            && entered(rig, ExploreBrain.State.RETRACE, 0) < 0 && notesWith(notes, "wedged") == 0
                             && notesWith(notes, "the board is back") == 0 && rig.violations.isEmpty(),
-                    "stall@" + stall + " wait@" + wait + " nothing=" + nothing + " real@" + real + " wriggle@" + wriggle
-                            + " failed@" + failed + " jam@" + jam + " helps=" + helps + " turns=" + turnsBefore
-                            + " notes=" + lastNotes(notes, 25));
+                    "stall@" + stall + " waits=" + waits + " nothing=" + nothing + " real@" + real + " wriggle@" + wriggle
+                            + " failed@" + failed + " jam@" + jam + " helps=" + helps + " notes=" + lastNotes(notes, 30));
+        });
+        scenario("recover_robot_16_42_a_blocked_turn_after_the_back_out_recovers_again_and_he_gets_free", n -> {
+            // Robot 16:42: the stall's cutout ends, the probe moves, he backs straight out, and
+            // the next turn reads 0 deg with no wheel counts: a fresh 6 s cutout. He waits again
+            // (not the escape ladder inside the cutout), backs straight out once more, and gets
+            // free: no jam, no wriggle, no help line.
+            List<String> notes = new ArrayList<String>();
+            Rig[] h = new Rig[1];
+            long[] stallAt = {-1};
+            long[] secondFrom = {-1};
+            long[] secondUntil = {-1};
+            String[] lastMotion = {null};
+            Rig rig = escRig(escTuning().hopTicks(20), h, t -> {
+                Rig r = h[0];
+                if (r == null) {
+                    return clear(t);
+                }
+                if (stallAt[0] < 0 && r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 700
+                        && r.blockedFrom == Long.MAX_VALUE) {
+                    r.blockedFrom = t;
+                }
+                if (stallAt[0] < 0 && r.brain.state() == ExploreBrain.State.STARTLE) {
+                    stallAt[0] = t;
+                    pin(r, true);
+                }
+                if (stallAt[0] >= 0 && secondFrom[0] < 0 && t >= stallAt[0] + 4000 && r.yaw.stuck) {
+                    // The first cutout ends: the 5 s probe moves.
+                    pin(r, false);
+                }
+                long back = notedAt(notes, "backing straight out");
+                if (back >= 0 && secondFrom[0] < 0 && "back".equals(lastMotion[0]) && !"back".equals(r.motion)) {
+                    // The back-out ends; the turn after it re-arms the cutout for 6 s.
+                    secondFrom[0] = t;
+                    secondUntil[0] = t + 6000;
+                    pin(r, true);
+                }
+                lastMotion[0] = r.motion;
+                if (secondFrom[0] >= 0 && t >= secondUntil[0] && r.yaw.stuck) {
+                    pin(r, false);
+                }
+                return clear(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 120000, r -> {
+                List<Long> backs = notedTimes(notes, ": the board is back");
+                return backs.size() >= 2 && entered(r, ExploreBrain.State.HOP, backs.get(1)) > 0
+                        || notedAt(notes, "fully jammed") >= 0;
+            });
+            rig.runUntil(rig.now + 5000);
+            List<Long> waits = notedTimes(notes, "stall: waiting for the motor board to recover");
+            List<Long> boards = notedTimes(notes, ": the board is back");
+            List<Long> outs = notedTimes(notes, "backing straight out");
+            long blocked = secondFrom[0] < 0 ? -1 : noteAt(notes, "measured turn blocked", secondFrom[0]);
+            long hop = boards.size() < 2 ? -1 : entered(rig, ExploreBrain.State.HOP, boards.get(1));
+            check(n, waits.size() == 2 && boards.size() == 2 && outs.size() >= 2 && secondFrom[0] > boards.get(0)
+                            && blocked >= secondFrom[0] && waits.get(1) >= blocked && waits.get(1) - blocked <= 100
+                            && boards.get(1) >= secondUntil[0] && outs.get(1) >= boards.get(1) && hop > boards.get(1)
+                            && notesWith(notes, "wedged") == 0 && notesWith(notes, "fully jammed") == 0
+                            && notesWith(notes, "wriggle") == 0 && helpLines(rig, 0).isEmpty() && rig.violations.isEmpty(),
+                    "stall@" + stallAt[0] + " waits=" + waits + " boards=" + boards + " outs=" + outs + " second@"
+                            + secondFrom[0] + " blocked@" + blocked + " hop@" + hop + " notes=" + lastNotes(notes, 30));
         });
         scenario("recover_no_cutout_the_first_probe_moves_and_the_escape_goes_on", n -> {
             // Only something low ahead; the board works. The 2 s probe moves at once and the
@@ -7462,7 +7538,7 @@ public final class ExploreBrainHarness {
                             && entries(rig, ExploreBrain.State.RETRACE).size() >= 2
                             && notesWith(notes, "free after") == 0 && rig.violations.isEmpty(),
                     "rest@" + rest + " blocked@" + firstBlocked + " turn=" + rig.what(turn) + " lefts=" + lefts + " "
-                            + rig.tail());
+                            + rig.tail() + " notes=" + notes);
         });
         scenario("side_both_blocked_alternates_instead_of_one_side_for_ever", n -> {
             // Every turn blocked: the retries and ladders go back and forth, not LEFT every time.
@@ -7552,7 +7628,7 @@ public final class ExploreBrainHarness {
             List<String> notes = new ArrayList<String>();
             Rig rig = noseToWallRig(notes, true);
             rig.started();
-            runUntil(rig, 60000, r -> notedAt(notes, "free after") >= 0 && !r.moving);
+            runUntil(rig, 150000, r -> notedAt(notes, "free after") >= 0 && !r.moving);
             long wedged = notedAt(notes, "wedged: a turn that would not turn");
             List<Drive> backs = drivesIn(rig, "RETRACE", "back", Math.max(0, wedged), Long.MAX_VALUE);
             long nowhere = notedAt(notes, "backing up first went nowhere");
@@ -8772,9 +8848,14 @@ public final class ExploreBrainHarness {
                             + notes.subList(Math.max(0, notes.size() - 10), notes.size()));
         });
         scenario("seek_a_blocked_leg_ends_the_seek_cleanly", n -> {
+            // Robot 2026-10-01: a hazard toward Claude's pick no longer ends the seek at once; he
+            // tries 45 deg off the target (by the hazard, not the camera) first, and a hazard on
+            // that leg too ends it.
             long[] blockAt = {Long.MAX_VALUE};
+            long[] block2At = {Long.MAX_VALUE};
             Rig[] h = new Rig[1];
-            Rig rig = new Rig(seekTuning().build(), t -> t >= blockAt[0] && t < blockAt[0] + 300 ? obstacle(t) : clear(t),
+            Rig rig = new Rig(seekTuning().build(), t -> (t >= blockAt[0] && t < blockAt[0] + 300)
+                    || (t >= block2At[0] && t < block2At[0] + 300) ? obstacle(t) : clear(t),
                     NOTHING, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
             h[0] = rig;
             rig.openView = ALL_OPEN;
@@ -8787,15 +8868,20 @@ public final class ExploreBrainHarness {
             long picked = rig.now;
             runUntil(rig, picked + 30000, r -> r.firstAfter("hop", picked) >= 0);
             blockAt[0] = rig.now + 300;
+            runUntil(rig, blockAt[0] + 30000, r -> notedAt(notes, "seeking: blocked toward the target") >= 0);
+            long detour = notedAt(notes, "seeking: blocked toward the target");
+            runUntil(rig, rig.now + 30000, r -> r.firstAfter("hop", detour + 1) >= 0);
+            block2At[0] = rig.now + 300;
             rig.runUntil(rig.now + 30000);
-            String end = firstNote(notes, "seeking: ");
             String gaveUp = firstNote(notes, "seeking: gave up");
             long endAt = notedAt(notes, "seeking: gave up");
-            check(n, gaveUp != null && gaveUp.contains("blocked") && endAt >= blockAt[0] && endAt < blockAt[0] + 300
+            check(n, detour >= blockAt[0] && detour < blockAt[0] + 300 && gaveUp != null && gaveUp.contains("blocked")
+                            && endAt >= block2At[0] && endAt < block2At[0] + 300
                             && !rig.brain.seeking() && Double.isNaN(rig.brain.seekHeading())
-                            && rig.firstAfter("hop", blockAt[0] + 3000) >= 0 && notedAt(notes, "seeking: arrived") < 0
+                            && rig.firstAfter("hop", block2At[0] + 3000) >= 0 && notedAt(notes, "seeking: arrived") < 0
                             && rig.violations.isEmpty(),
-                    "blockAt=" + blockAt[0] + " end=" + end + " gaveUp=" + gaveUp + "@" + endAt + " " + rig.tail());
+                    "blockAt=" + blockAt[0] + " detour@" + detour + " block2At=" + block2At[0] + " gaveUp=" + gaveUp
+                            + "@" + endAt + " notes=" + lastNotes(notes, 25));
         });
         scenario("seek_after_arrival_the_next_seek_chooses_a_different_place", n -> {
             // Three looks 120 deg apart: each faces its own third of the room, and each third
@@ -8861,6 +8947,36 @@ public final class ExploreBrainHarness {
             check(n, notesStarting(notes, "curiosity stop") >= 6 && notesStarting(notes, "seeking:") == 0
                             && rig.seekRequests.isEmpty() && rig.violations.isEmpty(),
                     "stops=" + notesStarting(notes, "curiosity stop") + " seeks=" + notesStarting(notes, "seeking:"));
+        });
+        scenario("seek_a_person_box_mid_seek_is_passed_by_and_the_seek_reaches_its_target", n -> {
+            // Robot 16:46:30: a roaming person pick ended a seek 0.7 s in ("interrupted:
+            // approach"). While seeking, roaming person picks are ignored (noted once).
+            List<String> notes = new ArrayList<String>();
+            Rig[] h = new Rig[1];
+            Rig rig = new Rig(seekTuning().build(), CLEAR,
+                    (r, t) -> !Double.isNaN(r.brain.seekHeading()) ? list(box("person", 0.9f, 0.5f, 0.5f, 0.3f, 0.6f))
+                            : list(),
+                    true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+            h[0] = rig;
+            rig.openView = ALL_OPEN;
+            rig.seeks = (r, req, k) -> CuriosityPort.WayOut.way(0, 0f);
+            rig.simWheels = true;
+            rig.placeView = (r, t) -> {
+                long picked = notedAt(notes, "seeking: Claude picked");
+                return picked >= 0 && r.countPrefix("stop", firstHopT(r, picked), t) >= 3 ? scene(9) : scene(1);
+            };
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 400000, r -> notedAt(notes, "seeking: arrived") >= 0 || notedAt(notes, "seeking: gave up") >= 0);
+            long picked = notedAt(notes, "seeking: Claude picked");
+            long arrived = notedAt(notes, "seeking: arrived");
+            int carried = notesWith(notes, "a person while seeking: carrying on to the target");
+            long approach = picked < 0 ? -1 : entered(rig, ExploreBrain.State.APPROACH, picked);
+            check(n, picked > 0 && arrived > picked && carried == 1 && (approach < 0 || approach > arrived)
+                            && notedAt(notes, "a person while roaming") < 0
+                            && notedAt(notes, "seeking: gave up") < 0 && rig.violations.isEmpty(),
+                    "picked@" + picked + " arrived@" + arrived + " carried=" + carried + " approach@" + approach
+                            + " notes=" + lastNotes(notes, 25));
         });
         scenario("seek_a_call_during_a_seek_is_answered", n -> {
             Rig rig = seekRig(seekTuning().cueTurn(45, 90, 500, 2000, 600), (r, t) -> scene(1),
@@ -9055,20 +9171,41 @@ public final class ExploreBrainHarness {
                             && timed.violations.isEmpty() && driven.violations.isEmpty(),
                     "timed@" + te + " driven@" + de + " " + tNotes + " " + timed.tail());
         });
-        scenario("doorway_closed_since_reads_blocked_when_faced_and_is_dropped", n -> {
-            // Answered straight ahead; by the next decision the way ahead reads blocked.
-            Rig rig = doorRig(doorTuning(), CLEAR,
+        scenario("doorway_reading_blocked_when_faced_takes_a_short_leg_toward_it_and_an_obstacle_there_drops_it", n -> {
+            // Robot 2026-10-01: openness read open hallway carpet 0.00. Answered straight ahead; by
+            // the next decision the band there reads blocked: he trusts Claude with a short leg
+            // toward it (not a turn away). An obstacle on that leg is real: the doorway is dropped.
+            List<String> notes = new ArrayList<String>();
+            long[] obstAt = {Long.MAX_VALUE};
+            Rig[] h = new Rig[1];
+            Rig rig = doorRig(doorTuning(), t -> {
+                        if (obstAt[0] == Long.MAX_VALUE && h[0] != null) {
+                            long tr = notedAt(notes, "reads blocked");
+                            if (tr >= 0 && h[0].firstAfter("hop", tr) >= 0) {
+                                obstAt[0] = t + 200;
+                            }
+                        }
+                        return t >= obstAt[0] && t < obstAt[0] + 300 ? obstacle(t) : clear(t);
+                    },
                     (r, t) -> r.doorwayAnswerStates.isEmpty() ? prof(0.9f, 0.9f, 0.9f, 0.9f)
                             : prof(0.9f, 0.9f, 0.1f, 0.9f),
-                    (r, k) -> CuriosityPort.Doorway.door(0f));
-            List<String> notes = traced(rig);
+                    (r, k) -> k == 1 ? CuriosityPort.Doorway.door(0f) : CuriosityPort.Doorway.none());
+            h[0] = rig;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
             rig.started();
-            rig.runUntil(6000);
+            rig.runUntil(12000);
             long set = notedAt(notes, "open doorway");
-            long dropped = notedAt(notes, "reads blocked");
-            check(n, set > 0 && dropped > set && dropped <= set + 3500 && Double.isNaN(rig.brain.doorwayHeading())
+            String trusted = firstNote(notes, "the doorway at 0 deg reads blocked (open ");
+            long trustAt = notedAt(notes, "reads blocked");
+            Drive hop = trustAt < 0 ? null : firstHop(rig, trustAt);
+            long dropped = notedAt(notes, "a hazard on the leg toward it: forgotten");
+            check(n, set > 0 && trustAt > set && trustAt <= set + 3500 && trusted != null && trusted.contains("open 0.10")
+                            && trusted.contains("a short leg toward it") && hop != null && hop.end > 0
+                            && hop.end - hop.t <= rig.tuning.steerShortTicks * rig.tuning.hopTickMs + 100
+                            && dropped >= obstAt[0] && dropped < obstAt[0] + 300 && Double.isNaN(rig.brain.doorwayHeading())
                             && notedAt(notes, "expired") < 0 && rig.violations.isEmpty(),
-                    "set@" + set + " dropped@" + dropped + " " + notes);
+                    "set@" + set + " trusted=" + trusted + " hop=" + hop + " obst@" + obstAt[0] + " dropped@" + dropped
+                            + " notes=" + lastNotes(notes, 25));
         });
         scenario("doorway_passed_through_after_a_leg_toward_it_is_forgotten", n -> {
             Rig rig = doorRig(doorTuning(), CLEAR, ALL_OPEN, (r, k) -> CuriosityPort.Doorway.door(0f));
@@ -10168,6 +10305,35 @@ public final class ExploreBrainHarness {
                             && notedAt(notes, "boxed in") < 0 && rig.violations.isEmpty(),
                     "around@" + around + " looked@" + looked + " turns=" + turns + " notes=" + lastNotes(notes, 20));
         });
+        scenario("look_around_nothing_open_with_a_doorway_reported_faces_it_and_takes_a_short_leg", n -> {
+            // Robot 2026-10-01 16:35: every look-around look read 0.38 or less, but Claude had
+            // reported a doorway (at 90 deg, since expired from the steer) a minute before: he
+            // faces it and takes a short leg, not boxed in.
+            List<String> notes = new ArrayList<String>();
+            Rig[] h = new Rig[1];
+            Rig rig = doorRig(doorTuning().doorwayExpire(2000, 100000), CLEAR,
+                    (r, t) -> notedAt(notes, "doorway heading expired") < 0 ? prof(0.9f, 0.9f, 0.9f, 0.9f)
+                            : prof(0.9f, 0.02f, 0.02f, 0.02f),
+                    (r, k) -> k == 1 ? CuriosityPort.Doorway.door(-0.9f) : CuriosityPort.Doorway.none());
+            h[0] = rig;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 90000, r -> {
+                long f = notedAt(notes, "looked around: nothing open");
+                return f >= 0 && firstHop(r, f) != null && firstHop(r, f).end > 0 || notedAt(notes, "boxed in") >= 0;
+            });
+            double remembered = degAfter(notes, "remembered at ");
+            long around = notedAt(notes, "everything ahead closed: looking around (6 looks)");
+            String faced = firstNote(notes, "looked around: nothing open");
+            long facedAt = notedAt(notes, "looked around: nothing open");
+            Drive hop = facedAt < 0 ? null : firstHop(rig, facedAt);
+            check(n, around > 0 && faced != null && faced.contains("Claude reported a doorway") && hop != null
+                            && near(hop.heading, remembered, 15) && hop.end > 0
+                            && hop.end - hop.t <= rig.tuning.steerShortTicks * rig.tuning.hopTickMs + 100
+                            && notedAt(notes, "boxed in") < 0 && rig.violations.isEmpty(),
+                    "remembered=" + f1(remembered) + " around@" + around + " faced=" + faced + " hop=" + hop
+                            + " notes=" + lastNotes(notes, 25));
+        });
         scenario("look_around_a_floor_hazard_mid_turn_drops_it_and_the_hazard_rules", n -> {
             // A floor edge reads during the look-around's first turn: the wheels stop on that
             // step as always, and the look-around is dropped (the hazard's escape takes over).
@@ -10264,10 +10430,12 @@ public final class ExploreBrainHarness {
             check(n, asked > 0 && fell >= asked && asks == 1 && rig.violations.isEmpty(),
                     "asked@" + asked + " fell@" + fell + " asks=" + asks + " notes=" + lastNotes(notes, 20));
         });
-        scenario("seek_the_target_blocked_with_an_open_band_30_deg_left_drives_that_band", n -> {
-            // The target heading reads blocked when he faces it; open floor lies 30 deg left
-            // of it (in view at its edge): he aims at that band and drives it, no giving up.
+        scenario("seek_claudes_target_blocked_with_an_open_band_30_deg_left_still_drives_the_target", n -> {
+            // Robot 2026-10-01 16:35: openness is not trusted over Claude's pick. The target heading
+            // reads blocked when he faces it, open floor lies 30 deg left of it: he drives short
+            // legs at the target itself, not the open band, and does not give up.
             double[] w = {Double.NaN};
+            double[] target = {Double.NaN};
             Rig rig = seekRig(seekTuning(), (r, t) -> scene(1), (r, req, k) -> CuriosityPort.WayOut.way(1, 0f));
             rig.openView = (r, t) -> {
                 double sh = r.brain.seekHeading();
@@ -10275,6 +10443,7 @@ public final class ExploreBrainHarness {
                     return prof(0.9f, 0.9f, 0.9f, 0.9f);
                 }
                 if (Double.isNaN(w[0])) {
+                    target[0] = sh;
                     w[0] = Heading.wrap(sh + 30);
                 }
                 float[] b = new float[Openness.BINS];
@@ -10288,17 +10457,132 @@ public final class ExploreBrainHarness {
             List<String> notes = traced(rig);
             rig.started();
             runUntil(rig, 400000, r -> {
-                long at = notedAt(notes, "the target reads blocked: aiming at the open band");
-                return at >= 0 && firstHop(r, at) != null || notedAt(notes, "seeking: gave up") >= 0;
+                long at = notedAt(notes, "trusting Claude's pick and driving");
+                return at >= 0 && firstHop(r, at) != null && firstHop(r, at).end > 0
+                        || notedAt(notes, "seeking: gave up") >= 0;
             });
-            long at = notedAt(notes, "the target reads blocked: aiming at the open band");
+            String trusted = firstNote(notes, "seeking: openness reads the target blocked (open ");
+            long at = notedAt(notes, "trusting Claude's pick and driving");
             Drive hop = at < 0 ? null : firstHop(rig, at);
             long gaveUp = notedAt(notes, "seeking: gave up");
-            check(n, at > 0 && hop != null && near(hop.heading, w[0], 12) && (gaveUp < 0 || gaveUp > hop.t)
-                            && rig.violations.isEmpty(),
-                    "open=" + f1(w[0]) + " at@" + at + " hop=" + (hop == null ? "none" : hop.t + "@" + f1(hop.heading))
+            check(n, at > 0 && trusted != null && trusted.contains("(open 0.10); trusting Claude's pick and driving")
+                            && hop != null && near(hop.heading, target[0], 12) && !near(hop.heading, w[0], 15)
+                            && hop.end - hop.t <= rig.tuning.steerShortTicks * rig.tuning.hopTickMs + 100
+                            && notedAt(notes, "aiming at the open band") < 0 && gaveUp < 0 && rig.violations.isEmpty(),
+                    "target=" + f1(target[0]) + " open=" + f1(w[0]) + " at@" + at + " hop=" + hop
                             + " gaveUp@" + gaveUp + " notes=" + lastNotes(notes, 25));
         });
+        scenario("seek_claudes_doorway_reading_open_zero_with_clear_floor_drives_to_it_and_arrives", n -> {
+            // Robot 2026-10-01 16:35: Claude saw the doorway at x 0.77; every bin read 0.00 on the
+            // open hallway carpet. The floor is clear: he drives short legs toward it and arrives.
+            long[] trustAt = {-1};
+            Rig rig = seekRig(seekTuning().doorwayAsk(5000, 3000), null, (r, req, k) -> CuriosityPort.WayOut.way(2, 0f));
+            List<String> notes = traced(rig);
+            rig.placeView = (r, t) -> {
+                long door = notedAt(notes, "seeking: heading for the doorway at ");
+                long tr = door < 0 ? -1 : noteAt(notes, "seeking: openness reads the target blocked", door + 1);
+                return tr >= 0 && r.countPrefix("stop", firstHopT(r, tr), t) >= 3 ? scene(9) : scene(1);
+            };
+            rig.doorways = (r, k) -> r.brain.seeking() ? CuriosityPort.Doorway.door(0.77f) : CuriosityPort.Doorway.none();
+            rig.openView = (r, t) -> r.brain.seeking() ? prof(0.9f, 0f, 0f, 0f) : prof(0.9f, 0.9f, 0.9f, 0.9f);
+            rig.started();
+            runUntil(rig, 400000, r -> notedAt(notes, "seeking: arrived") >= 0 || notedAt(notes, "seeking: gave up") >= 0);
+            double target = degAfter(notes, "seeking: heading for the doorway at ");
+            long door = notedAt(notes, "seeking: heading for the doorway at ");
+            long arrived = notedAt(notes, "seeking: arrived");
+            String trusted = null;
+            for (String x : notes) {
+                if (x.contains("seeking: openness reads the target blocked") && Long.parseLong(x.substring(0, x.indexOf(' '))) > door) {
+                    trusted = x;
+                    break;
+                }
+            }
+            int legs = 0;
+            boolean onCourse = true;
+            boolean short_ = true;
+            for (Drive d : rig.drives) {
+                if (door >= 0 && d.t > door && d.t < arrived && "hop".equals(d.kind)) {
+                    legs++;
+                    onCourse &= near(d.heading, target, 20);
+                    short_ &= d.end > 0 && d.end - d.t <= rig.tuning.steerShortTicks * rig.tuning.hopTickMs + 100;
+                }
+            }
+            check(n, door > 0 && trusted != null && trusted.contains("(open 0.00); trusting Claude's pick and driving")
+                            && arrived > door && legs >= 2 && onCourse && short_
+                            && notedAt(notes, "seeking: gave up") < 0 && rig.violations.isEmpty(),
+                    "target=" + f1(target) + " door@" + door + " arrived@" + arrived + " legs=" + legs + " onCourse="
+                            + onCourse + " short=" + short_ + " trusted=" + trusted + " notes=" + lastNotes(notes, 25));
+        });
+        scenario("seek_claudes_doorway_reading_blocked_with_a_tof_obstacle_at_1_m_stops_on_the_hazard_then_the_seek_blocked_handling_runs", n -> {
+            // As above, but a real obstacle stands toward the doorway (and 45 deg either side of it):
+            // the floor sensor stops him as on any leg, he tries 45 deg off the target, is stopped
+            // again, and the seek gives up.
+            List<String> notes = new ArrayList<String>();
+            long[] first = {-1};
+            Rig[] h = new Rig[1];
+            double[] target = {Double.NaN};
+            Rig rig = new Rig(seekTuning().doorwayAsk(5000, 3000).build(), t -> {
+                Rig r = h[0];
+                boolean toward = r != null && !Double.isNaN(target[0]) && r.brain.seeking()
+                        && Math.abs(Heading.delta(r.yaw.wrapped(), target[0])) <= 60
+                        && notedAt(notes, "trusting Claude's pick and driving") >= 0;
+                if (toward && first[0] < 0) {
+                    first[0] = t;
+                }
+                return toward ? obstacle(t) : clear(t);
+            }, NOTHING, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+            h[0] = rig;
+            rig.placeView = (r, t) -> scene(1);
+            rig.seeks = (r, req, k) -> CuriosityPort.WayOut.way(2, 0f);
+            rig.simWheels = true;
+            rig.doorways = (r, k) -> r.brain.seeking() ? CuriosityPort.Doorway.door(0.77f) : CuriosityPort.Doorway.none();
+            rig.openView = (r, t) -> r.brain.seeking() ? prof(0.9f, 0f, 0f, 0f) : prof(0.9f, 0.9f, 0.9f, 0.9f);
+            rig.brain.setTrace(x -> {
+                notes.add(h[0].now + " " + x);
+                if (x.startsWith("seeking: heading for the doorway at ")) {
+                    target[0] = h[0].brain.seekHeading();
+                }
+            });
+            rig.started();
+            runUntil(rig, 400000, r -> notedAt(notes, "seeking: gave up") >= 0 || notedAt(notes, "seeking: arrived") >= 0);
+            int stop = first[0] < 0 ? -1 : rig.firstAfter("stop", first[0]);
+            long hazard = first[0] < 0 ? -1 : noteAt(notes, "hazard", first[0]);
+            long detour = notedAt(notes, "seeking: blocked toward the target");
+            String gaveUp = firstNote(notes, "seeking: gave up");
+            long gaveAt = notedAt(notes, "seeking: gave up");
+            boolean towardAfter = false;
+            for (Drive d : rig.drives) {
+                towardAfter |= "hop".equals(d.kind) && d.t > detour && detour > 0 && d.t < gaveAt
+                        && near(d.heading, target[0], 20);
+            }
+            check(n, first[0] > 0 && hazard >= first[0] && hazard <= first[0] + 1500
+                            && detour >= hazard && gaveUp != null && gaveUp.contains("blocked") && gaveAt > detour
+                            && !towardAfter && notedAt(notes, "seeking: arrived") < 0 && rig.violations.isEmpty(),
+                    "target=" + f1(target[0]) + " first@" + first[0] + " stop@" + (stop < 0 ? -1 : rig.timeOf(stop))
+                            + " hazard@" + hazard + " detour@" + detour + " gaveUp=" + gaveUp + " towardAfter=" + towardAfter
+                            + " notes=" + lastNotes(notes, 30));
+        });
+        scenario("seek_the_least_familiar_fallback_target_reading_blocked_still_gives_up", n -> {
+            // Claude sees nowhere new: the fallback (the least familiar frame) is not Claude's pick,
+            // so its reading blocked when faced ends the seek as before.
+            Rig rig = seekRig(seekTuning(), (r, t) -> scene(1), (r, req, k) -> CuriosityPort.WayOut.none());
+            rig.openView = (r, t) -> Double.isNaN(r.brain.seekHeading()) ? prof(0.9f, 0.9f, 0.9f, 0.9f)
+                    : prof(0.9f, 0.02f, 0.02f, 0.02f);
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 400000, r -> notedAt(notes, "seeking: gave up") >= 0);
+            long fell = notedAt(notes, "seeking: Claude sees nowhere new: least familiar frame");
+            String gaveUp = firstNote(notes, "seeking: gave up");
+            check(n, fell > 0 && gaveUp != null && gaveUp.contains("the target reads blocked, nothing open within 45 deg of it")
+                            && notedAt(notes, "trusting Claude") < 0 && rig.violations.isEmpty(),
+                    "fell@" + fell + " gaveUp=" + gaveUp + " notes=" + lastNotes(notes, 20));
+        });
+    }
+
+    /** The time of the first forward drive at or after from, or from itself when none yet. */
+    private static long firstHopT(Rig rig, long from) {
+        Drive d = from < 0 ? null : firstHop(rig, from);
+        return d == null ? Long.MAX_VALUE : d.t;
     }
 
     private static void cueScenarios() {
