@@ -868,5 +868,21 @@ class FacelessOpenerTest(unittest.TestCase):
         self.assertIn(".face(openedFaceless, faceSeen && name == null)", session)
 
 
+class SlimUploadWiringTest(unittest.TestCase):
+    """Every image Explore sends to Claude is slimmed in ClaudeApi.jpegBlock
+    (test_jpeg_slim); the frames it keeps for face matching and the frame ring
+    stay as captured."""
+
+    def test_every_image_block_goes_through_jpeg_block(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertGreaterEqual(a.count("ClaudeApi.jpegBlock("), 5)
+        for bypass in ('"image/jpeg"', '"base64"', "Base64."):
+            self.assertNotIn(bypass, a, bypass)
+
+    def test_kept_frames_are_not_slimmed(self):
+        for name in ("ClaudeCuriosity.java", "ExploreCamera.java", "FrameRing.java", "FaceCropper.java"):
+            self.assertNotIn("JpegSlim", code_only(src(name)), name)
+
+
 if __name__ == "__main__":
     unittest.main()

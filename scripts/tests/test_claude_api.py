@@ -20,7 +20,7 @@ HARNESS = TESTS / "fixtures" / "claude_api_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "shared" / "ClaudeApiHarness.java"
 CLIENT = SHARED / "ClaudeApi.java"
 TRANSPORT = SHARED / "ClaudeHttpsTransport.java"
-PLAIN_JAVA = [CLIENT, TRANSPORT, SHARED / "Json.java", SHARED / "ClaudeAccess.java"]
+PLAIN_JAVA = [CLIENT, TRANSPORT, SHARED / "Json.java", SHARED / "ClaudeAccess.java", SHARED / "JpegSlim.java"]
 
 
 class ClaudeClientIsPlainJavaTest(unittest.TestCase):
@@ -170,7 +170,7 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         out = cls._td.name
         # Only the plain-Java classes are compiled; the rest of shared/ needs the Android SDK.
         # The real transport is compiled too, to prove it builds without Android.
-        sources = [HARNESS_MAIN, CLIENT, TRANSPORT, SHARED / "Json.java", SHARED / "ClaudeAccess.java"]
+        sources = [HARNESS_MAIN] + PLAIN_JAVA
         c = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, sources, [HARNESS]),
                            capture_output=True, text=True)
         cls.compiled = c.returncode == 0

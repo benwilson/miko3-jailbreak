@@ -212,12 +212,17 @@ public final class ClaudeApi {
         return b;
     }
 
-    /** An image content block for messages(): the JPEG bytes as base64 with no line breaks. */
+    /**
+     * An image content block for messages(): the JPEG bytes as base64 with no
+     * line breaks. The bytes are slimmed first (JpegSlim: the camera vendor's
+     * APPn metadata dropped, pixels untouched), which cuts a robot frame from
+     * ~445 KB to ~140 KB; the caller's array is not modified.
+     */
     public static Map<String, Object> jpegBlock(byte[] jpeg) {
         Map<String, Object> source = new LinkedHashMap<String, Object>();
         source.put("type", "base64");
         source.put("media_type", "image/jpeg");
-        source.put("data", Base64.getEncoder().encodeToString(jpeg));
+        source.put("data", Base64.getEncoder().encodeToString(JpegSlim.slim(jpeg)));
         Map<String, Object> b = new LinkedHashMap<String, Object>();
         b.put("type", "image");
         b.put("source", source);
