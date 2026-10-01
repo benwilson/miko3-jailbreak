@@ -143,7 +143,9 @@ import java.util.Set;
  * is the one place it opens and closes, by rule (cameraWanted): open in every
  * roaming, escaping and curiosity state; closed while he meets, asks or talks, at
  * rest, without the lease or sensors, and for cameraBackoffMs after a camera that
- * gave no look in time (he roams on the floor sensor meanwhile, R5). Each leg is
+ * gave no look in time (he roams on the floor sensor meanwhile, R5); a curiosity
+ * stop's miss retries once and only a second in a row closes it, for
+ * curiosityBackoffMs. Each leg is
  * chosen from the newest fresh look's openness by RoamSteer (a bend toward the
  * most open columns, a length cut by blocked ones; a low-confidence profile
  * chooses as before), and a fresh look reading the way ahead blocked ends a leg
@@ -512,7 +514,9 @@ final class ExploreBrain {
             SEARCHES("searches"), FACES_FOUND("facesFound"), QUIET_RESUMES("quietResumes"),
             CUES_HELD("cuesHeld"), CUES_DROPPED("cuesDropped"), RETARGETS("retargets"), SHOVES("shoves"),
             /** A question the conversation model repeated after the re-request (U8, KTD9). */
-            REPEATS("repeats");
+            REPEATS("repeats"),
+            /** A curiosity stop's remark handed to the speech service (the remark rate, owner 2026-10-01). */
+            REMARKS("remarks");
 
             final String key;
 
@@ -627,6 +631,14 @@ final class ExploreBrain {
     /** When the next curiosity stop is due, and when a camera failure's back-off ends. */
     private long curiosityAt = Long.MAX_VALUE;
     private long curiosityOffUntil;
+    /** The last stop's look never came: the next miss in a row turns curiosity off (curiosityBackoffMs). */
+    private boolean stopLookMissed;
+    /** A stop retried after its first missed look: when the retry is due, instead of a full gap (or -1). */
+    private long curiosityRetryAt = -1;
+    /** The line queued at SPEAK is a stop's remark (counted when it is handed to the speech service). */
+    private boolean remarkQueued;
+    /** When each remark of the last ten minutes was spoken, for the running rate in the log. */
+    private final ArrayDeque<Long> remarkTimes = new ArrayDeque<Long>();
     private Step step;
     /** A look counts only if its frame was captured at or after lookAfter; none by lookDeadline is a failure. */
     private long lookAfter;
@@ -739,6 +751,8 @@ final class ExploreBrain {
     /** Continuous mode, in PAUSE: a leg decision waiting for a look to steer by, until then (steerWaitMs). */
     private long steerWaitUntil = NO_WAIT;
     private static final long NO_WAIT = Long.MIN_VALUE;
+    /** The running remark count in the log covers this long. */
+    private static final long REMARK_WINDOW_MS = 600000;
     /** Frames awaiting the floor-teach distance (teachQueue); the oldest is dropped first. */
     private static final int TEACH_QUEUE_MAX = 8;
     /** A timed orient shorter than this is already facing it. */
@@ -1855,7 +1869,7 @@ final class ExploreBrain {
         note("escape over: saying Claude's line from here");
         pick = p;
         target = null;
-        speak(now, p.line);
+        speakRemark(now, p.line);
         return true;
     }
 
@@ -2003,6 +2017,11 @@ final class ExploreBrain {
     // ---- curiosity ----
 
     private void scheduleCuriosity(long now) {
+        if (curiosityRetryAt >= 0) {
+            curiosityAt = curiosityRetryAt;
+            curiosityRetryAt = -1;
+            return;
+        }
         curiosityAt = now + between(tuning.curiosityMinMs, tuning.curiosityMaxMs);
     }
 
@@ -2039,6 +2058,32 @@ final class ExploreBrain {
         firstLook = false;
     }
 
+    /**
+     * A stop's look did not come in time (the remark rate, owner 2026-10-01). The
+     * stop ends (saying its pick, if it has one). The first miss is retried
+     * curiosityRetryMs later; a second in a row with no look at all turns curiosity
+     * off for curiosityBackoffMs, and one where looks came, just none new enough (a
+     * slow detector, not a broken camera), only ends the stop.
+     */
+    private void stopLookMissed(long now, boolean noLookAtAll) {
+        boolean again = stopLookMissed;
+        stopLookMissed = !again;
+        if (!noLookAtAll) {
+            note("no new look in time; ending this curiosity stop");
+        } else if (again) {
+            note("camera gave no look in time again; curiosity off for " + tuning.curiosityBackoffMs + " ms");
+            curiosityOffUntil = now + tuning.curiosityBackoffMs;
+        } else {
+            note("camera gave no look in time");
+        }
+        if (!again && pick == null) {
+            // Taken by scheduleCuriosity as the stop ends, in place of a full gap of wandering.
+            note("trying the curiosity stop again in " + tuning.curiosityRetryMs + " ms");
+            curiosityRetryAt = now + tuning.curiosityRetryMs;
+        }
+        giveUp(now);
+    }
+
     /** SCAN, FACE and APPROACH: waiting for a look, leading with the eyes, turning, or driving a leg. */
     private void curiosityStep(long now, boolean fresh, boolean hazard) {
         switch (step) {
@@ -2057,15 +2102,7 @@ final class ExploreBrain {
                         cueLookOver(now, look == null);
                         break;
                     }
-                    if (look != null) {
-                        // Looks are coming, just not a new enough one: a slow detector,
-                        // not a broken camera, so only this stop ends.
-                        note("no new look in time; ending this curiosity stop");
-                    } else {
-                        note("camera gave no look in time; curiosity off for " + tuning.cameraBackoffMs + " ms");
-                        curiosityOffUntil = now + tuning.cameraBackoffMs;
-                    }
-                    giveUp(now);
+                    stopLookMissed(now, look == null);
                 }
                 break;
             }
@@ -2121,6 +2158,7 @@ final class ExploreBrain {
             cueLook(now, look);
             return;
         }
+        stopLookMissed = false;
         // Someone met in the last 10 minutes: the detector's fallback never approaches a person (KTD8).
         // Only SCAN asks: a call's FACE and APPROACH never pass the leave-alone checks (hey-miko KTD8).
         boolean ignorePeople = state == State.SCAN
@@ -2390,6 +2428,7 @@ final class ExploreBrain {
         stranger = null;
         helloOnly = false;
         pendingLine = null;
+        remarkQueued = false;
         afterOrient = null;
         scanned.clear();
         scanHeadings.clear();
@@ -2927,7 +2966,7 @@ final class ExploreBrain {
             enterMeetLook(now);
             return;
         }
-        speak(now, pick.line);
+        speakRemark(now, pick.line);
     }
 
     // ---- meeting a person (explore on Claude U5; R9-R14, KTD3, KTD4) ----
@@ -3615,6 +3654,13 @@ final class ExploreBrain {
         say(now, line, State.SPEAK);
     }
 
+    /** SPEAK, for a stop's remark: counted once it is handed to the speech service (countRemark). */
+    private void speakRemark(long now, String line) {
+        queueLine(now, line, State.SPEAK);
+        remarkQueued = true;
+        lineStarted(now);
+    }
+
     private void say(long now, String line, State s) {
         queueLine(now, line, s);
         lineStarted(now);
@@ -3630,6 +3676,7 @@ final class ExploreBrain {
         syncCamera();
         stareAtPick();
         pendingLine = line;
+        remarkQueued = false;
         quietUntil = now + tuning.quietWaitMs;
     }
 
@@ -3639,6 +3686,20 @@ final class ExploreBrain {
         String line = pendingLine;
         pendingLine = null;
         port.say(line);
+        if (remarkQueued) {
+            remarkQueued = false;
+            countRemark(now);
+        }
+    }
+
+    /** A stop's remark handed to the speech service: counted, with the running rate logged. */
+    private void countRemark(long now) {
+        gauges.count(Gauges.Counter.REMARKS);
+        remarkTimes.addLast(now);
+        while (now - remarkTimes.peekFirst() > REMARK_WINDOW_MS) {
+            remarkTimes.pollFirst();
+        }
+        note("remarks in the last 10 min: " + remarkTimes.size());
     }
 
     /**
@@ -5994,14 +6055,15 @@ final class ExploreBrain {
             // He cannot move, or has no camera to decide with: only a call opens a meeting (callVerdict).
             return CueVerdict.DROP;
         }
+        if (remarkUnderway()) {
+            // The remark rate (owner 2026-10-01): a voice that is not a call waits for the remark.
+            return CueVerdict.HOLD;
+        }
         switch (state) {
             case PAUSE: case HOP: case SCAN: case INSPECT: case REACT_HERE: case CORNERED: case ASK: case ORIENT:
                 return CueVerdict.TAKE;
             case LOOK: case TURN:
                 return escape ? CueVerdict.HOLD : CueVerdict.TAKE;
-            case SPEAK:
-                // Before the line starts the remark is dropped; while it plays the deaf window is open (KTD1).
-                return pendingLine != null ? CueVerdict.TAKE : CueVerdict.HOLD;
             case FACE: case APPROACH: case MEET_LOOK: case MEET:
                 return sameSideAsPerson(c) ? CueVerdict.CONFIRM : CueVerdict.TAKE;
             case STARTLE: case BACK_OFF: case RETRACE: case CIRCLE: case WAY_OUT: case DRIVE_OFF:
@@ -6010,6 +6072,22 @@ final class ExploreBrain {
             default:
                 return CueVerdict.DROP;
         }
+    }
+
+    /**
+     * A stop with a remark to make (the remark rate, owner 2026-10-01): a line at
+     * SPEAK, or a pick with a line that is not a person to meet, on its way to it.
+     * Office voices that are not calls used to drop nearly every one.
+     */
+    private boolean remarkUnderway() {
+        if (state == State.SPEAK) {
+            return true;
+        }
+        if (state != State.ORIENT && state != State.FACE && state != State.APPROACH && state != State.INSPECT
+                && state != State.REACT_HERE) {
+            return false;
+        }
+        return pick != null && (pick.kind != CuriosityPort.Kind.PERSON || remarkOnly) && usable(pick.line);
     }
 
     /**

@@ -99,7 +99,7 @@ final class ExploreState {
      */
     static final class Gauges {
         static final String[] COUNTERS = {"cues", "strongCues", "weakCues", "leanIns", "searches", "facesFound",
-                "quietResumes", "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats"};
+                "quietResumes", "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats", "remarks"};
         static final String[] STAGES = {"cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested",
                 "firstSound", "callHeard", "callAnswered", "callFacing", "callArrived"};
         static final Gauges NONE = new Gauges(new int[COUNTERS.length], new long[STAGES.length]);

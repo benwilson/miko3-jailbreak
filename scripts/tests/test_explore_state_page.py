@@ -87,7 +87,7 @@ class ExploreStatePageTest(unittest.TestCase):
         self.assertEqual(self.holder["state"], "listening")
         gauges = self.holder["gauges"]
         counters = ["cues", "strongCues", "weakCues", "leanIns", "searches", "facesFound", "quietResumes",
-                    "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats"]
+                    "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats", "remarks"]
         stages = ["cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested", "firstSound",
                   "callHeard", "callAnswered", "callFacing", "callArrived"]
         self.assertEqual(sorted(k for k in gauges if k != "stages"), sorted(counters))

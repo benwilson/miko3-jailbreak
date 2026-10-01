@@ -198,7 +198,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "replies_look_reads_the_frame_box_kind_and_line",
         "replies_name_keeps_one_or_two_words_and_fills_the_placeholder",
         # The fixes from Explore on Claude's first live test
-        "tuning_defaults_roam_45_to_90_s_and_two_10_s_claude_tries",
+        "tuning_defaults_roam_25_to_40_s_and_two_10_s_claude_tries",
         "claude_other_pick_on_a_differently_named_detector_box_faces_without_driving",
         "claude_other_pick_with_a_synonym_or_shared_word_is_approached",
         "claude_pick_needs_iou_0_3_not_a_centre_inside_its_box",
@@ -372,7 +372,9 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "cue_during_ask_cancels_the_ask",
         "cue_during_a_playing_line_is_held_and_taken_when_it_ends",
         "cue_before_the_line_starts_drops_the_remark_and_turns",
-        "cue_during_orient_takes_and_drops_the_pick",
+        "cue_during_orient_is_held_until_the_remark_is_said",
+        "weak_cue_before_the_line_starts_still_says_the_remark",
+        "call_during_orient_drops_the_pick_and_is_answered",
         "cue_during_startle_is_held_until_pause",
         "cue_during_cornered_rest_is_taken",
         "cue_same_side_during_approach_continues_it",
@@ -546,6 +548,10 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "resolve_chat_ae9_name_on_turn_three_close_to_sarah_joins_her_and_moves_the_notes",
         "resolve_chat_a_known_conversation_whose_name_given_is_close_to_another_stored_person_joins_them",
         "resolve_chat_a_join_whose_photo_is_refused_continues_and_recreates_nobody",
+        # The remark rate (owner 2026-10-01): an observation about every 30 s with nobody about
+        "one_slow_look_retries_the_stop_soon_and_curiosity_stays_on",
+        "two_slow_looks_in_a_row_turn_curiosity_off_for_30_s",
+        "remark_rate_default_tuning_empty_room_at_least_12_remarks_in_10_min",
     )
 
     @classmethod

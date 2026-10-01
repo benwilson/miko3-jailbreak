@@ -2776,6 +2776,7 @@ public final class ExploreBrainHarness {
         faceMatchScenarios();
         faceMigrationScenarios();
         faceConfirmScenarios();
+        remarkRateScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -3719,13 +3720,19 @@ public final class ExploreBrainHarness {
         });
         scenario("camera_without_looks_turns_curiosity_off", n -> {
             Vision dark = (rig, t) -> null;
-            Rig rig = new Rig(curious().build(), CLEAR, dark, true).started();
+            Rig rig = new Rig(curious().build(), CLEAR, dark, true);
+            List<String> notes = traced(rig);
+            rig.started();
             rig.runUntil(12000);
             int close = rig.first("camera close", 0);
-            // Opened at 1300; no look by 1300 + 3000; back to wandering, and no retry within the back-off.
-            check(n, rig.timeOf(close) == 4300 && rig.count("camera open") == 1 && rig.countPrefix("hop", 4300, 12001) >= 3
-                            && rig.violations.isEmpty(),
-                    rig.tail());
+            // The stop's look is due by 1300 + 3000. That first miss keeps the camera open and
+            // retries the stop 3 s later, but roaming's own deadline (2 s with no look) comes
+            // first: the camera closes at 6300 for roaming's back-off, with no stop within it.
+            check(n, notes.contains("4300 camera gave no look in time") && rig.timeOf(close) == 6300
+                            && notes.contains("6300 camera gave no look in time while roaming; camera off for 10000 ms")
+                            && rig.count("camera open") == 1 && rig.countPrefix("hop", 6300, 12001) >= 3
+                            && entries(rig, ExploreBrain.State.SCAN).size() == 1 && rig.violations.isEmpty(),
+                    notes + " " + rig.tail());
         });
     }
 
@@ -4133,12 +4140,13 @@ public final class ExploreBrainHarness {
     }
 
     private static void liveFixScenarios() {
-        scenario("tuning_defaults_roam_45_to_90_s_and_two_10_s_claude_tries", n -> {
+        scenario("tuning_defaults_roam_25_to_40_s_and_two_10_s_claude_tries", n -> {
             ExploreTuning t = new ExploreTuning.Builder().calibration(calibration()).build();
             Rig rig = new Rig(curious().scan(3, 500).sayTimeoutMs(6000).build(), CLEAR, (r, tt) -> list(), true,
                     (r, req, nth) -> null).started();
             rig.runUntil(9000);
-            check(n, t.curiosityMinMs == 45000 && t.curiosityMaxMs == 90000 && t.askAttempts == 2
+            check(n, t.curiosityMinMs == 18000 && t.curiosityMaxMs == 28000 && t.curiosityRetryMs == 3000
+                            && t.curiosityBackoffMs == 30000 && t.cameraBackoffMs == 120000 && t.askAttempts == 2
                             && t.askTimeoutMs == 10000 && t.pickMatchIou == 0.3f
                             && !rig.askTimeouts.isEmpty() && rig.askTimeouts.get(0) == 10000,
                     t.curiosityMinMs + ".." + t.curiosityMaxMs + " " + t.askAttempts + "x" + t.askTimeoutMs
@@ -8534,8 +8542,9 @@ public final class ExploreBrainHarness {
                             && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 0 && rig.violations.isEmpty(),
                     "speak@" + speak + " " + gauges(rig) + " " + rig.tail());
         });
-        scenario("cue_during_orient_takes_and_drops_the_pick", n -> {
-            // The lamp is in the first scan look: after the two scan turns ORIENT turns back 80 deg.
+        scenario("cue_during_orient_is_held_until_the_remark_is_said", n -> {
+            // A voice that is not a call no longer cancels a stop with a pick: the remark comes
+            // first, then the held cue is taken (the remark rate, owner 2026-10-01).
             Rig rig = new Rig(claudeTuning().gyro(robotGyro()).scanTurnDeg(40).cueTurn(45, 90, 500, 2000, 600).build(),
                     CLEAR, EMPTY_ROOM, true, (r, req, nth) -> pick(0, "lamp", CuriosityPort.Kind.OTHER,
                             "What a shiny lamp!", 0.5f, 0.5f, 0.2f, 0.3f));
@@ -8544,10 +8553,49 @@ public final class ExploreBrainHarness {
             long cueT = orient + 300;
             rig.cue(cueT, Ears.Kind.GREETING, Ears.Side.RIGHT, 70f);
             rig.runUntil(orient + 8000);
-            check(n, orient > 0 && entered(rig, ExploreBrain.State.CUE_TURN, cueT) == cueT
+            int say = rig.first("say What a shiny lamp!", 0);
+            long search = entered(rig, ExploreBrain.State.CUE_TURN, cueT);
+            check(n, orient > 0 && say >= 0 && search > rig.timeOf(say)
+                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1
+                            && rig.count("react answer") == 0 && rig.violations.isEmpty(),
+                    "orient@" + orient + " say@" + (say < 0 ? -1 : rig.timeOf(say)) + " search@" + search + " "
+                            + gauges(rig) + " " + rig.tail());
+        });
+        scenario("weak_cue_before_the_line_starts_still_says_the_remark", n -> {
+            Rig rig = new Rig(claudeTuning().gyro(robotGyro()).cueTurn(45, 90, 500, 2000, 600).build(), CLEAR,
+                    EMPTY_ROOM, true, (r, req, nth) -> pick(0, "lamp", CuriosityPort.Kind.OTHER, "What a shiny lamp!",
+                            0.5f, 0.5f, 0.2f, 0.3f));
+            // As in cue_before_the_line_starts_...: the line waits at SPEAK, and a weak voice lands in that wait.
+            rig.detectorTailMs = 6000;
+            rig.started();
+            long speak = runUntilState(rig, ExploreBrain.State.SPEAK, 0, 30000);
+            // The detector goes quiet after the cue, inside the quiet wait: the line starts then.
+            rig.detectorTailMs = speak + 800 - rig.closedAt;
+            long cueT = speak + 300;
+            rig.cue(cueT, Ears.Tier.WEAK, Ears.Side.LEFT, -60f);
+            rig.runUntil(speak + 6000);
+            int say = rig.first("say What a shiny lamp!", 0);
+            long search = entered(rig, ExploreBrain.State.CUE_TURN, cueT);
+            check(n, speak > 0 && say >= 0 && rig.timeOf(say) > cueT && (search < 0 || search > rig.timeOf(say))
+                            && rig.counted(ExploreBrain.Gauges.Counter.CUES_HELD) == 1
+                            && rig.counted(ExploreBrain.Gauges.Counter.REMARKS) == 1
+                            && rig.count("react answer") == 0 && rig.violations.isEmpty(),
+                    "speak@" + speak + " say@" + (say < 0 ? -1 : rig.timeOf(say)) + " search@" + search + " "
+                            + gauges(rig) + " " + rig.tail());
+        });
+        scenario("call_during_orient_drops_the_pick_and_is_answered", n -> {
+            Rig rig = new Rig(claudeTuning().gyro(robotGyro()).scanTurnDeg(40).cueTurn(45, 90, 500, 2000, 600).build(),
+                    CLEAR, EMPTY_ROOM, true, (r, req, nth) -> pick(0, "lamp", CuriosityPort.Kind.OTHER,
+                            "What a shiny lamp!", 0.5f, 0.5f, 0.2f, 0.3f));
+            rig.started();
+            long orient = runUntilState(rig, ExploreBrain.State.ORIENT, 0, 30000);
+            long cueT = orient + 300;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 70f);
+            rig.runUntil(orient + 8000);
+            check(n, orient > 0 && answerAt(rig, cueT) == cueT && entered(rig, ExploreBrain.State.CUE_TURN, cueT) == cueT
                             && "ORIENT".equals(stateBefore(rig, ExploreBrain.State.CUE_TURN, cueT))
                             && rig.count("say What a shiny lamp!") == 0 && rig.violations.isEmpty(),
-                    "orient@" + orient + " " + rig.tail());
+                    "orient@" + orient + " answer@" + answerAt(rig, cueT) + " " + rig.tail());
         });
         scenario("cue_during_startle_is_held_until_pause", n -> {
             // A weak voice keeps the held-cue rule; a call waits only for the back-off (call_ae2_...).
@@ -11371,6 +11419,106 @@ public final class ExploreBrainHarness {
                             && !anyContains(notes, "Cheese", "cheese", "gouda", "Like", "Sarah", "catch you", "forget me",
                                     "Line 2", "Forget you"),
                     "over@" + over + " notes=" + notes);
+        });
+    }
+
+    // ---- the remark rate (an observation about every 30 s with nobody about) ----
+
+    /** Things no two of which match loosely, so every pick is new to him. */
+    private static final String[] NEW_THINGS = {"lamp", "plant", "chair", "mug", "poster", "clock", "book", "window",
+            "shoe", "bag", "desk", "cable", "kettle", "bin", "coat", "phone", "radiator", "door", "printer", "sofa",
+            "whiteboard", "umbrella", "bottle", "keyboard", "monitor", "rug", "fan", "guitar", "basket", "pillow"};
+
+    /** Claude picks something new in the first look every time he is asked, with a line to say. */
+    private static final Claude PICKS_SOMETHING = (r, req, nth) -> {
+        String thing = NEW_THINGS[(nth - 1) % NEW_THINGS.length];
+        return pick(0, thing, CuriosityPort.Kind.OTHER, "Look at that " + thing + "!", 0.5f, 0.5f, 0.2f, 0.3f);
+    };
+
+    /** Ten simulated minutes in an empty room with the robot's own tuning: the spoken remarks, logged as RATE. */
+    private static Rig emptyRoomTenMinutes(ExploreTuning tuning, List<String> notes) {
+        Rig rig = new Rig(tuning, CLEAR, EMPTY_ROOM, true, PICKS_SOMETHING);
+        rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+        rig.started();
+        rig.runUntil(600000);
+        return rig;
+    }
+
+    private static void remarkRateScenarios() {
+        scenario("one_slow_look_retries_the_stop_soon_and_curiosity_stays_on", n -> {
+            // The robot's own look budgets and back-off, with the camera dark in the first stop only.
+            // Look-then-go keeps it closed while roaming, so the stop opens it and has no look at all.
+            boolean[] dark = {true};
+            Vision v = (r, t) -> dark[0] && r.brain.state() == ExploreBrain.State.SCAN ? null : list();
+            Rig rig = new Rig(claudeTuning().curiosityMs(25000, 40000).lookTiming(400, 10000, 8000)
+                    .cameraBackoffMs(120000).navigation(ExploreTuning.Navigation.LOOK_THEN_GO).build(), CLEAR, v,
+                    true, PICKS_SOMETHING);
+            long[] miss = {-1};
+            rig.brain.setTrace(x -> {
+                if (miss[0] < 0 && x.contains("no look in time") && rig.brain.state() == ExploreBrain.State.SCAN) {
+                    miss[0] = rig.now;
+                    dark[0] = false;
+                }
+            });
+            rig.started();
+            rig.runUntil(90000);
+            long retry = miss[0] < 0 ? -1 : entered(rig, ExploreBrain.State.SCAN, miss[0] + 1);
+            int say = miss[0] < 0 ? -1 : rig.firstAfter("say ", miss[0]);
+            check(n, miss[0] > 0 && retry >= miss[0] + 3000 && retry <= miss[0] + 6000 && say >= 0
+                            && rig.timeOf(say) < miss[0] + 30000 && rig.violations.isEmpty(),
+                    "miss@" + miss[0] + " retry@" + retry + " say@" + (say < 0 ? -1 : rig.timeOf(say)) + " "
+                            + rig.tail());
+        });
+        scenario("two_slow_looks_in_a_row_turn_curiosity_off_for_30_s", n -> {
+            // The camera is dark in every stop: the stop misses, retries and misses again.
+            // Look-then-go keeps it closed while roaming, so each stop opens it and has no look at all.
+            Vision dark = (r, t) -> r.brain.state() == ExploreBrain.State.SCAN ? null : list();
+            Rig rig = new Rig(curious().lookTiming(400, 3000, 8000).cameraBackoffMs(120000)
+                    .navigation(ExploreTuning.Navigation.LOOK_THEN_GO).build(), CLEAR, dark, true);
+            List<Long> misses = new ArrayList<Long>();
+            rig.brain.setTrace(x -> {
+                if (x.contains("no look in time") && rig.brain.state() == ExploreBrain.State.SCAN) {
+                    misses.add(rig.now);
+                }
+            });
+            rig.started();
+            rig.runUntil(60000);
+            long second = misses.size() < 2 ? -1 : misses.get(1);
+            List<Long> scans = entries(rig, ExploreBrain.State.SCAN);
+            long afterOff = -1;
+            for (long t : scans) {
+                if (second > 0 && t > second) {
+                    afterOff = t;
+                    break;
+                }
+            }
+            check(n, misses.size() >= 2 && scans.size() >= 2 && scans.get(1) > misses.get(0)
+                            && second > 0 && afterOff >= second + 30000 && afterOff <= second + 33000
+                            && rig.violations.isEmpty(),
+                    "misses=" + misses + " scans=" + scans + " " + rig.tail());
+        });
+        scenario("remark_rate_default_tuning_empty_room_at_least_12_remarks_in_10_min", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = emptyRoomTenMinutes(new ExploreTuning.Builder().calibration(calibration()).build(), notes);
+            int said = rig.countPrefix("say ", 0, 600001);
+            List<Long> scans = entries(rig, ExploreBrain.State.SCAN);
+            List<Long> says = new ArrayList<Long>();
+            for (Event e : rig.log) {
+                if (e.what.startsWith("say ")) {
+                    says.add(e.t);
+                }
+            }
+            String lastRate = null;
+            for (String x : notes) {
+                if (x.contains("remarks in the last 10 min: ")) {
+                    lastRate = x.substring(x.indexOf("remarks in"));
+                }
+            }
+            System.out.println("REPORT remark rate, default tuning, an empty room, 10 simulated min: " + said
+                    + " remarks, " + scans.size() + " stops; stops at " + scans + "; remarks at " + says);
+            check(n, said >= 12 && rig.counted(ExploreBrain.Gauges.Counter.REMARKS) == said
+                            && ("remarks in the last 10 min: " + said).equals(lastRate) && rig.violations.isEmpty(),
+                    "said=" + said + " counted=" + rig.counted(ExploreBrain.Gauges.Counter.REMARKS) + " lastRate=" + lastRate + " " + rig.tail());
         });
     }
 }

@@ -115,7 +115,10 @@ final class ExploreTuning {
      * scanTurnMs step turn between them. A look counts only if its frame was
      * captured lookSettleMs after he stopped moving; no such look within
      * firstLookTimeoutMs of opening the camera (lookTimeoutMs later) is a camera
-     * failure, which turns curiosity off for cameraBackoffMs (KTD8).
+     * failure, which turns curiosity off for cameraBackoffMs (KTD8). A stop's own
+     * miss is gentler (the remark rate, owner 2026-10-01): the first is retried
+     * curiosityRetryMs later, and only a second in a row turns curiosity off, for
+     * curiosityBackoffMs. Roaming and the call's search keep cameraBackoffMs.
      */
     final long curiosityMinMs;
     final long curiosityMaxMs;
@@ -125,6 +128,8 @@ final class ExploreTuning {
     final long firstLookTimeoutMs;
     final long lookTimeoutMs;
     final long cameraBackoffMs;
+    final long curiosityRetryMs;
+    final long curiosityBackoffMs;
     /**
      * Facing and approaching (R5, R6). A target within centreTolerance of the
      * frame's centre (box centre, -1..1) is ahead; otherwise he turns toward it
@@ -647,6 +652,8 @@ final class ExploreTuning {
         firstLookTimeoutMs = b.firstLookTimeoutMs;
         lookTimeoutMs = b.lookTimeoutMs;
         cameraBackoffMs = b.cameraBackoffMs;
+        curiosityRetryMs = b.curiosityRetryMs;
+        curiosityBackoffMs = b.curiosityBackoffMs;
         centreTolerance = b.centreTolerance;
         turnMsPerUnit = b.turnMsPerUnit;
         faceTurnsMax = b.faceTurnsMax;
@@ -905,9 +912,12 @@ final class ExploreTuning {
         private float unsureFloor = 0.2f;
         private float fillHeight = 0.7f;
         private float fillArea = 0.4f;
-        // 45-90 s of wandering between stops: the owner likes him driving around.
-        private long curiosityMinMs = 45000;
-        private long curiosityMaxMs = 90000;
+        // 18-28 s of wandering from one stop's end to the next (a stop itself takes
+        // about 8-15 s): the owner wants a remark about every 30 s when nobody is
+        // talking to him (robot 2026-10-01: 45-90 s, with the losses below, gave one
+        // every 5-15 min).
+        private long curiosityMinMs = 18000;
+        private long curiosityMaxMs = 28000;
         private int scanLooks = 3;
         private long scanTurnMs = 700;
         private long lookSettleMs = 400;
@@ -918,6 +928,9 @@ final class ExploreTuning {
         // on the robot, so the first usable one can be ~5 s away.
         private long lookTimeoutMs = 8000;
         private long cameraBackoffMs = 120000;
+        // One slow look in a stop is retried soon; two in a row are a camera worth resting, briefly.
+        private long curiosityRetryMs = 3000;
+        private long curiosityBackoffMs = 30000;
         private float centreTolerance = 0.25f;
         private long turnMsPerUnit = 900;
         private int faceTurnsMax = 3;
@@ -1240,6 +1253,11 @@ final class ExploreTuning {
             return this;
         }
         Builder cameraBackoffMs(long v) { cameraBackoffMs = v; return this; }
+        Builder curiosityRetry(long retryMs, long backoffMs) {
+            curiosityRetryMs = retryMs;
+            curiosityBackoffMs = backoffMs;
+            return this;
+        }
         Builder facing(float tolerance, long msPerUnit, int turnsMax) {
             centreTolerance = tolerance;
             turnMsPerUnit = msPerUnit;

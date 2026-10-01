@@ -69,10 +69,12 @@ Everything below that needs the robot is sequenced into one session in `docs/rob
   - a fast face path: the camera's own face detection (Camera2 SIMPLE is reported available, up to 15 faces; spike behind `log.tag.MikoExploreHwFace`) or the bundled YuNet;
   - the heavy detector only for curiosity;
   - the camera kept open for the whole session (reopens wedge the vendor HAL).
-- [ ] **He comments less: lean-ins on every voice.** Any speech triggers a lean-in that drops the stop's pick, with no cooldown (5 a minute seen on 2026-09-30). Also "camera gave no look in time" turns curiosity off for 120 s. Fix:
-  - a lean-in cooldown;
-  - never drop a committed pick;
-  - retry a slow look once.
+- [ ] **He comments less: lean-ins on every voice.** Any speech triggers a lean-in, with no cooldown (5 a minute seen on 2026-09-30). On 2026-10-01 he made one remark every 5-15 min. Fix:
+  - [ ] a lean-in cooldown (a voice outside a stop still starts a search every time);
+  - [x] never drop a committed pick: a voice that is not a call is held until the remark is said (2026-10-01, host-tested);
+  - [x] retry a slow look once: a stop's first missed look retries 3 s later, and only a second in a row turns curiosity off, for 30 s, not 120 (2026-10-01, host-tested; roaming and the call's search keep 120 s);
+  - [x] stops every 25-40 s, not 45-90 s. In the harness's empty room that is 13 remarks in 10 min (was 8), one about every 46 s.
+- [ ] **Robot-check the remark rate.** The log now says "remarks in the last 10 min: N" at each remark, and `/state` gauges count `remarks` once the state page lists the key (`ExploreState.Gauges.COUNTERS`). The gap is timed from each stop's end, not its start, so a remark comes every gap plus one stop (about 46 s in the harness, longer live with slow looks and Claude). If it is still well over 30-45 s, time the gap from the stop's start, with a floor of wandering.
 - [ ] **A call's words never reach the brain.** `Ears.Cue` has no text, and a "Hey Miko …" said during CHAT_LISTEN arrives as a wake word, not as words. `ChatSession` resets its unanswered-listen count only on heard words. Needs EarsAdapter/launcher and ChatSession changes.
 - [ ] **Robot-test the 2026-09-30 call fixes** (side-first search, fresh frames from turn stop, talking during the search). They are host-tested only: the camera HAL wedged before the test.
 
