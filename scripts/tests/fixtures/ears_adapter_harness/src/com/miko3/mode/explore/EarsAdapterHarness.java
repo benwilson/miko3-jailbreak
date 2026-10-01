@@ -26,6 +26,13 @@ public final class EarsAdapterHarness {
         public void heard(String transcript) {
             heard.add(transcript);
         }
+
+        final List<Long> answering = new ArrayList<Long>();
+
+        @Override
+        public void answering(long at) {
+            answering.add(at);
+        }
     }
 
     public static void main(String[] args) {
@@ -36,6 +43,9 @@ public final class EarsAdapterHarness {
         run("uncalled_strong_partial_joins_later_weak_cue", EarsAdapterHarness::uncalledPartialJoins);
         run("queue_overflow_drops_oldest", EarsAdapterHarness::overflowDropsOldest);
         run("worded_utterance_queued_with_side_and_angle", EarsAdapterHarness::wordedQueuedWithSideAndAngle);
+        run("answering_goes_to_the_armed_reply_and_its_words_still_answer_it",
+                EarsAdapterHarness::answeringGoesToArmedReply);
+        run("answering_with_no_armed_reply_is_ignored_and_queues_nothing", EarsAdapterHarness::answeringUnarmedIgnored);
         System.exit(failures == 0 ? 0 : 1);
     }
 
@@ -225,6 +235,44 @@ public final class EarsAdapterHarness {
         }
         if (!a.drain().isEmpty()) {
             return "drain did not empty the queue";
+        }
+        return null;
+    }
+
+    /** Robot 2026-10-01: the launcher's "answering" reaches the armed reply; the words at its end answer it. */
+    private static String answeringGoesToArmedReply() {
+        EarsAdapter a = opened();
+        Recorder r = new Recorder();
+        a.listen(4000, r);
+        a.onAnswering(2500);
+        if (!r.answering.equals(java.util.Collections.singletonList(2500L)) || !r.heard.isEmpty()) {
+            return "the reply was told " + r.answering + " and heard " + r.heard;
+        }
+        if (!a.drain().isEmpty()) {
+            return "answering queued a cue";
+        }
+        a.onHeard("we went to the beach", RobotEars.SIDE_LEFT, -20f, RobotEars.TIER_WEAK, 2500, false,
+                RobotEars.KIND_VOICE, false);
+        if (!r.heard.equals(java.util.Collections.singletonList("we went to the beach")) || !a.drain().isEmpty()) {
+            return "the answer's words did not reach the reply: " + r.heard;
+        }
+        return null;
+    }
+
+    /** An answer after the listen was retired (or before any) goes nowhere: the brain moved on. */
+    private static String answeringUnarmedIgnored() {
+        EarsAdapter a = opened();
+        a.onAnswering(100);
+        Recorder r = new Recorder();
+        a.listen(4000, r);
+        a.listenOver(r);
+        a.onAnswering(2500);
+        EarsAdapter closed = new EarsAdapter(new Context());
+        Recorder c = new Recorder();
+        closed.listen(4000, c);
+        closed.onAnswering(300);
+        if (!r.answering.isEmpty() || !c.answering.isEmpty() || !a.drain().isEmpty()) {
+            return "an unarmed or closed adapter passed answering on: " + r.answering + " " + c.answering;
         }
         return null;
     }

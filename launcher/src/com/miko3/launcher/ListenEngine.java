@@ -252,6 +252,25 @@ final class ListenEngine implements ListenSession.Ears {
                     // Shutting down.
                 }
             }
+
+            /** On the same delivery thread as heard(), so the mode gets it before the answer's words. */
+            @Override
+            public void answering(final long at) {
+                try {
+                    deliver.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                callback.answering(at);
+                            } catch (RemoteException | RuntimeException e) {
+                                // The client is gone; its death releases the session.
+                            }
+                        }
+                    });
+                } catch (RejectedExecutionException ignored) {
+                    // Shutting down.
+                }
+            }
         };
         ears.open(String.valueOf(uid), token, client, chargerLatched);
     }

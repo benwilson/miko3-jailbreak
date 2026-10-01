@@ -426,16 +426,33 @@ public final class ExploreBrainHarness {
     static final class Hearing {
         final CuriosityPort.Heard heard;
         final long afterMs;
+        /** When the launcher's "answering" arrives, this long after the listen starts; -1: never (an older launcher). */
+        final long answeringAfterMs;
 
         Hearing(CuriosityPort.Heard heard, long afterMs) {
+            this(heard, afterMs, -1);
+        }
+
+        Hearing(CuriosityPort.Heard heard, long afterMs, long answeringAfterMs) {
             this.heard = heard;
             this.afterMs = afterMs;
+            this.answeringAfterMs = answeringAfterMs;
         }
 
         /** The same hearing, arriving this long after the listen starts. */
         Hearing after(long ms) {
-            return new Hearing(heard, ms);
+            return new Hearing(heard, ms, answeringAfterMs);
         }
+
+        /** The same hearing, with the answer starting (the port's answering()) this long after the listen starts. */
+        Hearing answeringAfter(long ms) {
+            return new Hearing(heard, afterMs, ms);
+        }
+    }
+
+    /** An answer that starts this long into the listen and whose words never come. */
+    static Hearing hearAnsweringOnly(long answeringAfterMs) {
+        return new Hearing(null, -1, answeringAfterMs);
     }
 
     static Hearing hearWords(String text) {
@@ -643,6 +660,8 @@ public final class ExploreBrainHarness {
         long pendingLinesAt;
         CuriosityPort.Heard pendingHeard;
         long pendingHeardAt;
+        /** When the listen's answer started (the port's answering() is true from then until heard()); MAX_VALUE: none. */
+        long pendingAnsweringAt = Long.MAX_VALUE;
         CuriosityPort.Named pendingName;
         long pendingNameAt;
         CuriosityPort.Answer pendingRemembered;
@@ -1312,8 +1331,14 @@ public final class ExploreBrainHarness {
             Hearing h = people.listen == null ? null : people.listen.hear(this, listens);
             pendingHeard = h == null ? null : h.heard;
             pendingHeardAt = now + (h == null || h.afterMs < 0 ? people.replyMs : h.afterMs);
+            pendingAnsweringAt = h == null || h.answeringAfterMs < 0 ? Long.MAX_VALUE : now + h.answeringAfterMs;
             micOpenUntil = now + maxMs;
             log.add(new Event(now, "listen"));
+        }
+
+        @Override
+        public boolean answering() {
+            return now >= pendingAnsweringAt;
         }
 
         @Override
@@ -1323,6 +1348,7 @@ public final class ExploreBrainHarness {
             }
             CuriosityPort.Heard h = pendingHeard;
             pendingHeard = null;
+            pendingAnsweringAt = Long.MAX_VALUE;
             micOpenUntil = Long.MIN_VALUE;
             log.add(new Event(now, "heard " + h.status));
             return h;
@@ -2362,6 +2388,16 @@ public final class ExploreBrainHarness {
                             && !rig.brain.state().confirms() && rig.violations.isEmpty(),
                     "confirm@" + confirm + " overs=" + rig.meetingOvers + " outcomes=" + rig.outcomes + " "
                             + rig.tail());
+        });
+        scenario("confirm_ladder_answer_started_in_time_is_heard_past_the_listen_deadline", n -> {
+            Rig rig = closeLadderRig(hearWords("yes").after(12000).answeringAfter(3000));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(45000);
+            check(n, rig.outcomes.equals(java.util.Arrays.asList("YES " + BEN_ID))
+                            && noteAt(notes, "an answer has started") >= 0
+                            && noteAt(notes, "no answer to the question") < 0 && rig.violations.isEmpty(),
+                    "outcomes=" + rig.outcomes + " notes=" + notes + " " + rig.tail());
         });
         scenario("confirm_ladder_runs_the_confirm_and_last_name_branches_without_a_conversation", n -> {
             // Yes: the photo, then the degraded greeting from the lines request with the stored name.
@@ -4506,6 +4542,20 @@ public final class ExploreBrainHarness {
                             && !resumedBy(rig, rig.timeOf(listen), rig.timeOf(listen) + 7990)
                             && rig.stored.isEmpty() && rig.violations.isEmpty(),
                     rig.tail());
+        });
+        scenario("meet_a_name_answer_started_in_time_is_heard_past_the_listen_deadline", n -> {
+            Rig rig = meetRig();
+            List<String> notes = traced(rig);
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.listen = ListenScript.always(hearWords("my name is Sarah").after(10000).answeringAfter(3000));
+            rig.started();
+            rig.runUntil(40000);
+            int listen = rig.first("listen", 0);
+            int remember = rig.first("remember Sarah", listen);
+            check(n, listen >= 0 && remember > listen && rig.timeOf(remember) - rig.timeOf(listen) >= 10000
+                            && noteAt(notes, "an answer has started") > rig.timeOf(listen)
+                            && noteAt(notes, "no answer from listening in time") < 0 && rig.violations.isEmpty(),
+                    "listen=" + listen + " remember=" + remember + " notes=" + notes + " " + rig.tail());
         });
         scenario("meet_remember_failure_resumes_within_the_budget", n -> {
             Rig rig = meetRig();
@@ -7341,6 +7391,31 @@ public final class ExploreBrainHarness {
         return c;
     }
 
+    /** The time of the first traced note containing what, or -1. */
+    private static long noteAt(List<String> notes, String what) {
+        for (String line : notes) {
+            if (line.contains(what)) {
+                return Long.parseLong(line.substring(0, line.indexOf(' ')));
+            }
+        }
+        return -1;
+    }
+
+    /** The time of the kth (1-based) listen at or after from, or -1. */
+    private static long nthListenAt(Rig rig, long from, int k) {
+        long t = from;
+        long at = -1;
+        for (int i = 0; i < k; i++) {
+            int j = rig.firstAfter("listen", t);
+            if (j < 0) {
+                return -1;
+            }
+            at = rig.timeOf(j);
+            t = at + 1;
+        }
+        return at;
+    }
+
     private static List<String> traced(Rig rig) {
         List<String> notes = new ArrayList<String>();
         rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
@@ -9935,6 +10010,63 @@ public final class ExploreBrainHarness {
             check(n, chat > 0 && rig.count("match") == 1 && rig.violations.isEmpty(), "chat@" + chat + " "
                     + rig.tail());
         });
+        // ---- Robot 2026-10-01: only a call may open a faceless meeting; a cue's needs a usable face ----
+        scenario("cue_weak_then_a_person_box_with_no_face_is_not_met_and_nothing_is_said", n -> {
+            String[] detail = {""};
+            boolean ok = true;
+            for (Ears.Kind kind : new Ears.Kind[] {null, Ears.Kind.GREETING}) {
+                Rig rig = cueRig(personAt(90, 25));
+                rig.people.persona = PERSONA;
+                rig.people.match = (r, k) -> noFace(r);
+                List<String> notes = traced(rig);
+                rig.started();
+                if (kind == null) {
+                    rig.cue(400, Ears.Tier.WEAK, Ears.Side.LEFT, -90f);
+                } else {
+                    rig.cue(400, kind, Ears.Side.LEFT, -90f);
+                }
+                rig.runUntil(400);
+                long match = runUntilEvent(rig, "match", 400, 30000);
+                rig.runUntil(Math.max(match, 400) + 12000);
+                long chat = entered(rig, ExploreBrain.State.CHAT_THINK, 0);
+                long pause = entered(rig, ExploreBrain.State.PAUSE, match);
+                boolean one = match > 0 && chat < 0 && rig.count("match") == 1 && rig.countPrefix("say ", match, Long.MAX_VALUE) == 0
+                        && rig.turnAsks.isEmpty() && pause > 0 && pause <= match + 1000
+                        && noteAt(notes, "a person toward him after the cue") >= 0
+                        && noteAt(notes, "a face turned toward him") < 0
+                        && noteAt(notes, "no usable face in the cue's person box") >= 0 && rig.violations.isEmpty();
+                ok &= one;
+                detail[0] += (kind == null ? "weak" : kind) + ": match@" + match + " chat@" + chat + " pause@" + pause
+                        + " notes=" + notes + " " + rig.tail() + " | ";
+            }
+            check(n, ok, detail[0]);
+        });
+        scenario("cue_weak_then_a_usable_face_meets_and_converses", n -> {
+            Rig rig = cueRig(personAt(90, 25));
+            rig.people.persona = PERSONA;
+            rig.people.match = (r, k) -> STRANGER.withMatch(FaceMatcher.Band.WEAK, null, 0.2f, 3L)
+                    .withConversation(r.people.persona, null, null, null);
+            rig.started();
+            rig.cue(400, Ears.Tier.WEAK, Ears.Side.LEFT, -90f);
+            rig.runUntil(400);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 30000);
+            check(n, chat > 0 && rig.count("match") == 1 && rig.violations.isEmpty(), "chat@" + chat + " "
+                    + rig.tail());
+        });
+        scenario("call_wake_word_with_no_face_still_opens_with_the_crouch_opener", n -> {
+            Rig rig = cueRig(personAt(90, 25));
+            rig.people.persona = PERSONA;
+            rig.people.match = (r, k) -> noFace(r);
+            rig.started();
+            rig.cue(400, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -90f);
+            rig.runUntil(400);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 30000);
+            runUntil(rig, chat + 20000, r -> !r.turnAsks.isEmpty());
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, chat > 0 && first != null && first.request.faceless && first.request.heard == null
+                            && rig.violations.isEmpty(),
+                    "chat@" + chat + " asks=" + rig.turnAsks + " " + rig.tail());
+        });
         callerTalksScenarios();
     }
 
@@ -10804,6 +10936,69 @@ public final class ExploreBrainHarness {
                             && secondListen > rig.timeOf(unpark) && rig.turnAsks.size() == 2
                             && rig.brain.state() == ExploreBrain.State.PAUSE && rig.violations.isEmpty(),
                     "open@" + open + " over@" + over + " unparks=" + rig.countPrefix("unpark", open, over) + " " + rig.tail());
+        });
+        // ---- Robot 2026-10-01: an answer that has started holds the listen past its 4 s ----
+        scenario("chat_an_answer_started_at_2_5_s_and_ended_at_7_3_s_is_heard_with_no_unanswered_listen", n -> {
+            String late = "we went to the beach with my sister";
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300),
+                    hearWords(late).after(7300).answeringAfter(2500), hearWords("catch you later"));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long second = nthListenAt(rig, open, 2);
+            long held = noteAt(notes, "an answer has started");
+            int heard = rig.firstAfter("heard WORDS", second);
+            TurnAsk third = rig.turnAsks.size() >= 3 ? rig.turnAsks.get(2) : null;
+            check(n, open > 0 && over > 0 && second > 0 && third != null && late.equals(third.request.heard)
+                            && held - second >= 4000 && held - second <= 4150
+                            && rig.timeOf(heard) - second >= 7300 && rig.timeOf(heard) - second <= 7450
+                            && noteAt(notes, "unanswered listen") < 0 && rig.count("react sign-off") == 1
+                            && rig.violations.isEmpty(),
+                    "open@" + open + " second@" + second + " held@" + held + " heard@" + rig.timeOf(heard)
+                            + " asks=" + rig.turnAsks + " notes=" + notes);
+        });
+        scenario("chat_a_silent_listen_is_still_the_first_unanswered_listen_at_4_s", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300), hearSilence(), hearSilence());
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long second = nthListenAt(rig, open, 2);
+            long first = noteAt(notes, "first unanswered listen");
+            check(n, open > 0 && over > 0 && second > 0 && first - second >= 4000 && first - second <= 4150
+                            && noteAt(notes, "an answer has started") < 0 && rig.violations.isEmpty(),
+                    "second@" + second + " first unanswered@" + first + " notes=" + notes);
+        });
+        scenario("chat_an_answer_whose_words_never_come_ends_as_unanswered_at_the_fallback", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300), hearAnsweringOnly(2500));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long second = nthListenAt(rig, open, 2);
+            long held = noteAt(notes, "an answer has started");
+            long gaveUp = noteAt(notes, "the answer's words never came");
+            long first = noteAt(notes, "first unanswered listen");
+            long hold = rig.tuning.answerHoldMs;
+            check(n, open > 0 && over > 0 && second > 0 && hold == 23000
+                            && held - second >= 4000 && held - second <= 4150
+                            && gaveUp - second >= hold && gaveUp - second <= hold + 150 && first == gaveUp
+                            && rig.violations.isEmpty(),
+                    "second@" + second + " held@" + held + " gaveUp@" + gaveUp + " first@" + first + " notes=" + notes);
+        });
+        scenario("chat_an_older_launcher_that_never_says_answering_ends_the_listen_at_4_s_as_today", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300),
+                    hearWords("we went to the beach").after(7300), hearSilence());
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long second = nthListenAt(rig, open, 2);
+            long first = noteAt(notes, "first unanswered listen");
+            check(n, open > 0 && over > 0 && second > 0 && first - second >= 4000 && first - second <= 4150
+                            && noteAt(notes, "an answer has started") < 0 && rig.violations.isEmpty(),
+                    "second@" + second + " first unanswered@" + first + " notes=" + notes);
         });
         scenario("chat_a_three_sentence_line_is_cut_to_two_before_speaking", n -> {
             Rig rig = sarahRig(true);

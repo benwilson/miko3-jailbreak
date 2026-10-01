@@ -654,8 +654,18 @@ final class ExploreBrain {
      * Claude's pick at a stop: a match that finds no face in its box drops it (a phantom).
      */
     private boolean roamingPick;
+    /**
+     * This stop's person came from a voice cue that is not a call (a lean-in, or a strong cue
+     * without the wake word or his name), found by the person-box shape test (robot
+     * 2026-10-01): like a roaming pick, its meeting needs a usable face.
+     */
+    private boolean cuePick;
     /** Roaming person picks are ignored until then after a phantom (phantomPersonCooldownMs). */
     private long phantomsIgnoredUntil;
+    /** Robot 2026-10-01: when the meeting's listen (LISTEN, or the confirm ladder's) started. */
+    private long meetListenAt;
+    /** That listen's deadline was moved to the answer hold once already. */
+    private boolean answerHeld;
 
     // ---- asking Claude (explore on Claude U4) ----
     /** This stop asks Claude: decided as the scan starts. */
@@ -2005,6 +2015,7 @@ final class ExploreBrain {
         scanDir = unblocked(randomDirection());
         target = null;
         roamingPick = false;
+        cuePick = false;
         claudeStop = port.canAsk();
         heldPick = null;
         scanned.clear();
@@ -2391,6 +2402,7 @@ final class ExploreBrain {
         latestTrend = null;
         wheellessMeeting = false;
         roamingPick = false;
+        cuePick = false;
         chat = null;
         chatCueSide = null;
         chatNoWheels = false;
@@ -3037,7 +3049,7 @@ final class ExploreBrain {
      * the lines it speaks with port.lines().
      */
     private void matchAnswered(long now, CuriosityPort.MatchAnswer a) {
-        if (roamingPick && !callsOwn() && !usableFace(a)) {
+        if ((roamingPick || cuePick) && !callsOwn() && !usableFace(a)) {
             phantomPerson(now, a);
             return;
         }
@@ -3071,8 +3083,9 @@ final class ExploreBrain {
         phantomsIgnoredUntil = now + tuning.phantomPersonCooldownMs;
         String why = a.status == CuriosityPort.MatchAnswer.Status.FAILED ? "the face check failed"
                 : a.band == FaceMatcher.Band.NOT_READY ? "the face models are not ready" : "no face, or one rejected";
-        note("no usable face in the roaming person pick's box (" + why + "): not meeting them; roaming on, roaming"
-                + " people ignored for " + tuning.phantomPersonCooldownMs + " ms");
+        note("no usable face in the " + (cuePick ? "cue's person box" : "roaming person pick's box") + " (" + why
+                + "): not meeting them; roaming on, roaming people ignored for " + tuning.phantomPersonCooldownMs
+                + " ms");
         endCuriosity(now);
     }
 
@@ -3175,14 +3188,35 @@ final class ExploreBrain {
         stopMotors();
         state = State.LISTEN;
         meetDeadline = now + tuning.listenMs + tuning.listenMarginMs;
+        meetListenAt = now;
+        answerHeld = false;
         note("listening for a reply");
         port.listen(tuning.listenMs);
+    }
+
+    /**
+     * A meeting listen's deadline passed with nothing heard (robot 2026-10-01): true, once
+     * per listen, when the answer has started (the launcher's "answering"), so the caller
+     * moves the deadline to tuning.answerHoldMs from the listen's start; the words come at
+     * the answer's end. False for a silent listen and under an older launcher: as before.
+     */
+    private boolean holdForAnswer() {
+        if (answerHeld || !port.answering()) {
+            return false;
+        }
+        answerHeld = true;
+        note("an answer has started: the listen holds for it up to " + tuning.answerHoldMs + " ms from its start");
+        return true;
     }
 
     /** LISTEN: nothing heard stores nothing (R12); words go on to the name. */
     private void listenStep(long now) {
         CuriosityPort.Heard h = port.heard();
         if (h == null) {
+            if (now >= meetDeadline && holdForAnswer()) {
+                meetDeadline = meetListenAt + tuning.answerHoldMs + tuning.listenMarginMs;
+                return;
+            }
             if (now >= meetDeadline) {
                 note("no answer from listening in time; carrying on");
                 finishPick(now);
@@ -3328,6 +3362,8 @@ final class ExploreBrain {
         if (port.sayFinished() || now >= sayUntil) {
             idStep = IdStep.LISTENING;
             idDeadline = now + tuning.listenMs + tuning.listenMarginMs;
+            meetListenAt = now;
+            answerHeld = false;
             show(EyeState.LISTENING, null);
             port.listen(tuning.listenMs);
         }
@@ -3336,6 +3372,9 @@ final class ExploreBrain {
     /** The one listen: silence counts as no (R21); words go to AnswerParser (KTD9). */
     private void answerStep(long now) {
         CuriosityPort.Heard h = port.heard();
+        if (h == null && now >= idDeadline && holdForAnswer()) {
+            idDeadline = meetListenAt + tuning.answerHoldMs + tuning.listenMarginMs;
+        }
         if (h == null && now < idDeadline) {
             return;
         }
@@ -4881,6 +4920,7 @@ final class ExploreBrain {
     private void beginPersonStop(long now, Look lookOrNull, Detection person) {
         claudeStop = true;
         roamingPick = false;
+        cuePick = false;
         heldPick = null;
         scanned.clear();
         scanHeadings.clear();
@@ -6276,7 +6316,7 @@ final class ExploreBrain {
             return;
         }
         lookDeadline = ready + tuning.leanInMs;
-        note("looking for a face turned toward him (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
+        note("looking for a person toward him (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
     }
 
     /** A look during CUE_LOOK: a facing face ends the search in the meeting; anything else waits for the next look. */
@@ -6315,7 +6355,8 @@ final class ExploreBrain {
     private void foundFace(long now, Look look, Detection face) {
         gauges.stamp(Gauges.Stage.FACE_FOUND, now);
         gauges.count(Gauges.Counter.FACES_FOUND);
-        note("a face turned toward him after the cue");
+        // The shape test sees a person box only: the face check in the meeting decides (robot 2026-10-01).
+        note("a person toward him after the cue (a person box; the face check decides)");
         port.clipWindow(tuning.ackClipMs);
         sound.playReaction("acknowledge");
         ackUntil = now + tuning.ackClipMs + tuning.deafTailMs;
@@ -6324,6 +6365,7 @@ final class ExploreBrain {
         searchCue = null;
         searchPlan = null;
         beginPersonStop(now, look, face);
+        cuePick = true;
         target = face;
         remember(face.label, CuriosityPort.Kind.PERSON, now);
         if (!port.canAsk()) {
@@ -6667,6 +6709,7 @@ final class ExploreBrain {
         callerInTurn = null;
         wheellessMeeting = false;
         roamingPick = false;
+        cuePick = false;
         chat = null;
         chatCueSide = null;
         chatNoWheels = false;

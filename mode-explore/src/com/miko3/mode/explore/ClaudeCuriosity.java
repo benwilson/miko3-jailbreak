@@ -127,6 +127,8 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<MatchAnswer> matches = new Slot<MatchAnswer>();
     private final Slot<MatchAnswer> strangerLines = new Slot<MatchAnswer>();
     private final Slot<Heard> hearings = new Slot<Heard>();
+    /** Robot 2026-10-01: the hearings generation whose answer the launcher said has started; 0 for none. */
+    private volatile int answeringGen;
     private final Slot<Named> names = new Slot<Named>();
     private final Slot<Answer> remembers = new Slot<Answer>();
     private final Slot<Answer> welcomes = new Slot<Answer>();
@@ -630,8 +632,11 @@ final class ClaudeCuriosity implements CuriosityPort {
      * A listen through the ears session: the next utterance with words finishes
      * WORDS; with none by maxMs the timer finishes NOTHING, unless that generation
      * was replaced or answered meanwhile. newcomerAngleDeg is NaN for a meeting listen.
+     * Robot 2026-10-01: once the launcher says the answer has started (answering,
+     * before maxMs), the maxMs timer leaves the listen open for the words, and it
+     * ends as silence only at LauncherProtocol.EARS_ANSWER_HOLD_MS from its start.
      */
-    private void earsListen(final EarsAdapter s, long maxMs, float newcomerAngleDeg) {
+    private void earsListen(final EarsAdapter s, final long maxMs, float newcomerAngleDeg) {
         final int g = hearings.start();
         // A newer listen retires this reply by replacing it in the session, and the
         // session's close or loss clears it; the silence deadline retires it below.
@@ -640,18 +645,45 @@ final class ClaudeCuriosity implements CuriosityPort {
             public void heard(String transcript) {
                 hearings.finish(g, new Heard(Heard.Status.WORDS, transcript));
             }
+
+            @Override
+            public void answering(long at) {
+                if (hearings.current(g) && hearings.poll() == null && answeringGen != g) {
+                    answeringGen = g;
+                    Log.i(TAG, "the listen's answer has started: holding it for the words, up to "
+                            + LauncherProtocol.EARS_ANSWER_HOLD_MS + " ms from its start");
+                }
+            }
+        };
+        final Runnable silence = new Runnable() {
+            @Override
+            public void run() {
+                if (hearings.current(g) && hearings.poll() == null) {
+                    // Silence: retire the reply first, or the next utterance with
+                    // words would answer this dead listen instead of queuing as a cue.
+                    s.listenOver(reply);
+                    hearings.finish(g, Heard.NOTHING);
+                }
+            }
         };
         s.listen(maxMs, newcomerAngleDeg, reply);
         try {
             timer.schedule(new Runnable() {
                 @Override
                 public void run() {
-                    if (hearings.current(g) && hearings.poll() == null) {
-                        // Silence: retire the reply first, or the next utterance with
-                        // words would answer this dead listen instead of queuing as a cue.
-                        s.listenOver(reply);
-                        hearings.finish(g, Heard.NOTHING);
+                    if (answeringGen == g) {
+                        if (hearings.current(g) && hearings.poll() == null) {
+                            Log.i(TAG, "listen past " + maxMs + " ms: an answer is in progress");
+                        }
+                        try {
+                            timer.schedule(silence, Math.max(0, LauncherProtocol.EARS_ANSWER_HOLD_MS - maxMs),
+                                    TimeUnit.MILLISECONDS);
+                        } catch (RuntimeException e) {
+                            // Shut down with Explore meanwhile.
+                        }
+                        return;
                     }
+                    silence.run();
                 }
             }, maxMs, TimeUnit.MILLISECONDS);
         } catch (RuntimeException e) {
@@ -1513,6 +1545,13 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public Heard heard() {
         return hearings.poll();
+    }
+
+    /** The current ears listen's answer has started (the launcher said so) and its words have not come. */
+    @Override
+    public boolean answering() {
+        int g = answeringGen;
+        return g != 0 && hearings.current(g) && hearings.poll() == null;
     }
 
     @Override

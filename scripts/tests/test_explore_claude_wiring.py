@@ -243,6 +243,34 @@ class EarsAdapterWiringTest(unittest.TestCase):
         self.assertRegex(silence.group(1), r"s\.listenOver\(reply\);\s*hearings\.finish\(g, Heard\.NOTHING\);")
         self.assertEqual(ears_listen.count("hearings.finish(g, Heard.NOTHING)"), 1)
 
+    def test_an_answer_that_has_started_holds_the_ears_listen_to_the_answer_hold(self):
+        """Robot 2026-10-01: the launcher's "answering" (RobotEars.Callback,
+        code 2) reaches the armed reply; the maxMs timer then does not end the
+        listen, which ends at its words or at LauncherProtocol.EARS_ANSWER_HOLD_MS from its
+        start. Without "answering" (silence, an older launcher) the timer ends
+        it at maxMs exactly as before."""
+        a = code_only(src("EarsAdapter.java"))
+        on = re.search(r"public void onAnswering\(long at\) \{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(on, "EarsAdapter has no onAnswering")
+        self.assertRegex(on.group(1), r"synchronized \(lock\) \{\s*r = open \? reply : null;")
+        self.assertIn("r.answering(at);", on.group(1))
+        c = code_only(src("ClaudeCuriosity.java"))
+        ears_listen = re.search(r"private void earsListen\((.*?)\n    \}", c, re.S).group(1)
+        self.assertIn("public void answering(long at)", ears_listen)
+        self.assertIn("answeringGen = g;", ears_listen)
+        self.assertIn("LauncherProtocol.EARS_ANSWER_HOLD_MS - maxMs", ears_listen)
+        self.assertRegex(ears_listen, r"if \(answeringGen == g\) \{")
+        port = re.search(r"public boolean answering\(\) \{(.*?)\n    \}", c, re.S)
+        self.assertIsNotNone(port)
+        self.assertIn("hearings.current(g) && hearings.poll() == null", port.group(1))
+        self.assertIn("boolean answering();", code_only(src("CuriosityPort.java")))
+        # The brain cannot see shared/: its mirror of the hold is pinned to the shared constant.
+        proto = (REPO / "shared" / "src" / "com" / "miko3" / "shared" / "LauncherProtocol.java").read_text()
+        cap = int(re.search(r"long EARS_LISTEN_HARD_CAP_MS = (\d+);", proto).group(1))
+        extra = int(re.search(r"long EARS_ANSWER_HOLD_MS = EARS_LISTEN_HARD_CAP_MS \+ (\d+);", proto).group(1))
+        tuning = src("ExploreTuning.java")
+        self.assertEqual(int(re.search(r"private long answerHoldMs = (\d+);", tuning).group(1)), cap + extra)
+
     def test_a_lost_session_closes_its_client_outside_the_lock(self):
         a = code_only(src("EarsAdapter.java"))
         lost = re.search(r"public void onLost\(String reason\) \{(.*?)\n    \}", a, re.S)

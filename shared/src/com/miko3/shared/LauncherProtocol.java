@@ -35,6 +35,19 @@ public final class LauncherProtocol {
 
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 
+    /**
+     * Robot 2026-10-01: an ears conversation listen's maxMs is the window to start
+     * answering; an answer begun in it runs to its endpoint, but the launcher cuts
+     * it this long after the listen opened (EarsSession.LISTEN_HARD_CAP_MS).
+     */
+    public static final long EARS_LISTEN_HARD_CAP_MS = 20000;
+    /**
+     * How long from its start a mode holds an ears listen whose answer has started
+     * (RobotEars.Callback.answering): the hard cap plus 3 s for the decode and the
+     * delivery. Explore's brain mirrors it as ExploreTuning.answerHoldMs.
+     */
+    public static final long EARS_ANSWER_HOLD_MS = EARS_LISTEN_HARD_CAP_MS + 3000;
+
     /** A mode's fixed reason when the launcher does not answer a Binder
      * transaction the mode's build knows (meeting plan U4, KTD11): the two
      * APKs are installed together, and every proxy method added since checks

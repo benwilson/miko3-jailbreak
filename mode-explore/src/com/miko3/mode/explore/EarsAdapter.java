@@ -37,6 +37,10 @@ import java.util.List;
  * early cue has no words, so it never goes to an armed reply; it reaches the
  * queue while the reply stays armed for the words.
  *
+ * A conversation listen's answer that has started (robot 2026-10-01): the
+ * launcher says so once, before the words, and the armed reply hears it, so
+ * ClaudeCuriosity holds the listen past its maxMs for the words.
+ *
  * The accelerometer arrives on the drive's readings (ExploreDrive.ReadingListener):
  * a magnitude step above the resting level is a shove spike for the brain, which
  * arms it only while stopped and past its blanking window (KTD5). The charger
@@ -66,6 +70,9 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     /** A conversation listen's answer (KTD1), delivered on the client's thread. */
     interface Reply {
         void heard(String transcript);
+
+        /** Robot 2026-10-01: the launcher says this listen's answer has started (speech began at at). */
+        void answering(long at);
     }
 
     private final Context app;
@@ -252,6 +259,22 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         }
         if (r != null) {
             r.heard(text);
+        }
+    }
+
+    /**
+     * Robot 2026-10-01: the launcher's conversation listen claimed an utterance, so its
+     * answer has started. It goes to the armed reply, which stays armed for the words;
+     * with none armed (the listen already ended, or none was open) it is dropped: no cue.
+     */
+    @Override
+    public void onAnswering(long at) {
+        Reply r;
+        synchronized (lock) {
+            r = open ? reply : null;
+        }
+        if (r != null) {
+            r.answering(at);
         }
     }
 

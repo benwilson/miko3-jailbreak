@@ -12,6 +12,8 @@ public class RobotEarsClient {
         void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
                      boolean called);
 
+        void onAnswering(long at);
+
         void onLost(String reason);
     }
 

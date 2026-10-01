@@ -167,6 +167,8 @@ final class ChatSession {
     // ---- listening ----
     private int unanswered;
     private long listenDeadline;
+    /** Robot 2026-10-01: this listen's deadline was moved to the answer hold once already. */
+    private boolean answerHeld;
     private long lookFrom;
     private long lookDeadline;
     private ExploreBrain.Direction newcomerSide;
@@ -1004,6 +1006,7 @@ final class ChatSession {
         phase = Phase.LISTENING;
         listenStartedAt = now;
         listenDeadline = now + tuning.unansweredListenMs;
+        answerHeld = false;
         port.chatListen(tuning.unansweredListenMs, tuning.newcomerAngleDeg);
     }
 
@@ -1023,6 +1026,17 @@ final class ChatSession {
                 }
                 // Silence or a failure before the timer: the timer is the authority (KTD2).
                 if (now >= listenDeadline) {
+                    if (!answerHeld && port.answering()) {
+                        // Robot 2026-10-01: they started answering in time; the words come at its end.
+                        answerHeld = true;
+                        listenDeadline = listenStartedAt + tuning.answerHoldMs;
+                        host.note("an answer has started: the listen holds for it up to " + tuning.answerHoldMs
+                                + " ms from its start");
+                        break;
+                    }
+                    if (answerHeld) {
+                        host.note("the answer's words never came: an unanswered listen");
+                    }
                     onUnanswered(now);
                 }
                 break;

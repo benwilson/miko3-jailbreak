@@ -441,6 +441,16 @@ public final class ListenServiceHarness {
         public void heard(EarsSession.Utterance u) {
             heard.add(u);
         }
+
+        /** Robot 2026-10-01: each "answering" as the start of the answer's speech, with the deliveries it preceded. */
+        final List<Long> answering = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Integer> heardBeforeAnswering = Collections.synchronizedList(new ArrayList<Integer>());
+
+        @Override
+        public void answering(long at) {
+            answering.add(at);
+            heardBeforeAnswering.add(heard.size());
+        }
     }
 
     static final class FakeToken implements LeaseKeeper.Token {
@@ -1411,6 +1421,97 @@ public final class ListenServiceHarness {
                                 && pastMax && r.client.heard.size() == 2 && f != null && f.called
                                 && "HEY MIKO I SAW A WHALE".equals(f.text) && f.at == e.at && !r.session.listening(),
                         "early=" + early + " pastMax=" + pastMax + " heard=" + r.heard());
+            }
+        });
+        // ---- Robot 2026-10-01: "answering" tells the mode once that a listen's answer has started ----
+        scenario("ears_answer_started_in_the_window_says_answering_once_before_the_words", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 2480);
+                long start = r.clock.now + 80;
+                for (int i = 0; i < 50; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH";
+                }
+                java.util.List<Long> during = new ArrayList<Long>(r.client.answering);
+                r.steps(false, 720);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.steps(false, 1000);
+                check(n, during.equals(Collections.singletonList(start)) && r.client.answering.size() == 1
+                                && r.client.heardBeforeAnswering.equals(Collections.singletonList(0))
+                                && r.client.heard.size() == 1,
+                        "during=" + during + " start=" + start + " answering=" + r.client.answering + " heard="
+                                + r.heard());
+            }
+        });
+        scenario("ears_answer_begun_just_before_the_listen_says_answering", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.step(true);
+                long start = r.clock.now;
+                r.rec.text = "YES I";
+                r.steps(true, 400);
+                boolean none = r.client.answering.isEmpty();
+                r.session.listen("10001", 4000);
+                r.steps(true, 400);
+                check(n, none && r.client.answering.equals(Collections.singletonList(start)),
+                        "none=" + none + " start=" + start + " answering=" + r.client.answering);
+            }
+        });
+        scenario("ears_silent_or_unlistened_speech_says_no_answering", new Scenario() {
+            public void run(String n) {
+                // A silent listen, then speech with no listen open, then speech begun too long before one.
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 4400);
+                r.steps(true, 1000);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.steps(false, 400);
+                Rig q = new Rig();
+                q.sw.on = false;
+                q.open(false);
+                q.steps(true, 1040);
+                q.session.listen("10001", 4000);
+                q.steps(true, 1000);
+                check(n, r.client.answering.isEmpty() && q.client.answering.isEmpty(),
+                        "silent/unlistened=" + r.client.answering + " old speech=" + q.client.answering);
+            }
+        });
+        scenario("ears_each_listen_says_answering_at_most_once", new Scenario() {
+            public void run(String n) {
+                // Two utterances inside one start window: the first is the answer, once; a new listen
+                // with a new answer says it again.
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                r.steps(true, 400); // a wordless burst: it ends without ending the listen
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                r.steps(false, 160);
+                boolean stillOpen = r.session.listening();
+                r.steps(true, 400); // a second utterance in the same start window
+                int afterTwo = r.client.answering.size();
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                r.steps(false, 4000);
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                r.steps(true, 400);
+                check(n, stillOpen && afterTwo == 1 && r.client.answering.size() == 2, "stillOpen=" + stillOpen
+                        + " afterTwo=" + afterTwo + " answering=" + r.client.answering + " heard=" + r.heard());
             }
         });
         scenario("ears_logs_counters_not_words", new Scenario() {

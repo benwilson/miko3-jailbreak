@@ -19,7 +19,9 @@ import android.os.RemoteException;
  * second, carrying the caller's charger latch (KTD6): false means the session
  * is no longer this uid's (missed renews, a death, a close). listen() marks a
  * conversation listen; clipWindow() opens the deaf window for a local clip;
- * shoved() stamps a shove or collision stop for the classifier. The launcher
+ * shoved() stamps a shove or collision stop for the classifier. A listen's
+ * answer that has started is announced first, one-way, by Callback.answering
+ * (robot 2026-10-01), so the mode holds the listen for its words. The launcher
  * checks the caller on every call (SecurityException to any app that isn't
  * ours) and binds renew, close, listen, clipWindow and shoved to the uid that
  * opened the session.
@@ -83,9 +85,23 @@ public interface RobotEars extends IInterface {
         void heard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
                    boolean called) throws RemoteException;
 
+        /**
+         * Robot 2026-10-01: the open conversation listen's answer has started (the
+         * launcher claimed an utterance that began inside the start window, or at
+         * most 500 ms before the listen opened); at is when its speech began. Sent
+         * once per listen, one-way, before the answer's heard(). Appended as its
+         * own code (2), never folded into heard's parcel: an older mode's Stub has
+         * no case for it and Binder.onTransact returns false, which a one-way
+         * sender never sees, so that mode behaves as before; a newer mode under an
+         * older launcher simply never receives it, and its listens end at maxMs.
+         * The mode holds a listen it was sent for LauncherProtocol.EARS_ANSWER_HOLD_MS.
+         */
+        void answering(long at) throws RemoteException;
+
         abstract class Stub extends Binder implements Callback {
             private static final String DESCRIPTOR = "com.miko3.shared.RobotEars.Callback";
             static final int TRANSACTION_heard = 1;
+            static final int TRANSACTION_answering = 2;
 
             public Stub() {
                 attachInterface(this, DESCRIPTOR);
@@ -121,6 +137,11 @@ public interface RobotEars extends IInterface {
                         int kind = data.dataAvail() > 0 ? data.readInt() : KIND_MISSING;
                         boolean called = data.dataAvail() > 0 && data.readInt() != 0;
                         heard(text, side, angle, tier, at, partial, kind, called);
+                        return true;
+                    }
+                    case TRANSACTION_answering: {
+                        data.enforceInterface(DESCRIPTOR);
+                        answering(data.readLong());
                         return true;
                     }
                     case IBinder.INTERFACE_TRANSACTION:
@@ -159,6 +180,19 @@ public interface RobotEars extends IInterface {
                         data.writeInt(kind);
                         data.writeInt(called ? 1 : 0);
                         remote.transact(TRANSACTION_heard, data, null, IBinder.FLAG_ONEWAY);
+                    } finally {
+                        data.recycle();
+                    }
+                }
+
+                /** One-way, like heard(): the capture thread never waits on a mode. */
+                @Override
+                public void answering(long at) throws RemoteException {
+                    Parcel data = Parcel.obtain();
+                    try {
+                        data.writeInterfaceToken(DESCRIPTOR);
+                        data.writeLong(at);
+                        remote.transact(TRANSACTION_answering, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();
                     }

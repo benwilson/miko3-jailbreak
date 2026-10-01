@@ -57,6 +57,9 @@ class EarsAdapterHarnessTest(unittest.TestCase):
         "uncalled_strong_partial_joins_later_weak_cue",
         "queue_overflow_drops_oldest",
         "worded_utterance_queued_with_side_and_angle",
+        # Robot 2026-10-01: the launcher's "answering" for a conversation listen.
+        "answering_goes_to_the_armed_reply_and_its_words_still_answer_it",
+        "answering_with_no_armed_reply_is_ignored_and_queues_nothing",
     )
 
     @classmethod

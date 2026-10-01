@@ -1,5 +1,6 @@
 package com.miko3.launcher;
 
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.VoiceDirection;
 
 import java.io.IOException;
@@ -69,7 +70,7 @@ final class EarsSession {
     static final long PARTIAL_HEAD_MS = 120;
     /** Robot 2026-10-01: a conversation listen's maxMs is the window to start answering; an
      * answer begun in it runs to its endpoint, but never past this long after the listen opened. */
-    static final long LISTEN_HARD_CAP_MS = 20000;
+    static final long LISTEN_HARD_CAP_MS = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS;
     /** Speech that began this soon before a listen opened (they answered as his question ended) is its answer. */
     static final long LISTEN_EARLY_START_MS = 500;
     static final long SUMMARY_MS = 60000;
@@ -153,6 +154,14 @@ final class EarsSession {
     /** The opener's callback. Called on the capture thread; must not block. */
     interface Client {
         void heard(Utterance u);
+
+        /**
+         * Robot 2026-10-01: the open conversation listen claimed an utterance (it
+         * began inside the start window, or just before the listen opened), so its
+         * answer has started; at is when the speech began. Once per listen, before
+         * the answer's delivery. Called on the capture thread; must not block.
+         */
+        void answering(long at);
     }
 
     /** Where counters and refusals go. Never given words. */
@@ -215,6 +224,7 @@ final class EarsSession {
     private long listenOpenedAt;
     private long listenCapAt; // listenOpenedAt + LISTEN_HARD_CAP_MS
     private boolean answering; // the utterance in progress is the open listen's answer
+    private boolean answerAnnounced; // Client.answering went out for this listen (robot 2026-10-01)
     private Thread captureThread;
     private boolean captureWanted;
     private long captureFailedAt = Long.MIN_VALUE / 4;
@@ -358,6 +368,7 @@ final class EarsSession {
         listenUntil = now + ListenSession.clampCap(maxMs);
         listenCapAt = now + LISTEN_HARD_CAP_MS;
         answering = false; // the next chunk claims an utterance in progress if it started in time
+        answerAnnounced = false;
         reconcile();
         return true;
     }
@@ -374,13 +385,30 @@ final class EarsSession {
      * answering), else Long.MAX_VALUE.
      */
     private long claimAnswer(long startMs) {
+        Client announce = null;
+        long cap;
         synchronized (this) {
-            if (listenUntil != 0 && startMs >= listenOpenedAt - LISTEN_EARLY_START_MS && startMs < listenUntil) {
-                answering = true;
-                return listenCapAt;
+            if (listenUntil == 0 || startMs < listenOpenedAt - LISTEN_EARLY_START_MS || startMs >= listenUntil) {
+                return Long.MAX_VALUE;
             }
-            return Long.MAX_VALUE;
+            answering = true;
+            cap = listenCapAt;
+            if (!answerAnnounced) {
+                // Robot 2026-10-01: the mode hears once that the answer started, so it holds its listen.
+                answerAnnounced = true;
+                announce = client;
+                diag.log("conversation listen answering: speech began " + (startMs - listenOpenedAt)
+                        + " ms after it opened");
+            }
         }
+        if (announce != null) {
+            try {
+                announce.answering(startMs);
+            } catch (RuntimeException e) {
+                diag.log("answering delivery failed: " + e.getClass().getSimpleName());
+            }
+        }
+        return cap;
     }
 
     /** Caller holds feedLock. The answer in progress ended; past its start window the listen ends with it. */

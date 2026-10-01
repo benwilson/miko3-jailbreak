@@ -76,6 +76,15 @@ interface CuriosityPort extends AnswerParser.Names {
     /** What listen() heard, or null while it is listening. */
     Heard heard();
 
+    /**
+     * Robot 2026-10-01: true while the current listen's answer has started (the
+     * launcher's "answering", sent once speech begins inside the listen's start
+     * window) and its words have not come. A listen's own deadline does not end it
+     * then: the brain holds it for up to tuning.answerHoldMs from its start. Always
+     * false for a one-shot listen, a silent one, and under an older launcher.
+     */
+    boolean answering();
+
     /** A new person replied but nothing will be kept: no face was found, or no name was heard
      * (R19). Ask for a text-only "nice to meet you" line that never promises to remember
      * them. Stores nothing. */
@@ -340,6 +349,10 @@ interface CuriosityPort extends AnswerParser.Names {
 
         public Heard heard() {
             return Heard.NOTHING;
+        }
+
+        public boolean answering() {
+            return false;
         }
 
         public void remember(String name, long timeoutMs) {

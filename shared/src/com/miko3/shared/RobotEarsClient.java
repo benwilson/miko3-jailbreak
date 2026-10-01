@@ -38,6 +38,12 @@ public final class RobotEarsClient {
         void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
                      boolean called);
 
+        /**
+         * Robot 2026-10-01: the conversation listen's answer has started (speech began at at);
+         * see RobotEars.Callback.answering. At most once per listen, before its onHeard.
+         */
+        void onAnswering(long at);
+
         /** The session is gone; reason is fixed text. Called at most once per open(). */
         void onLost(String reason);
     }
@@ -372,6 +378,22 @@ public final class RobotEarsClient {
                 public void run() {
                     if (!ended) {
                         listener.onHeard(text, side, angle, tier, at, partial, kind, called);
+                    }
+                }
+            });
+        }
+
+        /** On the worker, in order with heard(): the answer's words always come after it. */
+        @Override
+        public void answering(final long at) {
+            if (ended) {
+                return;
+            }
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!ended) {
+                        listener.onAnswering(at);
                     }
                 }
             });

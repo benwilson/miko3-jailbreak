@@ -177,6 +177,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "meet_known_person_without_a_name_is_greeted_with_the_unnamed_line",
         "meet_listen_failure_resumes_within_the_budget",
         "meet_listen_that_never_answers_ends_at_its_deadline",
+        "meet_a_name_answer_started_in_time_is_heard_past_the_listen_deadline",
         "meet_remember_failure_resumes_within_the_budget",
         "meet_match_that_never_answers_resumes_within_the_budget",
         "meet_match_request_never_carries_names",
@@ -393,6 +394,11 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "chat_three_turns_then_catch_you_later_signs_off_persists_once_and_resumes_away_from_them",
         "chat_silence_twice_with_the_face_gone_at_the_first_look_ends_without_a_sign_off",
         "chat_silence_twice_with_the_face_still_there_signs_off_once",
+        # Robot 2026-10-01: an answer that has started holds the listen past its 4 s.
+        "chat_an_answer_started_at_2_5_s_and_ended_at_7_3_s_is_heard_with_no_unanswered_listen",
+        "chat_a_silent_listen_is_still_the_first_unanswered_listen_at_4_s",
+        "chat_an_answer_whose_words_never_come_ends_as_unanswered_at_the_fallback",
+        "chat_an_older_launcher_that_never_says_answering_ends_the_listen_at_4_s_as_today",
         "chat_a_three_sentence_line_is_cut_to_two_before_speaking",
         "chat_a_repeated_question_is_re_requested_once_and_a_second_repeat_is_stripped_and_counted",
         "chat_ends_conversation_true_is_spoken_as_a_normal_line_and_the_conversation_goes_on",
@@ -469,6 +475,10 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "roaming_blur_seen_again_within_the_phantom_cooldown_is_ignored",
         "roaming_person_pick_with_a_face_still_meets_and_converses",
         "call_started_faceless_meeting_still_converses",
+        # Robot 2026-10-01: only a call may open a faceless meeting; a cue's needs a usable face.
+        "cue_weak_then_a_person_box_with_no_face_is_not_met_and_nothing_is_said",
+        "cue_weak_then_a_usable_face_meets_and_converses",
+        "call_wake_word_with_no_face_still_opens_with_the_crouch_opener",
         # The caller talks while he looks for them (owner 2026-09-30): the conversation opens at once
         "call_caller_talking_during_the_search_opens_the_conversation_before_the_search_ends",
         "call_a_repeated_wake_word_during_the_search_opens_the_conversation",
@@ -527,6 +537,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "confirm_chat_yes_with_the_photo_refused_starts_as_a_stranger_and_recreates_nobody",
         "confirm_meeting_ending_mid_confirm_closes_the_check_without_an_answer",
         "confirm_ladder_runs_the_confirm_and_last_name_branches_without_a_conversation",
+        "confirm_ladder_answer_started_in_time_is_heard_past_the_listen_deadline",
         "confirm_ladder_last_name_unanswered_welcomes_them_and_stores_nobody",
         "resolve_chat_ae4_weak_ben_asks_the_last_name_smith_stores_ben_smith_and_wilson_joins_ben_wilson",
         "resolve_chat_after_the_last_name_the_next_turn_carries_both_replies_and_an_equal_name_given_stores_nothing",

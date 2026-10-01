@@ -139,6 +139,11 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_endless_answer_is_cut_at_the_hard_cap",
         "ears_answer_begun_just_before_the_listen_is_its_answer",
         "ears_wake_word_inside_a_long_answer_keeps_the_early_cue",
+        # Robot 2026-10-01: "answering", once per listen, as its answer starts.
+        "ears_answer_started_in_the_window_says_answering_once_before_the_words",
+        "ears_answer_begun_just_before_the_listen_says_answering",
+        "ears_silent_or_unlistened_speech_says_no_answering",
+        "ears_each_listen_says_answering_at_most_once",
         "ears_logs_counters_not_words",
         # Ears CPU switches (2026-09-30): off by default, KTD2 unchanged.
         "ears_tuning_unset_is_ktd2",
@@ -594,7 +599,38 @@ class InterfaceAndClientTest(unittest.TestCase):
         codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", ears)]
         self.assertEqual([n for n, _ in codes], ["open", "renew", "close", "listen", "clipWindow", "shoved"])
         self.assertEqual([c for _, c in codes], list(range(1, 7)))
-        self.assertRegex(callback, r"TRANSACTION_heard\s*=\s*1;")
+        # The callback's codes are appended too: heard stays 1, answering (robot 2026-10-01) is 2.
+        callback_codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", callback)]
+        self.assertEqual(callback_codes, [("heard", 1), ("answering", 2)])
+
+    def test_ears_callback_answering_is_a_one_way_appended_transaction(self):
+        """Robot 2026-10-01: "answering" tells the mode a conversation listen's
+        answer has started. A new one-way code (2) on the callback, appended:
+        an older mode's Stub has no case for it and Binder.onTransact returns
+        false, which a one-way sender never sees; a newer mode under an older
+        launcher never receives it and its listens end at maxMs as before."""
+        src = _read(EARS_INTERFACE)
+        head = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(head, r"void answering\(long at\) throws RemoteException;")
+        protocol = _read(SHARED / "LauncherProtocol.java")
+        self.assertRegex(protocol, r"public static final long EARS_LISTEN_HARD_CAP_MS = 20000;")
+        self.assertRegex(protocol, r"public static final long EARS_ANSWER_HOLD_MS = EARS_LISTEN_HARD_CAP_MS \+ 3000;")
+        stub = _method_body(src, "public boolean onTransact")
+        self.assertRegex(stub, r"case TRANSACTION_answering: \{\s*data\.enforceInterface\(DESCRIPTOR\);\s*"
+                               r"answering\(data\.readLong\(\)\);\s*return true;")
+        proxy = src.split("private static class Proxy implements Callback", 1)[1].split("abstract class Stub", 1)[0]
+        self.assertRegex(proxy, r"data\.writeLong\(at\);\s*"
+                                r"remote\.transact\(TRANSACTION_answering, data, null, IBinder\.FLAG_ONEWAY\);")
+        ears = _read(EARS)
+        self.assertIn("static final long LISTEN_HARD_CAP_MS = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS;", ears)
+        self.assertRegex(ears, r"void answering\(long at\);")
+        engine = _read(LAUNCHER / "ListenEngine.java")
+        self.assertIn("callback.answering(at);", engine)
+        client = _read(EARS_CLIENT)
+        self.assertRegex(client, r"void onAnswering\(long \w+\);")
+        answering = _method_body(client, "public void answering")
+        self.assertIsNotNone(answering)
+        self.assertIn("listener.onAnswering(at)", answering)
 
     def test_ears_client_binds_renews_and_closes(self):
         src = _read(EARS_CLIENT)
