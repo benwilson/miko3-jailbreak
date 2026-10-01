@@ -292,6 +292,24 @@ final class ExploreTuning {
     final int jamProbeTicks;
     final long jamMovedCounts;
     final double jamMovedDeg;
+    /**
+     * The long wriggle (robot 2026-10-01, wedged under an office chair): the escape's
+     * ~1.5 s measured turns read "turned 0" and gave up, yet one continuous 11 s turn
+     * worked him loose (1952 counts, then a back-up moved). When fully jammed, or when an
+     * escape's measured turn is blocked twice in a row, he turns one way for up to
+     * wriggleMs, then the other way for up to wriggleMs, before the help line. A heading
+     * change of wriggleFreeDeg frees him; so does wriggleFreeCounts wheel counts (summed,
+     * both wheels) followed by a short back-up (jamProbeTicks) that moves. Fewer than
+     * wriggleMinCounts in any wriggleStillMs: the wheels are not moving, and that way stops
+     * at once (repeated stalled pushing latches the motor board). At most one wriggle per
+     * wriggleEveryMs. wriggleMs 0 (or jam detection off): no wriggle.
+     */
+    final long wriggleMs;
+    final long wriggleMinCounts;
+    final long wriggleStillMs;
+    final double wriggleFreeDeg;
+    final long wriggleFreeCounts;
+    final long wriggleEveryMs;
     final float callPersonMinHeight;
     /**
      * The call search's own person-score floor, used instead of confidenceFloor only
@@ -752,6 +770,12 @@ final class ExploreTuning {
         jamProbeTicks = Math.max(1, b.jamProbeTicks);
         jamMovedCounts = Math.max(1, b.jamMovedCounts);
         jamMovedDeg = Math.max(1, b.jamMovedDeg);
+        wriggleMs = Math.max(0, b.wriggleMs);
+        wriggleMinCounts = Math.max(1, b.wriggleMinCounts);
+        wriggleStillMs = Math.max(100, b.wriggleStillMs);
+        wriggleFreeDeg = Math.max(1, b.wriggleFreeDeg);
+        wriggleFreeCounts = Math.max(1, b.wriggleFreeCounts);
+        wriggleEveryMs = Math.max(0, b.wriggleEveryMs);
         callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
         callPersonMinScore = Math.max(0f, b.callPersonMinScore);
         callNearHeight = Math.max(0f, b.callNearHeight);
@@ -1076,6 +1100,14 @@ final class ExploreTuning {
         private int jamProbeTicks = 4;
         private long jamMovedCounts = 30;
         private double jamMovedDeg = 25;
+        // Robot 2026-10-01: an 11 s turn freed him where 1.5 s ones read "turned 0".
+        private long wriggleMs = 10000;
+        // A wedged wheel that truly turns moves hundreds of counts a second (~4000 in 20 s).
+        private long wriggleMinCounts = 30;
+        private long wriggleStillMs = 1500;
+        private double wriggleFreeDeg = 20;
+        private long wriggleFreeCounts = 800;
+        private long wriggleEveryMs = 120000;
         private float callPersonMinHeight = 0.12f;
         // Robot QA 2026-09-30: a floor-level caller scored person 0.27 and 0.32.
         private float callPersonMinScore = 0.25f;
@@ -1386,6 +1418,16 @@ final class ExploreTuning {
         Builder jamMoved(long counts, double deg) { jamMovedCounts = counts; jamMovedDeg = deg; return this; }
         /** No jam detection: a fully jammed escape runs the ladder and its rests, as before 2026-10-01. */
         Builder jamOff() { jamTurnDeg = 0; return this; }
+        Builder wriggle(long ms, long minCounts, long stillMs) {
+            wriggleMs = ms;
+            wriggleMinCounts = minCounts;
+            wriggleStillMs = stillMs;
+            return this;
+        }
+        Builder wriggleFree(double deg, long counts) { wriggleFreeDeg = deg; wriggleFreeCounts = counts; return this; }
+        Builder wriggleEveryMs(long v) { wriggleEveryMs = v; return this; }
+        /** No long wriggle: fully jammed goes straight to the help line, as before 2026-10-01's chair. */
+        Builder wriggleOff() { wriggleMs = 0; return this; }
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
         Builder quietWaitMs(long v) { quietWaitMs = v; return this; }

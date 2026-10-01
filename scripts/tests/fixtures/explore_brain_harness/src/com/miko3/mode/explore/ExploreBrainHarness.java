@@ -775,6 +775,10 @@ public final class ExploreBrainHarness {
         long legStartT;
         /** Reversing moves nothing (a stall during a back-out). */
         boolean backBlocked;
+        /** Turning moves no wheel counts (every wheel wedged); else turnWheelsPer100 >= 0: that
+         * many counts per wheel per 100 ms (a wedged wheel working slowly); else 1 per 10 ms. */
+        boolean turnWheelsBlocked;
+        int turnWheelsPer100 = -1;
         /** A wall at this heading (NaN: none) from wallFrom: driving forward while facing within
          * wallHalfDeg of it moves nothing (nose to the wall, live 2026-09-25). */
         double wallAt = Double.NaN;
@@ -841,8 +845,17 @@ public final class ExploreBrainHarness {
                     wheelRight--;
                 }
             } else if ("turn".equals(motion)) {
-                wheelLeft--;
-                wheelRight++;
+                if (turnWheelsBlocked) {
+                    // Every wheel wedged: the motors push, the encoders stay put.
+                } else if (turnWheelsPer100 >= 0) {
+                    if (now % 100 == 0) {
+                        wheelLeft -= turnWheelsPer100;
+                        wheelRight += turnWheelsPer100;
+                    }
+                } else {
+                    wheelLeft--;
+                    wheelRight++;
+                }
             }
         }
 
@@ -2768,6 +2781,7 @@ public final class ExploreBrainHarness {
         escapeScenarios();
         pinnedScenarios();
         jamScenarios();
+        wriggleScenarios();
         budgetScenarios();
         forwardFirstScenarios();
         sideScenarios();
@@ -6191,6 +6205,7 @@ public final class ExploreBrainHarness {
     private static void pin(Rig r, boolean on) {
         r.yaw.stuck = on;
         r.backBlocked = on;
+        r.turnWheelsBlocked = on;
         r.blockedFrom = on ? Math.min(r.blockedFrom, r.now) : Long.MAX_VALUE;
     }
 
@@ -6457,6 +6472,178 @@ public final class ExploreBrainHarness {
         });
     }
 
+    // ---- the long wriggle (robot 2026-10-01: an 11 s spin freed him where 1.5 s turns gave up) ----
+
+    /** Roams one clean leg, then is pinned (live 14:08: the steer's turn was the first move that would not turn). */
+    private static Rig chairRig(List<String> notes, ExploreTuning.Builder b) {
+        Rig[] h = new Rig[1];
+        Rig rig = escRig(b.turnChance(1.0), h, t -> {
+            Rig r = h[0];
+            if (r != null && !r.yaw.stuck && r.blockedFrom == Long.MAX_VALUE && !r.drives.isEmpty()
+                    && r.drives.get(0).end > 0) {
+                pin(r, true);
+            }
+            return clear(t);
+        }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+        rig.creepPer100 = 0;
+        rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+        return rig;
+    }
+
+    private static void wriggleScenarios() {
+        scenario("wriggle_slow_wheels_then_the_heading_turns_after_6s_frees_him_where_the_short_turns_gave_up", n -> {
+            // Under the chair the wheels work slowly at first (60 counts/s here), then he comes
+            // loose 6 s into the wriggle: free, and he roams. The same rig without the wriggle
+            // stops at the jam with only the ~1.5 s measured turns, and is still resting later.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.turnWheelsBlocked = false;
+            rig.turnWheelsPer100 = 3;
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "wriggle LEFT: up to 10000 ms") >= 0);
+            long start = notedAt(notes, "wriggle LEFT: up to 10000 ms");
+            rig.runUntil(rig.now + 6000);
+            pin(rig, false);
+            rig.turnWheelsPer100 = -1;
+            rig.runUntil(rig.now + 20000);
+            long free = notedAt(notes, "wriggle LEFT: free after");
+            long hop = entered(rig, ExploreBrain.State.HOP, Math.max(free, 0));
+
+            List<String> old = new ArrayList<String>();
+            Rig was = pinnedRig(old, escTuning().wriggleOff());
+            was.turnWheelsBlocked = false;
+            was.turnWheelsPer100 = 3;
+            was.started();
+            runUntil(was, 60000, r -> notedAt(old, "fully jammed") >= 0);
+            long jamAt = was.now;
+            was.runUntil(jamAt + 6000);
+            pin(was, false);
+            was.turnWheelsPer100 = -1;
+            was.runUntil(jamAt + 26000);
+            check(n, start > 0 && free - start >= 6000 && free - start <= 7500 && hop > free
+                            && notedAt(notes, "fully jammed") < 0 && helpLines(rig, 0).isEmpty()
+                            && notesWith(notes, "wriggle RIGHT") == 0 && rig.violations.isEmpty()
+                            && jamAt > 0 && notesWith(old, "free") == 0 && notesWith(old, "wriggle") == 0
+                            && was.brain.state() == ExploreBrain.State.CORNERED && was.violations.isEmpty(),
+                    "start@" + start + " free@" + free + " hop@" + hop + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 20), notes.size()) + " old jam@" + jamAt
+                            + " old=" + old.subList(Math.max(0, old.size() - 8), old.size()));
+        });
+        scenario("wriggle_nothing_moves_each_way_stops_within_1500ms_then_the_help_line", n -> {
+            // Every wheel wedged: no counts at all. Each way stops after one 1.5 s window, never
+            // 10 s of grinding against stalled wheels, then the existing jam path.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "fully jammed") >= 0);
+            rig.runUntil(rig.now + 5000);
+            long left = notedAt(notes, "wriggle LEFT: up to 10000 ms");
+            long leftStop = notedAt(notes, "wriggle LEFT: wheels not moving; stopping");
+            long right = notedAt(notes, "wriggle RIGHT: up to 10000 ms");
+            long rightStop = notedAt(notes, "wriggle RIGHT: wheels not moving; stopping");
+            long failed = notedAt(notes, "wriggle failed both ways: asking for help");
+            long jam = notedAt(notes, "fully jammed");
+            List<Long> helps = helpLines(rig, 0);
+            check(n, left > 0 && leftStop - left >= 1400 && leftStop - left <= 1700 && right >= leftStop
+                            && right - leftStop <= 200 && rightStop - right >= 1400 && rightStop - right <= 1700
+                            && failed >= rightStop && jam >= failed && helps.size() == 1 && helps.get(0) >= failed
+                            && helps.get(0) - failed < 2000 && turnCommands(rig, left, failed + 1).size() == 2
+                            && turnCommands(rig, failed + 1, Long.MAX_VALUE).isEmpty()
+                            && rig.brain.state() == ExploreBrain.State.CORNERED && rig.violations.isEmpty(),
+                    "left@" + left + "/" + leftStop + " right@" + right + "/" + rightStop + " failed@" + failed
+                            + " jam@" + jam + " helps=" + helps + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 20), notes.size()));
+        });
+        scenario("wriggle_wheels_spin_heading_never_moves_full_time_both_ways_then_help_one_per_two_minutes", n -> {
+            // The wheels spin (200 counts/s) but he never turns and backing up goes nowhere:
+            // 10 s each way, then the help line. Pulled out and wedged again within 2 minutes:
+            // straight to the jam path, no second wriggle.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.turnWheelsBlocked = false;
+            rig.started();
+            runUntil(rig, 90000, r -> notedAt(notes, "fully jammed") >= 0);
+            long left = notedAt(notes, "wriggle LEFT: up to 10000 ms");
+            long leftEnd = notedAt(notes, "wriggle LEFT: not free after 10000 ms");
+            long right = notedAt(notes, "wriggle RIGHT: up to 10000 ms");
+            long rightEnd = notedAt(notes, "wriggle RIGHT: not free after 10000 ms");
+            long failed = notedAt(notes, "wriggle failed both ways: asking for help");
+            long jam = rig.now;
+            int backsTried = notesWith(notes, "backing up to see");
+            rig.runUntil(jam + 5000);
+            // Pulled out by hand: the jam probe goes at once and frees him; then wedged again.
+            pin(rig, false);
+            rig.wheelLeft -= 200;
+            rig.wheelRight -= 200;
+            runUntil(rig, jam + 20000, r -> notedAt(notes, "jam probe moved") >= 0);
+            long freed = notedAt(notes, "jam probe moved");
+            pin(rig, true);
+            rig.turnWheelsBlocked = false;
+            runUntil(rig, left + 119000, r -> notesWith(notes, "fully jammed") >= 2);
+            List<Long> jams = notedTimes(notes, "fully jammed");
+            check(n, left > 0 && leftEnd - left >= 10000 && leftEnd - left <= 10200 && right >= leftEnd
+                            && rightEnd - right >= 10000 && rightEnd - right <= 10200 && failed >= rightEnd
+                            && backsTried == 2 && helpLines(rig, 0).size() == 1 && freed > jam
+                            && jams.size() == 2 && jams.get(1) - left < 120000
+                            && notesWith(notes, "wriggle LEFT: up to") == 1 && notesWith(notes, "wriggle RIGHT: up to") == 1
+                            && notedAt(notes, "no wriggle: the last was") > freed && rig.violations.isEmpty(),
+                    "left@" + left + "-" + leftEnd + " right@" + right + "-" + rightEnd + " failed@" + failed
+                            + " backs=" + backsTried + " freed@" + freed + " jams=" + jams + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 25), notes.size()));
+        });
+        scenario("wriggle_two_blocked_escape_turns_in_a_row_wriggles_before_the_ladder_grinds", n -> {
+            // Turns go nowhere both ways but the back-up moves, so the jam rule can't fire: the
+            // second blocked escape turn in a row starts the wriggle, which frees him 3 s in.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.backBlocked = false;
+            rig.turnWheelsBlocked = false;
+            rig.started();
+            runUntil(rig, 60000, r -> notesWith(notes, "wriggle ") > 0);
+            long start = rig.now;
+            List<Long> blocked = notedTimes(notes, "measured turn blocked");
+            int escBlocked = 0;
+            for (String x : notes) {
+                escBlocked += x.contains("measured turn blocked") && x.endsWith(")") ? 1 : 0;
+            }
+            rig.runUntil(start + 3000);
+            pin(rig, false);
+            rig.runUntil(start + 15000);
+            long free = notedTimes(notes, ": free after").isEmpty() ? -1 : notedAt(notes, "wriggle LEFT: free after");
+            check(n, start > 0 && notedAt(notes, "turns blocked twice in a row") > 0 && escBlocked == 2
+                            && free - start >= 3000 && free - start <= 4500
+                            && entered(rig, ExploreBrain.State.WAY_OUT, 0) < 0 && rig.wayOutRequests.isEmpty()
+                            && notesWith(notes, "cornered: ") == 0
+                            && notedAt(notes, "fully jammed") < 0 && helpLines(rig, 0).isEmpty()
+                            && rig.violations.isEmpty(),
+                    "start@" + start + " blocked=" + blocked + " esc=" + escBlocked + " free@" + free + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 25), notes.size()));
+        });
+        scenario("wriggle_the_1408_chair_episode_wedge_turn_stalled_back_up_blocked_retrace_is_caught", n -> {
+            // Live 14:08:22-14:09:53: a roaming turn would not turn, backing up first went
+            // nowhere, the RETRACE turn would not turn, then CORNERED. That is the jam rule's
+            // shape (back-up stalled, both ways under 10 deg): now the wriggle runs before it.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = chairRig(notes, escTuning());
+            rig.started();
+            runUntil(rig, 90000, r -> notedAt(notes, "fully jammed") >= 0);
+            rig.runUntil(rig.now + 3000);
+            long wedged = notedAt(notes, "wedged: a turn that would not turn");
+            long nowhere = notedAt(notes, "backing up first went nowhere");
+            long retrace = notedAt(notes, "retrace: facing");
+            long wriggle = notedAt(notes, "wriggle LEFT: up to 10000 ms");
+            long failed = notedAt(notes, "wriggle failed both ways");
+            long jam = notedAt(notes, "fully jammed");
+            long rest = entered(rig, ExploreBrain.State.CORNERED, 0);
+            check(n, wedged > 0 && nowhere > wedged && retrace > nowhere && wriggle > retrace && failed > wriggle
+                            && jam >= failed && rest >= jam && helpLines(rig, 0).size() == 1
+                            && notesWith(notes, "cornered: ") == 0 && rig.violations.isEmpty(),
+                    "wedged@" + wedged + " nowhere@" + nowhere + " retrace@" + retrace + " wriggle@" + wriggle
+                            + " failed@" + failed + " jam@" + jam + " rest@" + rest + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 25), notes.size()));
+        });
+    }
+
     // ---- a step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, the 3 s drive-off ran out mid-turn) ----
 
     /** Claude's way out: the frame and x that aim `deg` left of where he faces when asked. */
@@ -6537,9 +6724,10 @@ public final class ExploreBrainHarness {
         scenario("budget_blocked_drive_off_turn_still_fails_the_step_within_1_5_s", n -> {
             // The way out needs a turn, and the drive-off's turns go nowhere: blocked at ~1.5 s,
             // one back-up and the turn the other way, blocked again, and the step has failed.
+            // (The wriggle off: with it, the second blocked turn in a row starts one instead.)
             Rig[] h = new Rig[1];
             Feed b = bumps(h, 3);
-            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, t -> {
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10).wriggleOff(), h, t -> {
                 Rig r = h[0];
                 if (r != null && r.brain.state() == ExploreBrain.State.DRIVE_OFF) {
                     r.yaw.stuck = true;
@@ -7260,9 +7448,10 @@ public final class ExploreBrainHarness {
         });
         // ---- a turn the gyro says isn't turning (live: wedged under a desk, "asked 120 deg, turned 0") ----
         scenario("turn_flat_yaw_in_the_circle_is_blocked_within_1_5_s_and_the_escape_advances", n -> {
+            // The wriggle off: with it, the second blocked turn in a row starts one instead.
             Rig[] h = new Rig[1];
             Feed b = bumps(h, 3);
-            Rig rig = escRig(escTuning().escapeRetrace(0, 10), h, t -> {
+            Rig rig = escRig(escTuning().escapeRetrace(0, 10).wriggleOff(), h, t -> {
                 Rig r = h[0];
                 if (r != null && r.brain.state() == ExploreBrain.State.CIRCLE) {
                     r.yaw.stuck = true;

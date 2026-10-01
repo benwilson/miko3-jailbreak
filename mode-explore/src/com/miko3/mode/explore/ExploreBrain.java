@@ -32,7 +32,9 @@ import java.util.Set;
  *   STARTLE    stopped, startle clip and flinch (R11)
  *   BACK_OFF   the only reversing: backTicks, time-bounded and blind (R4, R12)
  *   CORNERED   too many hazards too fast: resting eyes, no motion (KTD8); also the
- *              fully jammed rest (robot 2026-10-01): the help line, jammedRestMs, one short back-up
+ *              fully jammed rest (robot 2026-10-01): the help line, jammedRestMs, one short back-up.
+ *              Before it, the long wriggle runs in the escape's state: up to wriggleMs one
+ *              way, then the other, stopping a way at once when its wheels don't move
  *   STOPPED    after shutdown(); inert
  *
  * Camera curiosity (camera curiosity plan KTD5), entered from PAUSE when a
@@ -902,6 +904,35 @@ final class ExploreBrain {
     private boolean jamHelpPending;
     private long jamHelpAt = NEVER;
 
+    // ---- the long wriggle (robot 2026-10-01: an 11 s spin freed him where 1.5 s turns gave up) ----
+    /** A wriggle is under way, in the escape's state (escapeTick hands it every step). */
+    private boolean wriggling;
+    /** Why it began: the jam rule's reason (it fails into "fully jammed"), or two blocked escape turns. */
+    private String wriggleWhy;
+    /** The way it turns now, and whether this is the second way. */
+    private Direction wriggleDir;
+    private boolean wriggleSecond;
+    /** This way began at wriggleWayAt and ends by wriggleUntil. */
+    private long wriggleWayAt;
+    private long wriggleUntil;
+    /** The heading when this way began (NaN: unusable). */
+    private double wriggleHeading = Double.NaN;
+    /** Wheel counts this way, summed over both wheels, and from where they are counted. */
+    private long wriggleCounts;
+    private SensorReading wriggleFrom;
+    /** {time, wriggleCounts} since the way began or resumed: the wheels-not-moving window. */
+    private final ArrayDeque<long[]> wriggleWindow = new ArrayDeque<long[]>();
+    /** This way's one short back-up after wriggleFreeCounts: tried, under way, its end and its counts. */
+    private boolean wriggleBackTried;
+    private boolean wriggleBacking;
+    private long wriggleBackUntil;
+    private long wriggleJudgeAfter;
+    private long wriggleBackMoved;
+    /** When the last wriggle began: at most one per wriggleEveryMs. */
+    private long wriggleAt = NEVER;
+    /** Escape measured turns in a row that turned under jamTurnDeg. */
+    private int escBlockedRun;
+
     /** This ladder's: the blocked turn to try the free way after the first back-up (null: none). */
     private Direction escRetryDir;
     private double escRetryDeg;
@@ -1191,6 +1222,7 @@ final class ExploreBrain {
         trackWheels(reading);
         countEscapeWheels(reading);
         countJamWheels(reading);
+        countWriggleWheels(reading);
         lastReading = reading;
         compass.offer(reading, moving);
         headingHistory.offer(reading.timestampMs,
@@ -1227,6 +1259,7 @@ final class ExploreBrain {
         }
         moving = false;
         motor.stop();
+        dropWriggle();
         cancelAsk();
         cancelWayOut();
         cancelDoorway(clock.nowMs(), null);
@@ -4131,6 +4164,7 @@ final class ExploreBrain {
         escapeFailures.clear();
         jamBackStalled = false;
         jamBlockedWays.clear();
+        escBlockedRun = 0;
         if (turnBlocked && wedgeTurnDir != null && wedgeTurnTurned < tuning.jamTurnDeg) {
             jamBlockedWays.add(wedgeTurnDir);
         }
@@ -4235,6 +4269,11 @@ final class ExploreBrain {
 
     /** Each tick of an escape step: its budget, then what it is doing. */
     private void escapeTick(long now, boolean fresh, boolean hazard) {
+        if (wriggling) {
+            // Turning in place, blind to hazards like the escape's own turns.
+            wriggleStep(now, fresh);
+            return;
+        }
         if (probing) {
             probeStep(now, fresh, hazard);
             return;
@@ -4626,6 +4665,7 @@ final class ExploreBrain {
     }
 
     private void escAfterTurn(long now) {
+        escBlockedRun = 0;
         if (escThen == EscThen.LOOK) {
             escLook(now);
         } else {
@@ -4638,10 +4678,19 @@ final class ExploreBrain {
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
                 + " deg in " + (now - turnStartedAt) + " ms (" + escDir + ")");
         blockSide(escDir);
-        if (measured && Math.abs(compass.turned()) < tuning.jamTurnDeg) {
+        boolean nowhere = measured && Math.abs(compass.turned()) < tuning.jamTurnDeg;
+        if (nowhere) {
             jamBlockedWays.add(escDir);
         }
         if (jamCheck(now)) {
+            return;
+        }
+        escBlockedRun = nowhere ? escBlockedRun + 1 : 0;
+        if (escBlockedRun >= 2 && wriggleAllowed(now)) {
+            // Robot 2026-10-01: short turns that read "turned 0" give up before a wedged
+            // robot works loose; one long wriggle before the ladder grinds on.
+            endEscapeForJam();
+            startWriggle(now, "escape turns blocked twice in a row");
             return;
         }
         if (escFirstRetry) {
@@ -5712,6 +5761,10 @@ final class ExploreBrain {
             return CallVerdict.IN_PLACE;
         }
         if (state == State.STARTLE || state == State.BACK_OFF) {
+            return CallVerdict.WAIT;
+        }
+        if (wriggling) {
+            // The wriggle is bounded (two ways of up to wriggleMs): the call waits for its verdict.
             return CallVerdict.WAIT;
         }
         if (jammed) {
@@ -6999,6 +7052,7 @@ final class ExploreBrain {
     private void enterEyesOnly(String why) {
         handBackCall("the lease or the sensors lost");
         stopMotors();
+        dropWriggle();
         cancelAsk();
         cancelWayOut();
         planner.reset();
@@ -7154,6 +7208,22 @@ final class ExploreBrain {
         if (tuning.jamTurnDeg <= 0 || !jamBackStalled || jamBlockedWays.size() < 2) {
             return false;
         }
+        endEscapeForJam();
+        String why = "the back-up went nowhere and turns both ways turned under " + Math.round(tuning.jamTurnDeg)
+                + " deg";
+        if (wriggleAllowed(now)) {
+            startWriggle(now, why);
+        } else {
+            if (tuning.wriggleMs > 0 && wriggleAt != NEVER) {
+                note("no wriggle: the last was " + (now - wriggleAt) / 1000 + " s ago");
+            }
+            enterJammed(now, why);
+        }
+        return true;
+    }
+
+    /** The escape ends where it stands: no more ladder steps, asks or probes. */
+    private void endEscapeForJam() {
         stopMotors();
         cancelWayOut();
         planner.reset();
@@ -7163,12 +7233,15 @@ final class ExploreBrain {
         escShortBack = false;
         jamBackStalled = false;
         jamBlockedWays.clear();
+        escBlockedRun = 0;
+    }
+
+    /** Fully jammed: no more pushing, the help line when due, the long rests and their probes. */
+    private void enterJammed(long now, String why) {
         jams++;
         jammed = true;
-        note("fully jammed: the back-up went nowhere and turns both ways turned under "
-                + Math.round(tuning.jamTurnDeg) + " deg; no more pushing (jam " + jams + " since start)");
+        note("fully jammed: " + why + "; no more pushing (jam " + jams + " since start)");
         jamRest(now);
-        return true;
     }
 
     /** The jammed rest: no motion for jammedRestMs, the help line when due, then one short back-up. */
@@ -7262,6 +7335,11 @@ final class ExploreBrain {
     /** The probe moved: he is free, and roams again with today's escape state cleared. */
     private void jamFreed(long now) {
         note("jam probe moved " + jamMoved + " counts: free, roaming again");
+        freedFromJam(now);
+    }
+
+    /** Out of a jam (the probe or the wriggle moved): roams again with today's escape state cleared. */
+    private void freedFromJam(long now) {
         jammed = false;
         jamHelpPending = false;
         blockedSides.clear();
@@ -7275,6 +7353,184 @@ final class ExploreBrain {
         escapeSide = null;
         lastHazardSide = null;
         enterPause(now, pauseMs(), false);
+    }
+
+    // ---- the long wriggle (robot 2026-10-01) ----
+
+    private boolean wriggleAllowed(long now) {
+        return tuning.wriggleMs > 0 && tuning.jamTurnDeg > 0 && state.escapes()
+                && (wriggleAt == NEVER || now - wriggleAt >= tuning.wriggleEveryMs);
+    }
+
+    /**
+     * One long wriggle: a continuous turn LEFT for up to wriggleMs, then RIGHT. Live under a
+     * chair, the escape's ~1.5 s turns read "turned 0" while one 11 s spin worked him loose.
+     * It stays bounded: a way stops at once when its wheels don't move (the motor board
+     * latches after repeated stalled pushing), and at most one runs per wriggleEveryMs.
+     */
+    private void startWriggle(long now, String why) {
+        note(why + ": one long wriggle first");
+        wriggling = true;
+        wriggleWhy = why;
+        wriggleAt = now;
+        wriggleSecond = false;
+        measured = false;
+        startWriggleWay(now, Direction.LEFT);
+    }
+
+    private void startWriggleWay(long now, Direction d) {
+        wriggleDir = d;
+        wriggleWayAt = now;
+        wriggleUntil = now + tuning.wriggleMs;
+        wriggleCounts = 0;
+        wriggleBackTried = false;
+        wriggleBacking = false;
+        wriggleHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
+        note("wriggle " + d + ": up to " + tuning.wriggleMs + " ms");
+        show(EyeState.LOOK, d);
+        wriggleTurn(now);
+    }
+
+    /** The turn (re)starts: the not-moving window counts from here. */
+    private void wriggleTurn(long now) {
+        wriggleFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        wriggleWindow.clear();
+        wriggleWindow.addLast(new long[]{now, wriggleCounts});
+        moving = true;
+        turnWheels(wriggleDir);
+    }
+
+    /** Wheel counts during the wriggle: summed over both wheels while turning, averaged while backing up. */
+    private void countWriggleWheels(SensorReading r) {
+        if (!wriggling || !r.hasWheels()) {
+            return;
+        }
+        if (wriggleFrom != null) {
+            long d = Math.abs(r.wheelLeft - wriggleFrom.wheelLeft) + Math.abs(r.wheelRight - wriggleFrom.wheelRight);
+            if (wriggleBacking) {
+                wriggleBackMoved += d / 2;
+            } else if (moving) {
+                wriggleCounts += d;
+                wriggleWindow.addLast(new long[]{clock.nowMs(), wriggleCounts});
+            }
+        }
+        wriggleFrom = r;
+    }
+
+    /** Fewer than wriggleMinCounts in the last wriggleStillMs: the wheels are not moving at all. */
+    private boolean wriggleWheelsStill(long now) {
+        long since = now - tuning.wriggleStillMs;
+        while (wriggleWindow.size() > 1) {
+            long[] first = wriggleWindow.pollFirst();
+            long[] next = wriggleWindow.peekFirst();
+            if (next[0] > since) {
+                wriggleWindow.addFirst(first);
+                break;
+            }
+        }
+        long[] base = wriggleWindow.peekFirst();
+        return base != null && base[0] <= since && wriggleCounts - base[1] < tuning.wriggleMinCounts;
+    }
+
+    private double wriggleTurned(long now) {
+        return Double.isNaN(wriggleHeading) || !compass.usable(now) ? 0
+                : Math.abs(Heading.delta(wriggleHeading, compass.degrees()));
+    }
+
+    private String wriggleSoFar(long now) {
+        return "turned " + Math.round(wriggleTurned(now)) + " deg, " + wriggleCounts + " counts";
+    }
+
+    private void wriggleStep(long now, boolean fresh) {
+        if (wriggleBacking) {
+            if (now < wriggleBackUntil) {
+                if (now >= nextTickAt) {
+                    nextTickAt += tuning.backTickMs;
+                    motor.backTick();
+                }
+                return;
+            }
+            if (moving) {
+                stopMotors();
+                wriggleJudgeAfter = now;
+            }
+            if (!fresh || now <= wriggleJudgeAfter) {
+                return;
+            }
+            wriggleBacking = false;
+            if (wriggleBackMoved >= tuning.stallMinCounts) {
+                note("wriggle " + wriggleDir + ": free after " + (now - wriggleWayAt) + " ms (" + wriggleSoFar(now)
+                        + "; the back-up moved " + wriggleBackMoved + " counts)");
+                wriggleFreed(now);
+                return;
+            }
+            if (now >= wriggleUntil) {
+                note("wriggle " + wriggleDir + ": not free after " + tuning.wriggleMs + " ms (" + wriggleSoFar(now)
+                        + ")");
+                wriggleWayOver(now);
+                return;
+            }
+            note("wriggle " + wriggleDir + ": the back-up went nowhere (" + wriggleBackMoved + " counts); turning on");
+            wriggleTurn(now);
+            return;
+        }
+        if (wriggleTurned(now) >= tuning.wriggleFreeDeg) {
+            stopMotors();
+            note("wriggle " + wriggleDir + ": free after " + (now - wriggleWayAt) + " ms (" + wriggleSoFar(now) + ")");
+            wriggleFreed(now);
+            return;
+        }
+        if (!wriggleBackTried && wriggleCounts >= tuning.wriggleFreeCounts) {
+            // The wheels turn a lot but he doesn't: free to back away, or spinning in place?
+            stopMotors();
+            wriggleBackTried = true;
+            note("wriggle " + wriggleDir + ": " + wriggleSoFar(now) + "; backing up to see");
+            wriggleBacking = true;
+            wriggleBackMoved = 0;
+            wriggleFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+            wriggleBackUntil = now + tuning.jamProbeTicks * tuning.backTickMs;
+            nextTickAt = now + tuning.backTickMs;
+            moving = true;
+            motor.backTick();
+            return;
+        }
+        if (wriggleWheelsStill(now)) {
+            stopMotors();
+            note("wriggle " + wriggleDir + ": wheels not moving; stopping");
+            wriggleWayOver(now);
+            return;
+        }
+        if (now >= wriggleUntil) {
+            stopMotors();
+            note("wriggle " + wriggleDir + ": not free after " + tuning.wriggleMs + " ms (" + wriggleSoFar(now) + ")");
+            wriggleWayOver(now);
+        }
+    }
+
+    private void wriggleWayOver(long now) {
+        if (!wriggleSecond) {
+            wriggleSecond = true;
+            startWriggleWay(now, wriggleDir.opposite());
+            return;
+        }
+        wriggling = false;
+        boolean due = jamHelpAt == NEVER || now - jamHelpAt >= tuning.jamHelpEveryMs;
+        note(due ? "wriggle failed both ways: asking for help"
+                : "wriggle failed both ways: resting (the help line was said " + (now - jamHelpAt) / 1000 + " s ago)");
+        enterJammed(now, wriggleWhy.startsWith("the back-up") ? wriggleWhy : "a wriggle both ways went nowhere");
+    }
+
+    private void wriggleFreed(long now) {
+        wriggling = false;
+        wriggleBacking = false;
+        note("wriggled free: roaming again");
+        freedFromJam(now);
+    }
+
+    /** Leaving the wriggle unfinished (eyes only, shutdown): no motion of its own goes on. */
+    private void dropWriggle() {
+        wriggling = false;
+        wriggleBacking = false;
     }
 
     private void enterCornered(long now) {

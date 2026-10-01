@@ -276,6 +276,12 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "jammed_probe_that_moves_resumes_roaming",
         "jammed_moved_from_outside_probes_at_once",
         "jammed_partial_block_one_way_free_runs_the_escape",
+        # The long wriggle (robot 2026-10-01: an 11 s spin freed him under the chair)
+        "wriggle_slow_wheels_then_the_heading_turns_after_6s_frees_him_where_the_short_turns_gave_up",
+        "wriggle_nothing_moves_each_way_stops_within_1500ms_then_the_help_line",
+        "wriggle_wheels_spin_heading_never_moves_full_time_both_ways_then_help_one_per_two_minutes",
+        "wriggle_two_blocked_escape_turns_in_a_row_wriggles_before_the_ladder_grinds",
+        "wriggle_the_1408_chair_episode_wedge_turn_stalled_back_up_blocked_retrace_is_caught",
         # A step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, drive-off cut mid-turn)
         "budget_drive_off_turn_at_40_deg_s_completes_and_drives_off",
         "budget_slow_but_progressing_turn_is_never_cut_by_the_step_budget",
