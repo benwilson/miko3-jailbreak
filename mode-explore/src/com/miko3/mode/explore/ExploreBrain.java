@@ -36,8 +36,10 @@ import java.util.Set;
  *              Before it, the long wriggle runs in the escape's state: up to wriggleMs one
  *              way, then the other, stopping a way at once when its wheels don't move
  *   RECOVER    after a stall (robot 2026-10-01: the motor board refused all motion for 9-29 s):
- *              still, one short probe turn at each of stallRecoverProbesMs after the stall;
- *              the first that moves runs the normal escape, none is a real jam (the wriggle)
+ *              still, one short probe at each of stallRecoverProbesMs after the stall: a
+ *              back-up (the way he came), a turn only after two still back-ups; the first
+ *              that moves backs straight out, then the normal escape; none is a real jam (the
+ *              wriggle). A turn probe whose wheels move but heading doesn't: that way is blocked
  *   STOPPED    after shutdown(); inert
  *
  * Camera curiosity (camera curiosity plan KTD5), entered from PAUSE when a
@@ -1018,6 +1020,37 @@ final class ExploreBrain {
     private long recoverMoved;
     private SensorReading recoverFromReading;
     private double recoverHeading = Double.NaN;
+    /** This probe backs up (robot 15:19: behind is the way he came) rather than turning. */
+    private boolean recoverProbeBack;
+    /** The turn probe's way; back-up probes in a row that moved nothing; a turn probe found a way blocked. */
+    private Direction recoverProbeDir;
+    private int recoverBackStill;
+    private Direction recoverBlockedWay;
+    /** Once the board is back: the first move is the full straight back-up (blockedTurnBackTicks). */
+    private boolean recoverBackFirst;
+    /** A blocked turn's short back-up is over: the retry waits until then (blockedTurnWaitMs). */
+    private boolean retryWaiting;
+    // ---- boxed in (robot 2026-10-01: minutes under a desk, forward refused, turning in place) ----
+    /** The controller's forward refusals (CPL hiccups and hazards) within boxedInWindowMs. */
+    private final ArrayDeque<Long> cplRefusals = new ArrayDeque<Long>();
+    /** Leg decisions in a row whose steer read open boxedInOpen or less. */
+    private int lowOpenRun;
+    /** His last clean forward leg: its heading (NaN: none) and length (counts, one wheel). */
+    private double inHeading = Double.NaN;
+    private long inCounts;
+    /** This ladder began boxed in, leaving along boxedExit (NaN: no way in logged); the view there. */
+    private boolean boxedLadder;
+    private double boxedExit = Double.NaN;
+    private PlaceMemory.Print boxedPrint;
+    /** Once out: the way back under is avoided by the novelty steer until boxedAvoidUntil. */
+    private double boxedAvoidHeading = Double.NaN;
+    private long boxedAvoidUntil = NEVER;
+    /** The escape's next turn starts no sooner than this (after a blocked turn's back-up). */
+    private long escTurnNotBefore;
+    /** Jammed rests since he was found jammed: the probe times (jamProbeAtMs) count from there. */
+    private int jamRests;
+    private long jammedAt;
+    private long jamRestStartedAt;
     /** A shove while waiting: the next probe goes at once. */
     private String recoverPoke;
     /** Wheel counts (both wheels) in the current turn, from where (null: no encoders): a cutout reads none. */
@@ -1592,7 +1625,7 @@ final class ExploreBrain {
             case BACK_OFF:
                 // Blind (nothing watches behind him): bounded by time, hazards ignored; the
                 // short back-up before a retried turn also stops on a stall.
-                if (backForTurn && now < phaseUntil && wheelsStalled(now)) {
+                if (backForTurn && !retryWaiting && now < phaseUntil && wheelsStalled(now)) {
                     note("wheels stalled backing up");
                     stampStall(now);
                     if (recoverDue(now)) {
@@ -1604,9 +1637,18 @@ final class ExploreBrain {
                     }
                     phaseUntil = now;
                 }
-                if (now >= phaseUntil && backForTurn) {
+                if (now >= phaseUntil && backForTurn && !retryWaiting && tuning.blockedTurnWaitMs > 0) {
+                    // Robot 15:19: the blocked turn re-armed the board's cutout; the other way
+                    // straight after it would read nothing. Still, then the retry.
+                    stopMotors();
+                    retryWaiting = true;
+                    ticksLeft = 0;
+                    phaseUntil = now + tuning.blockedTurnWaitMs;
+                    note("backed up: waiting " + tuning.blockedTurnWaitMs + " ms before turning " + retryDir);
+                } else if (now >= phaseUntil && backForTurn) {
                     stopMotors();
                     backForTurn = false;
+                    retryWaiting = false;
                     enterLook(now, retryDir, retryEscape, retryMs, retryDeg);
                     turnRetrying = true;
                 } else if (now >= phaseUntil) {
@@ -1743,6 +1785,11 @@ final class ExploreBrain {
             // not a drive-off, so the blocked ways stay avoided.
             aheadBlocked();
         } else {
+            if (compass.usable(now) && lastWheels != null && hopMoved / 2 >= tuning.escapeRetraceMinCounts) {
+                // The way he came, should he end up boxed in (robot 2026-10-01).
+                inHeading = compass.degrees();
+                inCounts = hopMoved / 2;
+            }
             blockedSides.clear();
             blockedAheadAt = Double.NaN;
         }
@@ -1762,6 +1809,9 @@ final class ExploreBrain {
     private void decide(long now, boolean hazard) {
         if (hazard) {
             refuse(now);
+        } else if (boxedIn(now)) {
+            // Leaving the way he came (robot 2026-10-01): the retrace has started.
+            return;
         } else if (awayLeg != null) {
             // The first leg after a conversation turns away from the person (R16).
             Direction d = awayLeg;
@@ -1870,6 +1920,10 @@ final class ExploreBrain {
         doorwayLeg = false;
         if (plan != null) {
             note("steer: " + plan);
+            lowOpenRun = plan.open <= tuning.boxedInOpen ? lowOpenRun + 1 : 0;
+            if (boxedIn(now)) {
+                return;
+            }
             if (plan.towardDoorway && !plan.turnOnly && !plan.shortLeg && plan.open >= tuning.steerOpen) {
                 double after = compass.degrees() + (plan.side == RoamSteer.LEFT ? plan.bendDeg
                         : plan.side == RoamSteer.RIGHT ? -plan.bendDeg : 0);
@@ -1958,7 +2012,21 @@ final class ExploreBrain {
                 }
             };
         }
-        return places.steer(grid, facing, usable, placeNovelty(now, look), now);
+        final RoamSteer.Novelty base = places.steer(grid, facing, usable, placeNovelty(now, look), now);
+        if (!usable || now >= boxedAvoidUntil || Double.isNaN(boxedAvoidHeading)) {
+            return base;
+        }
+        // Just out of a boxed-in spot: the way back under reads as already seen.
+        final double avoid = boxedAvoidHeading;
+        return new RoamSteer.Novelty() {
+            @Override
+            public double at(double bearing) {
+                if (Math.abs(Heading.delta(Heading.wrap(facing + bearing), avoid)) <= tuning.boxedAvoidDeg) {
+                    return 0;
+                }
+                return base == null ? Double.NaN : base.at(bearing);
+            }
+        };
     }
 
     /**
@@ -2013,6 +2081,9 @@ final class ExploreBrain {
     private void refuse(long now) {
         HazardClassifier.Hazard h = classifier.hazard();
         note("hazard at start: " + h);
+        if (h != null && h.kind == HazardClassifier.Kind.CPL) {
+            recordRefusal(now);
+        }
         endSeek(now, false, "blocked: " + h);
         aheadBlocked();
         leaveStopForHazard();
@@ -2043,6 +2114,7 @@ final class ExploreBrain {
             return false;
         }
         int left = ticksRemaining(now);
+        recordRefusal(now);
         note("controller refused forward (CPL) on plain floor: a hiccup; " + left
                 + " ticks to go, trying once more in " + tuning.cplRetryPauseMs + " ms");
         stopMotors();
@@ -2112,6 +2184,9 @@ final class ExploreBrain {
     /** As above, for a hazard the classifier did not see (h null: side unknown). */
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
         recoverAfterStartle = false;
+        if (h != null && h.kind == HazardClassifier.Kind.CPL) {
+            recordRefusal(now);
+        }
         endSeek(now, false, h == null ? "blocked: wheels stalled" : "blocked: " + h);
         if (drivingForward() && (h == null || h.kind == HazardClassifier.Kind.OBSTACLE)) {
             stampBump(now);
@@ -2159,6 +2234,9 @@ final class ExploreBrain {
             // R9: the escape comes first; the voice is looked for again from where it leaves him.
             note("hazard during the turn to a voice: the cue waits for the escape");
             holdCue(clock.nowMs(), searchCue);
+            // Not over: the same voice is looked for again after the escape, not held off.
+            leanInOpen = false;
+            leanInExempt = searchCue;
             clearStop();
             return;
         }
@@ -2769,6 +2847,12 @@ final class ExploreBrain {
 
     /** Forgets everything about the current stop (the camera closes as the state leaves curiosity). */
     private void clearStop() {
+        if (leanInOpen) {
+            leanInOpen = false;
+            if (!leanInMet) {
+                leanInOver(clock.nowMs());
+            }
+        }
         closeMeeting();
         cancelAsk();
         // A check the stop was waiting on runs on; its answer then only clears a roaming person.
@@ -3495,6 +3579,7 @@ final class ExploreBrain {
             phantomPerson(now, a);
             return;
         }
+        leanInMet |= leanInOpen;
         if (confirmable(a)) {
             enterConfirm(now, a);
             return;
@@ -4336,6 +4421,13 @@ final class ExploreBrain {
     private void startLadder(long now, String why, boolean turnBlocked) {
         note("wedged: " + why + " (" + hazardTimes.size() + " hazards, " + stallStreak + " stalls, "
                 + failedLadders + " failed escapes in a row); escaping");
+        beginLadder(now, turnBlocked);
+        escapePhase(now);
+    }
+
+    /** The ladder's state for a new escape, at its first step (RETRACE), not yet entered. */
+    private void beginLadder(long now, boolean turnBlocked) {
+        boxedLadder = false;
         hazardTimes.clear();
         escapeFailures.clear();
         jamBackStalled = false;
@@ -4345,6 +4437,7 @@ final class ExploreBrain {
             jamBlockedWays.add(wedgeTurnDir);
         }
         wedgeTurnTurned = Double.NaN;
+        escTurnNotBefore = 0;
         planner.begin(now, compass.degrees());
         escDroveForward = false;
         escBackOutFirst = turnBlocked;
@@ -4354,7 +4447,87 @@ final class ExploreBrain {
         escRetryDeg = wedgeTurnDeg;
         escShortBack = false;
         circleDir = unblocked(escapeSide != null ? escapeSide : Direction.LEFT);
-        escapePhase(now);
+    }
+
+    /** A forward refusal by the controller (a CPL hiccup or hazard): boxedInRefusals in boxedInWindowMs is boxed in. */
+    private void recordRefusal(long now) {
+        cplRefusals.addLast(now);
+        while (!cplRefusals.isEmpty() && now - cplRefusals.peekFirst() > tuning.boxedInWindowMs) {
+            cplRefusals.pollFirst();
+        }
+    }
+
+    /**
+     * Boxed in (robot 2026-10-01: under a desk for minutes, turns working, forward refused,
+     * the steer reading "open 0.00"): at a leg decision in PAUSE, boxedInRefusals forward
+     * refusals within boxedInWindowMs, or boxedInOpenDecisions steer readings in a row of
+     * boxedInOpen or less. He leaves the way he came: the ladder's retrace move, facing the
+     * reverse of his last clean forward leg and driving its length back. Refused, the
+     * ladder goes on (circle, way out, drive off). Never with the heading unusable, while
+     * jammed, or with an escape under way. True when the retrace has started.
+     */
+    private boolean boxedIn(long now) {
+        while (!cplRefusals.isEmpty() && now - cplRefusals.peekFirst() > tuning.boxedInWindowMs) {
+            cplRefusals.pollFirst();
+        }
+        boolean refused = tuning.boxedInRefusals > 0 && cplRefusals.size() >= tuning.boxedInRefusals;
+        boolean closed = tuning.boxedInOpenDecisions > 0 && lowOpenRun >= tuning.boxedInOpenDecisions;
+        if (!(refused || closed) || state != State.PAUSE || !compass.usable(now) || jammed || planner.active()) {
+            return false;
+        }
+        String why = refused
+                ? cplRefusals.size() + " forward refusals in " + Math.round((now - cplRefusals.peekFirst()) / 1000.0) + " s"
+                : "the steer read open " + tuning.boxedInOpen + " or less for " + lowOpenRun + " decisions in a row";
+        cplRefusals.clear();
+        lowOpenRun = 0;
+        boolean way = !Double.isNaN(inHeading);
+        double exit = way ? Heading.wrap(inHeading + 180) : Double.NaN;
+        note("boxed in: " + why + (way ? "; leaving the way he came (facing " + Math.round(exit) + " deg)"
+                : "; no way in logged: escaping"));
+        endSeek(now, false, "boxed in");
+        stopMotors();
+        if (!Double.isNaN(doorway)) {
+            forgetDoorway();
+        }
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        doorwayLeg = false;
+        steerWaitUntil = NO_WAIT;
+        Look look = camera.latest();
+        boxedPrint = look == null ? null : look.place;
+        beginLadder(now, false);
+        boxedLadder = true;
+        boxedExit = exit;
+        if (!way) {
+            escapePhase(now);
+            return true;
+        }
+        // Straight to the retrace move: no blind back-up first, no back-out.
+        escBackUpFirst = false;
+        escBackOutFirst = false;
+        state = State.RETRACE;
+        show(EyeState.IDLE, null);
+        EscapePlanner.Move m = new EscapePlanner.Move(exit, Math.min(inCounts, tuning.escapeRetraceCounts));
+        note("retrace: facing " + m);
+        planner.tried(m.heading);
+        escGoal = m.counts;
+        escTurnTo(now, m.heading, EscThen.DRIVE);
+        return true;
+    }
+
+    /** Out of a boxed-in spot: the view there is where a seek went, and the way back under is avoided a while. */
+    private void leftBox(long now) {
+        boxedLadder = false;
+        places.markSought(boxedPrint, now);
+        boxedPrint = null;
+        if (Double.isNaN(boxedExit) || tuning.boxedAvoidMs <= 0) {
+            return;
+        }
+        boxedAvoidHeading = Heading.wrap(boxedExit + 180);
+        boxedAvoidUntil = now + tuning.boxedAvoidMs;
+        note("boxed in: out; the way back under (" + Math.round(boxedAvoidHeading) + " deg) avoided for "
+                + tuning.boxedAvoidMs / 1000 + " s");
     }
 
     /** Enters the planner's current step. */
@@ -4495,7 +4668,8 @@ final class ExploreBrain {
                 break;
             case TURN_READY:
                 // Turning in place is how he gets out: a hazard in view doesn't stop it.
-                if (fresh) {
+                if (fresh && now >= escTurnNotBefore) {
+                    escTurnNotBefore = 0;
                     heading = escDir;
                     turnDeg = escTurnAmount;
                     moving = true;
@@ -4654,6 +4828,9 @@ final class ExploreBrain {
             if (escFirstRetry) {
                 escFirstRetry = false;
                 escapeFreed(now, "backed up, turned and drove off");
+            } else if (planner.phase() == EscapePlanner.Phase.RETRACE && boxedLadder) {
+                planner.addRetraced(escMoved);
+                escapeFreed(now, "left the way he came: " + escMoved + " counts", true);
             } else if (planner.phase() == EscapePlanner.Phase.RETRACE) {
                 planner.addRetraced(escMoved);
                 escWait(now, EscThen.RETRACE_NEXT);
@@ -4712,6 +4889,7 @@ final class ExploreBrain {
             } else if (escThen == EscThen.RETRY_TURN) {
                 escThen = escThenAfterRetry;
                 flipEscTurn(now);
+                escWaitBeforeTurn(now);
                 if (planner.phase() == EscapePlanner.Phase.RETRACE && !Double.isNaN(escTarget)
                         && escTurnAmount > tuning.retraceLongWayMaxDeg) {
                     escFailed(now, "the other way round is " + Math.round(escTurnAmount) + " deg");
@@ -4753,6 +4931,7 @@ final class ExploreBrain {
             escFirstRetry = true;
             escGoal = 0;
             escTurnBy(d, deg, EscThen.DRIVE);
+            escWaitBeforeTurn(now);
             return;
         }
         if (tryForwardFirst(now, "after backing up", false, ProbeThen.STEP)) {
@@ -4908,6 +5087,18 @@ final class ExploreBrain {
             }
         }
         escFailed(now, "a turn that would not turn");
+    }
+
+    /**
+     * A blocked turn's back-up is over: the other way waits blockedTurnWaitMs (robot 15:19:
+     * the blocked turn re-armed the cutout); the step's budget waits with him (budgetWaits).
+     */
+    private void escWaitBeforeTurn(long now) {
+        if (tuning.blockedTurnWaitMs <= 0) {
+            return;
+        }
+        escTurnNotBefore = now + tuning.blockedTurnWaitMs;
+        note("backed up: waiting " + tuning.blockedTurnWaitMs + " ms before the turn");
     }
 
     /** What follows a turn retried after a back-out. */
@@ -5124,6 +5315,10 @@ final class ExploreBrain {
         if (esc == Esc.TURNING && measured && compass.usable(now)) {
             return true;
         }
+        if (esc == Esc.TURN_READY && escTurnNotBefore > 0) {
+            // Waiting after a blocked turn's back-up (blockedTurnWaitMs), until that turn starts.
+            return true;
+        }
         EscapePlanner.Phase p = planner.phase();
         return (p == EscapePlanner.Phase.DRIVE_OFF || p == EscapePlanner.Phase.SECOND_DRIVE_OFF)
                 && (esc == Esc.DRIVE_READY || esc == Esc.DRIVING);
@@ -5276,6 +5471,9 @@ final class ExploreBrain {
     private void escapeFreed(long now, String how, boolean droveForward) {
         stopMotors();
         note("free after " + (now - (planner.active() ? planner.startedAt() : probeSince)) + " ms: " + how);
+        if (boxedLadder) {
+            leftBox(now);
+        }
         jammed = false;
         recoverDone();
         if (droveForward) {
@@ -5887,6 +6085,18 @@ final class ExploreBrain {
 
     private enum CueVerdict { TAKE, HOLD, DROP, CONFIRM }
 
+    // The lean-in cooldown (robot 2026-10-01 15:12-15:17: 15 lean-ins in 5 minutes under a desk).
+    /** A lean-in (not a call's search) is under way, and whether it has met someone. */
+    private boolean leanInOpen;
+    private boolean leanInMet;
+    /** When the last lean-in started (leanInMinGapMs) and until when one that met nobody holds off voices. */
+    private long leanInAt = NEVER;
+    private long leanInCooldownUntil = NEVER;
+    /** The hold-off already noted (one note per cooldown). */
+    private long leanInIgnoreNoted = NEVER;
+    /** A cue exempt from the hold-off: a lean-in's own, held through an escape, or a conversation's newcomer. */
+    private Ears.Cue leanInExempt;
+
     /**
      * Opens the launcher's ears and closes them at shutdown (they stay open on the charger,
      * hey-miko plan KTD5), and
@@ -6049,6 +6259,9 @@ final class ExploreBrain {
         if (state.chats() && chat != null && verdict == CueVerdict.DROP) {
             // Not a newcomer: the conversation partner's voice (their words reach the listen).
             partnerSpokeAt = now;
+        }
+        if ((verdict == CueVerdict.TAKE || verdict == CueVerdict.HOLD) && !state.chats() && leanInHeldOff(now, c)) {
+            return;
         }
         switch (verdict) {
             case TAKE:
@@ -6851,9 +7064,16 @@ final class ExploreBrain {
             // A turn to a voice would only push against the jam; a call is met where he is.
             return CueVerdict.DROP;
         }
+        if (seeking() && state.roams()) {
+            // Robot 2026-10-01: a voice is no reason to drop a seek; it waits for the seek's end.
+            return CueVerdict.HOLD;
+        }
         switch (state) {
-            case PAUSE: case HOP: case SCAN: case INSPECT: case REACT_HERE: case CORNERED: case ASK: case ORIENT:
+            case PAUSE: case HOP: case SCAN: case INSPECT: case REACT_HERE: case ASK: case ORIENT:
                 return CueVerdict.TAKE;
+            case CORNERED:
+                // A cornered rest is part of an escape (robot 2026-10-01): a voice waits for its end.
+                return CueVerdict.HOLD;
             case LOOK: case TURN:
                 return escape ? CueVerdict.HOLD : CueVerdict.TAKE;
             case FACE: case APPROACH: case MEET_LOOK: case MEET:
@@ -6957,6 +7177,34 @@ final class ExploreBrain {
         gauges.count(Gauges.Counter.CUES_DROPPED);
     }
 
+    /** A lean-in ended with no meeting (nobody facing him, no usable face, a dropped meeting): the cooldown. */
+    private void leanInOver(long now) {
+        if (tuning.leanInCooldownMs > 0) {
+            leanInCooldownUntil = now + tuning.leanInCooldownMs;
+        }
+    }
+
+    /**
+     * A voice that is not a call, inside the lean-in hold-off (leanInCooldownMs after one
+     * that met nobody, leanInMinGapMs after any): ignored, with one note per hold-off.
+     */
+    private boolean leanInHeldOff(long now, Ears.Cue c) {
+        if (c == leanInExempt) {
+            return false;
+        }
+        long until = Math.max(leanInCooldownUntil, leanInAt == NEVER || tuning.leanInMinGapMs <= 0 ? NEVER
+                : leanInAt + tuning.leanInMinGapMs);
+        if (until == NEVER || now >= until) {
+            return false;
+        }
+        gauges.count(Gauges.Counter.CUES_DROPPED);
+        if (until != leanInIgnoreNoted) {
+            leanInIgnoreNoted = until;
+            note("cue ignored: lean-in cooldown (" + (until - now + 999) / 1000 + " s left)");
+        }
+        return true;
+    }
+
     /** A held cue lasts cueHoldMs; past that a strong one becomes a lean-in and a weak one is dropped (KTD3). */
     private void expireHeldCue(long now) {
         // A newcomer held during a conversation keeps however long it runs (KTD3, R15).
@@ -6981,6 +7229,9 @@ final class ExploreBrain {
         switch (cueVerdict(now, c)) {
             case TAKE:
                 cueHeld = null;
+                if (leanInHeldOff(now, c)) {
+                    break;
+                }
                 note("taking the held cue");
                 takeCue(now, c);
                 break;
@@ -7033,6 +7284,12 @@ final class ExploreBrain {
             if (!c.strong()) {
                 gauges.count(Gauges.Counter.LEAN_INS);
             }
+            if (c != leanInExempt) {
+                leanInAt = now;
+            }
+            leanInExempt = null;
+            leanInOpen = true;
+            leanInMet = false;
         }
         double first = firstTurnDeg(c);
         searchPlan = lookPlan(first, c.strong());
@@ -7240,6 +7497,7 @@ final class ExploreBrain {
         remember(face.label, CuriosityPort.Kind.PERSON, now);
         if (!port.canAsk()) {
             note("no Claude to meet them with: the name clip");
+            leanInMet = true;
             nameClip(now);
             return;
         }
@@ -7402,6 +7660,7 @@ final class ExploreBrain {
         } else if (cueHeld != null) {
             note("the newcomer's held cue is taken now");
             cueHeld = new Ears.Cue(cueHeld.kind, cueHeld.tier, cueHeld.side, cueHeld.angleDeg, now);
+            leanInExempt = cueHeld;
             awayLeg = null;
         } else if (docked) {
             note("on the charger: no resume leg");
@@ -7683,6 +7942,12 @@ final class ExploreBrain {
 
     private void startBackOff(long now) {
         int ticks = stalledNow ? Math.max(tuning.backTicks, tuning.stallBackTicks) : tuning.backTicks;
+        if (recoverBackFirst) {
+            // The board is back (robot 15:19): straight back the full escape length before any turn.
+            recoverBackFirst = false;
+            ticks = Math.max(ticks, tuning.blockedTurnBackTicks);
+            note("the board is back: backing straight out " + ticks + " back ticks before turning");
+        }
         if (ticks <= 0) {
             enterLook(now, escapeDir, true, escapeTurnMs(), escapeTurnDeg());
             return;
@@ -7741,12 +8006,17 @@ final class ExploreBrain {
         jams++;
         jammed = true;
         note("fully jammed: " + why + "; no more pushing (jam " + jams + " since start)");
+        jamRests = 0;
+        jammedAt = now;
         jamRest(now);
     }
 
     /** The jammed rest: no motion for jammedRestMs, the help line when due, then one short back-up. */
     private void jamRest(long now) {
-        rest(now, tuning.jammedRestMs);
+        long restMs = jamRestMs(now);
+        jamRests++;
+        jamRestStartedAt = now;
+        rest(now, restMs);
         jamProbing = false;
         jamPoke = null;
         jamMoved = 0;
@@ -7755,7 +8025,24 @@ final class ExploreBrain {
         if (jamHelpAt == NEVER || now - jamHelpAt >= tuning.jamHelpEveryMs) {
             jamHelpPending = true;
         }
-        note("jammed: resting " + tuning.jammedRestMs + " ms, then one short back-up");
+        note("jammed: resting " + restMs + " ms, then one short back-up");
+    }
+
+    /**
+     * The next jammed rest: up to the next of jamProbeAtMs (30, 60, 120 s after he was found
+     * jammed), then jammedRestMs each (robot 15:19: one probe at 120 s left him stuck for
+     * minutes after the cutout had cleared).
+     */
+    private long jamRestMs(long now) {
+        long[] at = tuning.jamProbeAtMs;
+        while (jamRests < at.length && jammedAt + at[jamRests] <= now) {
+            // A probe time already past (a poke probed early, or the last probe ran long).
+            jamRests++;
+        }
+        if (jamRests < at.length) {
+            return jammedAt + at[jamRests] - now;
+        }
+        return tuning.jammedRestMs;
     }
 
     /** Wheel counts while jammed: someone pulling him out during the rest, or the probe moving. */
@@ -7772,7 +8059,7 @@ final class ExploreBrain {
     /** CORNERED while jammed: the help line, the rest, the probe and its verdict. */
     private void jamStep(long now, boolean fresh) {
         if (jamHelpPending && !jamProbing
-                && (camera.quiet() || now - (phaseUntil - tuning.jammedRestMs) >= tuning.quietWaitMs)) {
+                && (camera.quiet() || now - jamRestStartedAt >= tuning.quietWaitMs)) {
             // Said once the camera and detector are closed (R6), with no motion under way.
             jamHelpPending = false;
             jamHelpAt = now;
@@ -8080,6 +8367,9 @@ final class ExploreBrain {
         escBlockedRun = 0;
         recoverWedged = wedgedAfter;
         recoverWhy = why;
+        recoverBackStill = 0;
+        recoverBlockedWay = null;
+        retryWaiting = false;
         recoverFrom = stallStampAt == NEVER ? now : stallStampAt;
         long since = now - recoverFrom;
         long[] all = tuning.stallRecoverProbesMs;
@@ -8109,6 +8399,10 @@ final class ExploreBrain {
         }
         if (recoverProbing) {
             if (now < recoverProbeUntil) {
+                if (recoverProbeBack && now >= nextTickAt) {
+                    nextTickAt += tuning.backTickMs;
+                    motor.backTick();
+                }
                 return;
             }
             if (moving) {
@@ -8142,10 +8436,21 @@ final class ExploreBrain {
         recoverMoved = 0;
         recoverFromReading = lastReading != null && lastReading.hasWheels() ? lastReading : null;
         recoverHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
-        recoverProbeUntil = now + tuning.stallRecoverProbeMs;
         measured = false;
         moving = true;
-        turnWheels(unblocked(escapeSide != null ? escapeSide : escapeDir != null ? escapeDir : Direction.LEFT));
+        // Back the way he came first (robot 15:19); a turn only after two back-ups moved nothing,
+        // or with no encoders to judge a back-up by.
+        recoverProbeBack = tuning.stallRecoverProbeBackTicks > 0 && recoverFromReading != null
+                && (recoverBlockedWay != null || recoverBackStill < 2);
+        if (recoverProbeBack) {
+            recoverProbeUntil = now + tuning.stallRecoverProbeBackTicks * tuning.backTickMs;
+            nextTickAt = now + tuning.backTickMs;
+            motor.backTick();
+            return;
+        }
+        recoverProbeUntil = now + tuning.stallRecoverProbeMs;
+        recoverProbeDir = unblocked(escapeSide != null ? escapeSide : escapeDir != null ? escapeDir : Direction.LEFT);
+        turnWheels(recoverProbeDir);
     }
 
     /** The probe's counts (both wheels), and every turn's: a turn whose wheels read none is a cutout's sign. */
@@ -8183,35 +8488,62 @@ final class ExploreBrain {
             recovered(now);
             return;
         }
-        if ((counts && recoverMoved >= tuning.stallMinCounts) || turned >= tuning.stallRecoverProbeDeg) {
+        boolean wheels = counts && recoverMoved >= tuning.stallMinCounts;
+        if (recoverProbeBack) {
+            if (wheels) {
+                note("recover probe at " + at + " s: moved " + recoverMoved + " counts backing up: the board is back");
+                recovered(now);
+                return;
+            }
+            recoverBackStill++;
+        } else if (turned >= tuning.stallRecoverProbeDeg || (wheels && !heading)) {
             note("recover probe at " + at + " s: moved " + recoverMoved + " counts"
                     + (turned >= tuning.stallRecoverProbeDeg ? " (turned " + Math.round(turned) + " deg)" : "")
                     + ": the board is back");
             recovered(now);
             return;
+        } else if (wheels) {
+            // The board is alive, but the turn hit something (robot 15:19: a desk leg; 109
+            // counts, 0 deg): that way is blocked, and the probes left back up again.
+            note("recover probe at " + at + " s: wheels moved " + recoverMoved + " counts but he did not turn: that"
+                    + " way is blocked");
+            recoverBlockedWay = recoverProbeDir;
+            blockSide(recoverProbeDir);
         }
-        note("recover probe at " + at + " s: nothing");
+        if (!wheels) {
+            note("recover probe at " + at + " s: nothing");
+        }
         if (recoverProbeScheduled && recoverNext >= recoverProbes.length) {
             note("no recovery after " + at + " s: a real jam");
-            recoverSpent = true;
-            String why = "no recovery after " + at + " s";
-            if (tuning.jamTurnDeg <= 0) {
-                // Jam detection off: the escape as it ran before the wait.
-                resumeEscape(now);
-            } else if (wriggleAllowed(now)) {
-                startWriggle(now, why);
-            } else {
-                if (tuning.wriggleMs > 0 && wriggleAt != NEVER) {
-                    note("no wriggle: the last was " + (now - wriggleAt) / 1000 + " s ago");
-                }
-                enterJammed(now, why);
+            realJam(now, "no recovery after " + at + " s");
+        }
+    }
+
+    /** The wait's verdict is a real jam: the wriggle, then the jam path. */
+    private void realJam(long now, String why) {
+        recoverSpent = true;
+        if (tuning.jamTurnDeg <= 0) {
+            // Jam detection off: the escape as it ran before the wait.
+            resumeEscape(now);
+        } else if (wriggleAllowed(now)) {
+            startWriggle(now, why);
+        } else {
+            if (tuning.wriggleMs > 0 && wriggleAt != NEVER) {
+                note("no wriggle: the last was " + (now - wriggleAt) / 1000 + " s ago");
             }
+            enterJammed(now, why);
         }
     }
 
     /** The board is back: the normal escape, judged only on what it does from now. */
     private void recovered(long now) {
         recoverSpent = true;
+        recoverBackFirst = true;
+        if (recoverBlockedWay != null) {
+            // Turn away from the way a probe found blocked, once he has backed up.
+            escapeDir = recoverBlockedWay.opposite();
+            escapeSide = escapeDir;
+        }
         resumeEscape(now);
     }
 
@@ -8223,6 +8555,8 @@ final class ExploreBrain {
         wheelMoves.clear();
         hopStartedAt = now;
         if (recoverWedged) {
+            // The ladder starts with its own straight back-up (backing up first).
+            recoverBackFirst = false;
             wedged(now, recoverWhy, false);
             return;
         }

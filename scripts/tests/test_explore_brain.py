@@ -289,6 +289,8 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "recover_a_call_while_waiting_is_answered_where_he_stands",
         "recover_a_shove_while_waiting_probes_at_once",
         "recover_a_turn_that_reads_nothing_after_a_bump_waits_and_its_attempts_never_count",
+        "recover_desk_rig_backs_out_the_way_he_came_within_15_s_no_jam_no_help_line",
+        "recover_behind_blocked_probes_turn_after_two_still_back_ups_and_a_slipping_turn_is_that_way_blocked",
         # A step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, drive-off cut mid-turn)
         "budget_drive_off_turn_at_40_deg_s_completes_and_drives_off",
         "budget_slow_but_progressing_turn_is_never_cut_by_the_step_budget",
@@ -311,6 +313,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "turn_rate_learns_only_from_completed_turns",
         # A blocked side: the retry and later turns go the other way (live 2026-09-25)
         "blocked_side_backs_up_then_turns_the_other_way_and_drives_off",
+        "blocked_side_waits_3_s_after_the_back_up_before_trying_the_other_way",
         "blocked_side_escape_turns_go_the_unblocked_way_even_the_long_way_round",
         "blocked_turn_back_up_default_is_about_2_s",
         # Signed wheel counters (live 2026-09-25: reverse counts down, from 0 at power-up)
@@ -516,6 +519,17 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         # Robot 2026-10-01: only a call may open a faceless meeting; a cue's needs a usable face.
         "cue_weak_then_a_person_box_with_no_face_is_not_met_and_nothing_is_said",
         "cue_weak_then_a_usable_face_meets_and_converses",
+        # The lean-in cooldown (robot 2026-10-01 15:12-15:17: 15 lean-ins in 5 min under a desk)
+        "leanin_weak_cues_every_20_s_for_5_min_nobody_found_at_most_5_lean_ins_and_roams_between",
+        "leanin_a_call_during_the_cooldown_is_answered_at_once",
+        "leanin_at_most_one_per_30_s_even_after_a_meeting",
+        "leanin_never_interrupts_a_seek",
+        "leanin_never_interrupts_the_recover_wait",
+        "leanin_never_interrupts_an_escape_or_the_ladder",
+        # Boxed in: leave the way he came (robot 2026-10-01: minutes under a desk)
+        "boxed_in_three_cpl_refusals_in_60_s_leaves_the_way_he_came",
+        "boxed_in_a_refused_retrace_falls_back_to_the_escape_ladder",
+        "boxed_in_steer_reading_open_under_0_1_three_times_leaves_the_way_he_came",
         "call_wake_word_with_no_face_still_opens_with_the_crouch_opener",
         # The caller talks while he looks for them (owner 2026-09-30): the conversation opens at once
         "call_caller_talking_during_the_search_opens_the_conversation_before_the_search_ends",

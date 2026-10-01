@@ -211,6 +211,32 @@ final class ExploreTuning {
      */
     final long cueHoldMs;
     final long leanInMs;
+    /**
+     * The lean-in cooldown (robot 2026-10-01 15:12-15:17: under a desk while the owner
+     * talked nearby, 15 lean-ins in 5 minutes, each interrupting the escape or leg he was
+     * on). A lean-in (a weak cue, or a strong one that is not a call) that ends with no
+     * meeting (nobody facing him, no usable face, a dropped meeting) ignores voices that
+     * are not calls for leanInCooldownMs; and lean-ins start at most one per
+     * leanInMinGapMs, after a meeting too. Calls are never ignored. 0: off.
+     */
+    final long leanInCooldownMs;
+    final long leanInMinGapMs;
+    /**
+     * Boxed in (robot 2026-10-01: minutes under a desk, turns working, forward refused):
+     * boxedInRefusals or more forward refusals by the controller (CPL hiccups and CPL
+     * hazards) within boxedInWindowMs, or boxedInOpenDecisions leg decisions in a row
+     * whose steer reads open at most boxedInOpen. He then leaves the way he came: faces
+     * the reverse of his last clean forward leg and drives it back (the escape ladder's
+     * retrace move; refused, the ladder goes on). Once out, the view there counts as
+     * where a seek went, and the novelty steer reads 0 within boxedAvoidDeg of the way
+     * back in for boxedAvoidMs. boxedInRefusals 0: off.
+     */
+    final int boxedInRefusals;
+    final long boxedInWindowMs;
+    final double boxedInOpen;
+    final int boxedInOpenDecisions;
+    final long boxedAvoidMs;
+    final double boxedAvoidDeg;
     final float newcomerAngleDeg;
     final float cueStopBandDeg;
     final int strongCueLooks;
@@ -281,13 +307,15 @@ final class ExploreTuning {
      * against the seat, every wheel wedged): in one escape, a back-up that moved under
      * stallMinCounts and measured turns both ways that turned under jamTurnDeg. He stops
      * pushing at once (repeated stalled pushing latches the motor board), says the help
-     * line at most every jamHelpEveryMs, rests jammedRestMs, then tries one short back-up
-     * of jamProbeTicks back ticks; it moving frees him, else he rests again. Moved from
+     * line at most every jamHelpEveryMs, rests, then tries one short back-up of
+     * jamProbeTicks back ticks; it moving frees him, else he rests again. The back-ups come
+     * at each of jamProbeAtMs after he was found jammed, then every jammedRestMs. Moved from
      * outside while resting (jamMovedCounts wheel counts, or jamMovedDeg of heading), he
      * probes at once. jamTurnDeg 0: off (the escape ladder and its rests, as before).
      */
     final double jamTurnDeg;
     final long jammedRestMs;
+    final long[] jamProbeAtMs;
     final long jamHelpEveryMs;
     final int jamProbeTicks;
     final long jamMovedCounts;
@@ -319,7 +347,7 @@ final class ExploreTuning {
      * he stops and waits, probing with one short turn (stallRecoverProbeMs) at each of
      * stallRecoverProbesMs after the stall. A probe that moves stallMinCounts wheel counts
      * (both wheels) or stallRecoverProbeDeg of heading: the board is back, and the normal
-     * escape runs. None by the last: a real jam (the wriggle, then the help line). Once per
+     * escape runs (see stallRecoverProbeBackTicks for which probes back up). None by the last: a real jam (the wriggle, then the help line). Once per
      * stuck spell (until he drives off cleanly or is freed). Empty: off. The probe turns in
      * place: a wedged wheel still counts when the board is alive (the 14:34 spin: ~100
      * counts per 0.5 s), and a turn can't back him blind into what stopped the back-up.
@@ -327,6 +355,22 @@ final class ExploreTuning {
     final long[] stallRecoverProbesMs;
     final long stallRecoverProbeMs;
     final double stallRecoverProbeDeg;
+    /**
+     * Robot 2026-10-01 15:19, owner: under the desk "all he has to do is back up". A probe
+     * is a short back-up of stallRecoverProbeBackTicks back ticks (the way he came in is
+     * usually clear; stallMinCounts wheel counts: the board is back). Only after two in a
+     * row moved nothing is a probe the short turn. A turn probe whose wheels move but whose
+     * heading does not (109 counts, 0 deg live) hit a desk leg: that way is blocked, and
+     * the probes left back up again. Without encoders every probe turns, as before.
+     */
+    final int stallRecoverProbeBackTicks;
+    /**
+     * After a blocked turn's short back-up, he waits this long before trying the other way
+     * (robot 15:19: a blocked turn is a fresh stall and re-arms the board's cutout, so the
+     * move straight after it reads nothing). Also before the ladder's turn after its first
+     * back-up when a turn was what wedged him. 0: no wait.
+     */
+    final long blockedTurnWaitMs;
     final long stallRecoverWindowMs;
     final float callPersonMinHeight;
     /**
@@ -797,6 +841,14 @@ final class ExploreTuning {
         listenMarginMs = b.listenMarginMs;
         cueHoldMs = Math.max(0, b.cueHoldMs);
         leanInMs = Math.max(0, b.leanInMs);
+        leanInCooldownMs = Math.max(0, b.leanInCooldownMs);
+        leanInMinGapMs = Math.max(0, b.leanInMinGapMs);
+        boxedInRefusals = Math.max(0, b.boxedInRefusals);
+        boxedInWindowMs = Math.max(0, b.boxedInWindowMs);
+        boxedInOpen = b.boxedInOpen;
+        boxedInOpenDecisions = Math.max(0, b.boxedInOpenDecisions);
+        boxedAvoidMs = Math.max(0, b.boxedAvoidMs);
+        boxedAvoidDeg = Math.max(0, b.boxedAvoidDeg);
         newcomerAngleDeg = Math.max(0f, b.newcomerAngleDeg);
         cueStopBandDeg = Math.max(0f, b.cueStopBandDeg);
         strongCueLooks = Math.max(1, b.strongCueLooks);
@@ -829,6 +881,9 @@ final class ExploreTuning {
         stallRecoverProbesMs = positiveSorted(b.stallRecoverProbesMs);
         stallRecoverProbeMs = Math.max(50, b.stallRecoverProbeMs);
         stallRecoverProbeDeg = Math.max(1, b.stallRecoverProbeDeg);
+        stallRecoverProbeBackTicks = Math.max(0, b.stallRecoverProbeBackTicks);
+        blockedTurnWaitMs = Math.max(0, b.blockedTurnWaitMs);
+        jamProbeAtMs = positiveSorted(b.jamProbeAtMs);
         stallRecoverWindowMs = Math.max(0, b.stallRecoverWindowMs);
         callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
         callPersonMinScore = Math.max(0f, b.callPersonMinScore);
@@ -1138,6 +1193,17 @@ final class ExploreTuning {
         // a strong cue gets three looks and a weak cue two.
         private long cueHoldMs = 10000;
         private long leanInMs = 4000;
+        // Robot 2026-10-01: a voice every ~20 s restarted a lean-in each time; a minute's quiet after one that
+        // found nobody, and never more than one per 30 s.
+        private long leanInCooldownMs = 60000;
+        private long leanInMinGapMs = 30000;
+        // Robot 2026-10-01 15:12-15:17: 8 refusals in 5 min, steer "open 0.00"/"turn only" for most decisions.
+        private int boxedInRefusals = 3;
+        private long boxedInWindowMs = 60000;
+        private double boxedInOpen = 0.1;
+        private int boxedInOpenDecisions = 3;
+        private long boxedAvoidMs = 60000;
+        private double boxedAvoidDeg = 45;
         private float newcomerAngleDeg = 45f;
         private float cueStopBandDeg = 10f;
         private int strongCueLooks = 3;
@@ -1193,6 +1259,12 @@ final class ExploreTuning {
         // Half a second of turning: ~100 counts on a live board, too little to push a latched one.
         private long stallRecoverProbeMs = 500;
         private double stallRecoverProbeDeg = 5;
+        // Two back ticks: about 50 counts a wheel on a live board, a few cm back the way he came.
+        private int stallRecoverProbeBackTicks = 2;
+        // About half the 6 s cutout a blocked turn re-arms, after the back-up's own time.
+        private long blockedTurnWaitMs = 3000;
+        // Robot 15:19: probing only at 120 s left him stuck for minutes after the cutout cleared.
+        private long[] jamProbeAtMs = {30000, 60000, 120000};
         // Just past the longest cutout seen (29 s).
         private long stallRecoverWindowMs = 30000;
         private float callPersonMinHeight = 0.12f;
@@ -1512,6 +1584,21 @@ final class ExploreTuning {
         }
         Builder peopleCooldownMs(long v) { peopleCooldownMs = v; return this; }
         Builder phantomPersonCooldownMs(long v) { phantomPersonCooldownMs = v; return this; }
+        Builder leanInCooldown(long cooldownMs, long minGapMs) {
+            leanInCooldownMs = cooldownMs;
+            leanInMinGapMs = minGapMs;
+            return this;
+        }
+        Builder boxedIn(int refusals, long windowMs, double open, int openDecisions) {
+            boxedInRefusals = refusals;
+            boxedInWindowMs = windowMs;
+            boxedInOpen = open;
+            boxedInOpenDecisions = openDecisions;
+            return this;
+        }
+        Builder boxedAvoid(long ms, double deg) { boxedAvoidMs = ms; boxedAvoidDeg = deg; return this; }
+        /** Never boxed in: the refusals and closed steer readings run as before 2026-10-01. */
+        Builder boxedInOff() { boxedInRefusals = 0; boxedInOpenDecisions = 0; return this; }
         Builder callSeenRetargetsMax(int v) { callSeenRetargetsMax = v; return this; }
         Builder callBlockedTurns(int max, double deg) { callBlockedTurnsMax = max; callBlockedTurnDeg = deg; return this; }
         Builder jam(double turnDeg, long restMs, long helpEveryMs, int probeTicks) {
@@ -1542,6 +1629,10 @@ final class ExploreTuning {
             return this;
         }
         Builder stallRecoverWindowMs(long v) { stallRecoverWindowMs = v; return this; }
+        Builder stallRecoverProbeBackTicks(int v) { stallRecoverProbeBackTicks = v; return this; }
+        Builder blockedTurnWaitMs(long v) { blockedTurnWaitMs = v; return this; }
+        /** The jammed rest's probe times, in ms after he was found jammed; then every jammedRestMs. */
+        Builder jamProbeAt(long... ms) { jamProbeAtMs = ms.clone(); return this; }
         /** No recovery wait: the escape runs at once after a stall, as before 2026-10-01's cutouts. */
         Builder stallRecoverOff() { stallRecoverProbesMs = new long[0]; return this; }
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
