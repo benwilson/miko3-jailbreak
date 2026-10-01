@@ -86,6 +86,11 @@ final class ExploreCamera implements ExploreBrain.Camera {
     /** Spike (2026-09-30): log.tag.MikoExploreHwFace=DEBUG turns on the camera's own
      * face detection (SIMPLE) and logs the faces it reports, twice a second at most. */
     static final String HW_FACE_TAG = "MikoExploreHwFace";
+    /** log.tag.MikoExploreStages=DEBUG adds a "look stages: ..." line after each
+     * "look in N ms" (detector speed plan): JPEG decode, preprocess, run, output
+     * copy and detection decode. (A non-default provider or model is logged once,
+     * by OnnxRecognizer, when it loads.) */
+    static final String STAGES_TAG = "MikoExploreStages";
     private Rect activeArray;
     private long hwFaceLoggedMs;
     static final String LAST_NAV = "last-nav.jpg";
@@ -609,15 +614,22 @@ final class ExploreCamera implements ExploreBrain.Camera {
                     if (recognizer == null || gen != generation) {
                         return;
                     }
+                    long d0 = System.nanoTime();
                     Bitmap frame = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, decode);
                     if (frame == null) {
                         return;
                     }
+                    long decodeNs = System.nanoTime() - d0;
                     decode.inBitmap = frame;
                     long t0 = clock.nowMs();
                     List<Detection> found = recognizer.detect(frame);
                     if (gen == generation) {
                         Log.i(TAG, "look in " + (clock.nowMs() - t0) + " ms: " + found);
+                        DetectorStages stages = recognizer.stages();
+                        if (stages != null && Log.isLoggable(STAGES_TAG, Log.DEBUG)) {
+                            stages.set(DetectorStages.DECODE, decodeNs);
+                            Log.i(TAG, "look stages: " + stages.line());
+                        }
                         long s0 = clock.nowMs();
                         Openness.Profile profile = scoreOpenness(jpeg, found, frameMs, teachable);
                         Log.i(TAG, "openness in " + (clock.nowMs() - s0) + " ms");

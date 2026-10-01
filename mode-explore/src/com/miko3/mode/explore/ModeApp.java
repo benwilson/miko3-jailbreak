@@ -52,6 +52,8 @@ public class ModeApp extends Application {
     private ExploreLoop loop;
     private ClipPlayer clips;
     private ExploreCamera camera;
+    /** Set instead of the wander while the detector bench runs (debug.miko3.explore.bench). */
+    private DetectorBench bench;
     // Claude, the launcher's voice, ears and people store at curiosity stops (explore on Claude U6).
     private ClaudeCuriosity curiosity;
     // The launcher's continuous ears as the brain's step input (meeting plan U7, KTD1).
@@ -146,6 +148,15 @@ public class ModeApp extends Application {
             }
             exploring = true;
             setExploreState(ExploreState.of(ExploreState.EYES_ONLY));
+            if (DetectorBench.requested()) {
+                // Detector speed plan: time the detector on bundled or pushed frames and
+                // nothing else. No camera (repeated opens wedged its HAL), no driver, no
+                // lease, no brain; scripts/qa-detector-bench.py clears the property after.
+                Log.i(TAG, "detector bench requested -- no camera, no driving this run");
+                bench = new DetectorBench(this);
+                bench.start();
+                return;
+            }
             ExploreTuning.Calibration calibration =
                     ExploreCalibration.read(new File(getFilesDir(), ExploreCalibration.FILE_NAME));
             Log.i(TAG, calibration == null
@@ -209,6 +220,13 @@ public class ModeApp extends Application {
                 return;
             }
             exploring = false;
+            if (bench != null) {
+                bench.cancel();
+                bench = null;
+                setExploreState(ExploreState.IDLE_STATE);
+                Log.i(TAG, "detector bench stopped");
+                return;
+            }
             loop.stop();
             drive.setReadingListener(null);
             ears.release();
