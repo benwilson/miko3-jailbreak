@@ -91,6 +91,12 @@ final class ExploreCamera implements ExploreBrain.Camera {
      * copy and detection decode. (A non-default provider or model is logged once,
      * by OnnxRecognizer, when it loads.) */
     static final String STAGES_TAG = "MikoExploreStages";
+    /** Camera calibration (scripts/calibrate-camera-fov.py): log.tag.MikoExploreFrames=DEBUG
+     * saves each decoded look's JPEG, unchanged, to files/frames/frame-<wall ms>.jpg
+     * (wall clock at frame arrival), the newest FRAME_RING_SIZE kept. Private files only. */
+    static final String FRAMES_TAG = "MikoExploreFrames";
+    private static final int FRAME_RING_SIZE = 400;
+    private FrameRing frameRing;
     private Rect activeArray;
     private long hwFaceLoggedMs;
     static final String LAST_NAV = "last-nav.jpg";
@@ -583,10 +589,11 @@ final class ExploreCamera implements ExploreBrain.Camera {
                     return;
                 }
                 ByteBuffer buf = image.getPlanes()[0].getBuffer();
+                long wallMs = System.currentTimeMillis();
                 byte[] jpeg = new byte[buf.remaining()];
                 buf.get(jpeg);
                 busy = true;
-                recognize(jpeg, clock.nowMs(), generation, floorClear);
+                recognize(jpeg, clock.nowMs(), wallMs, generation, floorClear);
             } finally {
                 image.close();
             }
@@ -595,7 +602,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     // ---- detect thread ----
 
-    private void recognize(final byte[] jpeg, final long frameMs, final int gen, final boolean teachable) {
+    private void recognize(final byte[] jpeg, final long frameMs, final long wallMs, final int gen,
+                           final boolean teachable) {
         detectHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -621,6 +629,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
                     }
                     long decodeNs = System.nanoTime() - d0;
                     decode.inBitmap = frame;
+                    saveFrame(wallMs, jpeg);
                     long t0 = clock.nowMs();
                     List<Detection> found = recognizer.detect(frame);
                     if (gen == generation) {
@@ -723,6 +732,21 @@ final class ExploreCamera implements ExploreBrain.Camera {
             }
         }
         return new Openness.Frame(out, hw, hh, 0f, 1f);
+    }
+
+    /** Detect thread: the calibration frame ring (FRAMES_TAG), off unless the tag is DEBUG. */
+    private void saveFrame(long wallMs, byte[] jpeg) {
+        if (!Log.isLoggable(FRAMES_TAG, Log.DEBUG)) {
+            return;
+        }
+        if (frameRing == null) {
+            frameRing = new FrameRing(new File(context.getFilesDir(), "frames"), FRAME_RING_SIZE);
+        }
+        try {
+            frameRing.save(wallMs, jpeg);
+        } catch (IOException e) {
+            Log.w(FRAMES_TAG, "could not save frame: " + e.getMessage());
+        }
     }
 
     /** The owner's gate check (NAV_DEBUG_TAG): the look and its numbers, private files only. */

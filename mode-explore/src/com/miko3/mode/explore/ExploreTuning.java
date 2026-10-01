@@ -1095,9 +1095,11 @@ final class ExploreTuning {
         private double stallTurnStepDeg = 60;
         private double escapeSweepDeg = 360;
         private double scanTurnDeg = 40;
-        // Not measured on this camera: "right third" of the frame is about 20 deg
-        // right (explore nav plan U6), i.e. a 60 deg view.
-        private double cameraHalfFovDeg = 30;
+        // Measured on the robot (2026-10-01, scripts/calibrate-camera-fov.py, 6 turn
+        // pairs): a 62.6 deg horizontal view, focal length about 526 px on the 640 px
+        // frame, with the camera pitched up about 18 deg. Half of 62.6; the linear
+        // centerX x halfFov mapping is within about 2 deg of the exact bearing.
+        private double cameraHalfFovDeg = 31.3;
         private int legsMax = 16;
         private Navigation navigation = Navigation.CONTINUOUS;
         // A live look takes ~0.6 s and up to ~2.5 s; older than this he has moved on.

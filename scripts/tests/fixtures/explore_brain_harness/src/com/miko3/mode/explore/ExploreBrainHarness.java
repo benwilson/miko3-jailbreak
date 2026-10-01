@@ -7780,7 +7780,8 @@ public final class ExploreBrainHarness {
                     "ask=" + ask + " cap=" + cap + " notes=" + notes);
         });
         scenario("roam_steer_doorway_weights_open_bands_and_turns_to_face_one_out_of_view", n -> {
-            RoamSteer steer = new RoamSteer(doorTuning().build());
+            ExploreTuning doorT = doorTuning().build();
+            RoamSteer steer = new RoamSteer(doorT);
             Openness.Profile open = prof(0.9f, 0.9f, 0.9f, 0.9f);
             RoamSteer.Plan plain = steer.plan(open);
             RoamSteer.Plan right = steer.plan(open, -20);
@@ -7792,7 +7793,7 @@ public final class ExploreBrainHarness {
             boolean openFaced = steer.doorwayReadsBlocked(open, 5);
             boolean notFaced = steer.doorwayReadsBlocked(prof(0.9f, 0.9f, 0.1f, 0.9f), 25);
             check(n, plain.side == RoamSteer.STRAIGHT && !plain.towardDoorway
-                            && right.side == RoamSteer.RIGHT && Math.abs(right.bendDeg - 18.75) < 0.01 && right.towardDoorway
+                            && right.side == RoamSteer.RIGHT && Math.abs(right.bendDeg - 0.625 * doorT.cameraHalfFovDeg) < 0.01 && right.towardDoorway
                             && !right.turnOnly && behind.side == RoamSteer.LEFT && behind.turnOnly
                             && Math.abs(behind.bendDeg - 90) < 0.01
                             && intoClosed.side != RoamSteer.RIGHT && !intoClosed.towardDoorway
