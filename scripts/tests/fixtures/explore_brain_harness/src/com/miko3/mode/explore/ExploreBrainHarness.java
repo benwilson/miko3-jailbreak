@@ -4189,16 +4189,17 @@ public final class ExploreBrainHarness {
                     rig.tail());
         });
         scenario("claude_repeat_of_a_recent_thing_is_nothing", n -> {
-            // Live: the same potted plant twice in a row.
+            // Live: the same potted plant twice in a row. With no fresh line it is as good as nothing
+            // (a fresh line is said: claude_familiar_pick_with_a_fresh_line_is_said).
             Rig rig = new Rig(claudeTuning().build(), CLEAR, (r, t) -> list(), true,
                     (r, req, nth) -> nth == 1
                             ? pick(2, "potted plant", CuriosityPort.Kind.OTHER, "Look at that plant!",
                                     0.5f, 0.5f, 0.2f, 0.3f)
-                            : pick(1, "plant", CuriosityPort.Kind.OTHER, "A plant again!", 0.5f, 0.5f, 0.2f, 0.3f))
+                            : pick(1, "plant", CuriosityPort.Kind.OTHER, "", 0.5f, 0.5f, 0.2f, 0.3f))
                     .started();
             rig.runUntil(20000);
             int second = rig.first("answer PICK", rig.first("answer PICK", 0) + 1);
-            check(n, rig.count("say Look at that plant!") == 1 && rig.countPrefix("say A plant again!", 0, 20001) == 0
+            check(n, rig.count("say Look at that plant!") == 1 && rig.countPrefix("say ", 0, 20001) == 1
                             && second > 0 && rig.firstMotionAfter(rig.timeOf(second)) > 0
                             && rig.violations.isEmpty(),
                     "second=" + second + " " + rig.tail());
@@ -4232,7 +4233,10 @@ public final class ExploreBrainHarness {
             recent.add(new CuriosityPort.Recent("potted plant", CuriosityPort.Kind.OTHER, 30000));
             String p = ExplorePrompts.lookAsk(new CuriosityPort.LookRequest(
                     new ArrayList<CuriosityPort.Frame>(), recent, false));
-            check(n, p.contains("potted plant") && p.contains("Do not pick anything on this list"), p);
+            // Robot 2026-10-01: a hard "do not pick" plus "or answer interesting false" left a familiar
+            // office silent; familiar things are now preferred against, with a fresh line if picked.
+            check(n, p.contains("potted plant") && p.contains("Prefer something new over anything on this list")
+                            && !p.contains("Do not pick anything on this list"), p);
         });
         scenario("claude_camera_closed_at_speak_entry_on_every_path", n -> {
             Rig approach = new Rig(claudeTuning().build(), CLEAR, cupIn(2), true, MUG_ON_THE_CUP).started();
@@ -4300,7 +4304,8 @@ public final class ExploreBrainHarness {
                             case 3: case 4: return CuriosityPort.Answer.failed();
                             case 5: return pick(2, "person", CuriosityPort.Kind.PERSON, "Hi!", 0.5f, 0.5f, 0.4f, 0.8f);
                             case 6: return pick(1, "cat", CuriosityPort.Kind.ANIMAL, "A kitty!", 0.5f, 0.5f, 0.3f, 0.3f);
-                            default: return pick(0, "lamp", CuriosityPort.Kind.OTHER, "The lamp again!",
+                            // A repeat with the line he has said already: as good as nothing.
+                            default: return pick(0, "lamp", CuriosityPort.Kind.OTHER, "What a shiny lamp!",
                                     0.5f, 0.5f, 0.2f, 0.3f);
                         }
                     }).started();
@@ -11444,6 +11449,26 @@ public final class ExploreBrainHarness {
         return rig;
     }
 
+    /** A familiar office (robot 2026-10-01): Claude keeps picking the same few things, each time with a new line. */
+    private static final String[] FAMILIAR_THINGS = {"plant", "refrigerator", "gaming console"};
+
+    private static final Claude PICKS_THE_SAME_FEW = (r, req, nth) -> {
+        String thing = FAMILIAR_THINGS[(nth - 1) % FAMILIAR_THINGS.length];
+        return pick(0, thing, CuriosityPort.Kind.OTHER, "Thought " + nth + " about that " + thing + ".",
+                0.5f, 0.5f, 0.2f, 0.3f);
+    };
+
+    /** The spoken lines in the log, in order. */
+    private static List<String> spoken(Rig rig) {
+        List<String> out = new ArrayList<String>();
+        for (Event e : rig.log) {
+            if (e.what.startsWith("say ")) {
+                out.add(e.what.substring(4));
+            }
+        }
+        return out;
+    }
+
     private static void remarkRateScenarios() {
         scenario("one_slow_look_retries_the_stop_soon_and_curiosity_stays_on", n -> {
             // The robot's own look budgets and back-off, with the camera dark in the first stop only.
@@ -11519,6 +11544,105 @@ public final class ExploreBrainHarness {
             check(n, said >= 12 && rig.counted(ExploreBrain.Gauges.Counter.REMARKS) == said
                             && ("remarks in the last 10 min: " + said).equals(lastRate) && rig.violations.isEmpty(),
                     "said=" + said + " counted=" + rig.counted(ExploreBrain.Gauges.Counter.REMARKS) + " lastRate=" + lastRate + " " + rig.tail());
+        });
+        scenario("remark_rate_familiar_room_at_least_12_remarks_in_10_min_none_repeated", n -> {
+            // Robot 2026-10-01: in a familiar office every pick was something he had reacted to, and the stop
+            // ended silently (2 remarks in 30 min). A familiar pick with a fresh line is now said.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = new Rig(new ExploreTuning.Builder().calibration(calibration()).build(), CLEAR, EMPTY_ROOM, true,
+                    PICKS_THE_SAME_FEW);
+            rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+            rig.started();
+            rig.runUntil(600000);
+            List<String> lines = spoken(rig);
+            int said = rig.countPrefix("say ", 0, 600001);
+            boolean unique = new java.util.HashSet<String>(lines).size() == lines.size();
+            System.out.println("REPORT remark rate, default tuning, a familiar room, 10 simulated min: " + said
+                    + " remarks, " + entries(rig, ExploreBrain.State.SCAN).size() + " stops, unique=" + unique);
+            check(n, said >= 12 && unique && rig.violations.isEmpty(),
+                    "said=" + said + " unique=" + unique + " lines=" + lines + " " + rig.tail());
+        });
+        scenario("claude_familiar_pick_with_a_fresh_line_is_said", n -> {
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, EMPTY_ROOM, true,
+                    (r, req, nth) -> pick(0, nth == 1 ? "potted plant" : "plant", CuriosityPort.Kind.OTHER,
+                            nth == 1 ? "What a lovely plant!" : "That plant has grown since this morning, take " + nth + ".",
+                            0.5f, 0.5f, 0.2f, 0.3f));
+            List<String> notes = new ArrayList<String>();
+            rig.brain.setTrace(notes::add);
+            rig.started();
+            rig.runUntil(120000);
+            boolean silent = false;
+            for (String x : notes) {
+                silent |= x.contains("as good as nothing");
+            }
+            check(n, rig.count("say What a lovely plant!") == 1
+                            && rig.countPrefix("say That plant has grown since this morning, take ", 0, 120001) >= 1
+                            && !silent
+                            && rig.violations.isEmpty(),
+                    "asks=" + rig.asks.size() + " lines=" + spoken(rig) + " " + rig.tail());
+        });
+        scenario("claude_familiar_pick_with_no_line_or_a_repeated_line_is_as_good_as_nothing", n -> {
+            // No fresh line: the old ending, no remark. A line he has already said counts as no line.
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, EMPTY_ROOM, true,
+                    (r, req, nth) -> pick(0, "plant", CuriosityPort.Kind.OTHER,
+                            nth == 1 ? "What a lovely plant!" : nth % 2 == 0 ? "" : "What a lovely plant!",
+                            0.5f, 0.5f, 0.2f, 0.3f));
+            List<String> notes = new ArrayList<String>();
+            rig.brain.setTrace(notes::add);
+            rig.started();
+            rig.runUntil(150000);
+            int already = 0;
+            for (String x : notes) {
+                already += x.contains("reacted to that already") ? 1 : 0;
+            }
+            check(n, rig.asks.size() >= 3 && rig.countPrefix("say ", 0, 150001) == 1 && already >= 2
+                            && rig.violations.isEmpty(),
+                    "asks=" + rig.asks.size() + " already=" + already + " lines=" + spoken(rig) + " " + rig.tail());
+        });
+        scenario("claude_look_request_carries_what_he_reacted_to_and_said_but_no_person_or_name", n -> {
+            // A named person is met first, then things: the request lists things only, most recent first.
+            String[] things = {"lamp", "kettle", "radiator"};
+            Rig rig = new Rig(claudeTuning().build(), CLEAR, (r, t) -> list(), true,
+                    (r, req, nth) -> nth == 1
+                            ? pick(2, "man in a blue shirt", CuriosityPort.Kind.PERSON, "Hi!", 0.5f, 0.5f, 0.4f, 0.8f)
+                            : pick(0, things[(nth - 2) % things.length], CuriosityPort.Kind.OTHER,
+                            "Remark " + nth + " on the " + things[(nth - 2) % things.length] + ".",
+                            0.5f, 0.5f, 0.2f, 0.3f));
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah", "Hi {name}!", "Hi there, friend!");
+            rig.started();
+            rig.runUntil(240000);
+            CuriosityPort.LookRequest last = rig.asks.get(rig.asks.size() - 1);
+            boolean clean = true;
+            for (CuriosityPort.LookRequest q : rig.asks) {
+                String text = ExplorePrompts.lookAsk(q) + q.reacted + q.said;
+                clean &= !text.contains("Sarah") && !q.reacted.contains("man in a blue shirt")
+                        && !q.reacted.contains("person") && !q.said.contains("Hi Sarah!") && !q.said.contains("Hi!");
+            }
+            List<String> lines = spoken(rig);
+            // Most recent first, capped: the newest remark is about the newest thing reacted to.
+            boolean listed = rig.asks.size() >= 14 && last.reacted.size() == 3 && last.said.size() == 10
+                    && lines.contains(last.said.get(0)) && last.said.get(0).contains(last.reacted.get(0))
+                    && !last.said.get(0).equals(last.said.get(1));
+            check(n, rig.count("say Hi Sarah!") + rig.count("say Hi there, friend!") >= 1 && listed && clean
+                            && rig.violations.isEmpty(),
+                    "asks=" + rig.asks.size() + " reacted=" + last.reacted + " said=" + last.said + " lines=" + lines
+                            + " " + rig.tail());
+        });
+        scenario("prompt_lists_reacted_things_and_said_lines_and_asks_for_a_fresh_line", n -> {
+            List<String> reacted = new ArrayList<String>();
+            reacted.add("refrigerator");
+            reacted.add("potted plant");
+            List<String> said = new ArrayList<String>();
+            said.add("That fridge hums like it knows a secret.");
+            String p = ExplorePrompts.lookAsk(new CuriosityPort.LookRequest(new ArrayList<CuriosityPort.Frame>(),
+                    new ArrayList<CuriosityPort.Recent>(), false, reacted, said));
+            String q = ExplorePrompts.lookAsk(new CuriosityPort.LookRequest(new ArrayList<CuriosityPort.Frame>(),
+                    new ArrayList<CuriosityPort.Recent>(), false));
+            check(n, p.contains("refrigerator; potted plant") && p.contains("Prefer something not on this list")
+                            && p.contains("That fridge hums like it knows a secret.") && p.contains("never repeat")
+                            && p.contains("say something new about it") && !q.contains("Prefer something not on")
+                            && !q.contains("already said"),
+                    p);
         });
     }
 }

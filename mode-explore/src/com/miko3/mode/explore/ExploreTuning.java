@@ -179,6 +179,14 @@ final class ExploreTuning {
     final long heldLineFreshMs;
     final int recentPicksMax;
     /**
+     * Robot 2026-10-01 (a familiar office, 2 remarks in 30 min): the look request
+     * also carries the labels of the last reactedLabelsMax things he reacted to and
+     * his last saidLinesMax remarks about things, most recent first, so Claude can
+     * prefer something new and otherwise give a fresh line, never a repeat.
+     */
+    final int reactedLabelsMax;
+    final int saidLinesMax;
+    /**
      * Meeting a person (explore on Claude U5, KTD3, KTD4): the match request and
      * each later Claude request get meetTimeoutMs; he listens for up to listenMs
      * and waits listenMarginMs more for the launcher's answer before giving up.
@@ -675,6 +683,8 @@ final class ExploreTuning {
         quietWaitMs = Math.max(0, b.quietWaitMs);
         heldLineFreshMs = Math.max(0, b.heldLineFreshMs);
         recentPicksMax = Math.max(0, b.recentPicksMax);
+        reactedLabelsMax = Math.max(0, b.reactedLabelsMax);
+        saidLinesMax = Math.max(0, b.saidLinesMax);
         meetTimeoutMs = b.meetTimeoutMs;
         faceHoldMs = Math.max(0, b.faceHoldMs);
         listenMs = b.listenMs;
@@ -958,6 +968,8 @@ final class ExploreTuning {
         // Long enough for a startle, back-off and escape turn; stale after that.
         private long heldLineFreshMs = 30000;
         private int recentPicksMax = 8;
+        private int reactedLabelsMax = 20;
+        private int saidLinesMax = 10;
         // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
         private long meetTimeoutMs = 12000;
         // KTD11: the migration usually takes a few seconds; 30 s caps the wait for the first roam.
@@ -1290,6 +1302,8 @@ final class ExploreTuning {
         Builder quietWaitMs(long v) { quietWaitMs = v; return this; }
         Builder heldLineFreshMs(long v) { heldLineFreshMs = v; return this; }
         Builder recentPicksMax(int v) { recentPicksMax = v; return this; }
+        Builder reactedLabelsMax(int v) { reactedLabelsMax = v; return this; }
+        Builder saidLinesMax(int v) { saidLinesMax = v; return this; }
         Builder meet(long timeoutMs, long listenMs, long listenMarginMs) {
             meetTimeoutMs = timeoutMs;
             this.listenMs = listenMs;

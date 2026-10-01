@@ -56,15 +56,29 @@ final class ExplorePrompts {
                 sb.append(i == 0 ? "" : "; ").append(kindWord(r.kind)).append(' ').append(r.label)
                         .append(", ").append(Math.max(0, r.agoMs / 1000)).append(" s ago");
             }
-            sb.append(". Do not pick anything on this list again, nor the same kind of thing under another"
-                    + " name, unless it is a person or an animal: pick something new, or answer interesting false.");
+            sb.append(". Prefer something new over anything on this list, unless it is a person or an animal.");
+        }
+        if (!request.reacted.isEmpty()) {
+            sb.append(" Things he has already reacted to this session, most recent first: ")
+                    .append(join(request.reacted)).append(". Prefer something not on this list, nor the same kind of"
+                    + " thing under another name. If everything worth a look is familiar, pick one anyway and say"
+                    + " something new about it or the scene: a new angle, an opinion, a question to the room, or"
+                    + " what has changed.");
+        }
+        if (!request.said.isEmpty()) {
+            sb.append(" Lines he has already said this session, most recent first: ");
+            for (int i = 0; i < request.said.size(); i++) {
+                sb.append(i == 0 ? "" : " ").append('"').append(request.said.get(i)).append('"');
+            }
+            sb.append(". His line must be new: never repeat one of these or something close to it.");
         }
         if (request.livingCoolingDown) {
             sb.append(" He greeted a person or an animal a moment ago. Do not pick a person or an animal this"
                     + " time, even if one is in view: pick the most interesting other thing, or answer"
                     + " interesting false if there is none.");
         }
-        sb.append(" Answer with interesting false if nothing is worth a reaction (an empty wall, a floor). "
+        sb.append(" Answer with interesting false only if there is nothing at all to talk about (an empty wall,"
+                + " a floor); a familiar room still has something to say about it. "
                 + "Otherwise give the frame number it is in, its box in that frame's pixels as"
                 + " [left, top, right, bottom], its kind (person, animal, technology or other), a short label"
                 + " (\"cat\", \"laptop\", \"person\"), and the line Miko says: to a person, addressed to them;"
@@ -324,6 +338,14 @@ final class ExplorePrompts {
                     "closed_threads", arrayOf(type("string")),
                     "topics", arrayOf(type("string")),
                     "questions_asked", arrayOf(type("string"))));
+
+    private static String join(java.util.List<String> items) {
+        StringBuilder sb = new StringBuilder();
+        for (String item : items) {
+            sb.append(sb.length() == 0 ? "" : "; ").append(item);
+        }
+        return sb.toString();
+    }
 
     private static String kindWord(CuriosityPort.Kind k) {
         return k == null ? "thing" : k.name().toLowerCase(java.util.Locale.US);

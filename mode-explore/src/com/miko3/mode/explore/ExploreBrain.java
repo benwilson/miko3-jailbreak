@@ -660,6 +660,13 @@ final class ExploreBrain {
     private final ArrayDeque<Cue> cues = new ArrayDeque<Cue>();
     /** Names inspected this session (R9), and when the person/pet cool-down ends (R12). */
     private final Set<String> seen = new HashSet<String>();
+    /** The things in seen, most recent first, capped at reactedLabelsMax: labels only, never a person. */
+    private final ArrayDeque<String> reacted = new ArrayDeque<String>();
+    /** His remarks about things this session, most recent first, capped at saidLinesMax (for the look request). */
+    private final ArrayDeque<String> saidLines = new ArrayDeque<String>();
+    /** Every remark about a thing this session, normalised, so none is said twice (capped at SAID_EVER_MAX). */
+    private final Set<String> saidEver = new java.util.LinkedHashSet<String>();
+    private static final int SAID_EVER_MAX = 500;
     private long peopleIgnoredUntil;
     /**
      * This stop's person came from a roaming pick (approachPerson), not a call, a cue or
@@ -1960,6 +1967,7 @@ final class ExploreBrain {
         if (measured) {
             compass.startTurn(heading == Direction.LEFT ? Heading.LEFT : Heading.RIGHT,
                     escape && state == State.TURN ? Math.min(deg, tuning.escapeSweepDeg) : deg, now);
+            note("turn start: heading " + Math.round(compass.degrees()) + " deg, asking " + Math.round(deg) + " deg " + heading);
         }
     }
 
@@ -2374,7 +2382,7 @@ final class ExploreBrain {
                 if (Sighting.isPersonOrPet(target.label)) {
                     peopleIgnoredUntil = now + tuning.peopleCooldownMs;
                 } else {
-                    seen.add(target.label);
+                    markSeen(target.label);
                 }
                 remember(target.label, CuriosityPort.Kind.of(target.label), now);
             }
@@ -2653,8 +2661,8 @@ final class ExploreBrain {
         askDeadline = now + tuning.askTimeoutMs;
         boolean cooling = now < peopleIgnoredUntil;
         note("asking Claude (try " + askTries + " of " + tuning.askAttempts + ", " + askedFrames.size() + " frames)");
-        port.ask(new CuriosityPort.LookRequest(new ArrayList<CuriosityPort.Frame>(askedFrames), recent(now), cooling),
-                tuning.askTimeoutMs);
+        port.ask(new CuriosityPort.LookRequest(new ArrayList<CuriosityPort.Frame>(askedFrames), recent(now), cooling,
+                new ArrayList<String>(reacted), new ArrayList<String>(saidLines)), tuning.askTimeoutMs);
     }
 
     /** ASK, each tick: poll the answer; a failure or a missed deadline is another try, then the fallback (R7). */
@@ -2683,9 +2691,10 @@ final class ExploreBrain {
         }
     }
 
+    /** A line is needed, except for a familiar thing: that one is as good as nothing without a fresh line (onPick). */
     private boolean validPick(CuriosityPort.Answer a) {
         return a.frame >= 0 && a.frame < askedFrames.size() && a.box != null && a.kind != null
-                && usable(a.line);
+                && (usable(a.line) || (!a.kind.isLiving() && seenLoosely(a.box.label)));
     }
 
     private void retryOrFallback(long now) {
@@ -2718,9 +2727,21 @@ final class ExploreBrain {
             nothing(now, "greeted people and animals recently: as good as nothing, carrying on");
             return;
         }
-        if (!a.kind.isLiving() && seenLoosely(a.box.label)) {
-            nothing(now, "reacted to that already: as good as nothing, carrying on");
-            return;
+        if (!a.kind.isLiving()) {
+            // Robot 2026-10-01: in a familiar office nearly every pick was something he had reacted
+            // to, and those stops ended silently. A fresh line about it is said; no line, or one he
+            // has said before, is as good as nothing.
+            boolean fresh = usable(a.line) && !saidBefore(a.line);
+            if (seenLoosely(a.box.label)) {
+                if (!fresh) {
+                    nothing(now, "reacted to that already: as good as nothing, carrying on");
+                    return;
+                }
+                note("reacted to that already, but with a fresh line: saying it");
+            } else if (!fresh) {
+                nothing(now, "a line he has said already: as good as nothing, carrying on");
+                return;
+            }
         }
         takePick(now, a, false);
     }
@@ -2779,6 +2800,40 @@ final class ExploreBrain {
     private void nothing(long now, String why) {
         note(why);
         endCuriosity(now);
+    }
+
+    /** A thing he reacted to: into seen, and to the front of the request's reacted list. */
+    private void markSeen(String label) {
+        seen.add(label);
+        reacted.remove(label);
+        reacted.addFirst(label);
+        while (reacted.size() > tuning.reactedLabelsMax) {
+            reacted.pollLast();
+        }
+    }
+
+    /** A remark about a thing: to the front of the request's said list, and never to be said again. */
+    private void rememberSaid(String line) {
+        saidLines.remove(line);
+        saidLines.addFirst(line);
+        while (saidLines.size() > tuning.saidLinesMax) {
+            saidLines.pollLast();
+        }
+        saidEver.add(normalisedLine(line));
+        if (saidEver.size() > SAID_EVER_MAX) {
+            java.util.Iterator<String> it = saidEver.iterator();
+            it.next();
+            it.remove();
+        }
+    }
+
+    private boolean saidBefore(String line) {
+        return saidEver.contains(normalisedLine(line));
+    }
+
+    /** Lower case, letters and digits only, single spaces: "What a plant!" and "what a plant" are one line. */
+    private static String normalisedLine(String line) {
+        return line.toLowerCase(java.util.Locale.US).replaceAll("[^a-z0-9]+", " ").trim();
     }
 
     /** Whether a thing he reacted to this session (seen) loosely matches this label. */
@@ -3656,6 +3711,9 @@ final class ExploreBrain {
 
     /** SPEAK, for a stop's remark: counted once it is handed to the speech service (countRemark). */
     private void speakRemark(long now, String line) {
+        if (pick != null && pick.kind != null && !pick.kind.isLiving()) {
+            rememberSaid(line);
+        }
         queueLine(now, line, State.SPEAK);
         remarkQueued = true;
         lineStarted(now);
@@ -3730,7 +3788,7 @@ final class ExploreBrain {
                         + met.size() + " met recently)");
             }
         } else {
-            seen.add(pick.box.label);
+            markSeen(pick.box.label);
         }
         endCuriosity(now);
     }

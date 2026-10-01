@@ -552,6 +552,11 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "one_slow_look_retries_the_stop_soon_and_curiosity_stays_on",
         "two_slow_looks_in_a_row_turn_curiosity_off_for_30_s",
         "remark_rate_default_tuning_empty_room_at_least_12_remarks_in_10_min",
+        "remark_rate_familiar_room_at_least_12_remarks_in_10_min_none_repeated",
+        "claude_familiar_pick_with_a_fresh_line_is_said",
+        "claude_familiar_pick_with_no_line_or_a_repeated_line_is_as_good_as_nothing",
+        "claude_look_request_carries_what_he_reacted_to_and_said_but_no_person_or_name",
+        "prompt_lists_reacted_things_and_said_lines_and_asks_for_a_fresh_line",
     )
 
     @classmethod

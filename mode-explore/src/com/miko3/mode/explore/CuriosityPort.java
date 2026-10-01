@@ -565,17 +565,33 @@ interface CuriosityPort extends AnswerParser.Names {
         }
     }
 
-    /** The look request: the scan's frames in order, the recent picks, and whether people are cooling down. */
+    /**
+     * The look request: the scan's frames in order, the recent picks, whether people
+     * are cooling down, the things he has reacted to this session (labels of things
+     * only, most recent first: never a person, a name or notes) and his last remarks
+     * about things (most recent first), so a familiar room still gets a fresh line.
+     */
     final class LookRequest {
         final List<Frame> frames;
         final List<Recent> recent;
         /** People and animals were greeted within the cool-down: prefer anything else. */
         final boolean livingCoolingDown;
+        /** Labels of things (never people or animals) he has reacted to this session, most recent first. */
+        final List<String> reacted;
+        /** His remarks about things this session, most recent first: not to be repeated. */
+        final List<String> said;
 
         LookRequest(List<Frame> frames, List<Recent> recent, boolean livingCoolingDown) {
+            this(frames, recent, livingCoolingDown, Collections.<String>emptyList(), Collections.<String>emptyList());
+        }
+
+        LookRequest(List<Frame> frames, List<Recent> recent, boolean livingCoolingDown, List<String> reacted,
+                List<String> said) {
             this.frames = Collections.unmodifiableList(frames);
             this.recent = Collections.unmodifiableList(recent);
             this.livingCoolingDown = livingCoolingDown;
+            this.reacted = Collections.unmodifiableList(reacted);
+            this.said = Collections.unmodifiableList(said);
         }
     }
 
