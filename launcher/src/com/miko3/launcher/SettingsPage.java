@@ -486,7 +486,10 @@ final class SettingsPage {
 
     private static String save(Map<String, String> form, ClaudeSettings settings) {
         try {
-            settings.save(form.get("base_url"), form.get("key"), form.get("model"));
+            // A model picked from the list wins; the default entry ("") keeps the typed name.
+            String pick = form.get("model_pick");
+            String model = pick != null && !pick.trim().isEmpty() ? pick.trim() : form.get("model");
+            settings.save(form.get("base_url"), form.get("key"), model);
         } catch (ClaudeSettings.InvalidException e) {
             // Fixed text by contract (ClaudeSettings), never what was typed.
             return "Not saved: " + e.getMessage();
@@ -591,21 +594,28 @@ final class SettingsPage {
         html.append("<input type=\"password\" id=\"key\" name=\"key\" autocomplete=\"off\" "
                 + "autocapitalize=\"off\" spellcheck=\"false\">");
         html.append("<small>Leave empty to keep the saved key.</small></label>");
+        // A plain select, not a datalist: a datalist only suggests entries matching the
+        // text already in the box (the current model), so it showed nothing (owner, 2026-10-01).
+        if (!models.isEmpty()) {
+            html.append("<label for=\"model_pick\">Pick a model");
+            html.append("<select id=\"model_pick\" name=\"model_pick\">");
+            html.append("<option value=\"\" selected>Use the name typed below</option>");
+            for (String id : models) {
+                html.append("<option value=\"").append(escapeHtml(id)).append("\">").append(escapeHtml(id))
+                        .append(id.equals(st.model) ? " (current)" : "").append("</option>");
+            }
+            html.append("</select></label>");
+        }
         html.append("<label for=\"model\">Model");
-        html.append("<input type=\"text\" id=\"model\" name=\"model\" list=\"claude-models\" value=\"")
+        html.append("<input type=\"text\" id=\"model\" name=\"model\" value=\"")
                 .append(escapeHtml(st.model))
                 .append("\" autocomplete=\"off\" autocapitalize=\"off\" spellcheck=\"false\">");
-        html.append("<datalist id=\"claude-models\">");
-        for (String id : models) {
-            html.append("<option value=\"").append(escapeHtml(id)).append("\">");
-        }
-        html.append("</datalist>");
         if (!models.isEmpty() && !st.model.isEmpty() && !models.contains(st.model)) {
             // KTD5: kept, since the endpoint's list may be incomplete.
             html.append("<small id=\"model-unlisted\">").append(escapeHtml(st.model))
                     .append(" is not listed by endpoint.</small>");
         } else {
-            html.append("<small>Pick from the list after Refresh models, or type a model name.</small>");
+            html.append("<small>Pick from the list above after Refresh models, or type a model name.</small>");
         }
         html.append("</label>");
         html.append("<button type=\"submit\">Save</button>");

@@ -603,6 +603,22 @@ public final class SettingsPageHarness {
             }
         });
 
+        // The model picked from the list wins over the typed box; an empty pick keeps the typed name.
+        scenario("save_picked_model_wins_and_an_empty_pick_keeps_the_typed_name", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = withKey();
+                String base = "t=" + token(f) + "&base_url=" + enc(ClaudeSettings.DEFAULT_BASE_URL + "/v1/") + "&key=";
+                request(f, "POST", "/settings/claude", "", base + "&model=" + enc("claude-a") + "&model_pick="
+                        + enc("claude-b"));
+                String picked = f.settings.credentialsForRequests().model;
+                request(f, "POST", "/settings/claude", "", "t=" + token(f) + "&base_url="
+                        + enc(ClaudeSettings.DEFAULT_BASE_URL + "/v1/") + "&key=&model=" + enc("claude-c")
+                        + "&model_pick=");
+                String typed = f.settings.credentialsForRequests().model;
+                check(n, "claude-b".equals(picked) && "claude-c".equals(typed), "picked=" + picked + " typed=" + typed);
+            }
+        });
+
         // AE2: a blank key keeps the stored one; the model updates.
         scenario("save_blank_key_keeps_key_and_updates_model", new Scenario() {
             public void run(String n) throws Exception {
@@ -716,8 +732,10 @@ public final class SettingsPageHarness {
                 Resp r = action(f, "/settings/claude/models");
                 String html = get(f);
                 check(n, Arrays.asList("claude-a", "claude-b").equals(f.settings.models())
-                                && html.contains("<datalist") && html.contains("<option value=\"claude-a\">")
-                                && html.contains("<option value=\"claude-b\">")
+                                && html.contains("<select id=\"model_pick\"")
+                                && html.contains("<option value=\"claude-a\">claude-a")
+                                && html.contains("<option value=\"claude-b\">claude-b")
+                                && !html.contains("<datalist")
                                 && r.status().contains("2"),
                         "status=" + r.status() + " models=" + f.settings.models());
             }

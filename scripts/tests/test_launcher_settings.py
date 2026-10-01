@@ -389,6 +389,7 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "oversized_form_rejected",
         "get_on_action_paths_refused",
         "refresh_stores_ids_and_page_suggests_them",
+        "save_picked_model_wins_and_an_empty_pick_keeps_the_typed_name",
         "refresh_uses_saved_credentials",
         "saved_model_missing_from_list_marked",
         "refresh_failure_shows_reason_and_keeps_model",
