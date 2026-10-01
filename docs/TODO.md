@@ -63,6 +63,17 @@ Everything below that needs the robot is sequenced into one session in `docs/rob
   - Make Camera2 callbacks in `ExploreCamera` ignore a stale open (per-open generation).
   - Add harness scenarios for the approach give-up, the mid-approach re-centre, the face-turn cap, and a scan that ends with nothing seen.
 
+- [ ] **Camera pipeline redesign (owner, 2026-09-30).** The YOLOE detector took 1.4–4.8 s a frame on the robot (budget 1 s) while speech recognition was running. Plan, as its own change:
+  - a fast face path: the camera's own face detection (Camera2 SIMPLE is reported available, up to 15 faces; spike behind `log.tag.MikoExploreHwFace`) or the bundled YuNet;
+  - the heavy detector only for curiosity;
+  - the camera kept open for the whole session (reopens wedge the vendor HAL).
+- [ ] **He comments less: lean-ins on every voice.** Any speech triggers a lean-in that drops the stop's pick, with no cooldown (5 a minute seen on 2026-09-30). Also "camera gave no look in time" turns curiosity off for 120 s. Fix:
+  - a lean-in cooldown;
+  - never drop a committed pick;
+  - retry a slow look once.
+- [ ] **A call's words never reach the brain.** `Ears.Cue` has no text, and a "Hey Miko …" said during CHAT_LISTEN arrives as a wake word, not as words. `ChatSession` resets its unanswered-listen count only on heard words. Needs EarsAdapter/launcher and ChatSession changes.
+- [ ] **Robot-test the 2026-09-30 call fixes** (side-first search, fresh frames from turn stop, talking during the search). They are host-tested only: the camera HAL wedged before the test.
+
 ## Remote-control mode
 
 - [ ] Confirm it still drives forward after the shared `DirectMotorDriver` change (needs someone watching the robot).
