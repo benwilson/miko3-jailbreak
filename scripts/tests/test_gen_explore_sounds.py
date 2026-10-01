@@ -93,7 +93,7 @@ class GeneratedClipsTest(unittest.TestCase):
             self.assertLessEqual(len(clips), 3, group)
             for i, p in enumerate(sorted(clips), start=1):
                 self.assertEqual(p.name, f"react-{group}-{i}.wav")
-        self.assertEqual({group for group, _ in gen.REACTIONS}, {"curious", "thinking", "disappointed", "delighted", "puzzled"})
+        self.assertEqual({group for group, _ in gen.REACTIONS}, {"curious", "thinking", "disappointed", "delighted", "puzzled", "acknowledge"})
 
     def test_each_reaction_is_short_mono_16bit_at_the_expected_rate(self):
         for p in self.reacts():

@@ -138,13 +138,24 @@ REACTIONS = (
          ("ah", 0.10, 330, 330, "glide", 0.0, 0.15, 0.06),
          ("oh", 0.45, 247, 392, "arc", 0.02, 0.15, 0.0)],
     )),
-    ("puzzled", (  # a questioning "hm?"
-        [("mm", 0.18, 196, 185, "glide", 0.01, 0.1, 0.05),
-         ("mm", 0.45, 175, 294, "up", 0.012, 0.1, 0.0)],
-        [("ah", 0.12, 220, 220, "glide", 0.0, 0.05, 0.05),
-         ("oo", 0.50, 185, 311, "up", 0.015, 0.0, 0.0)],
-        [("mm", 0.30, 196, 165, "down", 0.012, 0.1, 0.05),
-         ("mm", 0.35, 175, 277, "up", 0.012, 0.1, 0.0)],
+    ("puzzled", (  # a confused, questioning WALL-E warble: a dip, then a rising "ooh?"
+        [("oh", 0.20, 294, 247, "down", 0.012, 0.05, 0.04),
+         ("oo", 0.42, 233, 466, "up", 0.02, 0.05, 0.0)],
+        [("ah", 0.12, 262, 262, "glide", 0.0, 0.05, 0.04),
+         ("ee", 0.45, 220, 440, "up", 0.02, 0.0, 0.0)],
+        [("oo", 0.30, 262, 208, "down", 0.015, 0.05, 0.04),
+         ("ee", 0.32, 208, 415, "up", 0.02, 0.05, 0.0)],
+    )),
+    # The acknowledgement when he turns to a voice (owner, 2026-10-01: "a quizzical,
+    # confused WALL-E style noise", replacing the spoken "hm?"/"yes?" clips).
+    ("acknowledge", (  # a short chirp, then a warbly rise: "eh-ooh?"
+        [("ee", 0.08, 392, 440, "up", 0.0, 0.0, 0.04),
+         ("oo", 0.38, 294, 587, "up", 0.025, 0.05, 0.0)],
+        [("oh", 0.14, 330, 262, "down", 0.01, 0.05, 0.03),
+         ("ee", 0.36, 262, 523, "up", 0.02, 0.05, 0.0)],
+        [("ah", 0.07, 440, 440, "glide", 0.0, 0.0, 0.03),
+         ("ah", 0.07, 392, 392, "glide", 0.0, 0.0, 0.04),
+         ("oo", 0.40, 311, 622, "up", 0.03, 0.05, 0.0)],
     )),
 )
 REACTION_SEED = 100  # seeds for reactions start here, clear of the songs' seeds

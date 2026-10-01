@@ -180,7 +180,7 @@ class LineClipsTest(unittest.TestCase):
     model needs sherpa-onnx, so a missing asset is reported as pending generation
     rather than invented."""
 
-    GROUPS = ("acknowledge", "sign-off", "one-sec", "deflect", "nothing-kept", "answer", "where")
+    GROUPS = ("sign-off", "one-sec", "deflect", "nothing-kept", "answer", "where")
     SESSION_GROUPS = ("sign-off", "one-sec", "deflect", "nothing-kept")
 
     def test_every_group_the_brain_plays_has_phrasings(self):
@@ -214,7 +214,7 @@ class LineClipsTest(unittest.TestCase):
 
     def test_clip_names_follow_the_reaction_index(self):
         names = [n for n, _ in voice.line_clips()]
-        self.assertEqual(names[:2], ["react-acknowledge-1.webm", "react-sign-off-1.webm"])
+        self.assertEqual(names[:2], ["react-sign-off-1.webm", "react-sign-off-2.webm"])
         self.assertEqual(len(names), len(set(names)))
         for n in names:
             self.assertRegex(n, r"^react-[a-z-]+-\d+\.webm$")
