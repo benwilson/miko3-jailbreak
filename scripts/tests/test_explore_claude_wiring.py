@@ -582,16 +582,19 @@ class ClaudeRateLimitWiringTest(unittest.TestCase):
         self.assertEqual(self.a.count("api.conversation("), 1)
         gated = re.search(r"private final class Gated \{(.*?)\n    \}", self.a, re.S)
         self.assertIsNotNone(gated)
+        # Look-type requests wait out a pause; conversation turns are always sent (owner, 2026-10-01).
+        i = gated.group(1).index("api.messages(")
+        before = gated.group(1)[max(0, i - 300):i]
+        self.assertIn("if (held())", before)
+        self.assertIn("return ClaudeApi.MessageResult.paused();", before)
+        convo = gated.group(1)[gated.group(1).index("ClaudeApi.MessageResult conversation("):]
+        self.assertNotIn("held()", convo)
         for call in ("api.messages(", "api.conversation("):
-            i = gated.group(1).index(call)
-            before = gated.group(1)[max(0, i - 300):i]
-            self.assertIn("if (held())", before, call)
-            self.assertIn("return ClaudeApi.MessageResult.paused();", before, call)
             self.assertIn("recorded(" + call, gated.group(1), call)
 
-    def test_the_pause_closes_can_ask_and_is_what_claude_paused_ms_reports(self):
-        self.assertIn("backoff.remainingMs(", self.body(r"public boolean canAsk\(\)"))
-        self.assertIn("return backoff.remainingMs(", self.body(r"public long claudePausedMs\(\)"))
+    def test_the_pause_holds_looks_only_and_never_closes_can_ask(self):
+        self.assertNotIn("backoff.remainingMs(", self.body(r"public boolean canAsk\(\)"))
+        self.assertIn("return 0;", self.body(r"public long claudePausedMs\(\)"))
         self.assertIn("backoff.remainingMs(", self.body(r"private boolean held\(\)"))
 
     def test_every_result_is_recorded_and_a_new_pause_is_logged_once(self):

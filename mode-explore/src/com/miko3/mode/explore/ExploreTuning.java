@@ -1233,7 +1233,7 @@ final class ExploreTuning {
         // within ~20 s (AE4). Owner's call after live tests: a look usually takes ~3 s,
         // and a slow one is retried rather than waited on longer.
         private int askAttempts = 2;
-        private int claudeLooksPerMinute = 4;
+        private int claudeLooksPerMinute = 0; // off (owner, 2026-10-01: too much throttling)
         private long askTimeoutMs = 10000;
         // A few seconds of speech (R5), plus the launcher's synthesis; only a backstop.
         private long sayTimeoutMs = 15000;

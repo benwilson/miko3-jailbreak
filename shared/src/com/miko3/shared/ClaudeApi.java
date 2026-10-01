@@ -222,16 +222,16 @@ public final class ClaudeApi {
     /**
      * One back-off clock for rate limits (robot 2026-10-01: a 429 retried 0.6 s later made
      * it worse). A 429 or 529 (RATE_LIMITED or OVERLOADED with a status) pauses requests for
-     * its retry-after, or without one for FIRST_MS, doubling on each header-less pause up to
-     * CAP_MS; a success sets the doubling back to FIRST_MS. A rate limit that lands inside a
+     * its retry-after, or without one for FIRST_MS, never longer than CAP_MS and without
+     * doubling (owner, 2026-10-01: the doubling to 5 min throttled him "way too hard"). A rate limit that lands inside a
      * running pause (a request already in flight) starts nothing new. Thread-safe; the caller
      * owns the clock and decides what a pause holds back.
      */
     public static final class Backoff {
-        public static final long FIRST_MS = 30000;
-        public static final long CAP_MS = 300000;
-        /** A retry-after above this is taken as this: an hour is already "not today". */
-        private static final long RETRY_AFTER_CAP_MS = 3600000;
+        public static final long FIRST_MS = 15000;
+        public static final long CAP_MS = 60000;
+        /** A retry-after above this is taken as this. */
+        private static final long RETRY_AFTER_CAP_MS = CAP_MS;
 
         private long until = Long.MIN_VALUE;
         private long next = FIRST_MS;
@@ -261,8 +261,7 @@ public final class ClaudeApi {
             if (retryAfterMs >= 0) {
                 pause = Math.min(retryAfterMs, RETRY_AFTER_CAP_MS);
             } else {
-                pause = next;
-                next = Math.min(CAP_MS, next * 2);
+                pause = Math.min(CAP_MS, next);
             }
             until = nowMs + pause;
             return pause;

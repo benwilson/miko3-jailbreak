@@ -89,9 +89,9 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final ClaudeApi api = new ClaudeApi(new ClaudeHttpsTransport());
     /**
      * Robot 2026-10-01: the key hit 429s, and each was retried 0.6 s later. One back-off
-     * clock for every request kind: a 429 or 529 pauses them all for its retry-after (else
-     * 30 s doubling to 5 min, reset by a success). While it runs canAsk() is false, so each
-     * kind takes its no-Claude path, and the gate below sends nothing.
+     * clock: a 429 or 529 pauses the look-type requests (curiosity, seek, doorway, way-out,
+     * faces) for its retry-after, else 15 s, at most 60 s; they fail fast and take their
+     * no-Claude paths. Conversation turns are always sent (owner, 2026-10-01).
      */
     private final ClaudeApi.Backoff backoff = new ClaudeApi.Backoff();
     private final Gated claude = new Gated();
@@ -106,11 +106,10 @@ final class ClaudeCuriosity implements CuriosityPort {
             return recorded(api.messages(access, system, content, schema, timeoutMs));
         }
 
+        // Talking to someone is never held back (owner, 2026-10-01): a conversation turn is
+        // always sent, whatever the pause; only the background looks wait it out.
         ClaudeApi.MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
                 Map<String, ?> schema, String effort, int timeoutMs) {
-            if (held()) {
-                return ClaudeApi.MessageResult.paused();
-            }
             return recorded(api.conversation(access, system, messages, schema, effort, timeoutMs));
         }
     }
@@ -277,12 +276,14 @@ final class ClaudeCuriosity implements CuriosityPort {
     public boolean canAsk() {
         refreshSettings();
         ClaudeAccess a = access;
-        return !released && a != null && a.isSetUp() && backoff.remainingMs(System.currentTimeMillis()) <= 0;
+        // The pause holds back look-type requests only (the gate above); conversations and
+        // calls always go ahead, so canAsk() and claudePausedMs() ignore it.
+        return !released && a != null && a.isSetUp();
     }
 
     @Override
     public long claudePausedMs() {
-        return backoff.remainingMs(System.currentTimeMillis());
+        return 0;
     }
 
     /** Fetch the settings in the background (one fetch at a time); canAsk() reads the last answer. */

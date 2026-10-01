@@ -791,9 +791,9 @@ public final class ClaudeApiHarness {
         }
         long afterOk = e.record(ok, now);
         long again = e.record(none, now);
-        check("backoff_without_retry_after_doubles_to_a_5_min_cap_and_resets_after_a_success",
-                got.equals(Arrays.asList(30000L, 60000L, 120000L, 240000L, 300000L, 300000L))
-                        && afterOk == 0 && again == 30000,
+        check("backoff_without_retry_after_is_a_fixed_15_s_and_never_doubles",
+                got.equals(Arrays.asList(15000L, 15000L, 15000L, 15000L, 15000L, 15000L))
+                        && afterOk == 0 && again == 15000,
                 got + " afterOk=" + afterOk + " again=" + again);
         // A 529 pauses too; other failures don't.
         ClaudeApi.Backoff o = new ClaudeApi.Backoff();
@@ -803,16 +803,16 @@ public final class ClaudeApiHarness {
         long pTimeout = x.record(new ClaudeApi(new FakeTransport().fail(new SocketTimeoutException("read")))
                 .messages(ACCESS, null, Collections.singletonList(ClaudeApi.textBlock("hi")), null, 5000), 0);
         check("backoff_pauses_on_529_but_not_on_other_failures",
-                p529 == 30000 && o.remainingMs(0) == 30000 && p500 == 0 && pTimeout == 0 && x.remainingMs(0) == 0,
+                p529 == 15000 && o.remainingMs(0) == 15000 && p500 == 0 && pTimeout == 0 && x.remainingMs(0) == 0,
                 p529 + " " + p500 + " " + pTimeout);
-        // A second 429 inside a running pause (a request already in flight) starts nothing new and doesn't double.
+        // A second 429 inside a running pause (a request already in flight) starts nothing new.
         ClaudeApi.Backoff d = new ClaudeApi.Backoff();
         d.record(none, 0);
         long inside = d.record(none, 5000);
         long left = d.remainingMs(5000);
         long next = d.record(none, 30000);
         check("backoff_a_429_inside_a_pause_starts_no_new_pause",
-                inside == 0 && left == 25000 && next == 60000,
+                inside == 0 && left == 10000 && next == 15000,
                 inside + " " + left + " next=" + next);
         // The stand-in result for a request the pause kept from being sent: rate limited, no status, not a new pause.
         ClaudeApi.MessageResult held = ClaudeApi.MessageResult.paused();

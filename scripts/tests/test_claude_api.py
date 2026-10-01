@@ -166,7 +166,7 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "retry_after_missing_or_unreadable_is_minus_one",
         "rate_limited_and_overloaded_are_never_retried_by_the_client",
         "backoff_honours_retry_after",
-        "backoff_without_retry_after_doubles_to_a_5_min_cap_and_resets_after_a_success",
+        "backoff_without_retry_after_is_a_fixed_15_s_and_never_doubles",
         "backoff_pauses_on_529_but_not_on_other_failures",
         "backoff_a_429_inside_a_pause_starts_no_new_pause",
         "a_paused_result_is_rate_limited_without_a_status_and_starts_no_pause",

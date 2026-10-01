@@ -4070,7 +4070,7 @@ public final class ExploreBrainHarness {
             }
             ExploreTuning d = tuning().build();
             check(n, times.size() >= 3 && capped && noted(notes, "Claude look budget spent")
-                            && d.claudeLooksPerMinute == 4 && d.chatPauseWaitMs == 10000 && rig.violations.isEmpty(),
+                            && d.claudeLooksPerMinute == 0 && d.chatPauseWaitMs == 10000 && rig.violations.isEmpty(),
                     "asks at " + times + " defaults " + d.claudeLooksPerMinute + "/" + d.chatPauseWaitMs);
         });
         scenario("chat_turn_in_a_short_claude_pause_says_one_sec_waits_and_carries_on", n -> {
