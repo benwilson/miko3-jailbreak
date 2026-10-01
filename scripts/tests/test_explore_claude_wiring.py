@@ -574,7 +574,7 @@ class ClaudeRateLimitWiringTest(unittest.TestCase):
         return m.group(1)
 
     def test_one_clock_and_every_request_goes_through_the_gate(self):
-        self.assertEqual(self.a.count("new ClaudeApi.Backoff()"), 1)
+        self.assertEqual(self.a.count("new ClaudeApi.Backoff(false)"), 1)  # off on the robot (owner, 2026-10-01)
         self.assertEqual(self.a.count("new ClaudeApi("), 1)
         self.assertRegex(self.a, r"private final ClaudeApi api = new ClaudeApi\(")
         self.assertRegex(self.a, r"private final Gated claude = new Gated\(\)")

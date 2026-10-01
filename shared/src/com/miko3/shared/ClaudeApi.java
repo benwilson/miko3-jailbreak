@@ -233,6 +233,17 @@ public final class ClaudeApi {
         /** A retry-after above this is taken as this. */
         private static final long RETRY_AFTER_CAP_MS = CAP_MS;
 
+        /** False: a rate limit starts no pause and nothing is held back (the robot's choice). */
+        private final boolean enabled;
+
+        public Backoff() {
+            this(true);
+        }
+
+        public Backoff(boolean enabled) {
+            this.enabled = enabled;
+        }
+
         private long until = Long.MIN_VALUE;
         private long next = FIRST_MS;
 
@@ -247,6 +258,9 @@ public final class ClaudeApi {
         }
 
         private long record(boolean ok, Reason reason, int status, long retryAfterMs, long nowMs) {
+            if (!enabled) {
+                return 0;
+            }
             if (ok) {
                 next = FIRST_MS;
                 return 0;

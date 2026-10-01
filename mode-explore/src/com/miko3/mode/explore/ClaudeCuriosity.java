@@ -93,7 +93,9 @@ final class ClaudeCuriosity implements CuriosityPort {
      * faces) for its retry-after, else 15 s, at most 60 s; they fail fast and take their
      * no-Claude paths. Conversation turns are always sent (owner, 2026-10-01).
      */
-    private final ClaudeApi.Backoff backoff = new ClaudeApi.Backoff();
+    // Off (owner, 2026-10-01: "we don't need rate limits"): a 429 is still logged per request,
+    // but no pause starts and nothing is held back.
+    private final ClaudeApi.Backoff backoff = new ClaudeApi.Backoff(false);
     private final Gated claude = new Gated();
 
     /** ClaudeApi's two requests behind the back-off clock: held while it runs, every result recorded. */
