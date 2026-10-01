@@ -87,6 +87,8 @@ import java.util.Set;
  *                               no name: nothing kept, R19)
  *        -> failed: lines request -> ASK_NAME ..., or NAME_CLIP
  *   Every failure or missed deadline ends the stop and he carries on exploring.
+ *   A roaming person pick (the detector's, while roaming) meets only with a usable
+ *   face; anything else drops it quietly (owner 2026-10-01). A call's meeting never does.
  *   Names and lines never go into the trace.
  *
  *   SCAN -> ASK -> nothing interesting: PAUSE, silent
@@ -920,8 +922,21 @@ final class ExploreBrain {
      * opened on their voice with nobody in view, so more of their voice in it is theirs.
      */
     private boolean callerHeard;
-    /** The caller spoke during the first turn of the call's search: the conversation opens when it ends. */
+    /**
+     * The caller spoke during the first turn of the call's search, or while he turned to or
+     * looked at a caller seen in a look: the conversation opens when that turn or look ends.
+     */
     private Ears.Cue callerInTurn;
+    /** Turns this call toward a caller seen in a look (capped at callSeenRetargetsMax). */
+    private int seenRetargets;
+    /** This CUE_TURN or CUE_LOOK is the turn toward, or the confirming look at, a caller seen in a look. */
+    private boolean seenLook;
+    /** The planned look the search resumes after when nobody is where the caller was seen. */
+    private int seenResumeLook;
+    /** The capture time of the look that turned him to a seen caller: it and older looks cannot confirm them. */
+    private long seenFrame = NEVER;
+    /** The call's search turns that would not turn (robot 2026-10-01: the motor board latched). */
+    private int callBlockedTurns;
     /** The frame time of the newest look when the call's stop began (it arrived before the stop). */
     private long callStopFrame = NEVER;
     /** The frame time of the last look checked during the call's stop, fresh or stale. */
@@ -2054,6 +2069,9 @@ final class ExploreBrain {
                     turnWouldNotTurn(now);
                 } else if (hazard) {
                     hazardInMotion(now);
+                } else if (state == State.CUE_TURN && fresh && callsOwn() && seenInTurn(now)) {
+                    // Turning to face a caller seen in a look taken on the way (turnToSeenCaller).
+                    break;
                 } else if (state == State.CUE_TURN && trendSaysStop(now)) {
                     double turned = turnedSoFar(now);
                     stopMotors();
@@ -3019,8 +3037,8 @@ final class ExploreBrain {
      * the lines it speaks with port.lines().
      */
     private void matchAnswered(long now, CuriosityPort.MatchAnswer a) {
-        if (roamingPick && !callsOwn() && noFaceFound(a)) {
-            phantomPerson(now);
+        if (roamingPick && !callsOwn() && !usableFace(a)) {
+            phantomPerson(now, a);
             return;
         }
         if (confirmable(a)) {
@@ -3031,24 +3049,30 @@ final class ExploreBrain {
     }
 
     /**
-     * The match ran no face comparison: faceless with no band. The port does not say why,
-     * so this covers no face found in the person box (the phantom case) and also a face that
-     * could not be straightened, a crop rejected as too small, dark or blurry, and the face
-     * model, face settings or people store being unavailable. NOT_READY (a band) is not it.
+     * The face check gave a usable face (owner 2026-10-01): a match, or a new face that passed
+     * the quality gate. Not one: no face in the person box, a crop rejected as too small, dark
+     * or blurry, one that could not be straightened, the face models not ready (NOT_READY), the
+     * face settings or people store unavailable, or a failed or timed-out check.
      */
-    private static boolean noFaceFound(CuriosityPort.MatchAnswer a) {
-        return a.status == CuriosityPort.MatchAnswer.Status.NEW && a.faceless && a.band == null;
+    private static boolean usableFace(CuriosityPort.MatchAnswer a) {
+        return a.status == CuriosityPort.MatchAnswer.Status.KNOWN
+                || a.status == CuriosityPort.MatchAnswer.Status.NEW && !a.faceless;
     }
 
     /**
-     * A roaming person pick whose match found no face (robot 2026-09-30: motion blur scored
-     * person about 0.5 while roaming): not a person. The meeting is dropped with nothing
-     * said, roaming person picks are ignored for phantomPersonCooldownMs, and he roams on.
+     * A roaming person pick with no usable face (robot 2026-09-30: motion blur scored person
+     * about 0.5 while roaming; 2026-10-01: a chair's edge and the shadow under a desk scored
+     * 0.53-0.54, and a box that stays is no proof, since furniture stays too). Owner: "If he's
+     * not positive that it's a person, why is he acting like it is a person?" The meeting is
+     * dropped with nothing said, roaming person picks are ignored for phantomPersonCooldownMs,
+     * and he roams on. A call's meeting is never dropped: someone asked for him.
      */
-    private void phantomPerson(long now) {
+    private void phantomPerson(long now, CuriosityPort.MatchAnswer a) {
         phantomsIgnoredUntil = now + tuning.phantomPersonCooldownMs;
-        note("no face in the roaming person pick's box: not a person; roaming on, roaming people ignored for "
-                + tuning.phantomPersonCooldownMs + " ms");
+        String why = a.status == CuriosityPort.MatchAnswer.Status.FAILED ? "the face check failed"
+                : a.band == FaceMatcher.Band.NOT_READY ? "the face models are not ready" : "no face, or one rejected";
+        note("no usable face in the roaming person pick's box (" + why + "): not meeting them; roaming on, roaming"
+                + " people ignored for " + tuning.phantomPersonCooldownMs + " ms");
         endCuriosity(now);
     }
 
@@ -3692,6 +3716,11 @@ final class ExploreBrain {
 
     /** A roaming, escape or curiosity turn that would not turn: stop at once, and he is wedged. */
     private void turnWouldNotTurn(long now) {
+        if (state == State.CUE_TURN && callsOwn() && Math.abs(compass.turned()) < tuning.callBlockedTurnDeg) {
+            callBlockedTurns++;
+            note("the call's search turn would not turn (" + callBlockedTurns + " of " + tuning.callBlockedTurnsMax
+                    + (callBlockedTurns >= tuning.callBlockedTurnsMax ? "): meeting the caller where he is" : ")"));
+        }
         stopMotors();
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
                 + " deg in " + (now - turnStartedAt) + " ms");
@@ -5351,6 +5380,15 @@ final class ExploreBrain {
         if (state == State.STARTLE || state == State.BACK_OFF) {
             return CallVerdict.WAIT;
         }
+        if (callBlockedTurns >= tuning.callBlockedTurnsMax) {
+            // Robot 2026-10-01 (the motor board latched): his turns do nothing, so no search.
+            return CallVerdict.IN_PLACE;
+        }
+        if (state.escapes() && callAnswered) {
+            // A call handed back by a hazard waits out the escape it caused (robot 2026-10-01: its
+            // search restarted 40 ms into each wedge escape, so none ever ran). A new call is answered at once.
+            return CallVerdict.WAIT;
+        }
         if (state == State.EYES_ONLY || !leaseHeld || !camera.available() || now < curiosityOffUntil) {
             return CallVerdict.IN_PLACE;
         }
@@ -5369,6 +5407,11 @@ final class ExploreBrain {
             cueHeld = null;
         }
         if (v != CallVerdict.CARRY_ON) {
+            if (state.escapes()) {
+                // An escape cut short is a failed one (robot 2026-10-01: the count stayed at 0 through 11).
+                failedLadders++;
+                note("the escape gives way to the call (" + failedLadders + " failed escapes in a row)");
+            }
             leaveForCue();
             backForTurn = false;
             turnRetrying = false;
@@ -5391,7 +5434,8 @@ final class ExploreBrain {
         callTaken = true;
         switch (v) {
             case IN_PLACE:
-                // On the charger (KTD5), in EYES_ONLY, without the lease or a camera: no turn, no drive.
+                // On the charger (KTD5), in EYES_ONLY, without the lease or a camera, or with turns that
+                // do nothing (callBlockedTurns): no turn, no drive.
                 meetWithoutLooking(now, c, "a call while he cannot turn to it: meeting without a look");
                 break;
             case CARRY_ON:
@@ -5454,6 +5498,10 @@ final class ExploreBrain {
     /** The call's search from here (KTD6): the plan, then the first turn or look. A retarget counts as one. */
     private void startCallSearch(long now, Ears.Cue c, boolean retarget) {
         callerInTurn = null;
+        seenLook = false;
+        if (!retarget) {
+            seenRetargets = 0;
+        }
         state = State.CUE_TURN;
         searchCue = c;
         searchRetargeted = retarget;
@@ -5533,15 +5581,16 @@ final class ExploreBrain {
      * turned past a caller who was in the frames he threw away). A caller in it counts
      * when the heading it was captured at (the heading history) is within
      * callStaleLookDeg of where he faces now: found, and the meeting or the approach
-     * follows as for a fresh look. Farther off it is left to the plan's next looks (turning
-     * back to it would be a second search inside the first). A stale look that arrived
+     * follows as for a fresh look. Farther off (robot 2026-10-01: the owner seen 37 and 61 deg
+     * away and the search went on blind) it is a bearing to turn to (turnToSeenCaller). A stale look that arrived
      * during the stop means the detector has been working since on a frame captured after
      * the stop began (it takes one frame at a time), due about one detection time later,
      * so the stop waits for it past callLookMs if need be. True when the caller was found.
      */
     private boolean staleCallLook(long now, Look look) {
         callLookChecked = look.frameMs;
-        Detection p = look.jpeg == null ? null : callPerson(look.detections);
+        // The confirming look needs a look captured after the one that turned him there.
+        Detection p = look.jpeg == null || (seenLook && look.frameMs <= seenFrame) ? null : callPerson(look.detections);
         if (p != null) {
             double turned = headingHistory.turnedSince(look.frameMs);
             if (!Double.isNaN(turned) && Math.abs(turned) <= tuning.callStaleLookDeg) {
@@ -5550,8 +5599,11 @@ final class ExploreBrain {
                 callFound(now, look, p);
                 return true;
             }
-            note("a caller in a look captured " + (Double.isNaN(turned) ? "at an unknown heading"
-                    : Math.round(Math.abs(turned)) + " deg from here") + ": not where he faces now");
+            if (Double.isNaN(turned)) {
+                note("a caller in a look captured at an unknown heading: not where he faces now");
+            } else if (turnToSeenCaller(now, look, p, turned, false)) {
+                return true;
+            }
         }
         if (look.frameMs != callStopFrame) {
             long detecting = Math.min(tuning.callLookMs, Math.max(0, now - look.frameMs));
@@ -5567,6 +5619,83 @@ final class ExploreBrain {
 
     /** Slack on a frame's due time (the readings that notice looks come every 100 ms). */
     private static final long STALE_LOOK_SLACK_MS = 200;
+
+    /**
+     * A new look during one of the call search's turns: a caller in it whose bearing the turn
+     * will not bring into view (passed already, or well beyond where the turn stops) is turned
+     * to now (turnToSeenCaller). One the turn's stop will face is left to that stop's look.
+     */
+    private boolean seenInTurn(long now) {
+        Look look = camera.latest();
+        if (look == null || look.jpeg == null || look.frameMs == callLookChecked) {
+            return false;
+        }
+        callLookChecked = look.frameMs;
+        Detection p = callPerson(look.detections);
+        double turned = p == null ? Double.NaN : headingHistory.turnedSince(look.frameMs);
+        if (Double.isNaN(turned)) {
+            return false;
+        }
+        // In the turn's own direction: where the caller is, and how far the turn still goes.
+        double way = searchTurnLeft ? -1 : 1;
+        double at = way * seenBearing(p, turned);
+        double ahead = Math.max(0, searchRemainingDeg - turnedSoFar(now));
+        if (at >= -tuning.callStaleLookDeg && at <= ahead + tuning.callStaleLookDeg) {
+            return false;
+        }
+        return turnToSeenCaller(now, look, p, turned, true);
+    }
+
+    /**
+     * Where a caller in a look is from here (right positive): the heading the look was
+     * captured at (turned is how far he has turned left since) plus where the box sits in
+     * the frame, half the frame's width being cameraHalfFovDeg.
+     */
+    private double seenBearing(Detection p, double turned) {
+        return Heading.delta(0, p.centerX() * tuning.cameraHalfFovDeg + turned);
+    }
+
+    /**
+     * A caller in a look captured at a known heading away from here (robot 2026-10-01: the
+     * owner was seen 37 and 61 deg off and the search went on blind): the planned looks wait
+     * while he turns to face them and takes one confirming look, by the call's fresh-frame
+     * rules. Someone there is found (callFound); nobody resumes the planned looks
+     * (callLookOver). At most callSeenRetargetsMax a call, so blurred boxes cannot swing him
+     * to and fro. True when he turned (or looks at once, the bearing being ahead).
+     */
+    private boolean turnToSeenCaller(long now, Look look, Detection p, double turned, boolean inTurn) {
+        double rel = seenBearing(p, turned);
+        String where = "a caller in a look captured " + Math.round(Math.abs(turned)) + " deg from here, "
+                + Math.round(Math.abs(rel)) + " deg to the " + (rel < 0 ? "left" : "right");
+        if (seenRetargets >= tuning.callSeenRetargetsMax) {
+            note(where + ": already turned to a seen caller " + seenRetargets + " times this call, left to the plan");
+            return false;
+        }
+        seenRetargets++;
+        if (inTurn) {
+            double t = turnedSoFar(now);
+            stopMotors();
+            searchRel += searchTurnLeft ? -t : t;
+        }
+        if (!seenLook) {
+            // The look the search was turning to is still to come; the one it stopped at is done.
+            seenResumeLook = inTurn ? searchLook - 1 : searchLook;
+        }
+        seenLook = true;
+        seenFrame = look.frameMs;
+        callBearing = searchRel + rel;
+        note(where + ": turning to face them (" + seenRetargets + " of " + tuning.callSeenRetargetsMax + ")");
+        state = State.CUE_TURN;
+        searchFirstTurn = false;
+        searchRemainingDeg = Math.abs(rel);
+        searchTurnLeft = rel < 0;
+        if (searchRemainingDeg < 1) {
+            enterCueLook(now);
+            return true;
+        }
+        startCueTurn(now, searchRemainingDeg, searchTurnLeft, 0);
+        return true;
+    }
 
     /** KTD6's "found": a person box tall enough, with no aspect-ratio gate; nearest the bearing, else the tallest. */
     private Detection callPerson(List<Detection> found) {
@@ -5593,6 +5722,14 @@ final class ExploreBrain {
      * near, the meeting here. The answer already played, so no acknowledgement.
      */
     private void callFound(long now, Look look, Detection p) {
+        seenLook = false;
+        if (callerInTurn != null) {
+            // The caller spoke while he turned to them: the meeting opens facing them, and is theirs.
+            note("the caller is talking and in view: the meeting opens facing them");
+            call = callerInTurn;
+            callerInTurn = null;
+            callerHeard = true;
+        }
         gauges.stamp(Gauges.Stage.FACE_FOUND, now);
         gauges.stamp(Gauges.Stage.CALL_FACING, now);
         gauges.count(Gauges.Counter.FACES_FOUND);
@@ -5631,6 +5768,15 @@ final class ExploreBrain {
             takeCall(now, CallVerdict.IN_PLACE);
             return;
         }
+        if (seenLook) {
+            seenLook = false;
+            if (callerInTurn != null) {
+                callerSpoke(now, callerInTurn, "nobody where the caller was seen, and the caller is talking");
+                return;
+            }
+            note("nobody where the caller was seen: back to the planned looks");
+            searchLook = seenResumeLook;
+        }
         if (searchLook + 1 >= searchPlan.length) {
             enterWhere(now);
             return;
@@ -5641,6 +5787,7 @@ final class ExploreBrain {
     /** KTD9: nobody found. "Where'd you go?" in a clip window, then a listen of callListenMs after it. */
     private void enterWhere(long now) {
         stopMotors();
+        seenLook = false;
         state = State.CUE_WHERE;
         searchPlan = null;
         searchCue = null;
@@ -5697,6 +5844,14 @@ final class ExploreBrain {
      * turn (the one toward the call's side), once that turn is done, so he faces their side.
      */
     private void callerVoiceInSearch(long now, Ears.Cue c, String why) {
+        if (seenLook) {
+            // Facing the person he saw beats opening with nobody in view: the confirming look decides.
+            if (callerInTurn == null) {
+                note(why + ": the caller is talking; the conversation opens once he has looked where they were seen");
+            }
+            callerInTurn = c;
+            return;
+        }
         if (state == State.CUE_TURN && searchFirstTurn) {
             if (callerInTurn == null) {
                 note(why + ": the caller is talking; the conversation opens once he faces their side");
@@ -5709,6 +5864,7 @@ final class ExploreBrain {
 
     private void callerSpoke(long now, Ears.Cue c, String why) {
         callerInTurn = null;
+        seenLook = false;
         note(why + ": the caller is talking to him, the conversation opens now");
         call = c;
         meetWithoutLooking(now, c, "the call's meeting opens on the caller's voice, nobody in view");
@@ -5748,6 +5904,7 @@ final class ExploreBrain {
 
     private void clearCall() {
         call = null;
+        callBlockedTurns = 0;
         callTaken = false;
         callAnswered = false;
         callWaitCounted = false;
@@ -5956,6 +6113,7 @@ final class ExploreBrain {
 
     /** CUE_TURN: the eyes glance to the side, then the first turn toward the voice (KTD4). */
     private void enterCueSearch(long now, Ears.Cue c, boolean retarget) {
+        seenLook = false;
         state = State.CUE_TURN;
         searchCue = c;
         searchRetargeted = retarget;
@@ -6088,7 +6246,7 @@ final class ExploreBrain {
 
     /** CUE_LOOK: attentive eyes, the camera deciding within leanInMs of being ready (KTD4). */
     private void enterCueLook(long now) {
-        if (callerInTurn != null && callsOwn()) {
+        if (callerInTurn != null && callsOwn() && !seenLook) {
             callerSpoke(now, callerInTurn, "the turn toward the caller's side is done");
             return;
         }
@@ -6113,7 +6271,8 @@ final class ExploreBrain {
             // KTD6: a budget; a camera just (re)opened has no look yet and gets the first-look time.
             long budget = camera.latest() == null ? tuning.firstLookTimeoutMs : tuning.callLookMs;
             lookDeadline = Math.max(lookAfter, ready) + budget;
-            note("looking for the caller (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
+            note(seenLook ? "looking where the caller was seen"
+                    : "looking for the caller (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
             return;
         }
         lookDeadline = ready + tuning.leanInMs;
@@ -6429,6 +6588,11 @@ final class ExploreBrain {
                 return false;
             }
             // The camera rule keeps its lease requirement (KTD7): without it the look is skipped.
+            return leaseHeld && !chatNoWheels && cameraOpen && camera.available() && clock.nowMs() >= curiosityOffUntil;
+        }
+
+        @Override
+        public boolean faceLooksAllowed() {
             return leaseHeld && !chatNoWheels && cameraOpen && camera.available() && clock.nowMs() >= curiosityOffUntil;
         }
 

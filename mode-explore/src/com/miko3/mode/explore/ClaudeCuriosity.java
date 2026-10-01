@@ -477,13 +477,18 @@ final class ClaudeCuriosity implements CuriosityPort {
         long t0 = System.currentTimeMillis();
         String system = ExplorePrompts.systemPrefix(request.persona, request.notes);
         List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
+        // A conversation that opened faceless invites them down instead of asking the name (robot 2026-10-01).
+        String first = request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name);
         for (Exchange e : request.transcript) {
-            messages.add(ClaudeApi.message("user", e.heard == null ? ExplorePrompts.openerAsk(request.name) : e.heard));
+            messages.add(ClaudeApi.message("user", e.heard == null ? first : e.heard));
             messages.add(ClaudeApi.message("assistant", ExplorePrompts.saidAsJson(e.said == null ? "" : e.said)));
         }
-        String ask = request.heard == null ? ExplorePrompts.openerAsk(request.name) : request.heard;
+        String ask = request.heard == null ? first : request.heard;
         if (request.avoidQuestion != null) {
             ask = ask + "\n\n" + ExplorePrompts.avoidQuestion(request.avoidQuestion);
+        }
+        if (request.faceSeen) {
+            ask = ask + "\n\n" + ExplorePrompts.FACE_SEEN;
         }
         if (face != null) {
             List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();

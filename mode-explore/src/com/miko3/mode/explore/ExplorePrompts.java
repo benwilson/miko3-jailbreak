@@ -273,6 +273,24 @@ final class ExplorePrompts {
                 + "from the notes before anything new.";
     }
 
+    /**
+     * The opener when the conversation opened with no usable face (robot 2026-10-01: from
+     * the floor the face was out of frame or too small, and he asked people names he could
+     * never keep, R19). No photo goes with it. He invites them down to his level instead of
+     * asking the name; it is replayed as the conversation's first message, so it holds for
+     * every turn until FACE_SEEN says otherwise.
+     */
+    static final String FACELESS_OPENER = "Miko has just turned to someone who asked for him, but from down on the floor "
+            + "he cannot see their face, so he cannot remember them yet. Write his opener: greet them, say he can't "
+            + "see their face from down here, and ask them to crouch down to his level so he can get a good look at "
+            + "them. Do not ask their name. Later in the conversation, do not ask their name either; if they tell "
+            + "him their name before he can see their face, he thanks them and asks them to crouch down to his "
+            + "level so he'll remember them.";
+
+    /** Appended to a turn's message once a face retry found a usable face for someone still unnamed. */
+    static final String FACE_SEEN = "He can see their face now, so he will be able to remember them: in this line, "
+            + "ask their name if he does not know it yet.";
+
     /** The assistant side of an exchange, as the model answered it: the line alone, since nothing else is kept. */
     static String saidAsJson(String said) {
         StringBuilder b = new StringBuilder("{\"line\":\"");

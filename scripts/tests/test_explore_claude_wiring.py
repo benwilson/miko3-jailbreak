@@ -801,5 +801,44 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertNotIn("import android", session)
         self.assertNotIn("System.out", session)
 
+
+class FacelessOpenerTest(unittest.TestCase):
+    """Robot 2026-10-01: from the floor the face was out of frame or too small, so he asked
+    people names he could never keep (R19). A conversation that opens with no usable face
+    invites them down to his level instead; the name is asked only once a face retry found a
+    usable face. A face-in-hand stranger's opener still asks the name."""
+
+    @staticmethod
+    def constant(name):
+        return ConversationWiringTest.java_string(src("ExplorePrompts.java"), name)
+
+    def test_the_faceless_opener_invites_them_down_and_never_asks_the_name(self):
+        text = self.constant("FACELESS_OPENER")
+        for words in ("can't see their face from down here", "crouch down to his level", "Do not ask their name",
+                      "do not ask their name either"):
+            self.assertIn(words, text)
+
+    def test_a_face_in_hand_strangers_opener_still_asks_the_name(self):
+        p = src("ExplorePrompts.java")
+        body = p[p.index("static String openerAsk("):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("ask \"\n                    + \"their name", body)
+
+    def test_a_face_seen_on_a_retry_lets_him_ask_the_name(self):
+        self.assertIn("ask their name if he does not know it yet", self.constant("FACE_SEEN"))
+
+    def test_the_turn_picks_the_opener_by_the_request_and_appends_face_seen(self):
+        turn = re.search(r"private Turn oneTurn\((.*?)\n    \}", code_only(src("ClaudeCuriosity.java")), re.S).group(1)
+        self.assertIn("request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name)", turn)
+        self.assertIn("e.heard == null ? first : e.heard", turn)
+        self.assertIn("request.heard == null ? first : request.heard", turn)
+        self.assertRegex(turn, r"if \(request\.faceSeen\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.FACE_SEEN;")
+        port = code_only(src("CuriosityPort.java"))
+        for sig in ("final boolean faceless;", "final boolean faceSeen;"):
+            self.assertIn(sig, port)
+        session = code_only(src("ChatSession.java"))
+        self.assertIn(".face(openedFaceless, faceSeen && name == null)", session)
+
+
 if __name__ == "__main__":
     unittest.main()

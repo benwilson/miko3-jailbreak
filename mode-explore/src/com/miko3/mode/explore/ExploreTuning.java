@@ -252,6 +252,17 @@ final class ExploreTuning {
      */
     final long callLookMs;
     final double callStaleLookDeg;
+    /**
+     * Robot 2026-10-01: a caller in a look captured farther than callStaleLookDeg from where
+     * he faces is a bearing to turn to (one confirming look there), at most this many times a call.
+     */
+    final int callSeenRetargetsMax;
+    /**
+     * Robot 2026-10-01 (the motor board latched): a call whose search turns were blocked
+     * (turned under callBlockedTurnDeg) this many times meets the caller where he is.
+     */
+    final int callBlockedTurnsMax;
+    final double callBlockedTurnDeg;
     final float callPersonMinHeight;
     /**
      * The call search's own person-score floor, used instead of confidenceFloor only
@@ -275,6 +286,15 @@ final class ExploreTuning {
      * a default until U2 measures it.
      */
     final long unansweredListenMs;
+    /**
+     * Robot 2026-10-01: a conversation that opened with no usable face retries the face
+     * check on a fresh look up to chatFaceTries times: each try's look is asked for
+     * chatFaceDelayMs into a listen (time to crouch down to him), at least chatFaceGapMs
+     * after the last try ended. Only a usable face lets him ask the name and store it.
+     */
+    final int chatFaceTries;
+    final long chatFaceDelayMs;
+    final long chatFaceGapMs;
     final long chatStallGraceMs;
     final long turnBudgetMs;
     final long turnRetryMs;
@@ -659,6 +679,9 @@ final class ExploreTuning {
         answerClipMs = Math.max(0, b.answerClipMs);
         callLookMs = Math.max(1, b.callLookMs);
         callStaleLookDeg = Math.max(0, b.callStaleLookDeg);
+        callSeenRetargetsMax = Math.max(0, b.callSeenRetargetsMax);
+        callBlockedTurnsMax = Math.max(1, b.callBlockedTurnsMax);
+        callBlockedTurnDeg = Math.max(0, b.callBlockedTurnDeg);
         callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
         callPersonMinScore = Math.max(0f, b.callPersonMinScore);
         callNearHeight = Math.max(0f, b.callNearHeight);
@@ -667,6 +690,9 @@ final class ExploreTuning {
         headingHistoryMs = Math.max(0, b.headingHistoryMs);
         headingSampleMs = Math.max(10, b.headingSampleMs);
         unansweredListenMs = Math.max(1, b.unansweredListenMs);
+        chatFaceTries = Math.max(0, b.chatFaceTries);
+        chatFaceDelayMs = Math.max(0, b.chatFaceDelayMs);
+        chatFaceGapMs = Math.max(0, b.chatFaceGapMs);
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
         turnRetryMs = Math.max(0, b.turnRetryMs);
@@ -951,6 +977,10 @@ final class ExploreTuning {
         // keeps 30 s (a call handed back by an escape is retaken with it), a sample a reading.
         private long callLookMs = 5000;
         private double callStaleLookDeg = 30;
+        // One turn to a seen caller, one more if a later look shows them again: no ping-pong.
+        private int callSeenRetargetsMax = 2;
+        private int callBlockedTurnsMax = 2;
+        private double callBlockedTurnDeg = 10;
         private float callPersonMinHeight = 0.12f;
         // Robot QA 2026-09-30: a floor-level caller scored person 0.27 and 0.32.
         private float callPersonMinScore = 0.25f;
@@ -962,6 +992,10 @@ final class ExploreTuning {
         // Meeting plan Assumptions: an unanswered listen is 4 s; the chat sensor-stall grace 5 s;
         // a turn has 5 s plus a 3 s retry; two sentences; a window of 30 exchanges; a 500 ms deaf tail.
         private long unansweredListenMs = 4000;
+        // Robot 2026-10-01: about three tries, a few seconds apart, after the crouch invitation.
+        private int chatFaceTries = 3;
+        private long chatFaceDelayMs = 1000;
+        private long chatFaceGapMs = 3000;
         private long chatStallGraceMs = 5000;
         private long turnBudgetMs = 5000;
         private long turnRetryMs = 3000;
@@ -1219,6 +1253,8 @@ final class ExploreTuning {
         }
         Builder peopleCooldownMs(long v) { peopleCooldownMs = v; return this; }
         Builder phantomPersonCooldownMs(long v) { phantomPersonCooldownMs = v; return this; }
+        Builder callSeenRetargetsMax(int v) { callSeenRetargetsMax = v; return this; }
+        Builder callBlockedTurns(int max, double deg) { callBlockedTurnsMax = max; callBlockedTurnDeg = deg; return this; }
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
         Builder quietWaitMs(long v) { quietWaitMs = v; return this; }

@@ -480,6 +480,27 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "call_a_person_in_a_stale_look_20_deg_from_the_stop_is_found",
         "call_detect_4500_ms_a_caller_at_90_left_is_found_on_look_1",
         "call_detect_4500_ms_an_empty_circle_still_reaches_where",
+        # A caller seen in a stale look is a target (robot 2026-10-01)
+        "call_a_person_in_look_1_captured_37_deg_right_is_faced_and_met_with_no_circle",
+        "call_a_person_seen_61_deg_away_during_look_4_is_retargeted_faced_and_met",
+        "call_a_seen_caller_gone_from_the_retarget_bearing_resumes_the_planned_looks_and_asks_where",
+        "call_the_seen_caller_retarget_cap_holds_against_phantom_boxes",
+        "call_caller_talking_while_he_turns_to_a_seen_caller_meets_them_facing",
+        # A roaming person is met only with a usable face (owner 2026-10-01)
+        "roaming_faceless_person_box_in_3_stopped_looks_is_still_not_met",
+        "roaming_person_with_no_face_is_not_met_and_nothing_is_said",
+        "roaming_person_with_a_too_small_face_is_not_met_and_nothing_is_said",
+        "roaming_person_with_the_face_models_not_ready_is_not_met",
+        "roaming_person_whose_face_check_failed_is_not_met",
+        "roaming_person_with_a_usable_new_face_is_met_and_the_opener_asks_the_name",
+        # A faceless call: the crouch opener, face retries, the name only with a face (robot 2026-10-01)
+        "call_faceless_meeting_opener_invites_them_down_and_does_not_ask_the_name",
+        "call_faceless_usable_face_on_a_retry_asks_the_name_then_stores_name_and_face",
+        "call_faceless_name_given_is_held_and_stored_when_a_face_arrives_on_a_retry",
+        "call_faceless_with_no_usable_face_on_any_retry_chats_unnamed_and_discards_the_notes",
+        # A call while his turns do nothing (robot 2026-10-01: the motor board latched)
+        "call_with_turns_that_never_turn_searches_at_most_twice_then_meets_where_he_is",
+        "call_search_waits_for_the_escape_back_up_before_it_restarts",
         # On-device matching in Explore (face plan U6; KTD7, KTD11, R11, R18)
         "replies_lines_carry_the_named_greeting_with_its_placeholder",
         "face_confident_with_a_conversation_enters_chat_known_without_a_lines_request",

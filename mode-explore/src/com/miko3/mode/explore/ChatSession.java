@@ -22,7 +22,9 @@ import java.util.Set;
  *   CHAT_LISTEN  the only state where looks run: the conversation listen, the 4 s
  *                unanswered timer, the single walked-off look after the first
  *                unanswered listen, the newcomer glance and "one sec" at the
- *                listen's end, goodbye and forget-me on the speaker's side
+ *                listen's end, goodbye and forget-me on the speaker's side;
+ *                in a conversation that opened with no usable face, the face
+ *                retries' looks (robot 2026-10-01: faceStep)
  *   CHAT_NOTES   the buffered notes deltas drained through the People store,
  *                then the brain resumes roaming on a leg turned away
  *
@@ -67,6 +69,12 @@ final class ChatSession {
 
         /** "A face turned toward him" in this look (KTD4). */
         boolean facing(ExploreBrain.Look look);
+
+        /**
+         * Whether a look for a face retry may run now (robot 2026-10-01): the walked-off
+         * look's camera rule (the lease and the camera, KTD7) without its listen check.
+         */
+        boolean faceLooksAllowed();
 
         /**
          * The charger latch (KTD6): a conversation it arrives in finishes and no resume leg
@@ -185,6 +193,31 @@ final class ChatSession {
     private long photoDeadline;
     private String photoFor;
 
+    // ---- the face retries (robot 2026-10-01) ----
+    /**
+     * The conversation opened with no usable face: the opener invited them down to his
+     * level instead of asking the name (TurnRequest.faceless), and a fresh look's face is
+     * checked again up to chatFaceTries times. faceSeen: a retry found a usable face, so an
+     * unnamed person may now be asked their name.
+     */
+    private boolean openedFaceless;
+    private boolean faceSeen;
+    private int faceTries;
+    private boolean faceLooking;
+    private long faceLookFrom;
+    private long faceLookDeadline;
+    private boolean faceMatching;
+    private long faceMatchDeadline;
+    private long listenStartedAt = ExploreBrain.NEVER;
+    private long faceTryEndedAt = ExploreBrain.NEVER;
+    /** A name given while faceless, checked against the store once a retry found a usable face. */
+    private boolean heldResolving;
+    private long heldResolveDeadline;
+    /** The held name's resolver asked for the last name: asked in place of the next turn's line. */
+    private boolean lastNameNext;
+    /** The face retry's box when the look has no person box: the whole frame. */
+    private static final Detection WHOLE_FRAME = new Detection("person", 1f, 0f, 0f, 1f, 1f);
+
     // ---- the store ----
     private boolean keepPending;
     private long keepDeadline;
@@ -266,6 +299,8 @@ final class ChatSession {
         this.settledName = settled;
         startedOnCharger = host.charger();
         this.faceless = faceless;
+        String storedName = a.name == null ? "" : a.name.trim();
+        openedFaceless = faceless && storedName.isEmpty();
         persona = a.persona == null ? "" : a.persona;
         String stored = a.name == null ? "" : a.name.trim();
         // A known match with an empty name takes the stranger path (KTD10): unnamed, the old id never written.
@@ -296,6 +331,7 @@ final class ChatSession {
         }
         keepStep(now);
         photoStep(now);
+        faceStep(now);
         notesStep(now);
         switch (state) {
             case CHAT_THINK:
@@ -308,7 +344,7 @@ final class ChatSession {
                 listenStep(now);
                 break;
             case CHAT_NOTES:
-                if (!deltaInFlight && !keepPending && !photoPending
+                if (!deltaInFlight && !keepPending && !photoPending && !heldResolving && !faceMatching
                         && (!persistWanted || buffer.isEmpty() || personId == null)) {
                     finished = true;
                     host.note("conversation over after " + turns + " turn(s), " + persisted + " note delta(s) kept");
@@ -344,7 +380,8 @@ final class ChatSession {
         heard = heardText;
         attempt = 1;
         reRequested = false;
-        request = new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText);
+        request = new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
+                .face(openedFaceless, faceSeen && name == null);
         turnDeadline = now + tuning.turnBudgetMs;
         host.eyes(ExploreBrain.EyeState.THINKING, null);
         if (opener) {
@@ -459,6 +496,14 @@ final class ChatSession {
             host.note("the line deflects a task");
         }
         turns++;
+        if (lastNameNext) {
+            // The held name matched someone stored whose face is weak for them (KTD6): the
+            // last-name question replaces this line, as when the name comes with a face.
+            lastNameNext = false;
+            nameReply = heard;
+            askLastName(now);
+            return;
+        }
         if (given != null && nameGiven(now, given, line)) {
             // The line waits for the resolver: the last-name question may replace it (KTD6).
             return;
@@ -480,12 +525,20 @@ final class ChatSession {
             return false;
         }
         if (faceless) {
-            host.note("a name given; no face to keep them by, so nothing is stored");
+            // Robot 2026-10-01: from the floor the face is out of frame or too small. The name is
+            // used for the rest of the conversation, in memory only; it is stored only if a face
+            // retry finds a usable face, else it goes with the conversation (R19).
+            host.note(faceRetrying() ? "a name given; no usable face yet, so the name is held for this conversation"
+                    + " while he looks for one" : "a name given; no face to keep them by, so nothing is stored");
             name = given;
             personId = null;
             asked.clear();
             notes = null;
             return false;
+        }
+        if (heldResolving) {
+            heldResolving = false;
+            port.cancelResolve();
         }
         host.note(name == null ? "a name given: checking it against the people stored"
                 : "a name given that differs from the stored one: checking it against the people stored");
@@ -681,10 +734,180 @@ final class ChatSession {
         }
     }
 
+    // ---- the face retries (robot 2026-10-01) ----
+
+    /** Another face try may still come: the conversation opened faceless and the tries are not spent. */
+    private boolean faceRetrying() {
+        return faceless && !ending && (faceLooking || faceMatching || faceTries < tuning.chatFaceTries);
+    }
+
+    /**
+     * A faceless conversation's face retries: chatFaceDelayMs into a listen (time to crouch
+     * down to him) and chatFaceGapMs after the last try, one look; the face in its person box
+     * (the whole frame when it has none) goes through the meeting's own match (port.match).
+     * A usable face lets him ask the name, or stores a name already given (R19 then keeps the
+     * notes). The look runs only while he is not speaking (KTD7).
+     */
+    private void faceStep(long now) {
+        if (heldResolving) {
+            heldResolveStep(now);
+        }
+        if (faceMatching) {
+            CuriosityPort.MatchAnswer a = port.matchAnswer();
+            if (a == null) {
+                if (now < faceMatchDeadline) {
+                    return;
+                }
+                host.note("face try " + faceTries + ": no answer about the face in " + tuning.meetTimeoutMs + " ms");
+                a = CuriosityPort.MatchAnswer.FAILED;
+            }
+            faceMatching = false;
+            faceAnswered(now, a);
+            return;
+        }
+        if (faceLooking) {
+            ExploreBrain.Look look = host.look();
+            boolean arrived = look != null && look.frameMs >= faceLookFrom && look.jpeg != null;
+            if (!arrived && now < faceLookDeadline) {
+                return;
+            }
+            dropFaceLook(false);
+            if (!arrived) {
+                host.note("face try " + faceTries + " of " + tuning.chatFaceTries + ": no look in time");
+                faceTryOver(now);
+                return;
+            }
+            Detection box = personBox(look.detections);
+            host.note("face try " + faceTries + " of " + tuning.chatFaceTries + ": checking the face in a fresh look"
+                    + (box == null ? " (no person box: the whole frame)" : ""));
+            faceMatching = true;
+            faceMatchDeadline = now + tuning.meetTimeoutMs;
+            port.match(look.jpeg, box == null ? WHOLE_FRAME : box, tuning.meetTimeoutMs);
+            return;
+        }
+        if (faceless && !ending && faceTries < tuning.chatFaceTries && state == State.CHAT_LISTEN
+                && phase == Phase.LISTENING && now >= listenStartedAt + tuning.chatFaceDelayMs
+                && now >= faceTryEndedAt + tuning.chatFaceGapMs && host.faceLooksAllowed()) {
+            faceTries++;
+            faceLooking = true;
+            faceLookFrom = now;
+            faceLookDeadline = now + tuning.lookSettleMs + tuning.lookTimeoutMs;
+            host.wantLook(true);
+        }
+    }
+
+    /** The largest person box in the look, or null. */
+    private static Detection personBox(List<Detection> found) {
+        Detection best = null;
+        if (found != null) {
+            for (Detection d : found) {
+                if (CuriosityPort.Kind.of(d.label) == CuriosityPort.Kind.PERSON
+                        && (best == null || d.area() > best.area())) {
+                    best = d;
+                }
+            }
+        }
+        return best;
+    }
+
+    /** A face try's answer: usable (a match, or a new face past the quality gate), or another try later. */
+    private void faceAnswered(long now, CuriosityPort.MatchAnswer a) {
+        boolean usable = a.status == CuriosityPort.MatchAnswer.Status.KNOWN
+                || a.status == CuriosityPort.MatchAnswer.Status.NEW && !a.faceless;
+        if (!usable) {
+            host.note("face try " + faceTries + " of " + tuning.chatFaceTries + ": no usable face");
+            faceTryOver(now);
+            return;
+        }
+        faceless = false;
+        // The retry's match opened its own face check, which now waits for this conversation's outcome.
+        checkOpen = true;
+        if (name == null) {
+            faceSeen = true;
+            host.note("a usable face on try " + faceTries + " of " + tuning.chatFaceTries
+                    + (ending ? ", but the conversation is ending: nothing is stored" : ": he may ask the name now"));
+            return;
+        }
+        host.note("a usable face on try " + faceTries + " of " + tuning.chatFaceTries
+                + ": checking the name held against the people stored");
+        pendingFirst = name;
+        heldResolving = true;
+        heldResolveDeadline = now + tuning.meetTimeoutMs;
+        port.resolveName(name, tuning.meetTimeoutMs);
+    }
+
+    private void faceTryOver(long now) {
+        faceTryEndedAt = now;
+        if (faceTries >= tuning.chatFaceTries) {
+            host.note("no usable face after " + faceTries + " tries: the conversation runs unnamed"
+                    + (name != null ? " and the name held is not stored" : ""));
+        }
+    }
+
+    /**
+     * The held name's resolve (face plan U7, KTD10), off the turn: join, store someone new,
+     * or ask the last name in place of the next turn's line.
+     */
+    private void heldResolveStep(long now) {
+        CuriosityPort.Resolved r = port.resolved();
+        if (r == null) {
+            if (now < heldResolveDeadline) {
+                return;
+            }
+            port.cancelResolve();
+            r = CuriosityPort.Resolved.FAILED;
+        }
+        heldResolving = false;
+        switch (r.status) {
+            case JOIN:
+                join(now, r.personId, r.name != null ? r.name : pendingFirst);
+                break;
+            case NEW:
+                storeNew(now, r.name);
+                break;
+            case ASK_LAST_NAME:
+                if (ending) {
+                    settle(now);
+                } else {
+                    host.note("the name held matches someone stored but the face is weak for them: the last name"
+                            + " is asked after the next reply");
+                    lastNameNext = true;
+                }
+                break;
+            default:
+                host.note("the name held could not be checked: nothing is stored");
+                break;
+        }
+    }
+
+    /** The face look ends (its look in, or he is about to speak: then the try is not spent). */
+    private void dropFaceLook(boolean unspent) {
+        if (!faceLooking) {
+            return;
+        }
+        faceLooking = false;
+        if (unspent) {
+            faceTries--;
+        }
+        if (phase != Phase.LOOKING) {
+            host.wantLook(false);
+        }
+    }
+
+    /** The conversation is ending: no new face try; a match in flight is waited for only to store a name held. */
+    private void endFaceRetries() {
+        dropFaceLook(true);
+        if (faceMatching && (name == null || personId != null)) {
+            faceMatching = false;
+        }
+    }
+
     // ---- CHAT_SPEAK ----
 
     /** A line through the voice with the camera open and no quiet wait (KTD7): a turn's line, or a fixed template. */
     private void speak(long now, String line, boolean isTurn) {
+        // The detector parks before he speaks (KTD7): a face look not yet in is asked again later.
+        dropFaceLook(true);
         state = State.CHAT_SPEAK;
         phase = Phase.WAIT_CLIP;
         pendingLine = line;
@@ -779,6 +1002,7 @@ final class ChatSession {
             return;
         }
         phase = Phase.LISTENING;
+        listenStartedAt = now;
         listenDeadline = now + tuning.unansweredListenMs;
         port.chatListen(tuning.unansweredListenMs, tuning.newcomerAngleDeg);
     }
@@ -902,7 +1126,9 @@ final class ChatSession {
         if (!arrived && now < lookDeadline) {
             return;
         }
-        host.wantLook(false);
+        if (!faceLooking) {
+            host.wantLook(false);
+        }
         if (arrived && !host.facing(look)) {
             host.note("they have walked off: no sign-off");
             walkedOff = true;
@@ -951,6 +1177,7 @@ final class ChatSession {
     /** The sign-off clip (R11), then the notes; the person is still in front of him. */
     private void signOff(long now) {
         ending = true;
+        endFaceRetries();
         port.cancelTurn();
         if (resolving != Resolving.NONE) {
             resolving = Resolving.NONE;
@@ -962,10 +1189,11 @@ final class ChatSession {
 
     private void enterNotes(long now) {
         ending = true;
+        endFaceRetries();
         state = State.CHAT_NOTES;
         phase = Phase.PERSISTING;
         host.eyes(ExploreBrain.EyeState.THINKING, null);
-        if (personId == null && !keepPending && !photoPending) {
+        if (personId == null && !keepPending && !photoPending && !heldResolving && !faceMatching) {
             if (!buffer.isEmpty()) {
                 host.note("unnamed: " + buffer.size() + " note delta(s) discarded (R19)");
                 buffer.clear();

@@ -990,6 +990,15 @@ interface CuriosityPort extends AnswerParser.Names {
          * a first request.
          */
         final String avoidQuestion;
+        /**
+         * The conversation opened with no usable face (robot 2026-10-01): the opener
+         * invites them down to his level and never asks the name, since nothing could
+         * be stored without a face (R19). Fixed for the conversation, so the replayed
+         * opener reads as it was sent.
+         */
+        final boolean faceless;
+        /** A usable face arrived on a retry since: he may ask the name of someone still unnamed. */
+        final boolean faceSeen;
 
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard) {
             this(persona, name, notes, transcript, heard, null);
@@ -997,17 +1006,29 @@ interface CuriosityPort extends AnswerParser.Names {
 
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
                     String avoidQuestion) {
+            this(persona, name, notes, transcript, heard, avoidQuestion, false, false);
+        }
+
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
+                    String avoidQuestion, boolean faceless, boolean faceSeen) {
             this.persona = persona;
             this.name = name;
             this.notes = notes;
             this.transcript = transcript == null ? Collections.<Exchange>emptyList() : transcript;
             this.heard = heard;
             this.avoidQuestion = avoidQuestion;
+            this.faceless = faceless;
+            this.faceSeen = faceSeen;
         }
 
         /** This request again, with the repeated question to avoid. */
         TurnRequest avoiding(String question) {
-            return new TurnRequest(persona, name, notes, transcript, heard, question);
+            return new TurnRequest(persona, name, notes, transcript, heard, question, faceless, faceSeen);
+        }
+
+        /** This request as one in a conversation that opened faceless, with or without a face since. */
+        TurnRequest face(boolean openedFaceless, boolean seenSince) {
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, openedFaceless, seenSince);
         }
 
         /** The opener: nothing heard yet. */

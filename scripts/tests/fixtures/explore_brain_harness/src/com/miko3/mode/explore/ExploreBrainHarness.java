@@ -9869,7 +9869,11 @@ public final class ExploreBrainHarness {
 
     /** Roaming with Claude and a conversation possible; a person straight ahead whenever visible(t). */
     private static Rig roamRig(java.util.function.LongPredicate visible, boolean face) {
-        Rig rig = cueRig(cueTuning(), CLEAR, personWhen(visible));
+        return roamRig(personWhen(visible), face);
+    }
+
+    private static Rig roamRig(Vision v, boolean face) {
+        Rig rig = cueRig(cueTuning(), CLEAR, v);
         rig.people.persona = PERSONA;
         rig.people.match = face
                 ? (r, k) -> STRANGER.withMatch(FaceMatcher.Band.WEAK, null, 0.2f, 3L)
@@ -9886,7 +9890,7 @@ public final class ExploreBrainHarness {
 
     private static void roamingPhantomScenarios() {
         scenario("roaming_person_pick_with_no_face_drops_the_meeting_quietly_and_roams_on", n -> {
-            Rig rig = roamRig(t -> t < 12000, false).started();
+            Rig rig = roamRig(oncePaused(box("person", 0.9f, 0.5f, 0.5f, 0.3f, 0.3f)), false).started();
             long match = runUntilEvent(rig, "match", 0, 12000);
             rig.runUntil(match + 12000);
             long chat = entered(rig, ExploreBrain.State.CHAT_THINK, 0);
@@ -9897,7 +9901,8 @@ public final class ExploreBrainHarness {
                     "match@" + match + " chat@" + chat + " pause@" + pause + " " + rig.tail());
         });
         scenario("roaming_blur_seen_again_within_the_phantom_cooldown_is_ignored", n -> {
-            Rig rig = roamRig(t -> true, false).started();
+            // A one-frame phantom at each leg decision, alternating sides, so none persists.
+            Rig rig = roamRig(eachPauseAlternating(), false).started();
             long first = runUntilEvent(rig, "match", 0, 12000);
             long cool = rig.tuning.phantomPersonCooldownMs;
             rig.runUntil(first + cool + 20000);
@@ -9977,7 +9982,9 @@ public final class ExploreBrainHarness {
             rig.runUntil(Math.max(chat, look1) + 15000);
             check(n, look1 > 0 && chat > 0 && chat <= look1 + 100 + 1500 && rig.count("react where") == 0
                             && rig.cueLookYaws.size() == 1 && rig.count("react answer") == 1 && rig.count("lines") == 1
-                            && rig.turnAsks.size() >= 1 && searchFrom(rig, chat) < 0 && rig.count("match") == 0
+                            && rig.turnAsks.size() >= 1 && searchFrom(rig, chat) < 0
+                            // No match opens it; the conversation's face retries come later (robot 2026-10-01).
+                            && (rig.first("match", 0) < 0 || rig.timeOf(rig.first("match", 0)) > chat)
                             && noted(notes, "the caller is talking to him") && rig.violations.isEmpty(),
                     "look1@" + look1 + " chat@" + chat + " looks=" + rig.cueLookYaws.size() + " turns=" + rig.turnAsks
                             + " " + gauges(rig) + " " + rig.tail());
@@ -10154,6 +10161,486 @@ public final class ExploreBrainHarness {
             check(n, where > 0 && bearingsNear(lookBearings(rig, start), 15, 90, 135, 45, 0, -45, -90, -135, 180)
                             && rig.count("react answer") == 1 && rig.count("match") == 0 && rig.violations.isEmpty(),
                     "where@" + where + " looks=" + lookBearings(rig, start) + " " + rig.tail());
+        });
+        seenCallerScenarios();
+        persistedPersonScenarios();
+        blockedSearchScenarios();
+    }
+
+    // ---- a caller seen in a stale look is a target (robot 2026-10-01) ----
+    //
+    // The owner said "Hey Miko" from his right; the search's looks caught him twice, 37 and
+    // 61 deg from where he faced, and threw both away as "not where he faces now", then the
+    // conversation opened with nobody in view. Now a person in a look whose capture heading is
+    // known is a bearing: he turns to face it and takes one confirming look; nobody there
+    // resumes the planned looks. At most callSeenRetargetsMax such turns per call.
+
+    /** A person box whose centre is centreX (-1 left .. 1 right), 0.4 of the frame tall (near). */
+    private static Detection personBoxAt(float centreX) {
+        return box("person", 0.9f, 0.5f + centreX / 2, 0.5f, 0.2f, 0.4f);
+    }
+
+    /**
+     * A person standing at this bearing (yaw frame, left positive), seen from where each frame
+     * was taken: the box sits where they are in a 60 deg wide frame, while capture time t passes.
+     */
+    private static Vision personSeenAt(double bearingLeftDeg, java.util.function.LongPredicate there) {
+        return (r, t) -> {
+            if (r.yaw == null || !there.test(t)) {
+                return list();
+            }
+            double left = Heading.delta(r.yawAt(t), Heading.wrap(bearingLeftDeg));
+            return Math.abs(left) > 27 ? list() : list(personBoxAt((float) (-left / 30)));
+        };
+    }
+
+    /** The first time in the probe's yaw log after from at which he faced at least deg left of start. */
+    private static long whenFacing(Rig probe, double start, double deg, long from) {
+        for (double[] e : probe.yawLog) {
+            if (e[0] > from && Heading.delta(start, e[1]) >= deg) {
+                return (long) e[0];
+            }
+        }
+        return -1;
+    }
+
+    /** The trace notes containing text. */
+    private static int notedCount(List<String> notes, String text) {
+        int k = 0;
+        for (String x : notes) {
+            if (x.contains(text)) {
+                k++;
+            }
+        }
+        return k;
+    }
+
+    /** The time of the first note at or after from containing text, else -1. */
+    private static long notedAt(List<String> notes, String text, long from) {
+        for (String x : notes) {
+            long t = Long.parseLong(x.substring(0, x.indexOf(' ')));
+            if (t >= from && x.contains(text)) {
+                return t;
+            }
+        }
+        return -1;
+    }
+
+    /** Runs in 10 ms steps until a note containing text appears, or until limit; its time or -1. */
+    private static long runUntilNoted(Rig rig, List<String> notes, String text, long limit) {
+        while (rig.now < limit && notedAt(notes, text, 0) < 0) {
+            rig.runUntil(rig.now + 10);
+        }
+        return notedAt(notes, text, 0);
+    }
+
+    private static final String RETARGET_NOTE = "turning to face them";
+
+    /** A LEFT call with detection 2500 ms; the frame taken while he faced 53 deg left on the way to 90 arrives in look 1. */
+    private static long[] look1Shot53() {
+        Rig probe = slowRig(EMPTY_ROOM, 2500, 0).started();
+        double start = sideCall(probe, Ears.Side.LEFT);
+        long stop = runUntilState(probe, ExploreBrain.State.CUE_LOOK, 410, 20000);
+        long at53 = whenFacing(probe, start, 53, 410);
+        return new long[]{at53, stop, Math.round(start * 1000)};
+    }
+
+    private static void seenCallerScenarios() {
+        scenario("call_a_person_in_look_1_captured_37_deg_right_is_faced_and_met_with_no_circle", n -> {
+            long[] p = look1Shot53();
+            long at53 = p[0];
+            double start = p[2] / 1000.0;
+            Rig rig = slowRig(personSeenAt(start + 53, t -> true), 2500, Math.floorMod(at53 + 2500, 2500));
+            List<String> notes = traced(rig);
+            rig.started();
+            sideCall(rig, Ears.Side.LEFT);
+            long meet = runUntilState(rig, ExploreBrain.State.MEET, 410, 40000);
+            rig.runUntil(Math.max(meet, 410) + 3000);
+            List<Long> looks = lookBearings(rig, start);
+            System.out.println("REPORT call search, a person seen 37 deg right of look 1: looks " + looks
+                    + ", met at " + meet + " ms");
+            check(n, at53 > 0 && p[1] < at53 + 2500 && meet > 0 && looks.size() == 2 && Math.abs(looks.get(1) - 53) <= 8
+                            && notedCount(notes, RETARGET_NOTE) == 1 && rig.count("react where") == 0
+                            && rig.matchBoxes.size() == 1 && rig.violations.isEmpty(),
+                    "at53@" + at53 + " stop@" + p[1] + " meet@" + meet + " looks=" + looks + " " + rig.tail());
+        });
+        scenario("call_a_person_seen_61_deg_away_during_look_4_is_retargeted_faced_and_met", n -> {
+            // Frames every 100 ms, each taken 2500 ms before it arrives: the probe's run is the
+            // real one's until the person steps in, as look 3 ends, 16 deg left of it.
+            Rig probe = slowRig(EMPTY_ROOM, 2500, 0);
+            probe.lookEveryMs = 100;
+            probe.started();
+            probe.runUntil(400);
+            double start = probe.yaw.wrapped();
+            probe.cue(410, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            long look4 = -1;
+            while (probe.now < 60000 && probe.cueLookYaws.size() < 4) {
+                probe.runUntil(probe.now + 10);
+            }
+            look4 = probe.now;
+            long turn4 = -1;
+            int looks = 0;
+            for (Event e : probe.stateLog) {
+                if (e.what.equals("CUE_LOOK")) {
+                    looks++;
+                } else if (looks == 3 && e.what.equals("CUE_TURN")) {
+                    turn4 = e.t;
+                    break;
+                }
+            }
+            double y3 = probe.cueLookYaws.get(2);
+            double y4 = probe.cueLookYaws.get(3);
+            double b = y4 + 61;
+            long in = turn4;
+            Rig rig = slowRig(personSeenAt(b, t -> t >= in), 2500, 0);
+            rig.lookEveryMs = 100;
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(400);
+            rig.cue(410, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            long meet = runUntilState(rig, ExploreBrain.State.MEET, 410, 60000);
+            rig.runUntil(Math.max(meet, 410) + 3000);
+            List<Long> got = lookBearings(rig, start);
+            String note61 = "";
+            for (String x : notes) {
+                if (x.contains(RETARGET_NOTE)) {
+                    note61 = x;
+                }
+            }
+            System.out.println("REPORT call search, a person stepping in 61 deg from look 4: looks " + got
+                    + ", met at " + meet + " ms; " + note61);
+            check(n, turn4 > 0 && Math.abs(Heading.delta(y3, y4) + 45) <= 5 && meet > 0 && got.size() == 5
+                            && Math.abs(Heading.delta(rig.cueLookYaws.get(4), b)) <= 8
+                            && notedCount(notes, RETARGET_NOTE) == 1 && rig.count("react where") == 0
+                            && rig.matchBoxes.size() == 1 && rig.violations.isEmpty(),
+                    "turn4@" + turn4 + " look4@" + look4 + " y3=" + y3 + " y4=" + y4 + " meet@" + meet + " looks=" + got
+                            + " " + note61 + " " + rig.tail());
+        });
+        scenario("call_a_seen_caller_gone_from_the_retarget_bearing_resumes_the_planned_looks_and_asks_where", n -> {
+            long[] p = look1Shot53();
+            long at53 = p[0];
+            double start = p[2] / 1000.0;
+            Rig rig = slowRig(personSeenAt(start + 53, t -> t <= at53 + 50), 2500, Math.floorMod(at53 + 2500, 2500));
+            List<String> notes = traced(rig);
+            rig.started();
+            sideCall(rig, Ears.Side.LEFT);
+            long where = runUntilEvent(rig, "react where", 410, 200000);
+            List<Long> looks = lookBearings(rig, start);
+            check(n, where > 0 && bearingsNear(looks, 15, 90, 53, 135, 45, 0, -45, -90, -135, 180)
+                            && notedCount(notes, RETARGET_NOTE) == 1 && notedCount(notes, "nobody where the caller was seen") == 1
+                            && rig.count("react where") == 1 && rig.count("match") == 0 && rig.violations.isEmpty(),
+                    "where@" + where + " looks=" + looks + " " + rig.tail());
+        });
+        scenario("call_the_seen_caller_retarget_cap_holds_against_phantom_boxes", n -> {
+            // A blurred "person" at the frame's trailing edge in the frames taken as each of three
+            // turns starts: each one puts a "caller" well behind the turn, a different one every turn.
+            int[] shown = {0};
+            Vision phantoms = (r, t) -> {
+                if (!turningAt(r, t) || turningAt(r, t - 100) || shown[0] >= 3) {
+                    return list();
+                }
+                shown[0]++;
+                boolean left = Heading.delta(r.yawAt(t - 100), r.yawAt(t)) > 0;
+                return list(personBoxAt(left ? 0.8f : -0.8f));
+            };
+            Rig rig = slowRig(phantoms, 2500, 0);
+            rig.lookEveryMs = 100;
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(400);
+            rig.cue(410, Ears.Kind.WAKE_WORD, Ears.Side.UNKNOWN, Float.NaN);
+            long where = runUntilEvent(rig, "react where", 410, 300000);
+            int retargets = notedCount(notes, RETARGET_NOTE);
+            check(n, where > 0 && retargets == 2 && notedCount(notes, "left to the plan") >= 1
+                            && rig.cueLookYaws.size() == 8 + 2 && rig.count("match") == 0 && rig.violations.isEmpty(),
+                    "where@" + where + " retargets=" + retargets + " looks=" + rig.cueLookYaws.size() + " " + rig.tail());
+        });
+        scenario("call_caller_talking_while_he_turns_to_a_seen_caller_meets_them_facing", n -> {
+            long[] p = look1Shot53();
+            long at53 = p[0];
+            double start = p[2] / 1000.0;
+            Rig rig = slowRig(personSeenAt(start + 53, t -> true), 2500, Math.floorMod(at53 + 2500, 2500));
+            rig.people.persona = PERSONA;
+            rig.people.match = (r, k) -> STRANGER.withConversation(r.people.persona, null, null, null);
+            rig.people.lines = STRANGER.withConversation(PERSONA, null, null, null);
+            List<String> notes = traced(rig);
+            rig.started();
+            sideCall(rig, Ears.Side.LEFT);
+            long turn = runUntilNoted(rig, notes, RETARGET_NOTE, 40000);
+            rig.cue(rig.now + 50, Ears.Tier.WEAK, Ears.Side.LEFT, Float.NaN);
+            long meet = runUntilState(rig, ExploreBrain.State.MEET, Math.max(turn, 0), 40000);
+            rig.runUntil(Math.max(meet, 410) + 3000);
+            List<Long> looks = lookBearings(rig, start);
+            check(n, turn > 0 && meet > 0 && looks.size() == 2 && Math.abs(looks.get(1) - 53) <= 8
+                            && rig.matchBoxes.size() == 1 && !noted(notes, "nobody in view")
+                            && rig.count("react where") == 0 && rig.violations.isEmpty(),
+                    "turn@" + turn + " meet@" + meet + " looks=" + looks + " " + rig.tail());
+        });
+    }
+
+    // ---- a faceless roaming person who stays (robot 2026-10-01) ----
+    //
+    // From the floor a standing person nearby is legs and a body, no face. A rule that met a
+    // faceless roaming pick when its box stayed in the still looks also met static furniture
+    // (a chair's edge, the shadow under a desk), so it is gone: a faceless roaming pick is
+    // never a meeting, however long its box stays (usableFaceScenarios).
+
+    /** A person straight ahead in only the first still frame taken in a leg-decision pause. */
+    private static Vision oncePaused(Detection box) {
+        boolean[] shown = {false};
+        return (r, t) -> {
+            long p = pauseEntry(r);
+            if (!shown[0] && p >= 0 && t >= p && !turningAt(r, t)) {
+                shown[0] = true;
+                return list(box);
+            }
+            return list();
+        };
+    }
+
+    /** When the current leg-decision PAUSE began (not the short one after a turn), or -1 when he is not in one. */
+    private static long pauseEntry(Rig r) {
+        if (r.brain.state() != ExploreBrain.State.PAUSE) {
+            return -1;
+        }
+        for (int i = r.stateLog.size() - 1; i >= 0; i--) {
+            if (r.stateLog.get(i).what.equals("PAUSE")) {
+                return i > 0 && r.stateLog.get(i - 1).what.equals("TURN") ? -1 : r.stateLog.get(i).t;
+            }
+        }
+        return -1;
+    }
+
+    /** Whether he was turning when the frame at t was taken (his true heading moved over the 100 ms before). */
+    private static boolean turningAt(Rig r, long t) {
+        return r.yaw != null && Math.abs(Heading.delta(r.yawAt(t - 100), r.yawAt(t))) > 1;
+    }
+
+    /** A person box in the first still frame taken in each leg-decision pause only, on alternating sides. */
+    private static Vision eachPauseAlternating() {
+        int[] shown = {0};
+        long[] lastPause = {-1};
+        return (r, t) -> {
+            long p = pauseEntry(r);
+            if (p < 0 || p == lastPause[0] || t < p || turningAt(r, t)) {
+                return list();
+            }
+            lastPause[0] = p;
+            shown[0]++;
+            return list(box("person", 0.9f, shown[0] % 2 == 0 ? 0.25f : 0.75f, 0.5f, 0.2f, 0.3f));
+        };
+    }
+
+    private static void persistedPersonScenarios() {
+        scenario("roaming_faceless_person_box_in_3_stopped_looks_is_still_not_met", n -> {
+            // Owner 2026-10-01: a box that stays is no proof (furniture stays too); only a usable face is.
+            Rig rig = roamRig(t -> true, false);
+            List<String> notes = traced(rig);
+            rig.started();
+            long match = runUntilEvent(rig, "match", 0, 12000);
+            rig.runUntil(match + 8000);
+            check(n, match > 0 && entered(rig, ExploreBrain.State.CHAT_THINK, 0) < 0 && spokenAfter(rig, match) == 0
+                            && noted(notes, "no usable face in the roaming person pick's box")
+                            && rig.countPrefix("remember ", 0, Long.MAX_VALUE) == 0 && rig.violations.isEmpty(),
+                    "match@" + match + " " + rig.tail());
+        });
+        usableFaceScenarios();
+        facelessCallScenarios();
+    }
+
+    // ---- a roaming person is met only with a usable face (owner 2026-10-01) ----
+    //
+    // "If he's not positive that it's a person, why is he acting like it is a person?" The
+    // roaming detector scored a chair's edge and the shadow under a desk "person" 0.53-0.54,
+    // and he asked a wastebasket its name. A roaming pick now opens a meeting only when the
+    // face check gave a usable face (a match, or a new face past the quality gate); no face,
+    // a rejected one, the face models not ready or a failed check drop it quietly.
+
+    /** A roaming pick whose match answers a; whether a meeting opened, and anything was said. */
+    private static void roamingDropped(String n, CuriosityPort.MatchAnswer a) {
+        Rig rig = roamRig(t -> true, false);
+        rig.people.match = (r, k) -> a == CuriosityPort.MatchAnswer.FAILED ? a
+                : a.withConversation(r.people.persona, null, null, null);
+        List<String> notes = traced(rig);
+        rig.started();
+        long match = runUntilEvent(rig, "match", 0, 12000);
+        rig.runUntil(match + 8000);
+        long pause = entered(rig, ExploreBrain.State.PAUSE, match);
+        check(n, match > 0 && entered(rig, ExploreBrain.State.CHAT_THINK, 0) < 0 && spokenAfter(rig, match) == 0
+                        && rig.count("lines") == 0 && pause > 0 && pause <= match + 12000
+                        && noted(notes, "no usable face in the roaming person pick's box") && rig.violations.isEmpty(),
+                "match@" + match + " pause@" + pause + " " + rig.tail());
+    }
+
+    private static void usableFaceScenarios() {
+        scenario("roaming_person_with_no_face_is_not_met_and_nothing_is_said",
+                n -> roamingDropped(n, CuriosityPort.MatchAnswer.faceless().withMatch(null, null, Float.NaN, 11L)));
+        scenario("roaming_person_with_a_too_small_face_is_not_met_and_nothing_is_said",
+                // The adapter answers a rejected crop (TOO_SMALL, TOO_DARK, TOO_BLURRY) faceless with no band.
+                n -> roamingDropped(n, CuriosityPort.MatchAnswer.faceless().withMatch(null, null, Float.NaN, 12L)));
+        scenario("roaming_person_with_the_face_models_not_ready_is_not_met",
+                n -> roamingDropped(n, CuriosityPort.MatchAnswer.faceless()
+                        .withMatch(FaceMatcher.Band.NOT_READY, null, Float.NaN, 13L)));
+        scenario("roaming_person_whose_face_check_failed_is_not_met",
+                n -> roamingDropped(n, CuriosityPort.MatchAnswer.FAILED));
+        scenario("roaming_person_with_a_usable_new_face_is_met_and_the_opener_asks_the_name", n -> {
+            Rig rig = roamRig(t -> true, true).started();
+            long match = runUntilEvent(rig, "match", 0, 12000);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, match, match + 10000);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, match > 0 && chat > 0 && first != null && first.request.heard == null && first.request.name == null
+                            && !first.request.faceless && rig.violations.isEmpty(),
+                    "match@" + match + " chat@" + chat + " first=" + first + " " + rig.tail());
+        });
+    }
+
+    // ---- a call with no usable face: the crouch opener, face retries, the name only with a face ----
+    //
+    // Robot 2026-10-01: from the floor the face was out of frame or under 48 px, so he asked
+    // three office regulars their names and remembered none of them. A call (someone asked for
+    // him) still converses facelessly, but the opener invites them down to his level instead
+    // of asking the name; he retries the face on a fresh look up to chatFaceTries times; the
+    // name is asked (or one already given is used) only once a usable face is in hand, and
+    // then it is stored with the face. With no usable face he chats unnamed, as before.
+
+    /** A call from Priya on his left whose face is usable from the usableFrom-th match on (0: never). */
+    private static Rig facelessCallRig(int usableFrom, TurnScript turns, Hearing... listens) {
+        Rig rig = chatRig(personAt(bearingOf(-90f), 25), false);
+        rig.people.match = (r, k) -> usableFrom > 0 && k >= usableFrom
+                ? CuriosityPort.MatchAnswer.stranger().withMatch(FaceMatcher.Band.WEAK, null, 0.1f, 40L + k)
+                        .withConversation(r.people.persona, null, null, null)
+                : noFace(r);
+        rig.turns = turns;
+        rig.people.listen = ListenScript.turns(listens);
+        return rig;
+    }
+
+    private static Hearing[] replies(int ok) {
+        Hearing[] h = new Hearing[ok + 1];
+        for (int i = 0; i < ok; i++) {
+            h[i] = hearWords("sure");
+        }
+        h[ok] = hearWords("bye");
+        return h;
+    }
+
+    /** The index of the first turn request carrying faceSeen, or -1. */
+    private static int firstFaceSeen(Rig rig) {
+        for (int i = 0; i < rig.turnAsks.size(); i++) {
+            if (rig.turnAsks.get(i).request.faceSeen) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static void facelessCallScenarios() {
+        scenario("call_faceless_meeting_opener_invites_them_down_and_does_not_ask_the_name", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k), replies(1));
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            boolean allFaceless = !rig.turnAsks.isEmpty();
+            for (TurnAsk t : rig.turnAsks) {
+                allFaceless &= t.request.faceless && !t.request.faceSeen;
+            }
+            check(n, open > 0 && over > 0 && first != null && first.request.heard == null && first.request.name == null
+                            && allFaceless && rig.kept.isEmpty() && rig.violations.isEmpty(),
+                    "open@" + open + " asks=" + rig.turnAsks + " " + rig.tail());
+        });
+        scenario("call_faceless_usable_face_on_a_retry_asks_the_name_then_stores_name_and_face", n -> {
+            // The face is usable on the third match (the meeting's, then two retries).
+            Rig rig = facelessCallRig(3, (r, req, k) -> req.faceSeen && req.name == null ? named(k, "Priya")
+                    : turnLine(k), replies(6));
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            int seen = firstFaceSeen(rig);
+            int third = rig.first("match NEW", rig.first("match NEW", rig.first("match NEW", 0) + 1) + 1);
+            check(n, open > 0 && over > 0 && rig.count("match") == 3 && seen > 0
+                            && rig.turnAsks.get(seen).t > rig.timeOf(third)
+                            && rig.kept.equals(java.util.Arrays.asList("Priya"))
+                            && rig.resolves.equals(java.util.Arrays.asList("Priya")) && !rig.notesDeltas.isEmpty()
+                            && allStartWith(rig.notesDeltas, "kept-1: ") && !noted(notes, "discarded (R19)")
+                            && noted(notes, "a usable face on try 2 of 3") && rig.violations.isEmpty(),
+                    "seen=" + seen + " kept=" + rig.kept + " deltas=" + rig.notesDeltas + " asks=" + rig.turnAsks + " "
+                            + rig.tail());
+        });
+        scenario("call_faceless_name_given_is_held_and_stored_when_a_face_arrives_on_a_retry", n -> {
+            Rig rig = facelessCallRig(3, turnsOf(turnLine(1), named(2, "Priya")), replies(6));
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.count("match") == 3 && noted(notes, "the name is held")
+                            && rig.kept.equals(java.util.Arrays.asList("Priya"))
+                            && rig.resolves.equals(java.util.Arrays.asList("Priya")) && firstFaceSeen(rig) < 0
+                            && allStartWith(rig.notesDeltas, "kept-1: ") && rig.notesDeltas.size() >= 2
+                            && !noted(notes, "discarded (R19)") && rig.violations.isEmpty(),
+                    "kept=" + rig.kept + " deltas=" + rig.notesDeltas + " " + rig.tail());
+        });
+        scenario("call_faceless_with_no_usable_face_on_any_retry_chats_unnamed_and_discards_the_notes", n -> {
+            Rig rig = facelessCallRig(0, turnsOf(turnLine(1), named(2, "Priya")), replies(8));
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.count("match") == 1 + rig.tuning.chatFaceTries
+                            && rig.tuning.chatFaceTries == 3 && rig.kept.isEmpty() && rig.resolves.isEmpty()
+                            && noted(notes, "no usable face after 3 tries") && noted(notes, "discarded (R19)")
+                            && firstFaceSeen(rig) < 0 && rig.violations.isEmpty(),
+                    "matches=" + rig.count("match") + " " + rig.tail());
+        });
+    }
+
+    // ---- a call while his turns do nothing (robot 2026-10-01: the motor board latched) ----
+    //
+    // Every search turn was blocked, the call went back to its slot, and the search restarted
+    // 40 ms into the wedge escape, every 2-4 s for 40 s. Now the waiting call lets the escape
+    // run first, and a call whose search turns were blocked twice meets the caller where he is.
+
+    private static Rig stuckCallRig(List<String> notes) {
+        Rig rig = talkRig(EMPTY_ROOM);
+        rig.people.listen = ListenScript.turns(hearWords("over here"), hearWords("bye"));
+        rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+        rig.started();
+        rig.runUntil(400);
+        rig.yaw.stuck = true;
+        rig.cue(410, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, Float.NaN);
+        return rig;
+    }
+
+    private static void blockedSearchScenarios() {
+        scenario("call_with_turns_that_never_turn_searches_at_most_twice_then_meets_where_he_is", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = stuckCallRig(notes);
+            long meet = runUntilNoted(rig, notes, "meeting without a look", 120000);
+            rig.runUntil(Math.max(meet, 410) + 5000);
+            rig.runUntil(rig.now + 30000);
+            int searches = notedCount(notes, "looking for the caller with no angle");
+            System.out.println("REPORT a call with turns that never turn: " + searches + " search starts, met where he is at "
+                    + meet + " ms, " + notedCount(notes, "failed escapes in a row") + " escape notes; "
+                    + notes.stream().filter(x -> x.contains("search turn would not turn") || x.contains("gives way")
+                    || x.contains("backing up first") || x.contains("looking for the caller with")).collect(java.util.stream.Collectors.toList()));
+            check(n, meet > 0 && searches >= 1 && searches <= 2 && entered(rig, ExploreBrain.State.MEET, 410) > 0
+                            && notedCount(notes, "meeting without a look") == 1,
+                    "meet@" + meet + " searches=" + searches + " " + rig.tail());
+        });
+        scenario("call_search_waits_for_the_escape_back_up_before_it_restarts", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = stuckCallRig(notes);
+            runUntilNoted(rig, notes, "meeting without a look", 120000);
+            long blocked = notedAt(notes, "measured turn blocked", 410);
+            long backUp = notedAt(notes, "backing up first", Math.max(blocked, 0));
+            long again = blocked < 0 ? -1 : notedAt(notes, "looking for the caller with no angle", blocked);
+            boolean backed = false;
+            for (Drive d : rig.drives) {
+                backed |= d.kind.equals("back") && d.t > blocked && (again < 0 || d.t < again);
+            }
+            check(n, blocked > 0 && backUp > 0 && backed && (again < 0 || again > backUp + 500),
+                    "blocked@" + blocked + " backUp@" + backUp + " again@" + again + " " + rig.tail());
         });
     }
 
