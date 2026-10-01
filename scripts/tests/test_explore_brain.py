@@ -270,6 +270,12 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "pinned_runs_the_ladder_once_with_two_asks_then_rests",
         "pinned_after_the_rest_waits_longer_before_the_next_ladder",
         "pinned_backoff_resets_after_a_clean_drive_off",
+        # Fully jammed (robot 2026-10-01, stuck under a chair): stop pushing and ask for help
+        "jammed_nothing_moves_one_help_line_one_probe_per_rest_no_ladder_loop",
+        "jammed_help_line_at_most_every_five_minutes",
+        "jammed_probe_that_moves_resumes_roaming",
+        "jammed_moved_from_outside_probes_at_once",
+        "jammed_partial_block_one_way_free_runs_the_escape",
         # A step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, drive-off cut mid-turn)
         "budget_drive_off_turn_at_40_deg_s_completes_and_drives_off",
         "budget_slow_but_progressing_turn_is_never_cut_by_the_step_budget",

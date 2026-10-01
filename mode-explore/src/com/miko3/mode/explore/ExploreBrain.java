@@ -31,7 +31,8 @@ import java.util.Set;
  *              hopTickMs apart (each resend keeps it rolling), then stop (R1)
  *   STARTLE    stopped, startle clip and flinch (R11)
  *   BACK_OFF   the only reversing: backTicks, time-bounded and blind (R4, R12)
- *   CORNERED   too many hazards too fast: resting eyes, no motion (KTD8)
+ *   CORNERED   too many hazards too fast: resting eyes, no motion (KTD8); also the
+ *              fully jammed rest (robot 2026-10-01): the help line, jammedRestMs, one short back-up
  *   STOPPED    after shutdown(); inert
  *
  * Camera curiosity (camera curiosity plan KTD5), entered from PAUSE when a
@@ -846,6 +847,36 @@ final class ExploreBrain {
     /** The measured turn that would not turn when he was wedged (null: another trigger), and its amount. */
     private Direction wedgeTurnDir;
     private double wedgeTurnDeg;
+    /** How far the measured turn that wedged him had turned when it was ruled blocked. */
+    private double wedgeTurnTurned = Double.NaN;
+
+    // ---- fully jammed (robot 2026-10-01: "he's constantly getting stuck under this chair") ----
+    /** The fixed help line, said on the launcher's speech service (no Claude call). */
+    static final String HELP_LINE = "I'm stuck under here. Could someone pull me out?";
+    /** This escape: a back-up went nowhere (under stallMinCounts). */
+    private boolean jamBackStalled;
+    /** This escape: the ways a measured turn turned under jamTurnDeg. */
+    private final EnumSet<Direction> jamBlockedWays = EnumSet.noneOf(Direction.class);
+    /** Fully jammed: no escapes, only the long rests and one short back-up after each. */
+    private boolean jammed;
+    /** How many times he has been fully jammed since start, for the log. */
+    private int jams;
+    /** The one short back-up after a jammed rest is under way, until jamProbeUntil. */
+    private boolean jamProbing;
+    private long jamProbeUntil;
+    /** The probe's ticks are done and its motors stopped at this time; it is judged on a later reading. */
+    private long jamJudgeAfter;
+    /** Wheel counts moved (average of both wheels) since the rest or the probe began, and from where. */
+    private long jamMoved;
+    private SensorReading jamFrom;
+    /** The heading when the rest began (NaN: unusable), to see him turned from outside. */
+    private double jamHeading = Double.NaN;
+    /** Why the rest ends early (moved from outside, shoved), or null. */
+    private String jamPoke;
+    /** The help line waits for the camera to close; when it was last said. */
+    private boolean jamHelpPending;
+    private long jamHelpAt = NEVER;
+
     /** This ladder's: the blocked turn to try the free way after the first back-up (null: none). */
     private Direction escRetryDir;
     private double escRetryDeg;
@@ -1128,6 +1159,7 @@ final class ExploreBrain {
         classifier.offer(reading);
         trackWheels(reading);
         countEscapeWheels(reading);
+        countJamWheels(reading);
         lastReading = reading;
         compass.offer(reading, moving);
         headingHistory.offer(reading.timestampMs,
@@ -1468,6 +1500,10 @@ final class ExploreBrain {
                 escapeTick(now, fresh, hazard);
                 break;
             case CORNERED:
+                if (jammed) {
+                    jamStep(now, fresh);
+                    break;
+                }
                 if (now >= phaseUntil) {
                     if (!ladderAfterRest) {
                         restEndedAt = now;
@@ -1510,6 +1546,7 @@ final class ExploreBrain {
             blockedAheadAt = Double.NaN;
         }
         // Driven away cleanly: whatever cornered him is behind him.
+        jammed = false;
         compass.droveOffCleanly();
         hazardTimes.clear();
         stallStreak = 0;
@@ -3900,6 +3937,7 @@ final class ExploreBrain {
         leaveStopForHazard();
         wedgeTurnDir = heading;
         wedgeTurnDeg = turnDeg;
+        wedgeTurnTurned = measured ? Math.abs(compass.turned()) : Double.NaN;
         wedged(now, "a turn that would not turn", true);
     }
 
@@ -3943,6 +3981,11 @@ final class ExploreBrain {
             enterCornered(now);
             return;
         }
+        if (jammed) {
+            note("still jammed: " + why + "; no escape, resting");
+            jamRest(now);
+            return;
+        }
         if (failedLadders > 0 && now - restEndedAt <= tuning.pinnedWindowMs) {
             // The first move after the rest is blocked too: still pinned. The ladder (and
             // its two Claude asks) waits out a longer rest instead of running again now.
@@ -3976,6 +4019,12 @@ final class ExploreBrain {
                 + failedLadders + " failed escapes in a row); escaping");
         hazardTimes.clear();
         escapeFailures.clear();
+        jamBackStalled = false;
+        jamBlockedWays.clear();
+        if (turnBlocked && wedgeTurnDir != null && wedgeTurnTurned < tuning.jamTurnDeg) {
+            jamBlockedWays.add(wedgeTurnDir);
+        }
+        wedgeTurnTurned = Double.NaN;
         planner.begin(now, compass.degrees());
         escDroveForward = false;
         escBackOutFirst = turnBlocked;
@@ -4308,6 +4357,9 @@ final class ExploreBrain {
         boolean stalled = (escGoal > 0 || escShortBack) && wheelsStalled(now);
         if (reached || stalled || now >= escUntil) {
             stopMotors();
+            if (!reached && escFrom != null && escMoved < tuning.stallMinCounts) {
+                jamBackStalled = true;
+            }
             if (escShortBack) {
                 escShortBack = false;
                 escGoal = escGoalAfterRetry;
@@ -4320,6 +4372,9 @@ final class ExploreBrain {
                 } else {
                     note("backed out " + escMoved + " counts");
                 }
+            }
+            if (jamCheck(now)) {
+                return;
             }
             if (escThen == EscThen.FIRST_BACK) {
                 afterFirstBack(now, escMoved >= tuning.stallMinCounts);
@@ -4473,6 +4528,12 @@ final class ExploreBrain {
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
                 + " deg in " + (now - turnStartedAt) + " ms (" + escDir + ")");
         blockSide(escDir);
+        if (measured && Math.abs(compass.turned()) < tuning.jamTurnDeg) {
+            jamBlockedWays.add(escDir);
+        }
+        if (jamCheck(now)) {
+            return;
+        }
         if (escFirstRetry) {
             firstRetryFailed(now, "a turn that would not turn");
             return;
@@ -4869,6 +4930,7 @@ final class ExploreBrain {
     private void escapeFreed(long now, String how, boolean droveForward) {
         stopMotors();
         note("free after " + (now - (planner.active() ? planner.startedAt() : probeSince)) + " ms: " + how);
+        jammed = false;
         if (droveForward) {
             blockedSides.clear();
         }
@@ -5277,6 +5339,9 @@ final class ExploreBrain {
         }
         note("shoved: " + shove.counts + " counts while stopped");
         gauges.count(Gauges.Counter.SHOVES);
+        if (jammed && state == State.CORNERED && !jamProbing && jamPoke == null) {
+            jamPoke = "shoved (" + shove.counts + " counts)";
+        }
         lastShoveAt = shove.at;
         port.earsShoved(shove.at);
         offerCue(now, new Ears.Cue(Ears.Kind.VOICE, Ears.Tier.WEAK, Ears.Side.UNKNOWN, Float.NaN, shove.at));
@@ -5538,6 +5603,10 @@ final class ExploreBrain {
         }
         if (state == State.STARTLE || state == State.BACK_OFF) {
             return CallVerdict.WAIT;
+        }
+        if (jammed) {
+            // Fully jammed (robot 2026-10-01): a search turn would only push against the jam.
+            return CallVerdict.IN_PLACE;
         }
         if (callBlockedTurns >= tuning.callBlockedTurnsMax) {
             // Robot 2026-10-01 (the motor board latched): his turns do nothing, so no search.
@@ -6116,6 +6185,10 @@ final class ExploreBrain {
         if (remarkUnderway()) {
             // The remark rate (owner 2026-10-01): a voice that is not a call waits for the remark.
             return CueVerdict.HOLD;
+        }
+        if (jammed && state == State.CORNERED) {
+            // A turn to a voice would only push against the jam; a call is met where he is.
+            return CueVerdict.DROP;
         }
         switch (state) {
             case PAUSE: case HOP: case SCAN: case INSPECT: case REACT_HERE: case CORNERED: case ASK: case ORIENT:
@@ -6957,6 +7030,141 @@ final class ExploreBrain {
         moving = true;
         motor.backTick();
         compass.startLeg(true, now);
+    }
+
+    // ---- fully jammed (robot 2026-10-01) ----
+
+    /**
+     * Fully jammed: in this escape a back-up went nowhere and measured turns both ways
+     * turned under jamTurnDeg. Live under a chair, forward, reverse and both turns all
+     * moved nothing at once; the ladder and its 30 s rests kept pushing, which risks the
+     * motor board's stall latch. Stops the escape now and rests; true when it did.
+     */
+    private boolean jamCheck(long now) {
+        if (tuning.jamTurnDeg <= 0 || !jamBackStalled || jamBlockedWays.size() < 2) {
+            return false;
+        }
+        stopMotors();
+        cancelWayOut();
+        planner.reset();
+        esc = null;
+        probing = false;
+        escFirstRetry = false;
+        escShortBack = false;
+        jamBackStalled = false;
+        jamBlockedWays.clear();
+        jams++;
+        jammed = true;
+        note("fully jammed: the back-up went nowhere and turns both ways turned under "
+                + Math.round(tuning.jamTurnDeg) + " deg; no more pushing (jam " + jams + " since start)");
+        jamRest(now);
+        return true;
+    }
+
+    /** The jammed rest: no motion for jammedRestMs, the help line when due, then one short back-up. */
+    private void jamRest(long now) {
+        rest(now, tuning.jammedRestMs);
+        jamProbing = false;
+        jamPoke = null;
+        jamMoved = 0;
+        jamFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        jamHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
+        if (jamHelpAt == NEVER || now - jamHelpAt >= tuning.jamHelpEveryMs) {
+            jamHelpPending = true;
+        }
+        note("jammed: resting " + tuning.jammedRestMs + " ms, then one short back-up");
+    }
+
+    /** Wheel counts while jammed: someone pulling him out during the rest, or the probe moving. */
+    private void countJamWheels(SensorReading r) {
+        if (!jammed || state != State.CORNERED || !r.hasWheels()) {
+            return;
+        }
+        if (jamFrom != null) {
+            jamMoved += (Math.abs(r.wheelLeft - jamFrom.wheelLeft) + Math.abs(r.wheelRight - jamFrom.wheelRight)) / 2;
+        }
+        jamFrom = r;
+    }
+
+    /** CORNERED while jammed: the help line, the rest, the probe and its verdict. */
+    private void jamStep(long now, boolean fresh) {
+        if (jamHelpPending && !jamProbing
+                && (camera.quiet() || now - (phaseUntil - tuning.jammedRestMs) >= tuning.quietWaitMs)) {
+            // Said once the camera and detector are closed (R6), with no motion under way.
+            jamHelpPending = false;
+            jamHelpAt = now;
+            note("asking for help: \"" + HELP_LINE + "\"");
+            port.say(HELP_LINE);
+        }
+        if (jamProbing) {
+            if (now < jamProbeUntil) {
+                if (now >= nextTickAt) {
+                    nextTickAt += tuning.backTickMs;
+                    motor.backTick();
+                }
+                return;
+            }
+            if (moving) {
+                stopMotors();
+                jamJudgeAfter = now;
+            }
+            if (!fresh || now <= jamJudgeAfter) {
+                return;
+            }
+            jamProbing = false;
+            if (jamFrom != null && jamMoved >= tuning.stallMinCounts) {
+                jamFreed(now);
+            } else {
+                note("jam probe went nowhere (" + (jamFrom == null ? "no encoders" : jamMoved + " counts")
+                        + "): resting again");
+                jamRest(now);
+            }
+            return;
+        }
+        if (jamPoke == null && jamFrom != null && jamMoved >= tuning.jamMovedCounts) {
+            jamPoke = "moved from outside (" + jamMoved + " counts)";
+        }
+        if (jamPoke == null && !Double.isNaN(jamHeading) && compass.usable(now)
+                && Math.abs(Heading.delta(jamHeading, compass.degrees())) >= tuning.jamMovedDeg) {
+            jamPoke = "moved from outside (turned " + Math.round(Heading.delta(jamHeading, compass.degrees()))
+                    + " deg)";
+        }
+        if (jamPoke != null) {
+            startJamProbe(now, jamPoke);
+        } else if (now >= phaseUntil) {
+            startJamProbe(now, "the rest is over");
+        }
+    }
+
+    /** The one gentle probe: jamProbeTicks back ticks, blind and bounded by their time. */
+    private void startJamProbe(long now, String why) {
+        note("jam probe: " + why + "; backing up " + tuning.jamProbeTicks + " ticks");
+        jamPoke = null;
+        jamProbing = true;
+        jamMoved = 0;
+        jamFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        jamProbeUntil = now + tuning.jamProbeTicks * tuning.backTickMs;
+        nextTickAt = now + tuning.backTickMs;
+        moving = true;
+        motor.backTick();
+    }
+
+    /** The probe moved: he is free, and roams again with today's escape state cleared. */
+    private void jamFreed(long now) {
+        note("jam probe moved " + jamMoved + " counts: free, roaming again");
+        jammed = false;
+        jamHelpPending = false;
+        blockedSides.clear();
+        blockedAheadAt = Double.NaN;
+        ladderAfterRest = false;
+        restEndedAt = NEVER;
+        hazardTimes.clear();
+        stallStreak = 0;
+        failedLadders = 0;
+        escapeFailures.clear();
+        escapeSide = null;
+        lastHazardSide = null;
+        enterPause(now, pauseMs(), false);
     }
 
     private void enterCornered(long now) {

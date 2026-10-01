@@ -276,6 +276,22 @@ final class ExploreTuning {
      */
     final int callBlockedTurnsMax;
     final double callBlockedTurnDeg;
+    /**
+     * Fully jammed (robot 2026-10-01, "constantly getting stuck under this chair": head
+     * against the seat, every wheel wedged): in one escape, a back-up that moved under
+     * stallMinCounts and measured turns both ways that turned under jamTurnDeg. He stops
+     * pushing at once (repeated stalled pushing latches the motor board), says the help
+     * line at most every jamHelpEveryMs, rests jammedRestMs, then tries one short back-up
+     * of jamProbeTicks back ticks; it moving frees him, else he rests again. Moved from
+     * outside while resting (jamMovedCounts wheel counts, or jamMovedDeg of heading), he
+     * probes at once. jamTurnDeg 0: off (the escape ladder and its rests, as before).
+     */
+    final double jamTurnDeg;
+    final long jammedRestMs;
+    final long jamHelpEveryMs;
+    final int jamProbeTicks;
+    final long jamMovedCounts;
+    final double jamMovedDeg;
     final float callPersonMinHeight;
     /**
      * The call search's own person-score floor, used instead of confidenceFloor only
@@ -708,6 +724,12 @@ final class ExploreTuning {
         callSeenRetargetsMax = Math.max(0, b.callSeenRetargetsMax);
         callBlockedTurnsMax = Math.max(1, b.callBlockedTurnsMax);
         callBlockedTurnDeg = Math.max(0, b.callBlockedTurnDeg);
+        jamTurnDeg = Math.max(0, b.jamTurnDeg);
+        jammedRestMs = Math.max(1, b.jammedRestMs);
+        jamHelpEveryMs = Math.max(0, b.jamHelpEveryMs);
+        jamProbeTicks = Math.max(1, b.jamProbeTicks);
+        jamMovedCounts = Math.max(1, b.jamMovedCounts);
+        jamMovedDeg = Math.max(1, b.jamMovedDeg);
         callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
         callPersonMinScore = Math.max(0f, b.callPersonMinScore);
         callNearHeight = Math.max(0f, b.callNearHeight);
@@ -1016,6 +1038,13 @@ final class ExploreTuning {
         private int callSeenRetargetsMax = 2;
         private int callBlockedTurnsMax = 2;
         private double callBlockedTurnDeg = 10;
+        private double jamTurnDeg = 10;
+        private long jammedRestMs = 120000;
+        private long jamHelpEveryMs = 300000;
+        // ~1 s at backTickMs: gentle, half the escape's first back-up.
+        private int jamProbeTicks = 4;
+        private long jamMovedCounts = 30;
+        private double jamMovedDeg = 25;
         private float callPersonMinHeight = 0.12f;
         // Robot QA 2026-09-30: a floor-level caller scored person 0.27 and 0.32.
         private float callPersonMinScore = 0.25f;
@@ -1297,6 +1326,16 @@ final class ExploreTuning {
         Builder phantomPersonCooldownMs(long v) { phantomPersonCooldownMs = v; return this; }
         Builder callSeenRetargetsMax(int v) { callSeenRetargetsMax = v; return this; }
         Builder callBlockedTurns(int max, double deg) { callBlockedTurnsMax = max; callBlockedTurnDeg = deg; return this; }
+        Builder jam(double turnDeg, long restMs, long helpEveryMs, int probeTicks) {
+            jamTurnDeg = turnDeg;
+            jammedRestMs = restMs;
+            jamHelpEveryMs = helpEveryMs;
+            jamProbeTicks = probeTicks;
+            return this;
+        }
+        Builder jamMoved(long counts, double deg) { jamMovedCounts = counts; jamMovedDeg = deg; return this; }
+        /** No jam detection: a fully jammed escape runs the ladder and its rests, as before 2026-10-01. */
+        Builder jamOff() { jamTurnDeg = 0; return this; }
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
         Builder quietWaitMs(long v) { quietWaitMs = v; return this; }

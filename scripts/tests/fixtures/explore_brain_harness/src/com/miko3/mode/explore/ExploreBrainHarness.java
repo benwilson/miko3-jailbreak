@@ -2758,6 +2758,7 @@ public final class ExploreBrainHarness {
         coverageScenarios();
         escapeScenarios();
         pinnedScenarios();
+        jamScenarios();
         budgetScenarios();
         forwardFirstScenarios();
         sideScenarios();
@@ -6032,8 +6033,21 @@ public final class ExploreBrainHarness {
 
     /** A pinned rig whose Claude always points straight ahead in the first frame (no turn needed). */
     private static Rig pinnedRig(List<String> notes) {
+        return pinnedRig(notes, escTuning());
+    }
+
+    /**
+     * pinnedRig with jam detection off (ExploreTuning.jamOff): the escape ladder, its rests
+     * and its forward tries as they still run when the encoders can't rule a back-up (since
+     * 2026-10-01 a fully pinned rig with encoders is jammed: the jam scenarios).
+     */
+    private static Rig pinnedLadderRig(List<String> notes) {
+        return pinnedRig(notes, escTuning().jamOff());
+    }
+
+    private static Rig pinnedRig(List<String> notes, ExploreTuning.Builder b) {
         Rig[] h = new Rig[1];
-        Rig rig = escRig(escTuning().turnChance(1.0), h, CLEAR, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+        Rig rig = escRig(b.turnChance(1.0), h, CLEAR, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
         rig.creepPer100 = 0;
         rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
         pin(rig, true);
@@ -6074,7 +6088,7 @@ public final class ExploreBrainHarness {
     private static void pinnedScenarios() {
         scenario("pinned_runs_the_ladder_once_with_two_asks_then_rests", n -> {
             List<String> notes = new ArrayList<String>();
-            Rig rig = pinnedRig(notes);
+            Rig rig = pinnedLadderRig(notes);
             rig.started();
             runUntil(rig, 60000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
             long rest = entered(rig, ExploreBrain.State.CORNERED, 0);
@@ -6099,7 +6113,7 @@ public final class ExploreBrainHarness {
             // ladder. Ladders start near 0 s, ~103 s, ~264 s here: at most 3 in 5 minutes,
             // so at most 6 way-out asks (two per ladder) where 30 s rests alone gave ~7 ladders.
             List<String> notes = new ArrayList<String>();
-            Rig rig = pinnedRig(notes);
+            Rig rig = pinnedLadderRig(notes);
             rig.started();
             rig.runUntil(300000);
             List<Long> ladders = entries(rig, ExploreBrain.State.RETRACE);
@@ -6121,7 +6135,7 @@ public final class ExploreBrainHarness {
         });
         scenario("pinned_backoff_resets_after_a_clean_drive_off", n -> {
             List<String> notes = new ArrayList<String>();
-            Rig rig = pinnedRig(notes);
+            Rig rig = pinnedLadderRig(notes);
             rig.started();
             // Pinned: ladder 1 fails, the rest, still pinned, the longer rest.
             runUntil(rig, 120000, r -> entries(r, ExploreBrain.State.CORNERED).size() >= 2);
@@ -6150,6 +6164,133 @@ public final class ExploreBrainHarness {
                             && restLength(rig, rest3) == 30000 && rest4 > rest3 && restLength(rig, rest4) == 60000
                             && rig.violations.isEmpty(),
                     "free@" + freeAt + " ladders=" + ladders + " rests=" + rests + " " + rig.tail());
+        });
+    }
+
+    // ---- fully jammed (robot 2026-10-01: "constantly getting stuck under this chair") ----
+
+    /** The help line's say events at or after from. */
+    private static List<Long> helpLines(Rig rig, long from) {
+        List<Long> out = new ArrayList<Long>();
+        for (Event e : rig.log) {
+            if (e.t >= from && e.what.startsWith("say ") && e.what.contains("stuck")) {
+                out.add(e.t);
+            }
+        }
+        return out;
+    }
+
+    /** Back drives (each a fresh reverse) started in [from, to). */
+    private static List<Long> backDrives(Rig rig, long from, long to) {
+        List<Long> out = new ArrayList<Long>();
+        for (Drive d : rig.drives) {
+            if (d.kind.equals("back") && d.t >= from && d.t < to) {
+                out.add(d.t);
+            }
+        }
+        return out;
+    }
+
+    private static void jamScenarios() {
+        scenario("jammed_nothing_moves_one_help_line_one_probe_per_rest_no_ladder_loop", n -> {
+            // Forward, reverse and both turns go nowhere (under the seat, every wheel wedged):
+            // the escape stops the moment the back-up and both turns have gone nowhere, he asks
+            // for help once, rests jammedRestMs (120 s), then one short back-up per rest. No
+            // more ladders, way-out asks, turns or forward pushes; no 30 s rest loop.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            rig.runUntil(290000);
+            long jamAt = notedAt(notes, "fully jammed");
+            List<Long> rests = entries(rig, ExploreBrain.State.CORNERED);
+            List<Long> helps = helpLines(rig, 0);
+            List<Long> probes = backDrives(rig, jamAt + 1, Long.MAX_VALUE);
+            int pushes = rig.countPrefix("hop", jamAt + 1, Long.MAX_VALUE)
+                    + rig.countPrefix("turn", jamAt + 1, Long.MAX_VALUE);
+            int laddersAfter = 0;
+            for (long t : entries(rig, ExploreBrain.State.RETRACE)) {
+                laddersAfter += t > jamAt ? 1 : 0;
+            }
+            // Each rest is 120 s; a rest after a probe stays in CORNERED (one state entry).
+            boolean probesSpaced = probes.size() == 2 && withinTick(probes.get(0), jamAt + 120000)
+                    && probes.get(1) - probes.get(0) >= 120000;
+            check(n, jamAt > 0 && jamAt < 30000 && helps.size() == 1 && helps.get(0) >= jamAt
+                            && helps.get(0) - jamAt < 2000 && !rests.isEmpty() && rests.get(0) >= jamAt
+                            && rests.get(0) - jamAt < 100 && rests.size() == 1
+                            && probesSpaced && pushes == 0 && laddersAfter == 0 && rig.wayOutRequests.size() <= 1
+                            && notesWith(notes, "cornered: ") == 0 && notesWith(notes, "free after") == 0
+                            && rig.violations.isEmpty(),
+                    "jam@" + jamAt + " rests=" + rests + " helps=" + helps + " probes=" + probes + " pushes=" + pushes
+                            + " ladders after=" + laddersAfter + " asks=" + rig.wayOutRequests.size() + " notes="
+                            + notes.subList(Math.max(0, notes.size() - 25), notes.size()));
+        });
+        scenario("jammed_help_line_at_most_every_five_minutes", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            rig.runUntil(800000);
+            List<Long> helps = helpLines(rig, 0);
+            boolean spaced = true;
+            for (int i = 1; i < helps.size(); i++) {
+                spaced &= helps.get(i) - helps.get(i - 1) >= 300000;
+            }
+            check(n, helps.size() >= 2 && helps.size() <= 3 && spaced && notesWith(notes, "free") == 0
+                            && rig.violations.isEmpty(),
+                    "helps=" + helps + " " + rig.tail());
+        });
+        scenario("jammed_probe_that_moves_resumes_roaming", n -> {
+            // Pulled out during the rest (nothing told him): the probe at its end moves, so he
+            // is free and roams again.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "fully jammed") >= 0);
+            long jamAt = rig.now;
+            rig.runUntil(jamAt + 30000);
+            pin(rig, false);
+            rig.runUntil(jamAt + 140000);
+            List<Long> probes = backDrives(rig, jamAt + 1, Long.MAX_VALUE);
+            long freeAt = notedAt(notes, "jam probe moved");
+            long hop = entered(rig, ExploreBrain.State.HOP, Math.max(freeAt, 0));
+            check(n, jamAt > 0 && !probes.isEmpty() && probes.get(0) >= jamAt + 119000 && freeAt > probes.get(0)
+                            && hop > freeAt && helpLines(rig, 0).size() == 1 && rig.violations.isEmpty(),
+                    "jam@" + jamAt + " probes=" + probes + " free@" + freeAt + " hop@" + hop + " " + rig.tail());
+        });
+        scenario("jammed_moved_from_outside_probes_at_once", n -> {
+            // Pulled out by hand 20 s into the rest: the encoders count it, and he probes at
+            // once instead of sitting out the 120 s.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "fully jammed") >= 0);
+            long jamAt = rig.now;
+            rig.runUntil(jamAt + 20000);
+            pin(rig, false);
+            long movedAt = rig.now;
+            rig.wheelLeft -= 200;
+            rig.wheelRight -= 200;
+            rig.runUntil(movedAt + 5000);
+            List<Long> probes = backDrives(rig, jamAt + 1, Long.MAX_VALUE);
+            long freeAt = notedAt(notes, "jam probe moved");
+            check(n, notedAt(notes, "moved from outside") >= movedAt && !probes.isEmpty()
+                            && probes.get(0) - movedAt <= 1000 && freeAt > probes.get(0) && rig.violations.isEmpty(),
+                    "jam@" + jamAt + " moved@" + movedAt + " probes=" + probes + " free@" + freeAt + " " + rig.tail());
+        });
+        scenario("jammed_partial_block_one_way_free_runs_the_escape", n -> {
+            // As side_left_blocked_escape_ladder_commands_no_left_turn_until_free: reversing and
+            // LEFT blocked, RIGHT free. Not fully jammed: the escape handles it, no help line.
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
+            rig.yaw.stuckDir = 1;
+            rig.backBlocked = true;
+            rig.openView = openAt(90);
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 120000, r -> notedAt(notes, "free after") >= 0 || r.brain.state() == ExploreBrain.State.CORNERED);
+            check(n, entered(rig, ExploreBrain.State.RETRACE, 0) > 0 && notedAt(notes, "free after") > 0
+                            && notedAt(notes, "fully jammed") < 0 && helpLines(rig, 0).isEmpty()
+                            && rig.violations.isEmpty(),
+                    "notes=" + notes.subList(Math.max(0, notes.size() - 20), notes.size()));
         });
     }
 
@@ -6279,7 +6420,7 @@ public final class ExploreBrainHarness {
     private static void forwardFirstScenarios() {
         scenario("forward_first_after_a_rest_facing_open_floor_drives_forward_instead_of_turning", n -> {
             List<String> notes = new ArrayList<String>();
-            Rig rig = pinnedRig(notes);
+            Rig rig = pinnedLadderRig(notes);
             rig.started();
             runUntil(rig, 60000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
             long rest = rig.now;
@@ -6299,7 +6440,7 @@ public final class ExploreBrainHarness {
             // Pinned: the forward try goes nowhere, then the wider turn and the still-pinned
             // rest as before; with an obstacle in front, no forward try at all, only the turn.
             List<String> notes = new ArrayList<String>();
-            Rig rig = pinnedRig(notes);
+            Rig rig = pinnedLadderRig(notes);
             rig.started();
             runUntil(rig, 60000, r -> r.brain.state() == ExploreBrain.State.CORNERED);
             long rest = rig.now;
@@ -6316,7 +6457,7 @@ public final class ExploreBrainHarness {
 
             List<String> notes2 = new ArrayList<String>();
             Rig[] h = new Rig[1];
-            Rig rig2 = escRig(escTuning().turnChance(1.0), h, t -> {
+            Rig rig2 = escRig(escTuning().jamOff().turnChance(1.0), h, t -> {
                 Rig r = h[0];
                 return r != null && r.statesSeen.contains(ExploreBrain.State.CORNERED) ? obstacle(t) : clear(t);
             }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
@@ -6497,7 +6638,7 @@ public final class ExploreBrainHarness {
         scenario("side_both_blocked_alternates_instead_of_one_side_for_ever", n -> {
             // Every turn blocked: the retries and ladders go back and forth, not LEFT every time.
             List<String> notes = new ArrayList<String>();
-            Rig rig = pinnedRig(notes);
+            Rig rig = pinnedLadderRig(notes);
             rig.started();
             rig.runUntil(120000);
             List<long[]> turns = turnCommands(rig, 0, Long.MAX_VALUE);
@@ -7327,7 +7468,9 @@ public final class ExploreBrainHarness {
             // Pinned: turns and reversing go nowhere. A long back-up (12 ticks, 3 s) stops on the
             // stall watch (~1 s here); the retried turn is still blocked, so he is wedged, and each
             // blocked turn of the escape's circle backs up once too.
-            Rig rig = new Rig(escTuning().turnChance(1.0).blockedTurnBackTicks(12).build(), CLEAR, NOTHING, true);
+            // Jam detection off: with it, the circle's first blocked turn would end the escape (jammed).
+            Rig rig = new Rig(escTuning().turnChance(1.0).blockedTurnBackTicks(12).jamOff().build(), CLEAR, NOTHING,
+                    true);
             rig.simWheels = true;
             rig.yaw.stuck = true;
             rig.backBlocked = true;
