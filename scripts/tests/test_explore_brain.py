@@ -282,6 +282,13 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "wriggle_wheels_spin_heading_never_moves_full_time_both_ways_then_help_one_per_two_minutes",
         "wriggle_two_blocked_escape_turns_in_a_row_wriggles_before_the_ladder_grinds",
         "wriggle_the_1408_chair_episode_wedge_turn_stalled_back_up_blocked_retrace_is_caught",
+        # The post-stall recovery wait (robot 2026-10-01: the motor board refused all motion for 9-29 s)
+        "recover_a_12s_cutout_probes_find_nothing_until_20s_then_the_normal_escape",
+        "recover_motors_that_never_come_back_probe_then_wriggle_then_the_help_line",
+        "recover_no_cutout_the_first_probe_moves_and_the_escape_goes_on",
+        "recover_a_call_while_waiting_is_answered_where_he_stands",
+        "recover_a_shove_while_waiting_probes_at_once",
+        "recover_a_turn_that_reads_nothing_after_a_bump_waits_and_its_attempts_never_count",
         # A step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, drive-off cut mid-turn)
         "budget_drive_off_turn_at_40_deg_s_completes_and_drives_off",
         "budget_slow_but_progressing_turn_is_never_cut_by_the_step_budget",

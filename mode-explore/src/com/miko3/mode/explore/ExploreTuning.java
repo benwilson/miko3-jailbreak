@@ -310,6 +310,24 @@ final class ExploreTuning {
     final double wriggleFreeDeg;
     final long wriggleFreeCounts;
     final long wriggleEveryMs;
+    /**
+     * The post-stall recovery wait (robot 2026-10-01, 14:08 and 14:33): after a drive
+     * stall the motor board refused all motion for somewhere between ~9 s and 29 s, then
+     * recovered by itself, so an escape run at once read 0 counts and 0 deg everywhere and
+     * misjudged a jam. After a stall (forward or a back-up that went nowhere), or a turn
+     * whose wheels read nothing within stallRecoverWindowMs of a stall or a collision stop,
+     * he stops and waits, probing with one short turn (stallRecoverProbeMs) at each of
+     * stallRecoverProbesMs after the stall. A probe that moves stallMinCounts wheel counts
+     * (both wheels) or stallRecoverProbeDeg of heading: the board is back, and the normal
+     * escape runs. None by the last: a real jam (the wriggle, then the help line). Once per
+     * stuck spell (until he drives off cleanly or is freed). Empty: off. The probe turns in
+     * place: a wedged wheel still counts when the board is alive (the 14:34 spin: ~100
+     * counts per 0.5 s), and a turn can't back him blind into what stopped the back-up.
+     */
+    final long[] stallRecoverProbesMs;
+    final long stallRecoverProbeMs;
+    final double stallRecoverProbeDeg;
+    final long stallRecoverWindowMs;
     final float callPersonMinHeight;
     /**
      * The call search's own person-score floor, used instead of confidenceFloor only
@@ -776,6 +794,10 @@ final class ExploreTuning {
         wriggleFreeDeg = Math.max(1, b.wriggleFreeDeg);
         wriggleFreeCounts = Math.max(1, b.wriggleFreeCounts);
         wriggleEveryMs = Math.max(0, b.wriggleEveryMs);
+        stallRecoverProbesMs = positiveSorted(b.stallRecoverProbesMs);
+        stallRecoverProbeMs = Math.max(50, b.stallRecoverProbeMs);
+        stallRecoverProbeDeg = Math.max(1, b.stallRecoverProbeDeg);
+        stallRecoverWindowMs = Math.max(0, b.stallRecoverWindowMs);
         callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
         callPersonMinScore = Math.max(0f, b.callPersonMinScore);
         callNearHeight = Math.max(0f, b.callNearHeight);
@@ -897,6 +919,20 @@ final class ExploreTuning {
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
+    /** The positive values, ascending (a recovery probe at or before the stall is meaningless). */
+    private static long[] positiveSorted(long[] v) {
+        long[] out = new long[v == null ? 0 : v.length];
+        int n = 0;
+        for (int i = 0; i < out.length; i++) {
+            if (v[i] > 0) {
+                out[n++] = v[i];
+            }
+        }
+        out = java.util.Arrays.copyOf(out, n);
+        java.util.Arrays.sort(out);
+        return out;
+    }
+
     static ExploreTuning defaults(Calibration calibration) {
         return defaults(calibration, null);
     }
@@ -1108,6 +1144,14 @@ final class ExploreTuning {
         private double wriggleFreeDeg = 20;
         private long wriggleFreeCounts = 800;
         private long wriggleEveryMs = 120000;
+        // Robot 2026-10-01: the board came back between ~9 s and 29 s after the stall. The 2 s
+        // probe keeps a stall with no cutout (the common case on the desk) to ~2.5 s of waiting.
+        private long[] stallRecoverProbesMs = {2000, 5000, 10000, 20000};
+        // Half a second of turning: ~100 counts on a live board, too little to push a latched one.
+        private long stallRecoverProbeMs = 500;
+        private double stallRecoverProbeDeg = 5;
+        // Just past the longest cutout seen (29 s).
+        private long stallRecoverWindowMs = 30000;
         private float callPersonMinHeight = 0.12f;
         // Robot QA 2026-09-30: a floor-level caller scored person 0.27 and 0.32.
         private float callPersonMinScore = 0.25f;
@@ -1428,6 +1472,16 @@ final class ExploreTuning {
         Builder wriggleEveryMs(long v) { wriggleEveryMs = v; return this; }
         /** No long wriggle: fully jammed goes straight to the help line, as before 2026-10-01's chair. */
         Builder wriggleOff() { wriggleMs = 0; return this; }
+        /** The recovery wait's probe times, in ms after the stall (each > 0). */
+        Builder stallRecover(long... probesMs) { stallRecoverProbesMs = probesMs.clone(); return this; }
+        Builder stallRecoverProbe(long ms, double deg) {
+            stallRecoverProbeMs = ms;
+            stallRecoverProbeDeg = deg;
+            return this;
+        }
+        Builder stallRecoverWindowMs(long v) { stallRecoverWindowMs = v; return this; }
+        /** No recovery wait: the escape runs at once after a stall, as before 2026-10-01's cutouts. */
+        Builder stallRecoverOff() { stallRecoverProbesMs = new long[0]; return this; }
         Builder ask(int attempts, long timeoutMs) { askAttempts = attempts; askTimeoutMs = timeoutMs; return this; }
         Builder sayTimeoutMs(long v) { sayTimeoutMs = v; return this; }
         Builder quietWaitMs(long v) { quietWaitMs = v; return this; }

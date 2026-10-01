@@ -1903,6 +1903,8 @@ public final class ExploreBrainHarness {
         switch (s) {
             case MEET: case SPEAK: case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP:
             case ASK: case ORIENT: case EYES_ONLY: case CORNERED: case STOPPED:
+            // Waiting out a motor cutout (robot 2026-10-01): still and resting, like CORNERED.
+            case RECOVER:
                 return open ? "camera open in " + s : null;
             case CHAT_THINK: case CHAT_SPEAK: case CHAT_LISTEN: case CHAT_NOTES:
                 // Open with the detector parked (KTD7), unless the lease was lost mid-conversation.
@@ -2782,6 +2784,7 @@ public final class ExploreBrainHarness {
         pinnedScenarios();
         jamScenarios();
         wriggleScenarios();
+        recoverScenarios();
         budgetScenarios();
         forwardFirstScenarios();
         sideScenarios();
@@ -3286,7 +3289,9 @@ public final class ExploreBrainHarness {
         scenario("stalled_wheels_mid_hop_stop_startle_and_escape", n -> {
             // A 5 s leg from 1300; the wheels turn until 2000, then stand still though
             // forward keeps going out: after a second with no progress he stops.
-            Rig rig = new Rig(tuning().hopTicks(20).build(), t -> wheels(t, Math.min(t, 2000))).started();
+            // The feed's wheels never move again, so the post-stall wait would find no recovery (the
+            // recover_ scenarios): this is the escape as it runs once the board is back.
+            Rig rig = new Rig(tuning().hopTicks(20).stallRecoverOff().build(), t -> wheels(t, Math.min(t, 2000))).started();
             rig.runUntil(5500);
             int stop = rig.firstAfter("stop", 1301);
             check(n, rig.timeOf(stop) >= 2900 && rig.timeOf(stop) <= 3100 && rig.count("startle") == 1
@@ -3296,7 +3301,8 @@ public final class ExploreBrainHarness {
         scenario("repeated_stalls_back_off_further_and_turn_more_each_time", n -> {
             // The wheels never turn: every leg stalls. Each stall backs off 3 ticks and
             // turns longer than the last (2 s, 3 s, 4 s here), one way, one "whoa".
-            Rig rig = new Rig(tuning().hopTicks(20).stallEscape(3, 2000, 1000).cap(8, 20000, 30000)
+            // Recovery off: the feed's wheels never move, so the wait would call a real jam.
+            Rig rig = new Rig(tuning().hopTicks(20).stallRecoverOff().stallEscape(3, 2000, 1000).cap(8, 20000, 30000)
                     .escape(300, 6000, 3, 60000).build(),
                     t -> wheels(t, 0)).started();
             rig.runUntil(30000);
@@ -5455,7 +5461,10 @@ public final class ExploreBrainHarness {
 
     private static Rig roomRig(boolean novelty, long seed) {
         ExploreTuning.Builder b = navTuning().gyro(robotGyro()).hopTicks(16, 40).turnChance(0.7).turnDeg(20, 55)
-                .cap(8, 20000, 30000);
+                .cap(8, 20000, 30000)
+                // The room's walls stall him with a working board; the post-stall wait would only
+                // take time from both runs. Coverage is measured without it.
+                .stallRecoverOff();
         b = novelty ? coverageTuning(b) : coverageTuning(b).coverageOff();
         Rig[] h = new Rig[1];
         rigSeed = seed;
@@ -6621,26 +6630,239 @@ public final class ExploreBrainHarness {
         });
         scenario("wriggle_the_1408_chair_episode_wedge_turn_stalled_back_up_blocked_retrace_is_caught", n -> {
             // Live 14:08:22-14:09:53: a roaming turn would not turn, backing up first went
-            // nowhere, the RETRACE turn would not turn, then CORNERED. That is the jam rule's
-            // shape (back-up stalled, both ways under 10 deg): now the wriggle runs before it.
+            // nowhere, the RETRACE turn would not turn, then CORNERED. The spin at 14:09:41 moved
+            // fine, so that was the motor board's cutout: now the back-up that went nowhere waits
+            // for the board (no retrace inside the window), and only with no recovery by the last
+            // probe does the wriggle run, then the jam path.
             List<String> notes = new ArrayList<String>();
             Rig rig = chairRig(notes, escTuning());
             rig.started();
             runUntil(rig, 90000, r -> notedAt(notes, "fully jammed") >= 0);
             rig.runUntil(rig.now + 3000);
             long wedged = notedAt(notes, "wedged: a turn that would not turn");
-            long nowhere = notedAt(notes, "backing up first went nowhere");
-            long retrace = notedAt(notes, "retrace: facing");
+            long nowhere = notedAt(notes, "back-up went nowhere");
+            long wait = notedAt(notes, "stall: waiting for the motor board to recover");
+            long real = notedAt(notes, "no recovery after 20 s: a real jam");
             long wriggle = notedAt(notes, "wriggle LEFT: up to 10000 ms");
             long failed = notedAt(notes, "wriggle failed both ways");
             long jam = notedAt(notes, "fully jammed");
             long rest = entered(rig, ExploreBrain.State.CORNERED, 0);
-            check(n, wedged > 0 && nowhere > wedged && retrace > nowhere && wriggle > retrace && failed > wriggle
-                            && jam >= failed && rest >= jam && helpLines(rig, 0).size() == 1
+            check(n, wedged > 0 && nowhere > wedged && wait >= nowhere && real > wait && wriggle >= real
+                            && failed > wriggle && jam >= failed && rest >= jam && helpLines(rig, 0).size() == 1
+                            && entered(rig, ExploreBrain.State.RETRACE, nowhere + 1) < 0
                             && notesWith(notes, "cornered: ") == 0 && rig.violations.isEmpty(),
-                    "wedged@" + wedged + " nowhere@" + nowhere + " retrace@" + retrace + " wriggle@" + wriggle
+                    "wedged@" + wedged + " nowhere@" + nowhere + " wait@" + wait + " real@" + real + " wriggle@" + wriggle
                             + " failed@" + failed + " jam@" + jam + " rest@" + rest + " notes="
                             + notes.subList(Math.max(0, notes.size() - 25), notes.size()));
+        });
+    }
+
+    // ---- the post-stall recovery wait (robot 2026-10-01: the motor board refused all motion for 9-29 s) ----
+
+    /**
+     * Roams one leg into something low (forward goes nowhere 700 ms in, so the stall watch
+     * fires); at the stall's STARTLE, cutoutMs > 0 pins every motion for cutoutMs, < 0 pins it
+     * for good, 0 leaves the board working (only forward was blocked, and the low thing is
+     * behind him once he moves).
+     */
+    private static Rig cutoutRig(List<String> notes, ExploreTuning.Builder b, long cutoutMs) {
+        Rig[] h = new Rig[1];
+        long[] stallAt = {-1};
+        Rig rig = escRig(b, h, t -> {
+            Rig r = h[0];
+            if (r == null) {
+                return clear(t);
+            }
+            if (stallAt[0] < 0 && r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 700
+                    && r.blockedFrom == Long.MAX_VALUE) {
+                r.blockedFrom = t;
+            }
+            if (stallAt[0] < 0 && r.brain.state() == ExploreBrain.State.STARTLE) {
+                stallAt[0] = t;
+                if (cutoutMs != 0) {
+                    pin(r, true);
+                } else {
+                    r.blockedFrom = Long.MAX_VALUE;
+                }
+            }
+            if (stallAt[0] >= 0 && cutoutMs > 0 && t >= stallAt[0] + cutoutMs && r.yaw.stuck) {
+                pin(r, false);
+            }
+            return clear(t);
+        }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+        rig.creepPer100 = 0;
+        rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+        return rig;
+    }
+
+    private static List<String> lastNotes(List<String> notes, int n) {
+        return notes.subList(Math.max(0, notes.size() - n), notes.size());
+    }
+
+    private static void recoverScenarios() {
+        scenario("recover_a_12s_cutout_probes_find_nothing_until_20s_then_the_normal_escape", n -> {
+            // Live 14:33: the board refused everything after the stall, then came back on its
+            // own. He waits still; the 2, 5 and 10 s probes give nothing, the 20 s one moves,
+            // and only then the escape backs up and turns away. No jam, no wriggle, no help line.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cutoutRig(notes, escTuning().hopTicks(20), 12000);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "the board is back") >= 0);
+            long back = rig.now;
+            rig.runUntil(back + 15000);
+            long stall = notedAt(notes, "wheels stalled while driving");
+            long wait = notedAt(notes, "stall: waiting for the motor board to recover (probes at 2, 5, 10, 20 s)");
+            long p2 = notedAt(notes, "recover probe at 2 s: nothing");
+            long p5 = notedAt(notes, "recover probe at 5 s: nothing");
+            long p10 = notedAt(notes, "recover probe at 10 s: nothing");
+            long p20 = notedAt(notes, "recover probe at 20 s: moved");
+            List<long[]> probes = turnCommands(rig, stall + 1, p20);
+            boolean onTime = probes.size() == 4;
+            long[] want = {2000, 5000, 10000, 20000};
+            for (int i = 0; onTime && i < 4; i++) {
+                onTime = probes.get(i)[0] - stall >= want[i] && probes.get(i)[0] - stall <= want[i] + 200;
+            }
+            // Still between the probes: no leg, no back-up; each probe one short turn.
+            int pushes = rig.countPrefix("hop", stall + 1, p20) + backDrives(rig, stall + 1, p20).size();
+            List<Long> escBacks = backDrives(rig, p20, Long.MAX_VALUE);
+            long turn = escBacks.isEmpty() ? -1 : rig.timeOf(rig.firstAfter("turn", escBacks.get(0)));
+            long hop = entered(rig, ExploreBrain.State.HOP, Math.max(p20, 0));
+            check(n, stall > 0 && wait >= stall && wait - stall <= 600 && p2 > 0 && p5 > p2 && p10 > p5 && p20 > p10
+                            && onTime && pushes == 0 && p2 - probes.get(0)[0] <= 700 && !escBacks.isEmpty() && turn > escBacks.get(0) && hop > turn
+                            && notesWith(notes, "fully jammed") == 0 && notesWith(notes, "wriggle") == 0
+                            && notesWith(notes, "no recovery") == 0 && helpLines(rig, 0).isEmpty()
+                            && rig.violations.isEmpty(),
+                    "stall@" + stall + " wait@" + wait + " probes=" + probes.size() + " pushes=" + pushes + " escBacks="
+                            + escBacks + " turn@" + turn + " hop@" + hop + " notes=" + lastNotes(notes, 25));
+        });
+        scenario("recover_motors_that_never_come_back_probe_then_wriggle_then_the_help_line", n -> {
+            // Every wheel wedged for good: four probes give nothing, then the wriggle (no
+            // ladder, no retrace in between), then the fully-jammed path and its help line.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cutoutRig(notes, escTuning().hopTicks(20), -1);
+            rig.started();
+            runUntil(rig, 90000, r -> notedAt(notes, "fully jammed") >= 0);
+            rig.runUntil(rig.now + 3000);
+            long stall = notedAt(notes, "wheels stalled while driving");
+            long wait = notedAt(notes, "stall: waiting for the motor board to recover");
+            int nothing = notesWith(notes, ": nothing");
+            long real = notedAt(notes, "no recovery after 20 s: a real jam");
+            long wriggle = notedAt(notes, "wriggle LEFT: up to");
+            long failed = notedAt(notes, "wriggle failed both ways");
+            long jam = notedAt(notes, "fully jammed");
+            List<Long> helps = helpLines(rig, 0);
+            int turnsBefore = turnCommands(rig, stall, real).size();
+            check(n, stall > 0 && wait >= stall && nothing == 4 && real - stall >= 20000 && real - stall <= 21500
+                            && backDrives(rig, stall + 1, real + 1).isEmpty() && turnsBefore == 4
+                            && wriggle >= real && wriggle - real <= 200 && failed > wriggle && jam >= failed
+                            && helps.size() == 1 && helps.get(0) >= jam
+                            && entered(rig, ExploreBrain.State.RETRACE, 0) < 0 && notesWith(notes, "wedged") == 0
+                            && notesWith(notes, "the board is back") == 0 && rig.violations.isEmpty(),
+                    "stall@" + stall + " wait@" + wait + " nothing=" + nothing + " real@" + real + " wriggle@" + wriggle
+                            + " failed@" + failed + " jam@" + jam + " helps=" + helps + " turns=" + turnsBefore
+                            + " notes=" + lastNotes(notes, 25));
+        });
+        scenario("recover_no_cutout_the_first_probe_moves_and_the_escape_goes_on", n -> {
+            // Only something low ahead; the board works. The 2 s probe moves at once and the
+            // escape runs: about 2.5 s later than before the wait.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cutoutRig(notes, escTuning().hopTicks(20), 0);
+            rig.started();
+            runUntil(rig, 30000, r -> notedAt(notes, "the board is back") >= 0);
+            rig.runUntil(rig.now + 10000);
+            long stall = notedAt(notes, "wheels stalled while driving");
+            long moved = notedAt(notes, "recover probe at 2 s: moved");
+            List<Long> escBacks = backDrives(rig, moved, Long.MAX_VALUE);
+            long escape = escBacks.isEmpty() ? -1 : escBacks.get(0);
+            long turn = escape < 0 ? -1 : rig.timeOf(rig.firstAfter("turn", escape));
+            long hop = entered(rig, ExploreBrain.State.HOP, Math.max(turn, 0));
+            System.out.println("REPORT recovery wait with no cutout: the escape's back-up began " + (escape - stall)
+                    + " ms after the stall (before the wait: " + rig.tuning.startleMs + " ms)");
+            check(n, stall > 0 && moved - stall >= 2000 && moved - stall <= 3000 && escape >= moved
+                            && escape - stall <= 3200 && turn > escape && hop > turn
+                            && notesWith(notes, ": nothing") == 0 && notesWith(notes, "wriggle") == 0
+                            && notesWith(notes, "fully jammed") == 0 && rig.violations.isEmpty(),
+                    "stall@" + stall + " moved@" + moved + " escape@" + escape + " turn@" + turn + " hop@" + hop
+                            + " notes=" + lastNotes(notes, 20));
+        });
+        scenario("recover_a_call_while_waiting_is_answered_where_he_stands", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cutoutRig(notes, escTuning().hopTicks(20), -1);
+            rig.started();
+            runUntil(rig, 30000, r -> notedAt(notes, "stall: waiting for the motor board") >= 0);
+            long wait = rig.now;
+            long call = wait + 1000;
+            rig.cue(call, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, Float.NaN);
+            rig.runUntil(call + 6000);
+            int answers = rig.countPrefix("react answer", call, call + 200);
+            long met = notedAt(notes, "met someone");
+            int turns = turnCommands(rig, call, met).size();
+            check(n, answers == 1 && notedAt(notes, "meeting without a look") >= call && met > call && turns == 0
+                            && rig.countPrefix("hop", call, met) == 0
+                            && notesWith(notes, "looking for the caller") == 0 && rig.violations.isEmpty(),
+                    "answers=" + answers + " turns=" + turns + " met@" + met + " violations=" + rig.violations
+                            + " notes=" + lastNotes(notes, 20));
+        });
+        scenario("recover_a_shove_while_waiting_probes_at_once", n -> {
+            // Freed by hand 1.2 s after the stall: the shove probes then, not at the 2 s mark.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cutoutRig(notes, escTuning().hopTicks(20), -1);
+            rig.started();
+            runUntil(rig, 30000, r -> notedAt(notes, "stall: waiting for the motor board") >= 0);
+            long stall = notedAt(notes, "wheels stalled while driving");
+            long shove = stall + 1200 - (stall + 1200) % 10;
+            rig.at(shove - 10, () -> pin(rig, false));
+            rig.shoveAt(shove, 900);
+            rig.runUntil(shove + 8000);
+            List<long[]> probes = turnCommands(rig, stall + 1, Long.MAX_VALUE);
+            long back = notedAt(notes, "recover probe at 1 s: moved");
+            long probe = probes.isEmpty() ? -1 : probes.get(0)[0];
+            check(n, probe >= shove && probe - shove <= 200 && back > shove
+                            && notesWith(notes, ": nothing") == 0 && notesWith(notes, "fully jammed") == 0
+                            && rig.violations.isEmpty(),
+                    "stall@" + stall + " shove@" + shove + " probe@" + probe + " notes=" + lastNotes(notes, 20));
+        });
+        scenario("recover_a_turn_that_reads_nothing_after_a_bump_waits_and_its_attempts_never_count", n -> {
+            // A collision stop (the front sensor) and a 12 s cutout from it: the escape's blind
+            // back-off and its first turn land in the cutout. That turn reading nothing waits
+            // for the board; the escape then runs as if from the bump. Nothing made inside the
+            // window counts: no jam rule, no wriggle, no "turns blocked twice", no wedge.
+            Rig[] h = new Rig[1];
+            long[] bumpAt = {-1};
+            List<String> notes = new ArrayList<String>();
+            Rig rig = escRig(escTuning(), h, t -> {
+                Rig r = h[0];
+                if (r == null) {
+                    return clear(t);
+                }
+                if (bumpAt[0] < 0 && r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 700) {
+                    bumpAt[0] = t;
+                    pin(r, true);
+                    return obstacle(t);
+                }
+                if (bumpAt[0] >= 0 && t >= bumpAt[0] + 12000 && r.yaw.stuck) {
+                    pin(r, false);
+                }
+                return clear(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "the board is back") >= 0);
+            long back = rig.now;
+            rig.runUntil(back + 15000);
+            long bump = notedAt(notes, "collision stop: a bump");
+            long blocked = notedAt(notes, "measured turn blocked");
+            long wait = notedAt(notes, "stall: waiting for the motor board to recover");
+            long hop = entered(rig, ExploreBrain.State.HOP, back);
+            check(n, bump > 0 && blocked > bump && wait >= blocked && wait - blocked <= 100
+                            && notedAt(notes, "the board is back") - bump >= 12000
+                            && notesWith(notes, "measured turn blocked") == 1 && notesWith(notes, "wedged") == 0
+                            && notesWith(notes, "fully jammed") == 0 && notesWith(notes, "wriggle") == 0
+                            && notesWith(notes, "blocked twice") == 0 && hop > back
+                            && helpLines(rig, 0).isEmpty() && rig.violations.isEmpty(),
+                    "bump@" + bump + " blocked@" + blocked + " wait@" + wait + " back@" + back + " hop@" + hop
+                            + " notes=" + lastNotes(notes, 25));
         });
     }
 
@@ -6929,7 +7151,9 @@ public final class ExploreBrainHarness {
             // (A retrace move whose long way round is over retraceLongWayMaxDeg is skipped now,
             // so one RIGHT turn can be all he needs before a forward try frees him.)
             Rig[] h = new Rig[1];
-            Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
+            // The ladder against a physical block with the board working: its back-ups read 0 like a
+            // cutout's, so the post-stall wait would restart the ladder. The wait: the recover_ scenarios.
+            Rig rig = escRig(escTuning().stallRecoverOff(), h, bumps(h, 3), null);
             rig.yaw.stuckDir = 1;
             rig.backBlocked = true;
             rig.openView = openAt(90);
@@ -7098,7 +7322,9 @@ public final class ExploreBrainHarness {
             // on a 327 deg turn. LEFT blocked for good, nothing behind him gives: a retrace move
             // that would go over retraceLongWayMaxDeg the long way is skipped for the next step.
             Rig[] h = new Rig[1];
-            Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
+            // The ladder against a physical block with the board working: its back-ups read 0 like a
+            // cutout's, so the post-stall wait would restart the ladder. The wait: the recover_ scenarios.
+            Rig rig = escRig(escTuning().stallRecoverOff(), h, bumps(h, 3), null);
             rig.yaw.stuckDir = 1;
             rig.backBlocked = true;
             rig.openView = openAt(90);
@@ -7668,7 +7894,9 @@ public final class ExploreBrainHarness {
             // him gives (reversing goes nowhere), so the ladder's turns must go the other way:
             // the retrace's, the circle's and the drive-off's. Every turn after the first does.
             Rig[] h = new Rig[1];
-            Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
+            // The ladder against a physical block with the board working: its back-ups read 0 like a
+            // cutout's, so the post-stall wait would restart the ladder. The wait: the recover_ scenarios.
+            Rig rig = escRig(escTuning().stallRecoverOff(), h, bumps(h, 3), null);
             rig.yaw.blockFirstTurnsSide = true;
             rig.backBlocked = true;
             rig.openView = deskView();
@@ -7821,7 +8049,9 @@ public final class ExploreBrainHarness {
             // stall watch (~1 s here); the retried turn is still blocked, so he is wedged, and each
             // blocked turn of the escape's circle backs up once too.
             // Jam detection off: with it, the circle's first blocked turn would end the escape (jammed).
-            Rig rig = new Rig(escTuning().turnChance(1.0).blockedTurnBackTicks(12).jamOff().build(), CLEAR, NOTHING,
+            // Recovery off too: the stalled back-up would wait for the board instead of retrying.
+            Rig rig = new Rig(escTuning().turnChance(1.0).blockedTurnBackTicks(12).jamOff().stallRecoverOff().build(),
+                    CLEAR, NOTHING,
                     true);
             rig.simWheels = true;
             rig.yaw.stuck = true;
@@ -9193,7 +9423,9 @@ public final class ExploreBrainHarness {
         });
         scenario("cue_forward_stall_stamps_a_bump_and_sorry_within_2_s_is_strong_held_until_the_escape_ends", n -> {
             // A 5 s leg; the wheels turn until 2000, then stand still: the stall stops him at ~3000.
-            Rig rig = cueRig(cueTuning().hopTicks(20), t -> wheels(t, Math.min(t, 2000)), EMPTY_ROOM).started();
+            // Recovery off: the feed's wheels never move again (the wait would call a real jam).
+            Rig rig = cueRig(cueTuning().hopTicks(20).stallRecoverOff(), t -> wheels(t, Math.min(t, 2000)), EMPTY_ROOM)
+                    .started();
             long startle = runUntilState(rig, ExploreBrain.State.STARTLE, 0, 20000);
             long sorry = startle + 1500;
             rig.cue(sorry, Ears.Kind.APOLOGY, Ears.Side.LEFT, -40f);
@@ -9210,7 +9442,9 @@ public final class ExploreBrainHarness {
                             + gauges(rig) + " " + rig.tail());
         });
         scenario("cue_sorry_4_s_after_the_bump_is_weak", n -> {
-            Rig rig = cueRig(cueTuning().hopTicks(20), t -> wheels(t, Math.min(t, 2000)), EMPTY_ROOM).started();
+            // Recovery off: the feed's wheels never move again (the wait would call a real jam).
+            Rig rig = cueRig(cueTuning().hopTicks(20).stallRecoverOff(), t -> wheels(t, Math.min(t, 2000)), EMPTY_ROOM)
+                    .started();
             long startle = runUntilState(rig, ExploreBrain.State.STARTLE, 0, 20000);
             long sorry = startle + 4000;
             rig.cue(sorry, Ears.Kind.APOLOGY, Ears.Side.LEFT, -40f);
@@ -9783,7 +10017,8 @@ public final class ExploreBrainHarness {
         });
         scenario("call_during_an_escape_is_answered_at_once", n -> {
             List<String> notes = new ArrayList<String>();
-            Rig rig = pinnedRig(notes);
+            // Recovery off: pinned, the post-stall wait goes from the back-up to the wriggle, no RETRACE.
+            Rig rig = pinnedRig(notes, escTuning().stallRecoverOff());
             rig.started();
             long retrace = runUntilState(rig, ExploreBrain.State.RETRACE, 0, 60000);
             long cueT = retrace + 10;

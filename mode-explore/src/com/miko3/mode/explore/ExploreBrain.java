@@ -35,6 +35,9 @@ import java.util.Set;
  *              fully jammed rest (robot 2026-10-01): the help line, jammedRestMs, one short back-up.
  *              Before it, the long wriggle runs in the escape's state: up to wriggleMs one
  *              way, then the other, stopping a way at once when its wheels don't move
+ *   RECOVER    after a stall (robot 2026-10-01: the motor board refused all motion for 9-29 s):
+ *              still, one short probe turn at each of stallRecoverProbesMs after the stall;
+ *              the first that moves runs the normal escape, none is a real jam (the wriggle)
  *   STOPPED    after shutdown(); inert
  *
  * Camera curiosity (camera curiosity plan KTD5), entered from PAUSE when a
@@ -450,6 +453,7 @@ final class ExploreBrain {
         ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP,
         CONFIRM, LAST_NAME,
         RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF,
+        RECOVER,
         CUE_TURN, CUE_LOOK, CUE_WHERE,
         CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES;
 
@@ -933,6 +937,36 @@ final class ExploreBrain {
     /** Escape measured turns in a row that turned under jamTurnDeg. */
     private int escBlockedRun;
 
+    // ---- the post-stall recovery wait (robot 2026-10-01: the motor board refused all motion for 9-29 s) ----
+    /** The last stall (forward, or a back-up that went nowhere) or collision stop: a cutout may run from here. */
+    private long stallStampAt = NEVER;
+    /** A wait ran to its verdict this stuck spell: no second one until he drives off cleanly or is freed. */
+    private boolean recoverSpent;
+    /** This STARTLE follows a drive stall: the wait comes before the escape. */
+    private boolean recoverAfterStartle;
+    /** The wait counts from recoverFrom (the stall); probes at each of recoverProbes, next recoverNext. */
+    private long recoverFrom;
+    private long[] recoverProbes = new long[0];
+    private int recoverNext;
+    /** Once the board is back: the ladder (wedged, why recoverWhy), else the plain escape (back up, turn away). */
+    private boolean recoverWedged;
+    private String recoverWhy;
+    /** A probe (one short turn) is under way until recoverProbeUntil; it began at recoverProbeAt. */
+    private boolean recoverProbing;
+    private boolean recoverProbeScheduled;
+    private long recoverProbeAt;
+    private long recoverProbeUntil;
+    private long recoverJudgeAfter;
+    /** The probe's wheel counts (both wheels), from where, and the heading it began at. */
+    private long recoverMoved;
+    private SensorReading recoverFromReading;
+    private double recoverHeading = Double.NaN;
+    /** A shove while waiting: the next probe goes at once. */
+    private String recoverPoke;
+    /** Wheel counts (both wheels) in the current turn, from where (null: no encoders): a cutout reads none. */
+    private long turnCounts;
+    private SensorReading turnCountFrom;
+
     /** This ladder's: the blocked turn to try the free way after the first back-up (null: none). */
     private Direction escRetryDir;
     private double escRetryDeg;
@@ -1223,6 +1257,7 @@ final class ExploreBrain {
         countEscapeWheels(reading);
         countJamWheels(reading);
         countWriggleWheels(reading);
+        countRecoverWheels(reading);
         lastReading = reading;
         compass.offer(reading, moving);
         headingHistory.offer(reading.timestampMs,
@@ -1439,7 +1474,10 @@ final class ExploreBrain {
                     stallStreak++;
                     note("wheels stalled while driving: blocked by something low (" + stallStreak + " in a row)");
                     compass.legStalled(now - tuning.stallWindowMs);
+                    stampStall(now);
                     hazardInMotion(now, null);
+                    // Robot 2026-10-01: the board may refuse all motion for a while after a stall.
+                    recoverAfterStartle = recoverDue(now);
                 } else if (now >= phaseUntil) {
                     if (doorwayLeg) {
                         note("through the doorway at " + Math.round(doorway) + " deg");
@@ -1462,7 +1500,10 @@ final class ExploreBrain {
                 break;
             case STARTLE:
                 if (now >= phaseUntil) {
-                    if (corneredAfterStartle) {
+                    if (recoverAfterStartle) {
+                        recoverAfterStartle = false;
+                        enterRecover(now, corneredAfterStartle, "hazards in a row");
+                    } else if (corneredAfterStartle) {
                         wedged(now, "hazards in a row", false);
                     } else {
                         startBackOff(now);
@@ -1474,6 +1515,14 @@ final class ExploreBrain {
                 // short back-up before a retried turn also stops on a stall.
                 if (backForTurn && now < phaseUntil && wheelsStalled(now)) {
                     note("wheels stalled backing up");
+                    stampStall(now);
+                    if (recoverDue(now)) {
+                        if (escapeDir == null) {
+                            escapeDir = retryDir;
+                        }
+                        enterRecover(now, false, "the back-up went nowhere");
+                        break;
+                    }
                     phaseUntil = now;
                 }
                 if (now >= phaseUntil && backForTurn) {
@@ -1566,6 +1615,9 @@ final class ExploreBrain {
             case DRIVE_OFF:
                 escapeTick(now, fresh, hazard);
                 break;
+            case RECOVER:
+                recoverStep(now, fresh);
+                break;
             case CORNERED:
                 if (jammed) {
                     jamStep(now, fresh);
@@ -1614,6 +1666,7 @@ final class ExploreBrain {
         }
         // Driven away cleanly: whatever cornered him is behind him.
         jammed = false;
+        recoverDone();
         compass.droveOffCleanly();
         hazardTimes.clear();
         stallStreak = 0;
@@ -1953,6 +2006,7 @@ final class ExploreBrain {
 
     /** As above, for a hazard the classifier did not see (h null: side unknown). */
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
+        recoverAfterStartle = false;
         if (drivingForward() && (h == null || h.kind == HazardClassifier.Kind.OBSTACLE)) {
             stampBump(now);
         }
@@ -4062,6 +4116,14 @@ final class ExploreBrain {
         stopMotors();
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
                 + " deg in " + (now - turnStartedAt) + " ms");
+        if (state == State.TURN && turnWheelsStill() && recoverDue(now)) {
+            turnRetrying = false;
+            if (escapeDir == null) {
+                escapeDir = heading;
+            }
+            enterRecover(now, false, "a turn that would not turn");
+            return;
+        }
         blockSide(heading);
         if (state == State.TURN && !turnRetrying && tuning.blockedTurnBackTicks > 0
                 && !planner.hasLegToBackAlong(compass.legs(), compass.degrees())) {
@@ -4507,6 +4569,12 @@ final class ExploreBrain {
         if (reached || stalled || now >= escUntil) {
             stopMotors();
             if (!reached && escFrom != null && escMoved < tuning.stallMinCounts) {
+                stampStall(now);
+                if (recoverDue(now)) {
+                    note("back-up went nowhere (" + escMoved + " counts)");
+                    enterRecover(now, true, "the back-up went nowhere");
+                    return;
+                }
                 jamBackStalled = true;
             }
             if (escShortBack) {
@@ -4677,8 +4745,13 @@ final class ExploreBrain {
     private void escTurnBlocked(long now) {
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
                 + " deg in " + (now - turnStartedAt) + " ms (" + escDir + ")");
-        blockSide(escDir);
         boolean nowhere = measured && Math.abs(compass.turned()) < tuning.jamTurnDeg;
+        if (nowhere && turnWheelsStill() && recoverDue(now)) {
+            stopMotors();
+            enterRecover(now, true, "an escape turn that would not turn");
+            return;
+        }
+        blockSide(escDir);
         if (nowhere) {
             jamBlockedWays.add(escDir);
         }
@@ -5090,6 +5163,7 @@ final class ExploreBrain {
         stopMotors();
         note("free after " + (now - (planner.active() ? planner.startedAt() : probeSince)) + " ms: " + how);
         jammed = false;
+        recoverDone();
         if (droveForward) {
             blockedSides.clear();
         }
@@ -5501,6 +5575,9 @@ final class ExploreBrain {
         if (jammed && state == State.CORNERED && !jamProbing && jamPoke == null) {
             jamPoke = "shoved (" + shove.counts + " counts)";
         }
+        if (state == State.RECOVER && !recoverProbing && !wriggling && recoverPoke == null) {
+            recoverPoke = "shoved (" + shove.counts + " counts)";
+        }
         lastShoveAt = shove.at;
         port.earsShoved(shove.at);
         offerCue(now, new Ears.Cue(Ears.Kind.VOICE, Ears.Tier.WEAK, Ears.Side.UNKNOWN, Float.NaN, shove.at));
@@ -5509,6 +5586,7 @@ final class ExploreBrain {
     /** A collision stop while driving (a stall, an obstacle): "sorry" within bumpApologyMs is strong (KTD5). */
     private void stampBump(long now) {
         bumpAt = now;
+        stampStall(now);
         note("collision stop: a bump");
         port.earsShoved(now);
     }
@@ -5766,6 +5844,10 @@ final class ExploreBrain {
         if (wriggling) {
             // The wriggle is bounded (two ways of up to wriggleMs): the call waits for its verdict.
             return CallVerdict.WAIT;
+        }
+        if (state == State.RECOVER) {
+            // Waiting out a motor cutout (robot 2026-10-01): a search turn would read nothing.
+            return CallVerdict.IN_PLACE;
         }
         if (jammed) {
             // Fully jammed (robot 2026-10-01): a search turn would only push against the jam.
@@ -6360,7 +6442,7 @@ final class ExploreBrain {
                 return escape ? CueVerdict.HOLD : CueVerdict.TAKE;
             case FACE: case APPROACH: case MEET_LOOK: case MEET:
                 return sameSideAsPerson(c) ? CueVerdict.CONFIRM : CueVerdict.TAKE;
-            case STARTLE: case BACK_OFF: case RETRACE: case CIRCLE: case WAY_OUT: case DRIVE_OFF:
+            case STARTLE: case BACK_OFF: case RETRACE: case CIRCLE: case WAY_OUT: case DRIVE_OFF: case RECOVER:
             case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP: case CONFIRM: case LAST_NAME:
                 return CueVerdict.HOLD;
             default:
@@ -7053,6 +7135,7 @@ final class ExploreBrain {
         handBackCall("the lease or the sensors lost");
         stopMotors();
         dropWriggle();
+        recoverProbing = false;
         cancelAsk();
         cancelWayOut();
         planner.reset();
@@ -7341,6 +7424,7 @@ final class ExploreBrain {
     /** Out of a jam (the probe or the wriggle moved): roams again with today's escape state cleared. */
     private void freedFromJam(long now) {
         jammed = false;
+        recoverDone();
         jamHelpPending = false;
         blockedSides.clear();
         blockedAheadAt = Double.NaN;
@@ -7358,7 +7442,7 @@ final class ExploreBrain {
     // ---- the long wriggle (robot 2026-10-01) ----
 
     private boolean wriggleAllowed(long now) {
-        return tuning.wriggleMs > 0 && tuning.jamTurnDeg > 0 && state.escapes()
+        return tuning.wriggleMs > 0 && tuning.jamTurnDeg > 0 && (state.escapes() || state == State.RECOVER)
                 && (wriggleAt == NEVER || now - wriggleAt >= tuning.wriggleEveryMs);
     }
 
@@ -7533,6 +7617,204 @@ final class ExploreBrain {
         wriggleBacking = false;
     }
 
+    // ---- the post-stall recovery wait (robot 2026-10-01) ----
+
+    private void stampStall(long now) {
+        stallStampAt = now;
+    }
+
+    /**
+     * A wait is due: recovery on, none run to its verdict this stuck spell, and within
+     * stallRecoverWindowMs of the last stall or collision stop (the cutout lasted 9-29 s live).
+     */
+    private boolean recoverDue(long now) {
+        return tuning.stallRecoverProbesMs.length > 0 && !recoverSpent && stallStampAt != NEVER
+                && now - stallStampAt <= tuning.stallRecoverWindowMs;
+    }
+
+    /** Out of the stuck spell (drove off cleanly, freed): the next stall waits again. */
+    private void recoverDone() {
+        recoverSpent = false;
+        stallStampAt = NEVER;
+    }
+
+    /**
+     * Robot 2026-10-01, 14:08 and 14:33: after a stall the motor board refused all motion
+     * for ~9-29 s, then came back by itself. The escape run inside that window read 0 counts
+     * and 0 deg everywhere and called a jam. Now he stops, stays still, and probes with one
+     * short back-up at each of stallRecoverProbesMs after the stall; nothing he tried inside
+     * the window counts toward the jam rule, the wriggle or "turns blocked twice".
+     */
+    private void enterRecover(long now, boolean wedgedAfter, String why) {
+        stopMotors();
+        cancelWayOut();
+        planner.reset();
+        esc = null;
+        probing = false;
+        escFirstRetry = false;
+        escShortBack = false;
+        backForTurn = false;
+        turnRetrying = false;
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        jamBackStalled = false;
+        jamBlockedWays.clear();
+        escBlockedRun = 0;
+        recoverWedged = wedgedAfter;
+        recoverWhy = why;
+        recoverFrom = stallStampAt == NEVER ? now : stallStampAt;
+        long since = now - recoverFrom;
+        long[] all = tuning.stallRecoverProbesMs;
+        int first = 0;
+        while (first < all.length && all[first] < since) {
+            first++;
+        }
+        // Every probe time already past (a late trigger in the window): one probe now.
+        recoverProbes = first < all.length ? java.util.Arrays.copyOfRange(all, first, all.length) : new long[]{since};
+        recoverNext = 0;
+        recoverProbing = false;
+        recoverPoke = null;
+        state = State.RECOVER;
+        show(EyeState.RESTING, null);
+        StringBuilder at = new StringBuilder();
+        for (long ms : recoverProbes) {
+            at.append(at.length() == 0 ? "" : ", ").append(Math.round(ms / 1000.0));
+        }
+        note("stall: waiting for the motor board to recover (probes at " + at + " s)");
+    }
+
+    /** RECOVER: still until the next probe (or a shove), each probe's verdict, or the wriggle after none moved. */
+    private void recoverStep(long now, boolean fresh) {
+        if (wriggling) {
+            wriggleStep(now, fresh);
+            return;
+        }
+        if (recoverProbing) {
+            if (now < recoverProbeUntil) {
+                return;
+            }
+            if (moving) {
+                stopMotors();
+                recoverJudgeAfter = now;
+            }
+            if (!fresh || now <= recoverJudgeAfter) {
+                return;
+            }
+            recoverProbing = false;
+            recoverVerdict(now);
+            return;
+        }
+        // Motion only starts on a fresh reading.
+        if (fresh && (recoverPoke != null || now >= recoverFrom + recoverProbes[recoverNext])) {
+            startRecoverProbe(now);
+        }
+    }
+
+    private void startRecoverProbe(long now) {
+        recoverProbeScheduled = now >= recoverFrom + recoverProbes[recoverNext];
+        if (recoverProbeScheduled) {
+            recoverNext++;
+        }
+        if (recoverPoke != null) {
+            note("recover probe now: " + recoverPoke);
+            recoverPoke = null;
+        }
+        recoverProbing = true;
+        recoverProbeAt = now;
+        recoverMoved = 0;
+        recoverFromReading = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        recoverHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
+        recoverProbeUntil = now + tuning.stallRecoverProbeMs;
+        measured = false;
+        moving = true;
+        turnWheels(unblocked(escapeSide != null ? escapeSide : escapeDir != null ? escapeDir : Direction.LEFT));
+    }
+
+    /** The probe's counts (both wheels), and every turn's: a turn whose wheels read none is a cutout's sign. */
+    private void countRecoverWheels(SensorReading r) {
+        if (!r.hasWheels()) {
+            return;
+        }
+        if (turnSign != 0 && turnCountFrom != null) {
+            turnCounts += Math.abs(r.wheelLeft - turnCountFrom.wheelLeft) + Math.abs(r.wheelRight - turnCountFrom.wheelRight);
+        }
+        turnCountFrom = turnCountFrom == null ? null : r;
+        if (state != State.RECOVER || !recoverProbing) {
+            return;
+        }
+        if (recoverFromReading != null) {
+            recoverMoved += Math.abs(r.wheelLeft - recoverFromReading.wheelLeft)
+                    + Math.abs(r.wheelRight - recoverFromReading.wheelRight);
+        }
+        recoverFromReading = r;
+    }
+
+    /** This turn's wheels moved under stallMinCounts (both wheels): no power, not just no heading. */
+    private boolean turnWheelsStill() {
+        return turnCountFrom != null && turnCounts < tuning.stallMinCounts;
+    }
+
+    private void recoverVerdict(long now) {
+        long at = Math.round((recoverProbeAt - recoverFrom) / 1000.0);
+        boolean counts = recoverFromReading != null;
+        boolean heading = !Double.isNaN(recoverHeading) && compass.usable(now);
+        double turned = heading ? Math.abs(Heading.delta(recoverHeading, compass.degrees())) : 0;
+        if (!counts && !heading) {
+            // No encoders and no gyro: nothing can tell a cutout from a block. On as before.
+            note("recover probe at " + at + " s: no encoders or heading to judge by; escaping as before");
+            recovered(now);
+            return;
+        }
+        if ((counts && recoverMoved >= tuning.stallMinCounts) || turned >= tuning.stallRecoverProbeDeg) {
+            note("recover probe at " + at + " s: moved " + recoverMoved + " counts"
+                    + (turned >= tuning.stallRecoverProbeDeg ? " (turned " + Math.round(turned) + " deg)" : "")
+                    + ": the board is back");
+            recovered(now);
+            return;
+        }
+        note("recover probe at " + at + " s: nothing");
+        if (recoverProbeScheduled && recoverNext >= recoverProbes.length) {
+            note("no recovery after " + at + " s: a real jam");
+            recoverSpent = true;
+            String why = "no recovery after " + at + " s";
+            if (tuning.jamTurnDeg <= 0) {
+                // Jam detection off: the escape as it ran before the wait.
+                resumeEscape(now);
+            } else if (wriggleAllowed(now)) {
+                startWriggle(now, why);
+            } else {
+                if (tuning.wriggleMs > 0 && wriggleAt != NEVER) {
+                    note("no wriggle: the last was " + (now - wriggleAt) / 1000 + " s ago");
+                }
+                enterJammed(now, why);
+            }
+        }
+    }
+
+    /** The board is back: the normal escape, judged only on what it does from now. */
+    private void recovered(long now) {
+        recoverSpent = true;
+        resumeEscape(now);
+    }
+
+    private void resumeEscape(long now) {
+        jamBackStalled = false;
+        jamBlockedWays.clear();
+        escBlockedRun = 0;
+        lastWheels = null;
+        wheelMoves.clear();
+        hopStartedAt = now;
+        if (recoverWedged) {
+            wedged(now, recoverWhy, false);
+            return;
+        }
+        if (escapeDir == null) {
+            escapeDir = unblocked(escapeSide != null ? escapeSide : randomDirection());
+        }
+        startBackOff(now);
+    }
+
     private void enterCornered(long now) {
         stopMotors();
         note("cornered: " + escapeFailures.size() + " failed escapes, " + hazardTimes.size()
@@ -7588,6 +7870,8 @@ final class ExploreBrain {
     /** Starts the wheels turning d, noting the sign for KTD7's heading history. */
     private void turnWheels(Direction d) {
         turnSign = d == Direction.LEFT ? Heading.LEFT : Heading.RIGHT;
+        turnCounts = 0;
+        turnCountFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
         motor.turn(d);
     }
 
