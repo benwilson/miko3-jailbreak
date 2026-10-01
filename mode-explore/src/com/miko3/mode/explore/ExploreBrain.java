@@ -240,7 +240,15 @@ import java.util.Set;
  * he should find something that's unfamiliar and drive towards it"): a curiosity stop
  * that ends with nothing new to react to, whose scored looks were all familiar
  * (seekFamiliarNovelty), for the seekFamiliarScans-th stop in a row and at most once
- * per seekGapMs, starts a seek. Claude gets the stop's frames with their headings
+ * per seekGapMs, starts a seek. So does any roaming curiosity stop's end (after its
+ * remark, if it had one) once he has roamed seekEveryMs without a seek, or when the
+ * last seekAreaWindowMs of roaming stayed within a small area of the coverage grid's
+ * dead reckoning (seekAreaSpanM, seekAreaCells): owner, "if he's been somewhere in the
+ * last 30 minutes, he should try and find somewhere else to go". Live, Claude had a
+ * remark at almost every stop and the place memory read most views as new, so the
+ * familiar trigger alone never fired. Each trigger notes why: "seeking: surroundings
+ * familiar (...)", "seeking: stayed within a small area (N cells in 3 min)", "seeking:
+ * no seek for 5 min". Claude gets the stop's frames with their headings
  * and how familiar each looked (labels and numbers only) and answers a frame and x,
  * or none; offline, none, late or where the last seek went: the least familiar frame's
  * most open band. Its heading is the frame's capture heading plus the exact bearing of
@@ -664,6 +672,19 @@ final class ExploreBrain {
     private boolean seekTurned;
     /** No seek starts before this (seekGapMs after the last one ended). */
     private long seekNextAt;
+    /**
+     * A roaming curiosity stop is under way (begun in enterScan): as it ends, after its remark if
+     * it had one, a seek may start. Anything that clears the stop otherwise (a voice, a hazard)
+     * clears it too.
+     */
+    private boolean stopSeekable;
+    /** Roaming time since the last seek ended, or since he started (seekEveryMs). */
+    private long roamedSinceSeekMs;
+    /** Roaming time in all: the clock the area trail keeps. */
+    private long roamedMs;
+    private long roamClockAt = -1;
+    /** Where he was while roaming, about once a second: {roamedMs, x, y} (coverage's dead reckoning, metres). */
+    private final ArrayDeque<double[]> areaTrail = new ArrayDeque<double[]>();
     /** Times of the hazard reactions since the last successful hop, for the cornered cap. */
     private final ArrayDeque<Long> hazardTimes = new ArrayDeque<Long>();
 
@@ -1411,6 +1432,8 @@ final class ExploreBrain {
         seekFrames.clear();
         seekScan.clear();
         familiarStops = 0;
+        stopSeekable = false;
+        areaTrail.clear();
         places.clear();
         placeLook = null;
         placeNoted = null;
@@ -1447,6 +1470,7 @@ final class ExploreBrain {
             return;
         }
         stepping = true;
+        roamClock(clock.nowMs());
         boolean wasInStop = state.inStop();
         try {
             boolean f = fresh;
@@ -2430,6 +2454,7 @@ final class ExploreBrain {
         }
         lastStopNothing = false;
         seekScan.clear();
+        stopSeekable = true;
         // The next stop is scheduled now, so one cut short by a hazard is not retried at once.
         scheduleCuriosity(now);
         state = State.SCAN;
@@ -2840,13 +2865,19 @@ final class ExploreBrain {
 
     /** Back to wandering; the camera closes as the state leaves curiosity. */
     private void endCuriosity(long now) {
+        // A roaming stop's end (not a meeting's): after its remark, if any, it may become a seek.
+        boolean seekable = stopSeekable && !meetingHeld;
         stopMotors();
         clearStop();
         enterPause(now, pauseMs(), false);
+        if (seekable) {
+            maybeSeek(now);
+        }
     }
 
     /** Forgets everything about the current stop (the camera closes as the state leaves curiosity). */
     private void clearStop() {
+        stopSeekable = false;
         if (leanInOpen) {
             leanInOpen = false;
             if (!leanInMet) {
@@ -3230,9 +3261,8 @@ final class ExploreBrain {
     /** A stop that ends with nothing to react to: no line, back to wandering (R4). */
     private void nothing(long now, String why) {
         note(why);
-        endCuriosity(now);
         lastStopNothing = true;
-        maybeSeek(now);
+        endCuriosity(now);
     }
 
     /** A thing he reacted to: into seen, and to the front of the request's reacted list. */
@@ -5614,31 +5644,107 @@ final class ExploreBrain {
     }
 
     /**
-     * A curiosity stop ended with nothing new (in PAUSE now): when its looks were familiar
-     * (at least seekMinLooks scored, every one seekFamiliarNovelty or less) for the
-     * seekFamiliarScans-th stop in a row, and none has run for seekGapMs, he seeks.
+     * A roaming curiosity stop ended (in PAUSE now, after its remark if it had one): he
+     * seeks, at most once per seekGapMs, when
+     * - the stop found nothing new and its looks were familiar (at least seekMinLooks
+     *   scored, every one seekFamiliarNovelty or less) for the seekFamiliarScans-th stop
+     *   in a row;
+     * - the last seekAreaWindowMs of roaming stayed within a small area (areaTrapped); or
+     * - he has roamed seekEveryMs without a seek.
+     * Live (2026-10-01) the first alone never fired: Claude had a remark at almost every
+     * stop, and the place memory read most views as new.
      */
     private void maybeSeek(long now) {
-        if (tuning.seekFamiliarScans <= 0 || seeking() || state != State.PAUSE) {
+        if (seeking() || state != State.PAUSE) {
             return;
         }
-        int scored = 0;
-        double most = 0;
-        for (SeekView v : seekScan) {
-            if (!Double.isNaN(v.novelty)) {
-                scored++;
-                most = Math.max(most, v.novelty);
+        String why = null;
+        if (tuning.seekFamiliarScans > 0 && lastStopNothing) {
+            int scored = 0;
+            double most = 0;
+            for (SeekView v : seekScan) {
+                if (!Double.isNaN(v.novelty)) {
+                    scored++;
+                    most = Math.max(most, v.novelty);
+                }
+            }
+            familiarStops = scored >= tuning.seekMinLooks && most <= tuning.seekFamiliarNovelty ? familiarStops + 1 : 0;
+            if (familiarStops >= tuning.seekFamiliarScans) {
+                why = String.format(java.util.Locale.US,
+                        "seeking: surroundings familiar (%d stops in a row, every look's novelty %.2f or less)",
+                        familiarStops, most);
             }
         }
-        familiarStops = scored >= tuning.seekMinLooks && most <= tuning.seekFamiliarNovelty ? familiarStops + 1 : 0;
-        if (familiarStops < tuning.seekFamiliarScans || now < seekNextAt || !compass.usable(now)) {
+        if (why == null) {
+            int cells = areaTrapped();
+            if (cells >= 0) {
+                why = "seeking: stayed within a small area (" + cells + " cells in " + span(tuning.seekAreaWindowMs) + ")";
+            }
+        }
+        if (why == null && tuning.seekEveryMs > 0 && roamedSinceSeekMs >= tuning.seekEveryMs) {
+            why = "seeking: no seek for " + span(tuning.seekEveryMs);
+        }
+        if (why == null || now < seekNextAt || !compass.usable(now)) {
             return;
         }
-        note(String.format(java.util.Locale.US,
-                "seeking: surroundings familiar (%d stops in a row, every look's novelty %.2f or less)", familiarStops,
-                most));
+        note(why);
         familiarStops = 0;
         startSeek(now);
+    }
+
+    /** A duration as whole minutes ("5 min"), or seconds when it is not whole minutes. */
+    private static String span(long ms) {
+        return ms % 60000 == 0 ? (ms / 60000) + " min" : (ms / 1000) + " s";
+    }
+
+    /**
+     * Roaming time since the last step. For seekEveryMs: wandering, pauses, escapes and
+     * roaming curiosity stops (with their remarks), never a meeting, a conversation or a
+     * voice's turn. For the area trail, only the moving part (state.roams()): with coverage
+     * tracking, his dead-reckoned position joins it about once a second.
+     */
+    private void roamClock(long now) {
+        if (roamClockAt >= 0 && now > roamClockAt && leaseHeld
+                && (state.roams() || stopSeekable && !meetingHeld && !state.chats())) {
+            long dt = Math.min(now - roamClockAt, 1000);
+            roamedSinceSeekMs += dt;
+        }
+        if (roamClockAt >= 0 && now > roamClockAt && leaseHeld && state.roams()) {
+            roamedMs += Math.min(now - roamClockAt, 1000);
+            if (coverage.tracking() && (areaTrail.isEmpty() || roamedMs - areaTrail.peekLast()[0] >= 1000)) {
+                areaTrail.addLast(new double[]{roamedMs, coverage.x(), coverage.y()});
+                while (roamedMs - areaTrail.peekFirst()[0] > tuning.seekAreaWindowMs) {
+                    areaTrail.pollFirst();
+                }
+            }
+        }
+        roamClockAt = now;
+    }
+
+    /**
+     * The coverageCellM cells the last seekAreaWindowMs of roaming passed through, when
+     * they span less than seekAreaSpanM along both axes or number seekAreaCells or fewer;
+     * -1 when he got further, the area trigger is off, or the trail does not cover the
+     * whole window yet (dead reckoning not tracking for long enough).
+     */
+    private int areaTrapped() {
+        if (tuning.seekAreaWindowMs <= 0 || areaTrail.isEmpty()
+                || roamedMs - areaTrail.peekFirst()[0] < tuning.seekAreaWindowMs - 2000) {
+            return -1;
+        }
+        double minX = Double.MAX_VALUE, maxX = -Double.MAX_VALUE, minY = Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+        Set<Long> cells = new HashSet<Long>();
+        for (double[] p : areaTrail) {
+            minX = Math.min(minX, p[1]);
+            maxX = Math.max(maxX, p[1]);
+            minY = Math.min(minY, p[2]);
+            maxY = Math.max(maxY, p[2]);
+            long cx = (long) Math.floor(p[1] / tuning.coverageCellM);
+            long cy = (long) Math.floor(p[2] / tuning.coverageCellM);
+            cells.add((cx << 32) ^ (cy & 0xffffffffL));
+        }
+        boolean small = maxX - minX < tuning.seekAreaSpanM && maxY - minY < tuning.seekAreaSpanM;
+        return small || cells.size() <= tuning.seekAreaCells ? cells.size() : -1;
     }
 
     /** Ask Claude which of the stop's frames to go to; without Claude, the least familiar one. */
@@ -5896,6 +6002,7 @@ final class ExploreBrain {
         seekLegs = 0;
         familiarStops = 0;
         seekNextAt = now + tuning.seekGapMs;
+        roamedSinceSeekMs = 0;
     }
 
     // ---- people while roaming (explore nav plan U7, R9, R10, KTD4, KTD8) ----

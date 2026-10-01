@@ -375,6 +375,13 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "seek_after_arrival_the_next_seek_chooses_a_different_place",
         "seek_never_in_a_room_that_looks_new",
         "seek_a_call_during_a_seek_is_answered",
+        # Seeking somewhere new by time and area (owner 2026-10-01: "if he's been somewhere in the
+        # last 30 minutes, he should try and find somewhere else to go")
+        "seek_tuning_defaults_every_five_minutes_or_a_small_area_over_three",
+        "seek_claude_always_has_a_remark_still_seeks_within_five_minutes",
+        "seek_circling_in_a_one_metre_area_seeks_early",
+        "seek_just_sought_waits_seek_gap_before_seeking_again",
+        "seek_a_call_during_a_timed_seek_is_answered",
         "replies_seek_reads_frame_and_x_or_none_and_the_prompt_carries_numbers_and_labels_only",
         # The leg decision waits for a look to steer by (explore nav plan KTD9, live 2026-09-25)
         "steer_waits_for_a_look_after_a_turn_and_uses_the_legs_own_looks",

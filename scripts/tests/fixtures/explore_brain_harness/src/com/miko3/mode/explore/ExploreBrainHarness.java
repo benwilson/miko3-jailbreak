@@ -8422,6 +8422,121 @@ public final class ExploreBrainHarness {
         return m.find() ? Double.parseDouble(m.group(1)) : Double.NaN;
     }
 
+    // ---- seeking somewhere new by time and area (owner 2026-10-01: "if he's been somewhere in the
+    // last 30 minutes, he should try and find somewhere else to go") ----
+    //
+    // Live, 30+ minutes gave 9 curiosity stops and no seek: Claude had a fresh remark at almost
+    // every stop, and the place memory read most views as new. These rigs are that room: a
+    // remark at every stop, and every view new to the place memory, so only time or the
+    // ground he has covered can start a seek.
+
+    private static Rig remarkRig(ExploreTuning.Builder b, SeekScript seeks) {
+        Rig rig = new Rig(b.build(), CLEAR, NOTHING, true, (r, req, nth) -> pick(1, "plant " + nth,
+                CuriosityPort.Kind.OTHER, "Remark number " + nth + ", what a thing!", 0.5f, 0.5f, 0.2f, 0.3f));
+        rig.openView = ALL_OPEN;
+        rig.placeView = (r, t) -> scene(100000 + t);
+        rig.seeks = seeks;
+        rig.simWheels = true;
+        return rig;
+    }
+
+    /** The time of the last event starting with prefix before t, else -1. */
+    private static long lastEventBefore(Rig rig, String prefix, long t) {
+        long at = -1;
+        for (Event e : rig.log) {
+            if (e.t < t && e.what.startsWith(prefix)) {
+                at = e.t;
+            }
+        }
+        return at;
+    }
+
+    private static void timedSeekScenarios() {
+        scenario("seek_tuning_defaults_every_five_minutes_or_a_small_area_over_three", n -> {
+            ExploreTuning t = new ExploreTuning.Builder().build();
+            ExploreTuning off = new ExploreTuning.Builder().seekOff().build();
+            check(n, t.seekEveryMs == 300000 && t.seekAreaWindowMs == 180000 && t.seekAreaSpanM == 1.5
+                            && t.seekAreaCells == 3 && off.seekEveryMs == 0 && off.seekAreaWindowMs == 0
+                            && off.seekFamiliarScans == 0,
+                    "every=" + t.seekEveryMs + " window=" + t.seekAreaWindowMs + " span=" + t.seekAreaSpanM
+                            + " cells=" + t.seekAreaCells);
+        });
+        scenario("seek_claude_always_has_a_remark_still_seeks_within_five_minutes", n -> {
+            Rig rig = remarkRig(seekTuning(), (r, req, k) -> CuriosityPort.WayOut.way(0, 0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 420000, r -> notedAt(notes, "seeking: Claude picked") >= 0);
+            long why = notedAt(notes, "seeking: no seek for 5 min");
+            long asked = rig.timeOf(rig.firstAfter("seek ", 0));
+            int said = rig.countPrefix("say Remark number", 0, why < 0 ? rig.now : why);
+            // The stop's remark is said first, then its frames go to the seek ask.
+            long saidAt = lastEventBefore(rig, "say Remark number", asked < 0 ? rig.now : asked);
+            CuriosityPort.SeekRequest req = rig.seekRequests.isEmpty() ? null : rig.seekRequests.get(0);
+            check(n, why >= 300000 && why <= 360000 && said >= 10 && asked >= why && saidAt >= 0
+                            && asked - saidAt <= 15000 && req != null && req.frames.size() == 3
+                            && notedAt(notes, "seeking: surroundings familiar") < 0
+                            && notedAt(notes, "seeking: stayed within a small area") < 0
+                            && rig.violations.isEmpty(),
+                    "why=" + why + " asked=" + asked + " saidAt=" + saidAt + " said=" + said + " "
+                            + notes.subList(Math.max(0, notes.size() - 8), notes.size()));
+        });
+        scenario("seek_circling_in_a_one_metre_area_seeks_early", n -> {
+            // Wheel counts read as a fiftieth of the distance: all his roaming stays within about a metre.
+            Rig rig = remarkRig(seekTuning().coverageGrid(150000, 0.5, 1800000, 1.5),
+                    (r, req, k) -> CuriosityPort.WayOut.way(0, 0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 420000, r -> notedAt(notes, "seeking: Claude picked") >= 0);
+            String why = firstNote(notes, "seeking: stayed within a small area (");
+            long at = notedAt(notes, "seeking: stayed within a small area (");
+            check(n, why != null && why.matches(".* \\(\\d+ cells in 3 min\\)") && at >= 180000 && at < 300000
+                            && notedAt(notes, "seeking: no seek for") < 0 && notedAt(notes, "seeking: Claude picked") > at
+                            && rig.violations.isEmpty(),
+                    "why=" + why + " at=" + at + " " + notes.subList(Math.max(0, notes.size() - 8), notes.size()));
+        });
+        scenario("seek_just_sought_waits_seek_gap_before_seeking_again", n -> {
+            Rig rig = remarkRig(seekTuning().seekTrigger(2, 0.3, 2, 120000).seekEvery(20000).seekArea(0, 1.5, 3),
+                    (r, req, k) -> CuriosityPort.WayOut.way(0, 0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(600000);
+            List<Long> starts = notedTimes(notes, "seeking: no seek for");
+            List<Long> ends = new ArrayList<Long>(notedTimes(notes, "seeking: gave up"));
+            ends.addAll(notedTimes(notes, "seeking: arrived"));
+            java.util.Collections.sort(ends);
+            boolean floor = starts.size() >= 3 && starts.get(0) >= 20000;
+            for (int i = 1; floor && i < starts.size(); i++) {
+                long prevEnd = -1;
+                for (long e : ends) {
+                    if (e < starts.get(i)) {
+                        prevEnd = e;
+                    }
+                }
+                floor = prevEnd >= starts.get(i - 1) && starts.get(i) - prevEnd >= 120000
+                        && starts.get(i) - prevEnd <= 160000;
+            }
+            check(n, floor && rig.violations.isEmpty(), "starts=" + starts + " ends=" + ends);
+        });
+        scenario("seek_a_call_during_a_timed_seek_is_answered", n -> {
+            Rig rig = remarkRig(seekTuning().seekEvery(60000).cueTurn(45, 90, 500, 2000, 600),
+                    (r, req, k) -> CuriosityPort.WayOut.way(0, 0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 300000, r -> notedAt(notes, "seeking: Claude picked") >= 0);
+            long picked = rig.now;
+            runUntil(rig, picked + 30000, r -> r.firstAfter("hop", picked) >= 0);
+            long cueT = rig.now + 200;
+            rig.cue(cueT, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 70f);
+            rig.runUntil(cueT + 4000);
+            String gaveUp = firstNote(notes, "seeking: gave up");
+            long answered = answerAt(rig, cueT);
+            check(n, notedAt(notes, "seeking: no seek for 1 min") >= 0 && answered >= cueT && answered <= cueT + 500
+                            && entered(rig, ExploreBrain.State.CUE_TURN, cueT) >= cueT
+                            && gaveUp != null && gaveUp.contains("a call") && !rig.brain.seeking() && rig.violations.isEmpty(),
+                    "answered=" + answered + " gaveUp=" + gaveUp + " " + rig.tail());
+        });
+    }
+
     private static void seekScenarios() {
         scenario("seek_bearing_is_exact_at_the_centre_the_edge_and_a_quarter_of_the_width", n -> {
             ExploreTuning t = new ExploreTuning.Builder().build();
@@ -8664,6 +8779,7 @@ public final class ExploreBrainHarness {
                             && gaveUp != null && gaveUp.contains("a call") && !rig.brain.seeking() && rig.violations.isEmpty(),
                     "answered=" + answered + " gaveUp=" + gaveUp + " " + rig.tail());
         });
+        timedSeekScenarios();
         scenario("replies_seek_reads_frame_and_x_or_none_and_the_prompt_carries_numbers_and_labels_only", n -> {
             int[] w = {640, 640, 640};
             java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();

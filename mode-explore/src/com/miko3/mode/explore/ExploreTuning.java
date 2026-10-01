@@ -759,6 +759,21 @@ final class ExploreTuning {
     final double seekRecentreDeg;
     final double seekArriveNovelty;
     final float seekWeight;
+    /**
+     * Seeking somewhere new by time and ground (owner, 2026-10-01: "if he's been somewhere
+     * in the last 30 minutes, he should try and find somewhere else to go"). Live, Claude
+     * had a remark at almost every stop and the place memory read most views as new, so the
+     * familiar trigger above never fired in 30+ minutes. Two more triggers, checked as any
+     * roaming curiosity stop ends (after its remark, if it had one), each still at most one
+     * seek per seekGapMs: seekEveryMs of roaming without a seek (0: off), or, over the last
+     * seekAreaWindowMs of roaming (0: off), the dead-reckoned positions he passed through
+     * spanning less than seekAreaSpanM along both axes or covering seekAreaCells
+     * coverageCellM cells or fewer. The seek then asks Claude about that stop's frames.
+     */
+    final long seekEveryMs;
+    final long seekAreaWindowMs;
+    final double seekAreaSpanM;
+    final int seekAreaCells;
 
     private ExploreTuning(Builder b) {
         hopTicks = b.hopTicks;
@@ -1014,6 +1029,10 @@ final class ExploreTuning {
         seekRecentreDeg = Math.max(0, b.seekRecentreDeg);
         seekArriveNovelty = b.seekArriveNovelty;
         seekWeight = Math.max(0f, b.seekWeight);
+        seekEveryMs = Math.max(0, b.seekEveryMs);
+        seekAreaWindowMs = Math.max(0, b.seekAreaWindowMs);
+        seekAreaSpanM = Math.max(0, b.seekAreaSpanM);
+        seekAreaCells = Math.max(0, b.seekAreaCells);
     }
 
     /** The shipped defaults with the given calibration (null = uncalibrated). */
@@ -1482,6 +1501,12 @@ final class ExploreTuning {
         // Twice the doorway's pull: the target beats an equally open band anywhere in view,
         // but a blocked band never gains.
         private float seekWeight = 0.6f;
+        // Five minutes of roaming without a seek, or three minutes within about two body
+        // lengths (1.5 m, three 0.5 m cells): he looks for somewhere new.
+        private long seekEveryMs = 300000;
+        private long seekAreaWindowMs = 180000;
+        private double seekAreaSpanM = 1.5;
+        private int seekAreaCells = 3;
         // A scan's looks stand for their headings about as long as a stop and the next leg.
         private long placeGlanceMs = 120000;
 
@@ -1818,7 +1843,21 @@ final class ExploreTuning {
         }
         Builder seekAskTimeoutMs(long v) { seekAskTimeoutMs = v; return this; }
         /** Never seeks the unfamiliar: roaming as before it. */
-        Builder seekOff() { seekFamiliarScans = 0; return this; }
+        Builder seekOff() {
+            seekFamiliarScans = 0;
+            seekEveryMs = 0;
+            seekAreaWindowMs = 0;
+            return this;
+        }
+        /** A seek after everyMs of roaming without one (0: never by time). */
+        Builder seekEvery(long everyMs) { seekEveryMs = everyMs; return this; }
+        /** A seek when the last windowMs of roaming stayed within spanM, or within cells cells (windowMs 0: never). */
+        Builder seekArea(long windowMs, double spanM, int cells) {
+            seekAreaWindowMs = windowMs;
+            seekAreaSpanM = spanM;
+            seekAreaCells = cells;
+            return this;
+        }
         /** Novelty steering and long legs off: the roaming before U10 (the grid is still kept). */
         Builder coverageOff() { coverageWeight = 0f; return this; }
         Builder coverageTurns(float novelAhead, double turnScale) {
