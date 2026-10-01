@@ -76,6 +76,13 @@ Everything below that needs the robot is sequenced into one session in `docs/rob
 - [ ] **A call's words never reach the brain.** `Ears.Cue` has no text, and a "Hey Miko …" said during CHAT_LISTEN arrives as a wake word, not as words. `ChatSession` resets its unanswered-listen count only on heard words. Needs EarsAdapter/launcher and ChatSession changes.
 - [ ] **Robot-test the 2026-09-30 call fixes** (side-first search, fresh frames from turn stop, talking during the search). They are host-tested only: the camera HAL wedged before the test.
 
+- [ ] **The ears cut off the start of each utterance.** The recogniser is fed only from the VAD onset, so "Miko" often decodes as "O". On host (synthetic audio, 2026-09-30), feeding it the previous 160 ms first raised name hits from about 46 to 105 of 162. Fix in EarsSession/ListenEngine with a pre-roll buffer, then confirm on the robot.
+- [ ] **Robot-measure the speed switches** (2026-09-30, all off by default):
+  - `scripts/qa-detector-bench.py`, with Explore exited; it never opens the camera;
+  - `scripts/qa-ears-cpu.py --settings baseline threads1 greedy-threads1`.
+
+  Host results favour `detector-rgba.onnx` and `persist.miko3.ears.threads=1`. Make the winners the defaults and drop the fp32 detector asset (+9 MB until then).
+
 ## Remote-control mode
 
 - [ ] Confirm it still drives forward after the shared `DirectMotorDriver` change (needs someone watching the robot).
