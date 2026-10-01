@@ -90,7 +90,8 @@ A_NOT_AN = {"ukulele", "usb stick"}
 # confirmation itself is not a clip: it carries the stored name, so the
 # on-device voice says it from ChatSession's template.
 LINE_CLIPS = {
-    "acknowledge": ["hm?", "yes?"],
+    # "hm?" was dropped (owner, 2026-10-01): the robot voice says it as a clipped "h m".
+    "acknowledge": ["yes?"],
     "sign-off": ["catch you later.", "see you around."],
     "one-sec": ["one sec.", "hang on a sec."],
     "deflect": ["nice try, but no.", "not my department."],

@@ -214,7 +214,7 @@ class LineClipsTest(unittest.TestCase):
 
     def test_clip_names_follow_the_reaction_index(self):
         names = [n for n, _ in voice.line_clips()]
-        self.assertEqual(names[:2], ["react-acknowledge-1.webm", "react-acknowledge-2.webm"])
+        self.assertEqual(names[:2], ["react-acknowledge-1.webm", "react-sign-off-1.webm"])
         self.assertEqual(len(names), len(set(names)))
         for n in names:
             self.assertRegex(n, r"^react-[a-z-]+-\d+\.webm$")
