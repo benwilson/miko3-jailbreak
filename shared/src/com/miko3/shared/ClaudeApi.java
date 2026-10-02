@@ -160,6 +160,81 @@ public final class ClaudeApi {
         void complete(Map<String, String> fields);
     }
 
+    /**
+     * Told each text block of a conversation reply, in order, on the request's thread:
+     * from the stream at the block's content_block_stop (so prose before a tool call
+     * can be spoken while the call is still streaming), or from the whole reply when
+     * the transport cannot stream. Never told for a reply that fails first.
+     */
+    public interface TextBlocks {
+        void complete(String text);
+    }
+
+    /** One tool call in a reply: the id its tool_result must name, the tool's name and its input. */
+    public static final class ToolUse {
+        public final String id;
+        public final String name;
+        public final Map<String, Object> input;
+
+        ToolUse(String id, String name, Map<String, Object> input) {
+            this.id = id;
+            this.name = name;
+            this.input = Collections.unmodifiableMap(input);
+        }
+    }
+
+    /**
+     * The tools a conversation request offers (tool(...) definitions, sent in order),
+     * how Claude may choose among them ("auto" unless choice() names "any", "none" or
+     * one tool), the reply tool whose input carries the structured reply (its input
+     * becomes MessageResult.json and feeds EarlyFields as it streams), and an optional
+     * TextBlocks listener. Immutable; each setter returns a copy.
+     */
+    public static final class Tools {
+        public final List<Map<String, Object>> definitions;
+        /** "auto", "any", "none", or a tool's name to force that tool. */
+        public final String choice;
+        /** The tool whose input is the structured reply, or null. */
+        public final String replyTool;
+        public final TextBlocks textBlocks;
+
+        public Tools(List<Map<String, Object>> definitions) {
+            this(definitions, "auto", null, null);
+        }
+
+        private Tools(List<Map<String, Object>> definitions, String choice, String replyTool, TextBlocks textBlocks) {
+            this.definitions = Collections.unmodifiableList(new ArrayList<Map<String, Object>>(
+                    definitions == null ? Collections.<Map<String, Object>>emptyList() : definitions));
+            this.choice = choice == null || choice.isEmpty() ? "auto" : choice;
+            this.replyTool = replyTool;
+            this.textBlocks = textBlocks;
+        }
+
+        public Tools choice(String choice) {
+            return new Tools(definitions, choice, replyTool, textBlocks);
+        }
+
+        public Tools replyTool(String name) {
+            return new Tools(definitions, choice, name, textBlocks);
+        }
+
+        public Tools onText(TextBlocks listener) {
+            return new Tools(definitions, choice, replyTool, listener);
+        }
+
+        /** The tool_choice block: {"type": "auto" | "any" | "none"}, or {"type": "tool", "name": ...}. */
+        Map<String, Object> choiceBlock() {
+            Map<String, Object> c = new LinkedHashMap<String, Object>();
+            if ("auto".equals(choice) || "any".equals(choice) || "none".equals(choice)) {
+                c.put("type", choice);
+            } else {
+                c.put("type", "tool");
+                c.put("name", choice);
+            }
+            return c;
+        }
+    }
+
     public static final class Request {
         public final String method;
         public final String url;
@@ -210,12 +285,44 @@ public final class ClaudeApi {
         public final Map<String, Object> json;
         /** A failure's retry-after header in ms, or -1 when it had none (or one that isn't whole seconds). */
         public final long retryAfterMs;
+        /** The reply's stop_reason ("end_turn", "tool_use", "max_tokens"...); null unless ok(). */
+        public final String stopReason;
+        /** The reply's text blocks joined; "" unless ok(). */
+        public final String text;
+        /**
+         * The reply's content blocks, text ({type, text}) and tool_use ({type, id, name,
+         * input}) in order, ready to send back as the assistant turn (assistantTurn());
+         * empty unless ok().
+         */
+        public final List<Map<String, Object>> content;
+        /** The tool calls the reply asked for, in order; empty unless ok(). */
+        public final List<ToolUse> toolUses;
 
         private MessageResult(Reason reason, int httpStatus, Map<String, Object> json, long retryAfterMs) {
+            this(reason, httpStatus, json, retryAfterMs, null, "", new ArrayList<Map<String, Object>>(),
+                    new ArrayList<ToolUse>());
+        }
+
+        private MessageResult(Reason reason, int httpStatus, Map<String, Object> json, long retryAfterMs,
+                String stopReason, String text, List<Map<String, Object>> content, List<ToolUse> toolUses) {
             this.reason = reason;
             this.httpStatus = httpStatus;
             this.json = Collections.unmodifiableMap(json);
             this.retryAfterMs = retryAfterMs;
+            this.stopReason = stopReason;
+            this.text = text;
+            this.content = Collections.unmodifiableList(content);
+            this.toolUses = Collections.unmodifiableList(toolUses);
+        }
+
+        /** The tool call with this name, or null when the reply made none. */
+        public ToolUse toolUse(String name) {
+            for (ToolUse u : toolUses) {
+                if (u.name.equals(name)) {
+                    return u;
+                }
+            }
+            return null;
         }
 
         static MessageResult failure(Reason reason, int httpStatus) {
@@ -379,6 +486,72 @@ public final class ClaudeApi {
         b.put("type", "image");
         b.put("source", source);
         return b;
+    }
+
+    /**
+     * One tool definition for Tools: name, description and the input's JSON schema
+     * (nested Maps/Lists; null for a tool that takes no input, sent as an empty object schema).
+     */
+    public static Map<String, Object> tool(String name, String description, Map<String, ?> inputSchema) {
+        Map<String, Object> t = new LinkedHashMap<String, Object>();
+        t.put("name", name);
+        if (description != null && !description.isEmpty()) {
+            t.put("description", description);
+        }
+        if (inputSchema == null) {
+            Map<String, Object> empty = new LinkedHashMap<String, Object>();
+            empty.put("type", "object");
+            empty.put("properties", new LinkedHashMap<String, Object>());
+            t.put("input_schema", empty);
+        } else {
+            t.put("input_schema", inputSchema);
+        }
+        return t;
+    }
+
+    /** A tool_result block answering the tool call with this id in text. */
+    public static Map<String, Object> toolResult(String toolUseId, String text) {
+        return toolResult(toolUseId, (Object) (text == null ? "" : text), false);
+    }
+
+    /** A tool_result block saying the call failed (is_error), with why in text Claude can read. */
+    public static Map<String, Object> toolError(String toolUseId, String message) {
+        return toolResult(toolUseId, (Object) (message == null ? "" : message), true);
+    }
+
+    /**
+     * A tool_result block answering with a photo: the JPEG as jpegBlock() makes it
+     * (slimmed, base64), then the caption as a text block when there is one.
+     */
+    public static Map<String, Object> toolResultImage(String toolUseId, byte[] jpeg, String caption) {
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        content.add(jpegBlock(jpeg));
+        if (caption != null && !caption.isEmpty()) {
+            content.add(textBlock(caption));
+        }
+        return toolResult(toolUseId, content, false);
+    }
+
+    /** A tool_result block with any content: a String, or a list of text and image blocks. */
+    public static Map<String, Object> toolResult(String toolUseId, Object content, boolean isError) {
+        Map<String, Object> b = new LinkedHashMap<String, Object>();
+        b.put("type", "tool_result");
+        b.put("tool_use_id", toolUseId);
+        b.put("content", content);
+        if (isError) {
+            b.put("is_error", Boolean.TRUE);
+        }
+        return b;
+    }
+
+    /** The assistant turn to put back in the history: the reply's content blocks as they came. */
+    public static Map<String, Object> assistantTurn(MessageResult reply) {
+        return message("assistant", new ArrayList<Map<String, Object>>(reply.content));
+    }
+
+    /** The user turn that answers a tool-using reply: every tool_result, in one message (parallel calls included). */
+    public static Map<String, Object> toolResults(List<Map<String, Object>> results) {
+        return message("user", new ArrayList<Map<String, Object>>(results));
     }
 
     /**
@@ -614,39 +787,70 @@ public final class ClaudeApi {
      */
     public MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
             Map<String, ?> schema, String effort, int timeoutMs, List<String> earlyNames, EarlyFields early) {
+        return conversation(access, system, messages, schema, effort, timeoutMs, earlyNames, early, null);
+    }
+
+    /**
+     * As conversation(), offering tools (null: none, and the request and reply are
+     * exactly as without this overload). With tools:
+     * - the request carries tools and tool_choice beside the schema (if any); the gateway
+     *   takes both together (robot 2026-10-02), and the gates retry keeping the tools;
+     * - a reply that calls a tool is ok: MessageResult.toolUses, .content and .stopReason
+     *   ("tool_use") say what to run; json is the reply text's JSON object when it has one;
+     * - with tools.replyTool, that tool's input is the structured reply: it becomes json,
+     *   and early is told its named fields as the input streams;
+     * - tools.textBlocks is told each text block as it closes (a reason to stream on its own);
+     * - a tool input that isn't one JSON object (cut off by max_tokens) is BAD_REPLY.
+     * Answer a tool call by sending the history plus assistantTurn(result) and
+     * toolResults([...toolResult/toolError/toolResultImage]) in the next call.
+     */
+    public MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
+            Map<String, ?> schema, String effort, int timeoutMs, List<String> earlyNames, EarlyFields early,
+            Tools tools) {
         MessageResult notReady = preflight(access);
         if (notReady != null) {
             return notReady;
         }
         String base = normalizeBaseUrl(access.baseUrl);
-        boolean stream = early != null && earlyNames != null && transport instanceof StreamingTransport;
-        Stream sink = stream ? new Stream(earlyNames, early) : null;
+        boolean wantsEarly = early != null && earlyNames != null;
+        TextBlocks texts = tools == null ? null : tools.textBlocks;
+        boolean stream = (wantsEarly || texts != null) && transport instanceof StreamingTransport;
+        Stream sink = stream ? new Stream(wantsEarly ? earlyNames : null, wantsEarly ? early : null, tools,
+                schema != null) : null;
         Response resp;
         try {
             boolean useOutputConfig = schema != null && !schemaInPrompt;
             String sendEffort = effortUnsupported || !takesEffort(access.model) ? null : effort;
             resp = send(conversationRequest(base, access, system, messages, schema, useOutputConfig,
-                    sendEffort, true, stream, timeoutMs), sink);
+                    sendEffort, true, stream, tools, timeoutMs), sink);
             // The 400's error message, read only to choose the retry; never shown.
             String error = errorMessage(resp);
             if (sendEffort != null && error != null && error.contains("effort")) {
                 effortUnsupported = true;
                 sendEffort = null;
                 resp = send(conversationRequest(base, access, system, messages, schema, useOutputConfig,
-                        null, true, stream, timeoutMs), sink);
+                        null, true, stream, tools, timeoutMs), sink);
                 error = errorMessage(resp);
             }
             if (useOutputConfig && error != null && error.contains("output_config") && !error.contains("effort")) {
                 schemaInPrompt = true;
                 resp = send(conversationRequest(base, access, system, messages, schema, false, sendEffort,
-                        true, stream, timeoutMs), sink);
+                        true, stream, tools, timeoutMs), sink);
             }
         } catch (IOException e) {
             return MessageResult.failure(forException(e), 0);
         }
         MessageResult r = sink != null && resp.status >= 200 && resp.status <= 299 && resp.body.isEmpty()
-                ? sink.result(resp.status) : reply(resp);
-        if (early != null && earlyNames != null && r.ok() && (sink == null || !sink.told)) {
+                ? sink.result(resp.status) : reply(resp, tools, schema != null);
+        if (texts != null && r.ok() && sink == null) {
+            for (Map<String, Object> block : r.content) {
+                if ("text".equals(block.get("type"))) {
+                    texts.complete((String) block.get("text"));
+                }
+            }
+        }
+        // A tool call with no structured reply yet (no JSON text, no reply tool) has no fields to tell.
+        if (wantsEarly && r.ok() && (sink == null || !sink.told) && (tools == null || !r.json.isEmpty())) {
             Map<String, String> fields = new LinkedHashMap<String, String>();
             for (String name : earlyNames) {
                 Object v = r.json.get(name);
@@ -673,27 +877,52 @@ public final class ClaudeApi {
     }
 
     /**
-     * A streamed Messages reply (SSE), read as it arrives: the text deltas joined,
-     * the stop reason, and an error event; early is told the named fields once
-     * they are all complete. Nothing in it is logged.
+     * A streamed Messages reply (SSE), read as it arrives: each content block by its
+     * index (text deltas, and a tool_use's input_json_delta chunks, parsed at the end),
+     * the stop reason, and an error event. early is told the named fields once they
+     * are all complete, from the text or from the reply tool's input; a Tools text
+     * listener is told each text block at its content_block_stop. Nothing in it is logged.
      */
     private static final class Stream implements LineSink {
+        /** One content block as it streams: text, or a tool_use's id, name and raw input JSON. */
+        private static final class Block {
+            final String type;
+            final String id;
+            final String name;
+            final StringBuilder buf = new StringBuilder();
+
+            Block(String type, String id, String name) {
+                this.type = type;
+                this.id = id;
+                this.name = name;
+            }
+        }
+
         private final List<String> names;
         private final EarlyFields early;
+        private final Tools tools;
+        private final boolean wantJson;
         private final StringBuilder text = new StringBuilder();
+        /** By index, in the order they started. */
+        private final Map<Integer, Block> blocks = new LinkedHashMap<Integer, Block>();
+        private int chars;
         private String stopReason;
         private String errorType;
         private boolean any;
         boolean told;
 
-        Stream(List<String> names, EarlyFields early) {
+        Stream(List<String> names, EarlyFields early, Tools tools, boolean wantJson) {
             this.names = names;
             this.early = early;
+            this.tools = tools;
+            this.wantJson = wantJson;
         }
 
         /** A retried request starts afresh. */
         void reset() {
             text.setLength(0);
+            blocks.clear();
+            chars = 0;
             stopReason = null;
             errorType = null;
             any = false;
@@ -710,11 +939,32 @@ public final class ClaudeApi {
             }
             any = true;
             Object type = ev.get("type");
-            if ("content_block_delta".equals(type) && ev.get("delta") instanceof Map) {
-                Object t = ((Map<?, ?>) ev.get("delta")).get("text");
-                if (t instanceof String && text.length() < MAX_STREAM_CHARS) {
+            if ("content_block_start".equals(type) && ev.get("content_block") instanceof Map) {
+                Map<?, ?> cb = (Map<?, ?>) ev.get("content_block");
+                blocks.put(index(ev), new Block(String.valueOf(cb.get("type")), string(cb.get("id")),
+                        string(cb.get("name"))));
+            } else if ("content_block_delta".equals(type) && ev.get("delta") instanceof Map) {
+                Map<?, ?> delta = (Map<?, ?>) ev.get("delta");
+                Object t = delta.get("text");
+                Object partial = delta.get("partial_json");
+                if (t instanceof String && chars < MAX_STREAM_CHARS) {
+                    chars += ((String) t).length();
+                    block(ev, "text").buf.append((String) t);
                     text.append((String) t);
-                    tellIfComplete();
+                    tellIfComplete(text);
+                } else if (partial instanceof String && chars < MAX_STREAM_CHARS) {
+                    chars += ((String) partial).length();
+                    Block b = block(ev, "tool_use");
+                    b.buf.append((String) partial);
+                    if (tools != null && tools.replyTool != null && tools.replyTool.equals(b.name)) {
+                        tellIfComplete(b.buf);
+                    }
+                }
+            } else if ("content_block_stop".equals(type)) {
+                Block b = blocks.get(index(ev));
+                if (b != null && "text".equals(b.type) && tools != null && tools.textBlocks != null
+                        && errorType == null) {
+                    tools.textBlocks.complete(b.buf.toString());
                 }
             } else if ("message_delta".equals(type) && ev.get("delta") instanceof Map) {
                 Object r = ((Map<?, ?>) ev.get("delta")).get("stop_reason");
@@ -728,11 +978,31 @@ public final class ClaudeApi {
             }
         }
 
-        private void tellIfComplete() {
-            if (told || errorType != null) {
+        private static int index(Map<?, ?> ev) {
+            Object i = ev.get("index");
+            return i instanceof Number ? ((Number) i).intValue() : 0;
+        }
+
+        private static String string(Object v) {
+            return v instanceof String ? (String) v : "";
+        }
+
+        /** The block a delta belongs to; one with no content_block_start is taken to be of this type. */
+        private Block block(Map<?, ?> ev, String type) {
+            int i = index(ev);
+            Block b = blocks.get(i);
+            if (b == null) {
+                b = new Block(type, "", "");
+                blocks.put(i, b);
+            }
+            return b;
+        }
+
+        private void tellIfComplete(CharSequence source) {
+            if (told || errorType != null || early == null || names == null) {
                 return;
             }
-            Map<String, String> found = completeStringFields(text.toString());
+            Map<String, String> found = completeStringFields(source.toString());
             Map<String, String> fields = new LinkedHashMap<String, String>();
             for (String name : names) {
                 String v = found.get(name);
@@ -754,13 +1024,33 @@ public final class ClaudeApi {
             if (!any) {
                 return MessageResult.failure(Reason.ENDPOINT_ERROR, status);
             }
-            Map<String, Object> block = new LinkedHashMap<String, Object>();
-            block.put("type", "text");
-            block.put("text", text.toString());
+            List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+            for (Block b : blocks.values()) {
+                Map<String, Object> block = new LinkedHashMap<String, Object>();
+                if ("text".equals(b.type)) {
+                    block.put("type", "text");
+                    block.put("text", b.buf.toString());
+                } else if ("tool_use".equals(b.type)) {
+                    String raw = b.buf.toString().trim();
+                    Object input = raw.isEmpty() ? new LinkedHashMap<String, Object>() : parseAny(raw);
+                    if (!(input instanceof Map)) {
+                        // Cut off (max_tokens) or not an object: nothing that can be run.
+                        return MessageResult.failure("refusal".equals(stopReason) ? Reason.REFUSED : Reason.BAD_REPLY,
+                                status);
+                    }
+                    block.put("type", "tool_use");
+                    block.put("id", b.id);
+                    block.put("name", b.name);
+                    block.put("input", input);
+                } else {
+                    continue; // thinking and other block types are not kept
+                }
+                content.add(block);
+            }
             Map<String, Object> body = new LinkedHashMap<String, Object>();
-            body.put("content", Collections.singletonList(block));
+            body.put("content", content);
             body.put("stop_reason", stopReason);
-            return readReply(new Response(status, Json.write(body)));
+            return readReply(new Response(status, Json.write(body)), tools, wantJson);
         }
     }
 
@@ -889,10 +1179,14 @@ public final class ClaudeApi {
 
     /** The last response of messages() or conversation(): a non-2xx maps to its reason, a 2xx is read. */
     private static MessageResult reply(Response resp) {
+        return reply(resp, null, true);
+    }
+
+    private static MessageResult reply(Response resp, Tools tools, boolean wantJson) {
         if (resp.status < 200 || resp.status > 299) {
             return MessageResult.failure(forStatus(resp, false), resp.status, retryAfterMs(resp.retryAfter));
         }
-        return readReply(resp);
+        return readReply(resp, tools, wantJson);
     }
 
     /**
@@ -904,7 +1198,7 @@ public final class ClaudeApi {
      */
     private static Request conversationRequest(String base, ClaudeAccess access, String system,
             List<Map<String, Object>> messages, Map<String, ?> schema, boolean useOutputConfig, String effort,
-            boolean cacheControl, boolean stream, int timeoutMs) {
+            boolean cacheControl, boolean stream, Tools tools, int timeoutMs) {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("model", access.model);
         // The conversation (cacheControl) has its own, smaller cap; messages() keeps 1024.
@@ -914,6 +1208,10 @@ public final class ClaudeApi {
             body.put("system", sys);
         }
         body.put("messages", messages == null ? new ArrayList<Object>() : messages);
+        if (tools != null && !tools.definitions.isEmpty()) {
+            body.put("tools", tools.definitions);
+            body.put("tool_choice", tools.choiceBlock());
+        }
         Map<String, Object> outputConfig = new LinkedHashMap<String, Object>();
         if (useOutputConfig) {
             outputConfig.put("format", formatBlock(schema));
@@ -941,7 +1239,7 @@ public final class ClaudeApi {
         message.put("role", "user");
         message.put("content", content == null ? new ArrayList<Object>() : content);
         return conversationRequest(base, access, system, Collections.singletonList(message), schema,
-                useOutputConfig, null, false, false, timeoutMs);
+                useOutputConfig, null, false, false, null, timeoutMs);
     }
 
     /** The system prompt with the schema-in-prompt ask appended (the ask alone when there is no prompt). */
@@ -983,8 +1281,12 @@ public final class ClaudeApi {
         return message instanceof String ? (String) message : null;
     }
 
-    /** The JSON object in a 2xx Messages reply, or why there isn't one. */
-    private static MessageResult readReply(Response resp) {
+    /**
+     * The JSON object in a 2xx Messages reply, or why there isn't one. With tools, a
+     * reply is also read for its tool calls: one that calls a tool, or answers in prose
+     * when no schema asked for JSON, is ok without a JSON object.
+     */
+    private static MessageResult readReply(Response resp, Tools tools, boolean wantJson) {
         Map<?, ?> body = parseObject(resp.body);
         if (body == null) {
             return MessageResult.failure(Reason.ENDPOINT_ERROR, resp.status);
@@ -997,35 +1299,84 @@ public final class ClaudeApi {
         }
         StringBuilder text = new StringBuilder();
         boolean anyText = false;
+        List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
+        List<ToolUse> uses = new ArrayList<ToolUse>();
         for (Object block : (List<?>) body.get("content")) {
-            if (block instanceof Map && "text".equals(((Map<?, ?>) block).get("type"))
-                    && ((Map<?, ?>) block).get("text") instanceof String) {
-                text.append((String) ((Map<?, ?>) block).get("text"));
+            if (!(block instanceof Map)) {
+                continue;
+            }
+            Map<?, ?> b = (Map<?, ?>) block;
+            if ("text".equals(b.get("type")) && b.get("text") instanceof String) {
+                text.append((String) b.get("text"));
                 anyText = true;
+                content.add(textBlock((String) b.get("text")));
+            } else if (tools != null && "tool_use".equals(b.get("type"))) {
+                if (!(b.get("id") instanceof String) || !(b.get("name") instanceof String)
+                        || !(b.get("input") instanceof Map)) {
+                    return MessageResult.failure(Reason.BAD_REPLY, resp.status);
+                }
+                Map<String, Object> input = stringKeys((Map<?, ?>) b.get("input"));
+                ToolUse use = new ToolUse((String) b.get("id"), (String) b.get("name"), input);
+                uses.add(use);
+                // Only the fields the API takes back; a gateway's extras (caller) are dropped.
+                Map<String, Object> echo = new LinkedHashMap<String, Object>();
+                echo.put("type", "tool_use");
+                echo.put("id", use.id);
+                echo.put("name", use.name);
+                echo.put("input", input);
+                content.add(echo);
             }
         }
-        if (!anyText) {
-            return MessageResult.failure(Reason.ENDPOINT_ERROR, resp.status);
-        }
-        String t = text.toString().trim();
-        Object parsed = parseAny(t);
-        if (parsed == null) {
-            // Prompt-only JSON may come wrapped in prose or a ```json fence.
-            int open = t.indexOf('{');
-            if (open < 0) {
-                return MessageResult.failure(t.indexOf('[') >= 0 ? Reason.BAD_REPLY : Reason.REFUSED, resp.status);
+        String stopReason = body.get("stop_reason") instanceof String ? (String) body.get("stop_reason") : null;
+        ToolUse replyUse = null;
+        if (tools != null && tools.replyTool != null) {
+            for (ToolUse u : uses) {
+                if (tools.replyTool.equals(u.name)) {
+                    replyUse = u;
+                    break;
+                }
             }
-            int close = t.lastIndexOf('}');
-            parsed = close > open ? parseAny(t.substring(open, close + 1)) : null;
-        }
-        if (!(parsed instanceof Map)) {
-            return MessageResult.failure(Reason.BAD_REPLY, resp.status);
         }
         Map<String, Object> json = new LinkedHashMap<String, Object>();
-        for (Map.Entry<?, ?> e : ((Map<?, ?>) parsed).entrySet()) {
-            json.put(String.valueOf(e.getKey()), e.getValue());
+        if (replyUse != null) {
+            json.putAll(replyUse.input);
+        } else {
+            if (!anyText && uses.isEmpty()) {
+                return MessageResult.failure(Reason.ENDPOINT_ERROR, resp.status);
+            }
+            // Without tools every reply must be the JSON object (as it always was); with
+            // tools, only a schema-asking reply that calls no tool must be.
+            boolean jsonRequired = tools == null || (wantJson && uses.isEmpty());
+            String t = text.toString().trim();
+            Object parsed = t.isEmpty() ? null : parseAny(t);
+            if (parsed == null) {
+                // Prompt-only JSON may come wrapped in prose or a ```json fence.
+                int open = t.indexOf('{');
+                if (open < 0) {
+                    if (jsonRequired) {
+                        return MessageResult.failure(t.indexOf('[') >= 0 ? Reason.BAD_REPLY : Reason.REFUSED,
+                                resp.status);
+                    }
+                } else {
+                    int close = t.lastIndexOf('}');
+                    parsed = close > open ? parseAny(t.substring(open, close + 1)) : null;
+                }
+            }
+            if (parsed instanceof Map) {
+                json.putAll(stringKeys((Map<?, ?>) parsed));
+            } else if (jsonRequired) {
+                return MessageResult.failure(Reason.BAD_REPLY, resp.status);
+            }
         }
-        return new MessageResult(null, 0, json, -1);
+        return new MessageResult(null, 0, json, -1, stopReason, text.toString(), content, uses);
+    }
+
+    private static Map<String, Object> stringKeys(Map<?, ?> m) {
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
+        for (Map.Entry<?, ?> e : m.entrySet()) {
+            out.put(String.valueOf(e.getKey()), e.getValue());
+        }
+        return out;
     }
 
     /** NOT_SET_UP, BAD_BASE_URL or BAD_KEY_FORMAT before any request is made; null if fine.

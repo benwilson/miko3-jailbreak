@@ -186,6 +186,19 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "backoff_pauses_on_529_but_not_on_other_failures",
         "backoff_a_429_inside_a_pause_starts_no_new_pause",
         "a_paused_result_is_rate_limited_without_a_status_and_starts_no_pause",
+        "conversation_tools_request_carries_definitions_and_auto_choice",
+        "conversation_tools_ride_beside_the_schema_and_survive_the_output_config_gate",
+        "conversation_plain_reply_parses_text_and_tool_use",
+        "conversation_with_tools_accepts_a_tool_only_or_prose_reply",
+        "conversation_streamed_tool_use_parses_interleaved_text_and_split_input",
+        "conversation_streamed_text_before_a_tool_use_is_told_before_the_tool_streams",
+        "conversation_streamed_schema_line_before_a_tool_use_is_early",
+        "conversation_streamed_reply_tool_input_is_early_and_becomes_the_json",
+        "conversation_plain_reply_tool_reports_the_fields_from_the_whole_reply",
+        "conversation_streamed_truncated_tool_input_is_bad_reply",
+        "tool_result_text_and_image_blocks",
+        "tool_result_error_sets_is_error",
+        "conversation_tool_result_follow_up_sends_assistant_blocks_then_results",
     )
 
     @classmethod

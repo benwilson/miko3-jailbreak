@@ -99,6 +99,7 @@ public final class ClaudeApiHarness {
         streaming();
         keepWarm();
         rateLimits();
+        tools();
     }
 
     private static void normalization() {
@@ -1032,5 +1033,360 @@ public final class ClaudeApiHarness {
                 !held.ok() && held.reason == ClaudeApi.Reason.RATE_LIMITED && held.httpStatus == 0
                         && q.record(held, 0) == 0 && q.remainingMs(0) == 0,
                 held.describe());
+    }
+
+    // ---- tool calling (the conversation can offer look, recall_person, robot_status, places) ----
+
+    private static Map<String, Object> lookSchema() {
+        Map<String, Object> props = new LinkedHashMap<String, Object>();
+        props.put("why", Collections.singletonMap("type", "string"));
+        Map<String, Object> s = new LinkedHashMap<String, Object>();
+        s.put("type", "object");
+        s.put("properties", props);
+        s.put("required", Collections.singletonList("why"));
+        return s;
+    }
+
+    private static Map<String, Object> respondSchema() {
+        Map<String, Object> props = new LinkedHashMap<String, Object>();
+        props.put("line", Collections.singletonMap("type", "string"));
+        props.put("question_asked", Collections.singletonMap("type", "string"));
+        props.put("name_given", Collections.singletonMap("type", "string"));
+        Map<String, Object> s = new LinkedHashMap<String, Object>();
+        s.put("type", "object");
+        s.put("properties", props);
+        s.put("required", Arrays.asList("line", "question_asked", "name_given"));
+        return s;
+    }
+
+    private static List<Map<String, Object>> toolDefs() {
+        List<Map<String, Object>> defs = new ArrayList<Map<String, Object>>();
+        defs.add(ClaudeApi.tool("look", "Take a photo and see what is in front of you.", lookSchema()));
+        defs.add(ClaudeApi.tool("robot_status", "Battery, dock and motor state.", null));
+        return defs;
+    }
+
+    /** Builds a Messages SSE stream block by block, as the gateway sends it (data lines padded with spaces). */
+    private static final class Sse {
+        final List<String> lines = new ArrayList<String>();
+
+        Sse() {
+            event("message_start", "{\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\","
+                    + "\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":9,"
+                    + "\"output_tokens\":1}}}        ");
+            event("ping", "{\"type\": \"ping\"}");
+        }
+
+        Sse event(String name, String data) {
+            lines.add("event: " + name);
+            lines.add("data: " + data);
+            lines.add("");
+            return this;
+        }
+
+        Sse textStart(int index) {
+            return event("content_block_start", "{\"type\":\"content_block_start\",\"index\":" + index
+                    + ",\"content_block\":{\"type\":\"text\",\"text\":\"\"}}");
+        }
+
+        Sse text(int index, String text) {
+            Map<String, Object> delta = new LinkedHashMap<String, Object>();
+            delta.put("type", "text_delta");
+            delta.put("text", text);
+            return delta(index, delta);
+        }
+
+        Sse toolStart(int index, String id, String name) {
+            return event("content_block_start", "{\"type\":\"content_block_start\",\"index\":" + index
+                    + ",\"content_block\":{\"type\":\"tool_use\",\"id\":\"" + id + "\",\"name\":\"" + name
+                    + "\",\"input\":{},\"caller\":{\"type\":\"direct\"}}}   ");
+        }
+
+        Sse json(int index, String partial) {
+            Map<String, Object> delta = new LinkedHashMap<String, Object>();
+            delta.put("type", "input_json_delta");
+            delta.put("partial_json", partial);
+            return delta(index, delta);
+        }
+
+        Sse delta(int index, Map<String, Object> delta) {
+            Map<String, Object> ev = new LinkedHashMap<String, Object>();
+            ev.put("type", "content_block_delta");
+            ev.put("index", index);
+            ev.put("delta", delta);
+            return event("content_block_delta", Json.write(ev) + "   ");
+        }
+
+        Sse stop(int index) {
+            return event("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":" + index + "      }");
+        }
+
+        List<String> end(String stopReason) {
+            event("message_delta", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"" + stopReason
+                    + "\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":59}}");
+            event("message_stop", "{\"type\":\"message_stop\"   }");
+            return lines;
+        }
+
+        /** The number of lines so far: the index (1-based count) a sink has been fed once the next event lands. */
+        int fedAfterNextEvent() {
+            return lines.size() + 2;
+        }
+    }
+
+    /** Records each text block the listener is told, and how many SSE lines had arrived by then. */
+    private static final class Texts implements ClaudeApi.TextBlocks {
+        final FakeStreamingTransport t;
+        final List<String> told = new ArrayList<String>();
+        final List<Integer> atLine = new ArrayList<Integer>();
+
+        Texts(FakeStreamingTransport t) {
+            this.t = t;
+        }
+
+        @Override
+        public void complete(String text) {
+            told.add(text);
+            atLine.add(t == null ? -1 : t.fed);
+        }
+    }
+
+    private static String toolReply() {
+        Map<String, Object> text = new LinkedHashMap<String, Object>();
+        text.put("type", "text");
+        text.put("text", "Let me look.");
+        Map<String, Object> input = new LinkedHashMap<String, Object>();
+        input.put("why", "to see the mug");
+        input.put("zoom", 2);
+        Map<String, Object> use = new LinkedHashMap<String, Object>();
+        use.put("type", "tool_use");
+        use.put("id", "toolu_01A");
+        use.put("name", "look");
+        use.put("input", input);
+        use.put("caller", Collections.singletonMap("type", "direct"));
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("type", "message");
+        body.put("role", "assistant");
+        body.put("content", Arrays.asList(text, use));
+        body.put("stop_reason", "tool_use");
+        return Json.write(body);
+    }
+
+    private static String describeTools(ClaudeApi.MessageResult r) {
+        StringBuilder sb = new StringBuilder(describe(r));
+        sb.append(" stop=").append(r.stopReason).append(" text=").append(r.text).append(" uses=");
+        for (ClaudeApi.ToolUse u : r.toolUses) {
+            sb.append(u.id).append('/').append(u.name).append('/').append(u.input).append(' ');
+        }
+        return sb.append(" content=").append(r.content).toString();
+    }
+
+    private static void tools() {
+        // The request: definitions in order, tool_choice auto by default, a named choice forces that tool.
+        FakeTransport t = new FakeTransport().reply(200, toolReply()).reply(200, toolReply()).reply(200, turnReply());
+        ClaudeApi api = new ClaudeApi(t);
+        api.conversation(ACCESS, "PREFIX", chat(), null, null, 5000, null, null, new ClaudeApi.Tools(toolDefs()));
+        api.conversation(ACCESS, "PREFIX", chat(), null, null, 5000, null, null,
+                new ClaudeApi.Tools(toolDefs()).choice("look"));
+        api.conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000);
+        Map<?, ?> b0 = body(t.requests.get(0));
+        Object tl = b0.get("tools");
+        Map<?, ?> first = tl instanceof List && !((List<?>) tl).isEmpty() ? (Map<?, ?>) ((List<?>) tl).get(0) : null;
+        Map<?, ?> second = tl instanceof List && ((List<?>) tl).size() == 2 ? (Map<?, ?>) ((List<?>) tl).get(1) : null;
+        boolean defs = first != null && "look".equals(first.get("name"))
+                && "Take a photo and see what is in front of you.".equals(first.get("description"))
+                && first.get("input_schema") instanceof Map
+                && ((Map<?, ?>) first.get("input_schema")).get("properties") instanceof Map
+                && second != null && "robot_status".equals(second.get("name"))
+                && second.get("input_schema") instanceof Map
+                && "object".equals(((Map<?, ?>) second.get("input_schema")).get("type"));
+        Object c0 = b0.get("tool_choice");
+        Object c1 = body(t.requests.get(1)).get("tool_choice");
+        Map<?, ?> b2 = body(t.requests.get(2));
+        check("conversation_tools_request_carries_definitions_and_auto_choice",
+                defs && c0 instanceof Map && "auto".equals(((Map<?, ?>) c0).get("type"))
+                        && c1 instanceof Map && "tool".equals(((Map<?, ?>) c1).get("type"))
+                        && "look".equals(((Map<?, ?>) c1).get("name"))
+                        && !b2.containsKey("tools") && !b2.containsKey("tool_choice")
+                        && Boolean.TRUE.equals(Boolean.valueOf(b0.get("cache_control") instanceof Map)),
+                "tools=" + tl + " choice=" + c0 + " named=" + c1 + " plain keys=" + b2.keySet());
+
+        // Tools ride beside the JSON-schema format; the output_config gate still retries once, keeping the tools.
+        FakeTransport g = new FakeTransport()
+                .reply(400, error("invalid_request_error", "output_config: Extra inputs are not permitted"))
+                .reply(200, toolReply());
+        ClaudeApi.MessageResult gr = new ClaudeApi(g).conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000,
+                null, null, new ClaudeApi.Tools(toolDefs()));
+        Map<?, ?> g0 = body(g.requests.get(0));
+        Map<?, ?> g1 = g.requests.size() > 1 ? body(g.requests.get(1)) : Collections.emptyMap();
+        check("conversation_tools_ride_beside_the_schema_and_survive_the_output_config_gate",
+                gr.ok() && g.requests.size() == 2 && g0.get("output_config") instanceof Map && g0.get("tools") instanceof List
+                        && !g1.containsKey("output_config") && g1.get("tools") instanceof List
+                        && String.valueOf(g1.get("system")).contains("JSON schema"),
+                describeTools(gr) + " requests=" + g.requests.size());
+
+        // A plain (non-streamed) reply with a text block then a tool_use block.
+        FakeTransport p = new FakeTransport().reply(200, toolReply());
+        ClaudeApi.MessageResult pr = new ClaudeApi(p).conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000,
+                null, null, new ClaudeApi.Tools(toolDefs()));
+        ClaudeApi.ToolUse pu = pr.toolUses.size() == 1 ? pr.toolUses.get(0) : null;
+        Map<?, ?> echoed = pr.content.size() == 2 ? pr.content.get(1) : Collections.emptyMap();
+        check("conversation_plain_reply_parses_text_and_tool_use",
+                pr.ok() && "tool_use".equals(pr.stopReason) && "Let me look.".equals(pr.text) && pu != null
+                        && "toolu_01A".equals(pu.id) && "look".equals(pu.name)
+                        && "to see the mug".equals(pu.input.get("why")) && Long.valueOf(2).equals(pu.input.get("zoom"))
+                        && pr.json.isEmpty() && pr.content.size() == 2
+                        && "text".equals(pr.content.get(0).get("type"))
+                        && "tool_use".equals(echoed.get("type")) && "toolu_01A".equals(echoed.get("id"))
+                        && echoed.get("input") instanceof Map && !echoed.containsKey("caller"),
+                describeTools(pr));
+
+        // A tool-only reply without a schema and without text is fine; without tools it still fails as before.
+        FakeTransport only = new FakeTransport().reply(200,
+                "{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"robot_status\",\"input\":{}}],"
+                        + "\"stop_reason\":\"tool_use\"}");
+        ClaudeApi.MessageResult or = new ClaudeApi(only).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                null, null, new ClaudeApi.Tools(toolDefs()));
+        FakeTransport prose = new FakeTransport().reply(200, reply("Morning! Busy day?"));
+        ClaudeApi.MessageResult prr = new ClaudeApi(prose).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                null, null, new ClaudeApi.Tools(toolDefs()));
+        check("conversation_with_tools_accepts_a_tool_only_or_prose_reply",
+                or.ok() && or.toolUses.size() == 1 && "robot_status".equals(or.toolUses.get(0).name)
+                        && or.toolUses.get(0).input.isEmpty() && or.text.isEmpty()
+                        && prr.ok() && "Morning! Busy day?".equals(prr.text) && prr.toolUses.isEmpty()
+                        && "end_turn".equals(prr.stopReason),
+                describeTools(or) + " | " + describeTools(prr));
+
+        // The streamed reply: text, then two tool_use blocks whose input arrives in split chunks
+        // (one split inside an escape), interleaved block indexes as the API sends them.
+        FakeStreamingTransport s = new FakeStreamingTransport();
+        Sse sse = new Sse().textStart(0).text(0, "Let me ").text(0, "take a look.").stop(0)
+                .toolStart(1, "toolu_A", "look").json(1, "").json(1, "{\"why\":").json(1, " \"the \\")
+                .json(1, "\"mug\\\" ").json(1, "on the desk\"}").stop(1)
+                .toolStart(2, "toolu_B", "robot_status").json(2, "{}").stop(2);
+        s.sse(sse.end("tool_use"));
+        Texts st = new Texts(s);
+        ClaudeApi.MessageResult sr = new ClaudeApi(s).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                null, null, new ClaudeApi.Tools(toolDefs()).onText(st));
+        boolean twoUses = sr.toolUses.size() == 2 && "toolu_A".equals(sr.toolUses.get(0).id)
+                && "the \"mug\" on the desk".equals(sr.toolUses.get(0).input.get("why"))
+                && "toolu_B".equals(sr.toolUses.get(1).id) && sr.toolUses.get(1).input.isEmpty();
+        check("conversation_streamed_tool_use_parses_interleaved_text_and_split_input",
+                sr.ok() && "tool_use".equals(sr.stopReason) && "Let me take a look.".equals(sr.text) && twoUses
+                        && sr.content.size() == 3 && Boolean.TRUE.equals(body(s.requests.get(0)).get("stream")),
+                describeTools(sr));
+        // The text block is told at its content_block_stop: line 3 of its stop event, before the tool starts.
+        int textStop = 6 + 3 * 4;
+        check("conversation_streamed_text_before_a_tool_use_is_told_before_the_tool_streams",
+                st.told.size() == 1 && "Let me take a look.".equals(st.told.get(0)) && st.atLine.get(0) == textStop - 1,
+                "told=" + st.told + " atLine=" + st.atLine + " want " + (textStop - 1) + " of " + s.fed);
+
+        // Schema mode: the JSON line in a text block before a tool_use reaches the early fields before the tool.
+        FakeStreamingTransport j = new FakeStreamingTransport();
+        Sse js = new Sse().textStart(0).text(0, "{\"line\":\"Ooh, let me ").text(0, "see.\",\"question_asked\":\"\",")
+                .text(0, "\"name_given\":\"\"");
+        int jEarly = js.lines.size() - 1;
+        js.text(0, ",\"ends_conversation\":false}").stop(0).toolStart(1, "toolu_C", "look").json(1, "{\"why\":\"x\"}")
+                .stop(1);
+        j.sse(js.end("tool_use"));
+        Early je = new Early(j);
+        ClaudeApi.MessageResult jr = new ClaudeApi(j).conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000,
+                EARLY, je, new ClaudeApi.Tools(toolDefs()));
+        check("conversation_streamed_schema_line_before_a_tool_use_is_early",
+                jr.ok() && je.calls == 1 && "Ooh, let me see.".equals(je.fields.get("line")) && je.atLine == jEarly
+                        && jr.toolUses.size() == 1 && "Ooh, let me see.".equals(jr.json.get("line")),
+                describeTools(jr) + " calls=" + je.calls + " atLine=" + je.atLine + " want " + jEarly);
+
+        // The reply-tool pattern: the line streams inside the respond tool's input and is told early;
+        // the result's json is that tool's input.
+        FakeStreamingTransport rt = new FakeStreamingTransport();
+        Sse rs = new Sse().toolStart(0, "toolu_R", "respond").json(0, "{\"line\": \"Morn")
+                .json(0, "ing! Busy day?\", \"question_asked\": \"Busy day?\", \"name_")
+                .json(0, "given\": \"\"");
+        int rEarly = rs.lines.size() - 1;
+        rs.json(0, ", \"ends_conversation\": false}").stop(0);
+        rt.sse(rs.end("tool_use"));
+        Early re = new Early(rt);
+        List<Map<String, Object>> withRespond = toolDefs();
+        withRespond.add(ClaudeApi.tool("respond", "Say your reply.", respondSchema()));
+        ClaudeApi.MessageResult rr = new ClaudeApi(rt).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                EARLY, re, new ClaudeApi.Tools(withRespond).replyTool("respond"));
+        check("conversation_streamed_reply_tool_input_is_early_and_becomes_the_json",
+                rr.ok() && re.calls == 1 && "Morning! Busy day?".equals(re.fields.get("line"))
+                        && "Busy day?".equals(re.fields.get("question_asked")) && re.atLine == rEarly
+                        && "Morning! Busy day?".equals(rr.json.get("line"))
+                        && Boolean.FALSE.equals(rr.json.get("ends_conversation")) && rr.toolUses.size() == 1
+                        && "respond".equals(rr.toolUses.get(0).name),
+                describeTools(rr) + " calls=" + re.calls + " fields=" + re.fields + " atLine=" + re.atLine
+                        + " want " + rEarly);
+        // ...and without a streaming transport, from the whole reply.
+        FakeTransport rp = new FakeTransport().reply(200, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_R\","
+                + "\"name\":\"respond\",\"input\":{\"line\":\"Hi.\",\"question_asked\":\"\",\"name_given\":\"Sam\"}}],"
+                + "\"stop_reason\":\"tool_use\"}");
+        Early rpe = new Early(null);
+        ClaudeApi.MessageResult rpr = new ClaudeApi(rp).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                EARLY, rpe, new ClaudeApi.Tools(withRespond).replyTool("respond"));
+        check("conversation_plain_reply_tool_reports_the_fields_from_the_whole_reply",
+                rpr.ok() && rpe.calls == 1 && "Hi.".equals(rpe.fields.get("line")) && "Sam".equals(rpe.fields.get("name_given"))
+                        && "Hi.".equals(rpr.json.get("line")),
+                describeTools(rpr) + " calls=" + rpe.calls);
+
+        // A tool input cut off by max_tokens can't be run: BAD_REPLY.
+        FakeStreamingTransport cut = new FakeStreamingTransport();
+        cut.sse(new Sse().toolStart(0, "toolu_X", "look").json(0, "{\"why\": \"to see th").stop(0).end("max_tokens"));
+        ClaudeApi.MessageResult cr = new ClaudeApi(cut).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                null, null, new ClaudeApi.Tools(toolDefs()).onText(new Texts(cut)));
+        check("conversation_streamed_truncated_tool_input_is_bad_reply",
+                !cr.ok() && cr.reason == ClaudeApi.Reason.BAD_REPLY, describe(cr));
+
+        // Tool results: text, error, and an image (the slimmed JPEG), plus a caption.
+        Map<String, Object> tr = ClaudeApi.toolResult("toolu_A", "A red mug with a cat on it.");
+        Map<String, Object> te = ClaudeApi.toolError("toolu_B", "The camera is busy.");
+        byte[] jpeg = {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE1, 0, 4, 9, 9, (byte) 0xFF, (byte) 0xD9};
+        Map<String, Object> ti = ClaudeApi.toolResultImage("toolu_C", jpeg, "Taken just now.");
+        Object ic = ti.get("content");
+        Map<?, ?> img = ic instanceof List && ((List<?>) ic).size() == 2 ? (Map<?, ?>) ((List<?>) ic).get(0) : null;
+        Map<?, ?> cap = ic instanceof List && ((List<?>) ic).size() == 2 ? (Map<?, ?>) ((List<?>) ic).get(1) : null;
+        String wantData = java.util.Base64.getEncoder().encodeToString(JpegSlim.slim(jpeg));
+        Object src = img == null ? null : img.get("source");
+        check("tool_result_text_and_image_blocks",
+                "tool_result".equals(tr.get("type")) && "toolu_A".equals(tr.get("tool_use_id"))
+                        && "A red mug with a cat on it.".equals(tr.get("content")) && !tr.containsKey("is_error")
+                        && "tool_result".equals(ti.get("type")) && "toolu_C".equals(ti.get("tool_use_id"))
+                        && img != null && "image".equals(img.get("type")) && src instanceof Map
+                        && "image/jpeg".equals(((Map<?, ?>) src).get("media_type"))
+                        && wantData.equals(((Map<?, ?>) src).get("data"))
+                        && cap != null && "Taken just now.".equals(cap.get("text")) && !ti.containsKey("is_error")
+                        && ((List<?>) ClaudeApi.toolResultImage("toolu_D", jpeg, null).get("content")).size() == 1,
+                tr + " " + ti);
+        check("tool_result_error_sets_is_error",
+                "tool_result".equals(te.get("type")) && "toolu_B".equals(te.get("tool_use_id"))
+                        && "The camera is busy.".equals(te.get("content")) && Boolean.TRUE.equals(te.get("is_error")),
+                String.valueOf(te));
+
+        // The follow-up request: the assistant turn's blocks as they came, then one user turn of all the results.
+        List<Map<String, Object>> follow = new ArrayList<Map<String, Object>>(chat());
+        follow.add(ClaudeApi.assistantTurn(sr));
+        follow.add(ClaudeApi.toolResults(Arrays.asList(
+                ClaudeApi.toolResultImage("toolu_A", jpeg, null), ClaudeApi.toolResult("toolu_B", "battery 80%"))));
+        FakeTransport f = new FakeTransport().reply(200, turnReply());
+        ClaudeApi.MessageResult fr = new ClaudeApi(f).conversation(ACCESS, "PREFIX", follow, schema(), null, 5000,
+                null, null, new ClaudeApi.Tools(toolDefs()));
+        List<?> sent = (List<?>) body(f.requests.get(0)).get("messages");
+        Map<?, ?> asst = (Map<?, ?>) sent.get(3);
+        Map<?, ?> results = (Map<?, ?>) sent.get(4);
+        List<?> ab = (List<?>) asst.get("content");
+        List<?> rb = (List<?>) results.get("content");
+        Map<?, ?> use = (Map<?, ?>) ab.get(1);
+        check("conversation_tool_result_follow_up_sends_assistant_blocks_then_results",
+                fr.ok() && sent.size() == 5 && "assistant".equals(asst.get("role")) && ab.size() == 3
+                        && "text".equals(((Map<?, ?>) ab.get(0)).get("type"))
+                        && "tool_use".equals(use.get("type")) && "toolu_A".equals(use.get("id"))
+                        && "the \"mug\" on the desk".equals(((Map<?, ?>) use.get("input")).get("why"))
+                        && "user".equals(results.get("role")) && rb.size() == 2
+                        && "toolu_A".equals(((Map<?, ?>) rb.get(0)).get("tool_use_id"))
+                        && "toolu_B".equals(((Map<?, ?>) rb.get(1)).get("tool_use_id"))
+                        && "Camping?".equals(fr.json.get("line")),
+                describeTools(fr) + " sent=" + sent.size());
     }
 }
