@@ -3567,6 +3567,39 @@ public final class ExploreBrainHarness {
                             && mirror.violations.isEmpty() && faint.violations.isEmpty(),
                     "mirror notes=" + lastNotes(notes, 10) + " faint notes=" + lastNotes(notes2, 10));
         });
+        scenario("bathroom_toilet_paper_alone_or_a_tiny_box_never_triggers", n -> {
+            // Robot 2026-10-02 12:52: a small white thing on the office floor read "toilet paper" 0.35
+            // (a 5% wide box) beside a desk and a storage bin, and he beeped his way out of the office.
+            List<String> notes = new ArrayList<String>();
+            Rig office = bathRig(bathTuning(), (r, t) -> list(box("storage bin", 0.5f, 0.93f, 0.76f, 0.13f, 0.26f),
+                    box("desk", 0.42f, 0.93f, 0.76f, 0.13f, 0.25f), box("toilet paper", 0.35f, 0.325f, 0.92f, 0.05f, 0.06f),
+                    box("succulent", 0.26f, 0.95f, 0.53f, 0.09f, 0.22f)), notes);
+            office.started();
+            office.runUntil(30000);
+            List<String> notes2 = new ArrayList<String>();
+            Rig roll = bathRig(bathTuning(), (r, t) -> list(box("toilet paper", 0.8f, 0.5f, 0.6f, 0.2f, 0.25f)), notes2);
+            roll.started();
+            roll.runUntil(30000);
+            List<String> notes3 = new ArrayList<String>();
+            Rig tiny = bathRig(bathTuning(), (r, t) -> list(box("toilet", 0.7f, 0.5f, 0.9f, 0.05f, 0.06f)), notes3);
+            tiny.started();
+            tiny.runUntil(30000);
+            check(n, !anyContains(notes, "bathroom:") && !anyContains(notes2, "bathroom:") && !anyContains(notes3, "bathroom:")
+                            && office.privacyOns == 0 && roll.privacyOns == 0 && tiny.privacyOns == 0
+                            && office.count("hop") > 0 && roll.count("hop") > 0 && tiny.count("hop") > 0
+                            && office.violations.isEmpty() && roll.violations.isEmpty() && tiny.violations.isEmpty(),
+                    "office=" + lastNotes(notes, 6) + " roll=" + lastNotes(notes2, 6) + " tiny=" + lastNotes(notes3, 6));
+        });
+        scenario("bathroom_toilet_paper_and_a_sink_together_still_trigger", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("toilet paper", 0.5f, 0.4f, 0.6f, 0.15f, 0.2f),
+                    box("sink", 0.4f, 0.7f, 0.5f, 0.3f, 0.3f)) : list()), notes);
+            rig.started();
+            rig.runUntil(20000);
+            String trig = firstNote(notes, "bathroom: ");
+            check(n, trig != null && trig.contains("leaving and beeping (privacy)") && rig.privacyOns == 1
+                            && rig.violations.isEmpty(), "trig=" + trig + " notes=" + lastNotes(notes, 6));
+        });
         scenario("bathroom_a_sink_and_soap_within_three_looks_trigger_and_five_looks_apart_do_not", n -> {
             List<String> notes = new ArrayList<String>();
             Rig near = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.4f, 0.4f, 0.6f, 0.3f, 0.3f))

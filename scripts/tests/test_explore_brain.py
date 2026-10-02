@@ -711,6 +711,8 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         # Bathroom privacy (owner 2026-10-02)
         "bathroom_a_toilet_while_roaming_privacy_on_beeps_every_5_s_retraces_out_then_privacy_off",
         "bathroom_a_single_mirror_or_weak_labels_below_threshold_never_trigger",
+        "bathroom_toilet_paper_alone_or_a_tiny_box_never_triggers",
+        "bathroom_toilet_paper_and_a_sink_together_still_trigger",
         "bathroom_a_sink_and_soap_within_three_looks_trigger_and_five_looks_apart_do_not",
         "bathroom_privacy_a_due_curiosity_stop_asks_claude_nothing_and_stores_no_place_print",
         "bathroom_privacy_a_call_gets_a_glance_and_no_conversation",

@@ -1785,12 +1785,16 @@ final class ExploreBrain {
     // BATHROOM_OUT_LOOKS looks; then the way in and the coverage cells around the spot are
     // avoided for BATHROOM_AVOID_MS (the steer, seeks, doorways and his legs).
 
-    /** One look of these at BATHROOM_STRONG_MIN or more means a bathroom. */
-    static final Set<String> BATHROOM_STRONG = new HashSet<String>(java.util.Arrays.asList("toilet", "toilet paper"));
+    /** One look of these at BATHROOM_STRONG_MIN or more means a bathroom. Toilet paper is only
+     *  weak: on the robot (2026-10-02) a small white thing on the office floor read "toilet paper"
+     *  0.35 and he beeped his way out of the office. */
+    static final Set<String> BATHROOM_STRONG = new HashSet<String>(java.util.Arrays.asList("toilet"));
     static final float BATHROOM_STRONG_MIN = 0.35f;
     /** Two different ones of these at BATHROOM_WEAK_MIN or more, close together, mean a bathroom; one never does. */
     static final Set<String> BATHROOM_WEAK = new HashSet<String>(java.util.Arrays.asList(
-            "sink", "mirror", "soap", "paper towel", "towel", "bathtub"));
+            "toilet paper", "sink", "mirror", "soap", "paper towel", "towel", "bathtub"));
+    /** A box smaller than this share of the frame never counts: from the floor a real fixture is big. */
+    static final float BATHROOM_MIN_AREA = 0.006f;
     static final float BATHROOM_WEAK_MIN = 0.3f;
     static final int BATHROOM_WEAK_LOOKS = 3;
     static final long BATHROOM_WEAK_WINDOW_MS = 10000;
@@ -1847,6 +1851,9 @@ final class ExploreBrain {
         List<String> weak = new ArrayList<String>();
         if (look.detections != null) {
             for (Detection d : look.detections) {
+                if ((d.x1 - d.x0) * (d.y1 - d.y0) < BATHROOM_MIN_AREA) {
+                    continue;
+                }
                 if (BATHROOM_STRONG.contains(d.label) && d.score >= BATHROOM_STRONG_MIN && !strong.contains(d.label)) {
                     strong.add(d.label);
                 } else if (BATHROOM_WEAK.contains(d.label) && d.score >= BATHROOM_WEAK_MIN && !weak.contains(d.label)) {
