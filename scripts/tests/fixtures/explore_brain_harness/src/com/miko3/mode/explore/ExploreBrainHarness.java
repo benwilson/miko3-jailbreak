@@ -8447,6 +8447,66 @@ public final class ExploreBrainHarness {
                             + " r3=" + notesWith(notes, "(recovery 3 of 3)") + " jammed=" + notesWith(notes, "fully jammed")
                             + " freed=" + notesWith(notes, "free after") + " notes=" + lastNotes(notes, 30));
         });
+        scenario("recover_probe_schedules_alternate_when_an_alternate_is_set", n -> {
+            // Robot 2026-10-02 11:57-12:00: three recoveries over two minutes, each followed by
+            // clean driving, never reset the stuck spell's count (recoverMaxPerSpell = 3); the
+            // fourth stall went straight to the escape ladder inside the cutout and he jammed
+            // falsely. Clean driving (a forward leg of recoverSpellResetCounts) or
+            // recoverSpellResetMs with no stall or zero move ends the spell: the fourth still waits.
+            Rig[] h = new Rig[1];
+            List<String> notes = new ArrayList<String>();
+            long[] nextStallAt = {2000};
+            long[] pinnedAt = {-1};
+            int[] stalls = {0};
+            Rig rig = escRig(escTuning().stallRecoverAlt(7000, 10000, 20000).hopTicks(60).wedge(99, 99, 99), h, t -> {
+                Rig r = h[0];
+                if (r == null) {
+                    return clear(t);
+                }
+                if (pinnedAt[0] >= 0) {
+                    if (t >= pinnedAt[0] + 6000) {
+                        pin(r, false);
+                        pinnedAt[0] = -1;
+                        nextStallAt[0] = t + 30000;
+                    }
+                    return clear(t);
+                }
+                if (r.blockedFrom != Long.MAX_VALUE && r.brain.state() == ExploreBrain.State.STARTLE) {
+                    pin(r, true);
+                    pinnedAt[0] = t;
+                    stalls[0]++;
+                    return clear(t);
+                }
+                if (r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 700
+                        && t >= nextStallAt[0] && r.blockedFrom == Long.MAX_VALUE && stalls[0] < 4) {
+                    r.blockedFrom = t;
+                } else if (r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 3500
+                        && r.blockedFrom == Long.MAX_VALUE) {
+                    // Between stalls he drives cleanly, each leg ending at something ahead.
+                    return obstacle(t);
+                }
+                return clear(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 200000, r -> stalls[0] >= 4 && notedTimes(notes, "stall: waiting for the motor board").size() >= 4);
+            rig.runUntil(rig.now + 3000);
+            List<Long> waits = notedTimes(notes, "stall: waiting for the motor board to recover");
+            // Robot 2026-10-02: 136 of ~160 boards came back at the 10 s probe and none at 2 s; an
+            // A/B of the schedule (2, 5, 10, 20 s against 7, 10, 20 s) tells whether the early probes
+            // waste time or re-arm the cutout. Waits alternate A, B, A, B and say which.
+            List<String> plans = new ArrayList<String>();
+            for (String x : notes) {
+                if (x.contains("stall: waiting for the motor board to recover")) {
+                    plans.add(x.contains("(probes at 7, 10, 20 s) (schedule B)") ? "B"
+                            : x.contains("(probes at 2, 5, 10, 20 s) (schedule A)") ? "A" : "?");
+                }
+            }
+            check(n, plans.size() == 4 && plans.equals(java.util.Arrays.asList("A", "B", "A", "B"))
+                            && notesWith(notes, "fully jammed") == 0 && helpLines(rig, 0).isEmpty() && rig.violations.isEmpty(),
+                    "plans=" + plans + " notes=" + lastNotes(notes, 20));
+        });
     }
 
     // ---- a step's budget covers its turns (live 2026-09-25: ~40 deg/s on carpet, the 3 s drive-off ran out mid-turn) ----

@@ -402,6 +402,14 @@ final class ExploreTuning {
      * counts per 0.5 s), and a turn can't back him blind into what stopped the back-up.
      */
     final long[] stallRecoverProbesMs;
+    /**
+     * An alternate probe schedule, or empty (off). When set, RECOVER waits alternate between
+     * stallRecoverProbesMs (schedule A) and this (schedule B), each wait's note saying which: an
+     * A/B the learning log settles (robot 2026-10-02: 136 of ~160 boards came back at the 10 s
+     * probe, none at 2 s, so the early probes may only waste time or re-arm the cutout). The
+     * shipped defaults set {7000, 10000, 20000}; the builder's default is off.
+     */
+    final long[] stallRecoverProbesAltMs;
     final long stallRecoverProbeMs;
     final double stallRecoverProbeDeg;
     /**
@@ -1021,6 +1029,7 @@ final class ExploreTuning {
         wriggleFreeCounts = Math.max(1, b.wriggleFreeCounts);
         wriggleEveryMs = Math.max(0, b.wriggleEveryMs);
         stallRecoverProbesMs = positiveSorted(b.stallRecoverProbesMs);
+        stallRecoverProbesAltMs = positiveSorted(b.stallRecoverProbesAltMs);
         stallRecoverProbeMs = Math.max(50, b.stallRecoverProbeMs);
         stallRecoverProbeDeg = Math.max(1, b.stallRecoverProbeDeg);
         stallRecoverProbeBackTicks = Math.max(0, b.stallRecoverProbeBackTicks);
@@ -1201,7 +1210,8 @@ final class ExploreTuning {
 
     /** ...and the navigation mode (the MikoExploreLookThenGo hook picks LOOK_THEN_GO). */
     static ExploreTuning defaults(Calibration calibration, ExploreCalibration.Gyro gyro, Navigation navigation) {
-        return new Builder().calibration(calibration).gyro(gyro).navigation(navigation).build();
+        return new Builder().calibration(calibration).gyro(gyro).navigation(navigation)
+                .stallRecoverAlt(7000, 10000, 20000).build();
     }
 
     /**
@@ -1425,6 +1435,7 @@ final class ExploreTuning {
         // Robot 2026-10-01: the board came back between ~9 s and 29 s after the stall. The 2 s
         // probe keeps a stall with no cutout (the common case on the desk) to ~2.5 s of waiting.
         private long[] stallRecoverProbesMs = {2000, 5000, 10000, 20000};
+        private long[] stallRecoverProbesAltMs = new long[0];
         // Half a second of turning: ~100 counts on a live board, too little to push a latched one.
         private long stallRecoverProbeMs = 500;
         private double stallRecoverProbeDeg = 5;
@@ -1827,6 +1838,7 @@ final class ExploreTuning {
         Builder wriggleOff() { wriggleMs = 0; return this; }
         /** The recovery wait's probe times, in ms after the stall (each > 0). */
         Builder stallRecover(long... probesMs) { stallRecoverProbesMs = probesMs.clone(); return this; }
+        Builder stallRecoverAlt(long... probesMs) { stallRecoverProbesAltMs = probesMs.clone(); return this; }
         Builder stallRecoverProbe(long ms, double deg) {
             stallRecoverProbeMs = ms;
             stallRecoverProbeDeg = deg;

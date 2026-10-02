@@ -1138,6 +1138,8 @@ final class ExploreBrain {
     /** The wait counts from recoverFrom (the stall); probes at each of recoverProbes, next recoverNext. */
     private long recoverFrom;
     private long[] recoverProbes = new long[0];
+    /** RECOVER waits so far; with an alternate schedule set, odd ones use it (schedule B). */
+    private int recoverWaits = 0;
     private int recoverNext;
     /** Once the board is back: the ladder (wedged, why recoverWhy), else the plain escape (back up, turn away). */
     private boolean recoverWedged;
@@ -11700,7 +11702,9 @@ final class ExploreBrain {
         retryWaiting = false;
         recoverFrom = stallStampAt == NEVER ? now : stallStampAt;
         long since = now - recoverFrom;
-        long[] all = tuning.stallRecoverProbesMs;
+        boolean alt = tuning.stallRecoverProbesAltMs.length > 0 && recoverWaits % 2 == 1;
+        recoverWaits++;
+        long[] all = alt ? tuning.stallRecoverProbesAltMs : tuning.stallRecoverProbesMs;
         int first = 0;
         while (first < all.length && all[first] < since) {
             first++;
@@ -11717,6 +11721,7 @@ final class ExploreBrain {
             at.append(at.length() == 0 ? "" : ", ").append(Math.round(ms / 1000.0));
         }
         note("stall: waiting for the motor board to recover (probes at " + at + " s)"
+                + (tuning.stallRecoverProbesAltMs.length > 0 ? (alt ? " (schedule B)" : " (schedule A)") : "")
                 + (recoverCap() > 1 ? " (recovery " + recoverCount + " of " + recoverCap() + ")" : ""));
     }
 

@@ -292,6 +292,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "recover_a_12s_cutout_probes_find_nothing_until_20s_then_the_normal_escape",
         "recover_motors_that_never_come_back_three_recoveries_then_wriggle_then_the_help_line",
         "recover_spell_resets_after_clean_driving_so_a_fourth_stall_two_minutes_on_still_waits",
+        "recover_probe_schedules_alternate_when_an_alternate_is_set",
         "replies_turn_reads_addressed_action_and_target",
         "intent_go_away_ends_after_the_line_turns_away_and_leaves_them_alone_10_min",
         "intent_go_elsewhere_seeks_at_once_and_avoids_this_spot_15_min",
