@@ -16663,7 +16663,9 @@ public final class ExploreBrainHarness {
 
     /** Docked from the first reading: Claude as given, the cue rig's people. */
     private static Rig dockRig(Claude claude, Vision v) {
-        return dockRig(cueTuning(), claude, v);
+        // The docked camera closing is off by default until the robot's fresh-start-docked case is
+        // fixed (2026-10-02 16:30); these scenarios keep testing it on.
+        return dockRig(cueTuning().dockCameraCloses(true), claude, v);
     }
 
     private static Rig dockRig(ExploreTuning.Builder b, Claude claude, Vision v) {
@@ -16768,7 +16770,7 @@ public final class ExploreBrainHarness {
         scenario("dock_reopen_never_sooner_than_the_gap", n -> {
             // Looks due every second: each still waits out the reopen gap after the last close
             // (memory: a reopen within ~50 ms of a close hangs the camera HAL, err -110).
-            Rig rig = dockRig(cueTuning().reopenGapMs(3000).dockLookMs(1000),
+            Rig rig = dockRig(cueTuning().dockCameraCloses(true).reopenGapMs(3000).dockLookMs(1000),
                     (r, req, nth) -> CuriosityPort.Answer.nothing(), EMPTY_ROOM);
             rig.reopenGapMs = 3000;
             rig.started();
@@ -16780,7 +16782,7 @@ public final class ExploreBrainHarness {
                             + " " + rig.tail());
         });
         scenario("dock_a_conversation_opens_the_camera_and_it_closes_once_docked_again", n -> {
-            Rig rig = callChatRig(chatFirstTuning(), t -> charger(t), EMPTY_ROOM, hearWords("hi"), hearWords("bye"));
+            Rig rig = callChatRig(chatFirstTuning().dockCameraCloses(true), t -> charger(t), EMPTY_ROOM, hearWords("hi"), hearWords("bye"));
             rig.started();
             rig.runUntil(70000);
             boolean closedBefore = !rig.cameraOpen && rig.brain.state() == ExploreBrain.State.DOCKED;
