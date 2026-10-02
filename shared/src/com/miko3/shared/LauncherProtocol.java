@@ -119,6 +119,14 @@ public final class LauncherProtocol {
      * Owner tooling: scripts/robot-faces.py. */
     public static final String SETTINGS_FACE_STATE_PATH = "/settings/face/state";
 
+    /** POST with the page token deletes every entry in the feedback log
+     * (owner 2026-10-02: what people told the robot about himself). */
+    public static final String SETTINGS_FEEDBACK_CLEAR_PATH = "/settings/feedback/clear";
+
+    /** POST with the page token answers the feedback log as JSON, newest
+     * first, with no person ids. Owner tooling: scripts/pull-feedback.py. */
+    public static final String SETTINGS_FEEDBACK_STATE_PATH = "/settings/feedback/state";
+
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;
 

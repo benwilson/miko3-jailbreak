@@ -73,6 +73,11 @@ class HttpsTransportWiringTest(unittest.TestCase):
     def test_retry_after_header_is_passed_on(self):
         self.assertRegex(self.src, r"new ClaudeApi\.Response\(\s*status\s*,\s*readBody\(in\)\s*,\s*conn\.getHeaderField\(\s*\"retry-after\"\s*\)\s*\)")
 
+    def test_streams_through_the_same_connection_rules(self):
+        # Robot 2026-10-02: the conversation streams so the line can be spoken before the tail.
+        self.assertRegex(self.src, r"implements\s+ClaudeApi\.StreamingTransport")
+        self.assertRegex(self.src, r"public\s+ClaudeApi\.Response\s+stream\(")
+
     def test_no_logging(self):
         # R14: nothing about a request (and so nothing near the key) reaches logcat.
         self.assertNotIn("Log.", self.src)
@@ -152,7 +157,7 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "messages_not_set_up_makes_no_request",
         "jpeg_block_base64_has_no_newlines",
         "conversation_sends_the_message_list_in_order_with_its_roles",
-        "conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_1024",
+        "conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_400",
         "conversation_sends_effort_beside_the_json_schema_format",
         "conversation_effort_400_retries_once_without_effort_keeping_the_schema_format",
         "conversation_later_calls_send_no_effort_and_keep_the_format",
@@ -162,6 +167,17 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "conversation_without_effort_sends_only_the_format_and_the_retry_budget",
         "conversation_timeout_overload_rate_limit_and_refusal_map_to_their_reasons",
         "conversation_error_output_carries_no_transcript_prefix_or_key",
+        "conversation_streamed_asks_for_a_stream",
+        "conversation_streamed_reports_the_line_question_and_name_before_the_tail",
+        "conversation_streamed_result_is_the_whole_reply",
+        "conversation_streamed_fields_survive_escapes_split_across_deltas",
+        "conversation_streamed_400_gates_still_retry_once",
+        "conversation_streamed_error_event_and_refusal_map_to_their_reasons",
+        "conversation_without_a_streaming_transport_reports_the_fields_from_the_whole_reply",
+        "conversation_never_sends_effort_to_a_haiku_model",
+        "partial_json_scanner_reads_only_closed_top_level_strings",
+        "keep_warm_is_one_tokenless_models_page_of_one",
+        "keep_warm_failures_are_false_and_never_throw_and_unset_sends_nothing",
         "retry_after_seconds_reaches_both_results",
         "retry_after_missing_or_unreadable_is_minus_one",
         "rate_limited_and_overloaded_are_never_retried_by_the_client",

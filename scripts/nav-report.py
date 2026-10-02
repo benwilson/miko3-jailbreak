@@ -10,6 +10,15 @@ outcome table: each steer decision that led to a forward leg is labelled by
 what that leg met next (clean, camera cut, CPL, obstacle, stall...), and the
 legs are bucketed by the open score the steer chose them at.
 
+Since 2026-10-02 the brain also writes exact records: one `leg:` line at
+the end of every forward leg (decision source, open/best/confidence/novelty,
+the deciding look's wall ms, planned and sent ticks, encoder counts, heading,
+end reason, closest ToF, CPL counts), `escape#N` / `seek#N` start and end
+lines, `why=` on each "measured turn:" note, and a `mode:` note per change of
+top-level mode. A run with them uses them (frames matched by the look's wall
+ms; per-metre metrics from the encoder counts); older runs fall back to the
+inference from the notes.
+
 The robot never reads this. It is for the coding agent improving the
 navigation code, and only parses what the brain already notes.
 
@@ -55,10 +64,19 @@ LEG_WINDOW_S = 30.0
 FRAME_BEFORE_S = 3.0
 FRAME_AFTER_S = 0.5
 OPEN_EDGES = [0.0, 0.10, 0.20, 0.35, 0.50, 0.70, 1.0]  # steerBlocked 0.35, steerOpen 0.70
-BAD = ("cpl", "obstacle", "stall", "blocked_at_start")
+BAD = ("cpl", "obstacle", "edge", "stall", "nowhere", "blocked_at_start")
 TURN_FAIL = ("turn_hazard", "turn_blocked")
-OUTCOMES = ("clean", "camera_cut", "cpl_hiccup", "cpl", "obstacle", "stall", "blocked_at_start",
-            "turn_hazard", "turn_blocked", "sensor_drop")
+OUTCOMES = ("clean", "camera_cut", "cpl_hiccup", "cpl", "obstacle", "edge", "stall", "nowhere", "blocked_at_start",
+            "turn_hazard", "turn_blocked", "sensor_drop", "interrupted")
+# Encoder counts per metre (mean of the two wheels): ExploreTuning.coverageCountsPerMetre's default.
+COUNTS_PER_M = 3000.0
+# A leg record's look=<wall ms> names its frame-ring JPEG; the brain derives it from its own clock
+# offset, so a frame a few ms off is still that frame.
+FRAME_MATCH_TOL_MS = 20
+# The brain's leg record's end= reason as an outcome (cpl: a hazard, or a hiccup that was retried).
+END_OUTCOME = {"done": "clean", "reaim": "clean", "cpl_retry_ok": "clean", "camera": "camera_cut",
+               "obstacle": "obstacle", "edge": "edge", "stall": "stall", "nowhere": "nowhere", "eyes": "sensor_drop"}
+HAZARD_ENDS = ("cpl", "obstacle", "edge")
 
 TIME_RE = re.compile(r"^(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\.(\d{3}) ([VDIWEFA])/(.+?)\(\s*(\d+)\): ?(.*)$")
 EPOCH_RE = re.compile(r"^\s*(\d{9,11})\.(\d{3})\s+(\d+)\s+\d+\s+([VDIWEFA])\s+(.+?)\s*: ?(.*)$")
@@ -72,6 +90,13 @@ MEASURED_RE = re.compile(r"^measured turn: asked (-?\d+) deg, turned (-?\d+) deg
 PROBE_RE = re.compile(r"^recover probe (?:at (\d+) s|now): (.*)$")
 FREE_RE = re.compile(r"^free after (\d+) ms: (.*)$")
 TURNS_RE = re.compile(r"^conversation over after (\d+) turn")
+# The exact records (2026-10-02): one per forward leg, ids on escapes and seeks, the top-level mode.
+LEG_RE = re.compile(r"^leg: (.*)$")
+KV_RE = re.compile(r"(\w+)=(\S+)")
+ESC_ID_RE = re.compile(r"^escape#(\d+) (start|end) (.*)$")
+SEEK_ID_RE = re.compile(r"^seek#(\d+) (start|end) (.*)$")
+MODE_RE = re.compile(r"^mode: ([A-Z_]+)$")
+WHY_RE = re.compile(r" why=(\w+)$")
 
 BOUNDARY_PREFIXES = (
     "waiting up to", "no look to steer by", "curiosity stop:", "everything ahead closed", "look-around look",
@@ -209,6 +234,43 @@ def nearest_frame(frames, at, before_s=FRAME_BEFORE_S, after_s=FRAME_AFTER_S):
     return frames[i][1]
 
 
+def frame_index(frames):
+    """(sorted wall ms, paths) of the frame-ring files, for a leg record's exact look."""
+    pairs = []
+    for _, path in frames:
+        m = re.fullmatch(r"frame-(\d{12,14})\.jpg", Path(path).name)
+        if m:
+            pairs.append((int(m.group(1)), path))
+    pairs.sort()
+    return [ms for ms, _ in pairs], [path for _, path in pairs]
+
+
+def frame_by_ms(index, ms, tol_ms=FRAME_MATCH_TOL_MS):
+    """(path, exact) of the frame named ms, else the nearest within tol_ms; (None, False) when none."""
+    keys, paths = index
+    if ms is None or not keys:
+        return None, False
+    i = bisect.bisect_left(keys, ms)
+    best = None
+    for j in (i - 1, i):
+        if 0 <= j < len(keys) and abs(keys[j] - ms) <= tol_ms and (best is None or abs(keys[j] - ms) < abs(keys[best] - ms)):
+            best = j
+    if best is None:
+        return None, False
+    return paths[best], keys[best] == ms
+
+
+def opt(v, cast=float):
+    """A record's value, None for '-'."""
+    return None if v is None or v == "-" else cast(v)
+
+
+def end_outcome(end, cpl, hiccups):
+    if end == "cpl":
+        return "cpl" if cpl > 0 or hiccups == 0 else "cpl_hiccup"
+    return END_OUTCOME.get(end, "interrupted")
+
+
 def bucket_of(open_score):
     for lo, hi in zip(OPEN_EDGES, OPEN_EDGES[1:]):
         if open_score < hi or hi == OPEN_EDGES[-1]:
@@ -222,6 +284,8 @@ def openness_table(legs):
     for lo, hi in zip(OPEN_EDGES, OPEN_EDGES[1:]):
         rows[f"{lo:.2f}-{hi:.2f}"] = {"bucket": f"{lo:.2f}-{hi:.2f}", "legs": 0, "unknown": 0, "outcomes": Counter()}
     for g in legs:
+        if g["open"] is None:
+            continue  # a blind or retried leg: no open score to calibrate
         row = rows[bucket_of(g["open"])]
         if g["outcome"] == "unknown":
             row["unknown"] += 1
@@ -253,6 +317,40 @@ def turn_stats(t):
         "bias_small_deg": statistics.mean(small) if small else None,
         "bias_large_deg": statistics.mean(large) if large else None,
         "blocked_rate": t["blocked"] / t["measured"] if t["measured"] else None,
+        "by_why": dict(t["by_why"]),
+        "bias_by_why_deg": {w: statistics.mean(e for ww, e in zip(t["whys"], errs) if ww == w)
+                            for w in dict.fromkeys(t["whys"])},
+    }
+
+
+def distance_stats(legs):
+    """Per-metre metrics from the exact leg records (their encoder counts); None without any."""
+    ex = [g for g in legs if g.get("exact")]
+    dists = [g["dist_m"] for g in ex if g["dist_m"] is not None]
+    metres = sum(dists) if dists else None
+    hazards = sum(g["outcome"] in ("cpl", "obstacle", "edge") for g in ex)
+    stalls = sum(g["outcome"] == "stall" for g in ex)
+    nowhere = sum(g["outcome"] == "nowhere" for g in ex)
+    retries = [g for g in ex if g["src"] == "retry"]
+    ok = sum(g["outcome"] not in BAD for g in retries)
+    per_m = (lambda n: n / metres if metres else None)
+    cal = []
+    for lo, hi in zip(OPEN_EDGES, OPEN_EDGES[1:]):
+        b = f"{lo:.2f}-{hi:.2f}"
+        rows = [g for g in ex if g["open"] is not None and bucket_of(g["open"]) == b]
+        m = sum((g["dist_m"] or 0.0 for g in rows), 0.0)
+        bad = sum(g["outcome"] in BAD for g in rows)
+        cal.append({"bucket": b, "legs": len(rows), "metres": m, "bad": bad,
+                    "bad_per_m": bad / m if m > 0 else None, "m_per_leg": m / len(rows) if rows else None,
+                    "hazards_per_m": sum(g["outcome"] in ("cpl", "obstacle", "edge") for g in rows) / m if m > 0 else None})
+    return {
+        "legs": len(ex), "metres": metres, "hazards": hazards, "hazards_per_m": per_m(hazards),
+        "stalls": stalls, "stalls_per_m": per_m(stalls), "nowhere": nowhere,
+        "nowhere_rate": nowhere / len(ex) if ex else None,
+        "hiccups": sum(g["hiccups"] for g in ex), "cpl_retries": len(retries), "cpl_retries_ok": ok,
+        "cpl_retry_success": ok / len(retries) if retries else None,
+        "ends": dict(Counter(g["end"] for g in ex)), "by_src": dict(Counter(g["src"] for g in ex)),
+        "open_calibration": cal,
     }
 
 
@@ -263,14 +361,25 @@ def median(xs):
 class Analyzer:
     """One run's pass over its lines."""
 
-    def __init__(self, run, gaps, frames=None, window_s=LEG_WINDOW_S):
+    def __init__(self, run, gaps, frames=None, window_s=LEG_WINDOW_S, counts_per_m=COUNTS_PER_M):
         self.run, self.gaps, self.frames, self.window_s = run, gaps, frames or [], window_s
-        self.time = {"roaming_s": 0.0, "docked_s": 0.0, "eyes_only_s": 0.0, "gap_s": 0.0}
+        self.counts_per_m = counts_per_m
+        self.frame_index = frame_index(self.frames)
+        # The brain's exact records, when this run's code writes them; else the inference from its notes.
+        msgs = [p.msg for p in run.lines]
+        self.exact_legs = any(LEG_RE.match(m) for m in msgs)
+        self.exact_esc = any(ESC_ID_RE.match(m) for m in msgs)
+        self.exact_seek = any(SEEK_ID_RE.match(m) for m in msgs)
+        self.cur_mode = None
+        self.last_free_how = None
+        self.seek_trigger = self.seek_reason = None
+        self.time = {"roaming_s": 0.0, "docked_s": 0.0, "eyes_only_s": 0.0, "gap_s": 0.0, "modes_s": {}}
         self.sensing, self.docked, self.docked_weak = False, False, False
         self.legs, self.leg = [], None
         self.decisions = Counter()
         self.last_turn_only = None
-        self.turn = {"measured": 0, "blocked": 0, "interrupted": 0, "wrong_way": 0, "errors": [], "asked": []}
+        self.turn = {"measured": 0, "blocked": 0, "interrupted": 0, "wrong_way": 0, "errors": [], "asked": [],
+                     "whys": [], "by_why": {}}
         self.turn_blocked_since = self.turn_hazard_since = False
         self.hazards, self.hazard_states, self.stalls = Counter(), Counter(), Counter()
         self.c = Counter()
@@ -285,6 +394,8 @@ class Analyzer:
 
     # ---- time per mode ----
     def mode(self):
+        if self.cur_mode is not None:
+            return {"DOCKED": "docked_s", "EYES_ONLY": "eyes_only_s"}.get(self.cur_mode, "roaming_s")
         if self.docked:
             return "docked_s"
         return "roaming_s" if self.sensing else "eyes_only_s"
@@ -294,6 +405,9 @@ class Analyzer:
         g = gap_overlap(a, b, self.gaps)
         self.time["gap_s"] += g
         self.time[self.mode()] += max(0.0, span - g)
+        if self.cur_mode is not None:
+            ms = self.time["modes_s"]
+            ms[self.cur_mode] = ms.get(self.cur_mode, 0.0) + max(0.0, span - g)
 
     def update_mode(self, m):
         if m.startswith(("power: on the charger", "docked: on the charger", "docked: sitting still again")):
@@ -330,9 +444,44 @@ class Analyzer:
                     "novelty": novelty, "toward": toward, "outcome": None,
                     "frame": nearest_frame(self.frames, p.ts)}
 
+    def exact_leg(self, p, body):
+        kv = dict(KV_RE.findall(body))
+        ms, cpl, hic = int(kv["ms"]), int(kv["cpl"]), int(kv["hiccups"])
+        left, right = opt(kv.get("L"), int), opt(kv.get("R"), int)
+        look = opt(kv.get("look"), int)
+        frame, exact = frame_by_ms(self.frame_index, look)
+        hdg = kv.get("hdg", "-")
+        self.legs.append({
+            "time": p.ts - dt.timedelta(milliseconds=ms), "run": self.run.name, "open": opt(kv.get("open")),
+            "band": f"{kv['side']} {kv['bend']}", "kind": "retry" if kv["src"] == "retry" else "leg",
+            "novelty": opt(kv.get("nov")), "toward": "doorway" if kv["src"] == "door" else "",
+            "outcome": end_outcome(kv["end"], cpl, hic), "frame": frame, "exact": True,
+            "id": int(kv["id"]), "src": kv["src"], "side": kv["side"], "bend": int(kv["bend"]),
+            "best": opt(kv.get("best")), "conf": opt(kv.get("conf")), "look_ms": look,
+            "look_age_ms": opt(kv.get("lookAge"), int), "frame_exact": exact,
+            "plan": int(kv["plan"].rstrip("t")), "sent": int(kv["sent"].rstrip("t")), "L": left, "R": right,
+            "ms": ms, "hdg": None if hdg == "-" else tuple(int(x) for x in hdg.split(">")), "end": kv["end"],
+            "tof_min": opt(kv.get("tofMin"), int), "cpl": cpl, "hiccups": hic,
+            "dist_m": (abs(left) + abs(right)) / 2 / self.counts_per_m if left is not None and right is not None else None,
+        })
+
     def leg_line(self, p):
         """Returns True when the line was a decision (handled here)."""
         m = p.msg
+        if self.exact_legs:
+            # The brain's own leg records: only decisions are counted from the notes.
+            lm = LEG_RE.match(m)
+            s = STEER_RE.match(m)
+            if lm:
+                self.exact_leg(p, lm.group(1))
+            elif s:
+                self.decisions["steer"] += 1
+                self.decisions["turn_only"] += s.group(4) == "turn only"
+            elif TRUSTED_RE.match(m):
+                self.decisions["trusted_doorway"] += 1
+            elif m.startswith("no look to steer by"):
+                self.decisions["blind"] += 1
+            return bool(s)
         if self.leg is not None:
             age = (p.ts - self.leg["time"]).total_seconds()
             if age > self.window_s or gap_overlap(self.leg["time"], p.ts, self.gaps) > 0:
@@ -403,6 +552,9 @@ class Analyzer:
             mt = MEASURED_RE.match(m)
             if mt:
                 asked, turned = int(mt.group(1)), int(mt.group(2))
+                w = WHY_RE.search(m)
+                why = w.group(1) if w else "unknown"
+                self.turn["by_why"][why] = self.turn["by_why"].get(why, 0) + 1
                 self.turn["measured"] += 1
                 if self.turn_blocked_since:
                     pass
@@ -411,16 +563,22 @@ class Analyzer:
                 else:
                     self.turn["errors"].append(float(turned - asked))
                     self.turn["asked"].append(asked)
+                    self.turn["whys"].append(why)
                     if turned < 0 < asked:
                         self.turn["wrong_way"] += 1
                 self.turn_blocked_since = self.turn_hazard_since = False
 
     # ---- escapes ----
     def esc_start(self, p, trigger):
+        if self.exact_esc:
+            return  # the brain's escape#N records say when it starts
         if self.esc is None:
             self.esc = {"start": p.ts, "trigger": trigger, "help": False}
 
     def esc_end(self, p, outcome, free_ms=None, how=None):
+        if self.exact_esc:
+            self.last_free_how = how if outcome == "freed" else self.last_free_how
+            return
         if self.esc is None:
             if outcome != "freed":
                 return
@@ -432,9 +590,52 @@ class Analyzer:
         self.esc_list.append(e)
         self.esc = None
 
+    def esc_id_line(self, p):
+        e = ESC_ID_RE.match(p.msg)
+        if not e:
+            return
+        kv = dict(KV_RE.findall(e.group(3)))
+        if e.group(2) == "start":
+            self.esc = {"start": p.ts, "trigger": kv.get("trigger", "unlogged"), "help": False, "id": int(e.group(1))}
+            self.last_free_how = None
+            return
+        ms = int(kv.get("ms", 0))
+        esc = self.esc or {"start": p.ts - dt.timedelta(milliseconds=ms), "trigger": "unlogged", "help": False}
+        outcome = kv.get("outcome", "unknown")
+        esc.update(outcome=outcome, how=self.last_free_how if outcome == "freed" else None, ms=ms)
+        if outcome == "freed":
+            esc["free_ms"] = ms
+        self.esc_list.append(esc)
+        self.esc, self.last_free_how = None, None
+
     # ---- seeks ----
+    def exact_seek_line(self, p):
+        m = p.msg
+        sm = SEEK_ID_RE.match(m)
+        if sm:
+            kv = dict(KV_RE.findall(sm.group(3)))
+            if sm.group(2) == "start":
+                self.seek, self.seek_trigger, self.seek_reason = p.ts, kv.get("trigger"), None
+            else:
+                self.seeks.append({"outcome": kv.get("outcome", "gave_up"), "reason": self.seek_reason or "-",
+                                   "s": int(kv.get("ms", 0)) / 1000, "trigger": self.seek_trigger})
+                self.seek = self.seek_trigger = self.seek_reason = None
+            return
+        if not m.startswith("seeking:"):
+            return
+        body = m[len("seeking:"):].strip()
+        for word in ("arrived (", "gave up ("):
+            if body.startswith(word):
+                self.seek_reason = norm(body[len(word):].rstrip(")"))
+                return
+        if "; no seek for" in body:
+            self.seek_reason = "no target"
+
     def seek_line(self, p):
         m = p.msg
+        if self.exact_seek:
+            self.exact_seek_line(p)
+            return
         if not m.startswith("seeking:"):
             return
         body = m[len("seeking:"):].strip()
@@ -470,9 +671,13 @@ class Analyzer:
             if m.startswith("look in"):
                 self.looks += 1
             return
+        mm = MODE_RE.match(m)
+        if mm:
+            self.cur_mode = mm.group(1)
         self.leg_line(p)
         self.turn_line(m)
         self.seek_line(p)
+        self.esc_id_line(p)
         self.events(p)
         self.update_mode(m)
 
@@ -548,6 +753,7 @@ class Analyzer:
             self.esc_end(p, "freed", how="wriggle")
         elif FREE_RE.match(m):
             ms, how = FREE_RE.match(m).groups()
+            self.last_free_how = norm(how)
             self.esc_end(p, "freed", int(ms), norm(how))
         elif m.startswith("jam probe moved") and "free" in m:
             self.esc_end(p, "freed", how="jam probe")
@@ -579,10 +785,15 @@ class Analyzer:
         if self.recover_open:
             self.recover["unclosed"] += 1
         if self.esc is not None:
-            self.esc_end(self.run.lines[-1], "unresolved")
+            if self.exact_esc:
+                self.esc.update(outcome="unresolved", how=None)
+                self.esc_list.append(self.esc)
+                self.esc = None
+            else:
+                self.esc_end(self.run.lines[-1], "unresolved")
         if self.seek is not None:
             self.seeks.append({"outcome": "open", "reason": "run ended",
-                               "s": (self.run.end - self.seek).total_seconds()})
+                               "s": (self.run.end - self.seek).total_seconds(), "trigger": self.seek_trigger})
 
     def raw(self):
         return {
@@ -603,8 +814,8 @@ class Analyzer:
         }
 
 
-def analyze_run(run, gaps, frames=None, window_s=LEG_WINDOW_S):
-    a = Analyzer(run, gaps, frames, window_s)
+def analyze_run(run, gaps, frames=None, window_s=LEG_WINDOW_S, counts_per_m=COUNTS_PER_M):
+    a = Analyzer(run, gaps, frames, window_s, counts_per_m)
     prev = None
     for p in run.lines:
         a.line(p, prev)
@@ -630,6 +841,7 @@ def summarize(r):
         "free_ms": [e["free_ms"] for e in freed], "median_free_ms": median([e["free_ms"] for e in freed]),
         "how": dict(Counter(e["how"] for e in freed)),
         "by_trigger": dict(Counter(e["trigger"] for e in esc)),
+        "by_outcome": dict(Counter(e["outcome"] for e in esc)),
     }
     sk = [s for s in r["seek_raw"] if s["outcome"] in ("arrived", "gave_up")]
     r["seeks"] = {
@@ -637,11 +849,14 @@ def summarize(r):
         "arrived": dict(Counter(s["reason"] for s in sk if s["outcome"] == "arrived")),
         "gave_up": dict(Counter(s["reason"] for s in sk if s["outcome"] == "gave_up")),
         "durations_s": [s["s"] for s in sk], "median_s": median([s["s"] for s in sk]),
+        "by_trigger": dict(Counter(s["trigger"] for s in r["seek_raw"] if s.get("trigger"))),
     }
     r["turns"] = turn_stats(r["turn_raw"])
     nr = r["novelty_raw"]
     r["novelty"] = dict(nr, place_hit_rate=nr["place_hits"] / nr["camera_looks"] if nr["camera_looks"] else None)
     r["openness"] = openness_table(legs)
+    r["exact_legs"] = any(g.get("exact") for g in legs)
+    r["distance"] = distance_stats(legs)
     forward = [g for g in legs]
     tally = {
         "legs": len(forward), "decisions": c["decisions"].get("steer", 0) + c["decisions"].get("trusted_doorway", 0),
@@ -670,12 +885,15 @@ def merge_counts(a, b):
 
 
 def merge_runs(runs, label):
-    turn = {"measured": 0, "blocked": 0, "interrupted": 0, "wrong_way": 0, "errors": [], "asked": []}
+    turn = {"measured": 0, "blocked": 0, "interrupted": 0, "wrong_way": 0, "errors": [], "asked": [],
+            "whys": [], "by_why": {}}
     for r in runs:
         for k in ("measured", "blocked", "interrupted", "wrong_way"):
             turn[k] += r["turn_raw"][k]
         turn["errors"] += r["turn_raw"]["errors"]
         turn["asked"] += r["turn_raw"]["asked"]
+        turn["whys"] += r["turn_raw"]["whys"]
+        turn["by_why"] = merge_counts(turn["by_why"], r["turn_raw"]["by_why"])
     counts, social, time, nov = {}, {}, {}, {"coverage_cells": 0, "place_hits": 0, "camera_looks": 0}
     for r in runs:
         counts = merge_counts(counts, r["counts"])
@@ -698,15 +916,16 @@ def merge_runs(runs, label):
     }
     for k in ("roaming_s", "docked_s", "eyes_only_s", "gap_s"):
         day["time"].setdefault(k, 0.0)
+    day["time"].setdefault("modes_s", {})
     out = summarize(day)
     out["novelty"]["coverage_note"] = "largest single-run coverage (cells reset each run)"
     return out
 
 
-def build_report(lines, gap_s=120.0, frames=None, window_s=LEG_WINDOW_S):
+def build_report(lines, gap_s=120.0, frames=None, window_s=LEG_WINDOW_S, counts_per_m=COUNTS_PER_M):
     runs = split_runs(lines)
     gaps = capture_gaps(lines, gap_s)
-    results = [analyze_run(r, gaps, frames, window_s) for r in runs]
+    results = [analyze_run(r, gaps, frames, window_s, counts_per_m) for r in runs]
     by_day = {}
     for r in results:
         by_day.setdefault(r["start"][:10], []).append(r)
@@ -752,7 +971,8 @@ def scorecard(r):
     t, c, e, s, tu, n, soc = r["time"], r["counts"], r["escapes"], r["seeks"], r["turns"], r["novelty"], r["social"]
     rows = [
         ("Time", f"roaming {hm(t['roaming_s'])}, docked {hm(t['docked_s'])}, eyes-only {hm(t['eyes_only_s'])}, "
-                 f"capture gaps {hm(t['gap_s'])}"),
+                 f"capture gaps {hm(t['gap_s'])}"
+                 + ("; by mode " + ", ".join(f"{k} {hm(v)}" for k, v in t["modes_s"].items()) if t.get("modes_s") else "")),
         ("Legs (forward, after a steer)", rate(r, "legs")),
         ("Hazards", f"{rate(r, 'hazards')}: {kv(c['hazards'])}; by state {kv(c['hazards_by_state'])}"),
         ("CPL refusals (hiccups)", rate(r, "cpl_refusals")),
@@ -770,15 +990,16 @@ def scorecard(r):
                     f"resumed without a 'free' note {e['resumed_unlogged']}, unresolved at run end {e['unresolved']}, "
                     f"needed help {e['needed_help']}; success {fmt(e['success_rate'], pct=True)}, "
                     f"median time to free {fmt(e['median_free_ms'] and e['median_free_ms'] / 1000)} s; "
-                    f"how: {kv(e['how'])}"),
+                    f"how: {kv(e['how'])}; outcome {kv(e['by_outcome'])}"),
         ("Seeks", f"{s['count']}: arrived {kv(s['arrived'])}; gave up {kv(s['gave_up'])}; "
-                  f"median {fmt(s['median_s'])} s"),
+                  f"median {fmt(s['median_s'])} s; trigger {kv(s['by_trigger'])}"),
         ("Turn accuracy", f"{tu['measured']} measured, {tu['clean']} clean: bias {fmt(tu['bias_deg'])} deg "
                           f"(small <30: {fmt(tu['bias_small_deg'])}, large: {fmt(tu['bias_large_deg'])}), "
                           f"spread {fmt(tu['spread_deg'])} deg, median |err| {fmt(tu['median_abs_err_deg'])} deg, "
                           f"within 10 deg {fmt(tu['within_10deg'], pct=True)}, wrong way {tu['wrong_way']}; "
                           f"blocked {tu['blocked']} ({fmt(tu['blocked_rate'], pct=True)}), "
-                          f"cut by a hazard {tu['interrupted']}"),
+                          f"cut by a hazard {tu['interrupted']}; by why {kv(tu['by_why'])}, bias by why "
+                          + (", ".join(f"{w} {fmt(b)}" for w, b in tu["bias_by_why_deg"].items()) or "-")),
         ("Coverage / novelty", f"{n['coverage_cells']} cells; place seen-before {n['place_hits']} of "
                                f"{n['camera_looks']} camera looks ({fmt(n['place_hit_rate'], pct=True)})"
                                + ("" if r["camera"] else " (no camera)")),
@@ -791,9 +1012,25 @@ def scorecard(r):
     return table(["Metric", "Value (per roaming hour)"], rows)
 
 
+def distance_md(r):
+    d = r["distance"]
+    rows = [
+        ("Driven", f"{fmt(d['metres'], 2)} m in {d['legs']} legs (leg ends: {kv(d['ends'])}; source: {kv(d['by_src'])})"),
+        ("Forward hazards per metre", f"{fmt(d['hazards_per_m'], 2)} ({d['hazards']} CPL / obstacle / edge)"),
+        ("Stalls per metre", f"{fmt(d['stalls_per_m'], 2)} ({d['stalls']})"),
+        ("Legs that went nowhere", f"{d['nowhere']} ({fmt(d['nowhere_rate'], pct=True)})"),
+        ("CPL retry success", f"{d['cpl_retries_ok']} of {d['cpl_retries']} retries "
+                              f"({fmt(d['cpl_retry_success'], pct=True)}); {d['hiccups']} hiccups"),
+    ]
+    out = table(["Metric", "Value"], rows) + [""]
+    cal = [[c["bucket"], c["legs"], fmt(c["metres"], 2), fmt(c["m_per_leg"], 2), c["bad"], fmt(c["bad_per_m"], 2),
+            fmt(c["hazards_per_m"], 2)] for c in d["open_calibration"]]
+    return out + table(["open", "legs", "metres", "m/leg", "bad", "bad/m", "hazards/m"], cal)
+
+
 def openness_md(r):
-    cols = ["clean", "camera_cut", "cpl_hiccup", "cpl", "obstacle", "stall", "blocked_at_start",
-            "turn_hazard", "turn_blocked", "sensor_drop"]
+    cols = ["clean", "camera_cut", "cpl_hiccup", "cpl", "obstacle", "edge", "stall", "nowhere", "blocked_at_start",
+            "turn_hazard", "turn_blocked", "sensor_drop", "interrupted"]
     rows = []
     for row in r["openness"]:
         o = row["outcomes"]
@@ -827,8 +1064,11 @@ def render_markdown(report, sources):
            "(`leg xN`, `short leg`, a look-around's best, or Claude's trusted doorway); its outcome is the first "
            "of these before the next decision: hazard (CPL / obstacle / at start), stall, a blocked or hazarded "
            "bend turn, the camera cutting it short, else clean. `cpl_hiccup` = refused once, then the retry drove. "
-           "`unknown` = nothing decided it within 30 s, a capture gap, or the run ended. The logs carry no "
-           "per-leg encoder counts, so clean legs have no length.", ""]
+           "`unknown` = nothing decided it within 30 s, a capture gap, or the run ended. Runs whose brain writes "
+           "`leg:` records (2026-10-02 on) use those instead: each leg's own end reason, encoder counts and "
+           "decision look (frames matched by the look's wall ms), with `nowhere` (encoders still), `edge` and "
+           "`interrupted` (a cue, a person, bathroom privacy) as outcomes; older runs fall back to the inference, "
+           "where clean legs have no length.", ""]
     a = report.get("assumptions")
     if a:
         out += [f"Times are the robot's local wall clock ({a['tz']}; `-v time` lines get year {a['year']}, "
@@ -845,6 +1085,11 @@ def render_markdown(report, sources):
         out += ["", "### Openness versus outcome", "",
                 "Legs by the open score of the band the steer chose; hazard/stall rate = "
                 "(cpl + obstacle + stall + blocked_at_start) / legs with a known outcome.", ""] + openness_md(day)
+        if day["exact_legs"]:
+            out += ["", "### Per metre (exact leg records)", "",
+                    f"Distance is the mean of the two wheels' encoder counts at {report.get('counts_per_m', COUNTS_PER_M):.0f} "
+                    "counts a metre; bad = cpl / obstacle / edge / stall / nowhere (hiccups that were retried are not); "
+                    "hazards per metre count forward legs only.", ""] + distance_md(day)
         out += ["", "### Runs", ""] + runs_md(runs) + [""]
     return "\n".join(out) + "\n"
 
@@ -856,12 +1101,15 @@ def strip_raw(r):
 def write_labels(report, path):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["time", "run", "open", "band", "kind", "novelty", "outcome", "frame"])
+        w.writerow(["time", "run", "open", "band", "kind", "novelty", "outcome", "frame", "id", "src", "end", "dist_m",
+                    "look_ms"])
         for r in report["runs"]:
             for g in r["legs"]:
-                w.writerow([g["time"].isoformat(sep=" ", timespec="milliseconds"), g["run"], f"{g['open']:.2f}",
+                w.writerow([g["time"].isoformat(sep=" ", timespec="milliseconds"), g["run"],
+                            "" if g["open"] is None else f"{g['open']:.2f}",
                             g["band"], g["kind"], "" if g["novelty"] is None else f"{g['novelty']:.2f}",
-                            g["outcome"], g["frame"] or ""])
+                            g["outcome"], g["frame"] or "", g.get("id", ""), g.get("src", ""), g.get("end", ""),
+                            "" if g.get("dist_m") is None else f"{g['dist_m']:.3f}", g.get("look_ms") or ""])
 
 
 def main(argv=None):
@@ -875,6 +1123,8 @@ def main(argv=None):
     ap.add_argument("--year", type=int, default=dt.date.today().year, help="year for -v time lines")
     ap.add_argument("--tz", default=DEFAULT_TZ, help="the robot's local zone (epoch lines and frame names)")
     ap.add_argument("--gap-s", type=float, default=120.0, help="silence that counts as a capture gap")
+    ap.add_argument("--counts-per-m", type=float, default=COUNTS_PER_M,
+                    help="encoder counts a metre (mean of the wheels) for the leg records' distance")
     args = ap.parse_args(argv)
 
     raws = []
@@ -885,9 +1135,10 @@ def main(argv=None):
     dirs = args.frames_dir if args.frames_dir is not None else sorted(
         str(d) for d in (REPO / "out").glob("camera-frames-*") if d.is_dir())
     frames = load_frames(dirs, args.tz)
-    report = build_report(lines, args.gap_s, frames)
+    report = build_report(lines, args.gap_s, frames, counts_per_m=args.counts_per_m)
+    report["counts_per_m"] = args.counts_per_m
     report["assumptions"] = {"year": args.year, "tz": args.tz, "gap_s": args.gap_s, "frames_dirs": dirs,
-                             "frames": len(frames), "leg_window_s": LEG_WINDOW_S}
+                             "frames": len(frames), "leg_window_s": LEG_WINDOW_S, "counts_per_m": args.counts_per_m}
 
     md = render_markdown(report, args.logs)
     if args.out:

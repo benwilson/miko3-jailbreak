@@ -109,7 +109,7 @@ class RequestShapeTest(unittest.TestCase):
         body = bench.build_body("claude-sonnet-5", "SYSTEM", [{"role": "user", "content": "hi"}],
                                 bench.REPLY_SCHEMA, effort="low", schema_in_prompt=False)
         self.assertEqual(body["model"], "claude-sonnet-5")
-        self.assertEqual(body["max_tokens"], 1024)
+        self.assertEqual(body["max_tokens"], 400)  # robot 2026-10-02: ClaudeApi.CONVERSATION_MAX_TOKENS
         self.assertEqual(body["system"], "SYSTEM")
         self.assertEqual(body["messages"], [{"role": "user", "content": "hi"}])
         self.assertEqual(body["output_config"]["format"], {"type": "json_schema", "schema": bench.REPLY_SCHEMA})
@@ -143,7 +143,7 @@ class SchemaTest(unittest.TestCase):
     def test_reply_schema_has_ktd9_fields_all_required_and_closed(self):
         s = bench.REPLY_SCHEMA
         self.assertEqual(sorted(s["properties"]), sorted(
-            ["line", "question_asked", "name_given", "ends_conversation", "deflected", "notes_update"]))
+            ["line", "question_asked", "name_given", "ends_conversation", "deflected", "notes_update", "feedback"]))
         self.assertEqual(sorted(s["required"]), sorted(s["properties"]))
         self.assertIs(s["additionalProperties"], False)
         notes = s["properties"]["notes_update"]

@@ -95,6 +95,14 @@ interface CuriosityPort extends AnswerParser.Names {
      */
     boolean answering();
 
+    /**
+     * Robot 2026-10-02: the words of the current listen's answer so far, as the launcher
+     * sent them when its recogniser endpointed inside the answer (about 0.8 s after the
+     * last word, while the 2 s silence rule still runs), or null when none has come. The
+     * final answer (heard()) may differ: they kept talking. Never spoken, never logged.
+     */
+    String provisional();
+
     /** A new person replied but nothing will be kept: no face was found, or no name was heard
      * (R19). Ask for a text-only "nice to meet you" line that never promises to remember
      * them. Stores nothing. */
@@ -224,6 +232,40 @@ interface CuriosityPort extends AnswerParser.Names {
 
     /** Abandon the running turn(), if any; a late answer must never be returned. */
     void cancelTurn();
+
+    /**
+     * Robot 2026-10-02: start this turn now, on a provisional answer, so its reply is
+     * ready (or nearly) when the final answer confirms it. Nothing comes of it unless
+     * the next turn() asks for exactly the same request; any other turn() discards it.
+     * Its line is never handed over before that turn() asks for it.
+     */
+    void speculateTurn(TurnRequest request, long timeoutMs);
+
+    /**
+     * Robot 2026-10-02: a streamed turn's notes update that came after its line was
+     * handed over (turnAnswer() returned the line before the reply's tail), oldest
+     * first, or null when there is none.
+     */
+    String lateNotes();
+
+    /** Robot 2026-10-02: a turn's line was handed over and the rest of its reply (its notes) is still coming. */
+    boolean turnTailPending();
+
+    /**
+     * Owner 2026-10-02: a streamed turn's feedback that came after its line was handed
+     * over, oldest first, or null when there is none (as lateNotes()).
+     */
+    default Feedback lateFeedback() {
+        return null;
+    }
+
+    /**
+     * Owner 2026-10-02: pass one piece of feedback about the robot on to the launcher's
+     * feedback log, from this stored person (null: someone unknown), with a few words of
+     * context. Fire and forget; it carries no line and no transcript.
+     */
+    default void feedback(String personId, Feedback feedback, String context) {
+    }
 
     /**
      * Merge a notes delta into this person's record through the People store
@@ -392,6 +434,21 @@ interface CuriosityPort extends AnswerParser.Names {
         }
 
         public boolean answering() {
+            return false;
+        }
+
+        public String provisional() {
+            return null;
+        }
+
+        public void speculateTurn(TurnRequest request, long timeoutMs) {
+        }
+
+        public String lateNotes() {
+            return null;
+        }
+
+        public boolean turnTailPending() {
             return false;
         }
 
@@ -1194,6 +1251,222 @@ interface CuriosityPort extends AnswerParser.Names {
      * end; or a refusal (the deflection clip), unreachable (retry once, then
      * the local sign-off) or a failure.
      */
+    /**
+     * Robot 2026-10-02: the conversation turns in flight, for the live adapter. A turn
+     * started on a provisional answer (speculate) waits, unseen, until a turn() asks
+     * for the same request (adopt, by the request's key), which then answers that
+     * turn() with what it has or will have; any other turn() discards it. A streamed
+     * turn hands its line over early (early) and its whole reply later (whole): when
+     * the line already went, only the reply's notes follow, as late notes. Deliver
+     * says whether the turn() it answers is still the one asked; a dead one takes
+     * nothing, notes included. Thread-safe; plain Java.
+     */
+    final class TurnFlight {
+        /** Hands a turn's answer to turnAnswer(): true when generation g is still the turn asked. */
+        interface Deliver {
+            boolean turn(int g, Turn t);
+        }
+
+        /** One request in flight. */
+        final class Call {
+            final String key;
+            /** The turn() generation it answers; 0 while it is a speculation nobody has asked for. */
+            int gen;
+            Turn early;
+            Turn whole;
+            boolean earlyHandedOver;
+
+            Call(String key, int gen) {
+                this.key = key;
+                this.gen = gen;
+            }
+        }
+
+        private final Deliver deliver;
+        private Call speculation;
+        private final List<String> late = new ArrayList<String>();
+        private final List<Feedback> lateFeedback = new ArrayList<Feedback>();
+        private Call tail;
+
+        TurnFlight(Deliver deliver) {
+            this.deliver = deliver;
+        }
+
+        /** A new speculation for this key (replacing any other), or null when one for it is already running. */
+        synchronized Call speculate(String key) {
+            if (speculation != null && speculation.key.equals(key)) {
+                return null;
+            }
+            speculation = new Call(key, 0);
+            return speculation;
+        }
+
+        /**
+         * The speculation for this key, now answering generation g with whatever it
+         * already has; null when there is none for this key (any other is discarded).
+         */
+        synchronized Call adopt(String key, int g) {
+            dropTail();
+            Call c = speculation;
+            speculation = null;
+            if (c == null || !c.key.equals(key)) {
+                return null;
+            }
+            c.gen = g;
+            if (c.early != null) {
+                handEarly(c);
+                if (c.whole != null) {
+                    handWhole(c);
+                }
+            } else if (c.whole != null) {
+                handWhole(c);
+            }
+            return c;
+        }
+
+        /** A plain turn, answering generation g. */
+        synchronized Call start(String key, int g) {
+            dropTail();
+            return new Call(key, g);
+        }
+
+        /** Its line is known (a LINE turn with no notes yet): handed over now when its turn() asked for it. */
+        synchronized void early(Call c, Turn t) {
+            if (c.early != null || c.whole != null || t == null || t.status != Turn.Status.LINE) {
+                return;
+            }
+            c.early = t;
+            if (c.gen != 0 && c != speculation) {
+                handEarly(c);
+            }
+        }
+
+        /** Its whole reply (or failure): handed over, or only its notes when the line already went. */
+        synchronized void whole(Call c, Turn t) {
+            if (c.whole != null) {
+                return;
+            }
+            c.whole = t == null ? Turn.failed() : t;
+            if (c.gen != 0 && c != speculation) {
+                handWhole(c);
+            }
+        }
+
+        private void handEarly(Call c) {
+            c.earlyHandedOver = deliver.turn(c.gen, c.early);
+            if (c.earlyHandedOver && c.whole == null) {
+                tail = c;
+            }
+        }
+
+        private void handWhole(Call c) {
+            if (tail == c) {
+                tail = null;
+            }
+            if (c.gen < 0) {
+                return; // its turn was cancelled after the line went: no notes
+            }
+            if (!c.earlyHandedOver) {
+                deliver.turn(c.gen, c.whole);
+                return;
+            }
+            String notes = c.whole.status == Turn.Status.LINE ? c.whole.notesUpdate : null;
+            if (notes != null && !notes.trim().isEmpty()) {
+                late.add(notes);
+            }
+            if (c.whole.status == Turn.Status.LINE && c.whole.feedback != null) {
+                lateFeedback.add(c.whole.feedback);
+            }
+        }
+
+        /** The oldest late feedback, or null. */
+        synchronized Feedback lateFeedback() {
+            return lateFeedback.isEmpty() ? null : lateFeedback.remove(0);
+        }
+
+        /** The oldest late notes update, or null. */
+        synchronized String lateNotes() {
+            return late.isEmpty() ? null : late.remove(0);
+        }
+
+        /** A line went and its reply's tail has not come yet. */
+        synchronized boolean tailPending() {
+            return tail != null;
+        }
+
+        /** The turn asked was abandoned: a reply tail still coming brings no late notes. */
+        synchronized void cancel() {
+            dropTail();
+        }
+
+        /**
+         * A new turn() was asked, or the last abandoned: the previous turn's tail brings no
+         * notes (a re-request's rejected reply must not record its question as asked).
+         */
+        private void dropTail() {
+            if (tail != null) {
+                tail.gen = -1;
+                tail = null;
+            }
+        }
+
+        /** Explore stops: no speculation, no late notes. */
+        synchronized void clear() {
+            speculation = null;
+            tail = null;
+            late.clear();
+            lateFeedback.clear();
+        }
+    }
+
+    /**
+     * Owner 2026-10-02: feedback a person gave about the robot himself in a turn (his
+     * behaviour, abilities, voice, driving, getting stuck, interrupting): its kind, a
+     * one-sentence neutral summary and their key sentence, short and verbatim. The
+     * launcher re-checks it with the shared Feedback rules before keeping it;
+     * this side only refuses an unknown kind or an empty summary and trims.
+     */
+    final class Feedback {
+        static final List<String> KINDS = java.util.Arrays.asList("suggestion", "complaint", "praise", "bug");
+        static final int MAX_SUMMARY_CHARS = 200;
+        static final int MAX_QUOTE_CHARS = 240;
+
+        final String kind;
+        final String summary;
+        /** "" when there is none. */
+        final String quote;
+
+        private Feedback(String kind, String summary, String quote) {
+            this.kind = kind;
+            this.summary = summary;
+            this.quote = quote;
+        }
+
+        /** Null for an unknown kind (including "none") or an empty summary. */
+        static Feedback of(String kind, String summary, String quote) {
+            String k = kind == null ? "" : kind.trim().toLowerCase(java.util.Locale.US);
+            String s = squash(summary, MAX_SUMMARY_CHARS);
+            if (!KINDS.contains(k) || s.isEmpty()) {
+                return null;
+            }
+            return new Feedback(k, s, squash(quote, MAX_QUOTE_CHARS));
+        }
+
+        private static String squash(String text, int max) {
+            if (text == null) {
+                return "";
+            }
+            String t = text.replaceAll("[\\s\\p{Cntrl}]+", " ").trim();
+            return t.length() > max ? t.substring(0, max).trim() : t;
+        }
+
+        /** The kind only, so a stray trace line never carries what was said. */
+        @Override
+        public String toString() {
+            return kind;
+        }
+    }
+
     final class Turn {
         enum Status { LINE, REFUSED, UNREACHABLE, FAILED }
 
@@ -1204,9 +1477,16 @@ interface CuriosityPort extends AnswerParser.Names {
         final boolean endsConversation;
         final boolean deflected;
         final String notesUpdate;
+        /** Owner 2026-10-02: feedback the person gave about the robot himself, or null. */
+        final Feedback feedback;
 
         private Turn(Status status, String line, String questionAsked, String nameGiven, boolean endsConversation,
                      boolean deflected, String notesUpdate) {
+            this(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, null);
+        }
+
+        private Turn(Status status, String line, String questionAsked, String nameGiven, boolean endsConversation,
+                     boolean deflected, String notesUpdate, Feedback feedback) {
             this.status = status;
             this.line = line;
             this.questionAsked = questionAsked;
@@ -1214,6 +1494,12 @@ interface CuriosityPort extends AnswerParser.Names {
             this.endsConversation = endsConversation;
             this.deflected = deflected;
             this.notesUpdate = notesUpdate;
+            this.feedback = feedback;
+        }
+
+        /** This turn carrying feedback (null: none). */
+        Turn withFeedback(Feedback f) {
+            return new Turn(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, f);
         }
 
         static Turn line(String line, String questionAsked, String nameGiven, boolean endsConversation,

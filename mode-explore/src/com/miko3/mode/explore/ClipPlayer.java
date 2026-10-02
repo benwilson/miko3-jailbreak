@@ -149,7 +149,8 @@ final class ClipPlayer {
     }
 
     /** A random variant of a reaction group: "curious", "thinking", "disappointed",
-     * "delighted" or "puzzled". Returns at once; an unknown group is logged and skipped. */
+     * "delighted" or "puzzled", or "privacy" (the bathroom beep, react-privacy-1.wav, every
+     * 5 s while he leaves one). Returns at once; an unknown group is logged and skipped. */
     void playReaction(final String group) {
         handler.post(new Runnable() {
             @Override
@@ -263,6 +264,31 @@ final class ClipPlayer {
         if (currentOneShot != null) {
             releaseOneShot(currentOneShot);
         }
+    }
+
+    /**
+     * The speaker was muted (owner 2026-10-02): cut off the clip and the song phrase now
+     * playing, so neither carries on aloud when it is unmuted. Singing stays on; its next
+     * phrase plays as usual. Returns at once.
+     */
+    void hush() {
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                stopOneShot();
+                if (currentSong != null) {
+                    try {
+                        if (currentSong.isPlaying()) {
+                            currentSong.pause();
+                        }
+                        currentSong.seekTo(0);
+                    } catch (IllegalStateException e) {
+                        Log.w(TAG, "could not hush the song", e);
+                    }
+                    currentSong = null;
+                }
+            }
+        });
     }
 
     /** Start humming now and then until stopSinging(). Idempotent; returns at once. */

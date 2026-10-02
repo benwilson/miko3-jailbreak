@@ -399,6 +399,29 @@ final class PlaceMemory {
         return false;
     }
 
+    /**
+     * Forget every print, glance and seek mark taken at or after atMs (bathroom privacy,
+     * owner 2026-10-02: the looks that decided he was in a bathroom were taken inside).
+     */
+    void forgetSince(long atMs) {
+        for (Iterator<Kept> it = kept.iterator(); it.hasNext(); ) {
+            if (it.next().atMs >= atMs) {
+                it.remove();
+            }
+        }
+        for (Iterator<Kept> it = sought.iterator(); it.hasNext(); ) {
+            if (it.next().atMs >= atMs) {
+                it.remove();
+            }
+        }
+        for (Iterator<Glance> it = glances.iterator(); it.hasNext(); ) {
+            if (it.next().atMs >= atMs) {
+                it.remove();
+            }
+        }
+        lastKeptMs = kept.isEmpty() ? Long.MIN_VALUE / 4 : kept.peekLast().atMs;
+    }
+
     /** Prints kept now. */
     int size() {
         return kept.size();

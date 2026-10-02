@@ -105,14 +105,17 @@ final class ClaudeCuriosity implements CuriosityPort {
             if (held()) {
                 return ClaudeApi.MessageResult.paused();
             }
+            lastRequestAt = System.currentTimeMillis();
             return recorded(api.messages(access, system, content, schema, timeoutMs));
         }
 
         // Talking to someone is never held back (owner, 2026-10-01): a conversation turn is
         // always sent, whatever the pause; only the background looks wait it out.
         ClaudeApi.MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
-                Map<String, ?> schema, String effort, int timeoutMs) {
-            return recorded(api.conversation(access, system, messages, schema, effort, timeoutMs));
+                Map<String, ?> schema, String effort, int timeoutMs, List<String> earlyNames,
+                ClaudeApi.EarlyFields early) {
+            lastRequestAt = System.currentTimeMillis();
+            return recorded(api.conversation(access, system, messages, schema, effort, timeoutMs, earlyNames, early));
         }
     }
 
@@ -196,6 +199,37 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<MatchAnswer> photoAdds = new Slot<MatchAnswer>();
     /** The recommended effort for a turn (KTD9); the client's gate drops it where a model refuses it. */
     private static final String TURN_EFFORT = "low";
+    /**
+     * Robot 2026-10-02: the reply fields a turn's line needs before it can be spoken (the
+     * repeat check and the name both read them); the rest of the reply (the notes) follows.
+     */
+    private static final List<String> EARLY_FIELDS = Arrays.asList("line", "question_asked", "name_given");
+    /** Robot 2026-10-02: the turns in flight, a speculative one among them (CuriosityPort.TurnFlight). */
+    private final TurnFlight flight = new TurnFlight(new TurnFlight.Deliver() {
+        @Override
+        public boolean turn(int g, Turn t) {
+            if (!turns.current(g)) {
+                return false;
+            }
+            turns.finish(g, t);
+            return true;
+        }
+    });
+    /**
+     * Robot 2026-10-02: a cold HTTPS connection to the gateway costs about 0.4 s on the robot
+     * (TCP and TLS), and Android drops a pooled connection after 5 min idle. After this long
+     * with no Claude request a free models-page GET keeps it warm, checked every
+     * KEEP_WARM_CHECK_MS; conversation turns and looks keep it warm on their own.
+     */
+    private static final long KEEP_WARM_IDLE_MS = 200000;
+    private static final long KEEP_WARM_CHECK_MS = 30000;
+    private static final int KEEP_WARM_TIMEOUT_MS = 10000;
+    /** When the last Claude request (or keep-warm) went out; 0: none yet, so the first check warms up. */
+    private volatile long lastRequestAt;
+    private final AtomicInteger keepWarms = new AtomicInteger();
+    /** Robot 2026-10-02: the launcher's provisional answer for the hearings generation provisionalGen. */
+    private volatile String provisionalText;
+    private volatile int provisionalGen;
 
     /**
      * Someone met (explore nav plan U7): the face their meeting's match cut out, in
@@ -251,6 +285,44 @@ final class ClaudeCuriosity implements CuriosityPort {
             }
         });
         refreshSettings();
+        try {
+            timer.scheduleWithFixedDelay(new Runnable() {
+                @Override
+                public void run() {
+                    keepWarmIfIdle();
+                }
+            }, KEEP_WARM_CHECK_MS, KEEP_WARM_CHECK_MS, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException e) {
+            // No timer: the connection is warmed by real requests only.
+        }
+    }
+
+    /**
+     * Robot 2026-10-02: on the timer. With no Claude request for KEEP_WARM_IDLE_MS (or none
+     * yet), one free models-page GET on the worker keeps the pooled connection to the
+     * gateway warm, so a first turn does not pay the TCP and TLS setup. Counted and timed
+     * in the log; it carries nothing but the key in its header.
+     */
+    private void keepWarmIfIdle() {
+        long now = System.currentTimeMillis();
+        final ClaudeAccess settings = access;
+        if (released || settings == null || !settings.isSetUp() || now - lastRequestAt < KEEP_WARM_IDLE_MS) {
+            return;
+        }
+        lastRequestAt = now;
+        try {
+            worker.execute(new Runnable() {
+                @Override
+                public void run() {
+                    long t0 = System.currentTimeMillis();
+                    boolean ok = api.keepWarm(settings, KEEP_WARM_TIMEOUT_MS);
+                    Log.i(TAG, "keep-warm " + keepWarms.incrementAndGet() + (ok ? ": ok" : ": failed") + " in "
+                            + (System.currentTimeMillis() - t0) + " ms");
+                }
+            });
+        } catch (RuntimeException e) {
+            // Shut down with Explore.
+        }
     }
 
     /** The continuous ears session the port's ears calls and the meeting's listen go through (KTD1). */
@@ -261,6 +333,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     /** Drops any line still queued and stops answering; ModeApp calls it as Explore stops. */
     void release() {
         released = true;
+        flight.clear();
         speech.cancel();
         // A new adapter is built per Explore start: give back the clients' threads.
         speech.close();
@@ -579,16 +652,59 @@ final class ClaudeCuriosity implements CuriosityPort {
         final MetFace met = meeting;
         final byte[] face = request.heard == null && request.transcript.isEmpty() && met != null
                 ? met.storeCrop : null;
+        final TurnBody body = turnBody(request, face);
+        // Robot 2026-10-02: a turn started on the provisional answer answers this one if it asked the same.
+        if (flight.adopt(body.key, g) != null) {
+            Log.i(TAG, "turn: the request started on the provisional answer is used");
+            return;
+        }
+        final TurnFlight.Call call = flight.start(body.key, g);
         run(new Runnable() {
             @Override
             public void run() {
-                turns.finish(g, oneTurn(request, face, timeoutMs));
+                oneTurn(body, call, timeoutMs, false);
             }
         }, turns, g, Turn.failed());
     }
 
-    private Turn oneTurn(TurnRequest request, byte[] face, long timeoutMs) {
-        long t0 = System.currentTimeMillis();
+    /**
+     * Robot 2026-10-02: the turn the final answer would ask for, started on the launcher's
+     * provisional answer. Its reply waits in the flight, never handed over, until turn()
+     * asks for the same request; a different turn() discards it.
+     */
+    @Override
+    public void speculateTurn(final TurnRequest request, final long timeoutMs) {
+        final TurnBody body = turnBody(request, null);
+        final TurnFlight.Call call = flight.speculate(body.key);
+        if (call == null || released) {
+            return;
+        }
+        try {
+            worker.execute(new Runnable() {
+                @Override
+                public void run() {
+                    oneTurn(body, call, timeoutMs, true);
+                }
+            });
+        } catch (RuntimeException e) {
+            // Shut down with Explore: no speculation.
+        }
+    }
+
+    /** One turn's request: the system prefix, the messages, and the key a speculation is matched by. */
+    private static final class TurnBody {
+        final String system;
+        final List<Map<String, Object>> messages;
+        final String key;
+
+        TurnBody(String system, List<Map<String, Object>> messages, String key) {
+            this.system = system;
+            this.messages = messages;
+            this.key = key;
+        }
+    }
+
+    private TurnBody turnBody(TurnRequest request, byte[] face) {
         String system = ExplorePrompts.systemPrefix(request.persona, request.notes);
         List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
         // A conversation that opened faceless invites them down instead of asking the name (robot 2026-10-01);
@@ -620,14 +736,64 @@ final class ClaudeCuriosity implements CuriosityPort {
         } else {
             messages.add(ClaudeApi.message("user", ask));
         }
-        ClaudeApi.MessageResult r = claude.conversation(fetchSettings(), system, messages, ExplorePrompts.REPLY_SCHEMA,
-                TURN_EFFORT, (int) timeoutMs);
+        return new TurnBody(system, messages, system + "\u0000" + Json.write(messages));
+    }
+
+    /**
+     * Robot 2026-10-02: a turn's settings are the ones already fetched (canAsk() keeps them
+     * fresh in the background) instead of a launcher bind on every turn; only when none are
+     * set up yet are they fetched here, blocking.
+     */
+    private ClaudeAccess turnAccess() {
+        ClaudeAccess a = access;
+        if (a != null && a.isSetUp()) {
+            refreshSettings();
+            return a;
+        }
+        return fetchSettings();
+    }
+
+    /**
+     * One turn's request, streamed (robot 2026-10-02): the line goes to the flight as soon as
+     * the line, question and name are known, the whole reply after it. Logged: the request's
+     * shape (message count, system prefix size, max_tokens, schema, effort), when the line was
+     * known and the total, in counts only; nothing said or heard.
+     */
+    private void oneTurn(TurnBody body, final TurnFlight.Call call, long timeoutMs, boolean speculative) {
+        final long t0 = System.currentTimeMillis();
+        ClaudeAccess settings = turnAccess();
+        final long fetched = System.currentTimeMillis();
+        final long[] earlyAt = {0};
+        ClaudeApi.MessageResult r = claude.conversation(settings, body.system, body.messages, ExplorePrompts.REPLY_SCHEMA,
+                TURN_EFFORT, (int) timeoutMs, EARLY_FIELDS, new ClaudeApi.EarlyFields() {
+                    @Override
+                    public void complete(Map<String, String> fields) {
+                        earlyAt[0] = System.currentTimeMillis();
+                        flight.early(call, earlyTurn(fields));
+                    }
+                });
         long ms = System.currentTimeMillis() - t0;
         Turn t = turnOf(r);
-        String opener = messages.size() == 1 ? " (the opener)" : "";
-        Log.i(TAG, "turn request with " + messages.size() + " message(s)" + opener + ": "
-                + (r.ok() ? t.status.toString() : r.describe()) + " in " + ms + " ms");
-        return t;
+        flight.whole(call, t);
+        int count = body.messages.size();
+        String effort = settings.isSetUp() && ClaudeApi.takesEffort(settings.model) && !api.effortRefused()
+                ? TURN_EFFORT : "none";
+        Log.i(TAG, (speculative ? "speculative " : "") + "turn request with " + count + " message(s)"
+                + (count == 1 ? " (the opener)" : "") + ": " + (r.ok() ? t.status.toString() : r.describe())
+                + " in " + ms + " ms (settings " + (fetched - t0) + " ms, line at "
+                + (earlyAt[0] == 0 ? "-" : String.valueOf(earlyAt[0] - t0)) + " ms; system "
+                + body.system.length() + " chars, max_tokens " + ClaudeApi.CONVERSATION_MAX_TOKENS + ", "
+                + (api.schemaInPrompt() ? "schema in the prompt" : "json schema") + ", effort " + effort + ")");
+    }
+
+    /** The early fields as a LINE turn with no notes yet (the name through NameExtractor, as turnOf does). */
+    private static Turn earlyTurn(Map<String, String> fields) {
+        Map<String, Object> json = new LinkedHashMap<String, Object>(fields);
+        Turn t = ClaudeReplies.turn(json, null);
+        if (t.status != Turn.Status.LINE || t.nameGiven == null) {
+            return t;
+        }
+        return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), false, false, null);
     }
 
     /** The client's reason as the brain's turn status; a name given passes NameExtractor's word list first. */
@@ -639,7 +805,7 @@ final class ClaudeCuriosity implements CuriosityPort {
                 return t;
             }
             return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), t.endsConversation,
-                    t.deflected, t.notesUpdate);
+                    t.deflected, t.notesUpdate).withFeedback(t.feedback);
         }
         switch (r.reason) {
             case REFUSED:
@@ -662,6 +828,49 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public void cancelTurn() {
         turns.cancel();
+        flight.cancel();
+    }
+
+    @Override
+    public String lateNotes() {
+        return flight.lateNotes();
+    }
+
+    @Override
+    public boolean turnTailPending() {
+        return flight.tailPending();
+    }
+
+    @Override
+    public CuriosityPort.Feedback lateFeedback() {
+        return flight.lateFeedback();
+    }
+
+    /**
+     * Owner 2026-10-02: one piece of feedback about him, to the launcher's feedback log
+     * through the People store, which re-checks it and names the person (first name, or
+     * "someone"). Fire and forget, off the brain's thread; only the kind and the outcome
+     * are logged, never what was said.
+     */
+    @Override
+    public void feedback(final String personId, final CuriosityPort.Feedback f, final String context) {
+        final com.miko3.shared.Feedback shared = f == null ? null
+                : com.miko3.shared.Feedback.of(f.kind, f.summary, f.quote);
+        if (shared == null) {
+            return;
+        }
+        run(new Runnable() {
+            @Override
+            public void run() {
+                String outcome;
+                try {
+                    outcome = RobotPeopleClient.recordFeedback(app, personId, shared, context) ? "kept" : "refused";
+                } catch (IOException e) {
+                    outcome = "not kept (" + e.getMessage() + ")";
+                }
+                Log.i(TAG, "feedback (" + shared.kind + "): " + outcome);
+            }
+        }, null, 0, null);
     }
 
     /** A notes delta merged through the People store (KTD10); the store's fixed refusal reason is all that is logged. */
@@ -777,6 +986,15 @@ final class ClaudeCuriosity implements CuriosityPort {
                     answeringGen = g;
                     Log.i(TAG, "the listen's answer has started: holding it for the words, up to "
                             + LauncherProtocol.EARS_ANSWER_HOLD_MS + " ms from its start");
+                }
+            }
+
+            @Override
+            public void provisional(String transcript) {
+                // Robot 2026-10-02: the words so far, for this listen only while it has no answer yet.
+                if (hearings.poll() == null && hearings.current(g)) {
+                    provisionalText = transcript;
+                    provisionalGen = g;
                 }
             }
 
@@ -1707,6 +1925,14 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public Heard heard() {
         return hearings.poll();
+    }
+
+    /** Robot 2026-10-02: the current ears listen's provisional answer, while its final words have not come. */
+    @Override
+    public String provisional() {
+        int g = provisionalGen;
+        String words = provisionalText;
+        return g != 0 && hearings.current(g) && hearings.poll() == null ? words : null;
     }
 
     /** The current ears listen's answer has started (the launcher said so) and its words have not come. */

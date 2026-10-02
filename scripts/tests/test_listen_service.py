@@ -143,6 +143,9 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_wake_word_inside_a_long_answer_keeps_the_early_cue",
         # Owner 2026-10-02: the answer ends on 2 s of no speech; its segments are joined.
         "ears_answer_with_pauses_is_delivered_once_joined_after_the_silence",
+        # Robot 2026-10-02: the words so far go to the mode at each endpoint inside an answer.
+        "ears_each_endpoint_inside_an_answer_sends_the_words_so_far_as_provisional",
+        "ears_speech_outside_a_listens_answer_sends_no_provisional",
         "ears_a_40_s_answer_is_delivered_whole_not_cut_at_20_s",
         "ears_a_line_mid_answer_delivers_the_joined_words_as_partial",
         "ears_outside_a_listen_utterances_still_end_at_the_fast_endpoint",
@@ -649,7 +652,7 @@ class InterfaceAndClientTest(unittest.TestCase):
         # The callback's codes are appended too: heard stays 1, answering (robot 2026-10-01) is 2,
         # answerOver (review 2026-10-01, P2-2) is 3.
         callback_codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", callback)]
-        self.assertEqual(callback_codes, [("heard", 1), ("answering", 2), ("answerOver", 3)])
+        self.assertEqual(callback_codes, [("heard", 1), ("answering", 2), ("answerOver", 3), ("provisional", 4)])
 
     def test_no_per_utterance_cap_is_shorter_than_the_answer_cap(self):
         """Owner 2026-10-02: a 40 s run-on answer is not cut at 20 s. The Silero VAD's
@@ -715,6 +718,30 @@ class InterfaceAndClientTest(unittest.TestCase):
         over = _method_body(client, "public void answerOver")
         self.assertIsNotNone(over)
         self.assertIn("listener.onAnswerOver(at)", over)
+
+    def test_ears_callback_provisional_is_a_one_way_appended_transaction(self):
+        """Robot 2026-10-02: "provisional" carries an answer's words so far, at each
+        recogniser endpoint inside it, so the mode can start its turn while the 2 s
+        silence rule runs. Code 4, one-way, handled like codes 2 and 3: an older
+        mode's Stub has no case for it (onTransact returns false, which a one-way
+        sender never sees); a newer mode under an older launcher never receives it
+        and asks after the final answer, as before."""
+        src = _read(EARS_INTERFACE)
+        head = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(head, r"void provisional\(long at, String text\) throws RemoteException;")
+        stub = _method_body(src, "public boolean onTransact")
+        self.assertRegex(stub, r"case TRANSACTION_provisional: \{\s*data\.enforceInterface\(DESCRIPTOR\);\s*"
+                               r"long at = data\.readLong\(\);\s*provisional\(at, data\.readString\(\)\);\s*return true;")
+        proxy = src.split("private static class Proxy implements Callback", 1)[1].split("abstract class Stub", 1)[0]
+        self.assertRegex(proxy, r"data\.writeLong\(at\);\s*data\.writeString\(text\);\s*"
+                                r"remote\.transact\(TRANSACTION_provisional, data, null, IBinder\.FLAG_ONEWAY\);")
+        self.assertRegex(_read(EARS), r"void provisional\(long at, String text\);")
+        self.assertIn("callback.provisional(at, text);", _read(LAUNCHER / "ListenEngine.java"))
+        client = _read(EARS_CLIENT)
+        self.assertRegex(client, r"void onProvisional\(long \w+, String \w+\);")
+        prov = _method_body(client, "public void provisional")
+        self.assertIsNotNone(prov)
+        self.assertIn("listener.onProvisional(at, text)", prov)
 
     def test_ears_client_binds_renews_and_closes(self):
         src = _read(EARS_CLIENT)

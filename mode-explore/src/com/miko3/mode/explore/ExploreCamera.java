@@ -170,6 +170,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private volatile boolean busy;
 
     private volatile boolean parked;
+    /** Bathroom privacy: no frame saved while set (setPrivate). */
+    private volatile boolean privateFrames;
     /** close() has run on the camera thread and open() has not been called since. */
     private volatile boolean closedDone = true;
     private volatile ExploreBrain.Look latest;
@@ -266,6 +268,16 @@ final class ExploreCamera implements ExploreBrain.Camera {
     @Override
     public void park(boolean p) {
         parked = p;
+    }
+
+    /**
+     * Bathroom privacy (owner 2026-10-02), set by the brain: while on, no frame is saved
+     * anywhere (the NavDebug last-nav files, the calibration frame ring), whatever the
+     * debug tags say.
+     */
+    @Override
+    public void setPrivate(boolean on) {
+        privateFrames = on;
     }
 
     /** Closed on the camera thread, and no detector run in flight (the brain speaks only then, R6). */
@@ -744,7 +756,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     /** Detect thread: the calibration frame ring (FRAMES_TAG), off unless the tag is DEBUG. */
     private void saveFrame(long wallMs, byte[] jpeg) {
-        if (!Log.isLoggable(FRAMES_TAG, Log.DEBUG)) {
+        if (privateFrames || !Log.isLoggable(FRAMES_TAG, Log.DEBUG)) {
             return;
         }
         if (frameRing == null) {
@@ -759,7 +771,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     /** The owner's gate check (NAV_DEBUG_TAG): the look and its numbers, private files only. */
     private void debugNav(byte[] jpeg, Openness.Profile profile) {
-        if (profile == null || !Log.isLoggable(NAV_DEBUG_TAG, Log.DEBUG)) {
+        if (profile == null || privateFrames || !Log.isLoggable(NAV_DEBUG_TAG, Log.DEBUG)) {
             return;
         }
         File dir = context.getFilesDir();

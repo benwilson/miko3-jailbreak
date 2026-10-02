@@ -53,6 +53,22 @@ final class ExploreLoop {
         boolean spinInPlace();
     }
 
+    /**
+     * Whether the speaker is muted or turned all the way down with the volume keys
+     * (owner 2026-10-02): the brain's do-not-disturb. Polled every pass on the brain
+     * thread, so it must be cheap; ModeApp's caches the audio service's answer.
+     */
+    interface Mute {
+        boolean muted();
+    }
+
+    static final Mute NEVER_MUTED = new Mute() {
+        @Override
+        public boolean muted() {
+            return false;
+        }
+    };
+
     static final Hooks NO_HOOKS = new Hooks() {
         @Override
         public boolean staleSensors() {
@@ -87,6 +103,7 @@ final class ExploreLoop {
     private final StopTimer stopTimer;
 
     private volatile boolean running;
+    private volatile Mute mute = NEVER_MUTED;
     private Thread brainThread;
     private Thread stopTimerThread;
 
@@ -179,6 +196,11 @@ final class ExploreLoop {
         return running;
     }
 
+    /** Where the speaker's mute comes from (null: never muted); set before start(). */
+    void setMute(Mute mute) {
+        this.mute = mute == null ? NEVER_MUTED : mute;
+    }
+
     /** Where the brain's cue counters and stage stamps go (meeting plan U7, KTD14): the state page. */
     void setGauges(ExploreBrain.Gauges gauges) {
         brain.setGauges(gauges);
@@ -187,6 +209,7 @@ final class ExploreLoop {
     private void runBrain() {
         brain.start();
         boolean leaseReported = false;
+        boolean mutedReported = false;
         long lastReadingMs = Long.MIN_VALUE;
         while (running) {
             if (!hooks.freezeBrain() && hooks.spinInPlace()) {
@@ -202,6 +225,11 @@ final class ExploreLoop {
                 if (held != leaseReported) {
                     leaseReported = held;
                     brain.onLeaseChanged(held);
+                }
+                boolean muted = mute.muted();
+                if (muted != mutedReported) {
+                    mutedReported = muted;
+                    brain.setMuted(muted);
                 }
                 SensorReading reading = hooks.staleSensors() ? null : sensors.latest();
                 if (reading != null && reading.timestampMs > lastReadingMs) {

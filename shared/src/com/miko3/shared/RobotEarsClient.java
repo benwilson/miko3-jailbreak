@@ -51,6 +51,12 @@ public final class RobotEarsClient {
          */
         void onAnswerOver(long at);
 
+        /**
+         * Robot 2026-10-02: the conversation listen's answer so far (text), at an endpoint
+         * inside it; see RobotEars.Callback.provisional. Before that answer's onHeard.
+         */
+        void onProvisional(long at, String text);
+
         /** The session is gone; reason is fixed text. Called at most once per open(). */
         void onLost(String reason);
     }
@@ -401,6 +407,22 @@ public final class RobotEarsClient {
                 public void run() {
                     if (!ended) {
                         listener.onAnswering(at);
+                    }
+                }
+            });
+        }
+
+        /** On the worker, in order with heard(): the answer's words always come after it. */
+        @Override
+        public void provisional(final long at, final String text) {
+            if (ended) {
+                return;
+            }
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!ended) {
+                        listener.onProvisional(at, text);
                     }
                 }
             });

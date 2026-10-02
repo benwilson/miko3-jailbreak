@@ -368,6 +368,163 @@ class FrameTest(unittest.TestCase):
             self.assertIsNone(nav.nearest_frame(frames, at + dt.timedelta(seconds=30)))
 
 
+def LEG(lid, src="steer", side="R", bend=23, open_="0.54", best="0.71", conf="0.80", nov="0.36", look="-",
+        age="-", plan=13, sent=12, l=910, r=930, ms=3100, hdg="229>231", end="done", tof=210, cpl=0, hic=0):
+    """One `leg:` record as the brain writes it (2026-10-02)."""
+    return (f"leg: id={lid} src={src} side={side} bend={bend} open={open_} best={best} conf={conf} nov={nov} "
+            f"look={look} lookAge={age} plan={plan}t sent={sent}t L={l} R={r} ms={ms} hdg={hdg} end={end} "
+            f"tofMin={tof} cpl={cpl} hiccups={hic}")
+
+
+class ExactLegTest(unittest.TestCase):
+    def test_leg_records_replace_the_inferred_legs(self):
+        r = one(roaming(
+            L(10, "steer: right 23 deg, open 0.54, leg x0.80, new 0.36"),
+            L(14, LEG(1)),
+            L(20, "steer: left 10 deg, open 0.20, short leg"),
+            L(22, LEG(2, side="L", bend=10, open_="0.20", end="obstacle", l=300, r=290, ms=900)),
+            L(30, LEG(3, src="blind", side="S", bend=0, open_="-", best="-", conf="-", nov="-", end="nowhere",
+                      l=0, r=0, ms=700))))
+        legs = r["legs"]
+        self.assertEqual([g["id"] for g in legs], [1, 2, 3])
+        g = legs[0]
+        self.assertEqual((g["src"], g["band"], g["open"], g["best"], g["conf"], g["novelty"]),
+                         ("steer", "R 23", 0.54, 0.71, 0.80, 0.36))
+        self.assertEqual((g["plan"], g["sent"], g["L"], g["R"], g["ms"], g["hdg"], g["tof_min"], g["end"]),
+                         (13, 12, 910, 930, 3100, (229, 231), 210, "done"))
+        self.assertEqual(g["outcome"], "clean")
+        self.assertEqual(g["time"], BASE + dt.timedelta(seconds=14) - dt.timedelta(milliseconds=3100))
+        self.assertAlmostEqual(g["dist_m"], 920 / 3000)
+        self.assertEqual([x["outcome"] for x in legs], ["clean", "obstacle", "nowhere"])
+        self.assertIsNone(legs[2]["open"])
+        self.assertTrue(r["exact_legs"])
+
+    def test_end_reasons_map_to_outcomes(self):
+        ends = [("done", 0, 0, "clean"), ("reaim", 0, 0, "clean"), ("cpl_retry_ok", 0, 0, "clean"),
+                ("camera", 0, 0, "camera_cut"), ("cpl", 0, 1, "cpl_hiccup"), ("cpl", 1, 0, "cpl"),
+                ("obstacle", 0, 0, "obstacle"), ("edge", 0, 0, "edge"), ("stall", 0, 0, "stall"),
+                ("nowhere", 0, 0, "nowhere"), ("eyes", 0, 0, "sensor_drop"), ("cue", 0, 0, "interrupted"),
+                ("person", 0, 0, "interrupted"), ("bath", 0, 0, "interrupted")]
+        for end, cpl, hic, want in ends:
+            with self.subTest(end=end, cpl=cpl):
+                r = one(roaming(L(14, LEG(1, end=end, cpl=cpl, hic=hic))))
+                self.assertEqual(r["legs"][0]["outcome"], want)
+
+    def test_frame_matched_exactly_by_the_looks_wall_ms_and_never_while_private(self):
+        with tempfile.TemporaryDirectory() as d:
+            # 2026-10-02 09:00:10.000 PDT is epoch 1790956810000.
+            for ms in (1790956809900, 1790956810000, 1790956810150):
+                Path(d, f"frame-{ms}.jpg").write_bytes(b"")
+            frames = nav.load_frames([d], tz="America/Los_Angeles")
+            parsed = nav.parse_lines(roaming(
+                L(14, LEG(1, look="1790956810000", age="180")),
+                L(20, LEG(2, look="-", age="-")),
+                L(30, LEG(3, look="1790956810152", age="180")),
+                L(40, LEG(4, look="1790956899999", age="180"))), year=2026)
+            r = nav.analyze_run(nav.split_runs(parsed)[0], [], frames)
+            legs = r["legs"]
+            self.assertTrue(legs[0]["frame"].endswith("frame-1790956810000.jpg"))
+            self.assertEqual((legs[0]["look_ms"], legs[0]["look_age_ms"], legs[0]["frame_exact"]),
+                             (1790956810000, 180, True))
+            self.assertIsNone(legs[1]["frame"])  # privacy: look=- references no frame, whatever is near
+            self.assertIsNone(legs[1]["look_ms"])
+            self.assertTrue(legs[2]["frame"].endswith("frame-1790956810150.jpg"))  # a few ms of clock offset
+            self.assertFalse(legs[2]["frame_exact"])
+            self.assertIsNone(legs[3]["frame"])  # no frame within the tolerance
+
+    def test_distance_metrics(self):
+        r = one(roaming(
+            L(10, LEG(1, open_="0.80", l=3000, r=3000, end="done")),
+            L(20, LEG(2, open_="0.80", l=1500, r=1500, end="obstacle")),
+            L(30, LEG(3, open_="0.20", l=600, r=600, end="cpl", cpl=0, hic=1)),
+            L(31, LEG(4, src="retry", open_="-", l=900, r=900, end="cpl_retry_ok")),
+            L(40, LEG(5, open_="0.20", l=300, r=300, end="cpl", hic=1)),
+            L(41, LEG(6, src="retry", open_="-", l=0, r=0, end="cpl", cpl=1)),
+            L(50, LEG(7, open_="0.20", l=0, r=0, end="nowhere"))))
+        d = r["distance"]
+        self.assertAlmostEqual(d["metres"], (3000 + 1500 + 600 + 900 + 300) / 3000)
+        self.assertEqual(d["legs"], 7)
+        self.assertEqual(d["hazards"], 2)  # the obstacle and the retry's CPL; a hiccup is no hazard
+        self.assertAlmostEqual(d["hazards_per_m"], 2 / 2.1)
+        self.assertAlmostEqual(d["nowhere_rate"], 1 / 7)
+        self.assertEqual((d["cpl_retries"], d["cpl_retries_ok"]), (2, 1))
+        self.assertAlmostEqual(d["cpl_retry_success"], 0.5)
+        cal = {row["bucket"]: row for row in d["open_calibration"]}
+        self.assertEqual((cal["0.70-1.00"]["legs"], cal["0.70-1.00"]["bad"]), (2, 1))
+        self.assertAlmostEqual(cal["0.70-1.00"]["metres"], 1.5)
+        self.assertAlmostEqual(cal["0.70-1.00"]["bad_per_m"], 1 / 1.5)
+        self.assertAlmostEqual(cal["0.70-1.00"]["m_per_leg"], 0.75)
+        self.assertEqual((cal["0.10-0.20"]["legs"], cal["0.20-0.35"]["legs"]), (0, 3))
+        self.assertEqual(cal["0.20-0.35"]["bad"], 1)  # the nowhere leg; hiccups are not bad
+        self.assertAlmostEqual(cal["0.20-0.35"]["metres"], 0.3)
+
+    def test_old_logs_have_no_distance(self):
+        r = one(roaming(L(10, "steer: left 16 deg, open 0.50, leg x0.42"), L(12, "hazard while HOP: CPL")))
+        self.assertFalse(r["exact_legs"])
+        self.assertEqual(r["legs"][0]["outcome"], "cpl")
+        self.assertIsNone(r["distance"]["metres"])
+        self.assertIsNone(r["distance"]["hazards_per_m"])
+
+    def test_escape_and_seek_ids(self):
+        r = one(roaming(
+            L(10, "wedged: hazards in a row (3 hazards, 0 stalls, 0 failed escapes in a row); escaping"),
+            L(10, "escape#1 start trigger=wedged"),
+            L(11, "asking for help: stuck"),
+            L(14, "free after 4000 ms: drove off"),
+            L(14, "escape#1 end outcome=freed ms=4000"),
+            L(15, "steer: straight 0 deg, open 0.80, leg x1.00"),
+            L(20, "stall: waiting for the motor board"),
+            L(20, "escape#2 start trigger=stall"),
+            L(29, "escape#2 end outcome=resumed ms=9000"),
+            L(40, "escape#3 start trigger=boxed"),
+            L(45, "escape#3 end outcome=jam ms=5000"),
+            L(50, "seeking: surroundings familiar (2 stops in a row, every look's novelty 0.30 or less)"),
+            L(50, "seek#1 start trigger=familiar"),
+            L(51, "seeking: asking Claude where to go (3 frames)"),
+            L(70, "seeking: arrived (the place looks new, novelty 0.80)"),
+            L(70, "seek#1 end outcome=arrived ms=20000"),
+            L(90, "seek#2 start trigger=timer"),
+            L(95, "seeking: no least familiar frame with anything open; no seek for 3 min"),
+            L(95, "seek#2 end outcome=gave_up ms=5000")))
+        e = r["escapes"]
+        self.assertEqual((e["episodes"], e["freed"], e["needed_help"], e["unresolved"]), (3, 1, 1, 0))
+        self.assertEqual(e["by_trigger"], {"wedged": 1, "stall": 1, "boxed": 1})
+        self.assertEqual(e["by_outcome"], {"freed": 1, "resumed": 1, "jam": 1})
+        self.assertEqual(e["free_ms"], [4000])
+        self.assertEqual(e["how"], {"drove off": 1})
+        s = r["seeks"]
+        self.assertEqual(s["count"], 2)
+        self.assertEqual(s["arrived"], {"the place looks new, novelty N": 1})
+        self.assertEqual(s["durations_s"], [20.0, 5.0])
+        self.assertEqual(s["by_trigger"], {"familiar": 1, "timer": 1})
+
+    def test_mode_notes_split_the_time(self):
+        r = one([L(0, "mode: EYES_ONLY"), L(10, "mode: ROAM"), L(70, "mode: ESCAPE"), L(80, "mode: ROAM"),
+                 L(100, "mode: CHAT"), L(130, "mode: DOCKED"), L(200, "coverage: 1 cells")])
+        self.assertEqual(r["time"]["modes_s"], {"EYES_ONLY": 10.0, "ROAM": 80.0, "ESCAPE": 10.0, "CHAT": 30.0,
+                                                "DOCKED": 70.0})
+        self.assertAlmostEqual(r["time"]["roaming_s"], 120.0)
+        self.assertAlmostEqual(r["time"]["docked_s"], 70.0)
+        self.assertAlmostEqual(r["time"]["eyes_only_s"], 10.0)
+
+    def test_turns_by_why(self):
+        r = one(roaming(
+            L(10, "measured turn: asked 20 deg, turned 24 deg, overshoot 3 deg why=roam"),
+            L(20, "measured turn: asked 60 deg, turned 50 deg, overshoot 3 deg why=escape"),
+            L(30, "measured turn: asked 40 deg, turned 42 deg, overshoot 3 deg why=scan"),
+            L(40, "measured turn: asked 40 deg, turned 40 deg, overshoot 3 deg")))
+        tu = r["turns"]
+        self.assertEqual(tu["measured"], 4)
+        self.assertEqual(tu["by_why"], {"roam": 1, "escape": 1, "scan": 1, "unknown": 1})
+        self.assertEqual(tu["bias_by_why_deg"], {"roam": 4.0, "escape": -10.0, "scan": 2.0, "unknown": 0.0})
+
+    def test_markdown_has_the_distance_section(self):
+        parsed = nav.parse_lines(roaming(L(10, LEG(1, l=3000, r=3000)), L(20, LEG(2, end="obstacle"))), year=2026)
+        md = nav.render_markdown(nav.build_report(parsed), ["x.log"])
+        self.assertIn("### Per metre (exact leg records)", md)
+        self.assertIn("hazards per metre", md)
+
+
 class RollupAndCliTest(unittest.TestCase):
     LOG = roaming(
         L(10, "steer: left 16 deg, open 0.50, leg x0.42"), L(12, "hazard while HOP: CPL"),
@@ -405,7 +562,8 @@ class RollupAndCliTest(unittest.TestCase):
             self.assertEqual(len(data["runs"]), 2)
             rows = list(csv.DictReader(lab.open()))
             self.assertEqual([r["outcome"] for r in rows], ["cpl", "unknown"])
-            self.assertEqual(set(rows[0]), {"time", "run", "open", "band", "kind", "novelty", "outcome", "frame"})
+            self.assertEqual(set(rows[0]), {"time", "run", "open", "band", "kind", "novelty", "outcome", "frame",
+                                            "id", "src", "end", "dist_m", "look_ms"})
 
     def test_json_to_stdout(self):
         with tempfile.TemporaryDirectory() as d:

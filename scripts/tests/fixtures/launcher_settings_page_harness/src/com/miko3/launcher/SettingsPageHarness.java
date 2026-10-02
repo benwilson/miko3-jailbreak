@@ -1947,6 +1947,93 @@ public final class SettingsPageHarness {
             }
         });
 
+        // ---- Owner 2026-10-02: the feedback log ----
+        scenario("feedback_section_lists_entries_newest_first", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sarah = personWithPhotos(f, "Sarah Connor", 1);
+                f.people.recordFeedback(sarah, com.miko3.shared.Feedback.of("complaint", "He keeps interrupting.",
+                        "you talk over me every time"), "in a call's conversation");
+                f.peopleClock.now += 60_000;
+                f.people.recordFeedback(null, com.miko3.shared.Feedback.of("suggestion", "Learn <b>names</b> faster.",
+                        "learn names & faces"), "while docked");
+                String sec = section(get(f), "feedback");
+                int newer = sec.indexOf("Learn &lt;b&gt;names&lt;/b&gt; faster.");
+                int older = sec.indexOf("He keeps interrupting.");
+                check(n, sec.contains("Feedback from conversations") && newer > 0 && older > newer
+                                && sec.contains("you talk over me every time") && sec.contains("learn names &amp; faces")
+                                && sec.contains("Sarah") && !sec.contains("Connor") && sec.contains("someone")
+                                && sec.contains("while docked") && sec.contains("complaint") && sec.contains("suggestion")
+                                && sec.contains("2 entries") && !sec.contains(sarah) && !sec.contains("<b>names")
+                                && !form(sec, LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH).isEmpty(),
+                        sec);
+            }
+        });
+        scenario("feedback_section_says_when_there_is_none", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sec = section(get(f), "feedback");
+                check(n, sec.contains(SettingsPage.FEEDBACK_EMPTY), sec);
+            }
+        });
+        scenario("feedback_clear_needs_the_token_and_empties_the_log", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.people.recordFeedback(null, com.miko3.shared.Feedback.of("bug", "He froze.", ""), "x");
+                Resp stale = request(f, "POST", LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, "", "t=deadbeef");
+                int afterStale = f.people.feedback().size();
+                Resp get = request(f, "GET", LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, "t=" + token(f), null);
+                int afterGet = f.people.feedback().size();
+                Resp ok = action(f, LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH);
+                String sec = section(get(f), "feedback");
+                check(n, afterStale == 1 && afterGet == 1 && get.code() == 405
+                                && SettingsPage.FEEDBACK_CLEARED.equals(ok.status())
+                                && f.people.feedback().size() == 0 && sec.contains(SettingsPage.FEEDBACK_EMPTY),
+                        stale.head + " | " + ok.head);
+            }
+        });
+        scenario("feedback_state_needs_the_token_and_carries_entries_newest_first_without_ids", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String tom = personWithPhotos(f, "Tom", 1);
+                f.people.recordFeedback(tom, com.miko3.shared.Feedback.of("praise", "Likes his voice.", "nice voice"),
+                        "while roaming");
+                f.peopleClock.now += 1000;
+                f.people.recordFeedback(null, com.miko3.shared.Feedback.of("bug", "He froze.", ""), "x");
+                Resp refused = request(f, "POST", LauncherProtocol.SETTINGS_FEEDBACK_STATE_PATH, "", "t=nope");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_FEEDBACK_STATE_PATH, "", "t=" + token(f));
+                @SuppressWarnings("unchecked")
+                Map<String, Object> root = (Map<String, Object>) Json.parse(r.body);
+                @SuppressWarnings("unchecked")
+                List<Object> entries = (List<Object>) root.get("entries");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> first = (Map<String, Object>) entries.get(0);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> second = (Map<String, Object>) entries.get(1);
+                check(n, refused.code() == 403 && r.code() == 200 && entries.size() == 2
+                                && "He froze.".equals(first.get("summary")) && "someone".equals(first.get("who"))
+                                && "Likes his voice.".equals(second.get("summary")) && "Tom".equals(second.get("who"))
+                                && "nice voice".equals(second.get("quote")) && "while roaming".equals(second.get("context"))
+                                && "praise".equals(second.get("kind")) && second.get("at") instanceof Number
+                                && !r.body.contains(tom) && !second.containsKey("person"),
+                        refused.head + " " + r.body);
+            }
+        });
+        scenario("forget_on_page_deletes_their_feedback", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sarah = personWithPhotos(f, "Sarah", 1);
+                f.people.recordFeedback(sarah, com.miko3.shared.Feedback.of("complaint", "Too loud.", "too loud"), "x");
+                f.people.recordFeedback(null, com.miko3.shared.Feedback.of("bug", "He froze.", ""), "x");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + token(f) + "&id=" + sarah);
+                String sec = section(get(f), "feedback");
+                check(n, SettingsPage.PEOPLE_FORGOTTEN.equals(r.status()) && f.people.feedback().size() == 1
+                                && !sec.contains("Too loud.") && sec.contains("He froze."),
+                        sec);
+            }
+        });
+
         if (failures > 0) {
             System.exit(1);
         }

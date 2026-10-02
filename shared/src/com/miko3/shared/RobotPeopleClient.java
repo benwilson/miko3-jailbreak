@@ -222,6 +222,20 @@ public final class RobotPeopleClient {
         });
     }
 
+    /** Owner 2026-10-02: appends feedback about the robot to the launcher's
+     * feedback log, from the person with this id (null: someone unknown).
+     * False when the launcher refused it. Throws LAUNCHER_TOO_OLD as an
+     * IOException when the launcher predates the log. */
+    public static boolean recordFeedback(Context context, final String id, final Feedback feedback,
+                                         final String where) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.recordFeedback(id, feedback.kind, feedback.summary, feedback.quote, where);
+            }
+        });
+    }
+
     private static PersonNotes parseNotes(String json) {
         try {
             return PersonNotes.parse(json);

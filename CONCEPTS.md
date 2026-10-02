@@ -104,7 +104,11 @@ The single rule bounding what the robot says in its persona: it never says anyth
 
 ## Person notes
 
-The short record an autonomous mode keeps about a person who has given their name, beside the stored face: interests, open threads with roughly when they came up, topics covered, and questions already asked. Never a transcript. Written at the end of each conversation and read before the next, so the robot follows up on what the person said and never asks them the same question twice. A person who never gave a name gets no notes, and anyone can have their face, name and notes wiped by asking to be forgotten.
+The short record an autonomous mode keeps about a person who has given their name, beside the stored face: interests, open threads with roughly when they came up, topics covered, and questions already asked. Never a transcript. Written at the end of each conversation and read before the next, so the robot follows up on what the person said and never asks them the same question twice. A person who never gave a name gets no notes, and anyone can have their face, name, notes and feedback (below) wiped by asking to be forgotten.
+
+## Feedback log
+
+The record of what people tell the robot about himself in a conversation, so the owner can act on it: a suggestion, a complaint, praise or a bug, about how he behaves, what he can or can't do, his voice, his driving, getting stuck or interrupting. Each entry is when it was said, what kind it is, the point in one neutral sentence, the person's key sentence word for word, who said it (a remembered person's first name, otherwise "someone"), and a few words on where, such as on the charger or in a conversation a call opened. That quoted sentence is the only verbatim text the robot ever keeps; the conversation itself is never kept, and small talk about anything else is never logged. He acknowledges feedback out loud as he hears it. The log keeps only the most recent entries, oldest dropped first, the owner reads and clears it from the Settings page, and asking to be forgotten deletes that person's entries.
 
 ## Cue
 

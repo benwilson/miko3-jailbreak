@@ -197,6 +197,15 @@ final class EarsSession {
          * answering(). Called on the capture or ticker thread; must not block.
          */
         void answerOver(long at);
+
+        /**
+         * Robot 2026-10-02: the open conversation listen's answer so far (text, its
+         * segments joined), sent each time the recogniser endpoints inside it with new
+         * words, about 0.8 s after the last word, while ANSWER_SILENCE_MS still runs. The
+         * answer is delivered by heard() as before; this only lets the mode start early.
+         * at is when the answer's speech began. Called on the capture thread; must not block.
+         */
+        void provisional(long at, String text);
     }
 
     /** Where counters and refusals go. Never given words. */
@@ -320,6 +329,8 @@ final class EarsSession {
     private long uttCapAt = Long.MAX_VALUE;
     /** The words of the segments the recogniser already endpointed in this utterance (an answer's), joined. */
     private final StringBuilder segmentWords = new StringBuilder();
+    /** Robot 2026-10-02: how much of segmentWords already went out as the provisional answer. */
+    private int provisionalSent;
 
     // Decode cost per utterance (ms per chunk) and the worst chunk, since the last summary.
     private final Object statsLock = new Object();
@@ -808,6 +819,7 @@ final class EarsSession {
                     uttDecodeNs = 0;
                     uttFed = 0;
                     segmentWords.setLength(0);
+                    provisionalSent = 0;
                     // The word began before the gate saw it: its head goes in first.
                     int head = drainPreroll();
                     uttHeadMs = head * 1000L / SAMPLE_RATE;
@@ -871,6 +883,7 @@ final class EarsSession {
                         endUtterance(now, false);
                     } else if (endpoint) {
                         closeSegment();
+                        sendProvisional();
                     }
                 } else if (endpoint || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
                     endUtterance(now, false);
@@ -885,6 +898,29 @@ final class EarsSession {
     private void closeSegment() {
         appendWords(recognizer.text());
         recognizer.reset();
+    }
+
+    /**
+     * Caller holds feedLock. Robot 2026-10-02: the answer's words so far go to the client
+     * as its provisional answer when the segment just closed added words; never logged.
+     */
+    private void sendProvisional() {
+        if (segmentWords.length() == provisionalSent) {
+            return;
+        }
+        provisionalSent = segmentWords.length();
+        Client c;
+        synchronized (this) {
+            c = client;
+        }
+        if (c == null) {
+            return;
+        }
+        try {
+            c.provisional(speechStartMs, segmentWords.toString());
+        } catch (RuntimeException e) {
+            diag.log("provisional delivery failed: " + e.getClass().getSimpleName());
+        }
     }
 
     /** Caller holds feedLock. Adds words to the segments so far, a space between. */
@@ -1011,6 +1047,7 @@ final class EarsSession {
         appendWords(recognising ? recognizer.text() : "");
         String text = segmentWords.toString();
         segmentWords.setLength(0);
+        provisionalSent = 0;
         Float angle = latchAngle();
         if (sampling != null) {
             sampling.stop();
@@ -1081,6 +1118,7 @@ final class EarsSession {
         recordDecode();
         recognizer.reset();
         segmentWords.setLength(0);
+        provisionalSent = 0;
         preLen = 0;
         if (uttCapAt != Long.MAX_VALUE) {
             uttCapAt = Long.MAX_VALUE;

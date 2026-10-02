@@ -481,6 +481,21 @@ public final class ListenServiceHarness {
         FakeClock overClock;
         final List<Long> answerOverWhen = Collections.synchronizedList(new ArrayList<Long>());
 
+        /** Robot 2026-10-02: each provisional answer (the words so far at an endpoint inside an answer), with when it came. */
+        final List<String> provisional = Collections.synchronizedList(new ArrayList<String>());
+        final List<Long> provisionalWhen = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Long> provisionalAt = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Integer> heardBeforeProvisional = Collections.synchronizedList(new ArrayList<Integer>());
+        FakeClock provisionalClock;
+
+        @Override
+        public void provisional(long at, String text) {
+            provisional.add(text);
+            provisionalAt.add(at);
+            provisionalWhen.add(provisionalClock == null ? -1 : provisionalClock.now);
+            heardBeforeProvisional.add(heard.size());
+        }
+
         @Override
         public void answerOver(long at) {
             answerOver.add(at);
@@ -1585,6 +1600,68 @@ public final class ListenServiceHarness {
                         "quietBetween=" + quietBetween + " after=" + after + " span=" + (lastWord - t0) + " heard="
                                 + r.heard() + " text=" + (u == null ? null : u.text) + " over=" + r.client.answerOver
                                 + " resets=" + (r.rec.resets - resets0));
+            }
+        });
+        // ---- Robot 2026-10-02: each endpoint inside an answer sends the words so far as a provisional answer ----
+        scenario("ears_each_endpoint_inside_an_answer_sends_the_words_so_far_as_provisional", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.client.provisionalClock = r.clock;
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                long start = r.clock.now + 80;
+                String[] parts = {"WE WENT TO THE BEACH", "AND THEN WE HAD ICE CREAM"};
+                long[] endpointAt = new long[2];
+                for (int s = 0; s < 2; s++) {
+                    for (int i = 0; i < 35; i++) {
+                        r.step(true);
+                        r.rec.text = parts[s];
+                    }
+                    r.steps(false, 720);
+                    r.rec.endpoint = true;
+                    r.step(false);
+                    endpointAt[s] = r.clock.now;
+                    // The same endpoint seen again with no new words sends nothing more.
+                    r.rec.endpoint = true;
+                    r.step(false);
+                    if (s == 0) {
+                        r.steps(false, 400);
+                    }
+                }
+                while (r.client.heard.isEmpty() && r.clock.now - endpointAt[1] < 4000) {
+                    r.step(false);
+                }
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                java.util.List<String> want = java.util.Arrays.asList("WE WENT TO THE BEACH",
+                        "WE WENT TO THE BEACH AND THEN WE HAD ICE CREAM");
+                check(n, want.equals(r.client.provisional) && r.client.provisionalWhen.size() == 2
+                                && r.client.provisionalWhen.get(0) == endpointAt[0]
+                                && r.client.provisionalWhen.get(1) == endpointAt[1]
+                                && r.client.provisionalAt.get(0) == start
+                                && r.client.heardBeforeProvisional.equals(java.util.Arrays.asList(0, 0))
+                                && u != null && want.get(1).equals(u.text) && r.client.heard.size() == 1,
+                        "provisional=" + r.client.provisional + " when=" + r.client.provisionalWhen + " endpoints="
+                                + endpointAt[0] + "," + endpointAt[1] + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_speech_outside_a_listens_answer_sends_no_provisional", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.steps(false, 100);
+                int resets0 = r.rec.resets;
+                for (int i = 0; i < 20; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH";
+                }
+                r.steps(false, 10);
+                r.rec.endpoint = true;
+                r.steps(false, 40);
+                check(n, r.client.provisional.isEmpty() && r.rec.resets > resets0,
+                        "provisional=" + r.client.provisional + " resets=" + (r.rec.resets - resets0));
             }
         });
         scenario("ears_a_40_s_answer_is_delivered_whole_not_cut_at_20_s", new Scenario() {

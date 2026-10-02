@@ -319,7 +319,13 @@ final class ExplorePrompts {
     static final String SCHEMA_PREAMBLE = "Answer as one JSON object: line (what he says), question_asked (the question in "
             + "the line, or empty), name_given (a name the person just gave, or empty), ends_conversation (advisory), "
             + "deflected (true when a task was declined), notes_update (short new facts as plain strings under "
-            + "interests, open_threads, closed_threads, topics and questions_asked; empty lists when nothing new).";
+            + "interests, open_threads, closed_threads, topics and questions_asked; empty lists when nothing new), "
+            + "feedback (only when the person gives feedback about Miko himself: his behaviour, abilities, voice, "
+            + "driving, getting stuck, interrupting, or what he should or shouldn't do; kind suggestion, complaint, "
+            + "praise or bug, summary their point in one neutral sentence, quote their key sentence word for word in "
+            + "at most 25 words; never for small talk about anything else, which is kind none with an empty summary "
+            + "and quote). When they give feedback, the line acknowledges it naturally, like \"Good idea, I'll pass "
+            + "that on to my developer.\"";
     /** The re-request's reminder (KTD9), with the repeated question quoted. */
     static final String AVOID_QUESTION = "Not that one: he has asked \"{question}\" before. Ask something else, or nothing.";
     /**
@@ -421,7 +427,12 @@ final class ExplorePrompts {
                     "open_threads", arrayOf(type("string")),
                     "closed_threads", arrayOf(type("string")),
                     "topics", arrayOf(type("string")),
-                    "questions_asked", arrayOf(type("string"))));
+                    "questions_asked", arrayOf(type("string"))),
+            // Owner 2026-10-02: last, after the line, so a streamed line is spoken before it arrives.
+            "feedback", object(
+                    "kind", enumOf("none", "suggestion", "complaint", "praise", "bug"),
+                    "summary", type("string"),
+                    "quote", type("string")));
 
     private static String join(java.util.List<String> items) {
         StringBuilder sb = new StringBuilder();

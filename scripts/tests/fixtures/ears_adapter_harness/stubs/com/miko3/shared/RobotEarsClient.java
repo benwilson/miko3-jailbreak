@@ -16,6 +16,8 @@ public class RobotEarsClient {
 
         void onAnswerOver(long at);
 
+        void onProvisional(long at, String text);
+
         void onLost(String reason);
     }
 

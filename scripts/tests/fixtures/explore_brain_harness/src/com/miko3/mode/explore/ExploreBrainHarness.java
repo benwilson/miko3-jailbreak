@@ -455,25 +455,40 @@ public final class ExploreBrainHarness {
         final long afterMs;
         /** When the launcher's "answering" arrives, this long after the listen starts; -1: never (an older launcher). */
         final long answeringAfterMs;
+        /** Robot 2026-10-02: the launcher's provisional answer (the port's provisional()), or null. */
+        final String provisional;
+        final long provisionalAfterMs;
 
         Hearing(CuriosityPort.Heard heard, long afterMs) {
             this(heard, afterMs, -1);
         }
 
         Hearing(CuriosityPort.Heard heard, long afterMs, long answeringAfterMs) {
+            this(heard, afterMs, answeringAfterMs, null, -1);
+        }
+
+        Hearing(CuriosityPort.Heard heard, long afterMs, long answeringAfterMs, String provisional,
+                long provisionalAfterMs) {
             this.heard = heard;
             this.afterMs = afterMs;
             this.answeringAfterMs = answeringAfterMs;
+            this.provisional = provisional;
+            this.provisionalAfterMs = provisionalAfterMs;
         }
 
         /** The same hearing, arriving this long after the listen starts. */
         Hearing after(long ms) {
-            return new Hearing(heard, ms, answeringAfterMs);
+            return new Hearing(heard, ms, answeringAfterMs, provisional, provisionalAfterMs);
         }
 
         /** The same hearing, with the answer starting (the port's answering()) this long after the listen starts. */
         Hearing answeringAfter(long ms) {
-            return new Hearing(heard, afterMs, ms);
+            return new Hearing(heard, afterMs, ms, provisional, provisionalAfterMs);
+        }
+
+        /** The same hearing, with this provisional answer arriving this long after the listen starts. */
+        Hearing provisional(String text, long ms) {
+            return new Hearing(heard, afterMs, answeringAfterMs, text, ms);
         }
     }
 
@@ -695,6 +710,20 @@ public final class ExploreBrainHarness {
         long pendingHeardAt;
         /** When the listen's answer started (the port's answering() is true from then until heard()); MAX_VALUE: none. */
         long pendingAnsweringAt = Long.MAX_VALUE;
+        /** Robot 2026-10-02: the listen's provisional answer and when it arrives. */
+        String pendingProvisional;
+        long pendingProvisionalAt = Long.MAX_VALUE;
+        /** The turns started on a provisional answer (speculateTurn). */
+        final List<TurnAsk> speculations = new ArrayList<TurnAsk>();
+        /** A streamed turn's notes that come after its line: queued when the nth turn's answer is taken. */
+        final java.util.Map<Integer, String> lateNotesAfterTurn = new java.util.HashMap<Integer, String>();
+        final java.util.ArrayDeque<String> lateNotesQueue = new java.util.ArrayDeque<String>();
+        /** Owner 2026-10-02: feedback passed on (personId|kind|summary|context) and a streamed turn's late feedback. */
+        final List<String> feedbacks = new ArrayList<String>();
+        final java.util.ArrayDeque<CuriosityPort.Feedback> lateFeedbackQueue =
+                new java.util.ArrayDeque<CuriosityPort.Feedback>();
+        final java.util.Map<Integer, CuriosityPort.Feedback> lateFeedbackAfterTurn =
+                new java.util.HashMap<Integer, CuriosityPort.Feedback>();
         CuriosityPort.Named pendingName;
         long pendingNameAt;
         CuriosityPort.Answer pendingRemembered;
@@ -1151,6 +1180,20 @@ public final class ExploreBrainHarness {
             return !cameraOpen && now >= closedAt + detectorTailMs;
         }
 
+        /** The camera's privacy flag (bathroom privacy, owner 2026-10-02): no frame saved while on. */
+        boolean privacy;
+        int privacyOns;
+
+        @Override
+        public void setPrivate(boolean on) {
+            if (on == privacy) {
+                violations.add(now + ":setPrivate(" + on + ") twice");
+            }
+            privacy = on;
+            privacyOns += on ? 1 : 0;
+            log.add(new Event(now, on ? "private on" : "private off"));
+        }
+
         @Override
         public void park(boolean p) {
             if (p == parked) {
@@ -1171,6 +1214,11 @@ public final class ExploreBrainHarness {
         @Override
         public long nowMs() {
             return now;
+        }
+
+        /** The wall clock (nav log, 2026-10-02): WALL0 + the rig's own time, so a look's wall ms is exact. */
+        public long wallMs() {
+            return WALL0 + now;
         }
 
         /** A motion may only start on a fresh reading the rig itself would call clear. */
@@ -1441,6 +1489,8 @@ public final class ExploreBrainHarness {
             pendingHeard = h == null ? null : h.heard;
             pendingHeardAt = now + (h == null || h.afterMs < 0 ? people.replyMs : h.afterMs);
             pendingAnsweringAt = h == null || h.answeringAfterMs < 0 ? Long.MAX_VALUE : now + h.answeringAfterMs;
+            pendingProvisional = h == null ? null : h.provisional;
+            pendingProvisionalAt = h == null || h.provisional == null ? Long.MAX_VALUE : now + h.provisionalAfterMs;
             micOpenUntil = now + maxMs;
             log.add(new Event(now, "listen"));
         }
@@ -1451,6 +1501,38 @@ public final class ExploreBrainHarness {
         }
 
         @Override
+        public String provisional() {
+            return now >= pendingProvisionalAt ? pendingProvisional : null;
+        }
+
+        @Override
+        public void speculateTurn(CuriosityPort.TurnRequest request, long timeoutMs) {
+            speculations.add(new TurnAsk(now, brain.state().name(), request, timeoutMs));
+            log.add(new Event(now, "speculate turn"));
+        }
+
+        @Override
+        public String lateNotes() {
+            return lateNotesQueue.poll();
+        }
+
+        @Override
+        public CuriosityPort.Feedback lateFeedback() {
+            return lateFeedbackQueue.poll();
+        }
+
+        @Override
+        public void feedback(String personId, CuriosityPort.Feedback f, String context) {
+            feedbacks.add(personId + "|" + f.kind + "|" + f.summary + "|" + context);
+            log.add(new Event(now, "feedback " + f.kind));
+        }
+
+        @Override
+        public boolean turnTailPending() {
+            return false;
+        }
+
+        @Override
         public CuriosityPort.Heard heard() {
             if (pendingHeard == null || now < pendingHeardAt) {
                 return null;
@@ -1458,6 +1540,8 @@ public final class ExploreBrainHarness {
             CuriosityPort.Heard h = pendingHeard;
             pendingHeard = null;
             pendingAnsweringAt = Long.MAX_VALUE;
+            pendingProvisional = null;
+            pendingProvisionalAt = Long.MAX_VALUE;
             micOpenUntil = Long.MIN_VALUE;
             log.add(new Event(now, "heard " + h.status));
             return h;
@@ -1649,6 +1733,14 @@ public final class ExploreBrainHarness {
             }
             CuriosityPort.Turn t = pendingTurn;
             pendingTurn = null;
+            String late = lateNotesAfterTurn.get(turnAsks.size());
+            if (late != null) {
+                lateNotesQueue.add(late);
+            }
+            CuriosityPort.Feedback lateFb = lateFeedbackAfterTurn.get(turnAsks.size());
+            if (lateFb != null) {
+                lateFeedbackQueue.add(lateFb);
+            }
             if (t.status == CuriosityPort.Turn.Status.UNREACHABLE && pauseOnUnreachableMs > 0) {
                 claudePausedUntil = now + pauseOnUnreachableMs;
             }
@@ -3237,6 +3329,340 @@ public final class ExploreBrainHarness {
         });
     }
 
+    // ---- do not disturb: the speaker muted or turned all the way down (owner 2026-10-02) ----
+    //
+    // "I can turn them down or mute them if I'm having a conversation with someone else and
+    // I don't want him interrupting me." While muted he roams on but starts nothing to say:
+    // no curiosity stop, no lean-in, no conversation; a call gets a glance and nothing more,
+    // and a conversation under way ends with no sign-off. Unmuting gives him his voice back.
+
+    /** The last eyes event in [from, to), or "none". */
+    private static String lastEyes(Rig rig, long from, long to) {
+        String last = "none";
+        for (Event e : rig.log) {
+            if (e.t >= from && e.t < to && e.what.startsWith("eyes ")) {
+                last = e.what;
+            }
+        }
+        return last;
+    }
+
+    /** Any of these states entered in [from, to). */
+    private static boolean enteredAny(Rig rig, long from, long to, ExploreBrain.State... states) {
+        for (Event e : rig.stateLog) {
+            for (ExploreBrain.State st : states) {
+                if (e.t >= from && e.t < to && e.what.equals(st.name())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static void mutedScenarios() {
+        scenario("muted_no_curiosity_stop_or_remark_and_he_roams_on_then_unmuting_restores_them", n -> {
+            Rig rig = new Rig(curious().build(), CLEAR, PLANT, true).started();
+            List<String> notes = traced(rig);
+            rig.brain.setMuted(true);
+            rig.runUntil(30000);
+            boolean quiet = rig.countPrefix("react", 0, 30000) == 0 && rig.countPrefix("name", 0, 30000) == 0
+                    && rig.countPrefix("say", 0, 30000) == 0 && entered(rig, ExploreBrain.State.SCAN, 0) < 0;
+            int hops = rig.countPrefix("hop", 0, 30000);
+            rig.brain.setMuted(false);
+            rig.runUntil(60000);
+            long scan = entered(rig, ExploreBrain.State.SCAN, 30000);
+            check(n, quiet && hops > 0 && scan >= 30000 && rig.countPrefix("react", 30000, 60000) > 0
+                            && anyContains(notes, "muted: do not disturb (no remarks, calls get a glance)")
+                            && anyContains(notes, "unmuted: talking again") && rig.violations.isEmpty(),
+                    "quiet=" + quiet + " hops=" + hops + " scan=" + scan + " " + rig.tail());
+        });
+        scenario("muted_a_call_gets_only_a_glance_toward_the_voice_and_unmuting_answers_the_next", n -> {
+            Rig rig = cueRig(EMPTY_ROOM).started();
+            List<String> notes = traced(rig);
+            rig.brain.setMuted(true);
+            rig.cue(2000, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -90f);
+            rig.runUntil(8000);
+            long glance = rig.timeOf(rig.firstAfter("eyes GLANCE LEFT", 2000));
+            boolean onlyGlance = glance >= 2000 && glance <= 2100 && rig.countPrefix("react", 0, 8000) == 0
+                    && rig.countPrefix("say", 0, 8000) == 0 && rig.countPrefix("call chat", 0, 8000) == 0
+                    && !enteredAny(rig, 2000, 8000, ExploreBrain.State.CUE_TURN, ExploreBrain.State.CUE_LOOK,
+                            ExploreBrain.State.MEET, ExploreBrain.State.CHAT_THINK)
+                    && !lastEyes(rig, 0, 8000).startsWith("eyes GLANCE") && rig.countPrefix("hop", 2100, 8000) > 0;
+            rig.brain.setMuted(false);
+            rig.cue(9000, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -90f);
+            rig.runUntil(9200);
+            check(n, onlyGlance && answerAt(rig, 9000) == 9000 && anyContains(notes, "muted: a call gets a glance")
+                            && rig.violations.isEmpty(),
+                    "glance@" + glance + " lastEyes=" + lastEyes(rig, 0, 8000) + " answer@" + answerAt(rig, 9000) + " "
+                            + states(rig) + " " + rig.tail());
+        });
+        scenario("muted_a_strong_voice_is_no_lean_in_and_no_turn_toward_it", n -> {
+            Rig rig = cueRig(EMPTY_ROOM).started();
+            rig.brain.setMuted(true);
+            rig.cue(2000, Ears.Tier.STRONG, Ears.Side.LEFT, -90f);
+            rig.cue(3000, Ears.Tier.WEAK, Ears.Side.RIGHT, 90f);
+            rig.runUntil(8000);
+            check(n, !enteredAny(rig, 2000, 8000, ExploreBrain.State.CUE_TURN, ExploreBrain.State.CUE_LOOK,
+                            ExploreBrain.State.MEET) && rig.counted(ExploreBrain.Gauges.Counter.LEAN_INS) == 0
+                            && rig.countPrefix("react", 0, 8000) == 0 && rig.countPrefix("hop", 2000, 8000) > 0
+                            && rig.violations.isEmpty(),
+                    states(rig) + " " + gauges(rig) + " " + rig.tail());
+        });
+        scenario("muted_mid_conversation_it_ends_at_once_with_no_sign_off", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            long open = openChat(rig);
+            long muteAt = open + 50;
+            rig.runUntil(muteAt);
+            rig.brain.setMuted(true);
+            boolean ended = !rig.brain.state().chats() && !rig.brain.state().inStop();
+            rig.runUntil(muteAt + 20000);
+            check(n, open > 0 && ended && rig.countPrefix("react", muteAt, muteAt + 20000) == 0
+                            && rig.countPrefix("say", muteAt, muteAt + 20000) == 0
+                            && !enteredAny(rig, muteAt, muteAt + 20000, ExploreBrain.State.CHAT_THINK,
+                                    ExploreBrain.State.CHAT_SPEAK, ExploreBrain.State.CHAT_LISTEN)
+                            && anyContains(notes, "muted: the conversation ends quietly")
+                            && rig.countPrefix("hop", muteAt, muteAt + 20000) > 0 && rig.violations.isEmpty(),
+                    "open@" + open + " ended=" + ended + " " + states(rig) + " " + rig.tail());
+        });
+    }
+
+    // ---- bathroom privacy (owner 2026-10-02: "if he thinks he's in a bathroom, he beeps
+    // every five seconds and tries to escape the bathroom as quickly as possible") ----
+    //
+    // The escape rig: gyro, simulated wheels, the camera open while roaming, legs of 4 ticks
+    // (~100 counts), curiosity off, and Claude wired (every request is logged, so "none sent"
+    // is checkable). coverageGrid at 300 counts a metre makes "2 m driven" 600 counts.
+
+    private static ExploreTuning.Builder bathTuning() {
+        return escTuning().coverageGrid(300, 0.5, 1800000, 1.5);
+    }
+
+    private static Rig bathRig(ExploreTuning.Builder b, Vision v, List<String> notes) {
+        Rig[] h = new Rig[1];
+        Rig rig = new Rig(b.build(), CLEAR, v, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+        rig.simWheels = true;
+        rig.wayOuts = (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f);
+        h[0] = rig;
+        rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+        return rig;
+    }
+
+    /** A toilet in view once he has driven two legs, until privacy turns on; nothing after. */
+    private static final Vision TOILET_ONCE = (r, t) -> r.privacyOns == 0 && r.count("hop") >= 8
+            ? list(box("toilet", 0.6f, 0.5f, 0.6f, 0.3f, 0.4f)) : list();
+
+    /** A toilet in every look. */
+    private static final Vision TOILET_ALWAYS = (r, t) -> list(box("toilet", 0.6f, 0.5f, 0.6f, 0.3f, 0.4f));
+
+    /** Each look's detections by its number (1-based, counted per look the camera gives). */
+    private static Vision byLook(java.util.function.IntFunction<List<Detection>> f) {
+        int[] k = {0};
+        return (r, t) -> f.apply(++k[0]);
+    }
+
+    private static List<Long> beeps(Rig rig, long from, long to) {
+        List<Long> out = new ArrayList<Long>();
+        for (Event e : rig.log) {
+            if (e.t >= from && e.t < to && e.what.equals("react privacy")) {
+                out.add(e.t);
+            }
+        }
+        return out;
+    }
+
+    /** The requests that carry a frame to Claude, in all: looks, doorways, seeks, ways out, met checks, matches. */
+    private static int frameRequests(Rig rig) {
+        return rig.asks.size() + rig.doorwayAsks.size() + rig.seekRequests.size() + rig.wayOutRequests.size()
+                + rig.metCheckLog.size() + rig.matchBoxes.size();
+    }
+
+    /** The heading in a "...(N deg)..." note after the given text, else NaN. */
+    private static double degIn(List<String> notes, String part) {
+        for (String x : notes) {
+            int i = x.indexOf(part);
+            if (i >= 0) {
+                int open = x.indexOf('(', i + part.length() - 1);
+                int deg = x.indexOf(" deg", open);
+                if (open >= 0 && deg > open) {
+                    return Double.parseDouble(x.substring(open + 1, deg));
+                }
+            }
+        }
+        return Double.NaN;
+    }
+
+    private static void bathroomScenarios() {
+        scenario("bathroom_a_toilet_while_roaming_privacy_on_beeps_every_5_s_retraces_out_then_privacy_off", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning(), TOILET_ONCE, notes);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)") >= 0);
+            long trig = notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)");
+            int requestsAtTrig = frameRequests(rig);
+            runUntil(rig, 180000, r -> notedAt(notes, "bathroom: out; avoiding that area for 3 h") >= 0);
+            long out = notedAt(notes, "bathroom: out; avoiding that area for 3 h");
+            int requestsInside = frameRequests(rig) - requestsAtTrig;
+            rig.runUntil(rig.now + 12000);
+            long on = rig.timeOf(rig.firstAfter("private on", 0));
+            long off = rig.timeOf(rig.firstAfter("private off", 0));
+            long retrace = notedAt(notes, "retrace: facing ");
+            long leaving = notedAt(notes, "bathroom: leaving the way he came");
+            List<Long> inside = beeps(rig, 0, out + 1);
+            boolean spaced = !inside.isEmpty() && inside.get(0) - trig <= 100;
+            for (int i = 1; i < inside.size(); i++) {
+                spaced &= Math.abs(inside.get(i) - inside.get(i - 1) - 5000) <= 100;
+            }
+            boolean lastInTime = !inside.isEmpty() && out - inside.get(inside.size() - 1) <= 5100;
+            check(n, trig > 0 && on == trig && leaving >= trig && retrace >= leaving && out > retrace
+                            && off == out && rig.privacyOns == 1 && inside.size() >= 2 && spaced && lastInTime
+                            && beeps(rig, out + 1, Long.MAX_VALUE).isEmpty() && requestsInside == 0
+                            && entered(rig, ExploreBrain.State.SCAN, trig) < 0 && rig.violations.isEmpty(),
+                    "trig@" + trig + " on@" + on + " leaving@" + leaving + " retrace@" + retrace + " out@" + out
+                            + " off@" + off + " beeps=" + inside + " requests=" + requestsInside + " notes="
+                            + lastNotes(notes, 30));
+        });
+        scenario("bathroom_a_single_mirror_or_weak_labels_below_threshold_never_trigger", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig mirror = bathRig(bathTuning(), (r, t) -> list(box("mirror", 0.9f, 0.5f, 0.5f, 0.3f, 0.4f)), notes);
+            mirror.started();
+            mirror.runUntil(30000);
+            List<String> notes2 = new ArrayList<String>();
+            Rig faint = bathRig(bathTuning(), (r, t) -> list(box("towel", 0.25f, 0.3f, 0.5f, 0.2f, 0.3f),
+                    box("sink", 0.28f, 0.7f, 0.5f, 0.2f, 0.3f), box("toilet", 0.3f, 0.5f, 0.6f, 0.3f, 0.4f)), notes2);
+            faint.started();
+            faint.runUntil(30000);
+            check(n, !anyContains(notes, "bathroom:") && !anyContains(notes2, "bathroom:")
+                            && mirror.privacyOns == 0 && faint.privacyOns == 0 && beeps(mirror, 0, 30000).isEmpty()
+                            && beeps(faint, 0, 30000).isEmpty() && mirror.count("hop") > 0 && faint.count("hop") > 0
+                            && mirror.violations.isEmpty() && faint.violations.isEmpty(),
+                    "mirror notes=" + lastNotes(notes, 10) + " faint notes=" + lastNotes(notes2, 10));
+        });
+        scenario("bathroom_a_sink_and_soap_within_three_looks_trigger_and_five_looks_apart_do_not", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig near = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.4f, 0.4f, 0.6f, 0.3f, 0.3f))
+                    : k == 5 ? list(box("soap", 0.4f, 0.6f, 0.6f, 0.1f, 0.1f)) : list()), notes);
+            near.started();
+            near.runUntil(20000);
+            List<String> notes2 = new ArrayList<String>();
+            Rig apart = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.4f, 0.4f, 0.6f, 0.3f, 0.3f))
+                    : k == 8 ? list(box("soap", 0.4f, 0.6f, 0.6f, 0.1f, 0.1f)) : list()), notes2);
+            apart.started();
+            apart.runUntil(20000);
+            String trig = firstNote(notes, "bathroom: ");
+            check(n, trig != null && trig.contains("bathroom: sink, soap; leaving and beeping (privacy)")
+                            && near.privacyOns == 1 && !anyContains(notes2, "bathroom:") && apart.privacyOns == 0
+                            && near.violations.isEmpty() && apart.violations.isEmpty(),
+                    "near=" + trig + " apart notes=" + lastNotes(notes2, 10));
+        });
+        scenario("bathroom_privacy_a_due_curiosity_stop_asks_claude_nothing_and_stores_no_place_print", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = new Rig(curious().build(), CLEAR, TOILET_ALWAYS, true, (r, req, nth) -> CuriosityPort.Answer.nothing());
+            rig.placeView = (r, t) -> scene(t);
+            rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+            rig.started();
+            rig.runUntil(40000);
+            long trig = notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)");
+            int scansAfter = 0;
+            for (long t : entries(rig, ExploreBrain.State.SCAN)) {
+                scansAfter += t > trig ? 1 : 0;
+            }
+            check(n, trig > 0 && rig.privacy && frameRequests(rig) == 0 && scansAfter == 0
+                            && !rig.brain.state().inStop() && rig.brain.placePrints() == 0
+                            && rig.countPrefix("react", trig, 40000) == beeps(rig, trig, 40000).size()
+                            && rig.countPrefix("name", trig, 40000) == 0 && rig.countPrefix("say", trig, 40000) == 0
+                            && beeps(rig, trig, 40000).size() >= 7 && rig.violations.isEmpty(),
+                    "trig@" + trig + " requests=" + frameRequests(rig) + " scans after=" + scansAfter + " prints="
+                            + rig.brain.placePrints() + " " + states(rig) + " " + rig.tail());
+        });
+        scenario("bathroom_privacy_a_call_gets_a_glance_and_no_conversation", n -> {
+            Rig rig = cueRig(TOILET_ALWAYS).started();
+            List<String> notes = traced(rig);
+            rig.cue(4000, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -90f);
+            rig.runUntil(12000);
+            long trig = notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)");
+            long glance = rig.timeOf(rig.firstAfter("eyes GLANCE LEFT", 4000));
+            check(n, trig > 0 && trig < 4000 && glance >= 4000 && glance <= 4100
+                            && anyContains(notes, "bathroom: a call gets a glance from LEFT")
+                            && rig.count("react answer") == 0 && rig.countPrefix("say", 0, 12000) == 0
+                            && rig.countPrefix("call chat", 0, 12000) == 0 && rig.callChats == 0
+                            && !enteredAny(rig, 4000, 12000, ExploreBrain.State.CUE_TURN, ExploreBrain.State.CUE_LOOK,
+                                    ExploreBrain.State.MEET, ExploreBrain.State.CHAT_THINK)
+                            && rig.privacy && rig.violations.isEmpty(),
+                    "trig@" + trig + " glance@" + glance + " " + states(rig) + " " + rig.tail());
+        });
+        scenario("bathroom_muted_privacy_stays_on_and_the_beep_stays_silent", n -> {
+            // Do not disturb mutes the speaker anyway: no beep, but privacy is the same.
+            Rig rig = cueRig(TOILET_ALWAYS).started();
+            List<String> notes = traced(rig);
+            rig.brain.setMuted(true);
+            rig.runUntil(20000);
+            check(n, anyContains(notes, "bathroom: toilet; leaving and beeping (privacy)") && rig.privacy
+                            && beeps(rig, 0, 20000).isEmpty() && rig.brain.bathroomPrivate() && rig.violations.isEmpty(),
+                    "beeps=" + beeps(rig, 0, 20000) + " " + rig.tail());
+        });
+        scenario("bathroom_look_then_go_the_deciding_look_starts_the_escape_not_a_leg_toward_it", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning().navigation(ExploreTuning.Navigation.LOOK_THEN_GO), byLook(
+                    k -> k == 3 ? list(box("toilet", 0.6f, 0.5f, 0.6f, 0.3f, 0.4f)) : list()), notes);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)") >= 0);
+            long trig = notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)");
+            rig.runUntil(rig.now + 3000);
+            long hop = rig.timeOf(rig.firstAfter("hop", trig));
+            long leaving = notedAt(notes, "bathroom: leaving the way he came");
+            check(n, trig > 0 && leaving >= trig && leaving - trig <= 100 && (hop < 0 || hop > leaving)
+                            && rig.violations.isEmpty(),
+                    "trig@" + trig + " leaving@" + leaving + " hop@" + hop + " notes=" + lastNotes(notes, 15));
+        });
+        scenario("bathroom_after_leaving_the_steer_never_heads_back_toward_it", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning(), TOILET_ONCE, notes);
+            // The way he came in (heading 0) reads the most open, the way out (180) closed once
+            // he is out there, the sides barely open (under lookAroundOpen, so a look-around
+            // takes every look): without the avoid mark the look-around and the steer would
+            // head straight back in.
+            rig.openView = worldView(h -> Math.abs(Heading.delta(h, 0)) <= 35 ? 0.95
+                    : Math.abs(Heading.delta(h, 180)) <= 60 ? 0.1 : 0.45);
+            rig.started();
+            runUntil(rig, 180000, r -> notedAt(notes, "bathroom: out; avoiding that area for 3 h") >= 0);
+            long out = notedAt(notes, "bathroom: out; avoiding that area for 3 h");
+            rig.runUntil(rig.now + 90000);
+            double avoid = degIn(notes, "the way in (");
+            int legs = 0;
+            List<String> toward = new ArrayList<String>();
+            for (Drive d : rig.drives) {
+                if (d.t > out && d.kind.equals("hop") && d.state.equals("HOP")) {
+                    legs++;
+                    if (Math.abs(Heading.delta(d.heading, avoid)) <= 40) {
+                        toward.add(d.toString());
+                    }
+                }
+            }
+            check(n, out > 0 && !Double.isNaN(avoid) && legs >= 10 && toward.isEmpty() && rig.violations.isEmpty(),
+                    "out@" + out + " avoid=" + avoid + " legs=" + legs + " toward=" + toward + " notes="
+                            + lastNotes(notes, 20));
+        });
+        scenario("bathroom_jammed_inside_keeps_beeping_and_privacy_and_the_help_path_runs", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning().turnChance(1.0), TOILET_ALWAYS, notes);
+            rig.creepPer100 = 0;
+            pin(rig, true);
+            rig.blockedFrom = 0;
+            rig.started();
+            runUntil(rig, 150000, r -> notedAt(notes, "fully jammed") >= 0);
+            long jamAt = notedAt(notes, "fully jammed");
+            rig.runUntil(rig.now + 60000);
+            long trig = notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)");
+            List<Long> helps = helpLines(rig, trig);
+            List<Long> during = beeps(rig, jamAt, jamAt + 60000);
+            check(n, trig > 0 && jamAt > trig && !helps.isEmpty() && during.size() >= 11 && rig.privacy
+                            && rig.privacyOns == 1 && !anyContains(notes, "bathroom: out") && rig.violations.isEmpty(),
+                    "trig@" + trig + " jam@" + jamAt + " helps=" + helps + " beeps in jam=" + during.size()
+                            + " notes=" + lastNotes(notes, 20));
+        });
+    }
+
     private static void reviewLeanInScenarios() {
         scenario("review_a_lean_in_cut_off_by_a_lease_drop_does_not_start_a_cooldown_at_a_later_stop", n -> {
             // Review P3: a lean-in interrupted by a lease drop left leanInOpen set; the next
@@ -3365,6 +3791,9 @@ public final class ExploreBrainHarness {
         reviewTrustLegScenarios();
         reviewRecoverStampScenarios();
         reviewLeanInScenarios();
+        mutedScenarios();
+        bathroomScenarios();
+        navLogScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -5709,7 +6138,7 @@ public final class ExploreBrainHarness {
             double r = rig.yaw.turnResults.isEmpty() ? 0 : Math.abs(rig.yaw.turnResults.get(0));
             boolean noted = false;
             for (String note : notes) {
-                noted |= note.matches("measured turn: asked 90 deg, turned \\d+ deg, overshoot \\d+ deg");
+                noted |= note.matches("measured turn: asked 90 deg, turned \\d+ deg, overshoot \\d+ deg why=roam");
             }
             check(n, !turns.isEmpty() && Math.abs(r - 90) <= rig.tuning.turnToleranceDeg
                             && turns.get(0)[1] >= 1300 && noted && rig.violations.isEmpty(),
@@ -13843,6 +14272,23 @@ public final class ExploreBrainHarness {
     }
 
     /** Sarah facing him from the left; a cue at 400 ms opens the conversation. */
+    /** Two turn requests that would make the same Claude request (robot 2026-10-02: the speculation's test). */
+    private static boolean sameRequest(CuriosityPort.TurnRequest a, CuriosityPort.TurnRequest b) {
+        if (a.transcript.size() != b.transcript.size()) {
+            return false;
+        }
+        for (int i = 0; i < a.transcript.size(); i++) {
+            if (!java.util.Objects.equals(a.transcript.get(i).heard, b.transcript.get(i).heard)
+                    || !java.util.Objects.equals(a.transcript.get(i).said, b.transcript.get(i).said)) {
+                return false;
+            }
+        }
+        return java.util.Objects.equals(a.persona, b.persona) && java.util.Objects.equals(a.name, b.name)
+                && java.util.Objects.equals(a.notes, b.notes) && java.util.Objects.equals(a.heard, b.heard)
+                && java.util.Objects.equals(a.avoidQuestion, b.avoidQuestion) && a.faceless == b.faceless
+                && a.faceSeen == b.faceSeen && a.called == b.called && a.cantSee == b.cantSee;
+    }
+
     private static Rig sarahRig(boolean known) {
         return chatRig(personAt(bearingOf(-90f), 25), known).started();
     }
@@ -14006,6 +14452,233 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     "open@" + open + " second@" + second + " held@" + held + " heard@" + rig.timeOf(heard)
                             + " asks=" + rig.turnAsks + " notes=" + notes);
+        });
+        // ---- Robot 2026-10-02: the provisional answer starts the turn early; only the final answer speaks ----
+        scenario("chat_a_provisional_answer_starts_the_same_turn_early_and_only_the_final_answer_lets_it_speak", n -> {
+            String words = "we went camping by the lake";
+            Rig rig = sarahRig(true);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300),
+                    hearWords(words).after(4000).answeringAfter(500).provisional(words, 1800),
+                    hearWords("catch you later"));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long second = nthListenAt(rig, open, 2);
+            TurnAsk spec = rig.speculations.size() == 1 ? rig.speculations.get(0) : null;
+            TurnAsk third = rig.turnAsks.size() >= 3 ? rig.turnAsks.get(2) : null;
+            int heard = rig.firstAfter("heard WORDS", second);
+            long heardAt = heard < 0 ? -1 : rig.timeOf(heard);
+            check(n, open > 0 && over > 0 && spec != null && third != null && words.equals(spec.request.heard)
+                            && spec.t - second >= 1800 && spec.t - second <= 1950
+                            && spec.timeoutMs == rig.tuning.turnBudgetMs
+                            && sameRequest(spec.request, third.request) && third.t >= heardAt
+                            && rig.countPrefix("say", spec.t, heardAt) == 0 && rig.violations.isEmpty(),
+                    "second@" + second + " spec=" + (spec == null ? null : spec.t) + " heard@" + heardAt
+                            + " asks=" + rig.turnAsks + " specs=" + rig.speculations.size());
+        });
+        scenario("chat_a_changed_answer_asks_with_its_final_words_and_a_provisional_goodbye_starts_nothing", n -> {
+            String early = "we went camping";
+            String full = "we went camping and then fishing";
+            Rig rig = sarahRig(true);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300),
+                    hearWords(full).after(5000).answeringAfter(500).provisional(early, 1800),
+                    hearWords("catch you later").after(3000).answeringAfter(500).provisional("catch you later", 1800));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk third = rig.turnAsks.size() >= 3 ? rig.turnAsks.get(2) : null;
+            check(n, open > 0 && over > 0 && rig.speculations.size() == 1
+                            && early.equals(rig.speculations.get(0).request.heard) && third != null
+                            && full.equals(third.request.heard) && rig.turnAsks.size() == 3
+                            && rig.count("react sign-off") == 1 && rig.violations.isEmpty(),
+                    "specs=" + rig.speculations.size() + " asks=" + rig.turnAsks + " " + rig.tail());
+        });
+        scenario("chat_a_streamed_turns_late_notes_join_this_conversations_notes_and_stale_ones_never_do", n -> {
+            Rig rig = sarahRig(true);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300), hearSilence(), hearSilence());
+            rig.lateNotesQueue.add("{\"topics\":[\"stale\"]}");
+            rig.lateNotesAfterTurn.put(1, "{\"topics\":[\"late\"]}");
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            String deltas = String.valueOf(rig.notesDeltas);
+            check(n, open > 0 && over > 0 && deltas.contains("late") && !deltas.contains("stale")
+                            && rig.violations.isEmpty(),
+                    "deltas=" + deltas);
+        });
+        // ---- Owner 2026-10-02: feedback about himself is passed on, never the conversation ----
+        scenario("chat_a_complaint_is_passed_on_once_after_its_streamed_line", n -> {
+            Rig rig = sarahRig(true);
+            rig.people.listen = ListenScript.turns(hearWords("you keep bumping into my chair").after(300), hearSilence(),
+                    hearSilence());
+            rig.lateFeedbackAfterTurn.put(2, CuriosityPort.Feedback.of("complaint", "He bumps into chairs.",
+                    "you keep bumping into my chair"));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            int said = rig.first("say Line 2.", 0);
+            int passed = rig.first("feedback complaint", 0);
+            check(n, open > 0 && over > 0 && rig.feedbacks.size() == 1 && said >= 0 && passed > said
+                            && rig.feedbacks.get(0).startsWith(SARAH_ID + "|complaint|He bumps into chairs.|")
+                            && rig.feedbacks.get(0).endsWith("|in a conversation") && rig.violations.isEmpty(),
+                    "feedbacks=" + rig.feedbacks + " said=" + said + " passed=" + passed + " " + rig.tail());
+        });
+        scenario("chat_a_whole_turns_feedback_is_passed_on_with_it", n -> {
+            Rig rig = sarahRig(true);
+            rig.people.listen = ListenScript.turns(hearWords("you should learn to dance").after(300), hearSilence(),
+                    hearSilence());
+            rig.turns = turnsOf(turnLine(1), turnLine(2).withFeedback(CuriosityPort.Feedback.of("suggestion",
+                    "He could learn to dance.", "you should learn to dance")));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.feedbacks.size() == 1
+                            && rig.feedbacks.get(0).startsWith(SARAH_ID + "|suggestion|") && rig.violations.isEmpty(),
+                    "feedbacks=" + rig.feedbacks);
+        });
+        scenario("chat_feedback_in_a_call_on_the_charger_says_so_in_its_context", n -> {
+            Rig rig = callChatRig(chatFirstTuning(), t -> t >= 1000 ? charger(t) : clear(t), EMPTY_ROOM,
+                    hearWords("you never come when I call"), hearWords("bye"));
+            rig.turns = turnsOf(turnLine(1).withFeedback(CuriosityPort.Feedback.of("complaint",
+                    "He is slow to come when called.", "you never come when I call")));
+            rig.started();
+            heyMiko(rig, 4000, Ears.Side.LEFT, 800, "anyone home");
+            rig.runUntil(4000);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 4000, 24000);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.feedbacks.size() == 1
+                            && rig.feedbacks.get(0).endsWith("|in a call's conversation, while docked"),
+                    "feedbacks=" + rig.feedbacks);
+        });
+        scenario("chat_small_talk_passes_on_no_feedback", n -> {
+            Rig rig = sarahRig(true);
+            rig.people.listen = ListenScript.turns(hearWords("nice weather today").after(300), hearSilence(),
+                    hearSilence());
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.feedbacks.isEmpty() && rig.count("feedback complaint") == 0,
+                    "feedbacks=" + rig.feedbacks);
+        });
+        scenario("chat_feedback_from_someone_unnamed_carries_no_id", n -> {
+            Rig rig = sarahRig(false);
+            rig.people.listen = ListenScript.turns(hearWords("you are too slow").after(300), hearSilence(),
+                    hearSilence());
+            rig.turns = turnsOf(turnLine(1), turnLine(2).withFeedback(CuriosityPort.Feedback.of("complaint",
+                    "He is too slow.", "you are too slow")));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.feedbacks.size() == 1
+                            && rig.feedbacks.get(0).startsWith("null|complaint|He is too slow.|"),
+                    "feedbacks=" + rig.feedbacks);
+        });
+        scenario("chat_late_feedback_left_from_another_conversation_is_dropped", n -> {
+            Rig rig = sarahRig(true);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300), hearSilence(), hearSilence());
+            rig.lateFeedbackQueue.add(CuriosityPort.Feedback.of("bug", "Stale.", ""));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.feedbacks.isEmpty(), "feedbacks=" + rig.feedbacks);
+        });
+        scenario("turn_flight_a_streamed_turns_feedback_follows_as_late_feedback", n -> {
+            List<String> got = new ArrayList<String>();
+            CuriosityPort.TurnFlight f = new CuriosityPort.TurnFlight((g, t) -> got.add(g + ":" + t.line + ":" + t.feedback));
+            CuriosityPort.Feedback fb = CuriosityPort.Feedback.of("complaint", "Too loud.", "too loud");
+            CuriosityPort.TurnFlight.Call c = f.start("A", 3);
+            f.early(c, CuriosityPort.Turn.line("Hi.", "", null, false, false, null));
+            boolean none = f.lateFeedback() == null;
+            f.whole(c, CuriosityPort.Turn.line("Hi.", "", null, false, false, null).withFeedback(fb));
+            CuriosityPort.Feedback late = f.lateFeedback();
+            CuriosityPort.TurnFlight.Call whole = f.start("B", 4);
+            f.whole(whole, CuriosityPort.Turn.line("Yo.", "", null, false, false, null).withFeedback(fb));
+            check(n, none && late == fb && f.lateFeedback() == null
+                            && got.equals(java.util.Arrays.asList("3:Hi.:null", "4:Yo.:complaint")),
+                    "got=" + got + " late=" + late);
+        });
+        scenario("turn_flight_a_dead_or_replaced_turn_brings_no_late_feedback", n -> {
+            CuriosityPort.Feedback fb = CuriosityPort.Feedback.of("bug", "Froze.", "");
+            CuriosityPort.TurnFlight dead = new CuriosityPort.TurnFlight((g, t) -> false);
+            CuriosityPort.TurnFlight.Call c = dead.start("A", 5);
+            dead.early(c, CuriosityPort.Turn.line("Hi.", "", null, false, false, null));
+            dead.whole(c, CuriosityPort.Turn.line("Hi.", "", null, false, false, null).withFeedback(fb));
+            CuriosityPort.TurnFlight f = new CuriosityPort.TurnFlight((g, t) -> true);
+            CuriosityPort.TurnFlight.Call first = f.start("A", 1);
+            f.early(first, CuriosityPort.Turn.line("Again?", "Again?", null, false, false, null));
+            f.start("A+avoid", 2);
+            f.whole(first, CuriosityPort.Turn.line("Again?", "Again?", null, false, false, null).withFeedback(fb));
+            check(n, dead.lateFeedback() == null && f.lateFeedback() == null, "late feedback for a dead turn");
+        });
+        scenario("replies_turn_reads_feedback_and_ignores_a_malformed_one", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("line", "Good idea, I'll pass that on to my developer.");
+            java.util.Map<String, Object> fb = new java.util.LinkedHashMap<String, Object>();
+            fb.put("kind", "suggestion");
+            fb.put("summary", "He should say goodbye.");
+            fb.put("quote", "you should say bye");
+            json.put("feedback", fb);
+            CuriosityPort.Turn good = ClaudeReplies.turn(json, null);
+            json.put("feedback", "complaint");
+            CuriosityPort.Turn bad = ClaudeReplies.turn(json, null);
+            java.util.Map<String, Object> none = new java.util.LinkedHashMap<String, Object>();
+            none.put("kind", "none");
+            none.put("summary", "");
+            none.put("quote", "");
+            json.put("feedback", none);
+            CuriosityPort.Turn nothing = ClaudeReplies.turn(json, null);
+            json.remove("feedback");
+            CuriosityPort.Turn absent = ClaudeReplies.turn(json, null);
+            check(n, good.status == CuriosityPort.Turn.Status.LINE && good.feedback != null
+                            && "He should say goodbye.".equals(good.feedback.summary)
+                            && bad.status == CuriosityPort.Turn.Status.LINE && bad.feedback == null
+                            && bad.line.equals(good.line) && nothing.feedback == null && absent.feedback == null,
+                    "good=" + good.feedback + " bad=" + bad.feedback);
+        });
+        // ---- Robot 2026-10-02: the turns in flight (CuriosityPort.TurnFlight), on their own ----
+        scenario("turn_flight_a_speculation_is_used_only_by_a_turn_with_the_same_request", n -> {
+            List<String> got = new ArrayList<String>();
+            CuriosityPort.TurnFlight f = new CuriosityPort.TurnFlight((g, t) -> got.add(g + ":" + t.line));
+            CuriosityPort.TurnFlight.Call a = f.speculate("A");
+            CuriosityPort.TurnFlight.Call again = f.speculate("A");
+            f.whole(a, CuriosityPort.Turn.line("Hi.", "", null, false, false, null));
+            boolean quiet = got.isEmpty();
+            CuriosityPort.TurnFlight.Call used = f.adopt("A", 7);
+            CuriosityPort.TurnFlight.Call b = f.speculate("B");
+            CuriosityPort.TurnFlight.Call other = f.adopt("C", 8);
+            f.whole(b, CuriosityPort.Turn.line("Never.", "", null, false, false, null));
+            CuriosityPort.TurnFlight.Call afterDiscard = f.adopt("B", 9);
+            check(n, a != null && again == null && quiet && used == a && other == null && afterDiscard == null
+                            && got.equals(java.util.Arrays.asList("7:Hi.")),
+                    "again=" + again + " used=" + used + " other=" + other + " got=" + got);
+        });
+        scenario("turn_flight_the_early_line_goes_first_and_its_notes_follow_as_late_notes", n -> {
+            List<String> got = new ArrayList<String>();
+            CuriosityPort.TurnFlight f = new CuriosityPort.TurnFlight((g, t) -> got.add(g + ":" + t.line + ":" + t.notesUpdate));
+            CuriosityPort.TurnFlight.Call s = f.speculate("A");
+            f.early(s, CuriosityPort.Turn.line("Hi.", "", null, false, false, null));
+            boolean quietBefore = got.isEmpty();
+            f.adopt("A", 3);
+            boolean pending = f.tailPending();
+            f.whole(s, CuriosityPort.Turn.line("Hi.", "", null, false, false, "{\"topics\":[\"x\"]}"));
+            String late = f.lateNotes();
+            CuriosityPort.TurnFlight.Call c = f.start("Z", 4);
+            f.early(c, CuriosityPort.Turn.line("Yo.", "", null, false, false, null));
+            f.whole(c, CuriosityPort.Turn.failed());
+            check(n, quietBefore && pending && !f.tailPending() && "{\"topics\":[\"x\"]}".equals(late)
+                            && f.lateNotes() == null && got.equals(java.util.Arrays.asList("3:Hi.:null", "4:Yo.:null")),
+                    "got=" + got + " late=" + late + " pending=" + pending);
+        });
+        scenario("turn_flight_a_re_request_drops_the_rejected_replys_late_notes", n -> {
+            List<String> got = new ArrayList<String>();
+            CuriosityPort.TurnFlight f = new CuriosityPort.TurnFlight((g, t) -> got.add(g + ":" + t.line));
+            CuriosityPort.TurnFlight.Call first = f.start("A", 1);
+            f.early(first, CuriosityPort.Turn.line("Again?", "Again?", null, false, false, null));
+            CuriosityPort.TurnFlight.Call again = f.start("A+avoid", 2);
+            f.whole(first, CuriosityPort.Turn.line("Again?", "Again?", null, false, false, "{\"questions_asked\":[\"Again?\"]}"));
+            f.whole(again, CuriosityPort.Turn.line("New.", "", null, false, false, "{\"topics\":[\"y\"]}"));
+            check(n, f.lateNotes() == null && got.equals(java.util.Arrays.asList("1:Again?", "2:New.")),
+                    "got=" + got);
+        });
+        scenario("turn_flight_a_turn_no_longer_asked_takes_no_line_and_no_late_notes", n -> {
+            List<String> got = new ArrayList<String>();
+            CuriosityPort.TurnFlight f = new CuriosityPort.TurnFlight((g, t) -> false);
+            CuriosityPort.TurnFlight.Call c = f.start("A", 5);
+            f.early(c, CuriosityPort.Turn.line("Hi.", "", null, false, false, null));
+            f.whole(c, CuriosityPort.Turn.line("Hi.", "", null, false, false, "{\"topics\":[\"x\"]}"));
+            check(n, f.lateNotes() == null && !f.tailPending(), "late notes for a dead turn");
         });
         scenario("chat_a_silent_listen_is_still_the_first_unanswered_listen_at_4_s", n -> {
             Rig rig = sarahRig(true);
@@ -14857,4 +15530,269 @@ public final class ExploreBrainHarness {
         });
     }
 
+    // ---- the navigation log (2026-10-02): one compact line per forward leg, ids on escapes
+    // and seeks, why on measured turns, and the top-level mode. The coding agent reads these
+    // (scripts/nav-report.py); the robot never does. ----
+
+    /** The rig's wall clock at its time 0 (epoch ms), so a leg's look=<wall ms> is exact. */
+    static final long WALL0 = 1790887000000L;
+
+    /** The whole leg line: every field, in order, numbers and fixed words only. */
+    private static final java.util.regex.Pattern LEG_LINE = java.util.regex.Pattern.compile(
+            "leg: id=\\d+ src=(steer|door|around|seek|blind|retry) side=[LRS] bend=\\d+ open=(-|\\d\\.\\d\\d)"
+                    + " best=(-|\\d\\.\\d\\d) conf=(-|\\d\\.\\d\\d) nov=(-|\\d\\.\\d\\d) look=(-|\\d+) lookAge=(-|\\d+)"
+                    + " plan=\\d+t sent=\\d+t L=(-|-?\\d+) R=(-|-?\\d+) ms=\\d+ hdg=(-|\\d+>\\d+)"
+                    + " end=(done|camera|reaim|cpl|cpl_retry_ok|obstacle|edge|stall|nowhere|cue|person|eyes|bath|dock|stop|other)"
+                    + " tofMin=(-|\\d+) cpl=\\d+ hiccups=\\d+");
+
+    /** A traced "<t> <prefix> k=v k=v" note as its fields, with "t" its time; null when it is not one. */
+    private static java.util.Map<String, String> fields(String traced, String prefix) {
+        int sp = traced.indexOf(' ');
+        if (!traced.startsWith(prefix, sp + 1)) {
+            return null;
+        }
+        java.util.Map<String, String> m = new java.util.LinkedHashMap<String, String>();
+        m.put("t", traced.substring(0, sp));
+        for (String kv : traced.substring(sp + 1 + prefix.length()).trim().split(" ")) {
+            int eq = kv.indexOf('=');
+            if (eq > 0) {
+                m.put(kv.substring(0, eq), kv.substring(eq + 1));
+            }
+        }
+        return m;
+    }
+
+    private static List<java.util.Map<String, String>> legNotes(List<String> notes) {
+        List<java.util.Map<String, String>> out = new ArrayList<java.util.Map<String, String>>();
+        for (String x : notes) {
+            java.util.Map<String, String> m = fields(x, "leg: ");
+            if (m != null) {
+                out.add(m);
+            }
+        }
+        return out;
+    }
+
+    /** Every leg note is the whole, exact format; the offenders. */
+    private static List<String> badLegLines(List<String> notes) {
+        List<String> out = new ArrayList<String>();
+        for (String x : notes) {
+            String msg = x.substring(x.indexOf(' ') + 1);
+            if (msg.startsWith("leg:") && !LEG_LINE.matcher(msg).matches()) {
+                out.add(msg);
+            }
+        }
+        return out;
+    }
+
+    /** The mode notes in order; true when no two in a row are the same (a note only on a change). */
+    private static List<String> modes(List<String> notes) {
+        List<String> out = new ArrayList<String>();
+        for (String x : notes) {
+            String msg = x.substring(x.indexOf(' ') + 1);
+            if (msg.startsWith("mode: ")) {
+                out.add(msg.substring(6));
+            }
+        }
+        return out;
+    }
+
+    private static boolean noRepeats(List<String> xs) {
+        for (int i = 1; i < xs.size(); i++) {
+            if (xs.get(i).equals(xs.get(i - 1))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String lastNotes(List<String> notes) {
+        return notes.subList(Math.max(0, notes.size() - 25), notes.size()).toString();
+    }
+
+    private static void navLogScenarios() {
+        scenario("navlog_every_hop_ends_with_one_leg_line_of_its_decision_ticks_counts_heading_and_frame", n -> {
+            // Right open, left closed: each decision bends right and drives a leg.
+            Rig rig = navRig(navTuning().gyro(robotGyro()), CLEAR, (r, t) -> prof(0.9f, 0.1f, 0.4f, 0.9f));
+            rig.simWheels = true;
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(20000);
+            // Only legs that have ended (a stop after their hops) are logged.
+            List<Integer> ticks = legs(rig);
+            if (rig.brain.state() == ExploreBrain.State.HOP && !ticks.isEmpty()) {
+                ticks.remove(ticks.size() - 1);
+            }
+            List<java.util.Map<String, String>> legs = legNotes(notes);
+            boolean each = legs.size() == ticks.size() && legs.size() >= 2;
+            for (int i = 0; each && i < legs.size(); i++) {
+                java.util.Map<String, String> g = legs.get(i);
+                long look = g.get("look").equals("-") ? -1 : Long.parseLong(g.get("look"));
+                each = g.get("id").equals(String.valueOf(i + 1)) && g.get("sent").equals(ticks.get(i) + "t")
+                        && g.get("plan").equals("8t") && g.get("src").equals("steer") && g.get("side").equals("R")
+                        && Integer.parseInt(g.get("bend")) > 0 && g.get("open").equals("0.90")
+                        && g.get("best").equals("0.90") && g.get("conf").equals("0.90")
+                        && look > WALL0 && rig.lookHeadings.containsKey(look - WALL0)
+                        && Long.parseLong(g.get("lookAge")) >= 0 && g.get("end").equals("done")
+                        && Long.parseLong(g.get("L")) >= 150 && g.get("L").equals(g.get("R"))
+                        && Long.parseLong(g.get("ms")) >= 1900 && g.get("hdg").matches("\\d+>\\d+")
+                        && Integer.parseInt(g.get("tofMin")) >= 300 && Integer.parseInt(g.get("tofMin")) <= 306
+                        && g.get("cpl").equals("0") && g.get("hiccups").equals("0");
+            }
+            // The line comes at the leg's own stop.
+            boolean atStop = !legs.isEmpty() && rig.timeOf(rig.firstAfter("stop", rig.timeOf(rig.first("hop", 0))))
+                    == Long.parseLong(legs.get(0).get("t"));
+            List<String> m = modes(notes);
+            boolean turnWhy = false;
+            for (String x : notes) {
+                turnWhy |= x.matches("\\d+ measured turn: asked \\d+ deg, turned -?\\d+ deg, overshoot -?\\d+ deg why=roam");
+            }
+            check(n, each && atStop && badLegLines(notes).isEmpty() && !m.isEmpty() && m.get(m.size() - 1).equals("ROAM")
+                            && noRepeats(m) && turnWhy && rig.violations.isEmpty(),
+                    "ticks=" + ticks + " legs=" + legs + " bad=" + badLegLines(notes) + " modes=" + m + " "
+                            + lastNotes(notes));
+        });
+        scenario("navlog_a_leg_whose_wheels_never_moved_ends_nowhere_and_a_long_one_ends_stall", n -> {
+            Rig shortRig = navRig(navTuning().gyro(robotGyro()).hopTicks(3), CLEAR, (r, t) -> prof(0.9f, 0.9f, 0.9f, 0.9f));
+            shortRig.simWheels = true;
+            shortRig.blockedFrom = 0;
+            shortRig.creepPer100 = 0;
+            List<String> notes = traced(shortRig);
+            shortRig.started();
+            shortRig.runUntil(4000);
+            Rig longRig = navRig(navTuning().gyro(robotGyro()), CLEAR, (r, t) -> prof(0.9f, 0.9f, 0.9f, 0.9f));
+            longRig.simWheels = true;
+            longRig.blockedFrom = 0;
+            longRig.creepPer100 = 0;
+            List<String> notes2 = traced(longRig);
+            longRig.started();
+            longRig.runUntil(5000);
+            List<java.util.Map<String, String>> a = legNotes(notes);
+            List<java.util.Map<String, String>> b = legNotes(notes2);
+            check(n, !a.isEmpty() && a.get(0).get("end").equals("nowhere") && a.get(0).get("L").equals("0")
+                            && a.get(0).get("R").equals("0") && !b.isEmpty() && b.get(0).get("end").equals("stall")
+                            && badLegLines(notes).isEmpty() && badLegLines(notes2).isEmpty(),
+                    "short=" + a + " long=" + b + " " + lastNotes(notes2));
+        });
+        scenario("navlog_a_cpl_hiccup_ends_its_leg_cpl_and_the_retry_leg_ends_cpl_retry_ok_or_cpl", n -> {
+            Rig ok = new Rig(tuning().hopTicks(8).build(), t -> t == 1600 ? cpl2(t) : clear(t));
+            List<String> notes = traced(ok);
+            ok.started();
+            ok.runUntil(4000);
+            Rig again = new Rig(tuning().hopTicks(8).build(), t -> t == 1600 || t == 2100 ? cpl2(t) : clear(t));
+            List<String> notes2 = traced(again);
+            again.started();
+            again.runUntil(4000);
+            List<java.util.Map<String, String>> a = legNotes(notes);
+            List<java.util.Map<String, String>> b = legNotes(notes2);
+            check(n, a.size() >= 2 && a.get(0).get("end").equals("cpl") && a.get(0).get("hiccups").equals("1")
+                            && a.get(0).get("cpl").equals("0") && a.get(0).get("look").equals("-")
+                            && a.get(0).get("L").equals("-") && a.get(0).get("hdg").equals("-")
+                            && a.get(1).get("src").equals("retry") && a.get(1).get("end").equals("cpl_retry_ok")
+                            && a.get(1).get("plan").equals(a.get(1).get("sent"))
+                            && b.size() >= 2 && b.get(1).get("src").equals("retry") && b.get(1).get("end").equals("cpl")
+                            && b.get(1).get("cpl").equals("1") && b.get(1).get("hiccups").equals("0")
+                            && badLegLines(notes).isEmpty() && badLegLines(notes2).isEmpty(),
+                    "ok=" + a + " again=" + b + " " + lastNotes(notes2));
+        });
+        scenario("navlog_an_escape_has_an_id_from_start_to_end_and_its_turns_say_why", n -> {
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning(), h, bumps(h, 3), null);
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 120000, r -> notedAt(notes, "free after") >= 0);
+            rig.runUntil(rig.now + 100);
+            java.util.Map<String, String> start = null;
+            java.util.Map<String, String> end = null;
+            for (String x : notes) {
+                start = start == null ? fields(x, "escape#1 start ") : start;
+                end = end == null ? fields(x, "escape#1 end ") : end;
+            }
+            String free = firstNote(notes, "free after ");
+            long freeMs = free == null ? -1 : Long.parseLong(free.split(" ")[3]);
+            boolean obstacleLeg = false;
+            for (java.util.Map<String, String> g : legNotes(notes)) {
+                obstacleLeg |= g.get("end").equals("obstacle");
+            }
+            boolean escTurn = false;
+            for (String x : notes) {
+                escTurn |= x.contains("measured turn: ") && x.endsWith(" why=escape");
+            }
+            List<String> m = modes(notes);
+            check(n, start != null && start.get("trigger").equals("wedged") && end != null
+                            && end.get("outcome").equals("freed") && Long.parseLong(end.get("ms")) == freeMs
+                            && Long.parseLong(end.get("t")) == notedAt(notes, "free after")
+                            && obstacleLeg && escTurn && m.contains("ESCAPE") && noRepeats(m)
+                            && badLegLines(notes).isEmpty() && rig.violations.isEmpty(),
+                    "start=" + start + " end=" + end + " free=" + free + " modes=" + m + " " + lastNotes(notes));
+        });
+        scenario("navlog_a_seek_has_an_id_from_start_to_end_and_its_legs_and_turns_say_seek", n -> {
+            Rig rig = seekRig(seekTuning(), (r, t) -> scene(1), (r, req, k) -> CuriosityPort.WayOut.way(1, 0f));
+            List<String> notes = traced(rig);
+            rig.started();
+            runUntil(rig, 400000, r -> notedAt(notes, "seeking: gave up") >= 0 || notedAt(notes, "seeking: arrived") >= 0);
+            rig.runUntil(rig.now + 100);
+            java.util.Map<String, String> start = null;
+            java.util.Map<String, String> end = null;
+            for (String x : notes) {
+                start = start == null ? fields(x, "seek#1 start ") : start;
+                end = end == null ? fields(x, "seek#1 end ") : end;
+            }
+            boolean seekLeg = false;
+            for (java.util.Map<String, String> g : legNotes(notes)) {
+                seekLeg |= g.get("src").equals("seek");
+            }
+            boolean seekTurn = false;
+            boolean scanTurn = false;
+            for (String x : notes) {
+                seekTurn |= x.contains("measured turn: ") && x.endsWith(" why=seek");
+                scanTurn |= x.contains("measured turn: ") && x.endsWith(" why=scan");
+            }
+            long t0 = start == null ? -1 : Long.parseLong(start.get("t"));
+            long t1 = end == null ? -1 : Long.parseLong(end.get("t"));
+            check(n, start != null && start.get("trigger").equals("familiar") && end != null
+                            && (end.get("outcome").equals("gave_up") || end.get("outcome").equals("arrived"))
+                            && Long.parseLong(end.get("ms")) == t1 - t0 && seekLeg && seekTurn && scanTurn
+                            && badLegLines(notes).isEmpty() && rig.violations.isEmpty(),
+                    "start=" + start + " end=" + end + " seekLeg=" + seekLeg + " seekTurn=" + seekTurn + " scanTurn="
+                            + scanTurn + " " + lastNotes(notes));
+        });
+        scenario("navlog_bathroom_privacy_legs_are_logged_without_their_frame", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning(), TOILET_ONCE, notes);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)") >= 0);
+            long on = notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)");
+            runUntil(rig, 180000, r -> notedAt(notes, "bathroom: out; avoiding that area for 3 h") >= 0);
+            long out = notedAt(notes, "bathroom: out; avoiding that area for 3 h");
+            int before = 0;
+            int inside = 0;
+            boolean hidden = true;
+            for (java.util.Map<String, String> g : legNotes(notes)) {
+                long t = Long.parseLong(g.get("t"));
+                if (t < on) {
+                    before += g.get("look").equals("-") ? 0 : 1;
+                } else if (t < out) {
+                    inside++;
+                    hidden &= g.get("look").equals("-") && g.get("lookAge").equals("-");
+                }
+            }
+            String esc = firstNote(notes, "escape#1 start ");
+            check(n, on > 0 && out > on && before > 0 && inside >= 2 && hidden && esc != null
+                            && esc.endsWith("trigger=bathroom") && badLegLines(notes).isEmpty() && rig.violations.isEmpty(),
+                    "on@" + on + " out@" + out + " before=" + before + " inside=" + inside + " hidden=" + hidden
+                            + " esc=" + esc + " legs=" + legNotes(notes));
+        });
+        scenario("navlog_mode_notes_only_on_a_change_eyes_only_docked_and_roam", n -> {
+            Rig rig = cueRig(cueTuning(), t -> t < 60000 ? charger(t) : clear(t), EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(90000);
+            List<String> m = modes(notes);
+            int docked = m.indexOf("DOCKED");
+            check(n, !m.isEmpty() && m.get(0).equals("EYES_ONLY") && docked > 0 && m.lastIndexOf("ROAM") > docked
+                            && noRepeats(m) && rig.violations.isEmpty(),
+                    "modes=" + m + " " + lastNotes(notes));
+        });
+    }
 }

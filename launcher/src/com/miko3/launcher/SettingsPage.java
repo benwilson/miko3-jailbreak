@@ -121,6 +121,10 @@ final class SettingsPage {
     static final String FACE_NOT_A_NUMBER = "Not saved: every face threshold must be a number.";
     static final String FACE_THRESHOLDS_LOOPBACK_ONLY = "Face thresholds can only be set from the robot itself "
             + "(scripts/robot-faces.py over adb).";
+    // Owner 2026-10-02: the feedback log.
+    static final String FEEDBACK_EMPTY = "No feedback yet.";
+    static final String FEEDBACK_CLEARED = "Feedback log cleared.";
+
     /** What the photo route answers for a slot whose photo was replaced or deleted. */
     static final String REPLACED_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"112\" height=\"112\" "
             + "viewBox=\"0 0 112 112\"><rect width=\"112\" height=\"112\" fill=\"#ddd\"/>"
@@ -177,6 +181,10 @@ final class SettingsPage {
         }
         if (LauncherProtocol.SETTINGS_FACE_STATE_PATH.equals(req.path)) {
             sendFaceState(req, res, token, settings, people, checks);
+            return;
+        }
+        if (LauncherProtocol.SETTINGS_FEEDBACK_STATE_PATH.equals(req.path)) {
+            sendFeedbackState(req, res, token, people);
             return;
         }
         // The thresholds save (KTD5) is loopback-only, checked before the body is read.
@@ -236,6 +244,10 @@ final class SettingsPage {
         }
         if (LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH.equals(path)) {
             return saveFace(form, settings);
+        }
+        if (LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH.equals(path)) {
+            people.feedback().clear();
+            return FEEDBACK_CLEARED;
         }
         return "Nothing changed: unknown action.";
     }
@@ -403,6 +415,39 @@ final class SettingsPage {
         }
         res.sendText(200, "OK", "application/json; charset=utf-8",
                 faceStateJson(settings.faceSettings(), people, checks) + "\n");
+    }
+
+    /**
+     * The feedback log as JSON for scripts/pull-feedback.py (owner 2026-10-02):
+     * the entries newest first, never a person's id. POST with the page token
+     * in the body; 403 without it.
+     */
+    private static void sendFeedbackState(HttpRequest req, HttpResponse res, PageToken token, PeopleStore people)
+            throws IOException {
+        Map<String, String> form = readForm(req);
+        if (form == null || !token.check(form.get("t"))) {
+            res.sendText(403, "Forbidden", "text/plain; charset=utf-8", "page token missing or expired\n");
+            return;
+        }
+        res.sendText(200, "OK", "application/json; charset=utf-8", feedbackJson(people.feedback()) + "\n");
+    }
+
+    static String feedbackJson(FeedbackStore log) {
+        List<Object> rows = new ArrayList<Object>();
+        for (FeedbackStore.Entry e : log.newestFirst()) {
+            Map<String, Object> row = new LinkedHashMap<String, Object>();
+            row.put("at", e.atMillis);
+            row.put("kind", e.kind);
+            row.put("summary", e.summary);
+            row.put("quote", e.quote);
+            row.put("who", e.who);
+            row.put("context", e.context);
+            rows.add(row);
+        }
+        Map<String, Object> root = new LinkedHashMap<String, Object>();
+        root.put("max", FeedbackStore.MAX_ENTRIES);
+        root.put("entries", rows);
+        return Json.write(root);
     }
 
     static String faceStateJson(FaceSettings f, PeopleStore store, FaceChecks checks) {
@@ -650,6 +695,7 @@ final class SettingsPage {
         appendFaceChecks(html, people, checks);
         appendThresholds(html, face);
         appendPeople(html, t, people);
+        appendFeedback(html, t, people.feedback());
 
         html.append("</main></body></html>");
         return html.toString();
@@ -727,6 +773,42 @@ final class SettingsPage {
             html.append("<input type=\"hidden\" name=\"id\" value=\"").append(id).append("\">");
             html.append("<button type=\"submit\" class=\"contrast\">Forget</button></form>");
             html.append("</article>");
+        }
+        html.append("</section>");
+    }
+
+    /**
+     * Owner 2026-10-02: what people told the robot about himself, newest first:
+     * when, the kind, who (a first name or "someone"), the context, the summary
+     * and their quoted words, all escaped (the model and people wrote them).
+     * Never a person's id. A token-only Clear button empties the log.
+     */
+    private static void appendFeedback(StringBuilder html, String t, FeedbackStore log) {
+        List<FeedbackStore.Entry> entries = log.newestFirst();
+        html.append("<section id=\"feedback\"><h2>Feedback from conversations</h2>");
+        html.append("<p>Suggestions, complaints, praise and bugs people told the robot about himself, newest first: ")
+                .append(entries.size()).append(entries.size() == 1 ? " entry" : " entries").append(" (at most ")
+                .append(FeedbackStore.MAX_ENTRIES).append("; the oldest go first). Only their key sentence is kept, "
+                + "never the conversation. Forgetting a person deletes their entries.</p>");
+        if (entries.isEmpty()) {
+            html.append("<p id=\"feedback-empty\">").append(FEEDBACK_EMPTY).append("</p>");
+        }
+        for (FeedbackStore.Entry e : entries) {
+            html.append("<article class=\"feedback\">");
+            html.append("<p><strong>").append(escapeHtml(e.kind)).append("</strong> from ")
+                    .append(escapeHtml(e.who));
+            if (!e.context.isEmpty()) {
+                html.append(", ").append(escapeHtml(e.context));
+            }
+            html.append("<br><small>").append(escapeHtml(lastSeen(e.atMillis))).append("</small></p>");
+            html.append("<p>").append(escapeHtml(e.summary)).append("</p>");
+            if (!e.quote.isEmpty()) {
+                html.append("<blockquote>\u201c").append(escapeHtml(e.quote)).append("\u201d</blockquote>");
+            }
+            html.append("</article>");
+        }
+        if (!entries.isEmpty()) {
+            tokenForm(html, t, LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, "Clear the feedback log", "contrast");
         }
         html.append("</section>");
     }

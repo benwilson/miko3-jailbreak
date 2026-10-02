@@ -216,7 +216,27 @@ final class ClaudeReplies {
         String notes = notesUpdateJson == null || notesUpdateJson.trim().isEmpty() || "{}".equals(notesUpdateJson.trim())
                 ? null : notesUpdateJson;
         return CuriosityPort.Turn.line(line, text(json.get("question_asked")), text(json.get("name_given")),
-                Boolean.TRUE.equals(json.get("ends_conversation")), Boolean.TRUE.equals(json.get("deflected")), notes);
+                Boolean.TRUE.equals(json.get("ends_conversation")), Boolean.TRUE.equals(json.get("deflected")), notes)
+                .withFeedback(feedback(json.get("feedback")));
+    }
+
+    /**
+     * Owner 2026-10-02: the turn's "feedback" field, an object with string kind, summary
+     * and quote, or null. JSON null, the kind "none", an empty summary or anything
+     * malformed is no feedback; the line goes on either way.
+     */
+    static CuriosityPort.Feedback feedback(Object v) {
+        if (!(v instanceof Map)) {
+            return null;
+        }
+        Map<?, ?> m = (Map<?, ?>) v;
+        Object kind = m.get("kind");
+        Object summary = m.get("summary");
+        Object quote = m.get("quote");
+        if (!(kind instanceof String) || !(summary instanceof String) || quote != null && !(quote instanceof String)) {
+            return null;
+        }
+        return CuriosityPort.Feedback.of((String) kind, (String) summary, (String) quote);
     }
 
     /** Claude's named line with the stored name put in (the robot's side of KTD7: names are never sent). */

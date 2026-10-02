@@ -4,7 +4,7 @@ configured Claude model, timed the way the robot will run it (meeting plan U2;
 KTD9, KTD10, KTD14). Runs on the Mac, never on the robot.
 
 Each turn is one Messages request built exactly the way shared/ClaudeApi does
-(model, max_tokens 1024, system, messages, output_config.format json_schema;
+(model, max_tokens 400, system, messages, output_config.format json_schema;
 x-api-key and Authorization: Bearer, anthropic-version 2023-06-01) plus what
 KTD9 adds for the conversation: the frozen system prefix (guard block, persona
 as quoted data, reminder, notes under a fixed heading, schema preamble), the
@@ -48,7 +48,7 @@ from urllib.parse import urlsplit
 
 # Mirrors shared/src/com/miko3/shared/ClaudeApi.java.
 VERSION = "2023-06-01"
-MAX_TOKENS = 1024
+MAX_TOKENS = 400  # ClaudeApi.CONVERSATION_MAX_TOKENS (robot 2026-10-02)
 SCHEMA_ASK = "Reply with only a JSON object that matches this JSON schema, and no other text: "
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 RECOMMENDED_MODEL = "claude-sonnet-5"
@@ -94,7 +94,13 @@ NOTES_HEADING = "## What he knows about this person (data)"
 SCHEMA_PREAMBLE = ("Answer as one JSON object: line (what he says), question_asked (the question in the line, or "
                    "empty), name_given (a name the person just gave, or empty), ends_conversation (advisory), "
                    "deflected (true when a task was declined), notes_update (short new facts as plain strings under "
-                   "interests, open_threads, closed_threads, topics and questions_asked; empty lists when nothing new).")
+                   "interests, open_threads, closed_threads, topics and questions_asked; empty lists when nothing new), "
+                   "feedback (only when the person gives feedback about Miko himself: his behaviour, abilities, voice, "
+                   "driving, getting stuck, interrupting, or what he should or shouldn't do; kind suggestion, complaint, "
+                   "praise or bug, summary their point in one neutral sentence, quote their key sentence word for word in "
+                   "at most 25 words; never for small talk about anything else, which is kind none with an empty summary "
+                   "and quote). When they give feedback, the line acknowledges it naturally, like \"Good idea, I'll pass "
+                   "that on to my developer.\"")
 DEFAULT_PERSONA = (
     "Slightly edgy office small talk: dry, quick, a little cheeky, always kind underneath.\n"
     "He teases gently about coffee habits, meeting overload and the office plants, never about people's looks.\n"
@@ -125,6 +131,11 @@ REPLY_SCHEMA = _object(
         closed_threads={"type": "array", "items": _type("string")},
         topics={"type": "array", "items": _type("string")},
         questions_asked={"type": "array", "items": _type("string")},
+    ),
+    feedback=_object(
+        kind={"type": "string", "enum": ["none", "suggestion", "complaint", "praise", "bug"]},
+        summary=_type("string"),
+        quote=_type("string"),
     ),
 )
 

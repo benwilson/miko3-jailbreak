@@ -115,11 +115,24 @@ public interface RobotEars extends IInterface {
          */
         void answerOver(long at) throws RemoteException;
 
+        /**
+         * Robot 2026-10-02: the open conversation listen's answer so far, its segments
+         * joined, sent each time the recogniser endpoints inside it with new words (about
+         * 0.8 s after the last word) while the 2 s silence rule still runs; at is when its
+         * speech began. The answer itself still comes by heard(); this lets the mode start
+         * its turn early and use it only if the words are the same. Appended as its own
+         * code (4), one-way, handled exactly like codes 2 and 3: an older mode's Stub has
+         * no case for it (onTransact returns false, which a one-way sender never sees);
+         * a newer mode under an older launcher never receives it and asks as before.
+         */
+        void provisional(long at, String text) throws RemoteException;
+
         abstract class Stub extends Binder implements Callback {
             private static final String DESCRIPTOR = "com.miko3.shared.RobotEars.Callback";
             static final int TRANSACTION_heard = 1;
             static final int TRANSACTION_answering = 2;
             static final int TRANSACTION_answerOver = 3;
+            static final int TRANSACTION_provisional = 4;
 
             public Stub() {
                 attachInterface(this, DESCRIPTOR);
@@ -166,6 +179,12 @@ public interface RobotEars extends IInterface {
                     case TRANSACTION_answerOver: {
                         data.enforceInterface(DESCRIPTOR);
                         answerOver(data.readLong());
+                        return true;
+                    }
+                    case TRANSACTION_provisional: {
+                        data.enforceInterface(DESCRIPTOR);
+                        long at = data.readLong();
+                        provisional(at, data.readString());
                         return true;
                     }
                     case IBinder.INTERFACE_TRANSACTION:
@@ -231,6 +250,20 @@ public interface RobotEars extends IInterface {
                         data.writeInterfaceToken(DESCRIPTOR);
                         data.writeLong(at);
                         remote.transact(TRANSACTION_answerOver, data, null, IBinder.FLAG_ONEWAY);
+                    } finally {
+                        data.recycle();
+                    }
+                }
+
+                /** One-way, like answering(). */
+                @Override
+                public void provisional(long at, String text) throws RemoteException {
+                    Parcel data = Parcel.obtain();
+                    try {
+                        data.writeInterfaceToken(DESCRIPTOR);
+                        data.writeLong(at);
+                        data.writeString(text);
+                        remote.transact(TRANSACTION_provisional, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();
                     }

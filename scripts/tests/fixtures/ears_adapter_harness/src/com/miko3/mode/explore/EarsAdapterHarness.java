@@ -40,6 +40,13 @@ public final class EarsAdapterHarness {
         public void answerOver(long at) {
             answerOver.add(at);
         }
+
+        final List<String> provisional = new ArrayList<String>();
+
+        @Override
+        public void provisional(String transcript) {
+            provisional.add(transcript);
+        }
     }
 
     public static void main(String[] args) {
@@ -58,6 +65,8 @@ public final class EarsAdapterHarness {
         run("a_called_end_carries_the_callers_message_and_an_older_launcher_none",
                 EarsAdapterHarness::calledEndCarriesTheMessage);
         run("a_partial_answer_with_words_still_answers_the_armed_reply", EarsAdapterHarness::partialAnswerAnswers);
+        run("a_provisional_answer_goes_to_the_armed_reply_only_and_queues_nothing",
+                EarsAdapterHarness::provisionalGoesToArmedReply);
         System.exit(failures == 0 ? 0 : 1);
     }
 
@@ -299,6 +308,28 @@ public final class EarsAdapterHarness {
         if (!r.answerOver.equals(java.util.Collections.singletonList(1000L)) || !r.heard.isEmpty()
                 || !a.drain().isEmpty()) {
             return "the reply was told over=" + r.answerOver + " heard=" + r.heard;
+        }
+        return null;
+    }
+
+    /** Robot 2026-10-02: the words so far go to the armed reply; never to a retired one, never as a cue. */
+    private static String provisionalGoesToArmedReply() {
+        EarsAdapter a = opened();
+        Recorder r = new Recorder();
+        a.listen(4000, r);
+        a.onAnswering(1000);
+        a.onProvisional(1000, "we went to the beach");
+        a.onHeard("we went to the beach", RobotEars.SIDE_NONE, Float.NaN, RobotEars.TIER_WEAK, 1000, false,
+                RobotEars.KIND_VOICE, false, null);
+        a.onProvisional(1000, "late");
+        Recorder q = new Recorder();
+        a.listen(4000, q);
+        a.listenOver(q);
+        a.onProvisional(2000, "retired");
+        if (!r.provisional.equals(java.util.Collections.singletonList("we went to the beach"))
+                || !r.heard.equals(java.util.Collections.singletonList("we went to the beach"))
+                || !q.provisional.isEmpty() || !a.drain().isEmpty()) {
+            return "provisional=" + r.provisional + " heard=" + r.heard + " retired=" + q.provisional;
         }
         return null;
     }

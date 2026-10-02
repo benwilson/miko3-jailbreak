@@ -208,6 +208,8 @@ final class ChatSession {
     private long listenDeadline;
     /** Robot 2026-10-01: this listen's deadline was moved to the answer hold once already. */
     private boolean answerHeld;
+    /** Robot 2026-10-02: the provisional answer this listen already started a turn on (or passed over), or null. */
+    private String speculated;
     private long lookFrom;
     private long lookDeadline;
     private ExploreBrain.Direction newcomerSide;
@@ -375,6 +377,14 @@ final class ChatSession {
     }
 
     private void open(CuriosityPort.MatchAnswer a, boolean faceless, boolean checkOpen, String settled) {
+        // Robot 2026-10-02: a late notes update left over from another conversation is never this one's.
+        while (port.lateNotes() != null) {
+            // dropped
+        }
+        // Owner 2026-10-02: so is late feedback; whoever gave it, it is not this person's.
+        while (port.lateFeedback() != null) {
+            // dropped
+        }
         this.checkOpen = checkOpen;
         this.settledName = settled;
         startedOnCharger = host.charger();
@@ -399,6 +409,22 @@ final class ChatSession {
                 + asked.size() + " questions on record)");
     }
 
+    /**
+     * Owner 2026-10-02: feedback about the robot goes to the launcher's feedback log, from
+     * the stored person he is talking to (null: someone unknown, logged as "someone"),
+     * with a few words of where it happened. Only the feedback: never a line or a transcript.
+     */
+    private void passOn(CuriosityPort.Feedback f) {
+        port.feedback(personId, f, feedbackContext());
+        host.note("feedback (" + f.kind + ") passed on to the feedback log");
+    }
+
+    /** Where the feedback was given, in a few plain words. */
+    private String feedbackContext() {
+        String where = called ? "in a call's conversation" : "in a conversation";
+        return startedOnCharger || host.charger() ? where + ", while docked" : where;
+    }
+
     /** One brain tick in a CHAT state. */
     void step(long now) {
         if (finished) {
@@ -407,6 +433,14 @@ final class ChatSession {
         if (host.charger() && !endOnCharger && !startedOnCharger) {
             endOnCharger = true;
             host.note("charger connected: the conversation finishes and no resume leg is driven");
+        }
+        // Robot 2026-10-02: a streamed turn's notes, which came after its line, join the buffer.
+        for (String late = port.lateNotes(); late != null; late = port.lateNotes()) {
+            buffer.add(late);
+        }
+        // Owner 2026-10-02: and its feedback about him is passed on, after its line went.
+        for (CuriosityPort.Feedback late = port.lateFeedback(); late != null; late = port.lateFeedback()) {
+            passOn(late);
         }
         keepStep(now);
         photoStep(now);
@@ -424,7 +458,7 @@ final class ChatSession {
                 break;
             case CHAT_NOTES:
                 if (!deltaInFlight && !keepPending && !photoPending && !heldResolving && !faceMatching
-                        && (!persistWanted || buffer.isEmpty() || personId == null)) {
+                        && !port.turnTailPending() && (!persistWanted || buffer.isEmpty() || personId == null)) {
                     finished = true;
                     host.note("conversation over after " + turns + " turn(s), " + persisted + " note delta(s) kept");
                 }
@@ -459,8 +493,7 @@ final class ChatSession {
         heard = heardText;
         attempt = 1;
         reRequested = false;
-        request = new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
-                .face(openedFaceless, faceSeen && name == null).call(called, cantSeeDue);
+        request = turnRequest(heardText);
         cantSeeDue = false;
         turnHeld = false;
         secSaid = false;
@@ -502,6 +535,33 @@ final class ChatSession {
         turnHeld = false;
         turnDeadline = now + budget;
         port.turn(request, budget);
+    }
+
+    /** The turn request for what was heard, as it stands now; building it changes nothing. */
+    private CuriosityPort.TurnRequest turnRequest(String heardText) {
+        return new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
+                .face(openedFaceless, faceSeen && name == null).call(called, cantSeeDue);
+    }
+
+    /**
+     * Robot 2026-10-02: the launcher's provisional answer (its recogniser endpointed inside
+     * the answer, about 0.8 s after the last word) starts the turn the final answer would
+     * ask for, while the 2 s silence rule still runs. Only words that would go straight to
+     * a turn qualify (no goodbye, forget-me, last name or forget confirmation), each once.
+     * The port uses it only if the final answer makes exactly the same request; its line is
+     * never spoken before that.
+     */
+    private void speculate(String words) {
+        String text = words == null ? "" : words.trim();
+        if (text.isEmpty() || text.equals(speculated)) {
+            return;
+        }
+        speculated = text;
+        if (askingLastName || confirmingForget || endOnCharger || goodbye(text) || forgetMe(text)) {
+            return;
+        }
+        host.note("a provisional answer: its turn starts early");
+        port.speculateTurn(turnRequest(text), tuning.turnBudgetMs);
     }
 
     /** The transcript window (KTD9): the last transcriptWindow exchanges, oldest dropped first. */
@@ -612,6 +672,9 @@ final class ChatSession {
         }
         if (t.notesUpdate != null && !t.notesUpdate.trim().isEmpty()) {
             buffer.add(t.notesUpdate);
+        }
+        if (t.feedback != null) {
+            passOn(t.feedback);
         }
         if (t.deflected) {
             host.note("the line deflects a task");
@@ -1234,6 +1297,7 @@ final class ChatSession {
         listenStartedAt = now;
         listenDeadline = now + tuning.unansweredListenMs;
         answerHeld = false;
+        speculated = null;
         port.chatListen(tuning.unansweredListenMs, tuning.newcomerAngleDeg);
     }
 
@@ -1250,6 +1314,9 @@ final class ChatSession {
                         && !h.text.trim().isEmpty()) {
                     onHeard(now, h.text.trim());
                     return;
+                }
+                if (h == null) {
+                    speculate(port.provisional());
                 }
                 if (answerHeld && h != null) {
                     // Review P2-2: the held answer ended without words (the launcher's "answer

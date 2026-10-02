@@ -67,6 +67,8 @@ class EarsAdapterHarnessTest(unittest.TestCase):
         "a_called_end_carries_the_callers_message_and_an_older_launcher_none",
         # Robot 2026-10-02: an answer flagged partial (begun as the deaf window closed) still answers.
         "a_partial_answer_with_words_still_answers_the_armed_reply",
+        # Robot 2026-10-02: the launcher's provisional answer (code 4) for a conversation listen.
+        "a_provisional_answer_goes_to_the_armed_reply_only_and_queues_nothing",
     )
 
     @classmethod

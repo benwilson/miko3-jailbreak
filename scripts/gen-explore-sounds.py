@@ -10,7 +10,8 @@ reads as a voice rather than a beep. The idle songs are short original runs of
 voiced syllables (pitch glides, vowel tones, warble and rasp) that he babbles while
 sitting still, in the style of WALL-E's processed-voice babble; they copy none of
 his lines or tunes. The curiosity reactions (curious, thinking, disappointed,
-delighted, puzzled) are the same babble voice, lower. Output is deterministic, so the committed
+delighted, puzzled) are the same babble voice, lower. The bathroom privacy beep
+(react-privacy-1) is a plain two-tone beep, not his voice. Output is deterministic, so the committed
 WAVs can be checked against this script (scripts/tests/test_gen_explore_sounds.py).
 
   python3 scripts/gen-explore-sounds.py            # write mode-explore/assets/
@@ -160,6 +161,19 @@ REACTIONS = (
 )
 REACTION_SEED = 100  # seeds for reactions start here, clear of the songs' seeds
 
+# The bathroom privacy beep (owner 2026-10-02: "if he thinks he's in a bathroom, he beeps
+# every five seconds and tries to escape the bathroom as quickly as possible"). Not his
+# voice: one short, unmistakable two-tone beep, like a reversing truck's but friendlier
+# (rounded tones a fourth apart, soft edges). Written as react-<group>-<n>.wav so the
+# brain plays it through the reaction path. Each beep is a list of
+#   (Hz, seconds, gap after in seconds)
+BEEP_PEAK = 0.6
+BEEPS = (
+    ("privacy", (
+        [(988.0, 0.11, 0.025), (740.0, 0.115, 0.0)],
+    )),
+)
+
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "mode-explore" / "assets"
 
 
@@ -237,6 +251,23 @@ def render_song(syllables, seed):
     return samples
 
 
+def render_beep(tones):
+    """A beep: each tone held steady (fundamental plus a soft third harmonic, rounder than
+    a square wave), with 8 ms raised-cosine edges so there is no click; gaps are silence."""
+    samples = array.array("h")
+    edge = 0.008
+    for hz, dur, gap in tones:
+        n = int(dur * RATE)
+        for i in range(n):
+            t = i / RATE
+            ramp = min(1.0, t / edge, (dur - t) / edge)
+            ramp = 0.5 - 0.5 * math.cos(math.pi * max(0.0, ramp))
+            value = (math.sin(2 * math.pi * hz * t) + 0.2 * math.sin(6 * math.pi * hz * t)) / 1.2
+            samples.append(int(round(value * ramp * BEEP_PEAK * 32767)))
+        samples.extend([0] * int(gap * RATE))
+    return samples
+
+
 def write_wav(path, samples):
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
@@ -246,8 +277,8 @@ def write_wav(path, samples):
 
 
 def generate(out_dir):
-    """Write every startle, then every song, then every reaction into out_dir; returns
-    their paths in that order."""
+    """Write every startle, then every song, then every reaction, then every beep into
+    out_dir; returns their paths in that order."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for name, seconds, start, top, end in VARIANTS:
@@ -265,6 +296,11 @@ def generate(out_dir):
             write_wav(path, render_song(syllables, seed))
             paths.append(path)
             seed += 1
+    for group, variants in BEEPS:
+        for n, tones in enumerate(variants, start=1):
+            path = out_dir / f"react-{group}-{n}.wav"
+            write_wav(path, render_beep(tones))
+            paths.append(path)
     return paths
 
 

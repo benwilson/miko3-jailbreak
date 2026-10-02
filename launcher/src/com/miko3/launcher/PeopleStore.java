@@ -193,6 +193,8 @@ final class PeopleStore {
     private final List<Person> people = new ArrayList<Person>();
     // Each person's MAX_PHOTOS slots; a null slot has no photo.
     private final Map<String, Entry[]> slots = new HashMap<String, Entry[]>();
+    /** What people told him about himself (owner 2026-10-02); forget() deletes a person's entries. */
+    private final FeedbackStore feedback;
 
     PeopleStore(File dir, Clock clock) {
         this(dir, clock, FILE_OPENER);
@@ -203,6 +205,26 @@ final class PeopleStore {
         this.clock = clock;
         this.indexOpener = indexOpener;
         load();
+        this.feedback = new FeedbackStore(new File(dir, FeedbackStore.FILE), clock);
+    }
+
+    /** The feedback log, for the Settings page. */
+    FeedbackStore feedback() {
+        return feedback;
+    }
+
+    /**
+     * Appends feedback from the person with this id, or from someone unknown
+     * (null, an unknown id, or a nameless record): the entry names a known,
+     * named person by first name only, anyone else as "someone", and keeps the
+     * id only for a named person, so forget() can delete it. False for no
+     * feedback or a failed write.
+     */
+    synchronized boolean recordFeedback(String id, com.miko3.shared.Feedback f, String context) {
+        int i = isValidId(id) ? indexOf(id) : -1;
+        String name = i < 0 ? "" : people.get(i).name;
+        boolean named = !name.isEmpty();
+        return feedback.record(f, named ? FeedbackStore.whoOf(name) : FeedbackStore.SOMEONE, named ? id : "", context);
     }
 
     /** True for the only id shape the store ever issues. */
@@ -450,6 +472,7 @@ final class PeopleStore {
             return false;
         }
         remove(id);
+        feedback.purgePerson(id);
         // Index first: once it no longer names them, a failed delete leaves
         // only orphan files, which load() never reads and sweeps away (KTD10).
         saveIndexQuietly();

@@ -412,6 +412,8 @@ public class LauncherApp extends Application {
         server.route(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_FACE_STATE_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_FEEDBACK_STATE_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_EARS_PROBE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {

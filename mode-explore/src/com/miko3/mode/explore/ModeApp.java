@@ -1,6 +1,9 @@
 package com.miko3.mode.explore;
 
 import android.app.Application;
+import android.content.Context;
+import android.media.AudioManager;
+import android.os.SystemClock;
 import android.util.Log;
 
 import com.miko3.shared.HttpRequest;
@@ -9,6 +12,7 @@ import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.ModeRegistry;
 import com.miko3.shared.RoutingHttpServer;
+import com.miko3.shared.VolumeKeys;
 
 import java.io.File;
 import java.io.IOException;
@@ -58,6 +62,12 @@ public class ModeApp extends Application {
     private ClaudeCuriosity curiosity;
     // The launcher's continuous ears as the brain's step input (meeting plan U7, KTD1).
     private EarsAdapter ears;
+
+    // The speaker muted or turned all the way down (owner 2026-10-02): do not disturb.
+    // Set by SpeakerMute on the brain thread; the clip calls read it from any thread.
+    private volatile boolean speakerMuted;
+    /** How often SpeakerMute asks the audio service; a press is noticed within this. */
+    private static final long MUTE_POLL_MS = 250;
 
     /** How often the brain loop runs; well under a hop tick (ExploreBrain.onTick). */
     private static final long BRAIN_TICK_MS = 20;
@@ -200,6 +210,7 @@ public class ModeApp extends Application {
             loop = new ExploreLoop(tuning, ExploreDrive.CLOCK, drive, drive, drive, eyes, sound, camera, curiosity,
                     ears, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
             loop.setGauges(gauges);
+            loop.setMute(new SpeakerMute());
             loop.start();
             Log.i(TAG, "explore started");
         }
@@ -327,7 +338,7 @@ public class ModeApp extends Application {
         @Override
         public void playStartle() {
             ClipPlayer c = clips;
-            if (c != null) {
+            if (c != null && !speakerMuted) {
                 c.playStartle();
             }
         }
@@ -335,7 +346,7 @@ public class ModeApp extends Application {
         @Override
         public void playReaction(String group) {
             ClipPlayer c = clips;
-            if (c != null) {
+            if (c != null && !speakerMuted) {
                 c.playReaction(group);
             }
         }
@@ -343,11 +354,41 @@ public class ModeApp extends Application {
         @Override
         public void playName(String label) {
             ClipPlayer c = clips;
-            if (c != null) {
+            if (c != null && !speakerMuted) {
                 c.playName(label);
             }
         }
     };
+
+    /**
+     * The brain's do-not-disturb (ExploreLoop.Mute): STREAM_MUSIC muted or at zero, which
+     * the volume keys on top set (shared VolumeKeys). Asked of the audio service at most
+     * every MUTE_POLL_MS from the brain thread. Going quiet also cuts off the clip now
+     * playing, so it does not carry on aloud when the speaker comes back.
+     */
+    private final class SpeakerMute implements ExploreLoop.Mute {
+        private final AudioManager audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        private long nextPollMs;
+        private boolean muted;
+
+        @Override
+        public boolean muted() {
+            long now = SystemClock.elapsedRealtime();
+            if (now >= nextPollMs) {
+                nextPollMs = now + MUTE_POLL_MS;
+                boolean m = VolumeKeys.silenced(audio);
+                speakerMuted = m;
+                if (m != muted) {
+                    muted = m;
+                    ClipPlayer c = clips;
+                    if (m && c != null) {
+                        c.hush();
+                    }
+                }
+            }
+            return muted;
+        }
+    }
 
     private final ExploreBrain.Trace trace = new ExploreBrain.Trace() {
         @Override

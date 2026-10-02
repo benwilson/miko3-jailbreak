@@ -44,6 +44,14 @@ public final class ClaudeApi {
     private static final int MAX_PAGES = 20;
     /** Room for a JSON reply of a few short lines; the structured replies are far smaller. */
     private static final int MESSAGES_MAX_TOKENS = 1024;
+    /**
+     * A conversation turn's cap (robot 2026-10-02): two short sentences and the notes
+     * object come to about 90-130 tokens on Haiku 4.5; 400 leaves room for a long notes
+     * update without letting a runaway reply run on.
+     */
+    public static final int CONVERSATION_MAX_TOKENS = 400;
+    /** A streamed body is cut off past this many characters, as ClaudeHttpsTransport cuts a whole one. */
+    private static final int MAX_STREAM_CHARS = 1024 * 1024;
 
     /** Why a call failed. The text is fixed and safe to show anywhere. */
     public enum Reason {
@@ -125,6 +133,31 @@ public final class ClaudeApi {
     public interface Transport {
         /** Must not follow redirects: a 3xx comes back as a Response. Throws on no response at all. */
         Response send(Request request) throws IOException;
+    }
+
+    /**
+     * A transport that can hand a 2xx body over line by line as it arrives (robot
+     * 2026-10-02: the conversation streams so the line is known before the tail).
+     * Any other status comes back whole in the Response, as send() returns it.
+     */
+    public interface StreamingTransport extends Transport {
+        /** As send(); a 2xx body goes to sink one line at a time instead (its Response body is then ""). */
+        Response stream(Request request, LineSink sink) throws IOException;
+    }
+
+    /** Where a streamed body's lines go, on the request's thread. */
+    public interface LineSink {
+        void line(String line);
+    }
+
+    /**
+     * Told once, on the request's thread, when every named top-level string field
+     * of a conversation reply is complete: from the stream as soon as the last one
+     * closes, or from the whole reply when the transport cannot stream. Never told
+     * for a reply that fails before they are complete.
+     */
+    public interface EarlyFields {
+        void complete(Map<String, String> fields);
     }
 
     public static final class Request {
@@ -311,6 +344,16 @@ public final class ClaudeApi {
 
     public ClaudeApi(Transport transport) {
         this.transport = transport;
+    }
+
+    /** Whether the endpoint refused output_config, so the schema now rides in the system prompt. */
+    public boolean schemaInPrompt() {
+        return schemaInPrompt;
+    }
+
+    /** Whether the endpoint refused effort, so conversation() no longer sends it. */
+    public boolean effortRefused() {
+        return effortUnsupported;
     }
 
     /** A text content block for messages(). */
@@ -518,6 +561,28 @@ public final class ClaudeApi {
         return reply(resp);
     }
 
+    /**
+     * Robot 2026-10-02: keeps the pooled HTTPS connection to the endpoint warm, so the
+     * next real request skips the TCP and TLS setup (about 0.4 s on the robot). One
+     * GET of a single models page: no tokens, no cost. True on a 2xx; never throws.
+     */
+    public boolean keepWarm(ClaudeAccess access, int timeoutMs) {
+        if (access == null || !access.isSetUp()) {
+            return false;
+        }
+        String base = normalizeBaseUrl(access.baseUrl);
+        if (checkSetup(base, access.apiKey) != null) {
+            return false;
+        }
+        try {
+            Response resp = transport.send(new Request("GET", base + "/v1/models?limit=1", headers(access.apiKey, false),
+                    null, timeoutMs));
+            return resp.status >= 200 && resp.status <= 299;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
     /** One message of a conversation: role "user" or "assistant" with text, or "user" with content blocks. */
     public static Map<String, Object> message(String role, Object content) {
         Map<String, Object> m = new LinkedHashMap<String, Object>();
@@ -528,7 +593,7 @@ public final class ClaudeApi {
 
     /**
      * Sends one multi-turn Messages request (meeting plan U8, KTD9): the frozen
-     * system prefix, the message list as given, max_tokens 1024, the JSON schema
+     * system prefix, the message list as given, max_tokens 400, the JSON schema
      * as output_config.format, effort (null: none) beside it, and the top-level
      * automatic cache breakpoint. Two gates, each remembered for this ClaudeApi
      * and each retrying once: a 400 naming effort drops effort and keeps the
@@ -537,35 +602,270 @@ public final class ClaudeApi {
      */
     public MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
             Map<String, ?> schema, String effort, int timeoutMs) {
+        return conversation(access, system, messages, schema, effort, timeoutMs, null, null);
+    }
+
+    /**
+     * As conversation(), and streamed when the transport can (robot 2026-10-02):
+     * early is told the named top-level string fields (the line, the question, the
+     * name) as soon as they are all complete, while the rest of the reply is still
+     * coming; the result is the whole reply, as before. Without early nothing streams.
+     * Effort is never sent to a model known to refuse it (Haiku, the Claude 3 family).
+     */
+    public MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
+            Map<String, ?> schema, String effort, int timeoutMs, List<String> earlyNames, EarlyFields early) {
         MessageResult notReady = preflight(access);
         if (notReady != null) {
             return notReady;
         }
         String base = normalizeBaseUrl(access.baseUrl);
+        boolean stream = early != null && earlyNames != null && transport instanceof StreamingTransport;
+        Stream sink = stream ? new Stream(earlyNames, early) : null;
         Response resp;
         try {
             boolean useOutputConfig = schema != null && !schemaInPrompt;
-            String sendEffort = effortUnsupported ? null : effort;
-            resp = transport.send(conversationRequest(base, access, system, messages, schema, useOutputConfig,
-                    sendEffort, true, timeoutMs));
+            String sendEffort = effortUnsupported || !takesEffort(access.model) ? null : effort;
+            resp = send(conversationRequest(base, access, system, messages, schema, useOutputConfig,
+                    sendEffort, true, stream, timeoutMs), sink);
             // The 400's error message, read only to choose the retry; never shown.
             String error = errorMessage(resp);
             if (sendEffort != null && error != null && error.contains("effort")) {
                 effortUnsupported = true;
                 sendEffort = null;
-                resp = transport.send(conversationRequest(base, access, system, messages, schema, useOutputConfig,
-                        null, true, timeoutMs));
+                resp = send(conversationRequest(base, access, system, messages, schema, useOutputConfig,
+                        null, true, stream, timeoutMs), sink);
                 error = errorMessage(resp);
             }
             if (useOutputConfig && error != null && error.contains("output_config") && !error.contains("effort")) {
                 schemaInPrompt = true;
-                resp = transport.send(conversationRequest(base, access, system, messages, schema, false, sendEffort,
-                        true, timeoutMs));
+                resp = send(conversationRequest(base, access, system, messages, schema, false, sendEffort,
+                        true, stream, timeoutMs), sink);
             }
         } catch (IOException e) {
             return MessageResult.failure(forException(e), 0);
         }
-        return reply(resp);
+        MessageResult r = sink != null && resp.status >= 200 && resp.status <= 299 && resp.body.isEmpty()
+                ? sink.result(resp.status) : reply(resp);
+        if (early != null && earlyNames != null && r.ok() && (sink == null || !sink.told)) {
+            Map<String, String> fields = new LinkedHashMap<String, String>();
+            for (String name : earlyNames) {
+                Object v = r.json.get(name);
+                fields.put(name, v instanceof String ? (String) v : "");
+            }
+            early.complete(fields);
+        }
+        return r;
+    }
+
+    /** One request: streamed into sink when there is one, else sent whole. */
+    private Response send(Request request, Stream sink) throws IOException {
+        if (sink == null) {
+            return transport.send(request);
+        }
+        sink.reset();
+        return ((StreamingTransport) transport).stream(request, sink);
+    }
+
+    /** Whether a model takes output_config.effort: Haiku and the Claude 3 family answer 400. */
+    public static boolean takesEffort(String model) {
+        String m = model == null ? "" : model.toLowerCase(Locale.US);
+        return !m.contains("haiku") && !m.startsWith("claude-3");
+    }
+
+    /**
+     * A streamed Messages reply (SSE), read as it arrives: the text deltas joined,
+     * the stop reason, and an error event; early is told the named fields once
+     * they are all complete. Nothing in it is logged.
+     */
+    private static final class Stream implements LineSink {
+        private final List<String> names;
+        private final EarlyFields early;
+        private final StringBuilder text = new StringBuilder();
+        private String stopReason;
+        private String errorType;
+        private boolean any;
+        boolean told;
+
+        Stream(List<String> names, EarlyFields early) {
+            this.names = names;
+            this.early = early;
+        }
+
+        /** A retried request starts afresh. */
+        void reset() {
+            text.setLength(0);
+            stopReason = null;
+            errorType = null;
+            any = false;
+        }
+
+        @Override
+        public void line(String line) {
+            if (line == null || !line.startsWith("data:")) {
+                return;
+            }
+            Map<?, ?> ev = parseObject(line.substring(5).trim());
+            if (ev == null) {
+                return;
+            }
+            any = true;
+            Object type = ev.get("type");
+            if ("content_block_delta".equals(type) && ev.get("delta") instanceof Map) {
+                Object t = ((Map<?, ?>) ev.get("delta")).get("text");
+                if (t instanceof String && text.length() < MAX_STREAM_CHARS) {
+                    text.append((String) t);
+                    tellIfComplete();
+                }
+            } else if ("message_delta".equals(type) && ev.get("delta") instanceof Map) {
+                Object r = ((Map<?, ?>) ev.get("delta")).get("stop_reason");
+                if (r instanceof String) {
+                    stopReason = (String) r;
+                }
+            } else if ("error".equals(type)) {
+                Object e = ev.get("error");
+                Object et = e instanceof Map ? ((Map<?, ?>) e).get("type") : null;
+                errorType = et instanceof String ? (String) et : "";
+            }
+        }
+
+        private void tellIfComplete() {
+            if (told || errorType != null) {
+                return;
+            }
+            Map<String, String> found = completeStringFields(text.toString());
+            Map<String, String> fields = new LinkedHashMap<String, String>();
+            for (String name : names) {
+                String v = found.get(name);
+                if (v == null) {
+                    return;
+                }
+                fields.put(name, v);
+            }
+            told = true;
+            early.complete(fields);
+        }
+
+        /** The whole reply, read as a Messages body would be. */
+        MessageResult result(int status) {
+            if (errorType != null) {
+                Reason byType = forType(errorType, false);
+                return MessageResult.failure(byType != null ? byType : Reason.ENDPOINT_ERROR, status);
+            }
+            if (!any) {
+                return MessageResult.failure(Reason.ENDPOINT_ERROR, status);
+            }
+            Map<String, Object> block = new LinkedHashMap<String, Object>();
+            block.put("type", "text");
+            block.put("text", text.toString());
+            Map<String, Object> body = new LinkedHashMap<String, Object>();
+            body.put("content", Collections.singletonList(block));
+            body.put("stop_reason", stopReason);
+            return readReply(new Response(status, Json.write(body)));
+        }
+    }
+
+    /**
+     * The top-level string fields of a JSON object that are already complete in this
+     * prefix of it (from its first '{'; a ```json fence before it is skipped). A field
+     * still open, a nested one, or any non-string value is not in the map. Never throws.
+     */
+    static Map<String, String> completeStringFields(String partial) {
+        Map<String, String> out = new LinkedHashMap<String, String>();
+        if (partial == null) {
+            return out;
+        }
+        int n = partial.length();
+        int i = partial.indexOf('{');
+        if (i < 0) {
+            return out;
+        }
+        i++;
+        while (true) {
+            i = skipSpace(partial, i);
+            if (i < n && partial.charAt(i) == ',') {
+                i = skipSpace(partial, i + 1);
+            }
+            if (i >= n || partial.charAt(i) != '"') {
+                return out;
+            }
+            int keyEnd = stringEnd(partial, i);
+            if (keyEnd < 0) {
+                return out;
+            }
+            Object key = parseAny(partial.substring(i, keyEnd));
+            i = skipSpace(partial, keyEnd);
+            if (i >= n || partial.charAt(i) != ':') {
+                return out;
+            }
+            i = skipSpace(partial, i + 1);
+            if (i >= n) {
+                return out;
+            }
+            if (partial.charAt(i) == '"') {
+                int end = stringEnd(partial, i);
+                if (end < 0) {
+                    return out;
+                }
+                Object v = parseAny(partial.substring(i, end));
+                if (key instanceof String && v instanceof String) {
+                    out.put((String) key, (String) v);
+                }
+                i = end;
+                continue;
+            }
+            i = valueEnd(partial, i);
+            if (i < 0) {
+                return out;
+            }
+        }
+    }
+
+    private static int skipSpace(String s, int i) {
+        while (i < s.length() && Character.isWhitespace(s.charAt(i))) {
+            i++;
+        }
+        return i;
+    }
+
+    /** The index just past the string starting at the quote at i, or -1 while it is still open. */
+    private static int stringEnd(String s, int i) {
+        for (int k = i + 1; k < s.length(); k++) {
+            char c = s.charAt(k);
+            if (c == '\\') {
+                k++;
+            } else if (c == '"') {
+                return k + 1;
+            }
+        }
+        return -1;
+    }
+
+    /** The index just past the non-string value at i (an object, array or scalar), or -1 while it is still open. */
+    private static int valueEnd(String s, int i) {
+        int depth = 0;
+        for (int k = i; k < s.length(); k++) {
+            char c = s.charAt(k);
+            if (c == '"') {
+                int end = stringEnd(s, k);
+                if (end < 0) {
+                    return -1;
+                }
+                k = end - 1;
+            } else if (c == '{' || c == '[') {
+                depth++;
+            } else if (c == '}' || c == ']') {
+                if (depth == 0) {
+                    return k;
+                }
+                depth--;
+                if (depth == 0) {
+                    return k + 1;
+                }
+            } else if (c == ',' && depth == 0) {
+                return k;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -604,10 +904,11 @@ public final class ClaudeApi {
      */
     private static Request conversationRequest(String base, ClaudeAccess access, String system,
             List<Map<String, Object>> messages, Map<String, ?> schema, boolean useOutputConfig, String effort,
-            boolean cacheControl, int timeoutMs) {
+            boolean cacheControl, boolean stream, int timeoutMs) {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("model", access.model);
-        body.put("max_tokens", MESSAGES_MAX_TOKENS);
+        // The conversation (cacheControl) has its own, smaller cap; messages() keeps 1024.
+        body.put("max_tokens", cacheControl ? CONVERSATION_MAX_TOKENS : MESSAGES_MAX_TOKENS);
         String sys = schema != null && !useOutputConfig ? withSchemaAsk(system, schema) : system;
         if (sys != null && !sys.isEmpty()) {
             body.put("system", sys);
@@ -626,6 +927,9 @@ public final class ClaudeApi {
         if (cacheControl) {
             body.put("cache_control", Collections.singletonMap("type", "ephemeral"));
         }
+        if (stream) {
+            body.put("stream", Boolean.TRUE);
+        }
         return new Request("POST", base + "/v1/messages", headers(access.apiKey, true), Json.write(body),
                 timeoutMs);
     }
@@ -637,7 +941,7 @@ public final class ClaudeApi {
         message.put("role", "user");
         message.put("content", content == null ? new ArrayList<Object>() : content);
         return conversationRequest(base, access, system, Collections.singletonList(message), schema,
-                useOutputConfig, null, false, timeoutMs);
+                useOutputConfig, null, false, false, timeoutMs);
     }
 
     /** The system prompt with the schema-in-prompt ask appended (the ask alone when there is no prompt). */

@@ -47,6 +47,8 @@ SETTINGS_PATHS = (
     "SETTINGS_PEOPLE_PHOTO_DELETE_PATH",
     "SETTINGS_FACE_THRESHOLDS_PATH",
     "SETTINGS_FACE_STATE_PATH",
+    "SETTINGS_FEEDBACK_CLEAR_PATH",
+    "SETTINGS_FEEDBACK_STATE_PATH",
 )
 PROBE = LAUNCHER / "EarsProbe.java"
 CONVERSATION = SHARED_SRC / "com" / "miko3" / "shared" / "ConversationSettings.java"
@@ -253,6 +255,8 @@ class SettingsPageSourceTest(unittest.TestCase):
             "SETTINGS_PEOPLE_PHOTO_DELETE_PATH": "/settings/people/photo/delete",
             "SETTINGS_FACE_THRESHOLDS_PATH": "/settings/face/thresholds",
             "SETTINGS_FACE_STATE_PATH": "/settings/face/state",
+            "SETTINGS_FEEDBACK_CLEAR_PATH": "/settings/feedback/clear",
+            "SETTINGS_FEEDBACK_STATE_PATH": "/settings/feedback/state",
         }
         for name, path in expected.items():
             self.assertRegex(src, rf'public static final String {name} = "{re.escape(path)}";')
@@ -474,6 +478,11 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "face_state_carries_checks_people_and_thresholds_without_images",
         "face_paths_are_tls_only",
         "get_on_face_action_paths_refused",
+        "feedback_section_lists_entries_newest_first",
+        "feedback_section_says_when_there_is_none",
+        "feedback_clear_needs_the_token_and_empties_the_log",
+        "feedback_state_needs_the_token_and_carries_entries_newest_first_without_ids",
+        "forget_on_page_deletes_their_feedback",
     )
 
     @classmethod

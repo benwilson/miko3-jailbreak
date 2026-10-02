@@ -28,7 +28,7 @@ public final class ClaudeApiHarness {
     private static final String MODEL = "claude-test-1";
 
     /** Replays queued outcomes in order; each is a Response or an IOException. */
-    private static final class FakeTransport implements ClaudeApi.Transport {
+    private static class FakeTransport implements ClaudeApi.Transport {
         final ArrayDeque<Object> outcomes = new ArrayDeque<Object>();
         final List<ClaudeApi.Request> requests = new ArrayList<ClaudeApi.Request>();
 
@@ -96,6 +96,8 @@ public final class ClaudeApiHarness {
         secrecy();
         messages();
         conversation();
+        streaming();
+        keepWarm();
         rateLimits();
     }
 
@@ -648,9 +650,9 @@ public final class ClaudeApiHarness {
                         && "PREFIX".equals(b.get("system")) && t.requests.get(0).url.equals(BASE + "/v1/messages"),
                 describe(r) + " " + order);
         Object cc = b.get("cache_control");
-        check("conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_1024",
+        check("conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_400",
                 cc instanceof Map && "ephemeral".equals(((Map<?, ?>) cc).get("type"))
-                        && Long.valueOf(1024).equals(b.get("max_tokens")) && t.requests.get(0).readTimeoutMs == 5000,
+                        && Long.valueOf(400).equals(b.get("max_tokens")) && !b.containsKey("stream") && t.requests.get(0).readTimeoutMs == 5000,
                 "cache_control=" + cc + " max_tokens=" + b.get("max_tokens") + " timeout=" + t.requests.get(0).readTimeoutMs);
         Object oc = b.get("output_config");
         Object fmt = oc instanceof Map ? ((Map<?, ?>) oc).get("format") : null;
@@ -739,6 +741,215 @@ public final class ClaudeApiHarness {
                 !shown.contains("long weekend") && !shown.contains("PREFIX") && !shown.contains("Hi Sam")
                         && !shown.contains(KEY) && !shown.contains("something else"),
                 shown);
+    }
+
+    // ---- the streamed conversation (robot 2026-10-02: speak as soon as the line is known) ----
+
+    /** A transport that streams: an outcome is a Response (sent whole, as an error is) or SSE lines for a 200. */
+    private static final class FakeStreamingTransport extends FakeTransport implements ClaudeApi.StreamingTransport {
+        int fed;
+
+        FakeStreamingTransport sse(List<String> lines) {
+            outcomes.add(lines);
+            return this;
+        }
+
+        @Override
+        public ClaudeApi.Response stream(ClaudeApi.Request request, ClaudeApi.LineSink sink) throws IOException {
+            requests.add(request);
+            Object next = outcomes.poll();
+            if (next == null) {
+                throw new IllegalStateException("unexpected extra request to " + request.url);
+            }
+            if (next instanceof IOException) {
+                throw (IOException) next;
+            }
+            if (next instanceof ClaudeApi.Response) {
+                return (ClaudeApi.Response) next;
+            }
+            for (Object line : (List<?>) next) {
+                fed++;
+                sink.line((String) line);
+            }
+            return new ClaudeApi.Response(200, "");
+        }
+    }
+
+    /** The early-fields listener: what it was given, how often, and how many SSE lines had arrived by then. */
+    private static final class Early implements ClaudeApi.EarlyFields {
+        final FakeStreamingTransport t;
+        Map<String, String> fields;
+        int calls;
+        int atLine = -1;
+
+        Early(FakeStreamingTransport t) {
+            this.t = t;
+        }
+
+        @Override
+        public void complete(Map<String, String> f) {
+            calls++;
+            fields = f;
+            atLine = t == null ? -1 : t.fed;
+        }
+    }
+
+    private static final List<String> EARLY = Arrays.asList("line", "question_asked", "name_given");
+
+    /** A Messages stream whose text arrives in these deltas, ending with this stop reason (null: no message_delta). */
+    private static List<String> sse(String stopReason, String... deltas) {
+        List<String> l = new ArrayList<String>();
+        l.add("event: message_start");
+        l.add("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\","
+                + "\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}");
+        l.add("");
+        l.add("event: content_block_start");
+        l.add("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}");
+        l.add("");
+        l.add("event: ping");
+        l.add("data: {\"type\":\"ping\"}");
+        l.add("");
+        for (String d : deltas) {
+            Map<String, Object> delta = new LinkedHashMap<String, Object>();
+            delta.put("type", "text_delta");
+            delta.put("text", d);
+            Map<String, Object> ev = new LinkedHashMap<String, Object>();
+            ev.put("type", "content_block_delta");
+            ev.put("index", 0);
+            ev.put("delta", delta);
+            l.add("event: content_block_delta");
+            l.add("data: " + Json.write(ev));
+            l.add("");
+        }
+        l.add("event: content_block_stop");
+        l.add("data: {\"type\":\"content_block_stop\",\"index\":0}");
+        l.add("");
+        if (stopReason != null) {
+            l.add("event: message_delta");
+            l.add("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"" + stopReason
+                    + "\"},\"usage\":{\"output_tokens\":40}}");
+            l.add("");
+        }
+        l.add("event: message_stop");
+        l.add("data: {\"type\":\"message_stop\"}");
+        l.add("");
+        return l;
+    }
+
+    private static final String[] TURN_DELTAS = {
+            "{\"line\":\"Camping? ", "Nice.\",\"question_asked\":\"Camp", "ing?\"", ",\"name_given\":\"Sam\"",
+            ",\"ends_conversation\":false,\"deflected\":false,", "\"notes_update\":{\"topics\":[\"camping\"]}}"};
+
+    /** The SSE line index of the delta that carries the n-th text delta (1-based). */
+    private static int deltaLine(int n) {
+        return 9 + 3 * n - 1;
+    }
+
+    private static void streaming() {
+        FakeStreamingTransport t = new FakeStreamingTransport();
+        t.sse(sse("end_turn", TURN_DELTAS));
+        Early e = new Early(t);
+        ClaudeApi.MessageResult r = new ClaudeApi(t).conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000,
+                EARLY, e);
+        Map<?, ?> b = t.requests.isEmpty() ? Collections.emptyMap() : body(t.requests.get(0));
+        check("conversation_streamed_asks_for_a_stream",
+                Boolean.TRUE.equals(b.get("stream")) && Long.valueOf(400).equals(b.get("max_tokens")),
+                "stream=" + b.get("stream") + " max_tokens=" + b.get("max_tokens"));
+        boolean early = e.calls == 1 && e.fields != null && "Camping? Nice.".equals(e.fields.get("line"))
+                && "Camping?".equals(e.fields.get("question_asked")) && "Sam".equals(e.fields.get("name_given"));
+        check("conversation_streamed_reports_the_line_question_and_name_before_the_tail",
+                early && e.atLine == deltaLine(4) && e.atLine < t.fed,
+                "calls=" + e.calls + " fields=" + e.fields + " atLine=" + e.atLine + " want " + deltaLine(4)
+                        + " of " + t.fed);
+        Object notes = r.ok() ? r.json.get("notes_update") : null;
+        check("conversation_streamed_result_is_the_whole_reply",
+                r.ok() && "Camping? Nice.".equals(r.json.get("line")) && notes instanceof Map
+                        && String.valueOf(notes).contains("camping") && Boolean.FALSE.equals(r.json.get("deflected")),
+                describe(r));
+        // An escape split across two deltas, a colon and a brace inside the line, and an empty name.
+        FakeStreamingTransport s = new FakeStreamingTransport();
+        s.sse(sse("end_turn", "{ \"line\" : \"He said \\", "\"hi: {there}\\\" ", "\\u00e9\" , \"question_asked\":\"\",",
+                "\"name_given\":\"\"", ",\"ends_conversation\":true,\"deflected\":false,\"notes_update\":{}}"));
+        Early se = new Early(s);
+        ClaudeApi.MessageResult sr = new ClaudeApi(s).conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000,
+                EARLY, se);
+        check("conversation_streamed_fields_survive_escapes_split_across_deltas",
+                sr.ok() && se.calls == 1 && "He said \"hi: {there}\" \u00e9".equals(se.fields.get("line"))
+                        && "".equals(se.fields.get("name_given")) && se.atLine == deltaLine(4),
+                describe(sr) + " fields=" + se.fields + " atLine=" + se.atLine);
+        // The gates still work: the 400 comes back whole, before any stream; the retry streams.
+        FakeStreamingTransport g = new FakeStreamingTransport();
+        g.reply(400, error("invalid_request_error", "output_config.effort: Extra inputs are not permitted"));
+        g.sse(sse("end_turn", TURN_DELTAS));
+        Early ge = new Early(g);
+        ClaudeApi.MessageResult gr = new ClaudeApi(g).conversation(ACCESS, "PREFIX", chat(), schema(), "low", 5000,
+                EARLY, ge);
+        Object oc2 = g.requests.size() >= 2 ? body(g.requests.get(1)).get("output_config") : null;
+        check("conversation_streamed_400_gates_still_retry_once",
+                gr.ok() && g.requests.size() == 2 && ge.calls == 1 && oc2 instanceof Map
+                        && !((Map<?, ?>) oc2).containsKey("effort"),
+                describe(gr) + " requests=" + g.requests.size() + " calls=" + ge.calls);
+        // A stream that breaks with an error event, before the fields are complete.
+        List<String> broken = sse(null, "{\"line\":\"Camp");
+        broken.add(broken.size() - 3, "event: error");
+        broken.add(broken.size() - 3, "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}");
+        FakeStreamingTransport o = new FakeStreamingTransport().sse(broken);
+        Early oe = new Early(o);
+        ClaudeApi.MessageResult or = new ClaudeApi(o).conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000,
+                EARLY, oe);
+        FakeStreamingTransport rf = new FakeStreamingTransport().sse(sse("refusal", "I'd rather not."));
+        ClaudeApi.MessageResult rr = new ClaudeApi(rf).conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000,
+                EARLY, new Early(rf));
+        check("conversation_streamed_error_event_and_refusal_map_to_their_reasons",
+                or.reason == ClaudeApi.Reason.OVERLOADED && oe.calls == 0 && rr.reason == ClaudeApi.Reason.REFUSED,
+                or.reason + " calls=" + oe.calls + " " + rr.reason);
+        // A transport that cannot stream: the whole reply, then the fields once, from it.
+        FakeTransport plain = new FakeTransport().reply(200, turnReply());
+        Early pe = new Early(null);
+        ClaudeApi.MessageResult pr = new ClaudeApi(plain).conversation(ACCESS, "PREFIX", chat(), schema(), null, 5000,
+                EARLY, pe);
+        check("conversation_without_a_streaming_transport_reports_the_fields_from_the_whole_reply",
+                pr.ok() && pe.calls == 1 && "Camping?".equals(pe.fields.get("line"))
+                        && !body(plain.requests.get(0)).containsKey("stream"),
+                describe(pr) + " calls=" + pe.calls + " fields=" + pe.fields);
+        // Haiku refuses effort (robot 2026-10-02: a 400 on every first turn): it is never sent to it.
+        FakeTransport hk = new FakeTransport().reply(200, turnReply());
+        ClaudeApi.MessageResult hr = new ClaudeApi(hk).conversation(
+                ClaudeAccess.setUp(BASE, KEY, "claude-haiku-4-5-20251001"), "PREFIX", chat(), schema(), "low", 5000);
+        Object hoc = body(hk.requests.get(0)).get("output_config");
+        check("conversation_never_sends_effort_to_a_haiku_model",
+                hr.ok() && hk.requests.size() == 1 && hoc instanceof Map && !((Map<?, ?>) hoc).containsKey("effort")
+                        && ((Map<?, ?>) hoc).get("format") instanceof Map,
+                describe(hr) + " output_config=" + hoc);
+        // The partial-JSON scanner on its own: only closed top-level strings count.
+        Map<String, String> part = ClaudeApi.completeStringFields(
+                "```json\n{\"a\":\"x\",\"n\":{\"line\":\"inner\"},\"b\":[1,\"]\"],\"c\":tr");
+        Map<String, String> open = ClaudeApi.completeStringFields("{\"line\":\"still going");
+        check("partial_json_scanner_reads_only_closed_top_level_strings",
+                "x".equals(part.get("a")) && !part.containsKey("line") && !part.containsKey("c") && part.size() == 1
+                        && open.isEmpty(),
+                part + " " + open);
+    }
+
+    // ---- keep-warm (robot 2026-10-02: a cold connection costs ~0.4 s on the first turn) ----
+
+    private static void keepWarm() {
+        FakeTransport t = new FakeTransport().reply(200, "{\"data\":[{\"id\":\"m\"}],\"has_more\":true}");
+        boolean ok = new ClaudeApi(t).keepWarm(ACCESS, 4000);
+        ClaudeApi.Request q = t.requests.isEmpty() ? null : t.requests.get(0);
+        check("keep_warm_is_one_tokenless_models_page_of_one",
+                ok && t.requests.size() == 1 && q != null && "GET".equals(q.method)
+                        && q.url.equals(BASE + "/v1/models?limit=1") && q.body == null && q.readTimeoutMs == 4000
+                        && KEY.equals(q.headers.get("x-api-key")),
+                "ok=" + ok + " " + (q == null ? "no request" : q.method + " " + q.url + " timeout=" + q.readTimeoutMs));
+        boolean failed = new ClaudeApi(new FakeTransport().reply(500, "oops")).keepWarm(ACCESS, 4000);
+        boolean thrown = new ClaudeApi(new FakeTransport().fail(new java.net.SocketTimeoutException("read")))
+                .keepWarm(ACCESS, 4000);
+        FakeTransport none = new FakeTransport();
+        boolean notSetUp = new ClaudeApi(none).keepWarm(ClaudeAccess.notSetUp(), 4000);
+        check("keep_warm_failures_are_false_and_never_throw_and_unset_sends_nothing",
+                !failed && !thrown && !notSetUp && none.requests.isEmpty(),
+                failed + " " + thrown + " " + notSetUp + " requests=" + none.requests.size());
     }
 
     // ---- rate limits (robot 2026-10-01: a 429 retried 0.6 s later) ----

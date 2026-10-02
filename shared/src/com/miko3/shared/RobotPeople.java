@@ -134,6 +134,15 @@ public interface RobotPeople extends IInterface {
      * ring or been purged by forget. */
     boolean updateCheck(long handle, int outcome, String joinedId) throws RemoteException;
 
+    // Owner 2026-10-02 (the feedback log). Appended as above.
+
+    /** Appends one piece of feedback about the robot to the launcher's
+     * feedback log: from the person with this id (null or an unknown id:
+     * "someone"), its kind, summary and quote (Feedback's rules; anything
+     * else is refused, answering false) and a few words of context. */
+    boolean recordFeedback(String id, String kind, String summary, String quote, String context)
+            throws RemoteException;
+
     /** One stored photo as gallery() answers it: never a name or an image. */
     final class GalleryPhoto {
         public final String id;
@@ -193,6 +202,7 @@ public interface RobotPeople extends IInterface {
         static final int TRANSACTION_markUnusable = 14;
         static final int TRANSACTION_recordCheck = 15;
         static final int TRANSACTION_updateCheck = 16;
+        static final int TRANSACTION_recordFeedback = 17;
 
         public Stub() {
             attachInterface(this, DESCRIPTOR);
@@ -378,6 +388,17 @@ public interface RobotPeople extends IInterface {
                     boolean updated = updateCheck(handle, outcome, data.readString());
                     reply.writeNoException();
                     reply.writeInt(updated ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_recordFeedback: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    String kind = data.readString();
+                    String summary = data.readString();
+                    String quote = data.readString();
+                    boolean kept = recordFeedback(id, kind, summary, quote, data.readString());
+                    reply.writeNoException();
+                    reply.writeInt(kept ? 1 : 0);
                     return true;
                 }
                 case IBinder.INTERFACE_TRANSACTION: {
@@ -735,6 +756,29 @@ public interface RobotPeople extends IInterface {
                     data.writeInt(outcome);
                     data.writeString(joinedId);
                     if (!remote.transact(TRANSACTION_updateCheck, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public boolean recordFeedback(String id, String kind, String summary, String quote, String context)
+                    throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeString(kind);
+                    data.writeString(summary);
+                    data.writeString(quote);
+                    data.writeString(context);
+                    if (!remote.transact(TRANSACTION_recordFeedback, data, reply, 0)) {
                         throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
                     }
                     reply.readException();

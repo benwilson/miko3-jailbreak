@@ -81,6 +81,9 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
 
         /** Review 2026-10-01 (P2-2): the launcher says that answer ended without words. */
         void answerOver(long at);
+
+        /** Robot 2026-10-02: the launcher's words so far for this listen's answer (its provisional answer). */
+        void provisional(String transcript);
     }
 
     private final Context app;
@@ -304,6 +307,22 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         }
         if (r != null) {
             r.answerOver(at);
+        }
+    }
+
+    /**
+     * Robot 2026-10-02: the launcher's provisional answer (the words so far, at an endpoint
+     * inside the conversation listen's answer). It goes to the armed reply, which stays armed
+     * for the final words; with none armed it is dropped: never a cue.
+     */
+    @Override
+    public void onProvisional(long at, String text) {
+        Reply r;
+        synchronized (lock) {
+            r = open ? reply : null;
+        }
+        if (r != null && text != null) {
+            r.provisional(text);
         }
     }
 

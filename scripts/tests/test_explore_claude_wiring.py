@@ -682,6 +682,90 @@ class ClaudeRateLimitWiringTest(unittest.TestCase):
         self.assertIsNotNone(m)
 
 
+class FasterTurnWiringTest(unittest.TestCase):
+    """Robot 2026-10-02 (about 5.5 s from their last word to his first): the turn uses the
+    settings already fetched instead of binding the launcher every turn, streams so the
+    line goes as soon as the line, question and name are known (the notes follow as late
+    notes), and a turn started on the launcher's provisional answer is used only by a
+    turn() asking for exactly the same request. The turn's log line says the request's
+    shape in counts and fixed words only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.a = code_only(src("ClaudeCuriosity.java"))
+
+    def method(self, sig):
+        m = re.search(re.escape(sig) + r"(.*?)\n    \}", self.a, re.S)
+        self.assertIsNotNone(m, sig)
+        return m.group(1)
+
+    def test_a_turn_uses_the_settings_already_fetched(self):
+        acc = self.method("private ClaudeAccess turnAccess(")
+        self.assertRegex(acc, r"ClaudeAccess a = access;\s*if \(a != null && a\.isSetUp\(\)\) \{\s*refreshSettings\(\);\s*return a;")
+        self.assertIn("return fetchSettings();", acc)
+        self.assertIn("ClaudeAccess settings = turnAccess();", self.method("private void oneTurn("))
+
+    def test_a_turn_streams_and_hands_its_line_over_early(self):
+        turn = self.method("private void oneTurn(")
+        self.assertIn("TURN_EFFORT, (int) timeoutMs, EARLY_FIELDS,", turn)
+        self.assertIn("flight.early(call, ", turn)
+        self.assertIn("flight.whole(call, ", turn)
+        self.assertRegex(self.a, r'EARLY_FIELDS\s*=\s*Arrays\.asList\("line", "question_asked", "name_given"\)')
+        early = self.method("private static Turn earlyTurn(")
+        self.assertIn("ClaudeReplies.turn(", early)
+        self.assertIn("NameExtractor.validName(", early)
+
+    def test_a_speculation_is_used_only_by_the_same_request(self):
+        turn = self.method("public void turn(final TurnRequest request, final long timeoutMs)")
+        self.assertIn("flight.adopt(body.key, g)", turn)
+        self.assertIn("flight.start(body.key, g)", turn)
+        spec = self.method("public void speculateTurn(final TurnRequest request, final long timeoutMs)")
+        self.assertIn("flight.speculate(body.key)", spec)
+        self.assertIn("turnBody(request, null)", spec)
+        body = self.method("private TurnBody turnBody(")
+        self.assertIn("Json.write(messages)", body)
+        cancel = self.method("public void cancelTurn()")
+        self.assertIn("turns.cancel();", cancel)
+        self.assertIn("flight.cancel();", cancel)
+        self.assertIn("flight.clear();", self.method("    void release()"))
+        self.assertIn("return flight.lateNotes();", self.method("public String lateNotes()"))
+        self.assertIn("return flight.tailPending();", self.method("public boolean turnTailPending()"))
+
+    def test_the_provisional_answer_reaches_the_port_for_its_own_listen_only(self):
+        ears_listen = self.method("private void earsListen(")
+        prov = re.search(r"public void provisional\(String transcript\) \{(.*?)\n            \}", ears_listen, re.S)
+        self.assertIsNotNone(prov, "the ears listen's reply has no provisional")
+        self.assertIn("hearings.poll() == null && hearings.current(g)", prov.group(1))
+        self.assertIn("provisionalGen = g;", prov.group(1))
+        port = self.method("public String provisional()")
+        self.assertIn("hearings.current(g) && hearings.poll() == null", port)
+
+    def test_the_connection_is_kept_warm_while_explore_runs(self):
+        """Owner 2026-10-02: no cold first turn. A cold HTTPS connection costs about 0.4 s on
+        the robot; after KEEP_WARM_IDLE_MS with no Claude request a free models-page GET
+        keeps the pooled connection alive. Every request marks the time; the check runs on
+        the timer from the start and stops with Explore."""
+        self.assertRegex(self.a, r"KEEP_WARM_IDLE_MS = \d+;")
+        self.assertRegex(self.a, r"KEEP_WARM_CHECK_MS = \d+;")
+        ctor = self.method("    ClaudeCuriosity(Context context) {")
+        self.assertRegex(ctor, r"timer\.scheduleWithFixedDelay\(")
+        warm = self.method("private void keepWarmIfIdle(")
+        self.assertIn("api.keepWarm(", warm)
+        self.assertIn("now - lastRequestAt < KEEP_WARM_IDLE_MS", warm)
+        self.assertIn("released", warm)
+        gated = self.a.split("private final class Gated {", 1)[1].split("\n    }\n", 1)[0]
+        self.assertEqual(gated.count("lastRequestAt = System.currentTimeMillis();"), 2)
+        logs = " ".join(re.findall(r"Log\.[diwe]\((.*?)\);", warm, re.S))
+        self.assertIn('"keep-warm ', logs)
+        self.assertIn('" ms"', logs)
+
+    def test_the_turn_log_says_the_request_shape_without_words(self):
+        turn = self.method("private void oneTurn(")
+        logs = " ".join(re.findall(r"Log\.[diwe]\((.*?)\);", turn, re.S))
+        for word in ("system ", " chars, max_tokens ", "effort ", " ms", "line at "):
+            self.assertIn(word, logs)
+
+
 class FaceCropStoresOnlyFacesTest(unittest.TestCase):
     """Owner report: a stored face showed the wall. The top quarter of a loose or
     small person box stood in whenever FaceDetector found nothing, and was stored."""
@@ -908,9 +992,14 @@ class ConversationWiringTest(unittest.TestCase):
         for name in ("GUARD", "REMINDER", "NOTES_HEADING", "SCHEMA_PREAMBLE"):
             self.assertEqual(self.java_string(prompts, name), getattr(bench, name), name)
         self.assertIn("never say anything a coworker would be fired for saying", self.java_string(prompts, "GUARD"))
-        java_props = re.findall(r'"(\w+)", (?:type|object|arrayOf)\(', prompts.split("REPLY_SCHEMA = object(")[1].split(";")[0])
-        bench_props = list(bench.REPLY_SCHEMA["properties"]) + list(bench.REPLY_SCHEMA["properties"]["notes_update"]["properties"])
+        java_props = re.findall(r'"(\w+)", (?:type|object|arrayOf|enumOf)\(', prompts.split("REPLY_SCHEMA = object(")[1].split(";")[0])
+        bench_props = []
+        for name, schema in bench.REPLY_SCHEMA["properties"].items():
+            bench_props.append(name)
+            bench_props += list(schema.get("properties", {}))
         self.assertEqual(java_props, bench_props)
+        self.assertEqual(bench.REPLY_SCHEMA["properties"]["feedback"]["properties"]["kind"]["enum"],
+                         ["none", "suggestion", "complaint", "praise", "bug"])
         self.assertIn("closed_threads", java_props)
         # The prefix order the bench renders: guard, quoted persona, reminder, notes heading, preamble.
         prefix = re.search(r"static String systemPrefix\((.*?)\n    \}", prompts, re.S).group(1)
@@ -921,16 +1010,18 @@ class ConversationWiringTest(unittest.TestCase):
 
     def test_the_adapter_binds_every_new_port_method(self):
         a = code_only(src("ClaudeCuriosity.java"))
-        for method in ("turn", "turnAnswer", "cancelTurn", "notesDelta", "notesDeltaAnswer", "cancelNotesDelta", "forget",
+        for method in ("turn", "turnAnswer", "cancelTurn", "speculateTurn", "lateNotes", "turnTailPending",
+                       "provisional", "notesDelta", "notesDeltaAnswer", "cancelNotesDelta", "forget",
                        "forgetAnswer", "cancelForget", "chatListen", "keep", "keptAnswer", "cancelKeep"):
             self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
-        turn = re.search(r"private Turn oneTurn\((.*?)\n    \}", a, re.S).group(1)
-        self.assertIn("claude.conversation(fetchSettings(), system, messages, ExplorePrompts.REPLY_SCHEMA", turn)
+        turn = re.search(r"private void oneTurn\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("claude.conversation(settings, body.system, body.messages, ExplorePrompts.REPLY_SCHEMA", turn)
         self.assertIn("TURN_EFFORT", turn)
-        self.assertIn("ExplorePrompts.systemPrefix(request.persona, request.notes)", turn)
-        self.assertIn("ExplorePrompts.openerAsk(request.name)", turn)
-        self.assertIn("ExplorePrompts.avoidQuestion(request.avoidQuestion)", turn)
-        self.assertIn("ClaudeApi.jpegBlock(face)", turn)
+        body = re.search(r"private TurnBody turnBody\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("ExplorePrompts.systemPrefix(request.persona, request.notes)", body)
+        self.assertIn("ExplorePrompts.openerAsk(request.name)", body)
+        self.assertIn("ExplorePrompts.avoidQuestion(request.avoidQuestion)", body)
+        self.assertIn("ClaudeApi.jpegBlock(face)", body)
         self.assertIn("request.heard == null && request.transcript.isEmpty() && met != null\n                ? met.storeCrop : null", a)
         self.assertIn("NameExtractor.validName(t.nameGiven)", a)
         self.assertIn("RobotPeopleClient.mergeNotes(app, personId, notesUpdate)", a)
@@ -1039,7 +1130,7 @@ class FacelessOpenerTest(unittest.TestCase):
         self.assertIn("ask their name if he does not know it yet", self.constant("FACE_SEEN"))
 
     def test_the_turn_picks_the_opener_by_the_request_and_appends_face_seen(self):
-        turn = re.search(r"private Turn oneTurn\((.*?)\n    \}", code_only(src("ClaudeCuriosity.java")), re.S).group(1)
+        turn = re.search(r"private TurnBody turnBody\((.*?)\n    \}", code_only(src("ClaudeCuriosity.java")), re.S).group(1)
         self.assertIn("request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name)", turn)
         self.assertIn("e.heard == null ? first : e.heard", turn)
         self.assertIn("request.heard == null ? first : request.heard", turn)
@@ -1072,7 +1163,7 @@ class CallConversationTest(unittest.TestCase):
             self.assertIn(words, cant)
 
     def test_the_turn_picks_the_call_opener_first_and_appends_the_call_notes(self):
-        turn = re.search(r"private Turn oneTurn\((.*?)\n    \}", code_only(src("ClaudeCuriosity.java")), re.S).group(1)
+        turn = re.search(r"private TurnBody turnBody\((.*?)\n    \}", code_only(src("ClaudeCuriosity.java")), re.S).group(1)
         self.assertRegex(turn, r"String first = request\.called \? ExplorePrompts\.CALL_OPENER\s*"
                                r": request\.faceless \? ExplorePrompts\.FACELESS_OPENER")
         self.assertRegex(turn, r"if \(request\.called && request\.heard != null && request\.transcript\.isEmpty\(\)\) \{\s*"
@@ -1119,3 +1210,54 @@ class SlimUploadWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FeedbackWiringTest(unittest.TestCase):
+    """Owner 2026-10-02: feedback about himself is detected in the turn, spoken past
+    early, passed to the launcher's feedback log, and never traced."""
+
+    def prompts(self):
+        return src("ExplorePrompts.java")
+
+    def test_the_preamble_asks_for_feedback_only_about_miko_and_an_acknowledgement(self):
+        pre = ConversationWiringTest.java_string(self.prompts(), "SCHEMA_PREAMBLE")
+        for phrase in ("feedback (only when the person gives feedback about Miko himself",
+                       "suggestion, complaint, praise or bug", "word for word", "at most 25 words",
+                       "never for small talk", "kind none", "I'll pass that on to my developer"):
+            self.assertIn(phrase, pre, phrase)
+
+    def test_the_feedback_field_comes_last_so_the_line_still_streams_first(self):
+        body = self.prompts().split("REPLY_SCHEMA = object(")[1].split(";")[0]
+        top = re.findall(r'^            "(\w+)",', body, re.M)
+        self.assertEqual(top[0], "line")
+        self.assertEqual(top[-1], "feedback")
+        self.assertIn('enumOf("none", "suggestion", "complaint", "praise", "bug")', body)
+        a = code_only(src("ClaudeCuriosity.java"))
+        early = re.search(r"EARLY_FIELDS = Arrays\.asList\((.*?)\);", a).group(1)
+        self.assertNotIn("feedback", early)
+
+    def test_the_adapter_passes_feedback_to_the_launcher_and_never_logs_it(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertRegex(a, r"public CuriosityPort\.Feedback lateFeedback\(\)")
+        self.assertIn("return flight.lateFeedback();", a)
+        body = re.search(r"public void feedback\(final String personId, final CuriosityPort\.Feedback f, "
+                         r"final String context\)(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(body)
+        b = body.group(1)
+        self.assertIn("com.miko3.shared.Feedback.of(f.kind, f.summary, f.quote)", b)
+        self.assertIn("RobotPeopleClient.recordFeedback(app, personId, shared, context)", b)
+        for call in re.findall(r"Log\.[diwe]\((.*?)\);", b, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"summary|quote|context|\bshared\b(?!\.kind)|\bf\b", call)
+        turn_of = re.search(r"private static Turn turnOf\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn(".withFeedback(t.feedback)", turn_of)
+
+    def test_the_conversation_traces_only_the_kind(self):
+        chat = code_only(src("ChatSession.java"))
+        passes = re.search(r"private void passOn\(CuriosityPort\.Feedback f\)(.*?)\n    \}", chat, re.S).group(1)
+        self.assertIn("port.feedback(personId, f, feedbackContext())", passes)
+        for call in re.findall(r"\bnote\((.*?)\);", passes, re.S):
+            self.assertNotRegex(call, r"summary|quote", call)
+        self.assertIn("passOn(t.feedback)", chat)
+        self.assertIn("port.lateFeedback()", chat)
+

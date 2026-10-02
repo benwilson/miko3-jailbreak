@@ -278,6 +278,25 @@ final class ListenEngine implements ListenSession.Ears {
                 }
             }
 
+            /** Robot 2026-10-02: on the same delivery thread, so it follows answering() and precedes the words. */
+            @Override
+            public void provisional(final long at, final String text) {
+                try {
+                    deliver.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                callback.provisional(at, text);
+                            } catch (RemoteException | RuntimeException e) {
+                                // The client is gone; its death releases the session.
+                            }
+                        }
+                    });
+                } catch (RejectedExecutionException ignored) {
+                    // Shutting down.
+                }
+            }
+
             /** Review P2-2: on the same delivery thread too, so it follows the answer's answering(). */
             @Override
             public void answerOver(final long at) {
