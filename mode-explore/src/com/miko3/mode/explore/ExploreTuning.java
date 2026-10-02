@@ -193,6 +193,12 @@ final class ExploreTuning {
     final int reactedLabelsMax;
     final int saidLinesMax;
     /**
+     * Docked (owner 2026-10-02): on the charger he sits still and quiet, and every
+     * dockLookMs he takes one camera look without moving. He speaks only for
+     * something he has not reacted to this session, with a line he has not said.
+     */
+    final long dockLookMs;
+    /**
      * Meeting a person (explore on Claude U5, KTD3, KTD4): the match request and
      * each later Claude request get meetTimeoutMs; he listens for up to listenMs
      * and waits listenMarginMs more for the launcher's answer before giving up.
@@ -934,6 +940,7 @@ final class ExploreTuning {
         recentPicksMax = Math.max(0, b.recentPicksMax);
         reactedLabelsMax = Math.max(0, b.reactedLabelsMax);
         saidLinesMax = Math.max(0, b.saidLinesMax);
+        dockLookMs = Math.max(1000, b.dockLookMs);
         meetTimeoutMs = b.meetTimeoutMs;
         faceHoldMs = Math.max(0, b.faceHoldMs);
         listenMs = b.listenMs;
@@ -1298,6 +1305,8 @@ final class ExploreTuning {
         private int recentPicksMax = 8;
         private int reactedLabelsMax = 20;
         private int saidLinesMax = 10;
+        // About one look a minute on the charger: new things get noticed, the look budget barely notices.
+        private long dockLookMs = 60000;
         // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
         private long meetTimeoutMs = 12000;
         // KTD11: the migration usually takes a few seconds; 30 s caps the wait for the first roam.
@@ -1796,6 +1805,7 @@ final class ExploreTuning {
         Builder recentPicksMax(int v) { recentPicksMax = v; return this; }
         Builder reactedLabelsMax(int v) { reactedLabelsMax = v; return this; }
         Builder saidLinesMax(int v) { saidLinesMax = v; return this; }
+        Builder dockLookMs(long v) { dockLookMs = v; return this; }
         Builder meet(long timeoutMs, long listenMs, long listenMarginMs) {
             meetTimeoutMs = timeoutMs;
             this.listenMs = listenMs;

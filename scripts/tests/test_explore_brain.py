@@ -658,6 +658,14 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "review_a_trusted_leg_cut_off_by_a_cue_or_a_lease_drop_leaves_no_trust_behind",
         "review_a_zero_turn_long_after_a_bump_waits_the_full_recovery_from_the_turn",
         "review_a_lean_in_cut_off_by_a_lease_drop_does_not_start_a_cooldown_at_a_later_stop",
+        # Docked: quiet on the charger, a remark only for something new (owner 2026-10-02)
+        "dock_five_minutes_docked_no_songs_no_startles_no_wheels",
+        "dock_a_new_thing_appearing_is_remarked_once",
+        "dock_the_same_thing_still_there_is_not_remarked_again",
+        "dock_detector_only_a_new_thing_says_its_name_once",
+        "dock_a_call_is_answered_and_the_conversation_runs_without_turning",
+        "dock_driving_onto_the_charger_is_no_startle_and_he_settles",
+        "dock_taken_off_the_charger_he_roams_again",
     )
 
     @classmethod

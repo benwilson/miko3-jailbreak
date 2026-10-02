@@ -21,9 +21,13 @@ import java.util.Random;
  * MediaPlayer on STREAM_MUSIC, the same path mode-remote-control's SongPlayer
  * uses.
  *
- * Singing: while he sits still (resting or eyes-only) he hums a short phrase
- * every so often, like Wall-E. The first phrase waits a few seconds, so a
- * brief stop (the moment at start-up before readings arrive) stays quiet, and
+ * Singing: while he sits still off the charger (resting or eyes-only) he hums a
+ * short phrase now and then, like Wall-E: one phrase every 45-90 s (owner
+ * 2026-10-02: every 6-12 s was a nonstop chirp). There is no quick first phrase:
+ * the first waits a full gap too, so the short rests (a cornered cool-down, the
+ * moment at start-up before readings arrive) stay quiet and only a long sit gets
+ * a hum, and phrases are never closer than the minimum gap, even across a stop
+ * and restart. On the charger the brain shows DOCKED, which never sings.
  * stopSinging() cuts any phrase off the moment he moves again. All song state
  * lives on the clip thread.
  *
@@ -53,11 +57,9 @@ final class ClipPlayer {
     private static final String[] SONG_CLIPS = {"song-1.wav", "song-2.wav", "song-3.wav", "song-4.wav"};
     /** The reaction group held prepared, so a call's answer skips the prepare delay. */
     static final String ANSWER_GROUP = "answer";
-    /** Still for this long before the first phrase. */
-    private static final long FIRST_SONG_DELAY_MS = 3000;
-    /** Quiet gap between phrases, drawn from this range. */
-    private static final long SONG_GAP_MIN_MS = 6000;
-    private static final long SONG_GAP_MAX_MS = 12000;
+    /** Quiet gap before the first phrase and between phrases, drawn from this range. */
+    private static final long SONG_GAP_MIN_MS = 45000;
+    private static final long SONG_GAP_MAX_MS = 90000;
 
     private final Context context;
     private final HandlerThread thread = new HandlerThread("explore-clips");
@@ -272,7 +274,7 @@ final class ClipPlayer {
                     return;
                 }
                 singing = true;
-                handler.postDelayed(singPhrase, FIRST_SONG_DELAY_MS);
+                handler.postDelayed(singPhrase, songGap());
             }
         });
     }
@@ -307,7 +309,7 @@ final class ClipPlayer {
                 return;
             }
             MediaPlayer p = songs[random.nextInt(songs.length)];
-            long gap = SONG_GAP_MIN_MS + (long) (random.nextDouble() * (SONG_GAP_MAX_MS - SONG_GAP_MIN_MS));
+            long gap = songGap();
             if (p != null) {
                 try {
                     p.seekTo(0);
@@ -321,6 +323,11 @@ final class ClipPlayer {
             handler.postDelayed(this, gap);
         }
     };
+
+    /** Clip thread only: a quiet gap drawn from SONG_GAP_MIN_MS..SONG_GAP_MAX_MS. */
+    private long songGap() {
+        return SONG_GAP_MIN_MS + (long) (random.nextDouble() * (SONG_GAP_MAX_MS - SONG_GAP_MIN_MS));
+    }
 
     void release() {
         handler.post(new Runnable() {

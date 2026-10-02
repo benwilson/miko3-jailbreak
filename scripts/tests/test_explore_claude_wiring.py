@@ -94,6 +94,42 @@ class AdapterWiringTest(unittest.TestCase):
             self.assertIn(look, glance.group(1), look)
 
 
+class DockedQuietWiringTest(unittest.TestCase):
+    """Docked means quiet (owner 2026-10-02): the brain shows EyeState.DOCKED on the charger,
+    ModeApp sings only for RESTING and EYES_ONLY, and the song elsewhere is occasional."""
+
+    def test_docked_eyes_are_mapped_and_never_sing(self):
+        app = code_only(src("ModeApp.java"))
+        self.assertRegex(app, r"case DOCKED:\s*setExploreState\(ExploreState\.IDLE_STATE\)")
+        sing = re.search(r"if \((.*?)\)\s*\{\s*c\.startSinging\(\);", app, re.S)
+        self.assertIsNotNone(sing)
+        self.assertNotIn("DOCKED", sing.group(1))
+        self.assertIn("EyeState.RESTING", sing.group(1))
+        self.assertIn("EyeState.EYES_ONLY", sing.group(1))
+
+    def test_the_song_gap_is_45_to_90_s_and_there_is_no_quick_first_phrase(self):
+        player = code_only(src("ClipPlayer.java"))
+        lo = int(re.search(r"SONG_GAP_MIN_MS\s*=\s*(\d+)", player).group(1))
+        hi = int(re.search(r"SONG_GAP_MAX_MS\s*=\s*(\d+)", player).group(1))
+        self.assertEqual((lo, hi), (45000, 90000))
+        self.assertNotIn("FIRST_SONG_DELAY_MS", player)
+        start = re.search(r"void startSinging\(\)\s*\{(.*?)\n    \}", player, re.S).group(1)
+        self.assertIn("handler.postDelayed(singPhrase, songGap())", start)
+        phrase = re.search(r"Runnable singPhrase = new Runnable\(\)(.*?)\n    \};", player, re.S).group(1)
+        self.assertIn("songGap()", phrase)
+
+    def test_the_brain_hands_the_charger_to_the_eyes_and_silences_the_startle_there(self):
+        brain = code_only(src("ExploreBrain.java"))
+        self.assertIn("enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING, GLANCE, LISTENING, DOCKED }",
+                      brain)
+        show = re.search(r"private void show\(EyeState s, Direction gaze\)\s*\{(.*?)eyes\.show", brain, re.S).group(1)
+        self.assertIn("classifier.charger()", show)
+        self.assertIn("EyeState.DOCKED", show)
+        startle = re.search(r"if \(classifier\.charger\(\)\)\s*\{[^}]*\}\s*else if \([^)]*\)\s*\{\s*sound\.playStartle\(\);",
+                            brain)
+        self.assertIsNotNone(startle)
+
+
 class EarsAdapterWiringTest(unittest.TestCase):
     """The continuous ears as step input (meeting plan U7; KTD1, KTD5, KTD6): ModeApp builds the
     adapter and hands it to the loop and the port; the adapter maps every callback field, follows

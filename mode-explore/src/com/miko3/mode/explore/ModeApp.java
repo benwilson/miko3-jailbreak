@@ -251,7 +251,8 @@ public class ModeApp extends Application {
     private final ExploreBrain.Eyes eyes = new ExploreBrain.Eyes() {
         @Override
         public void show(ExploreBrain.EyeState state, ExploreBrain.Direction gaze) {
-            // He sings while parked: resting after being cornered, or eyes-only.
+            // He sings while parked: resting after being cornered, or eyes-only. Never DOCKED
+            // (owner 2026-10-02): on the charger the brain shows DOCKED and he sits quietly.
             ClipPlayer c = clips;
             if (c != null) {
                 if (state == ExploreBrain.EyeState.RESTING || state == ExploreBrain.EyeState.EYES_ONLY) {
@@ -286,6 +287,10 @@ public class ModeApp extends Application {
                     break;
                 case LISTENING:
                     setExploreState(ExploreState.of(ExploreState.LISTENING));
+                    break;
+                case DOCKED:
+                    // On the charger: the ordinary awake look, glancing about, and no song.
+                    setExploreState(ExploreState.IDLE_STATE);
                     break;
                 default:
                     setExploreState(ExploreState.IDLE_STATE);

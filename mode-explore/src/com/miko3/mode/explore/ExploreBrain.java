@@ -473,7 +473,7 @@ final class ExploreBrain {
     /** ...and THINKING: waiting for Claude's answer (explore on Claude R7). */
     /** ...and GLANCE: eyes sliding toward a voice (gaze is its side; meeting plan R3, KTD12),
      * and LISTENING: attentive, looking for a face turned toward him or hearing a reply. */
-    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING, GLANCE, LISTENING }
+    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING, GLANCE, LISTENING, DOCKED }
 
     enum State {
         EYES_ONLY, PAUSE, LOOK, TURN, HOP, STARTLE, BACK_OFF, CORNERED, STOPPED,
@@ -484,7 +484,8 @@ final class ExploreBrain {
         RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF,
         RECOVER,
         CUE_TURN, CUE_LOOK, CUE_WHERE,
-        CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES;
+        CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES,
+        DOCKED;
 
         /** A curiosity stop's looking states: the camera is always open in these (R2, AE6). */
         boolean curious() {
@@ -1320,6 +1321,18 @@ final class ExploreBrain {
     private String chatSettled;
     /** The acknowledgement clip's window (KTD14): the local question waits for it to end. */
     private long ackUntil = NEVER;
+    /**
+     * Docked (owner 2026-10-02): whether he has been on the charger since he last left it,
+     * when the next look is due, a look being waited for (the detector unparked) and its
+     * window, and a look out with Claude (asking holds the port's slot).
+     */
+    private boolean onDock;
+    private long dockLookAt = NEVER;
+    private boolean dockLooking;
+    private long dockLookAfter;
+    private long dockLookDeadline;
+    private boolean dockAsking;
+    private Look dockLook;
     /** The side the voice that started this stop came from, or null: the resume leg turns away from it. */
     private Direction chatCueSide;
     private Direction chatSide;
@@ -1621,6 +1634,15 @@ final class ExploreBrain {
             }
         } else if (state.chats()) {
             chatStallSince = NEVER;
+        }
+        // Docked (owner 2026-10-02): on the charger he sits still and quiet instead of roaming.
+        if (state != State.DOCKED && dockable() && classifier.charger()) {
+            enterDocked(now);
+        }
+        if (state == State.DOCKED) {
+            watchLooks(now);
+            dockStep(now);
+            return;
         }
         boolean hazard = s == HazardClassifier.Status.HAZARD;
         watchLooks(now);
@@ -2359,8 +2381,11 @@ final class ExploreBrain {
         escapeDir = escapeSide(h);
         corneredAfterStartle = recordHazard(now);
         corneredAfterStartle |= wedgedNow(now);
-        // One "whoa" per stall streak: repeat stalls flinch quietly.
-        if (!stalledNow || stallStreak == 1) {
+        // One "whoa" per stall streak: repeat stalls flinch quietly. On the charger (the
+        // latch refuses the leg he drove onto it with) he settles without a sound.
+        if (classifier.charger()) {
+            note("on the charger: no startle");
+        } else if (!stalledNow || stallStreak == 1) {
             sound.playStartle();
         }
         show(EyeState.FLINCH, null);
@@ -3077,7 +3102,8 @@ final class ExploreBrain {
         if (!camera.available() || !leaseHeld || now < curiosityOffUntil) {
             return false;
         }
-        if (state.curious() || state.cueSearch() || state.chats()) {
+        if (state.curious() || state.cueSearch() || state.chats() || state == State.DOCKED) {
+            // Docked: opened once and kept open, the detector parked between looks (syncPark).
             return true;
         }
         if ((state == State.MEET || state.confirms()) && chatLikely()) {
@@ -7787,8 +7813,9 @@ final class ExploreBrain {
         if (state.chats()) {
             return chatVerdict(c);
         }
-        if (state == State.EYES_ONLY || !camera.available() || now < curiosityOffUntil) {
-            // He cannot move, or has no camera to decide with: only a call opens a meeting (callVerdict).
+        if (state == State.EYES_ONLY || state == State.DOCKED || !camera.available() || now < curiosityOffUntil) {
+            // He cannot move (eyes-only, or docked: a shove or a voice there is not a reason to
+            // turn), or has no camera to decide with: only a call opens a meeting (callVerdict).
             return CueVerdict.DROP;
         }
         if (remarkUnderway()) {
@@ -7991,6 +8018,9 @@ final class ExploreBrain {
     /** Stops whatever the state was doing so the search can start: the wheels, a stop's pick or line, a leg plan. */
     private void leaveForCue() {
         stopMotors();
+        if (state == State.DOCKED) {
+            dropDockLook("a call");
+        }
         if (state.inStop()) {
             if (pendingLine != null) {
                 note("a voice before the line started: dropping the remark");
@@ -8618,7 +8648,8 @@ final class ExploreBrain {
 
     /** The detector is parked through the CHAT states except for the one look the conversation asks for (KTD7). */
     private void syncPark() {
-        boolean want = (state.chats() || (state == State.MEET || state.confirms()) && chatLikely()) && !chatLookWanted;
+        boolean want = (state.chats() || (state == State.MEET || state.confirms()) && chatLikely()) && !chatLookWanted
+                || state == State.DOCKED && !dockLooking;
         if (want != parked) {
             parked = want;
             if (!parked && cameraOpen) {
@@ -8803,6 +8834,223 @@ final class ExploreBrain {
     }
 
     // ---- entering states ----
+
+    // ---- docked (owner 2026-10-02) ----
+    //
+    // On the charger the latch refuses every leg, so roaming there was refusals,
+    // escape turns that whirred, startles and the resting song. Now any roaming,
+    // escaping or resting state becomes DOCKED the moment the latch is seen: no wheels,
+    // eyes DOCKED (no song), the camera open with the detector parked. Every
+    // dockLookMs, while nothing else is going on, he unparks for one look; Claude
+    // (else the detector) decides, and he speaks only for a thing he has not reacted
+    // to this session, with a line he has not said. Anything else is silence. Calls
+    // still take him out of DOCKED (callStep runs first) and come back to it after.
+
+    /** States DOCKED may replace: roaming, escaping and resting, never a stop, a call or a conversation. */
+    private boolean dockable() {
+        return (state.roams() || state == State.CORNERED || state == State.RECOVER)
+                && call == null && !callChatOpening && chat == null;
+    }
+
+    private void enterDocked(long now) {
+        note(onDock ? "docked: sitting still again" : "docked: on the charger; sitting still and quiet, a look every "
+                + tuning.dockLookMs + " ms");
+        onDock = true;
+        stopMotors();
+        dropWriggle();
+        recoverProbing = false;
+        cancelAsk();
+        cancelWayOut();
+        planner.reset();
+        esc = null;
+        probing = false;
+        probeThen = null;
+        escShortBack = false;
+        backForTurn = false;
+        retryWaiting = false;
+        turnRetrying = false;
+        trustLeg = false;
+        trustLegDoor = false;
+        escape = false;
+        jammed = false;
+        cancelDoorway(now, "docked");
+        endSeek(now, false, "docked");
+        cancelMetCheck();
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        steerWaitUntil = NO_WAIT;
+        target = null;
+        pick = null;
+        heldPick = null;
+        afterOrient = null;
+        cues.clear();
+        if (cueHeld != null) {
+            dropCue("docked: the held cue is dropped");
+            cueHeld = null;
+        }
+        awayLeg = null;
+        dockLooking = false;
+        dockAsking = false;
+        dockLook = null;
+        dockLookAt = now + tuning.dockLookMs;
+        state = State.DOCKED;
+        show(EyeState.DOCKED, null);
+    }
+
+    /** DOCKED, each step: off the charger roams again; else the next look, or the one being waited for or asked about. */
+    private void dockStep(long now) {
+        if (!classifier.charger()) {
+            onDock = false;
+            dropDockLook(null);
+            note("docked: off the charger; roaming again");
+            scheduleCuriosity(now);
+            enterPause(now, pauseMs(), false);
+            return;
+        }
+        show(EyeState.DOCKED, null);
+        if (dockAsking) {
+            dockAnswerStep(now);
+            return;
+        }
+        if (!dockLooking) {
+            if (now < dockLookAt || !dockQuiet(now)) {
+                return;
+            }
+            if (!cameraOpen) {
+                note("docked look: no camera now; the next in " + tuning.dockLookMs + " ms");
+                dockLookAt = now + tuning.dockLookMs;
+                return;
+            }
+            // The detector unparks at the end of this step; the look must be taken after it settles.
+            dockLooking = true;
+            dockLookAfter = now + tuning.lookSettleMs;
+            dockLookDeadline = Math.max(now, cameraClosedAt + tuning.reopenGapMs) + tuning.firstLookTimeoutMs;
+            return;
+        }
+        Look look = camera.latest();
+        if (look != null && look.frameMs >= dockLookAfter) {
+            dockLooking = false;
+            dockLookAt = now + tuning.dockLookMs;
+            onDockLook(now, look);
+        } else if (now >= dockLookDeadline) {
+            dockLooking = false;
+            dockLookAt = now + tuning.dockLookMs;
+            note("docked look: no look in time; the next in " + tuning.dockLookMs + " ms");
+        }
+    }
+
+    /** Nothing else going on: no call or its conversation opening, no answer clip, nothing being said. */
+    private boolean dockQuiet(long now) {
+        return call == null && !callChatOpening && now >= ackUntil && pendingLine == null && port.sayFinished();
+    }
+
+    /** One look: to Claude when it can be asked, else (or when Claude fails) the detector decides. */
+    private void onDockLook(long now, Look look) {
+        if (look.jpeg != null && port.canAsk() && lookBudgetLeft(now)) {
+            spendLook(now);
+            asking = true;
+            dockAsking = true;
+            dockLook = look;
+            askDeadline = now + tuning.askTimeoutMs;
+            List<CuriosityPort.Frame> frames = new ArrayList<CuriosityPort.Frame>();
+            frames.add(new CuriosityPort.Frame(0, look.jpeg));
+            note("docked look: asking Claude for anything new");
+            port.ask(new CuriosityPort.LookRequest(frames, recent(now), now < peopleIgnoredUntil,
+                    new ArrayList<String>(reacted), new ArrayList<String>(saidLines)), tuning.askTimeoutMs);
+            return;
+        }
+        dockDetectorLook(now, look);
+    }
+
+    /** Claude's answer to a docked look: a remark only for a new thing with a fresh line; anything else is silence. */
+    private void dockAnswerStep(long now) {
+        CuriosityPort.Answer a = port.answer();
+        if (a == null) {
+            if (now >= askDeadline) {
+                note("docked look: no answer from Claude in " + tuning.askTimeoutMs + " ms; the detector decides");
+                cancelAsk();
+                dockAsking = false;
+                dockDetectorLook(now, dockLook);
+                dockLook = null;
+            }
+            return;
+        }
+        asking = false;
+        dockAsking = false;
+        Look look = dockLook;
+        dockLook = null;
+        if (a.status == CuriosityPort.Answer.Status.NOTHING) {
+            note("docked look: nothing new (Claude); quiet");
+            return;
+        }
+        if (a.status != CuriosityPort.Answer.Status.PICK || a.frame != 0 || a.box == null || a.kind == null) {
+            note("docked look: Claude's answer failed or was unusable; the detector decides");
+            dockDetectorLook(now, look);
+            return;
+        }
+        if (a.kind.isLiving()) {
+            // A person or a pet: a call is how they reach him here, and the ears are open.
+            note("docked look: Claude picked a person or an animal; quiet");
+            return;
+        }
+        // A thing's label (never a person's description: they returned above) may be noted.
+        String thing = a.box.label;
+        if (seenLoosely(thing)) {
+            note("docked look: Claude picked something he reacted to already (" + thing + "); quiet");
+            return;
+        }
+        if (!usable(a.line) || saidBefore(a.line)) {
+            note("docked look: no fresh line about the " + thing + "; quiet");
+            return;
+        }
+        note("docked look: something new, the " + thing + ": saying it");
+        pick = a;
+        pickAt = now;
+        pickRecentred = false;
+        remarkOnly = false;
+        target = null;
+        remember(a.box.label, a.kind, now);
+        // SPEAK closes the camera for the line; finishPick marks it seen, and the step after is DOCKED again.
+        speakRemark(now, a.line);
+    }
+
+    /** The detector's verdict on a docked look: says the name of the biggest thing he has not reacted to, else nothing. */
+    private void dockDetectorLook(long now, Look look) {
+        Detection best = null;
+        if (look != null) {
+            for (Detection d : look.detections) {
+                if (d.score < tuning.confidenceFloor || Sighting.BACKGROUND.contains(d.label)
+                        || Sighting.isPersonOrPet(d.label) || seenLoosely(d.label)) {
+                    continue;
+                }
+                if (best == null || d.area() > best.area()) {
+                    best = d;
+                }
+            }
+        }
+        if (best == null) {
+            note("docked look: nothing new (detector); quiet");
+            return;
+        }
+        note("docked look: something new, a " + best.label + " (detector): saying its name");
+        markSeen(best.label);
+        remember(best.label, CuriosityPort.Kind.of(best.label), now);
+        sound.playName(best.label);
+    }
+
+    /** Leaves a docked look half-done: the look or Claude's answer to it is dropped (why: a note, or null for none). */
+    private void dropDockLook(String why) {
+        if (dockAsking) {
+            cancelAsk();
+            if (why != null) {
+                note("docked look: Claude's answer dropped for " + why);
+            }
+        }
+        dockAsking = false;
+        dockLooking = false;
+        dockLook = null;
+    }
 
     private void enterEyesOnly(String why) {
         handBackCall("the lease or the sensors lost");
@@ -9700,6 +9948,11 @@ final class ExploreBrain {
     }
 
     private void show(EyeState s, Direction gaze) {
+        if ((s == EyeState.RESTING || s == EyeState.EYES_ONLY) && classifier.charger()) {
+            // On the charger every still look is the docked one: ModeApp sings only for these two.
+            s = EyeState.DOCKED;
+            gaze = null;
+        }
         if (s == shownState && gaze == shownGaze) {
             return;
         }

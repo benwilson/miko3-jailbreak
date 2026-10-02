@@ -2013,6 +2013,12 @@ public final class ExploreBrainHarness {
             case CHAT_THINK: case CHAT_SPEAK: case CHAT_LISTEN: case CHAT_NOTES:
                 // Open with the detector parked (KTD7), unless the lease was lost mid-conversation.
                 return null;
+            case DOCKED:
+                // Docked (owner 2026-10-02): open with the detector parked between looks, never toggled per look.
+                if (open && !available) {
+                    return "camera open without a camera in " + s;
+                }
+                return open && backedOff ? "camera open during its back-off in " + s : null;
             default:
                 break;
         }
@@ -3328,6 +3334,7 @@ public final class ExploreBrainHarness {
         lookAroundScenarios();
         robotSeekScenarios();
         chatScenarios();
+        dockScenarios();
         callScenarios();
         callFindScenarios();
         callSideScenarios();
@@ -14622,4 +14629,146 @@ public final class ExploreBrainHarness {
                     p);
         });
     }
+    // ---- docked: quiet on the charger, a remark only for something new (owner 2026-10-02) ----
+    //
+    // On the charger he used to roam on: every leg refused, startles, escape turns that
+    // whirred, and the eyes-only song every few seconds. Docked he now sits still in
+    // DOCKED with the eyes DOCKED (ModeApp sings only for RESTING and EYES_ONLY), takes
+    // one camera look every dockLookMs, and speaks only for something he has not
+    // reacted to this session with a line he has not said.
+
+    /** Docked from the first reading: Claude as given, the cue rig's people. */
+    private static Rig dockRig(Claude claude, Vision v) {
+        Rig rig = new Rig(cueTuning().build(), t -> charger(t), v, true, claude);
+        rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah", "Hi {name}!", "Hello again!");
+        rig.people.lines = STRANGER;
+        return rig;
+    }
+
+    /** A kettle in view from 100 s on. */
+    private static final Vision KETTLE_FROM_100S = (r, t) -> t >= 100000
+            ? list(box("kettle", 0.8f, 0.1f, 0.5f, 0.2f, 0.3f)) : list();
+
+    /** Claude: nothing until the kettle comes, then the kettle with a fresh line every time. */
+    private static final Claude KETTLE_PICKS = (r, req, nth) -> r.now >= 100000
+            ? pick(0, "kettle", CuriosityPort.Kind.OTHER, "Ooh, a kettle, take " + nth + "!", 0.1f, 0.5f, 0.2f, 0.3f)
+            : CuriosityPort.Answer.nothing();
+
+    /** Eye states that make ModeApp sing (RESTING, EYES_ONLY) shown in [from, to). */
+    private static int singingEyes(Rig rig, long from, long to) {
+        return rig.countPrefix("eyes RESTING", from, to) + rig.countPrefix("eyes EYES_ONLY", from, to);
+    }
+
+    private static int sounds(Rig rig, long from, long to) {
+        return rig.countPrefix("startle", from, to) + rig.countPrefix("react ", from, to)
+                + rig.countPrefix("name ", from, to) + rig.countPrefix("say ", from, to);
+    }
+
+    private static void dockScenarios() {
+        scenario("dock_five_minutes_docked_no_songs_no_startles_no_wheels", n -> {
+            Rig rig = dockRig((r, req, nth) -> CuriosityPort.Answer.nothing(), EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.shoveAt(90000, 900);
+            rig.cue(150000, Ears.Kind.VOICE, Ears.Side.LEFT, -60f);
+            rig.runUntil(300000);
+            int asks = rig.asks.size();
+            check(n, rig.brain.state() == ExploreBrain.State.DOCKED && rig.count("eyes DOCKED") >= 1
+                            && singingEyes(rig, 500, 300001) == 0 && sounds(rig, 0, 300001) == 0
+                            && rig.motions(0, 300001) == 0 && asks >= 4 && asks <= 5
+                            && rig.count("camera open") == 1 && rig.count("camera close") == 0
+                            && notesWith(notes, "docked: on the charger") == 1
+                            && notesWith(notes, "docked look: nothing new") == asks && rig.violations.isEmpty(),
+                    "state=" + rig.brain.state() + " singing=" + singingEyes(rig, 500, 300001) + " sounds="
+                            + sounds(rig, 0, 300001) + " motions=" + rig.motions(0, 300001) + " asks=" + asks
+                            + " opens=" + rig.count("camera open") + " closes=" + rig.count("camera close")
+                            + " docked=" + notesWith(notes, "docked: on the charger") + " " + rig.tail());
+        });
+        scenario("dock_a_new_thing_appearing_is_remarked_once", n -> {
+            Rig rig = dockRig(KETTLE_PICKS, KETTLE_FROM_100S);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(200000);
+            int said = rig.firstAfter("say ", 0);
+            check(n, rig.countPrefix("say ", 0, 200001) == 1 && rig.timeOf(said) > 100000
+                            && rig.timeOf(said) <= 100000 + 60000 + 5000
+                            && rig.what(said).startsWith("say Ooh, a kettle") && rig.motions(0, 200001) == 0
+                            && rig.count("startle") == 0 && singingEyes(rig, 500, 200001) == 0
+                            && notesWith(notes, "docked look: something new") == 1
+                            && rig.brain.state() == ExploreBrain.State.DOCKED && rig.violations.isEmpty(),
+                    "lines=" + spoken(rig) + " at " + rig.timeOf(said) + " motions=" + rig.motions(0, 200001)
+                            + " state=" + rig.brain.state() + " " + rig.tail());
+        });
+        scenario("dock_the_same_thing_still_there_is_not_remarked_again", n -> {
+            Rig rig = dockRig(KETTLE_PICKS, KETTLE_FROM_100S);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(450000);
+            long said = rig.timeOf(rig.firstAfter("say ", 0));
+            int asksAfter = rig.countPrefix("ask ", said + 1, 450001);
+            check(n, rig.countPrefix("say ", 0, 450001) == 1 && asksAfter >= 4
+                            && notesWith(notes, "docked look: Claude picked something he reacted to already") == asksAfter
+                            && sounds(rig, said + 1, 450001) == 0 && rig.motions(0, 450001) == 0
+                            && rig.violations.isEmpty(),
+                    "lines=" + spoken(rig) + " asksAfter=" + asksAfter + " already="
+                            + notesWith(notes, "docked look: Claude picked something he reacted to already") + " "
+                            + rig.tail());
+        });
+        scenario("dock_detector_only_a_new_thing_says_its_name_once", n -> {
+            Rig rig = dockRig((r, req, nth) -> CuriosityPort.Answer.nothing(), KETTLE_FROM_100S);
+            rig.askRefused = true;
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(400000);
+            int named = rig.firstAfter("name ", 0);
+            check(n, rig.countPrefix("name ", 0, 400001) == 1 && rig.what(named).equals("name kettle")
+                            && rig.timeOf(named) > 100000 && rig.timeOf(named) <= 165000 && rig.asks.isEmpty()
+                            && rig.countPrefix("say ", 0, 400001) == 0 && rig.count("startle") == 0
+                            && rig.motions(0, 400001) == 0 && notesWith(notes, "docked look: nothing new") >= 3
+                            && rig.violations.isEmpty(),
+                    "named@" + rig.timeOf(named) + " " + rig.what(named) + " asks=" + rig.asks.size() + " " + rig.tail());
+        });
+        scenario("dock_a_call_is_answered_and_the_conversation_runs_without_turning", n -> {
+            Rig rig = callChatRig(chatFirstTuning(), t -> charger(t), EMPTY_ROOM, hearWords("hi"), hearWords("bye"));
+            rig.started();
+            rig.runUntil(70000);
+            ExploreBrain.State before = rig.brain.state();
+            heyMiko(rig, 75000, Ears.Side.LEFT, 800, "anyone home");
+            rig.runUntil(75000);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 75000, 95000);
+            long over = chatOver(rig, open);
+            TurnAsk first = firstAsk(rig, 75000);
+            rig.runUntil(Math.max(rig.now, over) + 5000);
+            check(n, before == ExploreBrain.State.DOCKED && open > 0 && over > 0 && first != null
+                            && "anyone home".equals(first.request.heard) && wheelMoves(rig, 0, rig.now + 1) == 0
+                            && rig.chatTurns == 0 && rig.count("startle") == 0
+                            && rig.brain.state() == ExploreBrain.State.DOCKED && rig.violations.isEmpty(),
+                    "before=" + before + " open@" + open + " over@" + over + " first=" + first + " after="
+                            + rig.brain.state() + " wheels=" + wheelMoves(rig, 0, rig.now + 1) + " " + rig.tail());
+        });
+        scenario("dock_driving_onto_the_charger_is_no_startle_and_he_settles", n -> {
+            Rig rig = cueRig(cueTuning(), t -> t >= 20000 ? charger(t) : clear(t), EMPTY_ROOM);
+            rig.started();
+            rig.runUntil(120000);
+            check(n, rig.motions(0, 20000) > 0 && rig.countPrefix("startle", 20000, 120001) == 0
+                            && rig.motions(20500, 120001) == 0 && singingEyes(rig, 20000, 120001) == 0
+                            && rig.brain.state() == ExploreBrain.State.DOCKED && rig.violations.isEmpty(),
+                    "before=" + rig.motions(0, 20000) + " startles=" + rig.countPrefix("startle", 20000, 120001)
+                            + " after=" + rig.motions(20500, 120001) + " state=" + rig.brain.state() + " " + rig.tail());
+        });
+        scenario("dock_taken_off_the_charger_he_roams_again", n -> {
+            Rig rig = cueRig(cueTuning(), t -> t < 60000 ? charger(t) : clear(t), EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(59000);
+            ExploreBrain.State docked = rig.brain.state();
+            rig.runUntil(90000);
+            check(n, docked == ExploreBrain.State.DOCKED && rig.brain.state() != ExploreBrain.State.DOCKED
+                            && rig.motions(0, 60000) == 0 && rig.motions(60000, 90001) > 0
+                            && notesWith(notes, "docked: off the charger") == 1 && rig.violations.isEmpty(),
+                    "docked=" + docked + " now=" + rig.brain.state() + " motions after=" + rig.motions(60000, 90001)
+                            + " " + rig.tail());
+        });
+    }
+
 }
