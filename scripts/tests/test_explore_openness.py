@@ -11,6 +11,7 @@ under fixtures/explore_openness_harness paints synthetic frames and prints one
 PASS/FAIL line per scenario. The camera's side (decode, dump switch, logging)
 is Android-only and is checked here by reading its source.
 """
+import importlib.util
 import re
 import subprocess
 import sys
@@ -44,7 +45,7 @@ GATE_CHECKS = (
     "open_frame_is_trusted_once_taught",
     "wall_reads_blocked_in_every_bin",
     "wall_scores_clearly_below_the_doorway",
-    "plant_and_chair_stay_below_the_doorway",
+    "doorway_outranks_the_plant_and_chair",
 )
 
 
@@ -70,7 +71,7 @@ class OpennessHarnessTest(unittest.TestCase):
         "profile_has_sixteen_bins_in_range",
         # Edges
         "all_dark_frame_has_low_confidence",
-        "no_detections_and_no_taught_floor_is_low_confidence",
+        "no_taught_floor_still_scores_the_geometry_and_is_trusted",
         "textured_bottom_rows_are_not_a_floor_sample",
         "floor_patches_are_capped",
         "band_optional_whole_frame_alone_still_scores",
@@ -93,6 +94,12 @@ class OpennessHarnessTest(unittest.TestCase):
         # After U9 brightened the camera: a grey wall over a grey carpet
         "grey_wall_the_colour_of_a_bright_taught_carpet_still_reads_blocked",
         "a_stray_floor_row_at_a_chairs_foot_is_not_a_view_past_it",
+        # Robot 2026-10-01: walls were taught as floor; the free-space boundary
+        "a_wall_he_faces_is_never_taught_as_floor",
+        "a_wall_he_once_faced_never_makes_a_white_wall_read_open",
+        "carpet_the_model_never_saw_under_a_hallway_end_reads_unsure_not_blocked",
+        "grainy_carpet_in_a_dim_frame_teaches",
+        "free_floor_scores_by_its_distance",
     )
 
     @classmethod
@@ -184,6 +191,56 @@ class OpennessRealFrameGateTest(unittest.TestCase):
 
 
 jvm_harness.add_scenario_tests(OpennessRealFrameGateTest)
+
+
+class OpennessLabelledFramesTest(unittest.TestCase):
+    """The offline evaluation (scripts/eval-explore-openness.py) on its labelled
+    robot frames (fixtures/explore_openness_eval: 46 frames at 160x120, people
+    pixelated, each bin labelled drivable / blocked / unclear). Robot
+    2026-10-01: the old scorer, taught walls, read four of six doorway frames
+    0.00 in every bin and a white wall 0.56-0.81; on this set it scored 0.54
+    (carried model) to 0.71 (untaught) per-bin accuracy, 0.64 wall-taught."""
+
+    @classmethod
+    def setUpClass(cls):
+        if jvm_harness.find_jdk() is None:
+            raise unittest.SkipTest("no JDK (javac + java) found")
+        spec = importlib.util.spec_from_file_location("eval_openness", REPO / "scripts" / "eval-explore-openness.py")
+        cls.ev = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.ev)
+        cls.labels = cls.ev.load_labels()
+        cls.names = list(cls.labels)
+        cls.results, cls.ms = cls.ev.run_java(cls.names)
+
+    def counts(self, cond, names):
+        return self.ev.score(self.labels, self.results[cond], names)
+
+    def test_the_set_is_big_enough_and_labelled_per_bin(self):
+        self.assertGreaterEqual(len(self.names), 40)
+        for n, v in self.labels.items():
+            self.assertRegex(v["open"], r"^[01?]{16}$", n)
+            self.assertTrue((self.ev.FRAMES / f"{n}.png").is_file(), n)
+
+    def test_bins_agree_with_the_labels_in_every_teaching_condition(self):
+        for cond in self.ev.CONDITIONS:
+            t = self.counts(cond, self.names)
+            acc = (t["tp"] + t["tn"]) / (t["tp"] + t["tn"] + t["fp"] + t["fn"])
+            self.assertGreaterEqual(acc, 0.85, f"{cond}: {self.ev.fmt(t)}")
+
+    def test_walls_rarely_read_open(self):
+        walls = [n for n in self.names if self.labels[n]["kind"] == "wall"]
+        for cond in self.ev.CONDITIONS:
+            t = self.counts(cond, walls)
+            self.assertLessEqual(t["fp"] / (t["fp"] + t["tn"]), 0.05, f"{cond}: {self.ev.fmt(t)}")
+
+    def test_no_doorway_capture_reads_blocked_everywhere(self):
+        for cond in self.ev.CONDITIONS:
+            for n in ("o1", "o2", "o3", "o4", "o5", "o6"):
+                conf, bins = self.results[cond][n]
+                self.assertGreater(max(bins), self.ev.OPEN_ABOVE, f"{cond} {n}: {bins}")
+
+    def test_walls_he_faced_are_not_taught(self):
+        self.assertEqual(self.results["wall_patches"], 0)
 
 
 class OpennessIsPrivateTest(unittest.TestCase):

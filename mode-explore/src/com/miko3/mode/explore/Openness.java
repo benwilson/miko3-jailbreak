@@ -8,51 +8,65 @@ import java.util.Locale;
 /**
  * How open the floor ahead looks in one camera frame (explore nav plan U3,
  * KTD3): BINS column bins across the frame, each 0 (blocked) to 1 (open), plus
- * a confidence. Three cheap signals, never a depth model:
+ * a confidence. Cheap signals, never a depth model:
  * <ol>
  * <li>the detector's boxes: a box whose bottom edge reaches low in the frame is
  * near and blocks its columns; one ending above the horizon only dents them;</li>
- * <li>a floor-colour model of the bottom rows, a few patches so a rug still
- * reads as floor. A colour never taught reads unsure (UNSURE), not blocked:
- * the floor sensor, not the camera, stops him near his nose (KTD9);</li>
- * <li>a horizon test: floor never shows above the horizon, so whatever sits just
- * above it and carries on down into the lower frame is standing in the way,
- * and the further down it reaches the nearer it is. With the floor taught, a
- * surface that comes well down with no floor between it and the floor run at
- * the bottom stands where that run ends (a wall 2 ft off leaves a sliver).</li>
+ * <li>the free-space boundary: in narrow column strips, from the frame bottom
+ * upward, where the surface at the bottom ends (the first clear colour edge).
+ * Floor never shows above the horizon and everything standing on the floor
+ * taller than the camera crosses it, so a bottom surface that ends below the
+ * horizon is floor, and the higher its end the farther the free floor runs;
+ * one that carries on past the horizon (or fills the band) is a wall, a desk
+ * side, a chair leg: blocked. A bin is its most blocked strip, so a chair leg
+ * a few pixels wide blocks its bin;</li>
+ * <li>a floor-colour model: a bottom surface whose colour was never taught
+ * reads unsure (UNSURE) at best, not blocked (KTD9).</li>
  * </ol>
+ * Robot 2026-10-01 (scripts/eval-explore-openness.py, 46 labelled frames): the
+ * old colour-run scorer was taught WALLS. A plain wall fills the bottom-centre
+ * sample evenly, so it passed the evenness test, while real carpet is grainy at
+ * this camera's ISO and was refused; a wall-taught model then read the hallway
+ * carpet as a standing surface (every bin 0.00) and the white wall as open.
+ * Geometry decides now; colour only caps.
  *
  * Teaching (R2, "floor sensor and camera together"): a frame captured while the
- * floor was clear and the wheels free leaves its bottom-centre patch pending.
- * It is taught once the brain reports he drove over it (floorDrivenOver), and
- * dropped if a hazard or stall comes first (floorHazard); a late frame from
- * before that hazard is refused. Low light or no taught floor gives low
- * confidence, and the brain then leans on the boxes and the floor sensor.
+ * floor was clear and the wheels free leaves its bottom-centre patch pending,
+ * but only when the boundary says that patch is floor (its surface ends below
+ * the horizon, above the patch). It is taught once the brain reports he drove
+ * over it (floorDrivenOver), and dropped if a hazard or stall comes first
+ * (floorHazard); a late frame from before that hazard is refused. Low light
+ * gives low confidence, and the brain then leans on the boxes and the floor
+ * sensor.
  *
  * Plain Java (no Android or shared-driver imports) so it runs on the host JVM.
  * It never logs and keeps no pixels, only colour means (R15). Methods are
  * synchronized: ExploreCamera scores on its detect thread and forwards the
- * brain's teach and hazard calls. Thresholds were tuned on U3's gate frames,
- * dim ones and bright ones from after the camera ran its own exposure (U9);
- * this camera is tilted up (see HORIZON), and colour distances are scaled for
- * dim light (apart()). Colour never overrules the horizon: a grey wall can be
- * the grey carpet's colour, so only where the floor run ends says how near.
+ * brain's teach and hazard calls. This camera sits ~15 cm up, tilted up ~16
+ * degrees (see HORIZON): the nearest floor it sees, the frame's bottom row, is
+ * already about 1 m ahead.
  */
 final class Openness {
     static final int BINS = 16;
     /**
      * Where the horizon falls, as a fraction of frame height (top 0). The camera
-     * sits ~10 cm up and tilts upward, so its horizon is well below the frame's
-     * middle: in the U3 gate frames the far floor through a doorway ends at ~0.85
-     * and a wall 2-3 ft away meets the floor at ~0.98, both putting it near 0.82.
+     * tilts UP, so its horizon is well below the frame's middle, not above it:
+     * on the robot's frames the far end of a hallway's floor ends at 0.85-0.86
+     * and door jambs lean in toward the top (vertical lines meeting above the
+     * frame), both putting it near 0.82 (a ~16 degree tilt at 526 px focal).
      * Floor never shows above it; everything standing on the floor crosses it.
      */
-    static final float HORIZON = 0.8f;
+    static final float HORIZON = 0.82f;
+    /**
+     * The sharper band ExploreCamera passes starts this high (fraction of frame
+     * height), a little above HORIZON, so a surface can be followed past it.
+     */
+    static final float BAND_TOP = 0.7f;
     /** Floor colours kept; the least recently taught is forgotten first. */
     static final int MAX_PATCHES = 4;
     /** Samples awaiting the brain's word; the oldest is dropped first. */
     static final int MAX_PENDING = 8;
-    /** What a colour the model never saw scores: unsure, not blocked. */
+    /** What a colour the model never saw scores at best: unsure, not blocked. */
     static final float UNSURE = 0.5f;
 
     /** A box whose bottom edge is at or below this (the nearer half of the ground below the horizon) blocks its columns. */
@@ -61,51 +75,62 @@ final class Openness {
     private static final float FAR_BOX_PENALTY = 0.15f;
     /** A box counts for a bin when it covers at least this share of the bin's width. */
     private static final float MIN_BIN_OVERLAP = 0.25f;
-    /** The band just above the horizon that the horizon test follows down. */
-    private static final float REFERENCE_ROWS = 0.04f;
-    /** A reach this short (share of the lower frame) is a far wall's base, not in the way. */
-    private static final float REACH_MARGIN = 0.1f;
+    /** Strip width, as a share of the frame width: 5 px of the 160 px band, two strips a bin. */
+    private static final float STRIP = 1f / 32f;
     /**
-     * A surface coming down this far (share of the lower frame) from the horizon
-     * is standing in front of him, not a far wall's base (those end within the
-     * ground band's top fifth or so, the true horizon sitting just below HORIZON).
+     * The boundary: two rows apart, a colour step over EDGE (RGB distance scaled
+     * by EDGE_LIGHT / (luma + EDGE_DARK), so a step means as much in a dim frame
+     * as in a bright one without blowing up sensor noise in the dark) ends the
+     * surface at the bottom. A slow shading of the carpet toward the light never
+     * steps that far between two rows.
      */
-    private static final float STANDING_REACH = 0.25f;
+    private static final int EDGE_GAP = 2;
+    private static final float EDGE = 25f;
+    private static final float EDGE_LIGHT = 64f;
+    private static final float EDGE_DARK = 20f;
+    /** A boundary this little above the horizon (share of frame height) is still the floor's far end. */
+    private static final float HORIZON_SLACK = 0.01f;
     /**
-     * Colour distance (RGB, 0..441, scaled for dim light by apart()) within which
-     * neighbouring pixels are one surface, and how far a surface may drift from
-     * its colour at the horizon (shading down a plain wall) and still count as it.
+     * The camera's geometry, to turn a boundary row into a distance along the
+     * floor: focal length as a share of frame height (526 px of 480), and its
+     * height above the floor. Its tilt follows from HORIZON. The bottom row is
+     * then ~1.0 m ahead, 0.96 ~1.3 m, 0.9 ~2.3 m, 0.86 ~4 m.
      */
-    private static final float SAME_SURFACE = 32f;
-    private static final float SURFACE_DRIFT = 64f;
-    /** The least step (same units) at which a surface coming down meets the floor. */
-    private static final float FLOOR_EDGE = 12f;
+    private static final float FOCAL = 526f / 480f;
+    private static final float CAMERA_HEIGHT_M = 0.15f;
     /**
-     * Shading and sensor noise scale with brightness, so below this luma colour
-     * distances are scaled up by LIGHT_REFERENCE / luma (this camera's frames are
-     * dim: luma 20-35 in office light), never by more than LIGHT_REFERENCE / MIN_LIGHT.
+     * Free floor of d metres scores (d - NEAR_M) / (d - NEAR_M + SOFT_M): 0 at
+     * NEAR_M (about the nearest floor the camera sees), the steer's blocked line
+     * (0.35) at ~1.25 m, its fully open line (0.7) at ~1.7 m, 0.9 at ~3.4 m. Tuned on the labelled frames
+     * (scripts/eval-explore-openness.py): something standing within ~1.2 m
+     * (reaching the bottom ~3% of the frame) is blocked.
      */
-    private static final float LIGHT_REFERENCE = 64f;
-    private static final float MIN_LIGHT = 16f;
+    private static final float NEAR_M = 1.1f;
+    private static final float SOFT_M = 0.25f;
+    /** The bottom rows (share of frame height) whose colour is the strip's floor colour. */
+    private static final float FLOOR_ROWS = 0.03f;
     /** A floor patch matches within this distance plus twice its spread, up to MAX_FLOOR_TOLERANCE. */
     private static final float FLOOR_TOLERANCE = 30f;
     private static final float MAX_FLOOR_TOLERANCE = 60f;
-    /** A bin's row is floor when at least this share of its pixels match a patch. */
-    private static final float FLOOR_ROW_SHARE = 0.6f;
     /**
-     * Floor rows past a gap in the bottom run (at least this share of the band's
-     * rows) mean the floor is seen beyond whatever broke the run.
+     * Shading and sensor noise scale with brightness, so below this luma floor
+     * colour distances are scaled up by LIGHT_REFERENCE / luma (this camera's
+     * frames are dim: luma 20-35 in office light), never by more than
+     * LIGHT_REFERENCE / MIN_LIGHT.
      */
-    private static final float FLOOR_BEYOND_SHARE = 0.08f;
-    /** The teaching sample: the bottom rows (the nearer half of the ground), centre columns (what he drives onto next). */
+    private static final float LIGHT_REFERENCE = 64f;
+    private static final float MIN_LIGHT = 16f;
+    /** The teaching sample: the bottom rows (the nearer ground), centre columns (what he drives onto next). */
     private static final float SAMPLE_TOP = 0.9f;
     private static final float SAMPLE_LEFT = 0.3f;
     private static final float SAMPLE_RIGHT = 0.7f;
+    /** A centre strip is sampled only when its floor runs at least this high above the frame bottom (share of height). */
+    private static final float SAMPLE_FLOOR = 0.04f;
     /**
      * A sample more varied than this is not one floor (a toy, a seam, an edge).
-     * Texture grows with brightness: a carpet read 4 in dim light and 21 once
-     * the camera brightened itself (U9), so the limit is the larger of a fixed
-     * floor and a share of the sample's luma.
+     * Measured over strip-row means (a carpet's grain at ISO 3200 averaged out),
+     * and growing with brightness, so the limit is the larger of a fixed floor
+     * and a share of the sample's luma.
      */
     private static final float MAX_SAMPLE_SPREAD = 18f;
     private static final float MAX_SAMPLE_SPREAD_SHARE = 0.45f;
@@ -117,8 +142,12 @@ final class Openness {
     private static final float DARK_LUMA = 8f;
     private static final float DIM_LUMA = 30f;
     private static final float SAMPLE_LUMA = 12f;
+    /**
+     * The boundary needs no taught floor, so an untaught profile is trusted
+     * (over the steer's 0.5), just less than one whose floor colour is known.
+     */
     private static final float TAUGHT_CONFIDENCE = 0.9f;
-    private static final float UNTAUGHT_CONFIDENCE = 0.3f;
+    private static final float UNTAUGHT_CONFIDENCE = 0.6f;
     /** Merging stops weighting history beyond this many samples, so a patch follows the light. */
     private static final int MERGE_WEIGHT_CAP = 20;
     /**
@@ -226,17 +255,22 @@ final class Openness {
     private final List<Sample> pending = new ArrayList<>();
     private long hazardMs = Long.MIN_VALUE;
     private long seq;
-    /** Scoring buffers, kept between frames (score() is synchronized); resized when the frame size changes. */
-    private boolean[] floorMask = new boolean[0];
-    /** All false, never written: the mask when no floor is taught. */
-    private boolean[] noFloor = new boolean[0];
-    private float[] reference = new float[0];
+    /**
+     * Scoring buffers, kept between frames (score() is synchronized); resized when
+     * the strip count changes. Per strip: where its bottom surface ends (fraction
+     * of frame height; NaN: it carries on past the horizon or fills the band),
+     * and that surface's colour at the bottom, packed r,g,b.
+     */
+    private float[] boundary = new float[0];
+    private float[] bottomColour = new float[0];
+    /** One strip's row colours, packed r,g,b, bottom row last. */
+    private float[] rows = new float[0];
 
     /**
      * Scores one frame. whole covers the full frame at low resolution; band, when
-     * given, the rows below the horizon at a higher one (else whole's lower rows
-     * serve). teachable: captured while the floor was clear and the wheels free,
-     * so its bottom patch may become a pending sample. Never throws.
+     * given, the rows from BAND_TOP down at a higher one (else whole serves).
+     * teachable: captured while the floor was clear and the wheels free, so its
+     * bottom patch may become a pending sample. Never throws.
      */
     synchronized Profile score(Frame whole, Frame band, List<Detection> detections, long frameMs, boolean teachable) {
         float[] boxes = null;
@@ -246,11 +280,12 @@ final class Openness {
                 return blind(boxes);
             }
             Frame lower = band != null && band.usable() ? band : whole;
+            int strips = boundaries(lower);
             if (teachable && frameMs > hazardMs) {
-                sample(lower, frameMs);
+                sample(lower, strips, frameMs);
             }
             float light = clamp01((meanLuma(whole) - DARK_LUMA) / (DIM_LUMA - DARK_LUMA));
-            float[] bins = judge(whole, lower, boxes);
+            float[] bins = judge(lower, strips, boxes);
             return new Profile(bins, light * (patches.isEmpty() ? UNTAUGHT_CONFIDENCE : TAUGHT_CONFIDENCE));
         } catch (RuntimeException e) {
             return blind(boxes);
@@ -324,276 +359,218 @@ final class Openness {
         return open;
     }
 
-    private float[] judge(Frame whole, Frame lower, float[] boxes) {
-        int first = 0;
-        while (first < lower.height && lower.rowCentre(first) < HORIZON) {
-            first++;
-        }
-        int rows = lower.height - first;
-        int w = lower.width;
+    /**
+     * Each bin: its most blocked strip's openness from the free floor below its
+     * boundary, capped at UNSURE where the strip's floor colour was never taught,
+     * and never above the boxes.
+     */
+    private float[] judge(Frame lower, int strips, float[] boxes) {
         float[] bins = new float[BINS];
-        if (rows <= 0) {
-            return blind(boxes).bins;
-        }
-        boolean[] floor = floorMask(lower, first, rows);
-        float[] reference = referenceAboveHorizon(whole, w);
-        float[] reachSum = new float[BINS];
-        int[] columns = new int[BINS];
-        for (int x = 0; x < w; x++) {
-            int bin = Math.min(BINS - 1, x * BINS / w);
-            columns[bin]++;
-            reachSum[bin] += reach(lower, first, rows, floor, x, reference);
+        boolean[] seen = new boolean[BINS];
+        Arrays.fill(bins, 1f);
+        for (int i = 0; i < strips; i++) {
+            float open = stripOpen(i);
+            int b = Math.min(BINS - 1, (int) ((i + 0.5f) * BINS / strips));
+            bins[b] = Math.min(bins[b], open);
+            seen[b] = true;
         }
         for (int b = 0; b < BINS; b++) {
-            int x0 = (b * w + BINS - 1) / BINS;
-            int x1 = Math.min(w, ((b + 1) * w + BINS - 1) / BINS);
-            float colour = UNSURE;
-            int free = 0;
-            int beyond = 0;
-            if (!patches.isEmpty() && x1 > x0) {
-                boolean run = true;
-                for (int y = rows - 1; y >= 0; y--) {
-                    int hits = 0;
-                    for (int x = x0; x < x1; x++) {
-                        if (floor[y * w + x]) {
-                            hits++;
-                        }
-                    }
-                    boolean isFloor = hits >= FLOOR_ROW_SHARE * (x1 - x0);
-                    run &= isFloor;
-                    if (run) {
-                        free++;
-                    } else if (isFloor) {
-                        beyond++;
-                    }
-                }
-                colour = UNSURE + (1f - UNSURE) * free / rows;
+            if (!seen[b]) {
+                // Fewer strips than bins (a narrow frame): the strip under its centre.
+                bins[b] = stripOpen(Math.min(strips - 1, (int) ((b + 0.5f) * strips / BINS)));
             }
-            float reach = columns[b] == 0 ? 0f : reachSum[b] / columns[b];
-            boolean floorBeyond = beyond >= FLOOR_BEYOND_SHARE * rows;
-            if (!patches.isEmpty() && reach > STANDING_REACH && !floorBeyond) {
-                // A surface comes well down from the horizon and no taught floor shows
-                // between it and the floor run at the bottom (if any): it stands where
-                // that run ends, even where its colour broke first (a chair's seat
-                // above its base). Floor seen beyond a gap keeps the gap unsure (KTD9);
-                // a stray row of shadowed carpet at a chair's foot is not a view past it.
-                reach = Math.max(reach, 1f - (float) free / rows);
-            }
-            float horizon = 1f - clamp01((reach - REACH_MARGIN) / (1f - REACH_MARGIN));
-            bins[b] = clamp01(Math.min(boxes[b], Math.min(horizon, colour)));
+            bins[b] = clamp01(Math.min(boxes[b], bins[b]));
         }
         return bins;
     }
 
-    /**
-     * Per lower-frame column, the mean colour of whole's rows just above the
-     * horizon, packed r,g,b; NaN only when the frame has no rows there. Floor
-     * never shows above the horizon, so this is never floor, even when its colour
-     * is the floor's: a grey wall over a grey carpet (the camera brightened by
-     * U9) matched the carpet and was waved through as open floor.
-     */
-    private float[] referenceAboveHorizon(Frame whole, int w) {
-        int from = -1;
-        int to = -1;
-        for (int y = 0; y < whole.height; y++) {
-            float c = whole.rowCentre(y);
-            if (c < HORIZON) {
-                to = y;
-                if (from < 0 && c >= HORIZON - REFERENCE_ROWS) {
-                    from = y;
-                }
-            }
+    /** One strip's openness: 0 standing, else its free floor, capped at UNSURE for an untaught colour. */
+    private float stripOpen(int i) {
+        float end = boundary[i];
+        if (Float.isNaN(end)) {
+            return 0f;
         }
-        if (reference.length != w * 3) {
-            reference = new float[w * 3];
+        float open = freeOpen(end);
+        if (open > UNSURE && !taught(bottomColour[i * 3], bottomColour[i * 3 + 1], bottomColour[i * 3 + 2])) {
+            open = UNSURE;
         }
-        float[] ref = reference;
-        if (to < 0) {
-            Arrays.fill(ref, Float.NaN);
-            return ref;
+        return open;
+    }
+
+    /** Openness of free floor running up to row end (fraction of frame height), from its distance. */
+    static float freeOpen(float end) {
+        double below = Math.atan((end - 0.5) / FOCAL) - Math.atan((HORIZON - 0.5) / FOCAL);
+        if (below <= 1e-4) {
+            return 1f;
         }
-        if (from < 0) {
-            from = to;
-        }
-        for (int x = 0; x < w; x++) {
-            int wx = Math.min(whole.width - 1, (int) ((x + 0.5f) * whole.width / w));
-            float r = 0f;
-            float g = 0f;
-            float b = 0f;
-            for (int y = from; y <= to; y++) {
-                int p = whole.at(wx, y);
-                r += (p >> 16) & 0xff;
-                g += (p >> 8) & 0xff;
-                b += p & 0xff;
-            }
-            int n = to - from + 1;
-            r /= n;
-            g /= n;
-            b /= n;
-            ref[x * 3] = r;
-            ref[x * 3 + 1] = g;
-            ref[x * 3 + 2] = b;
-        }
-        return ref;
+        double d = CAMERA_HEIGHT_M / Math.tan(below);
+        return clamp01((float) ((d - NEAR_M) / (d - NEAR_M + SOFT_M)));
     }
 
     /**
-     * How far (share of the lower frame) the surface above the horizon carries on
-     * down this column: pixel to pixel, so the shading down a plain wall is
-     * followed, but never drifting far from its colour at the horizon. It ends at
-     * floor only across an edge (a wall's base, its shadow line): a dim wall can
-     * shade smoothly into a floor-like grey without ever reaching the floor, and
-     * a bright grey wall can be the floor's colour all the way down. Each pixel
-     * is averaged with its left and right neighbours first: an edge the surface
-     * ends at runs across the column, while single-pixel JPEG noise (steps over
-     * FLOOR_EDGE on a plain bright wall) does not.
+     * Fills boundary and bottomColour for each strip of lower and returns the
+     * strip count. A strip's rows are averaged across it, then walked from the
+     * bottom up: the first step over EDGE between rows EDGE_GAP apart ends the
+     * surface at the bottom. Ending above the horizon (by more than
+     * HORIZON_SLACK), or never ending inside the band, it is standing: NaN.
      */
-    private static float reach(Frame lower, int first, int rows, boolean[] floor, int x, float[] ref) {
-        float r = ref[x * 3];
-        if (Float.isNaN(r)) {
-            return 0f;
-        }
-        float g = ref[x * 3 + 1];
-        float b = ref[x * 3 + 2];
-        float refLuma = luma(r, g, b);
-        float pr = r;
-        float pg = g;
-        float pb = b;
-        float pl = refLuma;
-        int last = -1;
-        int xl = Math.max(0, x - 1);
-        int xr = Math.min(lower.width - 1, x + 1);
-        for (int y = 0; y < rows; y++) {
-            float cr = 0f;
-            float cg = 0f;
-            float cb = 0f;
-            for (int xx = xl; xx <= xr; xx++) {
-                int p = lower.at(xx, first + y);
-                cr += (p >> 16) & 0xff;
-                cg += (p >> 8) & 0xff;
-                cb += p & 0xff;
-            }
-            int n = xr - xl + 1;
-            cr /= n;
-            cg /= n;
-            cb /= n;
-            float cl = luma(cr, cg, cb);
-            float sr = cr - pr;
-            float sg = cg - pg;
-            float sb = cb - pb;
-            float stepSq = sr * sr + sg * sg + sb * sb;
-            float stepScale = dimScale((cl + pl) / 2f);
-            float dr = cr - r;
-            float dg = cg - g;
-            float db = cb - b;
-            // apart(c, previous) > SAME_SURFACE, apart(c, reference) > SURFACE_DRIFT, apart(c, previous) > FLOOR_EDGE
-            if (!apartAtMost(stepSq, stepScale, SAME_SURFACE)
-                    || !apartAtMost(dr * dr + dg * dg + db * db, dimScale((cl + refLuma) / 2f), SURFACE_DRIFT)
-                    || (floor[y * lower.width + x] && !apartAtMost(stepSq, stepScale, FLOOR_EDGE))) {
-                break;
-            }
-            pr = cr;
-            pg = cg;
-            pb = cb;
-            pl = cl;
-            last = y;
-        }
-        if (last < 0) {
-            return 0f;
-        }
-        return clamp01((lower.rowBottom(first + last) - HORIZON) / (1f - HORIZON));
-    }
-
-    /**
-     * Which of the lower frame's rows below the horizon match a taught floor
-     * colour: apart(pixel, patch) within the patch's tolerance, for any patch.
-     * The same shared all-false mask when nothing is taught.
-     */
-    private boolean[] floorMask(Frame lower, int first, int rows) {
+    private int boundaries(Frame lower) {
         int w = lower.width;
-        if (floorMask.length != rows * w) {
-            floorMask = new boolean[rows * w];
-            noFloor = new boolean[rows * w];
+        int h = lower.height;
+        int strips = Math.max(Math.min(w, BINS), w / Math.max(1, Math.round(w * STRIP)));
+        if (boundary.length != strips) {
+            boundary = new float[strips];
+            bottomColour = new float[strips * 3];
         }
-        int k = patches.size();
-        if (k == 0) {
-            return noFloor;
+        if (rows.length != h * 3) {
+            rows = new float[h * 3];
         }
-        float[] fr = new float[k];
-        float[] fg = new float[k];
-        float[] fb = new float[k];
-        float[] fl = new float[k];
-        float[] tolerance = new float[k];
-        for (int i = 0; i < k; i++) {
-            Patch f = patches.get(i);
-            fr[i] = f.r;
-            fg[i] = f.g;
-            fb[i] = f.b;
-            fl[i] = luma(f.r, f.g, f.b);
-            tolerance[i] = f.tolerance();
-        }
-        for (int y = 0; y < rows; y++) {
-            for (int x = 0; x < w; x++) {
-                int p = lower.at(x, first + y);
-                float r = (p >> 16) & 0xff;
-                float g = (p >> 8) & 0xff;
-                float b = p & 0xff;
-                float l = luma(r, g, b);
-                boolean hit = false;
-                for (int i = 0; i < k && !hit; i++) {
-                    float dr = r - fr[i];
-                    float dg = g - fg[i];
-                    float db = b - fb[i];
-                    hit = apartAtMost(dr * dr + dg * dg + db * db, dimScale((l + fl[i]) / 2f), tolerance[i]);
+        int floorRows = Math.max(1, Math.round(FLOOR_ROWS * h / (lower.bottom - lower.top)));
+        for (int i = 0; i < strips; i++) {
+            int x0 = i * w / strips;
+            int x1 = Math.max(x0 + 1, (i + 1) * w / strips);
+            for (int y = 0; y < h; y++) {
+                float r = 0f;
+                float g = 0f;
+                float b = 0f;
+                for (int x = x0; x < x1; x++) {
+                    int p = lower.at(x, y);
+                    r += (p >> 16) & 0xff;
+                    g += (p >> 8) & 0xff;
+                    b += p & 0xff;
                 }
-                floorMask[y * w + x] = hit;
+                int n = x1 - x0;
+                rows[y * 3] = r / n;
+                rows[y * 3 + 1] = g / n;
+                rows[y * 3 + 2] = b / n;
+            }
+            float br = 0f;
+            float bg = 0f;
+            float bb = 0f;
+            int from = Math.max(0, h - floorRows);
+            for (int y = from; y < h; y++) {
+                br += rows[y * 3];
+                bg += rows[y * 3 + 1];
+                bb += rows[y * 3 + 2];
+            }
+            bottomColour[i * 3] = br / (h - from);
+            bottomColour[i * 3 + 1] = bg / (h - from);
+            bottomColour[i * 3 + 2] = bb / (h - from);
+            float end = Float.NaN;
+            for (int y = h - 1 - EDGE_GAP; y >= 0; y--) {
+                if (apart(y, y + EDGE_GAP, EDGE)) {
+                    end = lower.rowBottom(y);
+                    break;
+                }
+            }
+            boundary[i] = Float.isNaN(end) || end < HORIZON - HORIZON_SLACK ? Float.NaN : end;
+        }
+        return strips;
+    }
+
+    /** Whether rows a and b of the current strip differ by more than limit, scaled for their light. */
+    private boolean apart(int a, int b, float limit) {
+        return stepApart(rows[a * 3], rows[a * 3 + 1], rows[a * 3 + 2], rows[b * 3], rows[b * 3 + 1], rows[b * 3 + 2],
+                limit);
+    }
+
+    private static boolean stepApart(float r1, float g1, float b1, float r2, float g2, float b2, float limit) {
+        float dr = r1 - r2;
+        float dg = g1 - g2;
+        float db = b1 - b2;
+        float scale = EDGE_LIGHT / ((luma(r1, g1, b1) + luma(r2, g2, b2)) / 2f + EDGE_DARK);
+        return (dr * dr + dg * dg + db * db) * scale * scale > limit * limit;
+    }
+
+    /** Whether a colour matches a taught floor patch (false when nothing is taught). */
+    private boolean taught(float r, float g, float b) {
+        for (Patch f : patches) {
+            float dr = r - f.r;
+            float dg = g - f.g;
+            float db = b - f.b;
+            if (apartAtMost(dr * dr + dg * dg + db * db, dimScale((luma(r, g, b) + luma(f.r, f.g, f.b)) / 2f),
+                    f.tolerance())) {
+                return true;
             }
         }
-        return floorMask;
+        return false;
     }
 
     // ---- teaching ----
 
-    /** The bottom-centre patch as a pending sample, if it is one bright, even surface. */
-    private void sample(Frame lower, long frameMs) {
-        int x0 = (int) (SAMPLE_LEFT * lower.width);
-        int x1 = Math.max(x0 + 1, (int) (SAMPLE_RIGHT * lower.width));
+    /**
+     * The bottom-centre patch as a pending sample, if it is one bright, even
+     * surface and the boundary says it is floor: at least half the centre strips
+     * have a bottom surface that ends below the horizon, at least SAMPLE_FLOOR
+     * above the frame bottom, and only those strips' rows under their boundary
+     * (and under SAMPLE_TOP) are sampled. A wall he faces fills the patch just
+     * as evenly and is never floor. Evenness is measured over strip-row means,
+     * so a grainy carpet in a dim, noisy frame still counts.
+     */
+    private void sample(Frame lower, int strips, long frameMs) {
+        int s0 = (int) (SAMPLE_LEFT * strips);
+        int s1 = Math.min(strips, Math.max(s0 + 1, (int) Math.ceil(SAMPLE_RIGHT * strips)));
+        int floor = 0;
+        for (int i = s0; i < s1; i++) {
+            if (!Float.isNaN(boundary[i]) && boundary[i] <= 1f - SAMPLE_FLOOR) {
+                floor++;
+            }
+        }
+        if (floor * 2 < s1 - s0) {
+            return;
+        }
+        int w = lower.width;
+        int cells = 0;
         double r = 0;
         double g = 0;
         double b = 0;
-        int n = 0;
-        for (int y = 0; y < lower.height; y++) {
-            if (lower.rowCentre(y) < SAMPLE_TOP) {
+        float[] means = new float[(s1 - s0) * lower.height * 3];
+        for (int i = s0; i < s1; i++) {
+            if (Float.isNaN(boundary[i]) || boundary[i] > 1f - SAMPLE_FLOOR) {
                 continue;
             }
-            for (int x = x0; x < x1 && x < lower.width; x++) {
-                int p = lower.at(x, y);
-                r += (p >> 16) & 0xff;
-                g += (p >> 8) & 0xff;
-                b += p & 0xff;
-                n++;
+            int x0 = i * w / strips;
+            int x1 = Math.max(x0 + 1, (i + 1) * w / strips);
+            for (int y = 0; y < lower.height; y++) {
+                if (lower.rowCentre(y) < Math.max(SAMPLE_TOP, boundary[i])) {
+                    continue;
+                }
+                float cr = 0f;
+                float cg = 0f;
+                float cb = 0f;
+                for (int x = x0; x < x1; x++) {
+                    int p = lower.at(x, y);
+                    cr += (p >> 16) & 0xff;
+                    cg += (p >> 8) & 0xff;
+                    cb += p & 0xff;
+                }
+                int n = x1 - x0;
+                means[cells * 3] = cr / n;
+                means[cells * 3 + 1] = cg / n;
+                means[cells * 3 + 2] = cb / n;
+                r += cr / n;
+                g += cg / n;
+                b += cb / n;
+                cells++;
             }
         }
-        if (n == 0) {
+        if (cells == 0) {
             return;
         }
-        float mr = (float) (r / n);
-        float mg = (float) (g / n);
-        float mb = (float) (b / n);
+        float mr = (float) (r / cells);
+        float mg = (float) (g / cells);
+        float mb = (float) (b / cells);
         if (luma(mr, mg, mb) < SAMPLE_LUMA) {
             return;
         }
         double var = 0;
-        for (int y = 0; y < lower.height; y++) {
-            if (lower.rowCentre(y) < SAMPLE_TOP) {
-                continue;
-            }
-            for (int x = x0; x < x1 && x < lower.width; x++) {
-                float d = distance(lower.at(x, y), mr, mg, mb);
-                var += d * d;
-            }
+        for (int c = 0; c < cells; c++) {
+            float dr = means[c * 3] - mr;
+            float dg = means[c * 3 + 1] - mg;
+            float db = means[c * 3 + 2] - mb;
+            var += dr * dr + dg * dg + db * db;
         }
-        float spread = (float) Math.sqrt(var / n);
+        float spread = (float) Math.sqrt(var / cells);
         if (spread > Math.max(MAX_SAMPLE_SPREAD, MAX_SAMPLE_SPREAD_SHARE * luma(mr, mg, mb))) {
             return;
         }
@@ -689,13 +666,6 @@ final class Openness {
 
     private static float dimScale(float luma) {
         return LIGHT_REFERENCE / Math.max(MIN_LIGHT, Math.min(LIGHT_REFERENCE, luma));
-    }
-
-    private static float distance(int p, float r, float g, float b) {
-        float dr = ((p >> 16) & 0xff) - r;
-        float dg = ((p >> 8) & 0xff) - g;
-        float db = (p & 0xff) - b;
-        return (float) Math.sqrt(dr * dr + dg * dg + db * db);
     }
 
     private static float clamp01(float v) {

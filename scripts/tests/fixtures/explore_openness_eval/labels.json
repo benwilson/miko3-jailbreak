@@ -1,0 +1,410 @@
+{
+ "r143553": {
+  "source": "14-min roam frame-1790887143553.jpg",
+  "kind": "doorway",
+  "open": "1111?00000000000",
+  "masked": [
+   [
+    190,
+    60,
+    380,
+    380
+   ]
+  ]
+ },
+ "r152014": {
+  "source": "14-min roam frame-1790887152014.jpg",
+  "kind": "doorway",
+  "open": "111?000000000000",
+  "masked": []
+ },
+ "r306195": {
+  "source": "14-min roam frame-1790887306195.jpg",
+  "kind": "doorway",
+  "open": "???????1111?0000",
+  "masked": [
+   [
+    270,
+    0,
+    380,
+    380
+   ]
+  ]
+ },
+ "r320011": {
+  "source": "14-min roam frame-1790887320011.jpg",
+  "kind": "doorway",
+  "open": "111111????????11",
+  "masked": []
+ },
+ "r863484": {
+  "source": "14-min roam frame-1790887863484.jpg",
+  "kind": "doorway",
+  "open": "000000?100001111",
+  "masked": []
+ },
+ "f13": {
+  "source": "robot 2026-10-01 frame f13.jpg",
+  "kind": "doorway",
+  "open": "001111111111????",
+  "masked": [
+   [
+    470,
+    100,
+    640,
+    340
+   ]
+  ]
+ },
+ "r285851": {
+  "source": "14-min roam frame-1790887285851.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r364834": {
+  "source": "14-min roam frame-1790887364834.jpg",
+  "kind": "room",
+  "open": "1111111111111?00",
+  "masked": []
+ },
+ "r403028": {
+  "source": "14-min roam frame-1790887403028.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r492092": {
+  "source": "14-min roam frame-1790887492092.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r634854": {
+  "source": "14-min roam frame-1790887634854.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r662763": {
+  "source": "14-min roam frame-1790887662763.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r846701": {
+  "source": "14-min roam frame-1790887846701.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r921261": {
+  "source": "14-min roam frame-1790887921261.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r966005": {
+  "source": "14-min roam frame-1790887966005.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "f16": {
+  "source": "robot 2026-10-01 frame f16.jpg",
+  "kind": "wall",
+  "open": "000??????????000",
+  "masked": []
+ },
+ "f39": {
+  "source": "robot 2026-10-01 frame f39.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "f40": {
+  "source": "robot 2026-10-01 frame f40.jpg",
+  "kind": "wall",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r179997": {
+  "source": "14-min roam frame-1790887179997.jpg",
+  "kind": "furniture",
+  "open": "110??0?01111111?",
+  "masked": [
+   [
+    440,
+    100,
+    640,
+    330
+   ]
+  ]
+ },
+ "r192552": {
+  "source": "14-min roam frame-1790887192552.jpg",
+  "kind": "furniture",
+  "open": "1110?0?0?1111111",
+  "masked": [
+   [
+    480,
+    0,
+    640,
+    330
+   ],
+   [
+    0,
+    120,
+    80,
+    330
+   ]
+  ]
+ },
+ "r270784": {
+  "source": "14-min roam frame-1790887270784.jpg",
+  "kind": "furniture",
+  "open": "10?111110000????",
+  "masked": [
+   [
+    260,
+    120,
+    640,
+    370
+   ]
+  ]
+ },
+ "r335207": {
+  "source": "14-min roam frame-1790887335207.jpg",
+  "kind": "furniture",
+  "open": "1111111?0??00???",
+  "masked": [
+   [
+    240,
+    100,
+    560,
+    340
+   ]
+  ]
+ },
+ "r377186": {
+  "source": "14-min roam frame-1790887377186.jpg",
+  "kind": "furniture",
+  "open": "11111111111?0000",
+  "masked": []
+ },
+ "r587034": {
+  "source": "14-min roam frame-1790887587034.jpg",
+  "kind": "furniture",
+  "open": "?11000000000??11",
+  "masked": []
+ },
+ "r739127": {
+  "source": "14-min roam frame-1790887739127.jpg",
+  "kind": "furniture",
+  "open": "???????01111110?",
+  "masked": [
+   [
+    480,
+    120,
+    640,
+    340
+   ]
+  ]
+ },
+ "r938285": {
+  "source": "14-min roam frame-1790887938285.jpg",
+  "kind": "furniture",
+  "open": "??111110??000111",
+  "masked": [
+   [
+    0,
+    0,
+    220,
+    340
+   ]
+  ]
+ },
+ "r952239": {
+  "source": "14-min roam frame-1790887952239.jpg",
+  "kind": "furniture",
+  "open": "011110??00111111",
+  "masked": []
+ },
+ "r8100035": {
+  "source": "14-min roam frame-1790888100035.jpg",
+  "kind": "furniture",
+  "open": "1111111110??0010",
+  "masked": [
+   [
+    0,
+    60,
+    280,
+    360
+   ]
+  ]
+ },
+ "r8118094": {
+  "source": "14-min roam frame-1790888118094.jpg",
+  "kind": "furniture",
+  "open": "1111111110??0010",
+  "masked": [
+   [
+    0,
+    0,
+    280,
+    360
+   ]
+  ]
+ },
+ "f17": {
+  "source": "robot 2026-10-01 frame f17.jpg",
+  "kind": "furniture",
+  "open": "00111????0?????0",
+  "masked": [
+   [
+    0,
+    0,
+    140,
+    340
+   ]
+  ]
+ },
+ "f19": {
+  "source": "robot 2026-10-01 frame f19.jpg",
+  "kind": "furniture",
+  "open": "1110001111110000",
+  "masked": []
+ },
+ "f46": {
+  "source": "robot 2026-10-01 frame f46.jpg",
+  "kind": "furniture",
+  "open": "1111100000??????",
+  "masked": []
+ },
+ "r572326": {
+  "source": "14-min roam frame-1790887572326.jpg",
+  "kind": "under-desk",
+  "open": "0000000000??00??",
+  "masked": []
+ },
+ "r605723": {
+  "source": "14-min roam frame-1790887605723.jpg",
+  "kind": "under-desk",
+  "open": "000000000000???0",
+  "masked": []
+ },
+ "r694517": {
+  "source": "14-min roam frame-1790887694517.jpg",
+  "kind": "under-desk",
+  "open": "00000???????0000",
+  "masked": []
+ },
+ "r556605": {
+  "source": "14-min roam frame-1790887556605.jpg",
+  "kind": "under-desk",
+  "open": "00000000000000??",
+  "masked": []
+ },
+ "f14": {
+  "source": "robot 2026-10-01 frame f14.jpg",
+  "kind": "under-desk",
+  "open": "0000?????????000",
+  "masked": []
+ },
+ "f35": {
+  "source": "robot 2026-10-01 frame f35.jpg",
+  "kind": "under-desk",
+  "open": "0000000000000000",
+  "masked": []
+ },
+ "r724076": {
+  "source": "14-min roam frame-1790887724076.jpg",
+  "kind": "room",
+  "open": "????????????0000",
+  "masked": []
+ },
+ "f01": {
+  "source": "robot 2026-10-01 frame f01.jpg",
+  "kind": "wall",
+  "open": "????000000000000",
+  "masked": []
+ },
+ "o1": {
+  "source": "robot 2026-10-01 doorway capture o1.jpg",
+  "kind": "doorway",
+  "open": "111111111?000000",
+  "masked": [
+   [
+    240,
+    200,
+    380,
+    370
+   ]
+  ]
+ },
+ "o2": {
+  "source": "robot 2026-10-01 doorway capture o2.jpg",
+  "kind": "doorway",
+  "open": "11?01111?0000000",
+  "masked": [
+   [
+    190,
+    180,
+    340,
+    360
+   ]
+  ]
+ },
+ "o3": {
+  "source": "robot 2026-10-01 doorway capture o3.jpg",
+  "kind": "doorway",
+  "open": "??01111100000000",
+  "masked": [
+   [
+    180,
+    170,
+    340,
+    360
+   ]
+  ]
+ },
+ "o4": {
+  "source": "robot 2026-10-01 doorway capture o4.jpg",
+  "kind": "doorway",
+  "open": "??11111?00000000",
+  "masked": [
+   [
+    150,
+    150,
+    320,
+    360
+   ]
+  ]
+ },
+ "o5": {
+  "source": "robot 2026-10-01 doorway capture o5.jpg",
+  "kind": "doorway",
+  "open": "?111111?00000000",
+  "masked": [
+   [
+    160,
+    120,
+    330,
+    360
+   ]
+  ]
+ },
+ "o6": {
+  "source": "robot 2026-10-01 doorway capture o6.jpg",
+  "kind": "doorway",
+  "open": "?111111?00000000",
+  "masked": [
+   [
+    150,
+    130,
+    330,
+    360
+   ]
+  ]
+ }
+}

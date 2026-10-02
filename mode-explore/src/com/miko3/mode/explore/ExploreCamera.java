@@ -59,8 +59,8 @@ import java.util.concurrent.TimeUnit;
  *
  * Each look also carries an openness profile (explore nav plan U3, KTD3): the
  * kept JPEG is decoded a second time at a quarter scale, the whole frame
- * averaged down again and the floor band below the horizon kept at that
- * sharper scale, and scored by Openness with the look's boxes. Only the
+ * averaged down again and the floor band (from just above the horizon down)
+ * kept at that sharper scale, and scored by Openness with the look's boxes. Only the
  * scoring time is logged, never pixels or profiles (R15). The brain's
  * floor-clear flag rides with each captured frame so Openness learns the
  * floor only from frames he could safely drive onto.
@@ -662,7 +662,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     /**
      * Detect thread: the frame again at a quarter scale, as a whole frame averaged
-     * down to an eighth and the floor band below the horizon kept at a quarter,
+     * down to an eighth and the floor band from Openness.BAND_TOP (just above
+     * the horizon, so a surface can be followed past it) kept at a quarter,
      * scored with the look's boxes. Null when it can't be decoded.
      */
     private Openness.Profile scoreOpenness(byte[] jpeg, List<Detection> found, long frameMs, boolean teachable) {
@@ -681,7 +682,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
             }
             bmp.getPixels(smallPixels, 0, w, 0, 0, w, h);
             decodedLuma = Brightness.meanLuma(smallPixels, w * h);
-            int first = Math.min(h - 1, (int) (Openness.HORIZON * h));
+            int first = Math.min(h - 1, (int) (Openness.BAND_TOP * h));
             Openness.Frame floorBand = new Openness.Frame(smallPixels, w, h - first, (float) first / h, 1f, first);
             Openness.Frame whole = halve(smallPixels, w, h);
             // The place memory's fingerprint of this view, from the same halved frame.
