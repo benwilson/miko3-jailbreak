@@ -182,8 +182,9 @@ class LogStream:
 
     def __init__(self, robot):
         since = robot.device_time()
-        # adb joins its arguments for the remote shell, so the time's space must be quoted.
-        args = ["logcat", "-v", "time"] + (["-T", shlex.quote(since)] if since else ["-T", "1"]) + ["-s"]
+        # `adb logcat` hands its arguments over as they are (robot 2026-10-02: a quoted time
+        # reached logcat with its quotes, "not in time format", and the reader saw nothing).
+        args = ["logcat", "-v", "time"] + (["-T", since] if since else ["-T", "1"]) + ["-s"]
         args += [f"{t}:I" for t in TAGS]
         self.proc = subprocess.Popen(robot.cmd(*args), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                      text=True, errors="replace")
