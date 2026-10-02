@@ -457,6 +457,18 @@ final class ExploreTuning {
     final int chatFaceTries;
     final long chatFaceDelayMs;
     final long chatFaceGapMs;
+    /**
+     * Owner 2026-10-02: conversation first. A call opens the conversation at once (no search
+     * before it) and he looks for the caller during it, between utterances; false keeps the
+     * search-first call (find them, then the meeting). callUtteranceWaitMs: an early wake cue's
+     * answer clip waits up to this long for the utterance's end, so its deaf window never cuts
+     * off the words said with the wake word (they are the first message); 0 answers at once.
+     * callChatUnansweredMax: a call's conversation ends after this many unanswered listens in a
+     * row (not seeing them never ends it); a wordless answer gets one "didn't catch that" first.
+     */
+    final boolean callChatFirst;
+    final long callUtteranceWaitMs;
+    final int callChatUnansweredMax;
     final long chatStallGraceMs;
     final long turnBudgetMs;
     final long turnRetryMs;
@@ -990,6 +1002,9 @@ final class ExploreTuning {
         chatFaceTries = Math.max(0, b.chatFaceTries);
         chatFaceDelayMs = Math.max(0, b.chatFaceDelayMs);
         chatFaceGapMs = Math.max(0, b.chatFaceGapMs);
+        callChatFirst = b.callChatFirst;
+        callUtteranceWaitMs = Math.max(0, b.callUtteranceWaitMs);
+        callChatUnansweredMax = Math.max(1, b.callChatUnansweredMax);
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
         turnRetryMs = Math.max(0, b.turnRetryMs);
@@ -1392,6 +1407,11 @@ final class ExploreTuning {
         private int chatFaceTries = 3;
         private long chatFaceDelayMs = 1000;
         private long chatFaceGapMs = 3000;
+        // Owner 2026-10-02: conversation first; the answer waits for the wake utterance's end
+        // (a worded "Hey Miko, ..." runs about 1.5-2 s past the wake); three unanswered listens.
+        private boolean callChatFirst = true;
+        private long callUtteranceWaitMs = 2500;
+        private int callChatUnansweredMax = 3;
         private long chatStallGraceMs = 5000;
         private long turnBudgetMs = 5000;
         private long turnRetryMs = 3000;
@@ -2045,6 +2065,21 @@ final class ExploreTuning {
             this.sentenceCap = sentenceCap;
             this.transcriptWindow = transcriptWindow;
             this.deafTailMs = deafTailMs;
+            return this;
+        }
+
+        Builder callChatFirst(boolean on) {
+            this.callChatFirst = on;
+            return this;
+        }
+
+        Builder callUtteranceWaitMs(long ms) {
+            this.callUtteranceWaitMs = ms;
+            return this;
+        }
+
+        Builder callChatUnansweredMax(int n) {
+            this.callChatUnansweredMax = n;
             return this;
         }
 

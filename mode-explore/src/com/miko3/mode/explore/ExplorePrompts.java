@@ -361,6 +361,30 @@ final class ExplorePrompts {
             + "him their name before he can see their face, he thanks them and asks them to crouch down to his "
             + "level so he'll remember them.";
 
+    /**
+     * The opener of a conversation a call opened (owner 2026-10-02): he answered at once, before
+     * turning to find them, so no photo goes with it and he has not seen them yet. A short
+     * greeting-question, never the crouch invitation (CANT_SEE comes later, once he knows he
+     * can't see them) and never the name (nothing could be kept without a face, R19). It is
+     * replayed as the conversation's first message.
+     */
+    static final String CALL_OPENER = "Someone just called Miko by name and he answered right away; he is turning to "
+            + "find them and has not seen them yet. Write his opener: a short, natural greeting with a question, "
+            + "like \"Hey! What's up?\". Do not ask their name yet.";
+
+    /** Appended to turn 1 when the caller said words with the wake word: those words are what he answers. */
+    static final String CALL_WORDS = "(He was just called by name with the words above and has not seen them yet: "
+            + "answer them naturally, in a short line. Do not ask their name yet.)";
+
+    /**
+     * Appended once he knows he can't see them (owner 2026-10-02: the search found nobody, or
+     * found them with no usable face): FACELESS_OPENER's invitation, mid-conversation.
+     */
+    static final String CANT_SEE = "In this line, also say he can't see their face from down here and ask them to "
+            + "crouch down to his level so he can get a good look at them. Do not ask their name; if they tell him "
+            + "their name before he can see their face, he thanks them and asks them to crouch down so he'll "
+            + "remember them.";
+
     /** Appended to a turn's message once a face retry found a usable face for someone still unnamed. */
     static final String FACE_SEEN = "He can see their face now, so he will be able to remember them: in this line, "
             + "ask their name if he does not know it yet.";

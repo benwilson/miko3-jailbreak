@@ -27,7 +27,9 @@ import java.util.List;
  *
  * Partial utterances (the deaf window clipped them) are held rather than
  * enqueued: the next whole utterance within PARTIAL_JOIN_MS takes the stronger
- * of the two tiers, and a partial with nothing after it is dropped.
+ * of the two tiers, and a partial with nothing after it is dropped. A partial
+ * with words while a reply is armed is that reply's answer (robot 2026-10-02:
+ * they spoke as his line ended, and the launcher ends its listen on them).
  *
  * The wake word (Hey Miko plan KTD4): the launcher sends it as an early cue
  * (empty text) as soon as it is spotted, and marks the utterance's own
@@ -48,8 +50,11 @@ import java.util.List;
  * (the meeting's name reply) routes through the session while it is open, so
  * the one microphone capture is never contended (KTD1).
  *
- * Privacy (R21): the text is classified into a kind and forgotten; nothing here
- * logs an utterance, only counts and fixed reasons.
+ * Privacy (R21): the text is classified into a kind and forgotten, except a
+ * call's own words besides the address (owner 2026-10-02), which ride its cue
+ * to the brain as the conversation's first message and leave the robot only
+ * inside that conversation; nothing here logs an utterance, only counts and
+ * fixed reasons.
  */
 final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.ReadingListener {
     private static final String TAG = "ExploreEars";
@@ -223,13 +228,14 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
 
     @Override
     public void onHeard(String text, int side, float angle, int tier, long at, boolean partialUtterance, int kind,
-                        boolean called) {
+                        boolean called, String message) {
         Ears.Tier t = tier == RobotEars.TIER_STRONG ? Ears.Tier.STRONG : Ears.Tier.WEAK;
         Ears.Side s = side == RobotEars.SIDE_LEFT ? Ears.Side.LEFT
                 : side == RobotEars.SIDE_RIGHT ? Ears.Side.RIGHT : Ears.Side.UNKNOWN;
         Ears.Kind k = kindOf(kind, t);
         // The DSP's angle is already signed the brain's way (VoiceDirection: negative left); NaN passes through.
-        Ears.Cue cue = new Ears.Cue(k, t, s, angle, at, called);
+        // Owner 2026-10-02: a call's words besides the address ride its cue (null: an older launcher).
+        Ears.Cue cue = new Ears.Cue(k, t, s, angle, at, called, message);
         boolean words = text != null && !text.trim().isEmpty();
         Reply r = null;
         synchronized (lock) {
@@ -237,13 +243,18 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
                 return;
             }
             heardCount++;
-            if (partialUtterance) {
+            boolean newcomer = cue.strong() && !Float.isNaN(replyAngleDeg) && cue.hasAngle()
+                    && Math.abs(angle) > replyAngleDeg;
+            if (partialUtterance && !(reply != null && words && !newcomer)) {
                 partialCount++;
                 partial = cue;
                 return;
             }
-            boolean newcomer = cue.strong() && !Float.isNaN(replyAngleDeg) && cue.hasAngle()
-                    && Math.abs(angle) > replyAngleDeg;
+            if (partialUtterance) {
+                // Robot 2026-10-02: they answered as his line ended, so the deaf window flagged the
+                // answer partial; the launcher ended its listen on these words, so the reply takes them.
+                partialCount++;
+            }
             if (reply != null && words && !newcomer) {
                 r = reply;
                 reply = null;

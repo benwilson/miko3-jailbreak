@@ -1,5 +1,6 @@
 package com.miko3.launcher;
 
+import com.miko3.shared.CueWords;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.VoiceDirection;
 
@@ -210,13 +211,24 @@ final class EarsSession {
         final int kind;
         /** Hey Miko plan KTD4: the early wake cue for this at was already sent, so this delivery makes no call. */
         final boolean called;
+        /**
+         * Owner 2026-10-02: a call's words besides the address ("how's it going" from "Hey Miko,
+         * how's it going?"), normalised; "" for a bare call, an early cue and any other utterance.
+         */
+        final String message;
 
         Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind) {
             this(text, side, angle, tier, at, partial, kind, false);
         }
 
         Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind, boolean called) {
+            this(text, side, angle, tier, at, partial, kind, called, "");
+        }
+
+        Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind, boolean called,
+                  String message) {
             this.text = text;
+            this.message = message == null ? "" : message;
             this.side = side;
             this.angle = angle;
             this.tier = tier;
@@ -254,6 +266,10 @@ final class EarsSession {
     private boolean answering; // the utterance in progress is the open listen's answer
     private boolean answerAnnounced; // Client.answering went out for this listen (robot 2026-10-01)
     private long answerStartMs; // the announced answer's speech start
+    /** Robot 2026-10-02: why the announced answer had no words, for the "answer over" log line. */
+    private String answerOverWhy = "";
+    /** The pre-roll fed at this utterance's onset, in ms. */
+    private long uttHeadMs;
     private boolean answerOverDue; // review P2-2: the announced listen ended without words; tell the client
     private Thread captureThread;
     private boolean captureWanted;
@@ -454,7 +470,7 @@ final class EarsSession {
             answerOverDue = false;
             c = client;
             at = answerStartMs;
-            diag.log("conversation listen answer over: no words");
+            diag.log("conversation listen answer over: no words (" + answerOverWhy + ")");
         }
         if (c != null) {
             try {
@@ -505,7 +521,7 @@ final class EarsSession {
      * Caller holds feedLock. The answer in progress ended; past its start window the listen
      * ends with it. withWords: it is about to be delivered with words, so no "answer over".
      */
-    private void answerEnded(long now, boolean withWords) {
+    private void answerEnded(long now, boolean withWords, String why) {
         synchronized (this) {
             if (!answering) {
                 return;
@@ -513,6 +529,11 @@ final class EarsSession {
             answering = false;
             if (withWords) {
                 answerAnnounced = false;
+            } else if (answerAnnounced) {
+                // Robot 2026-10-02: the "answer over" line says why there were no words.
+                long toEnd = listenUntil == 0 ? 0 : listenUntil - now;
+                answerOverWhy = why + ", ended " + Math.abs(toEnd) + " ms " + (toEnd >= 0 ? "before" : "after")
+                        + " the listen's end";
             }
             if (listenUntil != 0 && now >= listenUntil) {
                 closeListen();
@@ -778,6 +799,7 @@ final class EarsSession {
                     uttFed = 0;
                     // The word began before the gate saw it: its head goes in first.
                     int head = drainPreroll();
+                    uttHeadMs = head * 1000L / SAMPLE_RATE;
                     if (head > 0) {
                         if (recognising) {
                             decode(preOut, head);
@@ -947,6 +969,7 @@ final class EarsSession {
             recognising = true; // a listen opened in this very chunk
             decode(held, heldLen);
         }
+        long fedHere = uttFed;
         recordDecode();
         String text = recognising ? recognizer.text() : "";
         text = text == null ? "" : text.trim();
@@ -972,7 +995,12 @@ final class EarsSession {
         if (uttCapAt != Long.MAX_VALUE) {
             // The listen's answer: tiered as heard in it, and the listen ends with it once its window is over.
             uttCapAt = Long.MAX_VALUE;
-            answerEnded(now, !text.isEmpty() && tier != CueClassifier.TIER_NONE);
+            answerEnded(now, !text.isEmpty() && tier != CueClassifier.TIER_NONE,
+                    "answer " + (now - at) + " ms long, " + fedHere + " chunks fed, "
+                            + (cutShort ? "deaf-clipped (a line began mid-answer)"
+                            : partial ? "deaf-clipped (it began as the deaf window closed)" : "not deaf-clipped")
+                            + ", began " + Math.max(0, at - hearingSince) + " ms after the deaf window, pre-roll "
+                            + uttHeadMs + " ms" + (text.isEmpty() ? "" : ", words but no tier"));
         }
         int side = CueClassifier.side(angle);
         if (direction.sideOnly()) {
@@ -987,8 +1015,11 @@ final class EarsSession {
             partials++;
         }
         int kind = CueClassifier.kind(text, wasWake, tier);
+        // Owner 2026-10-02: a call's words besides the address are the caller's first message.
+        String message = tier == CueClassifier.TIER_STRONG
+                && (kind == CueClassifier.KIND_WAKE_WORD || kind == CueClassifier.KIND_NAME) ? CueWords.message(text) : "";
         // wasWake: the early cue for this at already went out (every in-speech hit sends one).
-        deliver(new Utterance(text, side, angle, tier, at, partial, kind, wasWake));
+        deliver(new Utterance(text, side, angle, tier, at, partial, kind, wasWake, message));
         flushAnswerOver();
     }
 
@@ -1014,7 +1045,7 @@ final class EarsSession {
         preLen = 0;
         if (uttCapAt != Long.MAX_VALUE) {
             uttCapAt = Long.MAX_VALUE;
-            answerEnded(clock.nowMs(), false);
+            answerEnded(clock.nowMs(), false, "the capture closed mid-answer");
         }
         flushAnswerOver();
     }

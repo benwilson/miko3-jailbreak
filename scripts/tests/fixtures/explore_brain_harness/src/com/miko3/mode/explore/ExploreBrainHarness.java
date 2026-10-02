@@ -53,6 +53,11 @@ public final class ExploreBrainHarness {
                 .cues(10000, 4000, 45f, 10f, 3, 2)
                 .facingFace(0.65f, 0.12f)
                 .chat(4000, 5000, 5000, 3000, 2, 30, 500)
+                // Owner 2026-10-02: a call opens the conversation at once and he looks for the
+                // caller during it (callChatFirst, on by default). The scenarios written before
+                // it pin the search-first call so their timelines stay exact; the callchat_
+                // scenarios switch it on.
+                .callChatFirst(false)
                 .calibration(calibration());
     }
 
@@ -762,6 +767,12 @@ public final class ExploreBrainHarness {
         /** Every clip window the brain declared, and until when the last one keeps the recogniser deaf. */
         final List<Long> clipWindows = new ArrayList<Long>();
         long clipUntil = Long.MIN_VALUE;
+        /** Turns commanded in a CHAT state (owner 2026-10-02: the search during the conversation). */
+        int chatTurns;
+        /** The call conversation's opening (owner 2026-10-02): the persona, no Claude; null when none comes. */
+        CuriosityPort.MatchAnswer pendingCallChat;
+        long pendingCallChatAt;
+        int callChats;
         /** The one-shot mic (KTD1): open from listen() for its maxMs, or until heard() drains the answer. */
         long micOpenUntil = Long.MIN_VALUE;
         int listens;
@@ -976,9 +987,15 @@ public final class ExploreBrainHarness {
          * at t, keyed by the utterance's start at, and marked already called.
          */
         Rig calledCue(long t, long at, Ears.Kind kind, Ears.Side side, float angleDeg) {
+            return calledCue(t, at, kind, side, angleDeg, "");
+        }
+
+        /** As calledCue, carrying the caller's words besides the address (owner 2026-10-02; null: an older launcher). */
+        Rig calledCue(long t, long at, Ears.Kind kind, Ears.Side side, float angleDeg, String message) {
             return at(t, () -> {
-                cues.add(new Ears.Cue(kind, kind.tier, side, angleDeg, at, true));
-                log.add(new Event(t, "cue " + kind + " " + kind.tier + " " + side + " already called"));
+                cues.add(new Ears.Cue(kind, kind.tier, side, angleDeg, at, true, message));
+                log.add(new Event(t, "cue " + kind + " " + kind.tier + " " + side + " already called"
+                        + (message == null || message.isEmpty() ? "" : " with words")));
             });
         }
 
@@ -1181,6 +1198,20 @@ public final class ExploreBrainHarness {
             if (moving) {
                 violations.add(now + ":turn while still moving");
             }
+            if (brain.state().chats()) {
+                // Owner 2026-10-02: in a conversation he never turns while he speaks, while a clip
+                // plays, or while an answer is in progress (the motors would swallow the words).
+                if (now < sayingUntil) {
+                    violations.add(now + ":turn while speaking in " + brain.state());
+                }
+                if (now < clipUntil) {
+                    violations.add(now + ":turn while a clip plays in " + brain.state());
+                }
+                if (answering()) {
+                    violations.add(now + ":turn while an answer is in progress in " + brain.state());
+                }
+                chatTurns++;
+            }
             checkStart("turn", false);
             moving = true;
             motion = "turn";
@@ -1308,6 +1339,9 @@ public final class ExploreBrainHarness {
             if (!quiet() && !sayWhileBusyAllowed && !chatting) {
                 violations.add(now + ":say while a detector run is in flight in " + brain.state());
             }
+            if (moving && brain.state().chats()) {
+                violations.add(now + ":say while turning in " + brain.state());
+            }
             // The mic is a one-shot listen (KTD1): a line said while it is open is heard as the reply.
             if (micOpen()) {
                 violations.add(now + ":say while the mic is open in " + brain.state());
@@ -1339,6 +1373,27 @@ public final class ExploreBrainHarness {
             CuriosityPort.MatchAnswer a = pendingMatch;
             pendingMatch = null;
             log.add(new Event(now, "match " + a.status));
+            return a;
+        }
+
+        @Override
+        public void callChat(long timeoutMs) {
+            callChats++;
+            pendingCallChat = people.persona == null ? CuriosityPort.MatchAnswer.FAILED
+                    : CuriosityPort.MatchAnswer.faceless().withMatch(null, null, Float.NaN, -1L)
+                            .withConversation(people.persona, null, null, null);
+            pendingCallChatAt = now + 50;
+            log.add(new Event(now, "call chat"));
+        }
+
+        @Override
+        public CuriosityPort.MatchAnswer callChatAnswer() {
+            if (pendingCallChat == null || now < pendingCallChatAt) {
+                return null;
+            }
+            CuriosityPort.MatchAnswer a = pendingCallChat;
+            pendingCallChat = null;
+            log.add(new Event(now, "call chat " + a.status));
             return a;
         }
 
@@ -6893,7 +6948,9 @@ public final class ExploreBrainHarness {
         });
         scenario("pinned_backoff_resets_after_a_clean_drive_off", n -> {
             List<String> notes = new ArrayList<String>();
-            Rig rig = pinnedLadderRig(notes);
+            // Robot 2026-10-02: a first zero turn now waits for the board (RECOVER) before any
+            // ladder; this scenario is about the ladder's rests, so the wait is switched off.
+            Rig rig = pinnedRig(notes, escTuning().jamOff().stallRecoverOff());
             rig.started();
             // Pinned: ladder 1 fails, the rest, still pinned, the longer rest.
             runUntil(rig, 120000, r -> entries(r, ExploreBrain.State.CORNERED).size() >= 2);
@@ -7218,23 +7275,25 @@ public final class ExploreBrainHarness {
             rig.started();
             runUntil(rig, 150000, r -> notedAt(notes, "fully jammed") >= 0);
             rig.runUntil(rig.now + 3000);
+            // Robot 2026-10-02: the first zero turn is itself the stall, so the first wait comes at
+            // it, not after the wedge's back-up went nowhere.
+            long blocked = notedAt(notes, "measured turn blocked");
             long wedged = notedAt(notes, "wedged: a turn that would not turn");
-            long nowhere = notedAt(notes, "back-up went nowhere");
             long wait = notedAt(notes, "stall: waiting for the motor board to recover");
             long real = notedAt(notes, "no recovery after 20 s: a real jam");
             long wriggle = notedAt(notes, "wriggle LEFT: up to 10000 ms");
             long failed = notedAt(notes, "wriggle failed both ways");
             long jam = notedAt(notes, "fully jammed");
             long rest = entered(rig, ExploreBrain.State.CORNERED, 0);
-            check(n, wedged > 0 && nowhere > wedged && wait >= nowhere && real > wait && wriggle >= real
+            check(n, blocked > 0 && wait == blocked && (wedged < 0 || wedged > wait) && real > wait && wriggle >= real
                             && failed > wriggle && jam >= failed && rest >= jam && helpLines(rig, 0).size() == 1
                             && notesWith(notes, "stall: waiting for the motor board to recover") == 3
                             && notesWith(notes, "(recovery 3 of 3)") == 1
-                            && (entered(rig, ExploreBrain.State.RETRACE, nowhere + 1) < 0
-                                || entered(rig, ExploreBrain.State.RETRACE, nowhere + 1)
+                            && (entered(rig, ExploreBrain.State.RETRACE, wait + 1) < 0
+                                || entered(rig, ExploreBrain.State.RETRACE, wait + 1)
                                     >= notedAt(notes, "(recovery 1 of 3): trying the escape again"))
                             && notesWith(notes, "cornered: ") == 0 && rig.violations.isEmpty(),
-                    "wedged@" + wedged + " nowhere@" + nowhere + " wait@" + wait + " real@" + real + " wriggle@" + wriggle
+                    "blocked@" + blocked + " wedged@" + wedged + " wait@" + wait + " real@" + real + " wriggle@" + wriggle
                             + " failed@" + failed + " jam@" + jam + " rest@" + rest + " notes="
                             + notes.subList(Math.max(0, notes.size() - 25), notes.size()));
         });
@@ -7283,6 +7342,47 @@ public final class ExploreBrainHarness {
     }
 
     private static void recoverScenarios() {
+        scenario("recover_a_first_zero_turn_with_no_stall_before_it_waits_for_the_board_and_backs_out", n -> {
+            // Robot 2026-10-02 09:21:58: a roaming turn read 0 of 60 deg with its wheels still and
+            // no stall before it; it went straight to the escape ladder, whose turns and back-ups
+            // all read zero inside the board's cutout, and he rested "fully jammed". The zero turn
+            // is itself the stall: it stamps the stall clock and he waits in RECOVER, then backs out.
+            Rig[] h = new Rig[1];
+            long[] pinnedAt = {-1};
+            List<String> notes = new ArrayList<String>();
+            Rig rig = escRig(escTuning().turnChance(1.0), h, t -> {
+                Rig r = h[0];
+                if (r == null) {
+                    return clear(t);
+                }
+                if (pinnedAt[0] < 0 && r.brain.state() == ExploreBrain.State.LOOK) {
+                    // The board latched as the turn was about to start: it reads 0 deg and 0 counts.
+                    pinnedAt[0] = t;
+                    pin(r, true);
+                }
+                if (pinnedAt[0] >= 0 && t >= pinnedAt[0] + 6000 && r.yaw.stuck) {
+                    pin(r, false);
+                }
+                return clear(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 60000, r -> pinnedAt[0] >= 0 && notedAt(notes, "the board is back") >= 0);
+            long back = notedAt(notes, "the board is back");
+            rig.runUntil(Math.max(back, rig.now) + 15000);
+            long blocked = notedAt(notes, "measured turn blocked");
+            long wait = notedAt(notes, "stall: waiting for the motor board");
+            long wedged = notedAt(notes, "wedged");
+            long jammed = notedAt(notes, "fully jammed");
+            List<Long> backs = backDrives(rig, back, Long.MAX_VALUE);
+            check(n, pinnedAt[0] > 0 && blocked > pinnedAt[0] && wait >= blocked && wait <= blocked + 100
+                            && (wedged < 0 || wedged > back) && jammed < 0 && back > wait && !backs.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "pinned@" + pinnedAt[0] + " blocked@" + blocked + " wait@" + wait + " wedged@" + wedged
+                            + " jammed@" + jammed + " back@" + back + " backs=" + backs + " notes="
+                            + notesAfter(notes, Math.max(0, pinnedAt[0] - 200)));
+        });
         scenario("recover_a_12s_cutout_probes_find_nothing_until_20s_then_the_normal_escape", n -> {
             // Live 14:33: the board refused everything after the stall, then came back on its
             // own. He waits still; the 2, 5 and 10 s probes give nothing, the 20 s one moves,
@@ -13271,6 +13371,7 @@ public final class ExploreBrainHarness {
         });
         usableFaceScenarios();
         facelessCallScenarios();
+        callChatFirstScenarios();
     }
 
     // ---- a roaming person is met only with a usable face (owner 2026-10-01) ----
@@ -13357,6 +13458,242 @@ public final class ExploreBrainHarness {
             }
         }
         return -1;
+    }
+
+
+    // ---- conversation first, the caller found during it (owner 2026-10-02) ----
+    //
+    // Robot 09:08:57: a call from his right, eight search looks, the caller's voice opened the
+    // conversation with nobody in view, one wordless answer, "one look for them", over after one
+    // turn. Owner: "he needs to be able to carry on a conversation even before he's managed to
+    // turn and recognize the person." Now a call opens the conversation at once (the words said
+    // with the wake word are the first message), he looks for the caller between utterances, and
+    // not seeing them never ends it: three unanswered listens do, and a wordless answer first
+    // gets "Sorry, I didn't catch that?".
+
+    private static ExploreTuning.Builder chatFirstTuning() {
+        return cueTuning().callChatFirst(true);
+    }
+
+    /** A conversation-first rig: nobody's face usable unless the scenario says so, these listens. */
+    private static Rig callChatRig(ExploreTuning.Builder b, Feed feed, Vision v, Hearing... listens) {
+        Rig rig = chatRig(b, feed, v, false);
+        rig.people.match = (r, k) -> noFace(r);
+        rig.people.listen = ListenScript.turns(listens);
+        return rig;
+    }
+
+    private static Rig callChatRig(Vision v, Hearing... listens) {
+        return callChatRig(chatFirstTuning(), CLEAR, v, listens);
+    }
+
+    /** "Hey Miko" at t from side (no angle), its utterance's end delivered endMs later with message (endMs < 0: none). */
+    private static void heyMiko(Rig rig, long t, Ears.Side side, long endMs, String message) {
+        rig.cue(t, Ears.Kind.WAKE_WORD, side, Float.NaN);
+        if (endMs >= 0) {
+            rig.calledCue(t + endMs, t, Ears.Kind.WAKE_WORD, side, Float.NaN, message);
+        }
+    }
+
+    /** The first turn request at or after from, or null. */
+    private static TurnAsk firstAsk(Rig rig, long from) {
+        for (TurnAsk a : rig.turnAsks) {
+            if (a.t >= from) {
+                return a;
+            }
+        }
+        return null;
+    }
+
+    /** The wheel turns commanded in [from, to): {t, 1 for LEFT, -1 for RIGHT} (not the port's "turn LINE" events). */
+    private static List<long[]> wheelTurns(Rig rig, long from, long to) {
+        List<long[]> out = new ArrayList<long[]>();
+        for (Event e : rig.log) {
+            if (e.t >= from && e.t < to && (e.what.equals("turn LEFT") || e.what.equals("turn RIGHT"))) {
+                out.add(new long[]{e.t, e.what.equals("turn LEFT") ? 1 : -1});
+            }
+        }
+        return out;
+    }
+
+    private static boolean searchedBeforeTheConversation(Rig rig, long from) {
+        return entered(rig, ExploreBrain.State.CUE_TURN, from) >= 0 || entered(rig, ExploreBrain.State.CUE_LOOK, from) >= 0
+                || entered(rig, ExploreBrain.State.CUE_WHERE, from) >= 0;
+    }
+
+    private static void callChatFirstScenarios() {
+        scenario("callchat_wake_with_words_opens_with_their_words_as_the_first_message_within_2_s", n -> {
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("not bad"), hearWords("bye"));
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.RIGHT, 1200, "how's it going");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            TurnAsk first = firstAsk(rig, 400);
+            long answer = answerAt(rig, 400);
+            System.out.println("REPORT worded Hey Miko: " + notesAfter(notes, 400));
+            check(n, open > 0 && over > 0 && first != null && "how's it going".equals(first.request.heard)
+                            && first.request.called && first.t - 400 <= 2000 && answer >= 1600 && answer <= first.t
+                            && rig.count("react answer") == 1 && !searchedBeforeTheConversation(rig, 400)
+                            && noted(notes, "they said goodbye") && rig.violations.isEmpty(),
+                    "open@" + open + " answer@" + answer + " first=" + (first == null ? null : first.t + " heard="
+                            + first.request.heard + " called=" + first.request.called) + " " + rig.tail());
+        });
+        scenario("callchat_bare_wake_opens_at_once_with_a_greeting_question_and_searches_during_it", n -> {
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("not much"), hearWords("sure"), hearWords("ok"),
+                    hearWords("bye"));
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.RIGHT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            TurnAsk first = firstAsk(rig, 400);
+            List<long[]> turns = wheelTurns(rig, open, over);
+            System.out.println("REPORT bare Hey Miko: " + notesAfter(notes, 400));
+            check(n, open > 0 && over > 0 && first != null && first.request.heard == null && first.request.called
+                            && !first.request.cantSee && first.t - 400 <= 1500 && !searchedBeforeTheConversation(rig, 400)
+                            && !turns.isEmpty() && turns.get(0)[1] == -1 && rig.chatTurns == turns.size()
+                            && noted(notes, "looking for the caller during the conversation")
+                            && noted(notes, "search look") && rig.violations.isEmpty(),
+                    "open@" + open + " over@" + over + " first=" + first + " cantSee=" + (first == null ? null : first.request.cantSee)
+                            + " turns=" + turns.size() + " chatTurns=" + rig.chatTurns + " first turn=" + (turns.isEmpty() ? null : turns.get(0)[1])
+                            + " searchedBefore=" + searchedBeforeTheConversation(rig, 400) + " v=" + rig.violations);
+        });
+        scenario("callchat_the_caller_found_at_look_3_gets_the_face_path_and_the_conversation_goes_on", n -> {
+            // The side-first plan to his right: 90, 135, then 45 deg, where Priya stands.
+            Rig rig = callChatRig(personAt(bearingOf(45f), 20), replies(7));
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.stranger()
+                    .withMatch(FaceMatcher.Band.WEAK, null, 0.1f, 40L + k).withConversation(r.people.persona, null, null, null);
+            rig.turns = (r, req, k) -> req.faceSeen && req.name == null ? named(k, "Priya") : turnLine(k);
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.RIGHT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            long usable = notedAt(notes, "a usable face");
+            int seen = firstFaceSeen(rig);
+            List<Long> looks = notedTimes(notes, "search look");
+            int turnsAfter = wheelTurns(rig, usable, over).size();
+            check(n, open > 0 && over > 0 && usable > open && seen > 0 && rig.turnAsks.get(seen).t > usable
+                            && looks.size() >= 3 && rig.count("match") >= 1 && turnsAfter <= 1
+                            && rig.kept.equals(java.util.Arrays.asList("Priya")) && noted(notes, "they said goodbye")
+                            && !searchedBeforeTheConversation(rig, 400) && rig.violations.isEmpty(),
+                    "usable@" + usable + " seen=" + seen + " looks=" + looks + " turnsAfter=" + turnsAfter + " at="
+                            + wheelTurns(rig, usable, over).stream().map(x -> x[0]).collect(java.util.stream.Collectors.toList())
+                            + " over@" + over + " v=" + rig.violations + " kept="
+                            + rig.kept + " notes=" + notes + " " + rig.tail());
+        });
+        scenario("callchat_never_found_goes_on_while_they_answer_and_ends_after_3_unanswered", n -> {
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("one"), hearWords("two"), hearWords("three"),
+                    hearWords("four"), hearWords("five"));
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.LEFT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            boolean cantSee = false;
+            for (TurnAsk a : rig.turnAsks) {
+                cantSee |= a.request.cantSee;
+            }
+            check(n, open > 0 && over > 0 && rig.tuning.callChatUnansweredMax == 3 && rig.turnAsks.size() == 6
+                            && noted(notes, "3 unanswered listens in a row") && !noted(notes, "walked off")
+                            && !noted(notes, "one look for them") && noted(notes, "nobody found in the search")
+                            && cantSee && rig.violations.isEmpty(),
+                    "asks=" + rig.turnAsks.size() + " cantSee=" + cantSee + " notes=" + notes + " " + rig.tail());
+        });
+        scenario("callchat_an_answer_with_no_words_gets_one_didnt_catch_that_and_does_not_count", n -> {
+            // Wordless, then two silences: had the wordless one counted, the third would end it.
+            Rig rig = callChatRig(EMPTY_ROOM, hearSilence().after(5000).answeringAfter(1000), hearSilence(),
+                    hearSilence(), hearWords("hello again"), hearWords("bye"));
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.LEFT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            boolean heardAgain = false;
+            for (TurnAsk a : rig.turnAsks) {
+                heardAgain |= "hello again".equals(a.request.heard);
+            }
+            check(n, open > 0 && over > 0 && rig.count("say " + ChatSession.DIDNT_CATCH) == 1 && heardAgain
+                            && noted(notes, "they said goodbye") && !noted(notes, "unanswered listens in a row")
+                            && rig.violations.isEmpty(),
+                    "reasks=" + rig.count("say " + ChatSession.DIDNT_CATCH) + " notes=" + notes + " " + rig.tail());
+        });
+        scenario("callchat_no_turn_is_commanded_while_he_speaks_or_an_answer_is_in_progress", n -> {
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("well").after(2600).answeringAfter(200),
+                    hearWords("and then").after(3000).answeringAfter(100), hearWords("so").after(2000).answeringAfter(50),
+                    hearWords("bye").after(1500).answeringAfter(100));
+            rig.speechMs = 2500;
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.RIGHT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.chatTurns > 0 && rig.violations.isEmpty(),
+                    "turns=" + rig.chatTurns + " violations=" + rig.violations + " " + rig.tail());
+        });
+        scenario("callchat_an_older_launcher_with_no_words_gives_the_bare_wake_opener", n -> {
+            // An older launcher: the end delivery carries no message (null); or, older still, no end
+            // is marked at all, and the answer waits out callUtteranceWaitMs.
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("bye"));
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.RIGHT, 900, null);
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            TurnAsk first = firstAsk(rig, 400);
+            Rig old = callChatRig(EMPTY_ROOM, hearWords("bye"));
+            old.started();
+            heyMiko(old, 400, Ears.Side.RIGHT, -1, null);
+            old.runUntil(400);
+            long openOld = runUntilState(old, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            TurnAsk firstOld = firstAsk(old, 400);
+            long wait = old.tuning.callUtteranceWaitMs;
+            check(n, open > 0 && first != null && first.request.heard == null && first.request.called
+                            && answerAt(rig, 400) >= 1300 && openOld > 0 && firstOld != null && firstOld.request.heard == null
+                            && answerAt(old, 400) == 400 + wait && wait == 2500 && rig.violations.isEmpty()
+                            && old.violations.isEmpty(),
+                    "first=" + first + " answer@" + answerAt(rig, 400) + " old first=" + firstOld + " old answer@"
+                            + answerAt(old, 400) + " " + old.tail());
+        });
+        scenario("callchat_a_call_that_waits_out_a_back_off_keeps_its_words_and_answers_as_the_back_off_ends", n -> {
+            // The utterance's end (with its words) arrives while the call waits for the back-off:
+            // the answer must not then wait callUtteranceWaitMs for an end that already came.
+            Rig rig = chatRig(chatFirstTuning(), t -> t >= 1500 && t < 1700 ? edgeAhead(t) : clear(t), EMPTY_ROOM, false);
+            rig.people.match = (r, k) -> noFace(r);
+            rig.people.listen = ListenScript.turns(hearWords("bye"));
+            rig.started();
+            long back = runUntilState(rig, ExploreBrain.State.BACK_OFF, 0, 20000);
+            long cueT = back + 50;
+            heyMiko(rig, cueT, Ears.Side.LEFT, 100, "are you ok");
+            rig.runUntil(cueT);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, cueT, cueT + 20000);
+            long backEnd = stateChangeAfter(rig, back);
+            TurnAsk first = firstAsk(rig, cueT);
+            long answer = answerAt(rig, cueT);
+            check(n, back > 0 && backEnd > cueT + 100 && open > 0 && first != null && "are you ok".equals(first.request.heard)
+                            && answer >= backEnd && answer <= backEnd + 100 && rig.violations.isEmpty(),
+                    "back@" + back + " backEnd@" + backEnd + " answer@" + answer + " open@" + open + " first=" + first
+                            + " " + rig.tail());
+        });
+        scenario("callchat_on_the_charger_talks_without_turning", n -> {
+            Rig rig = callChatRig(chatFirstTuning(), t -> t >= 1000 ? charger(t) : clear(t), EMPTY_ROOM,
+                    hearWords("hi"), hearWords("bye"));
+            rig.started();
+            heyMiko(rig, 4000, Ears.Side.LEFT, 800, "anyone home");
+            rig.runUntil(4000);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 4000, 24000);
+            long over = chatOver(rig, open);
+            TurnAsk first = firstAsk(rig, 4000);
+            check(n, open > 0 && over > 0 && first != null && "anyone home".equals(first.request.heard)
+                            && wheelMoves(rig, 4000, over) == 0 && rig.chatTurns == 0 && rig.violations.isEmpty(),
+                    "open@" + open + " over@" + over + " first=" + first + " moves=" + wheelMoves(rig, 4000, Math.max(4000, over))
+                            + " " + rig.tail());
+        });
     }
 
     private static void facelessCallScenarios() {

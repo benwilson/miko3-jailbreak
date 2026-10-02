@@ -124,6 +124,16 @@ interface CuriosityPort extends AnswerParser.Names {
     /** NEW with the lines, FAILED, or null while it is running. */
     MatchAnswer linesAnswer();
 
+    /**
+     * A call's conversation, opened at once (owner 2026-10-02): no Claude request and no face,
+     * only the persona snapshot from the launcher's settings, as a faceless NEW answer with
+     * the conversation attached (FAILED when the settings are unavailable).
+     */
+    void callChat(long timeoutMs);
+
+    /** callChat's answer, or null while it is running. */
+    MatchAnswer callChatAnswer();
+
     /** The name in a heard reply: the robot's own patterns first, then a small text-only Claude request (KTD4). */
     void findName(String transcript, long timeoutMs);
 
@@ -406,6 +416,13 @@ interface CuriosityPort extends AnswerParser.Names {
         }
 
         public MatchAnswer linesAnswer() {
+            return MatchAnswer.FAILED;
+        }
+
+        public void callChat(long timeoutMs) {
+        }
+
+        public MatchAnswer callChatAnswer() {
             return MatchAnswer.FAILED;
         }
 
@@ -1104,6 +1121,17 @@ interface CuriosityPort extends AnswerParser.Names {
         final boolean faceless;
         /** A usable face arrived on a retry since: he may ask the name of someone still unnamed. */
         final boolean faceSeen;
+        /**
+         * Owner 2026-10-02: the conversation opened on a call, before he had seen them. Its opener
+         * is a short greeting-question (ExplorePrompts.CALL_OPENER), or, when they said words with
+         * the wake word, those words are turn 1's heard. Fixed for the conversation.
+         */
+        final boolean called;
+        /**
+         * Owner 2026-10-02: he now knows he can't see them (the search found nobody, or found
+         * them with no usable face): this turn invites them down to his level. Once.
+         */
+        final boolean cantSee;
 
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard) {
             this(persona, name, notes, transcript, heard, null);
@@ -1116,6 +1144,13 @@ interface CuriosityPort extends AnswerParser.Names {
 
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
                     String avoidQuestion, boolean faceless, boolean faceSeen) {
+            this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, false, false);
+        }
+
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
+                    String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee) {
+            this.called = called;
+            this.cantSee = cantSee;
             this.persona = persona;
             this.name = name;
             this.notes = notes;
@@ -1128,12 +1163,20 @@ interface CuriosityPort extends AnswerParser.Names {
 
         /** This request again, with the repeated question to avoid. */
         TurnRequest avoiding(String question) {
-            return new TurnRequest(persona, name, notes, transcript, heard, question, faceless, faceSeen);
+            return new TurnRequest(persona, name, notes, transcript, heard, question, faceless, faceSeen, called,
+                    cantSee);
         }
 
         /** This request as one in a conversation that opened faceless, with or without a face since. */
         TurnRequest face(boolean openedFaceless, boolean seenSince) {
-            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, openedFaceless, seenSince);
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, openedFaceless, seenSince,
+                    called, cantSee);
+        }
+
+        /** This request in a conversation a call opened (owner 2026-10-02), with or without the crouch invitation. */
+        TurnRequest call(boolean openedOnACall, boolean cantSeeThem) {
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen,
+                    openedOnACall, cantSeeThem);
         }
 
         /** The opener: nothing heard yet. */

@@ -10,7 +10,7 @@ import android.content.Context;
 public class RobotEarsClient {
     public interface Listener {
         void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
-                     boolean called);
+                     boolean called, String message);
 
         void onAnswering(long at);
 

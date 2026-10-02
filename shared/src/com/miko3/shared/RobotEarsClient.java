@@ -33,10 +33,11 @@ public final class RobotEarsClient {
     public interface Listener {
         /**
          * One heard utterance; see RobotEars.Callback.heard. kind is RobotEars.KIND_*, never KIND_MISSING;
-         * called marks the end of an utterance whose wake word already went out as an early cue.
+         * called marks the end of an utterance whose wake word already went out as an early cue;
+         * message is a call's words besides the address, "" or null (an older launcher) for none.
          */
         void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
-                     boolean called);
+                     boolean called, String message);
 
         /**
          * Robot 2026-10-01: the conversation listen's answer has started (speech began at at);
@@ -371,7 +372,7 @@ public final class RobotEarsClient {
 
         @Override
         public void heard(final String text, final int side, final float angle, final int tier, final long at,
-                          final boolean partial, final int kind, final boolean called) {
+                          final boolean partial, final int kind, final boolean called, final String message) {
             if (ended) {
                 return;
             }
@@ -383,7 +384,7 @@ public final class RobotEarsClient {
                 @Override
                 public void run() {
                     if (!ended) {
-                        listener.onHeard(text, side, angle, tier, at, partial, kind, called);
+                        listener.onHeard(text, side, angle, tier, at, partial, kind, called, message);
                     }
                 }
             });

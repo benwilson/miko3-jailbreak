@@ -175,6 +175,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Boolean> says = new Slot<Boolean>();
     private final Slot<MatchAnswer> matches = new Slot<MatchAnswer>();
     private final Slot<MatchAnswer> strangerLines = new Slot<MatchAnswer>();
+    private final Slot<MatchAnswer> callChats = new Slot<MatchAnswer>();
     private final Slot<Heard> hearings = new Slot<Heard>();
     /** Robot 2026-10-01: the hearings generation whose answer the launcher said has started; 0 for none. */
     private volatile int answeringGen;
@@ -590,8 +591,10 @@ final class ClaudeCuriosity implements CuriosityPort {
         long t0 = System.currentTimeMillis();
         String system = ExplorePrompts.systemPrefix(request.persona, request.notes);
         List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
-        // A conversation that opened faceless invites them down instead of asking the name (robot 2026-10-01).
-        String first = request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name);
+        // A conversation that opened faceless invites them down instead of asking the name (robot 2026-10-01);
+        // one a call opened greets them first, before he has seen them (owner 2026-10-02).
+        String first = request.called ? ExplorePrompts.CALL_OPENER
+                : request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name);
         for (Exchange e : request.transcript) {
             messages.add(ClaudeApi.message("user", e.heard == null ? first : e.heard));
             messages.add(ClaudeApi.message("assistant", ExplorePrompts.saidAsJson(e.said == null ? "" : e.said)));
@@ -599,6 +602,12 @@ final class ClaudeCuriosity implements CuriosityPort {
         String ask = request.heard == null ? first : request.heard;
         if (request.avoidQuestion != null) {
             ask = ask + "\n\n" + ExplorePrompts.avoidQuestion(request.avoidQuestion);
+        }
+        if (request.called && request.heard != null && request.transcript.isEmpty()) {
+            ask = ask + "\n\n" + ExplorePrompts.CALL_WORDS;
+        }
+        if (request.cantSee) {
+            ask = ask + "\n\n" + ExplorePrompts.CANT_SEE;
         }
         if (request.faceSeen) {
             ask = ask + "\n\n" + ExplorePrompts.FACE_SEEN;
@@ -1640,6 +1649,30 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public MatchAnswer linesAnswer() {
         return strangerLines.poll();
+    }
+
+    /**
+     * Owner 2026-10-02: a call's conversation opens at once, so it takes only the persona
+     * snapshot (a Binder read, no Claude): a faceless NEW with no face check behind it. No
+     * earlier meeting's crop may ride its opener.
+     */
+    @Override
+    public void callChat(final long timeoutMs) {
+        meeting = null;
+        final int g = callChats.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                MatchAnswer a = facelessMeeting(null, -1L);
+                Log.i(TAG, "call conversation: " + (a.persona != null ? "persona in hand" : "no persona"));
+                callChats.finish(g, a);
+            }
+        }, callChats, g, MatchAnswer.FAILED);
+    }
+
+    @Override
+    public MatchAnswer callChatAnswer() {
+        return callChats.poll();
     }
 
     @Override

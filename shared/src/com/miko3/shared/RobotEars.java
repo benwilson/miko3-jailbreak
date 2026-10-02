@@ -82,10 +82,14 @@ public interface RobotEars extends IInterface {
          * appended after it: true on the end-of-utterance delivery of a wake
          * word the launcher already sent as an early cue for the same at, so
          * the mode makes no second call. An older launcher's parcel ends before
-         * it, which reads as false.
+         * it, which reads as false. message (owner 2026-10-02) is appended after
+         * called: a call's words besides the address ("how's it going" from "Hey
+         * Miko, how's it going?"), the caller's first message, "" for anything
+         * else. An older mode ignores the trailing string; an older launcher's
+         * parcel ends before it, which reads as null: a bare call.
          */
         void heard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
-                   boolean called) throws RemoteException;
+                   boolean called, String message) throws RemoteException;
 
         /**
          * Robot 2026-10-01: the open conversation listen's answer has started (the
@@ -150,7 +154,8 @@ public interface RobotEars extends IInterface {
                         boolean partial = data.readInt() != 0;
                         int kind = data.dataAvail() > 0 ? data.readInt() : KIND_MISSING;
                         boolean called = data.dataAvail() > 0 && data.readInt() != 0;
-                        heard(text, side, angle, tier, at, partial, kind, called);
+                        String message = data.dataAvail() > 0 ? data.readString() : null;
+                        heard(text, side, angle, tier, at, partial, kind, called, message);
                         return true;
                     }
                     case TRANSACTION_answering: {
@@ -186,7 +191,7 @@ public interface RobotEars extends IInterface {
                 /** One-way, so the launcher's capture thread never waits on a mode. */
                 @Override
                 public void heard(String text, int side, float angle, int tier, long at, boolean partial,
-                                  int kind, boolean called) throws RemoteException {
+                                  int kind, boolean called, String message) throws RemoteException {
                     Parcel data = Parcel.obtain();
                     try {
                         data.writeInterfaceToken(DESCRIPTOR);
@@ -198,6 +203,7 @@ public interface RobotEars extends IInterface {
                         data.writeInt(partial ? 1 : 0);
                         data.writeInt(kind);
                         data.writeInt(called ? 1 : 0);
+                        data.writeString(message);
                         remote.transact(TRANSACTION_heard, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();

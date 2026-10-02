@@ -287,6 +287,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "wriggle_two_blocked_escape_turns_in_a_row_wriggles_before_the_ladder_grinds",
         "wriggle_the_1408_chair_episode_wedge_turn_stalled_back_up_blocked_retrace_is_caught",
         # The post-stall recovery wait (robot 2026-10-01: the motor board refused all motion for 9-29 s)
+        "recover_a_first_zero_turn_with_no_stall_before_it_waits_for_the_board_and_backs_out",
         "recover_a_12s_cutout_probes_find_nothing_until_20s_then_the_normal_escape",
         "recover_motors_that_never_come_back_three_recoveries_then_wriggle_then_the_help_line",
         "recover_robot_16_42_a_blocked_turn_after_the_back_out_recovers_again_and_he_gets_free",
@@ -586,6 +587,16 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "call_faceless_usable_face_on_a_retry_asks_the_name_then_stores_name_and_face",
         "call_faceless_name_given_is_held_and_stored_when_a_face_arrives_on_a_retry",
         "call_faceless_with_no_usable_face_on_any_retry_chats_unnamed_and_discards_the_notes",
+        # Conversation first, the caller found during it (owner 2026-10-02)
+        "callchat_wake_with_words_opens_with_their_words_as_the_first_message_within_2_s",
+        "callchat_bare_wake_opens_at_once_with_a_greeting_question_and_searches_during_it",
+        "callchat_the_caller_found_at_look_3_gets_the_face_path_and_the_conversation_goes_on",
+        "callchat_never_found_goes_on_while_they_answer_and_ends_after_3_unanswered",
+        "callchat_an_answer_with_no_words_gets_one_didnt_catch_that_and_does_not_count",
+        "callchat_no_turn_is_commanded_while_he_speaks_or_an_answer_is_in_progress",
+        "callchat_an_older_launcher_with_no_words_gives_the_bare_wake_opener",
+        "callchat_a_call_that_waits_out_a_back_off_keeps_its_words_and_answers_as_the_back_off_ends",
+        "callchat_on_the_charger_talks_without_turning",
         # A call while his turns do nothing (robot 2026-10-01: the motor board latched)
         "call_with_turns_that_never_turn_searches_at_most_twice_then_meets_where_he_is",
         "call_search_waits_for_the_escape_back_up_before_it_restarts",

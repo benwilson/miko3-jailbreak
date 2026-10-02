@@ -123,6 +123,8 @@ class ListenServiceHarnessTest(unittest.TestCase):
         # Hey Miko plan U3 (KTD4): the wake word is delivered as soon as it is spotted.
         "ears_wake_mid_speech_delivers_an_early_cue_at_once",
         "ears_end_of_a_called_utterance_is_marked_already_called",
+        "ears_a_called_utterance_carries_the_callers_message",
+        "ears_a_name_call_carries_its_message_and_other_utterances_none",
         "ears_two_hits_in_one_utterance_send_one_early_cue",
         "ears_wake_inside_the_deaf_window_delivers_nothing",
         "ears_early_cue_keeps_the_conversation_listen_for_the_words",
@@ -146,6 +148,7 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_each_listen_says_answering_at_most_once",
         # Review P2-2: a wordless answer ends the mode's hold ("answer over", code 3).
         "ears_wordless_answer_says_answer_over_once_when_the_listen_ends",
+        "ears_answer_over_logs_why_the_answer_had_no_words",
         "ears_wordless_answer_past_the_window_says_answer_over_as_it_ends",
         "ears_answer_with_words_or_no_answer_says_no_answer_over",
         # Review P3-10: the start window closes early enough for "answering" to reach the mode in time.
@@ -525,7 +528,7 @@ class InterfaceAndClientTest(unittest.TestCase):
                   r"void clipWindow\(long \w+\) throws RemoteException;",
                   r"void shoved\(long \w+\) throws RemoteException;",
                   r"void heard\(String \w+, int \w+, float \w+, int \w+, long \w+, boolean \w+, int \w+,\s+"
-                  r"boolean \w+\)"):
+                  r"boolean \w+, String \w+\)"):
             self.assertRegex(head, m)
 
     def test_ears_callback_kind_is_appended_last_and_an_older_launcher_ends_the_session(self):
@@ -542,20 +545,21 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertRegex(stub, r"boolean partial = data\.readInt\(\) != 0;\s*"
                                r"int kind = data\.dataAvail\(\) > 0 \? data\.readInt\(\) : KIND_MISSING;\s*"
                                r"boolean called = data\.dataAvail\(\) > 0 && data\.readInt\(\) != 0;\s*"
-                               r"heard\(text, side, angle, tier, at, partial, kind, called\);")
+                               r"String message = data\.dataAvail\(\) > 0 \? data\.readString\(\) : null;\s*"
+                               r"heard\(text, side, angle, tier, at, partial, kind, called, message\);")
         proxy = src.split("private static class Proxy implements Callback", 1)[1]
         self.assertRegex(proxy, r"data\.writeInt\(partial \? 1 : 0\);\s*data\.writeInt\(kind\);\s*"
-                                r"data\.writeInt\(called \? 1 : 0\);\s*"
+                                r"data\.writeInt\(called \? 1 : 0\);\s*data\.writeString\(message\);\s*"
                                 r"remote\.transact\(TRANSACTION_heard")
         client = _read(EARS_CLIENT)
         self.assertRegex(client, r"void onHeard\(String \w+, int \w+, float \w+, int \w+, long \w+, "
-                                 r"boolean \w+, int \w+,\s+boolean \w+\);")
+                                 r"boolean \w+, int \w+,\s+boolean \w+, String \w+\);")
         self.assertRegex(client, r'NO_KIND\s*=\s*"the launcher\'s ears session sends no cue kind '
                                  r'\(install both APKs together\)"')
         heard = _method_body(client, "public void heard")
         self.assertIsNotNone(heard)
         self.assertRegex(heard, r"if \(kind == RobotEars\.KIND_MISSING\)\s*\{\s*lost\(NO_KIND\);\s*return;")
-        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind, called)", heard)
+        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind, called, message)", heard)
 
     def test_ears_callback_already_called_flag_is_appended_after_the_kind(self):
         """Hey Miko plan U3 (KTD4): the end-of-utterance delivery of a call the
@@ -564,14 +568,34 @@ class InterfaceAndClientTest(unittest.TestCase):
         src = _read(EARS_INTERFACE)
         head = src.split("abstract class Stub", 1)[0]
         self.assertRegex(head, r"void heard\(String text, int side, float angle, int tier, long at, boolean partial, "
-                               r"int kind,\s*boolean called\)")
+                               r"int kind,\s*boolean called, String message\)")
         self.assertEqual(src.count("TRANSACTION_heard = 1;"), 1)
         ears = _read(EARS)
         self.assertIn("final boolean called;", ears)
         self.assertRegex(ears, r"Utterance\(String \w+, int \w+, Float \w+, int \w+, long \w+, boolean \w+, "
                                r"int \w+, boolean called\)")
         engine = _read(LAUNCHER / "ListenEngine.java")
-        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind, u\.called\);")
+        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind, u\.called, "
+                                 r"u\.message\);")
+
+    def test_a_calls_message_is_appended_last_and_an_older_launcher_sends_none(self):
+        """Owner 2026-10-02: the caller's words besides the address ride heard() as a String
+        appended after called, as kind and called were: an older mode ignores the trailing
+        string, and a newer mode under an older launcher reads none (null), the bare call."""
+        ears = _read(EARS_INTERFACE)
+        self.assertRegex(ears, r"void heard\(String text, int side, float angle, int tier, long at, boolean partial, "
+                               r"int kind,\s*boolean called, String message\) throws RemoteException;")
+        stub = ears.split("case TRANSACTION_heard:", 1)[1].split("return true;", 1)[0]
+        self.assertRegex(stub, r"boolean called = data\.dataAvail\(\) > 0 && data\.readInt\(\) != 0;\s*"
+                               r"String message = data\.dataAvail\(\) > 0 \? data\.readString\(\) : null;")
+        self.assertIn("heard(text, side, angle, tier, at, partial, kind, called, message);", stub)
+        proxy = ears.split("private static class Proxy implements Callback", 1)[1]
+        self.assertRegex(proxy, r"data\.writeInt\(called \? 1 : 0\);\s*data\.writeString\(message\);\s*"
+                                r"remote\.transact\(TRANSACTION_heard")
+        client = _read(SHARED / "RobotEarsClient.java")
+        self.assertRegex(client, r"void onHeard\(String text, int side, float angle, int tier, long at, boolean partial, "
+                                 r"int kind,\s*boolean called, String message\);")
+        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind, called, message);", client)
 
     def test_ears_session_capture_ignores_the_charger_latch(self):
         """Hey Miko plan U3 (KTD5): the capture rule no longer closes on the
@@ -590,11 +614,12 @@ class InterfaceAndClientTest(unittest.TestCase):
                                r"int kind\)")
         self.assertIn("final int kind;", ears)
         self.assertIn("int kind = CueClassifier.kind(text, wasWake, tier);", ears)
-        self.assertIn("new Utterance(text, side, angle, tier, at, partial, kind, wasWake)", ears)
+        self.assertIn("new Utterance(text, side, angle, tier, at, partial, kind, wasWake, message)", ears)
         self.assertRegex(ears, r"new Utterance\(\"\", CueClassifier\.SIDE_NONE, null, CueClassifier\.TIER_STRONG, "
                                r"now, false,\s*CueClassifier\.KIND_WAKE_WORD\)")
         engine = _read(LAUNCHER / "ListenEngine.java")
-        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind, u\.called\);")
+        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind, u\.called, "
+                                 r"u\.message\);")
 
     def test_ears_proxy_detects_an_older_launcher(self):
         """KTD11: every new proxy method checks the transaction result."""

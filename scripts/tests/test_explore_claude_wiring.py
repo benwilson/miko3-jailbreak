@@ -118,7 +118,8 @@ class EarsAdapterWiringTest(unittest.TestCase):
         a = code_only(src("EarsAdapter.java"))
         self.assertIn("implements Ears, RobotEarsClient.Listener, ExploreDrive.ReadingListener", a)
         heard = re.search(r"public void onHeard\(String text, int side, float angle, int tier, long at, "
-                          r"boolean partialUtterance, int kind,\s+boolean called\)\s*\{(.*?)\n    \}", a, re.S)
+                          r"boolean partialUtterance, int kind,\s+boolean called, String message\)\s*\{(.*?)\n    \}",
+                          a, re.S)
         self.assertIsNotNone(heard)
         body = heard.group(1)
         self.assertNotIn("CueKinds", a)
@@ -126,8 +127,8 @@ class EarsAdapterWiringTest(unittest.TestCase):
         self.assertIn("side == RobotEars.SIDE_RIGHT", body)
         self.assertIn("tier == RobotEars.TIER_STRONG", body)
         self.assertIn("Ears.Kind k = kindOf(kind, t)", body)
-        self.assertIn("new Ears.Cue(k, t, s, angle, at, called)", body)
-        self.assertIn("if (partialUtterance)", body)
+        self.assertIn("new Ears.Cue(k, t, s, angle, at, called, message)", body)
+        self.assertIn("if (partialUtterance && !(reply != null && words && !newcomer))", body)
         self.assertIn("partial = cue", body)
         self.assertIn("queue.addLast(cue)", body)
         self.assertIn("QUEUE_MAX", body)
@@ -146,7 +147,7 @@ class EarsAdapterWiringTest(unittest.TestCase):
         self.assertRegex(cue, r"boolean alreadyCalled\(\)\s*\{\s*return called;")
         a = code_only(src("EarsAdapter.java"))
         heard = re.search(r"public void onHeard\((.*?)\n    \}", a, re.S).group(1)
-        self.assertRegex(heard, r"if \(partialUtterance\) \{[^}]*partial = cue;")
+        self.assertRegex(heard, r"if \(partialUtterance && !\(reply != null && words && !newcomer\)\) \{[^}]*partial = cue;")
         join = re.search(r"if \(partial != null && ([^{]*)\) \{", heard)
         self.assertIsNotNone(join, "no partial join")
         self.assertIn("!partial.alreadyCalled()", join.group(1))
@@ -997,6 +998,56 @@ class FacelessOpenerTest(unittest.TestCase):
             self.assertIn(sig, port)
         session = code_only(src("ChatSession.java"))
         self.assertIn(".face(openedFaceless, faceSeen && name == null)", session)
+
+
+class CallConversationTest(unittest.TestCase):
+    """Owner 2026-10-02: conversation first. A call's conversation opens before he has seen
+    them: its opener is a short greeting-question (never the crouch invitation, never the
+    name), the words said with the wake word are turn 1's message, the crouch invitation comes
+    once he knows he can't see them, and opening it costs no Claude request."""
+
+    @staticmethod
+    def constant(name):
+        return ConversationWiringTest.java_string(src("ExplorePrompts.java"), name)
+
+    def test_the_call_opener_greets_with_a_question_and_asks_no_name_or_crouch(self):
+        text = self.constant("CALL_OPENER")
+        for words in ("greeting with a question", "has not seen them yet", "Do not ask their name yet"):
+            self.assertIn(words, text)
+        self.assertNotIn("crouch", text)
+        self.assertIn("Do not ask their name yet", self.constant("CALL_WORDS"))
+        cant = self.constant("CANT_SEE")
+        for words in ("can't see their face from down here", "crouch down to his level", "Do not ask their name"):
+            self.assertIn(words, cant)
+
+    def test_the_turn_picks_the_call_opener_first_and_appends_the_call_notes(self):
+        turn = re.search(r"private Turn oneTurn\((.*?)\n    \}", code_only(src("ClaudeCuriosity.java")), re.S).group(1)
+        self.assertRegex(turn, r"String first = request\.called \? ExplorePrompts\.CALL_OPENER\s*"
+                               r": request\.faceless \? ExplorePrompts\.FACELESS_OPENER")
+        self.assertRegex(turn, r"if \(request\.called && request\.heard != null && request\.transcript\.isEmpty\(\)\) \{\s*"
+                               r"ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CALL_WORDS;")
+        self.assertRegex(turn, r"if \(request\.cantSee\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CANT_SEE;")
+        session = code_only(src("ChatSession.java"))
+        self.assertIn(".call(called, cantSeeDue);", session)
+
+    def test_opening_a_call_conversation_reads_the_persona_and_sends_nothing_to_claude(self):
+        c = code_only(src("ClaudeCuriosity.java"))
+        body = re.search(r"public void callChat\(final long timeoutMs\) \{(.*?)\n    \}", c, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn("meeting = null;", body.group(1))
+        self.assertIn("facelessMeeting(null, -1L)", body.group(1))
+        self.assertNotIn("claude.", body.group(1))
+        self.assertIn("void callChat(long timeoutMs);", code_only(src("CuriosityPort.java")))
+
+    def test_the_brain_logs_no_words_of_the_callers_message(self):
+        brain = code_only(src("ExploreBrain.java"))
+        session = code_only(src("ChatSession.java"))
+        for text, field, pattern in ((brain, "callChatMessage", r"(?<![\w.])note\((.*?)\);"),
+                                     (brain, "c.message", r"(?<![\w.])note\((.*?)\);"),
+                                     (session, "message", r"host\.note\((.*?)\);")):
+            for call in re.findall(pattern, text, re.S):
+                bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+                self.assertNotRegex(bare, r"\b" + re.escape(field) + r"\b", call)
 
 
 class SlimUploadWiringTest(unittest.TestCase):

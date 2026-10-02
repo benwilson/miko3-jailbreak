@@ -81,7 +81,34 @@ final class ChatSession {
          * is driven; one opened on the charger (a call there, hey-miko plan KTD5) goes on.
          */
         boolean charger();
+
+        /**
+         * Owner 2026-10-02: the next move of the search for a caller during the conversation.
+         * TURNING: a short turn toward the plan's next bearing started; LOOK: he faces a bearing
+         * not yet looked at; DONE: the plan is spent (or the caller is faced); HELD: he cannot
+         * turn now (no fresh reading, a hazard, no wheels, the charger, turns that do nothing).
+         * Called only while he is neither speaking nor hearing an answer.
+         */
+        Seek seek(long now);
+
+        /** The bearing seek() said LOOK at has been looked at: the plan moves on. */
+        void seekLooked();
+
+        /** A search turn is under way. */
+        boolean seekTurning();
+
+        /** Stop a search turn now: he is about to speak, or an answer has started. */
+        void holdStill();
+
+        /** The caller in this look by the call's person rule, or null. */
+        Detection callerIn(ExploreBrain.Look look);
+
+        /** The caller was found in this box: the search ends and seek() turns to centre them. */
+        void faceCaller(Detection box);
     }
+
+    /** The brain's answer to Host.seek (owner 2026-10-02). */
+    enum Seek { TURNING, LOOK, DONE, HELD }
 
     // ---- fixed local lines (KTD12): the clip groups and the on-device voice's templates ----
     static final String CLIP_SIGN_OFF = "sign-off";
@@ -110,6 +137,8 @@ final class ChatSession {
     static final String FORGOTTEN = "Done. I've forgotten you.";
     static final String KEPT = "Okay, keeping you.";
     static final String FORGET_FAILED = "That didn't work; I still remember you.";
+    /** Owner 2026-10-02: a call's conversation, after an answer that ended without words: once, through the on-device voice. */
+    static final String DIDNT_CATCH = "Sorry, I didn't catch that?";
     /** The whole utterance that confirms a forget (KTD9); anything else, a negation included, is a no. */
     static final String[] AFFIRMATIVES = {"yes", "yeah", "yep", "do it"};
     private static final String[] GOODBYES = {"bye", "goodbye", "see you", "see ya", "catch you later", "later miko",
@@ -230,6 +259,22 @@ final class ChatSession {
     /** The face retry's box when the look has no person box: the whole frame. */
     private static final Detection WHOLE_FRAME = new Detection("person", 1f, 0f, 0f, 1f, 1f);
 
+    // ---- a call's conversation (owner 2026-10-02) ----
+    /** Opened on a call, before he had seen them: not seeing them never ends it. */
+    private boolean called;
+    /** Looking for the caller between utterances; centring: turning to face the one found. */
+    private boolean seeking;
+    private boolean centring;
+    /** The face look in flight is a search look: nobody in it spends no face try. */
+    private boolean seekLooking;
+    private int seekLooks;
+    /** The person box a search look found, while its face is checked. */
+    private Detection seekFound;
+    /** He knows he can't see them: the next turn invites them down to his level, once. */
+    private boolean cantSeeDue;
+    /** This run of unanswered listens has had its "didn't catch that". */
+    private boolean reasked;
+
     // ---- the store ----
     private boolean keepPending;
     private long keepDeadline;
@@ -307,6 +352,29 @@ final class ChatSession {
      * a first name whose last name never came, which is not asked about again.
      */
     void start(long now, CuriosityPort.MatchAnswer a, boolean faceless, boolean checkOpen, String settled) {
+        open(a, faceless, checkOpen, settled);
+        requestTurn(now, null);
+    }
+
+    /**
+     * A conversation a call opened at once (owner 2026-10-02), before he has seen them: faceless,
+     * with no face check behind it. message is what they said with the wake word ("" for a bare
+     * call): turn 1 answers it, else the opener greets them with a question. search: he looks for
+     * them between utterances (off on the charger and wherever he cannot turn). quietUntil: the
+     * answer clip's window, which no line plays over.
+     */
+    void startCall(long now, CuriosityPort.MatchAnswer a, String message, boolean search, long quietUntil) {
+        called = true;
+        seeking = search;
+        clipUntil = Math.max(clipUntil, quietUntil);
+        open(a, true, false, null);
+        if (search) {
+            host.note("looking for the caller during the conversation");
+        }
+        requestTurn(now, message == null || message.trim().isEmpty() ? null : message.trim());
+    }
+
+    private void open(CuriosityPort.MatchAnswer a, boolean faceless, boolean checkOpen, String settled) {
         this.checkOpen = checkOpen;
         this.settledName = settled;
         startedOnCharger = host.charger();
@@ -329,7 +397,6 @@ final class ChatSession {
         }
         host.note(name == null ? "a conversation with someone unnamed" : "a conversation with someone known ("
                 + asked.size() + " questions on record)");
-        requestTurn(now, null);
     }
 
     /** One brain tick in a CHAT state. */
@@ -393,7 +460,8 @@ final class ChatSession {
         attempt = 1;
         reRequested = false;
         request = new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
-                .face(openedFaceless, faceSeen && name == null);
+                .face(openedFaceless, faceSeen && name == null).call(called, cantSeeDue);
+        cantSeeDue = false;
         turnHeld = false;
         secSaid = false;
         heldSince = -1;
@@ -791,7 +859,7 @@ final class ChatSession {
 
     /** Another face try may still come: the conversation opened faceless and the tries are not spent. */
     private boolean faceRetrying() {
-        return faceless && !ending && (faceLooking || faceMatching || faceTries < tuning.chatFaceTries);
+        return faceless && !ending && (seeking || faceLooking || faceMatching || faceTries < tuning.chatFaceTries);
     }
 
     /**
@@ -824,7 +892,12 @@ final class ChatSession {
             if (!arrived && now < faceLookDeadline) {
                 return;
             }
+            boolean search = seekLooking;
             dropFaceLook(false);
+            if (search) {
+                searchLookIn(now, arrived ? look : null);
+                return;
+            }
             if (!arrived) {
                 host.note("face try " + faceTries + " of " + tuning.chatFaceTries + ": no look in time");
                 faceTryOver(now);
@@ -836,6 +909,10 @@ final class ChatSession {
             faceMatching = true;
             faceMatchDeadline = now + tuning.meetTimeoutMs;
             port.match(look.jpeg, box == null ? WHOLE_FRAME : box, tuning.meetTimeoutMs);
+            return;
+        }
+        if ((seeking || centring) && !ending) {
+            seekStep(now);
             return;
         }
         if (faceless && !ending && faceTries < tuning.chatFaceTries && state == State.CHAT_LISTEN
@@ -867,6 +944,19 @@ final class ChatSession {
     private void faceAnswered(long now, CuriosityPort.MatchAnswer a) {
         boolean usable = a.status == CuriosityPort.MatchAnswer.Status.KNOWN
                 || a.status == CuriosityPort.MatchAnswer.Status.NEW && !a.faceless;
+        if (seekFound != null) {
+            // Owner 2026-10-02: someone where the caller's voice was: the search stops and he faces them.
+            Detection box = seekFound;
+            seekFound = null;
+            seeking = false;
+            centring = !ending;
+            host.faceCaller(box);
+            host.note("the caller found on search look " + seekLooks + (usable ? " with a usable face" : " with no usable face")
+                    + ": the search stops, facing them");
+            if (!usable) {
+                cantSeeDue = !ending;
+            }
+        }
         if (!usable) {
             host.note("face try " + faceTries + " of " + tuning.chatFaceTries + ": no usable face");
             faceTryOver(now);
@@ -887,6 +977,85 @@ final class ChatSession {
         heldResolving = true;
         heldResolveDeadline = now + tuning.meetTimeoutMs;
         port.resolveName(name, tuning.meetTimeoutMs);
+    }
+
+    /**
+     * The search for the caller during a call's conversation (owner 2026-10-02): only while he is
+     * neither speaking nor hearing an answer (the motors would swallow their words), a short turn
+     * toward the plan's next bearing, then a look there; a turn under way stops the moment that
+     * changes. Nobody anywhere ends the search, never the conversation.
+     */
+    private void seekStep(long now) {
+        boolean quiet = quietForSearch(now);
+        if (host.seekTurning()) {
+            if (!quiet) {
+                host.holdStill();
+            }
+            return;
+        }
+        if (!quiet || faceLooking || faceMatching) {
+            return;
+        }
+        if (centring) {
+            Seek s = host.seek(now);
+            if (s == Seek.DONE || s == Seek.LOOK) {
+                centring = false;
+            }
+            return;
+        }
+        if (!host.faceLooksAllowed()) {
+            return;
+        }
+        switch (host.seek(now)) {
+            case LOOK:
+                faceLooking = true;
+                seekLooking = true;
+                faceLookFrom = now;
+                faceLookDeadline = now + tuning.lookSettleMs + tuning.lookTimeoutMs;
+                host.wantLook(true);
+                break;
+            case DONE:
+                seeking = false;
+                cantSeeDue = true;
+                host.note("nobody found in the search after " + seekLooks + " look(s): the conversation goes on,"
+                        + " and he asks them down to his level");
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** He may turn or look for the caller now: waiting on a line, or listening with no answer under way. */
+    private boolean quietForSearch(long now) {
+        if (now < clipUntil) {
+            return false;
+        }
+        if (state == State.CHAT_THINK) {
+            return phase == Phase.WAIT_TURN || phase == Phase.RESOLVING;
+        }
+        return state == State.CHAT_LISTEN && phase == Phase.LISTENING && !port.answering();
+    }
+
+    /** A search look came in (null: none in time): the caller in it has their face checked; nobody moves the plan on. */
+    private void searchLookIn(long now, ExploreBrain.Look look) {
+        if (look == null) {
+            host.note("search look: no look in time");
+            return;
+        }
+        host.seekLooked();
+        seekLooks++;
+        Detection p = host.callerIn(look);
+        if (p == null) {
+            host.note("search look " + seekLooks + ": nobody here");
+            return;
+        }
+        faceTries++;
+        seekFound = p;
+        host.note("search look " + seekLooks + ": someone here; checking their face (try " + faceTries + " of "
+                + tuning.chatFaceTries + ")");
+        faceMatching = true;
+        faceMatchDeadline = now + tuning.meetTimeoutMs;
+        port.match(look.jpeg, p, tuning.meetTimeoutMs);
     }
 
     private void faceTryOver(long now) {
@@ -939,9 +1108,10 @@ final class ChatSession {
             return;
         }
         faceLooking = false;
-        if (unspent) {
+        if (unspent && !seekLooking) {
             faceTries--;
         }
+        seekLooking = false;
         if (phase != Phase.LOOKING) {
             host.wantLook(false);
         }
@@ -949,6 +1119,9 @@ final class ChatSession {
 
     /** The conversation is ending: no new face try; a match in flight is waited for only to store a name held. */
     private void endFaceRetries() {
+        seeking = false;
+        centring = false;
+        host.holdStill();
         dropFaceLook(true);
         if (faceMatching && (name == null || personId != null)) {
             faceMatching = false;
@@ -959,6 +1132,8 @@ final class ChatSession {
 
     /** A line through the voice with the camera open and no quiet wait (KTD7): a turn's line, or a fixed template. */
     private void speak(long now, String line, boolean isTurn) {
+        // Owner 2026-10-02: never turning while he speaks.
+        host.holdStill();
         // The detector parks before he speaks (KTD7): a face look not yet in is asked again later.
         dropFaceLook(true);
         state = State.CHAT_SPEAK;
@@ -978,6 +1153,7 @@ final class ChatSession {
 
     /** A local clip in its deaf window (KTD12): the port's clip window, the clip, then the tail. */
     private void openClip(long now, String group) {
+        host.holdStill();
         port.clipWindow(tuning.chatClipMs);
         host.playClip(group);
         clipUntil = now + tuning.chatClipMs + tuning.deafTailMs;
@@ -1079,7 +1255,7 @@ final class ChatSession {
                     // Review P2-2: the held answer ended without words (the launcher's "answer
                     // over" ends the port's listen as silence): unanswered now, not at the hold.
                     host.note("the answer ended without words: an unanswered listen");
-                    onUnanswered(now);
+                    onUnanswered(now, true);
                     return;
                 }
                 // Silence or a failure before the timer: the timer is the authority (KTD2).
@@ -1095,7 +1271,7 @@ final class ChatSession {
                     if (answerHeld) {
                         host.note("the answer's words never came: an unanswered listen");
                     }
-                    onUnanswered(now);
+                    onUnanswered(now, answerHeld);
                 }
                 break;
             }
@@ -1112,6 +1288,7 @@ final class ChatSession {
 
     private void onHeard(long now, String text) {
         unanswered = 0;
+        reasked = false;
         glanceIfNewcomer(now);
         if (askingLastName) {
             askingLastName = false;
@@ -1162,7 +1339,14 @@ final class ChatSession {
         requestTurn(now, text);
     }
 
-    private void onUnanswered(long now) {
+    private void onUnanswered(long now, boolean wordless) {
+        if (called && wordless && !reasked && !endOnCharger && !confirmingForget && !askingLastName) {
+            // Owner 2026-10-02: an answer that ended without words gets one re-ask, which does not count.
+            reasked = true;
+            host.note("the answer ended without words: one \"didn't catch that\", not counted");
+            speak(now, DIDNT_CATCH, false);
+            return;
+        }
         unanswered++;
         confirmingForget = false;
         if (askingLastName) {
@@ -1172,6 +1356,18 @@ final class ChatSession {
         glanceIfNewcomer(now);
         if (endOnCharger) {
             signOff(now);
+            return;
+        }
+        if (called) {
+            // Owner 2026-10-02: not seeing them never ends a call's conversation; only silence does.
+            if (unanswered >= tuning.callChatUnansweredMax) {
+                host.note(unanswered + " unanswered listens in a row: the sign-off");
+                signOff(now);
+                return;
+            }
+            host.note("unanswered listen " + unanswered + " of " + tuning.callChatUnansweredMax
+                    + " in a call's conversation: listening again");
+            startListen(now);
             return;
         }
         if (unanswered >= 2) {

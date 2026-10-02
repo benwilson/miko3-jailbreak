@@ -63,6 +63,10 @@ class EarsAdapterHarnessTest(unittest.TestCase):
         # Review P2-2: the launcher's "answer over" for a wordless answer.
         "answer_over_goes_to_the_armed_reply_and_queues_nothing",
         "answer_over_with_no_armed_reply_is_ignored",
+        # Owner 2026-10-02: a call's words besides the address are the caller's first message.
+        "a_called_end_carries_the_callers_message_and_an_older_launcher_none",
+        # Robot 2026-10-02: an answer flagged partial (begun as the deaf window closed) still answers.
+        "a_partial_answer_with_words_still_answers_the_armed_reply",
     )
 
     @classmethod

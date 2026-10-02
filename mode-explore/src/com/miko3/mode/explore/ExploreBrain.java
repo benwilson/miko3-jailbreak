@@ -1222,6 +1222,29 @@ final class ExploreBrain {
      * opened on their voice with nobody in view, so more of their voice in it is theirs.
      */
     private boolean callerHeard;
+
+    // ---- conversation first (owner 2026-10-02) ----
+    /** The call's conversation is opening in MEET: the persona is on its way, the answer may wait for the utterance's end. */
+    private boolean callChatOpening;
+    /** The call the opening conversation answers, its words besides the address, and whether he may look for them. */
+    private Ears.Cue callChatCue;
+    private String callChatMessage = "";
+    private boolean callChatSearch;
+    /** When an early wake cue's answer stops waiting for the utterance's end (NEVER: not waiting). */
+    private long callUtteranceUntil = NEVER;
+    /** The search during the conversation: bearings (right positive) from where it opened, the next one, where he faces. */
+    private double[] chatSeekPlan;
+    private int chatSeekIndex;
+    private double chatSeekRel;
+    private boolean chatSeekCentring;
+    private boolean chatSeekTurning;
+    private boolean chatSeekTurnLeft;
+    private int chatSeekBlocked;
+    /** A search bearing this close counts as reached: turns undershoot by a few degrees, and a tiny turn reads 0. */
+    private static final double CHAT_SEEK_CLOSE_DEG = 10;
+    /** This step's reading, for the conversation's turns: fresh, and whether it is a hazard. */
+    private boolean chatFresh;
+    private boolean chatHazard;
     /**
      * The caller spoke during the first turn of the call's search, or while he turned to or
      * looked at a caller seen in a look: the conversation opens when that turn or look ends.
@@ -1752,7 +1775,7 @@ final class ExploreBrain {
             case CHAT_SPEAK:
             case CHAT_LISTEN:
             case CHAT_NOTES:
-                chatStep(now);
+                chatStep(now, fresh, hazard);
                 break;
             case INSPECT:
             case REACT_HERE:
@@ -3036,6 +3059,7 @@ final class ExploreBrain {
         chatNoWheels = false;
         chatStallSince = NEVER;
         chatLookWanted = false;
+        clearCallChat();
         syncPark();
     }
 
@@ -3728,6 +3752,10 @@ final class ExploreBrain {
     }
 
     private void meetStep(long now) {
+        if (callChatOpening) {
+            callChatOpeningStep(now);
+            return;
+        }
         CuriosityPort.MatchAnswer a = meetLines ? port.linesAnswer() : port.matchAnswer();
         if (a == null) {
             if (now < meetDeadline) {
@@ -4493,9 +4521,11 @@ final class ExploreBrain {
         stopMotors();
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
                 + " deg in " + (now - turnStartedAt) + " ms");
-        if (state == State.TURN && zeroTurn() && recoverCount > 0 && recoverCount < recoverCap()) {
+        if (state == State.TURN && zeroTurn() && recoverCount < recoverCap()) {
             // Robot 16:42:39: within a stuck spell, a turn reading 0 deg and no counts is a fresh
-            // cutout, even after a recovery: it waits again (up to recoverMaxPerSpell).
+            // cutout, even after a recovery: it waits again (up to recoverMaxPerSpell). Robot
+            // 2026-10-02 09:21:58: so is the first one, with no stall before it; it went to the
+            // escape ladder, whose moves all read zero inside the cutout, and he rested jammed.
             stampStall(now);
         }
         if (state == State.TURN && zeroTurn() && recoverDue(now)) {
@@ -6982,6 +7012,29 @@ final class ExploreBrain {
      */
     private void offerCall(long now, Ears.Cue c) {
         if (c.alreadyCalled() && callAts.contains(c.at)) {
+            if (callChatOpening && callChatCue != null && c.at == callChatCue.at) {
+                // Owner 2026-10-02: what they said with the wake word is the conversation's first message.
+                if (c.hasMessage()) {
+                    callChatMessage = c.message;
+                }
+                note("the end of the call's utterance: " + (c.hasMessage() ? "their words are the first message"
+                        : "no other words"));
+                if (callUtteranceUntil != NEVER) {
+                    callUtteranceUntil = NEVER;
+                    if (!callAnswered) {
+                        answerCall(now);
+                    }
+                }
+                return;
+            }
+            if (call != null && !callTaken && c.at == call.at) {
+                // The call still waits (a back-off, a line): its utterance has ended, so its answer
+                // will not wait for that end, and its words wait with it for the conversation.
+                call = new Ears.Cue(call.kind, call.tier, call.side, call.angleDeg, call.at, true,
+                        c.hasMessage() ? c.message : call.message);
+                note("the end of the waiting call's utterance" + (c.hasMessage() ? ", with words" : ""));
+                return;
+            }
             note("the end of a call's utterance: already called");
             return;
         }
@@ -7194,7 +7247,9 @@ final class ExploreBrain {
             retryWaiting = false;
             turnRetrying = false;
         }
-        if (!callAnswered) {
+        // Owner 2026-10-02: conversation first; its answer may wait for the end of what they are saying.
+        boolean chatFirst = tuning.callChatFirst && port.canAsk();
+        if (!callAnswered && !chatFirst) {
             answerCall(now);
         }
         if (!port.canAsk()) {
@@ -7210,6 +7265,10 @@ final class ExploreBrain {
             return;
         }
         callTaken = true;
+        if (chatFirst) {
+            openCallChat(now, c, v);
+            return;
+        }
         switch (v) {
             case IN_PLACE:
                 // On the charger (KTD5), in EYES_ONLY, without the lease or a camera, or with turns that
@@ -8227,6 +8286,184 @@ final class ExploreBrain {
     }
 
     /**
+     * Conversation first (owner 2026-10-02: "he needs to be able to carry on a conversation even
+     * before he's managed to turn and recognize the person"). The taken call opens the
+     * conversation here, with nobody in view and no search before it: the persona comes from the
+     * port (no Claude), and turn 1 goes out as soon as it is in. An early wake cue's answer clip
+     * waits for the utterance's end (at most callUtteranceWaitMs), since its deaf window would
+     * cut off the words said with the wake word, which are the first message. He looks for the
+     * caller during the conversation (ChatSession's search) unless he cannot turn (IN_PLACE).
+     */
+    private void openCallChat(long now, Ears.Cue c, CallVerdict v) {
+        stopMotors();
+        if (state.inStop()) {
+            clearStop();
+        }
+        gauges.stamp(Gauges.Stage.CUE_AT, c.at);
+        boolean inPlace = v == CallVerdict.IN_PLACE;
+        chatCueSide = sideOf(c);
+        wheellessMeeting = inPlace;
+        beginPersonStop(now, null, UNSEEN_PERSON);
+        target = null;
+        state = State.MEET;
+        meetingHeld = true;
+        stranger = null;
+        matched = null;
+        helloOnly = false;
+        meetLines = false;
+        callChatOpening = true;
+        callChatCue = c;
+        callChatMessage = c.message;
+        callChatSearch = !inPlace;
+        callUtteranceUntil = !callAnswered && c.kind == Ears.Kind.WAKE_WORD && !c.alreadyCalled() && !c.hasMessage()
+                && tuning.callUtteranceWaitMs > 0 ? now + tuning.callUtteranceWaitMs : NEVER;
+        show(EyeState.GLANCE, chatCueSide);
+        meetDeadline = now + tuning.meetTimeoutMs;
+        note("the call opens the conversation now" + (inPlace ? ", where he is (no turning)"
+                : "; he looks for the caller during it")
+                + (callUtteranceUntil != NEVER ? "; the answer waits for the end of what they are saying" : ""));
+        port.callChat(tuning.meetTimeoutMs);
+        if (callUtteranceUntil == NEVER && !callAnswered) {
+            answerCall(now);
+        }
+    }
+
+    /** The opening call conversation in MEET: the answer once the utterance ended, then the persona, then CHAT. */
+    private void callChatOpeningStep(long now) {
+        if (callUtteranceUntil != NEVER) {
+            if (now < callUtteranceUntil) {
+                return;
+            }
+            callUtteranceUntil = NEVER;
+            note("no end of the call's utterance in " + tuning.callUtteranceWaitMs + " ms: answering now");
+        }
+        if (!callAnswered) {
+            answerCall(now);
+        }
+        CuriosityPort.MatchAnswer a = port.callChatAnswer();
+        if (a == null) {
+            if (now < meetDeadline) {
+                return;
+            }
+            note("no conversation settings in " + tuning.meetTimeoutMs + " ms");
+            a = CuriosityPort.MatchAnswer.FAILED;
+        }
+        callChatOpening = false;
+        if (a.persona != null && chatLikely()) {
+            enterChat(now, a);
+            return;
+        }
+        // An older launcher, or no ears: the meeting without a look, as before conversation first.
+        note("the call's conversation cannot open here: the meeting without a look");
+        callChatCue = null;
+        meetLines = true;
+        meetDeadline = now + tuning.meetTimeoutMs;
+        port.lines(tuning.meetTimeoutMs);
+    }
+
+    /** Forgets the call conversation's opening and its search; a search turn under way stops. */
+    private void clearCallChat() {
+        if (chatSeekTurning) {
+            chatSeekTurning = false;
+            stopMotors();
+        }
+        callChatOpening = false;
+        callChatCue = null;
+        callChatMessage = "";
+        callChatSearch = false;
+        callUtteranceUntil = NEVER;
+        chatSeekPlan = null;
+        chatSeekIndex = 0;
+        chatSeekRel = 0;
+        chatSeekCentring = false;
+        chatSeekBlocked = 0;
+    }
+
+    /**
+     * The search plan for the call conversation (bearings right positive from where it opened),
+     * as the call's search plans it: an angle, then its 45 deg neighbours; a side (the chip's
+     * usual cue), that side at 90 deg, then 135 and 45 on it, then ahead, the other side and
+     * behind; neither, one circle of 45 deg looks from straight ahead.
+     */
+    private void planChatSeek(Ears.Cue c, boolean search) {
+        chatSeekPlan = null;
+        chatSeekIndex = 0;
+        chatSeekRel = 0;
+        chatSeekCentring = false;
+        chatSeekTurning = false;
+        chatSeekBlocked = 0;
+        if (!search) {
+            return;
+        }
+        double since = c.hasAngle() ? headingHistory.turnedSince(c.at) : Double.NaN;
+        if (!Double.isNaN(since)) {
+            double bearing = Heading.delta(0, c.angleDeg + since);
+            chatSeekPlan = new double[]{bearing, bearing - CALL_STEP_DEG, bearing + CALL_STEP_DEG};
+        } else if (c.side == Ears.Side.LEFT || c.side == Ears.Side.RIGHT) {
+            double s = c.side == Ears.Side.LEFT ? -1 : 1;
+            chatSeekPlan = new double[]{s * 2 * CALL_STEP_DEG, s * 3 * CALL_STEP_DEG, s * CALL_STEP_DEG, 0,
+                    -s * CALL_STEP_DEG, -s * 2 * CALL_STEP_DEG, -s * 3 * CALL_STEP_DEG, -s * 4 * CALL_STEP_DEG};
+        } else {
+            chatSeekPlan = new double[CALL_CIRCLE_LOOKS];
+            for (int i = 0; i < chatSeekPlan.length; i++) {
+                chatSeekPlan[i] = CALL_STEP_DEG * i;
+            }
+        }
+    }
+
+    /** Whether a search turn may start now: a fresh, clear reading, the wheels, off the charger, turns that turn. */
+    private boolean chatMayTurn() {
+        return chatFresh && !chatHazard && leaseHeld && !chatNoWheels && !wheellessMeeting && !classifier.charger()
+                && !jammed && chatSeekBlocked < tuning.callBlockedTurnsMax && state.chats();
+    }
+
+    /** One short search turn, timed or measured like a curiosity turn. */
+    private void startChatTurn(long now, double deg, boolean left) {
+        heading = left ? Direction.LEFT : Direction.RIGHT;
+        turnDeg = deg;
+        turnMs = timedMs(deg);
+        moving = true;
+        turnWheels(heading);
+        turnStartedAt = now;
+        phaseUntil = now + turnMs;
+        measureTurn(now, deg);
+        chatSeekTurning = true;
+        chatSeekTurnLeft = left;
+    }
+
+    /** The search turn ends (done, held or blocked): where he faces now moves by what it turned. */
+    private void endChatTurn(long now, String why) {
+        double turned;
+        if (measured && compass.usable(now)) {
+            turned = Math.abs(compass.turned());
+        } else {
+            turned = turnDeg * Math.min(1.0, (now - turnStartedAt) / (double) Math.max(1, turnMs));
+        }
+        stopMotors();
+        chatSeekTurning = false;
+        chatSeekRel += chatSeekTurnLeft ? -turned : turned;
+        if (why != null) {
+            note(why);
+        }
+    }
+
+    /** Each conversation step: the search turn under way, if any, ends when done, blocked or on a hazard. */
+    private void chatTurnStep(long now) {
+        if (!chatSeekTurning) {
+            return;
+        }
+        if (turnBlocked(now)) {
+            chatSeekBlocked++;
+            endChatTurn(now, "the search turn would not turn (" + chatSeekBlocked + " of " + tuning.callBlockedTurnsMax
+                    + (chatSeekBlocked >= tuning.callBlockedTurnsMax ? "): no more turning in this conversation" : ")"));
+        } else if (chatHazard) {
+            endChatTurn(now, "a hazard reading: the search turn stops");
+        } else if (turnDone(now)) {
+            endChatTurn(now, null);
+        }
+    }
+
+    /**
      * A call while he cannot move or cannot look (KTD8; hey-miko plan KTD5: on the
      * charger too): no turn and no face, so the meeting takes the stranger's text-only
      * lines and the guards that would send him to EYES_ONLY hold off until it ends.
@@ -8292,15 +8529,29 @@ final class ExploreBrain {
         chat = new ChatSession(tuning, port, chatHost);
         state = State.CHAT_THINK;
         syncPark();
-        chat.start(now, a, faceless, chatCheckOpen, chatSettled);
+        if (callChatCue != null) {
+            // Owner 2026-10-02: the call's conversation, opened before he has seen them.
+            Ears.Cue c = callChatCue;
+            boolean search = callChatSearch && !classifier.charger() && leaseHeld;
+            planChatSeek(c, search);
+            String message = callChatMessage;
+            callChatCue = null;
+            callChatMessage = "";
+            chat.startCall(now, a, message, search, ackUntil);
+        } else {
+            chat.start(now, a, faceless, chatCheckOpen, chatSettled);
+        }
         state = chatState(chat.state());
     }
 
-    private void chatStep(long now) {
+    private void chatStep(long now, boolean fresh, boolean hazard) {
         if (chat == null) {
             endCuriosity(now);
             return;
         }
+        chatFresh = fresh;
+        chatHazard = hazard;
+        chatTurnStep(now);
         chat.step(now);
         state = chatState(chat.state());
         syncPark();
@@ -8466,6 +8717,74 @@ final class ExploreBrain {
         public boolean charger() {
             return classifier.charger();
         }
+
+        @Override
+        public ChatSession.Seek seek(long now) {
+            if (chatSeekPlan == null || chatSeekIndex >= chatSeekPlan.length) {
+                chatSeekPlan = null;
+                chatSeekCentring = false;
+                return ChatSession.Seek.DONE;
+            }
+            double delta = Heading.wrap(chatSeekPlan[chatSeekIndex] - chatSeekRel + 180) - 180;
+            // A turn lands within a few degrees of what it asked: closer than CHAT_SEEK_CLOSE_DEG is there.
+            double close = chatSeekCentring ? Math.max(CHAT_SEEK_CLOSE_DEG, tuning.centreTolerance * tuning.cameraHalfFovDeg)
+                    : CHAT_SEEK_CLOSE_DEG;
+            if (Math.abs(delta) < close) {
+                if (chatSeekCentring) {
+                    chatSeekPlan = null;
+                    chatSeekCentring = false;
+                    return ChatSession.Seek.DONE;
+                }
+                return ChatSession.Seek.LOOK;
+            }
+            if (!chatMayTurn()) {
+                if (chatSeekBlocked >= tuning.callBlockedTurnsMax || !leaseHeld || chatNoWheels) {
+                    // Turns that do nothing, or no wheels: the search ends; looks here still run.
+                    chatSeekPlan = null;
+                    chatSeekCentring = false;
+                    return ChatSession.Seek.DONE;
+                }
+                return ChatSession.Seek.HELD;
+            }
+            double deg = Math.min(Math.abs(delta), tuning.cueTurnStepDeg);
+            note((chatSeekCentring ? "turning to face the caller: " : "looking for the caller: turning ")
+                    + (delta < 0 ? "left " : "right ") + Math.round(deg) + " deg");
+            startChatTurn(now, deg, delta < 0);
+            return ChatSession.Seek.TURNING;
+        }
+
+        @Override
+        public void seekLooked() {
+            if (chatSeekPlan != null && !chatSeekCentring) {
+                chatSeekIndex++;
+            }
+        }
+
+        @Override
+        public boolean seekTurning() {
+            return chatSeekTurning;
+        }
+
+        @Override
+        public void holdStill() {
+            if (chatSeekTurning) {
+                endChatTurn(clock.nowMs(), "the search turn stops: he speaks, or an answer started");
+            }
+        }
+
+        @Override
+        public Detection callerIn(Look look) {
+            return look == null ? null : callPerson(look.detections);
+        }
+
+        @Override
+        public void faceCaller(Detection box) {
+            gauges.stamp(Gauges.Stage.CALL_FACING, clock.nowMs());
+            chatSide = box.centerX() < 0 ? Direction.LEFT : box.centerX() > 0 ? Direction.RIGHT : chatSide;
+            chatSeekPlan = new double[]{chatSeekRel + box.centerX() * tuning.cameraHalfFovDeg};
+            chatSeekIndex = 0;
+            chatSeekCentring = true;
+        }
     };
 
     /** A cue's side as a turn direction; null when the mics tied. */
@@ -8537,6 +8856,7 @@ final class ExploreBrain {
         chatNoWheels = false;
         chatStallSince = NEVER;
         chatLookWanted = false;
+        clearCallChat();
         awayLeg = null;
         if (state != State.EYES_ONLY || shownState == null) {
             note("eyes only: " + why);

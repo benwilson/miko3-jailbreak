@@ -1210,6 +1210,49 @@ public final class ListenServiceHarness {
                         "heard=" + r.heard() + (f == null ? "" : " angle=" + f.angle));
             }
         });
+        scenario("ears_a_called_utterance_carries_the_callers_message", new Scenario() {
+            public void run(String n) {
+                // Owner 2026-10-02: the words said with the wake word are the caller's first message.
+                // The early cue has none yet; the end-of-utterance delivery carries them.
+                Rig r = new Rig();
+                r.open(false);
+                r.chunk(true);
+                r.rec.text = "HEY MIKO";
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                r.utter("HEY MIKO HOW'S IT GOING", 3);
+                EarsSession.Utterance e = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                Rig b = new Rig();
+                b.open(false);
+                b.chunk(true);
+                b.rec.text = "HEY MIKO";
+                b.spotter.hitNext = true;
+                b.chunk(true);
+                b.utter("HEY MIKO", 1);
+                EarsSession.Utterance bare = b.client.heard.size() < 2 ? null : b.client.heard.get(1);
+                check(n, e != null && "".equals(e.message) && f != null && f.called
+                                && "how's it going".equals(f.message) && bare != null && bare.called
+                                && "".equals(bare.message) && !r.diag.mention("going"),
+                        "heard=" + r.heard() + " early=" + (e == null ? null : e.message) + " end="
+                                + (f == null ? null : f.message) + " bare=" + (bare == null ? null : bare.message));
+            }
+        });
+        scenario("ears_a_name_call_carries_its_message_and_other_utterances_none", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.utter("MIKO COME OVER HERE", 3);
+                r.silence(1200);
+                r.utter("HEY BUDDY", 2);
+                EarsSession.Utterance name = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                EarsSession.Utterance hello = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, name != null && name.kind == CueClassifier.KIND_NAME && "come over here".equals(name.message)
+                                && hello != null && hello.kind == CueClassifier.KIND_GREETING && "".equals(hello.message),
+                        "heard=" + r.heard() + " name=" + (name == null ? null : name.message) + " hello="
+                                + (hello == null ? null : hello.message));
+            }
+        });
         scenario("ears_two_hits_in_one_utterance_send_one_early_cue", new Scenario() {
             public void run(String n) {
                 Rig r = new Rig();
@@ -1602,6 +1645,42 @@ public final class ListenServiceHarness {
                                 && when - opened >= 3600 && when - opened <= 4100 && !r.session.listening(),
                         "answering=" + r.client.answering + " over=" + r.client.answerOver + " @" + (when - opened)
                                 + " noneYet=" + noneYet + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_answer_over_logs_why_the_answer_had_no_words", new Scenario() {
+            public void run(String n) {
+                // Robot 2026-10-02: "answer over: no words" said nothing about the answer. It now
+                // gives its length, the chunks fed to the recogniser, when it ended against the
+                // listen's window, whether the deaf window clipped it, how soon after the deaf
+                // window it began and the pre-roll fed, so the robot log can tell a cough from his
+                // own speech's tail.
+                Rig r = new Rig();
+                r.client.overClock = r.clock;
+                r.sw.on = false;
+                r.open(false);
+                r.session.lineStarted();
+                r.steps(false, 400);
+                r.session.playbackIdle();
+                r.steps(false, Rig.TAIL);
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                r.steps(true, 320);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                r.steps(false, 4000);
+                String line = null;
+                synchronized (r.diag.lines) {
+                    for (String l : r.diag.lines) {
+                        if (l.contains("answer over: no words")) {
+                            line = l;
+                        }
+                    }
+                }
+                check(n, line != null && line.matches(".*answer \\d+ ms long.*") && line.contains("chunks fed")
+                                && line.contains("not deaf-clipped") && line.matches(".*began \\d+ ms after the deaf window.*")
+                                && line.matches(".*ended \\d+ ms before the listen's end.*") && line.contains("pre-roll"),
+                        "line=" + line + " all=" + r.diag.lines);
             }
         });
         scenario("ears_wordless_answer_past_the_window_says_answer_over_as_it_ends", new Scenario() {
