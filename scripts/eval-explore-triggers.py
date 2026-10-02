@@ -22,8 +22,8 @@ starts afresh. Each trigger is listed with whether the log itself shows a "bathr
 leaving" note within --match-s, so a changed rule's new and lost triggers stand out.
 
 Usage:
-  scripts/eval-explore-triggers.py LOG [LOG ...] [--json out.json|-] [--strong-min 0.35]
-                                   [--weak-min 0.3] [--min-area 0.006] [--year 2026]
+  scripts/eval-explore-triggers.py LOG [LOG ...] [--json out.json|-] [--strong-min 0.5]
+                                   [--weak-min 0.4] [--min-area 0.006] [--year 2026]
 """
 import argparse
 import datetime as dt
@@ -37,9 +37,9 @@ HERE = Path(__file__).resolve().parent
 
 # Mirrors ExploreBrain.BATHROOM_* (checked by scripts/tests/test_eval_explore_triggers.py).
 BATHROOM_STRONG = ("toilet",)
-BATHROOM_STRONG_MIN = 0.35
+BATHROOM_STRONG_MIN = 0.5
 BATHROOM_WEAK = ("toilet paper", "sink", "mirror", "soap", "paper towel", "towel", "bathtub")
-BATHROOM_WEAK_MIN = 0.3
+BATHROOM_WEAK_MIN = 0.4
 BATHROOM_MIN_AREA = 0.006
 BATHROOM_WEAK_LOOKS = 3
 BATHROOM_WEAK_WINDOW_MS = 10000

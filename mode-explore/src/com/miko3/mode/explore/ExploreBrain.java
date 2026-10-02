@@ -1791,13 +1791,15 @@ final class ExploreBrain {
      *  weak: on the robot (2026-10-02) a small white thing on the office floor read "toilet paper"
      *  0.35 and he beeped his way out of the office. */
     static final Set<String> BATHROOM_STRONG = new HashSet<String>(java.util.Arrays.asList("toilet"));
-    static final float BATHROOM_STRONG_MIN = 0.35f;
+    /** 0.5, not 0.35: replaying 2026-10-02 found office looks with a full-frame "toilet" at 0.35-0.36. */
+    static final float BATHROOM_STRONG_MIN = 0.5f;
     /** Two different ones of these at BATHROOM_WEAK_MIN or more, close together, mean a bathroom; one never does. */
     static final Set<String> BATHROOM_WEAK = new HashSet<String>(java.util.Arrays.asList(
             "toilet paper", "sink", "mirror", "soap", "paper towel", "towel", "bathtub"));
     /** A box smaller than this share of the frame never counts: from the floor a real fixture is big. */
     static final float BATHROOM_MIN_AREA = 0.006f;
-    static final float BATHROOM_WEAK_MIN = 0.3f;
+    /** 0.4, not 0.3: the same replay found office pairs like sink 0.31 + paper towel, mirror 0.30 + bathtub 0.38. */
+    static final float BATHROOM_WEAK_MIN = 0.4f;
     static final int BATHROOM_WEAK_LOOKS = 3;
     static final long BATHROOM_WEAK_WINDOW_MS = 10000;
     static final long BATHROOM_BEEP_MS = 5000;
