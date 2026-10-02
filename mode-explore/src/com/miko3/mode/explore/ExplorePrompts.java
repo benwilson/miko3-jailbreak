@@ -454,7 +454,11 @@ final class ExplorePrompts {
      * Appended once he knows he can't see them (owner 2026-10-02: the search found nobody, or
      * found them with no usable face): FACELESS_OPENER's invitation, mid-conversation.
      */
-    static final String CANT_SEE = "In this line, also say he can't see their face from down here and ask them to "
+    // Robot 2026-10-02 15:27 (robot-say.py): "go to the kitchen and see if anyone's there" got only "Can't see
+    // your face from down here, mind crouching down": the invitation must never replace their request.
+    static final String CANT_SEE = "First answer what they just said: if they asked him to do something, do it "
+            + "with his tools as usual and skip the rest of this. Otherwise, in this line, also say he can't see their "
+            + "face from down here and ask them to "
             + "crouch down to his level so he can get a good look at them. Do not ask their name; if they tell him "
             + "their name before he can see their face, he thanks them and asks them to crouch down so he'll "
             + "remember them.";
