@@ -2062,7 +2062,8 @@ public final class SettingsPageHarness {
                                 && edit.contains("value=\"" + id + "\"") && del.contains("value=\"" + id + "\"")
                                 && fieldNames(edit).equals(java.util.Arrays.asList("t", "id", "name", "note"))
                                 && !sec.contains(SettingsPage.OWNER_NOTES_EMPTY)
-                                && "Ask about <i>runs</i> & dogs".equals(f.people.ownerNotes().noteFor("priya")),
+                                && "Ask about <i>runs</i> & dogs".equals(f.people.ownerNotes().noteFor("priya <b>shah</b>"))
+                                && f.people.ownerNotes().noteFor("priya") == null,
                         r.status() + " | " + sec);
             }
         });

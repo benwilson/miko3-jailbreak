@@ -101,8 +101,6 @@ final class LearnLog {
         }
     }
 
-    private static final Entry STOP = new Entry(0, "", "");
-
     private final File file;
     private final File old;
     private final int pid;
@@ -162,13 +160,26 @@ final class LearnLog {
         }
     }
 
-    /** Writes what is queued, then stops the writer; waits up to waitMs for it. */
+    /** Stops the writer once it has written what is queued; the caller never waits for it. */
+    void close() {
+        close(0);
+    }
+
+    /**
+     * Stops the writer once it has written what is queued, waiting up to waitMs (0: not at all)
+     * for it. Review 2026-10-03: a STOP entry offered to a full queue was dropped silently, so the
+     * writer ran on and the caller waited out waitMs; now the closed flag and an interrupt stop
+     * it, whatever the queue holds.
+     */
     void close(long waitMs) {
         if (closed) {
             return;
         }
         closed = true;
-        queue.offer(STOP);
+        writer.interrupt();
+        if (waitMs <= 0) {
+            return;
+        }
         try {
             writer.join(waitMs);
         } catch (InterruptedException e) {
@@ -183,24 +194,33 @@ final class LearnLog {
         try {
             while (true) {
                 Entry e;
-                try {
-                    e = queue.poll(aliveMs, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException ie) {
-                    e = STOP;
+                boolean stop = closed;
+                if (stop) {
+                    e = queue.poll();
+                } else {
+                    try {
+                        e = queue.poll(aliveMs, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException ie) {
+                        // close(): what is queued is written below, then the writer stops.
+                        stop = true;
+                        e = queue.poll();
+                    }
                 }
-                boolean stop = false;
                 batch.setLength(0);
-                if (e == null) {
+                if (e == null && !stop) {
                     batch.append(line(time, wall.ms(), pid, "ExploreLearn", "learn: alive"
                             + (dropped > 0 ? " dropped=" + dropped : "")));
                 }
                 while (e != null) {
-                    if (e == STOP) {
-                        stop = true;
-                        break;
-                    }
                     batch.append(line(time, e.wallMs, pid, e.tag, e.message));
                     e = queue.poll();
+                }
+                if (!stop && closed) {
+                    // close() came while this batch was being built: what it left queued goes too.
+                    stop = true;
+                    for (e = queue.poll(); e != null; e = queue.poll()) {
+                        batch.append(line(time, e.wallMs, pid, e.tag, e.message));
+                    }
                 }
                 if (batch.length() > 0) {
                     if (out != null && size >= maxBytes) {

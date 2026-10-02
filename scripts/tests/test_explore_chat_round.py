@@ -27,7 +27,7 @@ HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "ChatRoundHarnes
 # The shared client's plain-Java classes by name (the rest of shared/ needs the Android SDK);
 # the explore classes ChatRound reaches come from the sourcepath, as the brain harness does.
 SOURCES = [HARNESS_MAIN, EXPLORE_PKG / "ChatRound.java"] + [
-    SHARED / n for n in ("ClaudeApi.java", "Json.java", "ClaudeAccess.java", "JpegSlim.java")]
+    SHARED / n for n in ("ClaudeApi.java", "Json.java", "ClaudeAccess.java", "JpegSlim.java", "NameExtractor.java")]
 
 
 class ChatRoundIsPlainJavaTest(unittest.TestCase):
@@ -62,6 +62,10 @@ class ChatRoundHarnessTest(unittest.TestCase):
         "round_the_owners_note_goes_in_the_system_context_with_its_guard_and_no_tool_returns_it",
         "round_tool_definitions_printed",
         "round_a_streamed_frame_the_detector_never_saw_goes_with_no_labels_said_so",
+        # Review 2026-10-03: the flight, ChatRound -> TurnFlight -> ChatSession.
+        "flight_an_accepted_action_after_an_early_line_reaches_the_conversation_and_ends_it",
+        "flight_a_refused_action_after_an_early_line_says_the_corrected_line_next",
+        "flight_an_unstreamed_action_beside_respond_reaches_the_conversation",
     )
 
     @classmethod

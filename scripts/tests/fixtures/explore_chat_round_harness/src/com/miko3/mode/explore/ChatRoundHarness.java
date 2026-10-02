@@ -44,6 +44,9 @@ public final class ChatRoundHarness {
         caps();
         ownerNote();
         streamedLook();
+        flightActAfterAnEarlyLine();
+        flightCorrectedLineAfterARefusedAction();
+        flightUnstreamedActionBesideRespond();
         definitionsJson();
         if (failures > 0) {
             System.exit(1);
@@ -474,7 +477,12 @@ public final class ChatRoundHarness {
         ChatActions.Verdict plural = ChatActions.check("find_thing", in("{\"label\":\"the Printers\"}"), f);
         ChatActions.Verdict unknown = ChatActions.check("find_thing", in("{\"label\":\"unicorn\"}"), f);
         ChatActions.Verdict seen = ChatActions.check("go_to_place",
-                in("{\"description\":\"the kitchen\",\"labels\":[\"fridge\",\"refrigerator\",\"sink\"]}"), f);
+                in("{\"description\":\"the kitchen\",\"labels\":[\"fridge\",\"refrigerator\",\"sink\",\"microwave\"]}"), f);
+        // Review 2026-10-03: never toward a bathroom thing: find_thing refuses one, go_to_place drops them.
+        ChatActions.Verdict toilet = ChatActions.check("find_thing", in("{\"label\":\"toilet\"}"), f);
+        ChatActions.Verdict sink = ChatActions.check("find_thing", in("{\"label\":\"a sink\"}"), f);
+        ChatActions.Verdict bathroom = ChatActions.check("go_to_place",
+                in("{\"description\":\"the bathroom\",\"labels\":[\"toilet\",\"sink\",\"mirror\"]}"), f);
         ChatActions.Verdict unseen = ChatActions.check("go_to_place",
                 in("{\"description\":\"the bus stop\",\"labels\":[\"bus\"]}"), f);
         ChatActions.Verdict nowhere = ChatActions.check("go_to_place",
@@ -483,18 +491,20 @@ public final class ChatRoundHarness {
                 plural.ok() && "printer".equals(plural.act.target) && plural.act.labels.equals(Arrays.asList("printer"))
                         && !unknown.ok() && unknown.result.startsWith("can't: his detector doesn't know")
                         && unknown.result.contains("printer") && seen.ok()
-                        && seen.act.labels.equals(Arrays.asList("refrigerator", "sink"))
-                        && seen.result.contains("where he saw a sink 3 min ago")
+                        && seen.act.labels.equals(Arrays.asList("refrigerator", "microwave"))
+                        && seen.result.contains("where he saw a microwave 3 min ago")
+                        && !toilet.ok() && toilet.result.startsWith("can't: ") && toilet.result.contains("bathroom")
+                        && !sink.ok() && !bathroom.ok() && bathroom.result.startsWith("can't: ")
                         && unseen.ok() && unseen.result.contains("searches through doorways for bus")
                         && !nowhere.ok() && nowhere.result.startsWith("don't know where that is"),
                 plural.result + " | " + unknown.result + " | " + seen.result + " | " + unseen.result + " | "
-                        + nowhere.result);
+                        + nowhere.result + " | " + toilet.result + " | " + bathroom.result);
     }
 
     private static void tasks() {
         CuriosityPort.ToolFacts f = facts(null);
         ChatActions.Verdict ok = ChatActions.check("run_task", in("{\"goal\":\"see if anyone's in the kitchen\","
-                + "\"steps\":[{\"tool\":\"go_to_place\",\"args\":{\"description\":\"kitchen\",\"labels\":[\"sink\"]},"
+                + "\"steps\":[{\"tool\":\"go_to_place\",\"args\":{\"description\":\"kitchen\",\"labels\":[\"microwave\"]},"
                 + "\"check\":false},{\"tool\":\"look\",\"args\":{},\"check\":true},"
                 + "{\"tool\":\"come_back\",\"args\":{},\"check\":false},"
                 + "{\"tool\":\"say\",\"args\":{\"text\":\"Nobody there.\"},\"check\":false}]}"), f);
@@ -507,6 +517,13 @@ public final class ChatRoundHarness {
         ChatActions.Verdict tooMany = ChatActions.check("run_task", in(many + "]}"), f);
         ChatActions.Verdict docked = ChatActions.check("run_task", in("{\"goal\":\"x\",\"steps\":[{\"tool\":"
                 + "\"move\",\"args\":{\"kind\":\"forward\",\"amount\":1},\"check\":false}]}"), facts("he is on his charger"));
+        // Review 2026-10-03: a consult's revised steps (ChatActions.steps) obey the same still rule.
+        List<Object> moveStep = new ArrayList<Object>();
+        moveStep.add(in("{\"tool\":\"move\",\"args\":{\"kind\":\"forward\",\"amount\":1},\"check\":false}"));
+        ChatActions.Verdict stuckPlan = ChatActions.steps(moveStep, facts("he is stuck and waiting for his motors"));
+        List<Object> sayStep = new ArrayList<Object>();
+        sayStep.add(in("{\"tool\":\"say\",\"args\":{\"text\":\"Hi.\"},\"check\":false}"));
+        ChatActions.Verdict sayPlan = ChatActions.steps(sayStep, facts("he is stuck and waiting for his motors"));
         ChatActions.Verdict talkOnly = ChatActions.check("run_task", in("{\"goal\":\"x\",\"steps\":[{\"tool\":"
                 + "\"say\",\"args\":{\"text\":\"Hi.\"},\"check\":false}]}"), facts("he is on his charger"));
         check("round_run_task_checks_every_step_and_a_bad_step_or_a_drive_he_cant_make_refuses_it",
@@ -517,8 +534,10 @@ public final class ChatRoundHarness {
                         && !ok.act.describe().contains("kitchen")
                         && !bad.ok() && bad.result.startsWith("can't: step 2: a task can't use stop")
                         && !tooMany.ok() && !docked.ok() && docked.result.startsWith("can't: he is on his charger")
-                        && talkOnly.ok(),
-                ok.result + " | " + bad.result + " | " + tooMany.result + " | " + docked.result);
+                        && talkOnly.ok() && !stuckPlan.ok() && stuckPlan.result.contains("he is stuck")
+                        && sayPlan.ok(),
+                ok.result + " | " + bad.result + " | " + tooMany.result + " | " + docked.result + " | "
+                        + stuckPlan.result);
     }
 
     private static void caps() {
@@ -584,6 +603,246 @@ public final class ChatRoundHarness {
                 parts != null && "image".equals(((Map<?, ?>) parts.get(0)).get("type"))
                         && caption.contains("has not looked at this one") && !caption.contains("named nothing"),
                 "caption=" + caption);
+    }
+
+    // ---- the flight (review 2026-10-03): ChatRound -> TurnFlight -> ChatSession, as the robot runs it ----
+    //
+    // The port is the adapter's turn plumbing in plain Java (ChatRound.fly into a TurnFlight, as
+    // ClaudeCuriosity.oneTurn runs it) over a fake transport; everything else a conversation asks
+    // of the port or the brain is a stand-in. The conversation itself is the real ChatSession.
+
+    /** A streaming fake: each request gets the next scripted reply as SSE lines (or a whole body). */
+    private static final class FakeStream implements ClaudeApi.StreamingTransport {
+        final ArrayDeque<String[]> replies = new ArrayDeque<String[]>();
+        final List<Map<?, ?>> bodies = new ArrayList<Map<?, ?>>();
+        final boolean streams;
+
+        FakeStream(boolean streams) {
+            this.streams = streams;
+        }
+
+        /** A reply of these tool calls ({id, name, input JSON}), in order. */
+        FakeStream reply(String[]... uses) {
+            StringBuilder b = new StringBuilder();
+            for (String[] u : uses) {
+                b.append(b.length() == 0 ? "" : "\u0001").append(u[0]).append('\u0002').append(u[1]).append('\u0002')
+                        .append(u[2]);
+            }
+            replies.add(new String[]{b.toString()});
+            return this;
+        }
+
+        private static List<String[]> uses(String packed) {
+            List<String[]> out = new ArrayList<String[]>();
+            for (String u : packed.split("\u0001")) {
+                out.add(u.split("\u0002"));
+            }
+            return out;
+        }
+
+        @Override
+        public ClaudeApi.Response send(ClaudeApi.Request request) throws IOException {
+            bodies.add((Map<?, ?>) Json.parse(request.body));
+            String[] next = replies.poll();
+            if (next == null) {
+                throw new IllegalStateException("unexpected extra request");
+            }
+            StringBuilder blocks = new StringBuilder();
+            for (String[] u : uses(next[0])) {
+                blocks.append(blocks.length() == 0 ? "" : ",").append(use(u[0], u[1], u[2]));
+            }
+            return new ClaudeApi.Response(200, "{\"content\":[" + blocks + "],\"stop_reason\":\"tool_use\"}");
+        }
+
+        @Override
+        public ClaudeApi.Response stream(ClaudeApi.Request request, ClaudeApi.LineSink sink) throws IOException {
+            if (!streams) {
+                return send(request);
+            }
+            bodies.add((Map<?, ?>) Json.parse(request.body));
+            String[] next = replies.poll();
+            if (next == null) {
+                throw new IllegalStateException("unexpected extra request");
+            }
+            sink.line("data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}");
+            int i = 0;
+            for (String[] u : uses(next[0])) {
+                sink.line("data: {\"type\":\"content_block_start\",\"index\":" + i + ",\"content_block\":"
+                        + "{\"type\":\"tool_use\",\"id\":\"" + u[0] + "\",\"name\":\"" + u[1] + "\",\"input\":{}}}");
+                String in = u[2];
+                for (String part : new String[]{in.substring(0, in.length() / 2), in.substring(in.length() / 2)}) {
+                    Map<String, Object> delta = new java.util.LinkedHashMap<String, Object>();
+                    delta.put("type", "input_json_delta");
+                    delta.put("partial_json", part);
+                    sink.line("data: {\"type\":\"content_block_delta\",\"index\":" + i + ",\"delta\":"
+                            + Json.write(delta) + "}");
+                }
+                sink.line("data: {\"type\":\"content_block_stop\",\"index\":" + i + "}");
+                i++;
+            }
+            sink.line("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}");
+            sink.line("data: {\"type\":\"message_stop\"}");
+            return new ClaudeApi.Response(200, "");
+        }
+    }
+
+    /** One conversation over the flight: the real ChatSession, the port's turns through ChatRound.fly. */
+    private static final class Flight {
+        final FakeStream transport;
+        final ClaudeApi api;
+        final CuriosityPort.ToolFacts facts;
+        final List<String> said = new ArrayList<String>();
+        final List<String> notes = new ArrayList<String>();
+        final ArrayDeque<String> heard = new ArrayDeque<String>();
+        int gen;
+        CuriosityPort.Turn ready;
+        final CuriosityPort.TurnFlight flight = new CuriosityPort.TurnFlight(new CuriosityPort.TurnFlight.Deliver() {
+            @Override
+            public boolean turn(int g, CuriosityPort.Turn t) {
+                if (g != gen) {
+                    return false;
+                }
+                ready = t;
+                return true;
+            }
+        });
+        final ChatSession chat;
+        long now = 1000;
+
+        Flight(FakeStream transport, CuriosityPort.ToolFacts facts) {
+            this.transport = transport;
+            this.api = new ClaudeApi(transport);
+            this.facts = facts;
+            CuriosityPort port = (CuriosityPort) java.lang.reflect.Proxy.newProxyInstance(
+                    CuriosityPort.class.getClassLoader(), new Class<?>[]{CuriosityPort.class}, (proxy, m, args) -> {
+                        switch (m.getName()) {
+                            case "turn":
+                                turn((CuriosityPort.TurnRequest) args[0]);
+                                return null;
+                            case "turnAnswer": {
+                                CuriosityPort.Turn t = ready;
+                                ready = null;
+                                return t;
+                            }
+                            case "cancelTurn":
+                                gen++;
+                                flight.cancel();
+                                return null;
+                            case "lateTurn":
+                                return flight.lateTurn();
+                            case "lateNotes":
+                                return flight.lateNotes();
+                            case "lateFeedback":
+                                return flight.lateFeedback();
+                            case "turnTailPending":
+                                return flight.tailPending();
+                            case "say":
+                                said.add((String) args[0]);
+                                return null;
+                            case "sayFinished":
+                                return Boolean.TRUE;
+                            case "heard": {
+                                String h = heard.poll();
+                                return h == null ? CuriosityPort.Heard.NOTHING
+                                        : new CuriosityPort.Heard(CuriosityPort.Heard.Status.WORDS, h);
+                            }
+                            case "toolAsk":
+                            case "provisional":
+                                return null;
+                            case "answering":
+                                return Boolean.FALSE;
+                            default:
+                                return m.invoke(CuriosityPort.NONE, args);
+                        }
+                    });
+            ChatSession.Host host = (ChatSession.Host) java.lang.reflect.Proxy.newProxyInstance(
+                    ChatSession.Host.class.getClassLoader(), new Class<?>[]{ChatSession.Host.class}, (proxy, m, args) -> {
+                        switch (m.getName()) {
+                            case "note":
+                                notes.add((String) args[0]);
+                                return null;
+                            case "toolFacts":
+                                return Flight.this.facts;
+                            case "seek":
+                                return ChatSession.Seek.DONE;
+                            default:
+                                Class<?> r = m.getReturnType();
+                                return r == boolean.class ? Boolean.FALSE : null;
+                        }
+                    });
+            chat = new ChatSession(new ExploreTuning.Builder().build(), port, host);
+        }
+
+        private void turn(CuriosityPort.TurnRequest request) {
+            int g = ++gen;
+            final ChatRound.Body body = ChatRound.body(request, null);
+            CuriosityPort.TurnFlight.Call call = flight.start(body.key, g);
+            ChatRound.fly(body, request, (messages, tools, early) -> api.conversation(ACCESS, body.system, messages,
+                    null, "low", 5000, ChatRound.EARLY_FIELDS, early, tools), new Host(), flight, call, new long[1],
+                    null);
+        }
+
+        /** Opens the conversation with Sarah and runs it until it is over (or 60 s pass). */
+        Flight run(String... answers) {
+            heard.addAll(Arrays.asList(answers));
+            chat.start(now, CuriosityPort.MatchAnswer.known("Sarah", "Hi {name}!", "Hello again!"), false, false, null);
+            for (int i = 0; i < 600 && !chat.finished(); i++) {
+                now += 100;
+                chat.step(now);
+            }
+            return this;
+        }
+    }
+
+    private static String[] respondUse(String id, String line) {
+        Map<String, Object> input = ChatTools.saidInput(line);
+        input.put("addressed", true);
+        return new String[]{id, "respond", Json.write(input)};
+    }
+
+    private static void flightActAfterAnEarlyLine() {
+        // The normal case: respond streams first, its line goes early, and come_here follows in the same
+        // reply. The act came only with the whole reply, which after an early line passed on its notes alone.
+        FakeStream t = new FakeStream(true)
+                .reply(respondUse("toolu_1", "Hi Sarah!"))
+                .reply(respondUse("toolu_2", "Sure, coming over!"), new String[]{"toolu_C", "come_here", "{}"});
+        Flight f = new Flight(t, facts(null)).run("Come over here.");
+        check("flight_an_accepted_action_after_an_early_line_reaches_the_conversation_and_ends_it",
+                f.chat.finished() && f.chat.action() == CuriosityPort.Action.COME_HERE && f.chat.act() != null
+                        && f.said.equals(Arrays.asList("Hi Sarah!", "Sure, coming over!")) && t.bodies.size() == 2,
+                "action=" + f.chat.action() + " said=" + f.said + " requests=" + t.bodies.size() + " notes=" + f.notes);
+    }
+
+    private static void flightCorrectedLineAfterARefusedAction() {
+        // respond first, then a move he can't make (on the charger): the early line already went, the round
+        // runs, and its honest line is said right after instead of being dropped.
+        FakeStream t = new FakeStream(true)
+                .reply(respondUse("toolu_1", "Hi Sarah!"))
+                .reply(respondUse("toolu_2", "Okay, coming forward."),
+                        new String[]{"toolu_M", "move", "{\"kind\":\"forward\",\"amount\":1}"})
+                .reply(respondUse("toolu_3", "Actually, I can't drive off my charger."))
+                .reply(respondUse("toolu_4", "Bye then."));
+        Flight f = new Flight(t, facts("he is on his charger")).run("Come forward a bit.", "Okay.");
+        int okay = f.said.indexOf("Okay, coming forward.");
+        int sorry = f.said.indexOf("Actually, I can't drive off my charger.");
+        String history = t.bodies.size() < 4 ? "" : Json.write(messages(t.bodies.get(3)));
+        check("flight_a_refused_action_after_an_early_line_says_the_corrected_line_next",
+                f.chat.action() == CuriosityPort.Action.NONE && okay >= 0 && sorry == okay + 1
+                        && history.contains("Okay, coming forward. Actually, I can't drive off my charger."),
+                "said=" + f.said + " action=" + f.chat.action() + " requests=" + t.bodies.size() + " notes=" + f.notes);
+    }
+
+    private static void flightUnstreamedActionBesideRespond() {
+        // Unstreamed, the whole reply told the early fields at its end even with an action beside respond,
+        // so the line went "early" and the act was lost the same way.
+        FakeStream t = new FakeStream(false)
+                .reply(respondUse("toolu_1", "Hi Sarah!"))
+                .reply(new String[]{"toolu_Q", "be_quiet", "{\"minutes\":5}"}, respondUse("toolu_2", "Okay, shh."));
+        Flight f = new Flight(t, facts(null)).run("Be quiet for a bit.");
+        check("flight_an_unstreamed_action_beside_respond_reaches_the_conversation",
+                f.chat.finished() && f.chat.action() == CuriosityPort.Action.BE_QUIET
+                        && f.said.equals(Arrays.asList("Hi Sarah!", "Okay, shh.")),
+                "action=" + f.chat.action() + " said=" + f.said + " notes=" + f.notes);
     }
 
     /** The tool definitions as sent, for the Python side to hold against the bench byte for byte. */

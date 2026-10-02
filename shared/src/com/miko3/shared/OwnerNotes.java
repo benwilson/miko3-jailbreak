@@ -19,11 +19,11 @@ import java.util.Map;
  * 1 to MAX_NOTE_CHARS). add() and edit() throw IllegalArgumentException with
  * a fixed REFUSE_* reason, never echoing what was typed.
  *
- * Matching (noteFor), case-insensitive with whitespace collapsed: an exact
- * full-name match wins; otherwise the asked name's first word must match the
- * first word of exactly one entry, and either the asked name or that entry is
- * a single word ("Priya" finds "Priya Shah", "Priya Shah" finds "Priya", but
- * "Priya Jones" never finds "Priya Shah"). Ambiguous or none: null.
+ * Matching (noteFor), case-insensitive with whitespace collapsed: the asked
+ * name must equal the entry's full name. Review 2026-10-03: a first name alone
+ * never finds a note ("Priya" does not find "Priya Shah"), because a spoken
+ * name is unverified and anyone can say a first name; Explore asks only with a
+ * face-matched person's stored name or the name they spoke. None: null.
  *
  * Plain Java (no android.*), not thread-safe: OwnerNotesStore guards it.
  */
@@ -115,7 +115,7 @@ public final class OwnerNotes {
         return Collections.unmodifiableList(new ArrayList<Entry>(entries));
     }
 
-    /** The note for the person with this name, or null (see the class comment for the rules). */
+    /** The note whose full name is exactly this name, or null (see the class comment). */
     public String noteFor(String name) {
         String asked = normalize(name);
         if (asked.isEmpty()) {
@@ -126,21 +126,7 @@ public final class OwnerNotes {
                 return e.note;
             }
         }
-        String first = firstWord(asked);
-        Entry only = null;
-        int count = 0;
-        for (Entry e : entries) {
-            if (firstWord(normalize(e.name)).equals(first)) {
-                only = e;
-                count++;
-            }
-        }
-        if (count != 1) {
-            return null;
-        }
-        boolean askedSingle = asked.indexOf(' ') < 0;
-        boolean entrySingle = normalize(only.name).indexOf(' ') < 0;
-        return askedSingle || entrySingle ? only.note : null;
+        return null;
     }
 
     public String toJson() {
@@ -236,10 +222,5 @@ public final class OwnerNotes {
 
     static String normalize(String name) {
         return name == null ? "" : name.replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
-    }
-
-    private static String firstWord(String normalized) {
-        int sp = normalized.indexOf(' ');
-        return sp < 0 ? normalized : normalized.substring(0, sp);
     }
 }

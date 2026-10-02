@@ -1362,6 +1362,29 @@ public final class ClaudeApiHarness {
                         && "Hi.".equals(rpr.json.get("line")),
                 describeTools(rpr) + " calls=" + rpe.calls);
 
+        // Review 2026-10-03: a reply that also calls another tool is not the final reply (a tool round
+        // may replace its line), so its fields are never told early: not when that tool started first
+        // in the stream, and never from the whole reply. One that starts after the line can't be known.
+        FakeStreamingTransport at = new FakeStreamingTransport();
+        Sse as = new Sse().toolStart(0, "toolu_M", "move").json(0, "{\"kind\": \"forward\"}").stop(0)
+                .toolStart(1, "toolu_R", "respond").json(1, "{\"line\": \"Coming.\", \"question_asked\": \"\", ")
+                .json(1, "\"name_given\": \"\", \"ends_conversation\": false}").stop(1);
+        at.sse(as.end("tool_use"));
+        Early ae = new Early(at);
+        ClaudeApi.MessageResult ar = new ClaudeApi(at).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                EARLY, ae, new ClaudeApi.Tools(withRespond).replyTool("respond"));
+        FakeTransport aw = new FakeTransport().reply(200, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_R\","
+                + "\"name\":\"respond\",\"input\":{\"line\":\"Coming.\",\"question_asked\":\"\",\"name_given\":\"\"}},"
+                + "{\"type\":\"tool_use\",\"id\":\"toolu_M\",\"name\":\"move\",\"input\":{\"kind\":\"forward\"}}],"
+                + "\"stop_reason\":\"tool_use\"}");
+        Early awe = new Early(null);
+        ClaudeApi.MessageResult awr = new ClaudeApi(aw).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                EARLY, awe, new ClaudeApi.Tools(withRespond).replyTool("respond"));
+        check("conversation_reply_tool_beside_another_tool_is_never_told_early_when_known",
+                ar.ok() && ae.calls == 0 && "Coming.".equals(ar.json.get("line")) && ar.toolUses.size() == 2
+                        && awr.ok() && awe.calls == 0 && "Coming.".equals(awr.json.get("line")),
+                "streamed calls=" + ae.calls + " whole calls=" + awe.calls + " " + describeTools(ar));
+
         // A tool input cut off by max_tokens can't be run: BAD_REPLY.
         FakeStreamingTransport cut = new FakeStreamingTransport();
         cut.sse(new Sse().toolStart(0, "toolu_X", "look").json(0, "{\"why\": \"to see th").stop(0).end("max_tokens"));

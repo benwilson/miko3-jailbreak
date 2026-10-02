@@ -84,7 +84,7 @@ final class ChatActions {
             + "in English, singular.";
     static final String GO_TO_PLACE_DESCRIPTION = "Go to a place they name, like the kitchen. Miko does not know "
             + "rooms by name, only what his camera saw: labels are the things his detector would see there (a "
-            + "kitchen: refrigerator, microwave, sink); he heads for where he saw them lately, or searches through "
+            + "kitchen: refrigerator, microwave, oven); he heads for where he saw them lately, or searches through "
             + "doorways for them. Do not call places first: this looks them up itself.";
     static final String WAIT_DESCRIPTION = "Wait where he is for some seconds (at most 120), then carry on.";
     static final String RUN_TASK_DESCRIPTION = "Run a short errand of several steps in order, like \"go to the "
@@ -355,7 +355,11 @@ final class ChatActions {
                     + " for up to 5 min.");
         }
         if (FIND_THING.equals(tool)) {
-            String label = known(text(in.get("label"), MAX_TEXT_CHARS), f);
+            String asked = text(in.get("label"), MAX_TEXT_CHARS);
+            String label = known(asked, f);
+            if (bathroomLabel(asked)) {
+                return Verdict.cant(BATHROOM_THING);
+            }
             if (label == null) {
                 return Verdict.cant("his detector doesn't know what that looks like" + knownHint(f));
             }
@@ -420,13 +424,21 @@ final class ChatActions {
         String desc = text(in.get("description"), MAX_TEXT_CHARS);
         List<String> labels = new ArrayList<String>();
         Object raw = in.get("labels");
+        boolean bathroomOnly = false;
         if (raw instanceof List) {
             for (Object o : (List<?>) raw) {
-                String l = known(text(o, MAX_TEXT_CHARS), f);
-                if (l != null && !labels.contains(l) && labels.size() < 6) {
+                String t = text(o, MAX_TEXT_CHARS);
+                String l = known(t, f);
+                if (bathroomLabel(t)) {
+                    // Review 2026-10-03: never toward a bathroom thing; the place's other labels still count.
+                    bathroomOnly = true;
+                } else if (l != null && !labels.contains(l) && labels.size() < 6) {
                     labels.add(l);
                 }
             }
+        }
+        if (labels.isEmpty() && bathroomOnly) {
+            return Verdict.cant(BATHROOM_THING);
         }
         if (labels.isEmpty()) {
             return new Verdict(null, "don't know where that is: give labels of things his detector would see there"
@@ -462,16 +474,14 @@ final class ChatActions {
         }
         Act task = new Act(CuriosityPort.Action.RUN_TASK, RUN_TASK, null, 0, 0, null, null, null, false,
                 parsed.act.steps, goal);
-        if (task.drives() && f.still != null) {
-            return Verdict.cant(f.still);
-        }
         return started(new Verdict(task, "started: a task of " + task.steps.size() + " steps ("
                 + stepTools(task.steps) + "); its own steps say what happened; a call or \"stop\" ends it."));
     }
 
     /**
-     * A task's steps as Acts, every one checked; the first bad step refuses them all.
-     * Answered as a verdict whose act carries the steps (ok) or why not.
+     * A task's steps as Acts, every one checked; the first bad step refuses them all, and so
+     * does a step that drives while he can't (facts.still: review 2026-10-03, a consult's
+     * revised plan included). Answered as a verdict whose act carries the steps (ok) or why not.
      */
     static Verdict steps(List<?> list, CuriosityPort.ToolFacts facts) {
         CuriosityPort.ToolFacts f = facts == null ? CuriosityPort.ToolFacts.NONE : facts;
@@ -503,6 +513,13 @@ final class ChatActions {
         if (out.size() > MAX_STEPS) {
             return Verdict.cant("a task has at most " + MAX_STEPS + " steps");
         }
+        if (f.still != null) {
+            for (Act a : out) {
+                if (a.drives()) {
+                    return Verdict.cant(f.still);
+                }
+            }
+        }
         return new Verdict(new Act(CuriosityPort.Action.RUN_TASK, RUN_TASK, null, 0, 0, null, null, null, false, out,
                 null), "ok");
     }
@@ -517,8 +534,25 @@ final class ChatActions {
         return new Act(a, tool, null, 0, ms, null, null, null, false, null, null);
     }
 
-    /** The label as his detector names it (lower case; a plural's singular), or null when it isn't one. */
-    static String known(String label, CuriosityPort.ToolFacts f) {
+    /** What a bathroom thing is told (review 2026-10-03). */
+    static final String BATHROOM_THING = "that is a bathroom thing, and he never goes looking for bathrooms";
+
+    /** Whether this label (as Claude wrote it) is one bathroom privacy watches for (ExploreBrain), at any score. */
+    static boolean bathroomLabel(String label) {
+        String l = plain(label);
+        if (l == null) {
+            return false;
+        }
+        for (String s : new String[]{l, l.replaceAll("es$", ""), l.replaceAll("s$", "")}) {
+            if (ExploreBrain.BATHROOM_STRONG.contains(s) || ExploreBrain.BATHROOM_WEAK.contains(s)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Lower case, spaces collapsed, a leading article dropped; null when nothing is left. */
+    private static String plain(String label) {
         if (label == null) {
             return null;
         }
@@ -530,7 +564,13 @@ final class ChatActions {
         } else if (l.startsWith("the ")) {
             l = l.substring(4);
         }
-        if (l.isEmpty()) {
+        return l.isEmpty() ? null : l;
+    }
+
+    /** The label as his detector names it (lower case; a plural's singular), or null when it isn't one. */
+    static String known(String label, CuriosityPort.ToolFacts f) {
+        String l = plain(label);
+        if (l == null) {
             return null;
         }
         if (f.vocabulary.isEmpty() || f.vocabulary.contains(l)) {
@@ -551,6 +591,9 @@ final class ChatActions {
         StringBuilder b = new StringBuilder();
         int n = 0;
         for (String w : f.vocabulary) {
+            if (bathroomLabel(w)) {
+                continue;
+            }
             if (n++ >= 40) {
                 b.append(", ...");
                 break;

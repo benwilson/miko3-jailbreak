@@ -799,7 +799,9 @@ public final class ClaudeApi {
      * - a reply that calls a tool is ok: MessageResult.toolUses, .content and .stopReason
      *   ("tool_use") say what to run; json is the reply text's JSON object when it has one;
      * - with tools.replyTool, that tool's input is the structured reply: it becomes json,
-     *   and early is told its named fields as the input streams;
+     *   and early is told its named fields as the input streams, but never when the reply
+     *   also calls another tool (one that started before them, or any in the whole reply):
+     *   such a reply is not the final one;
      * - tools.textBlocks is told each text block as it closes (a reason to stream on its own);
      * - a tool input that isn't one JSON object (cut off by max_tokens) is BAD_REPLY.
      * Answer a tool call by sending the history plus assistantTurn(result) and
@@ -850,8 +852,10 @@ public final class ClaudeApi {
                 }
             }
         }
-        // A tool call with no structured reply yet (no JSON text, no reply tool) has no fields to tell.
-        if (wantsEarly && r.ok() && (sink == null || !sink.told) && (tools == null || !r.json.isEmpty())) {
+        // A tool call with no structured reply yet (no JSON text, no reply tool) has no fields to tell,
+        // and a reply tool's input beside another tool call is not the final reply (review 2026-10-03).
+        if (wantsEarly && r.ok() && (sink == null || !sink.told) && (tools == null || !r.json.isEmpty())
+                && !otherToolUse(r, tools)) {
             Map<String, String> fields = new LinkedHashMap<String, String>();
             for (String name : earlyNames) {
                 Object v = r.json.get(name);
@@ -860,6 +864,19 @@ public final class ClaudeApi {
             early.complete(fields);
         }
         return r;
+    }
+
+    /** Whether the reply calls a tool other than tools.replyTool (none when there is no reply tool). */
+    private static boolean otherToolUse(MessageResult r, Tools tools) {
+        if (tools == null || tools.replyTool == null) {
+            return false;
+        }
+        for (ToolUse u : r.toolUses) {
+            if (!tools.replyTool.equals(u.name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** One request: streamed into sink when there is one, else sent whole. */
@@ -988,6 +1005,22 @@ public final class ClaudeApi {
             return v instanceof String ? (String) v : "";
         }
 
+        /**
+         * Review 2026-10-03: a tool call other than the reply tool has started, so this reply is not
+         * the final one (a tool round may replace its line): its fields are not told early.
+         */
+        private boolean otherToolStarted() {
+            if (tools == null || tools.replyTool == null) {
+                return false;
+            }
+            for (Block b : blocks.values()) {
+                if ("tool_use".equals(b.type) && !tools.replyTool.equals(b.name)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /** The block a delta belongs to; one with no content_block_start is taken to be of this type. */
         private Block block(Map<?, ?> ev, String type) {
             int i = index(ev);
@@ -1000,7 +1033,7 @@ public final class ClaudeApi {
         }
 
         private void tellIfComplete(CharSequence source) {
-            if (told || errorType != null || early == null || names == null) {
+            if (told || errorType != null || early == null || names == null || otherToolStarted()) {
                 return;
             }
             Map<String, String> found = completeStringFields(source.toString());

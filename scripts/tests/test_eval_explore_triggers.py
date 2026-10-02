@@ -65,6 +65,11 @@ class ConstantsInStepTest(unittest.TestCase):
         self.assertEqual(float(self.java_value("BATHROOM_MIN_AREA").rstrip("f")), ev.BATHROOM_MIN_AREA)
         self.assertEqual(int(self.java_value("BATHROOM_WEAK_LOOKS")), ev.BATHROOM_WEAK_LOOKS)
         self.assertEqual(int(self.java_value("BATHROOM_WEAK_WINDOW_MS")), ev.BATHROOM_WEAK_WINDOW_MS)
+        # Robot 2026-10-02 14:51: a strong box a non-bathroom label also claims is only weak, and
+        # the strong rule needs it in 2 of the last 3 looks.
+        self.assertEqual(float(self.java_value("BATHROOM_RIVAL_IOU").rstrip("f")), ev.BATHROOM_RIVAL_IOU)
+        self.assertEqual(float(self.java_value("BATHROOM_RIVAL_MIN").rstrip("f")), ev.BATHROOM_RIVAL_MIN)
+        self.assertEqual(int(self.java_value("BATHROOM_STRONG_LOOKS")), ev.BATHROOM_STRONG_LOOKS)
 
 
 class ReplayTest(unittest.TestCase):
@@ -75,10 +80,31 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(ev.parse_look("look in 5 ms: []"), [])
         self.assertIsNone(ev.parse_look("openness in 9 ms"))
 
-    def test_a_strong_toilet_triggers_and_a_faint_or_tiny_one_does_not(self):
-        r = run([look(0, "toilet 0.60 [0.35,0.40,0.65,0.80]"), look(30, "toilet 0.30 [0.35,0.40,0.65,0.80]"),
-                 look(60, "toilet 0.90 [0.50,0.50,0.55,0.55]")])
-        self.assertEqual([(x["rule"], x["looks"]) for x in r["triggers"]], [("strong", 1)])
+    def test_a_strong_toilet_in_two_of_three_looks_triggers_and_a_faint_tiny_or_lone_one_does_not(self):
+        toilet = "toilet 0.60 [0.35,0.40,0.65,0.80]"
+        r = run([look(0, toilet), look(1, "chair 0.5 [0,0,1,1]"), look(2, toilet)])
+        self.assertEqual([(x["rule"], x["looks"]) for x in r["triggers"]], [("strong", 2)])
+        self.assertEqual(run([look(0, toilet)])["triggers"], [])
+        self.assertEqual(run([look(0, toilet), look(1), look(2), look(3, toilet)])["triggers"], [])
+        self.assertEqual(run([look(0, toilet), look(11, toilet)])["triggers"], [])
+        faint, tiny = "toilet 0.30 [0.35,0.40,0.65,0.80]", "toilet 0.90 [0.50,0.50,0.55,0.55]"
+        self.assertEqual(run([look(0, faint), look(1, faint), look(2, tiny), look(3, tiny)])["triggers"], [])
+
+    def test_the_1451_office_chair_toilet_is_only_weak_and_never_triggers(self):
+        """Robot 2026-10-02 14:51: a close office chair filled the frame and the detector gave the
+        same box "toilet" 0.62 too: a strong box with a non-bathroom rival (IoU >= 0.8, score >= 0.25)."""
+        chair = ("toilet 0.62 [0.32,0.00,1.00,1.00]", "office chair 0.33 [0.32,0.00,1.00,1.00]",
+                 "sink 0.26 [0.32,0.00,1.00,0.53]")
+        self.assertEqual(run([look(0, *chair), look(1, *chair), look(2, *chair)])["triggers"], [])
+        # Demoted to weak, it still counts with another weak label.
+        r = run([look(0, *chair), look(1, "mirror 0.45 [0.10,0.10,0.30,0.50]")])
+        self.assertEqual([(x["rule"], [b[0] for b in x["boxes"]]) for x in r["triggers"]],
+                         [("weak2", ["toilet", "mirror"])])
+        # A rival under 0.25, or one that overlaps less, leaves it strong.
+        faint = ("toilet 0.62 [0.32,0.00,1.00,1.00]", "office chair 0.20 [0.32,0.00,1.00,1.00]")
+        self.assertEqual(len(run([look(0, *faint), look(1, *faint)])["triggers"]), 1)
+        apart = ("toilet 0.62 [0.32,0.00,1.00,1.00]", "office chair 0.40 [0.00,0.00,0.60,1.00]")
+        self.assertEqual(len(run([look(0, *apart), look(1, *apart)])["triggers"]), 1)
 
     def test_toilet_paper_alone_never_triggers_and_with_a_sink_does(self):
         r = run([look(0, "toilet paper 0.80 [0.30,0.30,0.50,0.60]")])
@@ -99,6 +125,7 @@ class ReplayTest(unittest.TestCase):
     def test_a_new_pid_starts_afresh_and_logged_triggers_are_matched(self):
         r = run([look(0, "sink 0.40 [0.30,0.30,0.60,0.60]", pid=1),
                  look(1, "soap 0.40 [0.30,0.30,0.60,0.60]", pid=2),
+                 look(49, "toilet 0.60 [0.35,0.40,0.65,0.80]"),
                  look(50, "toilet 0.60 [0.35,0.40,0.65,0.80]"),
                  L(50.5, "bathroom: toilet; leaving and beeping (privacy)", tag="ExploreBrain"),
                  L(90, "bathroom: toilet paper; leaving and beeping (privacy)", tag="ExploreBrain")])
@@ -107,18 +134,18 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(len(r["logged_not_replayed"]), 1)
 
     def test_thresholds_can_be_tried(self):
-        lines = [look(0, "toilet 0.30 [0.35,0.40,0.65,0.80]")]
+        lines = [look(0, "toilet 0.30 [0.35,0.40,0.65,0.80]"), look(1, "toilet 0.30 [0.35,0.40,0.65,0.80]")]
         self.assertEqual(run(lines)["triggers"], [])
         self.assertEqual(len(run(lines, strong_min=0.25)["triggers"]), 1)
 
     def test_cli_lists_new_triggers_and_writes_json(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d, "day.log")
-            log.write_text(look(0, "toilet 0.60 [0.35,0.40,0.65,0.80]"))
+            log.write_text(look(0, "toilet 0.60 [0.35,0.40,0.65,0.80]") + look(1, "toilet 0.60 [0.35,0.40,0.65,0.80]"))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 ev.main([str(log), "--year", "2026"])
-            self.assertIn("strong looks=1 NEW: toilet 0.60 [0.35,0.40,0.65,0.80]", out.getvalue())
+            self.assertIn("strong looks=2 NEW: toilet 0.60 [0.35,0.40,0.65,0.80]", out.getvalue())
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 ev.main([str(log), "--year", "2026", "--json", "-"])

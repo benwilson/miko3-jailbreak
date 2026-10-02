@@ -249,7 +249,7 @@ public class ModeApp extends Application {
             learnLog = null;
             if (l != null) {
                 l.record("ExploreModeApp", "learn: stop");
-                l.close(500);
+                l.close();
             }
             drive.setReadingListener(null);
             ears.release();

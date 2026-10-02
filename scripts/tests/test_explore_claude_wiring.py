@@ -677,8 +677,10 @@ class ClaudeRateLimitWiringTest(unittest.TestCase):
         self.assertIn('"): pausing Claude requests for "', rec)
 
     def test_a_rate_limited_or_paused_turn_is_unreachable_so_the_conversation_can_wait(self):
-        turn_of = self.body(r"private static Turn turnOf\(ChatRound\.Outcome o\)")
-        m = re.search(r"case OVERLOADED:\s*case RATE_LIMITED:.*?return Turn\.unreachable\(\);", turn_of, re.S)
+        # Review 2026-10-03: turnOf lives in ChatRound, beside fly(), which the host harness runs.
+        turn_of = re.search(r"static CuriosityPort\.Turn turnOf\(Outcome o\)(.*?)\n    \}",
+                            code_only(src("ChatRound.java")), re.S).group(1)
+        m = re.search(r"case OVERLOADED:\s*case RATE_LIMITED:.*?return CuriosityPort\.Turn\.unreachable\(\);", turn_of, re.S)
         self.assertIsNotNone(m)
 
 
@@ -708,13 +710,18 @@ class FasterTurnWiringTest(unittest.TestCase):
     def test_a_turn_streams_and_hands_its_line_over_early(self):
         turn = self.method("private void oneTurn(")
         self.assertIn("TURN_EFFORT, (int) timeoutMs,\n                        ChatRound.EARLY_FIELDS, early, tools)", turn)
-        self.assertIn("flight.early(call, ", turn)
-        self.assertIn("flight.whole(call, ", turn)
+        # Review 2026-10-03: the flight wiring is ChatRound.fly, which the host harness runs end to end.
+        self.assertIn("ChatRound.fly(body, request, new ChatRound.Asker()", turn)
+        cr = code_only(src("ChatRound.java"))
+        fly = re.search(r"static Outcome fly\((.*?)\n    \}", cr, re.S).group(1)
+        self.assertIn("flight.early(call, t)", fly)
+        self.assertIn("flight.whole(call, turnOf(o), earlyIn[0] != 0 && earlyIn[0] < sends[0])", fly)
+        self.assertIn("public Turn lateTurn()", self.a)
         # Owner 2026-10-02/03: "addressed" (a boolean, before the line) comes with the early fields
         # from the respond tool's streamed input (owner 2026-10-03: no action fields, they are tools now).
         self.assertRegex(code_only(src("ChatRound.java")),
                          r'EARLY_FIELDS\s*=\s*Arrays\.asList\("addressed", "line", "question_asked", "name_given"\)')
-        early = self.method("private static Turn earlyTurn(")
+        early = re.search(r"static CuriosityPort\.Turn earlyTurn\((.*?)\n    \}", cr, re.S).group(1)
         self.assertIn("ClaudeReplies.turn(", early)
         self.assertIn("NameExtractor.validName(", early)
 
@@ -1043,7 +1050,7 @@ class ConversationWiringTest(unittest.TestCase):
         turn = re.search(r"private void oneTurn\((.*?)\n    \}", a, re.S).group(1)
         # Owner 2026-10-03: the reply is the respond tool's input, so no JSON schema is sent.
         self.assertIn("claude.conversation(settings, body.system, messages, null, TURN_EFFORT", turn)
-        self.assertIn("ChatRound.run(body, request,", turn)
+        self.assertIn("ChatRound.fly(body, request,", turn)
         for method in ("toolAsk", "lookAnswer"):
             self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
         body = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
@@ -1054,7 +1061,7 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertIn("userMessage(saidBefore, face, ask)", body)
         self.assertIn("ClaudeApi.jpegBlock(face)", code_only(src("ChatRound.java")))
         self.assertIn("request.heard == null && request.transcript.isEmpty() && met != null\n                ? met.storeCrop : null", a)
-        self.assertIn("NameExtractor.validName(t.nameGiven)", a)
+        self.assertIn("NameExtractor.validName(t.nameGiven)", code_only(src("ChatRound.java")))
         self.assertIn("RobotPeopleClient.mergeNotes(app, personId, notesUpdate)", a)
         self.assertIn("RobotPeopleClient.forget(app, personId)", a)
         keep = re.search(r"public void keep\((.*?)\n    \}", a, re.S).group(1)
@@ -1088,9 +1095,8 @@ class ConversationWiringTest(unittest.TestCase):
     def test_the_camera_parks_the_detector_through_the_conversation(self):
         cam = code_only(src("ExploreCamera.java"))
         self.assertIn("public void park(boolean p)", cam)
-        # Robot 2026-10-03: parked frames are only kept (for the look tool), never detected.
-        self.assertIn("boolean detect = !busy && !parked;", cam)
-        self.assertIn("if (!detect) {\n                    return;\n                }\n                busy = true;", cam)
+        # Review 2026-10-03: a parked frame is neither detected nor copied.
+        self.assertIn("if (busy || parked) {\n                    return;\n                }", cam)
         brain = code_only(src("ExploreBrain.java"))
         self.assertIn("camera.park(parked)", brain)
         # Face plan U7: the close match's question keeps it open and parked on the conversation path too.
@@ -1203,7 +1209,7 @@ class CallConversationTest(unittest.TestCase):
                                r"ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CALL_WORDS;")
         self.assertRegex(turn, r"if \(request\.cantSee\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CANT_SEE;")
         session = code_only(src("ChatSession.java"))
-        self.assertIn(".call(called, cantSeeDue).withFacts(host.toolFacts());", session)
+        self.assertIn(".call(called, cantSeeDue).withFacts(host.toolFacts())\n                .noteBy(noteName);", session)
 
     def test_opening_a_call_conversation_reads_the_persona_and_sends_nothing_to_claude(self):
         c = code_only(src("ClaudeCuriosity.java"))
@@ -1278,7 +1284,8 @@ class FeedbackWiringTest(unittest.TestCase):
         for call in re.findall(r"Log\.[diwe]\((.*?)\);", b, re.S):
             bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
             self.assertNotRegex(bare, r"summary|quote|context|\bshared\b(?!\.kind)|\bf\b", call)
-        turn_of = re.search(r"private static Turn turnOf\((.*?)\n    \}", a, re.S).group(1)
+        turn_of = re.search(r"static CuriosityPort\.Turn turnOf\((.*?)\n    \}", code_only(src("ChatRound.java")),
+                            re.S).group(1)
         self.assertIn(".withFeedback(t.feedback)", turn_of)
 
     def test_the_conversation_traces_only_the_kind(self):
@@ -1326,13 +1333,14 @@ class InstructionsAndAddressedTest(unittest.TestCase):
 
     def test_the_early_line_waits_for_addressed_from_the_stream(self):
         a = code_only(src("ClaudeCuriosity.java"))
-        early = re.search(r"private static Turn earlyTurn\((.*?)\n    \}", a, re.S).group(1)
+        cr = code_only(src("ChatRound.java"))
+        early = re.search(r"static CuriosityPort\.Turn earlyTurn\((.*?)\n    \}", cr, re.S).group(1)
         self.assertIn("addressed", early)
         self.assertIn('"true".equals(fields.get("addressed"))', early)
         # Owner 2026-10-03: the shared client tells the streamed boolean itself; no transport wrapper.
         self.assertIn("new ClaudeApi(new ClaudeHttpsTransport())", a)
         self.assertNotIn("StreamedText", a)
-        turn_of = re.search(r"private static Turn turnOf\((.*?)\n    \}", a, re.S).group(1)
+        turn_of = re.search(r"static CuriosityPort\.Turn turnOf\((.*?)\n    \}", cr, re.S).group(1)
         self.assertIn(".withAddressed(t.addressed)", turn_of)
         # Owner 2026-10-03: the accepted action tool is the turn's act.
         self.assertIn("t = t.withAct(o.act);", turn_of)
@@ -1405,7 +1413,8 @@ class ToolRoundWiringTest(unittest.TestCase):
     def test_the_look_tool_is_gated_by_privacy_first(self):
         brain = code_only(src("ExploreBrain.java"))
         body = re.search(r"public String lookBlocked\(\) \{(.*?)\n        \}", brain, re.S).group(1)
-        self.assertLess(body.index("if (bathroom)"), body.index("muted || quiet"))
+        # Review 2026-10-03: a single strong look holds frames too (bathHeld).
+        self.assertLess(body.index("if (bathroom || bathHeld(clock.nowMs()))"), body.index("muted || quiet"))
         self.assertLess(body.index("muted || quiet"), body.index("!leaseHeld"))
 
 
@@ -1426,7 +1435,7 @@ class LearnLogWiringTest(unittest.TestCase):
         self.assertIn("LearnLog.startRecord(buildId(), tuning)", app)
         self.assertIn("getPackageInfo(getPackageName(), 0).versionName", app)
         stop = app[app.index("void stopExplore()"):]
-        self.assertLess(stop.index("loop.stop()"), stop.index(".close(500)"))
+        self.assertLess(stop.index("loop.stop()"), stop.index("l.close()"))
 
     def test_the_log_writes_off_the_brain_thread_and_never_blocks(self):
         log = code_only(src("LearnLog.java"))
@@ -1517,6 +1526,11 @@ class OwnerNotesWiringTest(unittest.TestCase):
         self.assertIn("RobotPeopleClient.ownerNoteFor(app, name)", a)
         conv = re.search(r"private MatchAnswer forConversation\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn("RobotPeopleClient.ownerNoteFor(app, a.name.trim())", conv)
+        # Review 2026-10-03: only a face-matched known person's name is fetched at the meeting.
+        self.assertIn("a.status == CuriosityPort.MatchAnswer.Status.KNOWN && !a.faceless", conv)
+        w = re.search(r"private TurnRequest withOwnerNote\(TurnRequest request\) \{(.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("final String name = request.noteName;", w)
+        self.assertNotIn("request.name", w)
         for sig in ("public void turn(TurnRequest asked, final long timeoutMs)",
                     "public void speculateTurn(TurnRequest asked, final long timeoutMs)"):
             body = re.search(re.escape(sig) + r"(.*?)\n    \}", a, re.S).group(1)
@@ -1538,21 +1552,25 @@ class OwnerNotesWiringTest(unittest.TestCase):
 
 
 class FastLookWiringTest(unittest.TestCase):
-    """Robot 2026-10-03: the look tool sends the camera's newest streamed frame at once when it
-    is fresh and the newest detection shows no bathroom label; the camera keeps no streamed
-    frame in bathroom privacy, and the note logs the frame's age only."""
+    """Robot 2026-10-03: the look tool sends the newest detected frame at once when it is fresh
+    and its detection shows no bathroom label. Review 2026-10-03: only a frame the detector itself
+    checked goes, so the camera copies only the frames it detects (no streamed copies), and the
+    note logs the frame's age only."""
 
-    def test_the_camera_keeps_no_streamed_frame_in_privacy(self):
+    def test_the_camera_copies_only_frames_it_detects(self):
         cam = code_only(src("ExploreCamera.java"))
-        self.assertIn("boolean keep = !privateFrames && (detect || t - rawAt >= RAW_EVERY_MS);", cam)
-        self.assertIn("return privateFrames ? null : latestRaw;", cam)
-        priv = re.search(r"public void setPrivate\(boolean on\) \{(.*?)\n    \}", cam, re.S).group(1)
-        self.assertIn("latestRaw = null;", priv)
+        self.assertNotIn("latestRaw", cam)
+        self.assertNotIn("RAW_EVERY_MS", cam)
+        listener = re.search(r"public void onImageAvailable\(ImageReader r\) \{(.*?)\n        \}", cam, re.S).group(1)
+        self.assertLess(listener.index("if (busy || parked)"), listener.index("new byte[buf.remaining()]"))
+        self.assertNotIn("RawFrame", code_only(src("ExploreBrain.java")))
 
     def test_the_fast_path_checks_privacy_first_and_the_newest_detection(self):
         brain = code_only(src("ExploreBrain.java"))
         body = re.search(r"private CuriosityPort.LookResult fastToolLook\(long now\) \{(.*?)\n    \}", brain, re.S).group(1)
         self.assertIn("bathroom || muted || quiet", body)
+        self.assertIn("Look d = camera.latest();", body)
+        self.assertIn("LookResult.streamed(d.jpeg, labels, now - d.frameMs)", body)
         self.assertIn("BATHROOM_STRONG.contains(x.label) || BATHROOM_WEAK.contains(x.label)", body)
         chat = code_only(src("ChatSession.java"))
         step = re.search(r"private void toolStep\(long now\) \{(.*?)\n    \}", chat, re.S).group(1)

@@ -196,6 +196,7 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "conversation_streamed_schema_line_before_a_tool_use_is_early",
         "conversation_streamed_reply_tool_input_is_early_and_becomes_the_json",
         "conversation_plain_reply_tool_reports_the_fields_from_the_whole_reply",
+        "conversation_reply_tool_beside_another_tool_is_never_told_early_when_known",
         "conversation_reply_tool_tells_a_named_boolean_as_a_word_streamed_or_whole",
         "conversation_streamed_truncated_tool_input_is_bad_reply",
         "tool_result_text_and_image_blocks",

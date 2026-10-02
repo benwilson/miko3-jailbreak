@@ -194,6 +194,11 @@ final class ChatSession {
     private String persona = "";
     private String name;
     private String personId;
+    /**
+     * Review 2026-10-03: the name the owner's note may be looked up by: a face-matched known
+     * person's stored name, or the name the person spoke; null otherwise (TurnRequest.noteName).
+     */
+    private String noteName;
     private String notes;
     private boolean faceless;
     private final Set<String> asked = new HashSet<String>();
@@ -229,6 +234,13 @@ final class ChatSession {
     private long sayUntil;
     private long clipUntil = ExploreBrain.NEVER;
     private boolean endAfterLine;
+    /**
+     * Review 2026-10-03: from a turn's whole reply after its line went early (port.lateTurn): a
+     * corrected line said right after the current one, and an instruction that ends the
+     * conversation once the line (and any correction) is said.
+     */
+    private String followLine;
+    private boolean lateActEnds;
     /** The pending line is a turn's (it joins the transcript), not a forget template. */
     private boolean lineIsTurn;
     private boolean confirmingForget;
@@ -478,6 +490,10 @@ final class ChatSession {
         while (port.lateFeedback() != null) {
             // dropped
         }
+        // Review 2026-10-03: and a late act or corrected line.
+        while (port.lateTurn() != null) {
+            // dropped
+        }
         this.checkOpen = checkOpen;
         this.settledName = settled;
         startedOnCharger = host.charger();
@@ -489,6 +505,7 @@ final class ChatSession {
         // A known match with an empty name takes the stranger path (KTD10): unnamed, the old id never written.
         name = stored.isEmpty() ? null : stored;
         personId = name == null ? null : a.personId;
+        noteName = a.status == CuriosityPort.MatchAnswer.Status.KNOWN && !faceless ? name : null;
         notes = personId == null ? null : a.notes;
         if (personId != null) {
             for (String q : a.questionsAsked) {
@@ -530,6 +547,10 @@ final class ChatSession {
         // Owner 2026-10-02: and its feedback about him is passed on, after its line went.
         for (CuriosityPort.Feedback late = port.lateFeedback(); late != null; late = port.lateFeedback()) {
             passOn(late);
+        }
+        // Review 2026-10-03: and the act (or a corrected line) the early line could not carry.
+        for (CuriosityPort.Turn late = port.lateTurn(); late != null; late = port.lateTurn()) {
+            lateTurn(now, late);
         }
         keepStep(now);
         photoStep(now);
@@ -642,7 +663,8 @@ final class ChatSession {
     /** The turn request for what was heard, as it stands now; building it changes nothing. */
     private CuriosityPort.TurnRequest turnRequest(String heardText) {
         return new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
-                .face(openedFaceless, faceSeen && name == null).call(called, cantSeeDue).withFacts(host.toolFacts());
+                .face(openedFaceless, faceSeen && name == null).call(called, cantSeeDue).withFacts(host.toolFacts())
+                .noteBy(noteName);
     }
 
     /**
@@ -754,12 +776,12 @@ final class ChatSession {
             }
             lookAfterPreamble = ask.look;
             if (ask.look && host.lookBlocked() == null) {
-                // Robot 2026-10-03: a fresh streamed frame goes at once, while the preamble plays;
-                // no detector run, so nothing unparks while he speaks.
+                // Robot 2026-10-03: a fresh detected frame goes at once, while the preamble plays;
+                // no new detector run, so nothing unparks while he speaks.
                 CuriosityPort.LookResult fast = host.fastLook(now);
                 if (fast != null) {
                     lookAfterPreamble = false;
-                    host.note("the tool's look: a streamed frame for Claude, " + fast.ageMs + " ms old, "
+                    host.note("the tool's look: the newest detected frame for Claude, " + fast.ageMs + " ms old, "
                             + (fast.detected ? "with its labels" : "no labels"));
                     port.lookAnswer(fast);
                 }
@@ -948,6 +970,59 @@ final class ChatSession {
     }
 
     /**
+     * Review 2026-10-03: what a streamed turn's whole reply added after its line went early
+     * (CuriosityPort.lateTurn): the accepted action tool's act, taken as onLine takes one, and,
+     * when a tool round replaced the line said early (an action beside respond, refused), the
+     * corrected line, said next. An act that ends the conversation ends it after the line and
+     * any correction, or at once when the line is already over.
+     */
+    private void lateTurn(long now, CuriosityPort.Turn t) {
+        String line = t.line == null ? "" : capSentences(t.line.trim());
+        boolean ends = false;
+        if (t.act != null && t.act.continuesConversation()) {
+            host.note("an instruction (" + t.act.describe() + "), after its line: done at once; the conversation goes on");
+            host.stopActs();
+        } else if (t.action != CuriosityPort.Action.NONE && action == CuriosityPort.Action.NONE) {
+            action = t.action;
+            actionTarget = t.target;
+            act = t.act;
+            host.note("an instruction (" + (act == null ? action.word() : act.describe())
+                    + "), after its line: the conversation ends after it");
+            learnEnd("instruction");
+            ends = true;
+        }
+        if (finished || state == State.CHAT_NOTES) {
+            return;
+        }
+        if (!line.isEmpty()) {
+            host.note("a tool round replaced the line said early: the corrected line follows");
+        }
+        if (state == State.CHAT_LISTEN) {
+            if (!line.isEmpty()) {
+                sayFollow(now, line, ends);
+            } else if (ends) {
+                enterNotes(now);
+            }
+            return;
+        }
+        if (!line.isEmpty()) {
+            followLine = line;
+        }
+        lateActEnds |= ends;
+    }
+
+    /** A corrected line after the turn's own: added to what he said in that exchange, then said. */
+    private void sayFollow(long now, String line, boolean end) {
+        if (!transcript.isEmpty()) {
+            CuriosityPort.Exchange last = transcript.remove(transcript.size() - 1);
+            transcript.add(new CuriosityPort.Exchange(last.heard,
+                    last.said == null || last.said.isEmpty() ? line : last.said + " " + line));
+        }
+        speak(now, line, false);
+        endAfterLine = end;
+    }
+
+    /**
      * A name given in the conversation (face plan U7, KTD6, R20): it goes to the
      * resolver on the port, which joins a stored person, asks the last name or
      * stores someone new; this replaces the meeting plan's KTD10 mismatch rule,
@@ -967,6 +1042,7 @@ final class ChatSession {
             host.note(faceRetrying() ? "a name given; no usable face yet, so the name is held for this conversation"
                     + " while he looks for one" : "a name given; no face to keep them by, so nothing is stored");
             name = given;
+            noteName = given;
             personId = null;
             asked.clear();
             notes = null;
@@ -1061,6 +1137,8 @@ final class ChatSession {
     private void join(long now, String id, String storedName) {
         host.note("the name belongs to someone stored whose face is close enough: adding the photo to them");
         name = storedName;
+        // The name and a close enough face both point at them.
+        noteName = storedName;
         personId = null;
         notes = null;
         asked.clear();
@@ -1074,6 +1152,7 @@ final class ChatSession {
     private void storeNew(long now, String newName) {
         host.note("nobody stored has that name" + (resolvingLastName() ? " and last name" : "") + ": keeping the face");
         name = newName;
+        noteName = newName;
         personId = null;
         asked.clear();
         notes = null;
@@ -1109,6 +1188,7 @@ final class ChatSession {
         settledName = pendingFirst;
         pendingFirst = null;
         name = null;
+        noteName = null;
         personId = null;
         notes = null;
         asked.clear();
@@ -1527,7 +1607,16 @@ final class ChatSession {
                 learnTurnOver();
             }
         }
-        if (endAfterLine) {
+        if (followLine != null && !askingLastName) {
+            String f = followLine;
+            followLine = null;
+            boolean end = endAfterLine || lateActEnds;
+            lateActEnds = false;
+            sayFollow(now, f, end);
+            return;
+        }
+        if (endAfterLine || lateActEnds && !askingLastName) {
+            lateActEnds = false;
             enterNotes(now);
             return;
         }
@@ -1807,6 +1896,7 @@ final class ChatSession {
             host.note("forgotten: the id and the notes buffer are cleared; the rest runs unnamed");
             personId = null;
             name = null;
+            noteName = null;
             notes = null;
             asked.clear();
             buffer.clear();

@@ -1185,17 +1185,12 @@ public final class ExploreBrainHarness {
             return latestLook;
         }
 
-        /** Robot 2026-10-03: a scenario streams frames (100 ms old) for the look tool's fast path. */
-        boolean rawStream;
-
-        @Override
-        public ExploreBrain.RawFrame latestRaw() {
-            if (!rawStream || !cameraOpen || privacy) {
-                return null;
-            }
-            long shot = now - 100;
-            return new ExploreBrain.RawFrame(shot, ("raw@" + shot).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
-        }
+        /**
+         * Review 2026-10-03: when set, the look tool's ask finds a detection of these labels, 100 ms
+         * old (or lookAgeAtToolMs), as the camera's newest detected frame ("det@" + its time).
+         */
+        List<Detection> lookAtToolAsk;
+        long lookAgeAtToolMs = 100;
 
         @Override
         public boolean quiet() {
@@ -1783,6 +1778,11 @@ public final class ExploreBrainHarness {
         public CuriosityPort.ToolAsk toolAsk() {
             CuriosityPort.ToolAsk a = pendingToolAsk;
             pendingToolAsk = null;
+            if (a != null && a.look && lookAtToolAsk != null && cameraOpen && !privacy) {
+                long shot = now - lookAgeAtToolMs;
+                latestLook = new ExploreBrain.Look(shot, lookAtToolAsk,
+                        ("det@" + shot).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            }
             if (a != null) {
                 log.add(new Event(now, "tool ask" + (a.look ? " look" : "") + (a.preamble != null ? " preamble" : "")));
             }
@@ -3596,6 +3596,40 @@ public final class ExploreBrainHarness {
                             + " off@" + off + " beeps=" + inside + " requests=" + requestsInside + " notes="
                             + lastNotes(notes, 30));
         });
+        scenario("bathroom_the_1451_office_chair_read_as_a_toilet_never_triggers", n -> {
+            // Robot 2026-10-02 14:51: a close office chair filled the frame and the detector gave the
+            // same box two labels, "toilet" 0.62 and "office chair" 0.33 (a sink 0.26 beside), and one
+            // look set off beeping, a retrace and a 3 h avoid. A strong box a non-bathroom label also
+            // claims (IoU >= 0.8, score >= 0.25) is only weak; that look over and over never triggers.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning(), (r, t) -> list(new Detection("toilet", 0.62f, 0.32f, 0.00f, 1.00f, 1.00f),
+                    new Detection("office chair", 0.33f, 0.32f, 0.00f, 1.00f, 1.00f),
+                    new Detection("sink", 0.26f, 0.32f, 0.00f, 1.00f, 0.53f)), notes);
+            rig.started();
+            rig.runUntil(30000);
+            check(n, !anyContains(notes, "bathroom:") && !anyContains(notes, "trig: kind=bathroom")
+                            && rig.privacyOns == 0 && rig.count("hop") > 0 && rig.violations.isEmpty(),
+                    "notes=" + lastNotes(notes, 8));
+        });
+        scenario("bathroom_a_real_toilet_needs_two_of_three_looks", n -> {
+            // A toilet with no rival label in two of the last three looks triggers ("looks=2"); in one look
+            // only, it does not.
+            List<String> notes = new ArrayList<String>();
+            Rig two = bathRig(bathTuning(), byLook(k -> k == 3 || k == 5 ? list(box("toilet", 0.6f, 0.5f, 0.6f, 0.3f, 0.4f),
+                    box("chair", 0.5f, 0.15f, 0.6f, 0.2f, 0.3f)) : list()), notes);
+            two.started();
+            two.runUntil(20000);
+            List<String> notes2 = new ArrayList<String>();
+            Rig one = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("toilet", 0.6f, 0.5f, 0.6f, 0.3f, 0.4f))
+                    : list()), notes2);
+            one.started();
+            one.runUntil(20000);
+            check(n, anyContains(notes, "trig: kind=bathroom rule=strong label=toilet score=0.60")
+                            && anyContains(notes, "looks=2") && two.privacyOns == 1
+                            && !anyContains(notes2, "bathroom:") && one.privacyOns == 0
+                            && two.violations.isEmpty() && one.violations.isEmpty(),
+                    "two=" + lastNotes(notes, 8) + " one=" + lastNotes(notes2, 8));
+        });
         scenario("bathroom_a_single_mirror_or_weak_labels_below_threshold_never_trigger", n -> {
             List<String> notes = new ArrayList<String>();
             Rig mirror = bathRig(bathTuning(), (r, t) -> list(box("mirror", 0.9f, 0.5f, 0.5f, 0.3f, 0.4f)), notes);
@@ -3710,8 +3744,9 @@ public final class ExploreBrainHarness {
         });
         scenario("bathroom_look_then_go_the_deciding_look_starts_the_escape_not_a_leg_toward_it", n -> {
             List<String> notes = new ArrayList<String>();
+            // Review 2026-10-03: the strong rule needs two looks, so the toilet is in looks 3 and 4.
             Rig rig = bathRig(bathTuning().navigation(ExploreTuning.Navigation.LOOK_THEN_GO), byLook(
-                    k -> k == 3 ? list(box("toilet", 0.6f, 0.5f, 0.6f, 0.3f, 0.4f)) : list()), notes);
+                    k -> k == 3 || k == 4 ? list(box("toilet", 0.6f, 0.5f, 0.6f, 0.3f, 0.4f)) : list()), notes);
             rig.started();
             runUntil(rig, 60000, r -> notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)") >= 0);
             long trig = notedAt(notes, "bathroom: toilet; leaving and beeping (privacy)");
@@ -14503,6 +14538,162 @@ public final class ExploreBrainHarness {
                             && !String.join("|", notes).contains("kitchen") && rig.violations.isEmpty(),
                     "done@" + done + " notes=" + notesAfter(notes, at));
         });
+        scenario("act_an_aimed_turn_never_flips_from_a_blocked_side_and_drives_only_facing_its_aim", n -> {
+            // Review 2026-10-03: enterLook flipped every turn whose side was blocked lately, so an
+            // aimed one (find_thing's approach, come_back, go_to_place) ended about twice its angle
+            // off and then drove. Now it turns its own way and the heading is checked before the hop.
+            double[] bearing = {Double.NaN};
+            long[] from = {Long.MAX_VALUE};
+            Rig rig = roamRig((r, t) -> {
+                if (t < from[0] || r.yaw == null) {
+                    return list();
+                }
+                double left = Heading.delta(r.yawAt(t), bearing[0]);
+                // Only ever seen on the left of the frame, so the aimed turn is always to the left.
+                return left < 8 || left > 27 ? list()
+                        : list(box("printer", 0.8f, 0.5f - (float) (left / 31.3) / 2, 0.5f, 0.2f, 0.25f));
+            }, true);
+            rig.started();
+            rig.runUntil(4000);
+            List<String> notes = traced(rig);
+            long at = rig.now;
+            // Off to the right: the find's scan turns right, sees it on the left of the frame, aims left.
+            bearing[0] = Heading.wrap(rig.yaw.wrapped() - 25);
+            rig.brain.markBlockedSide(ExploreBrain.Direction.LEFT);
+            from[0] = at;
+            rig.brain.startAct(act("find_thing", "{\"label\":\"printer\"}"), null);
+            rig.runUntil(at + 90000);
+            long seen = notedAt(notes, "intent: find_thing: seen", at);
+            int hopIdx = seen < 0 ? -1 : rig.firstAfter("hop", seen);
+            long hop = hopIdx < 0 ? -1 : rig.timeOf(hopIdx);
+            double offAtHop = hop < 0 ? 999 : Heading.delta(rig.yawAt(hop), bearing[0]);
+            check(n, seen > at && hop > seen && Math.abs(offAtHop) <= 8 && rig.violations.isEmpty(),
+                    "seen@" + seen + " hop@" + hop + " off at hop=" + Math.round(offAtHop) + " notes="
+                            + notesAfter(notes, at));
+        });
+        scenario("act_a_move_into_what_just_stopped_him_or_the_same_failed_move_is_refused", n -> {
+            // Review 2026-10-03: a task's re-plan could drive straight back into what had just
+            // stalled him. Forward toward where a hazard or stall stopped him, back with behind
+            // blocked, and the same move that just failed from this heading are refused honestly.
+            Rig rig = actRig();
+            List<String> notes = traced(rig);
+            long at = rig.now;
+            rig.brain.markBlockedAhead();
+            rig.brain.startAct(act("move", "{\"kind\":\"forward\",\"amount\":1}"), null);
+            rig.runUntil(at + 3000);
+            boolean fwd = noted(notes, "intent: dropped (something stopped him that way just now)")
+                    && noted(notes, "act: end move forward 1 failed ms=0");
+            long at2 = rig.now;
+            rig.brain.markBehindBlocked();
+            rig.brain.startAct(act("move", "{\"kind\":\"back\",\"amount\":0.3}"), null);
+            rig.runUntil(at2 + 3000);
+            boolean back = noted(notes, "intent: dropped (behind him is blocked)")
+                    && noted(notes, "act: end move back 0.30 failed ms=0");
+            long at3 = rig.now;
+            rig.brain.recordFailedMove("turn_left", rig.yaw.wrapped(), at3);
+            rig.brain.startAct(act("move", "{\"kind\":\"turn_left\",\"amount\":90}"), null);
+            rig.runUntil(at3 + 3000);
+            boolean again = noted(notes, "intent: dropped (the same move failed from here just now)")
+                    && noted(notes, "act: end move turn_left 90 failed ms=0");
+            long at4 = rig.now;
+            rig.brain.startAct(act("move", "{\"kind\":\"turn_right\",\"amount\":90}"), null);
+            rig.runUntil(at4 + 20000);
+            boolean other = notedAt(notes, "intent: done (moved)", at4) > at4;
+            check(n, fwd && back && again && other && rig.violations.isEmpty(),
+                    "fwd=" + fwd + " back=" + back + " again=" + again + " other=" + other + " notes=" + notesAfter(notes, at));
+        });
+        scenario("task_a_driving_step_never_starts_while_he_waits_for_the_motor_board", n -> {
+            // Review 2026-10-03: a step that failed on a stall consults Claude, whose revised plan
+            // may drive again at once; while he waits in RECOVER (or is jammed) that step fails
+            // with the honest reason instead of being queued to drive.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = cutoutRig(notes, escTuning().hopTicks(20), 12000);
+            rig.started();
+            rig.taskPlanner = c -> CuriosityPort.TaskPlan.revised(steps(
+                    "[{\"tool\":\"move\",\"args\":{\"kind\":\"forward\",\"amount\":1},\"check\":false}]"));
+            rig.runUntil(400);
+            rig.brain.startAct(act("run_task", "{\"goal\":\"go\",\"steps\":["
+                    + "{\"tool\":\"move\",\"args\":{\"kind\":\"forward\",\"amount\":1.5},\"check\":false}]}"), null);
+            runUntil(rig, 60000, r -> notedAt(notes, "the board is back") >= 0);
+            String done = rig.consults.size() < 2 ? "" : String.join("|", rig.consults.get(1).done);
+            check(n, rig.consults.size() >= 2 && done.contains("move: failed: he is stuck and waiting for his motors")
+                            && rig.violations.isEmpty(),
+                    "consults=" + rig.consults.size() + " done=" + done + " notes=" + lastNotes(notes, 20));
+        });
+        scenario("act_go_away_when_he_cant_drive_leaves_them_alone_with_no_leg_later", n -> {
+            // Review 2026-10-03: go_away was accepted while he could not drive and then turned and
+            // drove away later; now it is done at once, as on the charger: avoided, left alone, no leg.
+            Rig rig = actRig();
+            List<String> notes = traced(rig);
+            long at = rig.now;
+            rig.brain.onLeaseChanged(false);
+            rig.runUntil(at + 1000);
+            rig.brain.startAct(act("go_away", "{}"), ExploreBrain.Direction.LEFT);
+            rig.runUntil(at + 2000);
+            rig.brain.onLeaseChanged(true);
+            rig.runUntil(at + 30000);
+            check(n, noted(notes, "intent: go_away: their way avoided") && noted(notes, "intent: done (he can't drive now: no leg to drive)")
+                            && !noted(notes, "first leg after the conversation") && rig.violations.isEmpty(),
+                    "notes=" + notesAfter(notes, at));
+        });
+        scenario("act_find_thing_close_already_drives_nothing_and_a_block_in_the_approach_ends_it_done", n -> {
+            // Review 2026-10-03: the approach drove a fixed 0.6 m. A box half the frame high is close
+            // already (no leg); a smaller one gets a leg scaled by its size, and something stopping
+            // him on the way ends it done: he went over to it.
+            long[] from = {Long.MAX_VALUE};
+            Rig near = roamRig((r, t) -> t >= from[0] ? list(box("printer", 0.8f, 0.5f, 0.5f, 0.3f, 0.6f)) : list(), true);
+            near.started();
+            near.runUntil(4000);
+            List<String> notes = traced(near);
+            long at = near.now;
+            from[0] = at;
+            near.brain.startAct(act("find_thing", "{\"label\":\"printer\"}"), null);
+            near.runUntil(at + 30000);
+            long done = notedAt(notes, "intent: done (found it, close by)", at);
+            boolean close = done >= from[0] && near.countPrefix("hop", from[0], done + 1) == 0;
+            Rig[] h = new Rig[1];
+            long[] from2 = {Long.MAX_VALUE};
+            Rig far = cueRig(cueTuning(), t -> {
+                Rig r = h[0];
+                return r != null && t >= from2[0] && r.brain.state() == ExploreBrain.State.HOP && r.moving
+                        ? obstacle(t) : clear(t);
+            }, (r, t) -> t >= from2[0] ? list(box("printer", 0.8f, 0.5f, 0.5f, 0.2f, 0.2f)) : list());
+            h[0] = far;
+            far.people.persona = PERSONA;
+            far.started();
+            far.runUntil(4000);
+            List<String> notes2 = traced(far);
+            long at2 = far.now;
+            from2[0] = at2;
+            far.brain.startAct(act("find_thing", "{\"label\":\"printer\"}"), null);
+            far.runUntil(at2 + 40000);
+            boolean scaled = noted(notes2, "going over (0.49 m)");
+            boolean blocked = notedAt(notes2, "intent: done (went over to it until something stopped him)", at2) > at2
+                    && !noted(notes2, "intent: dropped (a hazard or a stall stopped it)");
+            check(n, close && scaled && blocked && near.violations.isEmpty(),
+                    "close=" + close + " scaled=" + scaled + " blocked=" + blocked + " near=" + notesAfter(notes, at)
+                            + " far=" + notesAfter(notes2, at2));
+        });
+        scenario("task_a_look_and_its_consult_never_name_a_bathroom_thing", n -> {
+            // Review 2026-10-03: a faint toilet (under the privacy threshold) reached Claude in a
+            // look step's "saw:" and in the consult's labels; bathroom labels are left out, as the
+            // places tool does.
+            Rig rig = roamRig((r, t) -> list(box("chair", 0.8f, 0.5f, 0.5f, 0.2f, 0.3f),
+                    box("toilet", 0.2f, 0.3f, 0.6f, 0.2f, 0.2f), box("sink", 0.2f, 0.7f, 0.6f, 0.2f, 0.2f)), true);
+            rig.started();
+            rig.runUntil(4000);
+            rig.taskPlanner = c -> CuriosityPort.TaskPlan.abort("Done.");
+            long at = rig.now;
+            rig.brain.startAct(act("run_task", "{\"goal\":\"look\",\"steps\":["
+                    + "{\"tool\":\"look\",\"args\":{},\"check\":false},"
+                    + "{\"tool\":\"wait\",\"args\":{\"seconds\":1},\"check\":false}]}"), null);
+            rig.runUntil(at + 30000);
+            CuriosityPort.TaskConsult c = rig.consults.isEmpty() ? null : rig.consults.get(0);
+            String said = c == null ? "" : String.join("|", c.done) + " labels=" + c.labels;
+            check(n, c != null && said.contains("saw: chair") && !said.contains("toilet") && !said.contains("sink")
+                            && c.labels.contains("chair") && !rig.brain.bathroomPrivate() && rig.violations.isEmpty(),
+                    "consult=" + said);
+        });
         scenario("task_three_steps_run_in_order_and_end_done_with_a_record", n -> {
             Rig rig = actRig();
             List<String> notes = traced(rig);
@@ -16057,13 +16248,15 @@ public final class ExploreBrainHarness {
                     "ask@" + ask + " pre@" + pre + " unpark@" + unpark + " answered@" + answered + " shot=" + jpeg
                             + " say2@" + say2 + " " + rig.tail());
         });
-        scenario("chat_tool_look_fast_path_sends_the_fresh_streamed_frame_at_once_with_no_unpark", n -> {
+        scenario("chat_tool_look_fast_path_sends_only_a_fresh_frame_the_detector_checked_with_its_labels", n -> {
             // Robot 2026-10-03: the first live look tool call took 7.3 s to its line, ~4.7 s of it
-            // waiting for a detected frame after the preamble. A streamed frame at most 1.5 s old
-            // now goes at once, while the preamble plays, when the newest detection shows no
-            // bathroom label; one that does takes the slow path (the detector, after the preamble).
+            // waiting for a detected frame after the preamble. The newest detected frame, at most
+            // 1.5 s old, now goes at once with its labels. Review 2026-10-03: only a frame the
+            // detector itself checked (never a newer streamed one trusting an older check), and
+            // never one whose detection shows a bathroom label at any score: those, and a stale
+            // detection, take the slow path (the detector, after the preamble).
             Rig rig = sarahRig(true);
-            rig.rawStream = true;
+            rig.lookAtToolAsk = list(box("chair", 0.7f, 0.5f, 0.5f, 0.2f, 0.3f));
             List<String> notes = traced(rig);
             rig.people.listen = ListenScript.turns(hearWords("what can you see"));
             rig.toolAsksOn.put(2, new CuriosityPort.ToolAsk("Let me look.", true));
@@ -16075,25 +16268,33 @@ public final class ExploreBrainHarness {
             CuriosityPort.LookResult r = rig.lookAnswers.isEmpty() ? null : rig.lookAnswers.get(0);
             String jpeg = r == null || r.jpeg == null ? "" : new String(r.jpeg, java.nio.charset.StandardCharsets.US_ASCII);
             int unparks = rig.countPrefix("unpark", pre, say2);
-            boolean fast = r != null && jpeg.startsWith("raw@") && r.ageMs >= 0 && r.ageMs <= 1500 && !r.detected
+            boolean fast = r != null && jpeg.startsWith("det@") && r.ageMs == 100 && r.detected
+                    && java.util.Arrays.asList("chair").equals(r.labels)
                     && answered >= pre && answered <= pre + 20 && unparks == 0 && say2 > answered
-                    && anyContains(notes, "the tool's look: a streamed frame for Claude, 100 ms old, no labels");
-            Rig sink = sarahRig(true);
-            sink.rawStream = true;
-            sink.people.listen = ListenScript.turns(hearWords("what can you see"));
-            sink.toolAsksOn.put(2, new CuriosityPort.ToolAsk("Let me look.", true));
-            long open2 = openChat(sink);
-            sink.latestLook = new ExploreBrain.Look(sink.now, list(box("sink", 0.3f, 0.5f, 0.5f, 0.2f, 0.2f)),
-                    ("jpeg@" + sink.now).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
-            long s1 = runUntilEvent(sink, "say Line 1.", open2, open2 + 30000);
-            long s2 = runUntilEvent(sink, "say Line 2.", s1, s1 + 30000);
-            CuriosityPort.LookResult r2 = sink.lookAnswers.isEmpty() ? null : sink.lookAnswers.get(0);
-            String j2 = r2 == null || r2.jpeg == null ? "" : new String(r2.jpeg, java.nio.charset.StandardCharsets.US_ASCII);
-            check(n, open > 0 && fast && rig.violations.isEmpty() && open2 > 0 && s2 > s1 && r2 != null
-                            && !j2.startsWith("raw@") && sink.countPrefix("unpark", s1, s2) > 0 && sink.violations.isEmpty(),
-                    "fast=" + fast + " jpeg=" + jpeg + " age=" + (r == null ? -1 : r.ageMs) + " pre@" + pre + " answered@"
-                            + answered + " unparks=" + unparks + " sink jpeg=" + j2 + " v=" + rig.violations + sink.violations
-                            + " dbg=" + debugNotes(notes));
+                    && anyContains(notes, "the tool's look: the newest detected frame for Claude, 100 ms old, with its labels");
+            boolean[] slow = new boolean[2];
+            String[] why = new String[2];
+            for (int k = 0; k < 2; k++) {
+                Rig sl = sarahRig(true);
+                // A faint toilet in the checked frame, or a check 2 s old: the slow path.
+                sl.lookAtToolAsk = k == 0 ? list(box("chair", 0.7f, 0.5f, 0.5f, 0.2f, 0.3f),
+                        box("toilet", 0.2f, 0.3f, 0.6f, 0.2f, 0.2f)) : list(box("chair", 0.7f, 0.5f, 0.5f, 0.2f, 0.3f));
+                sl.lookAgeAtToolMs = k == 0 ? 100 : 2000;
+                sl.people.listen = ListenScript.turns(hearWords("what can you see"));
+                sl.toolAsksOn.put(2, new CuriosityPort.ToolAsk("Let me look.", true));
+                long o2 = openChat(sl);
+                long s1 = runUntilEvent(sl, "say Line 1.", o2, o2 + 30000);
+                long s2 = runUntilEvent(sl, "say Line 2.", s1, s1 + 30000);
+                CuriosityPort.LookResult r2 = sl.lookAnswers.isEmpty() ? null : sl.lookAnswers.get(0);
+                String j2 = r2 == null || r2.jpeg == null ? "" : new String(r2.jpeg, java.nio.charset.StandardCharsets.US_ASCII);
+                slow[k] = o2 > 0 && s2 > s1 && r2 != null && !j2.startsWith("det@") && sl.countPrefix("unpark", s1, s2) > 0
+                        && sl.violations.isEmpty();
+                why[k] = "jpeg=" + j2 + " unparks=" + sl.countPrefix("unpark", s1, s2) + " v=" + sl.violations;
+            }
+            check(n, open > 0 && fast && rig.violations.isEmpty() && slow[0] && slow[1],
+                    "fast=" + fast + " jpeg=" + jpeg + " age=" + (r == null ? -1 : r.ageMs) + " labels="
+                            + (r == null ? null : r.labels) + " pre@" + pre + " answered@" + answered + " unparks="
+                            + unparks + " toilet: " + why[0] + " stale: " + why[1] + " dbg=" + debugNotes(notes));
         });
         scenario("chat_tool_look_in_do_not_disturb_or_bathroom_privacy_is_refused_without_a_frame", n -> {
             // Owner 2026-10-03: the look tool's frame never leaves in bathroom privacy, nor in do
@@ -16129,7 +16330,12 @@ public final class ExploreBrainHarness {
             long say22 = runUntilEvent(lost, "say Line 2.", say21, say21 + 30000);
             CuriosityPort.LookResult r2 = lost.lookAnswers.isEmpty() ? null : lost.lookAnswers.get(0);
             int unparks = lost.countPrefix("unpark", say21, say22);
-            check(n, open > 0 && say1 > 0 && over > say1 && noFrame && bath.count("say Line 2.") == 0
+            // Review 2026-10-03: one look of a toilet no longer turns privacy on (two of three looks
+            // do), but it holds every frame at once: the tool's look is refused, and the next look
+            // that shows it ends the conversation quietly.
+            boolean refused = !bath.lookAnswers.isEmpty() && bath.lookAnswers.get(0).refused != null
+                    && bath.lookAnswers.get(0).refused.startsWith("privacy");
+            check(n, open > 0 && say1 > 0 && over > say1 && noFrame && refused
                             && anyContains(notes, "the conversation ends quietly") && bath.brain.bathroomPrivate()
                             && open2 > 0 && say22 > say21 && r2 != null && r2.jpeg == null && r2.refused != null
                             && r2.refused.contains("camera") && unparks == 0
@@ -16181,6 +16387,36 @@ public final class ExploreBrainHarness {
                             && rig.kept.isEmpty() && rig.notesDeltas.isEmpty() && rig.count("react sign-off") == 1
                             && rig.brain.state() == ExploreBrain.State.EYES_ONLY && rig.violations.isEmpty(),
                     "open@" + open + " over@" + over + " end=" + rig.brain.state() + " " + rig.tail());
+        });
+        scenario("chat_the_owners_note_is_looked_up_by_a_face_matched_stored_name_or_the_spoken_name_only", n -> {
+            // Review 2026-10-03: the owner's note reaches the conversation when the partner is that
+            // person: a face-matched known person's stored name, or the name they spoke (the launcher
+            // then needs the note's full name exactly). Never by a name nobody verified.
+            Rig known = sarahRig(true);
+            known.people.listen = ListenScript.turns(hearWords("hi"), hearWords("bye"));
+            long open = openChat(known);
+            long over = chatOver(known, open);
+            String knownBy = known.turnAsks.isEmpty() ? "?" : known.turnAsks.get(0).request.noteName;
+            Rig called = chatRig(EMPTY_ROOM, false);
+            called.people.lines = STRANGER.withConversation(PERSONA, null, null, null);
+            called.turns = turnsOf(turnLine(1), CuriosityPort.Turn.line("Line 2.", null, "Sam Lee", false, false, null),
+                    turnLine(3));
+            called.people.listen = ListenScript.turns(hearWords("i'm sam lee"), hearWords("how are you"),
+                    hearWords("bye"));
+            called.brain.start();
+            called.cue(1000, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, 60f);
+            long open2 = runUntilState(called, ExploreBrain.State.CHAT_THINK, 1000, 20000);
+            long over2 = chatOver(called, open2);
+            String before = called.turnAsks.isEmpty() ? "?" : called.turnAsks.get(0).request.noteName;
+            String after = called.turnAsks.size() < 3 ? "?" : called.turnAsks.get(2).request.noteName;
+            Rig stranger = sarahRig(false);
+            stranger.people.listen = ListenScript.turns(hearWords("hi"), hearWords("bye"));
+            long open3 = openChat(stranger);
+            chatOver(stranger, open3);
+            String none = stranger.turnAsks.isEmpty() ? "?" : stranger.turnAsks.get(0).request.noteName;
+            check(n, open > 0 && over > 0 && "Sarah".equals(knownBy) && open2 > 0 && over2 > 0 && before == null
+                            && "Sam Lee".equals(after) && open3 > 0 && none == null,
+                    "known=" + knownBy + " before=" + before + " after=" + after + " stranger=" + none);
         });
         scenario("chat_the_transcript_never_appears_in_the_trace", n -> {
             Rig rig = sarahRig(true);
@@ -17000,7 +17236,7 @@ public final class ExploreBrainHarness {
             apart.runUntil(20000);
             List<String> looks2 = records(notes3, "trig: ");
             check(n, strong.size() == 1 && strong.get(0).equals(
-                            "trig: kind=bathroom rule=strong label=toilet score=0.60 box=0.35,0.40,0.65,0.80 looks=1")
+                            "trig: kind=bathroom rule=strong label=toilet score=0.60 box=0.35,0.40,0.65,0.80 looks=2")
                             && two.size() == 1 && two.get(0).startsWith("trig: kind=bathroom rule=weak2 label=toilet_paper+sink"
                             + " score=0.50+0.40 box=") && two.get(0).endsWith(",0.65 looks=1")
                             && field(two.get(0), "box").split("\\+").length == 2
@@ -17100,6 +17336,46 @@ public final class ExploreBrainHarness {
                             && start.equals("learn: start build=1a2b3c4d5e6f+deadbeef " + plain)
                             && LearnLog.startRecord(null, new ExploreTuning.Builder().build()).startsWith("learn: start build=- "),
                     "plain=" + plain + " look=" + look + " start=" + start);
+        });
+        scenario("learn_log_close_with_a_full_queue_stops_the_writer_without_blocking_the_caller", n -> {
+            // Review 2026-10-03: close() offered STOP to a full queue, which failed silently, so the
+            // writer ran on and close(500) waited out its whole 500 ms. Now close() flags and interrupts
+            // the writer, which writes what is queued and stops; the caller never waits on it.
+            java.io.File dir = java.nio.file.Files.createTempDirectory("learnlogfull").toFile();
+            java.util.concurrent.CountDownLatch hold = new java.util.concurrent.CountDownLatch(1);
+            LearnLog log = new LearnLog(dir, 1234, 1L << 30, 1, () -> {
+                if (Thread.currentThread().getName().equals("explore-learn-log")) {
+                    try {
+                        hold.await(); // the writer is stuck (its alive line) while the queue fills
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return 1790887142327L;
+            });
+            Thread.sleep(50);
+            for (int i = 0; i < LearnLog.QUEUE_MAX + 50; i++) {
+                log.offer("ExploreBrain", "leg: id=" + i + " end=done");
+            }
+            long t0 = System.nanoTime();
+            log.close(300);
+            long waitedMs = (System.nanoTime() - t0) / 1000000;
+            hold.countDown();
+            boolean stopped = false;
+            for (int i = 0; i < 100 && !stopped; i++) {
+                Thread.sleep(20);
+                stopped = true;
+                for (Thread t : Thread.getAllStackTraces().keySet()) {
+                    if (t.getName().equals("explore-learn-log") && t.isAlive()) {
+                        stopped = false;
+                    }
+                }
+            }
+            java.io.File f = new java.io.File(dir, LearnLog.FILE_NAME);
+            String all = f.exists() ? new String(java.nio.file.Files.readAllBytes(f.toPath()), "UTF-8") : "";
+            check(n, waitedMs < 150 && stopped && all.contains("leg: id=0 end=done")
+                            && all.contains("leg: id=" + (LearnLog.QUEUE_MAX - 1) + " end=done"),
+                    "waited " + waitedMs + " ms, stopped=" + stopped + ", bytes=" + all.length());
         });
     }
 }

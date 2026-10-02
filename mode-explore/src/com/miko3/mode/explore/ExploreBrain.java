@@ -365,15 +365,6 @@ final class ExploreBrain {
         /** The newest recognized frame since open(), or null. */
         Look latest();
         /**
-         * Robot 2026-10-03 (the look tool took ~4.7 s waiting for a detected frame): the newest
-         * streamed frame, detected or not, kept even while the detector is parked (never in
-         * bathroom privacy); null when there is none. Default: none, so the look waits as before.
-         */
-        default RawFrame latestRaw() {
-            return null;
-        }
-
-        /**
          * Closed and idle: close() has taken effect and no detector run is in
          * flight. close() is asynchronous, so speech waits for this (R6).
          */
@@ -417,17 +408,6 @@ final class ExploreBrain {
          * calibration frame ring). The brain sets it on each change. No-op by default.
          */
         default void setPrivate(boolean on) {
-        }
-    }
-
-    /** A streamed camera frame: when it was captured (brain clock) and its JPEG. */
-    static final class RawFrame {
-        final long frameMs;
-        final byte[] jpeg;
-
-        RawFrame(long frameMs, byte[] jpeg) {
-            this.frameMs = frameMs;
-            this.jpeg = jpeg;
         }
     }
 
@@ -1701,6 +1681,11 @@ final class ExploreBrain {
                     intentDone("on the charger: no leg to drive");
                     return;
                 }
+                if (stillReason(now) != null) {
+                    // Review 2026-10-03: as on the charger: he leaves them alone, but no leg later.
+                    intentDone("he can't drive now: no leg to drive");
+                    return;
+                }
                 intent = a;
                 intentUntil = now + INTENT_SEEK_MS;
                 awayLeg = side == null ? randomDirection() : side.opposite();
@@ -1762,10 +1747,23 @@ final class ExploreBrain {
     //   leg of at most COME_BACK_MAX_M.
     // Each act's start and end are records ("act: "), with its tool, kind and amount only.
 
-    /** Metres per forward or back tick at the fixed speed (~0.25 m/s, 250 ms ticks; not measured). */
+    /**
+     * Metres per forward or back tick at the fixed speed (~0.25 m/s, 250 ms ticks). Still a guess
+     * (review 2026-10-03): the 2026-10-02 robot log's 157 clean forward legs ("leg: ... end=done",
+     * 4+ ticks sent) moved a median 196 encoder counts per tick (mean of the wheels; 259 ms a
+     * tick), so the tick itself is steady, but counts only become metres through
+     * ExploreTuning.coverageCountsPerMetre (3000, which nav-report.py also uses), and that is
+     * the same unmeasured 0.25 m/s guess: 196 / 3000 = 0.065 m agrees with 0.0625 only because
+     * both rest on it. Tape-measure one leg of known ticks (docs/TODO.md) to set both.
+     */
     static final double MOVE_M_PER_TICK = 0.0625;
     static final long MOVE_MS = 60000;
+    /** find_thing's approach leg for a box at most FIND_FAR_HEIGHT of the frame high; shorter as it grows. */
     static final double FIND_APPROACH_M = 0.6;
+    static final double FIND_APPROACH_MIN_M = 0.15;
+    static final float FIND_FAR_HEIGHT = 0.1f;
+    /** A box at least this share of the frame high is close already: no approach. */
+    static final float FIND_NEAR_HEIGHT = 0.5f;
     static final double COME_BACK_MAX_M = 3.0;
     static final double COME_BACK_NEAR_M = 0.3;
 
@@ -1790,6 +1788,22 @@ final class ExploreBrain {
     private double actLegM;
     /** The look the label check last read. */
     private Look actLook;
+
+    /**
+     * Review 2026-10-03: find_thing's approach leg from the box's height (share of the frame):
+     * FIND_APPROACH_M up to FIND_FAR_HEIGHT, falling linearly to FIND_APPROACH_MIN_M near
+     * FIND_NEAR_HEIGHT, so a near thing gets a short nudge, not a fixed 0.6 m into it. The leg
+     * also ends early where something stops him (actStep).
+     */
+    static double findApproachM(float height) {
+        double f = (FIND_NEAR_HEIGHT - height) / (FIND_NEAR_HEIGHT - FIND_FAR_HEIGHT);
+        f = Math.max(0, Math.min(1, f));
+        return FIND_APPROACH_MIN_M + f * (FIND_APPROACH_M - FIND_APPROACH_MIN_M);
+    }
+
+    private static String fmt2(double v) {
+        return String.format(java.util.Locale.US, "%.2f", v);
+    }
 
     /** The intent's act, for tests. */
     ChatActions.Act intentAct() {
@@ -1821,53 +1835,33 @@ final class ExploreBrain {
                 ChatTools.placesText(recent, hidden), stillReason(now), null, shown);
     }
 
-    // ---- the look tool's fast path (robot 2026-10-03) ----
+    // ---- the look tool's fast path (robot 2026-10-03, review 2026-10-03) ----
     //
     // The first live look tool call waited ~4.7 s for the detector to unpark and run on a fresh
-    // frame after the preamble, and the line came at 7.3 s. Now the camera's newest streamed
-    // frame goes to Claude at once when it is at most FAST_LOOK_FRAME_MS old, with the
-    // detector's labels only when that very frame was detected. Privacy still comes first: the
-    // newest detection must show no bathroom label at all (any score), and be at most
-    // FAST_LOOK_CHECK_MS older than the frame, or have been taken with no driving since (turns on
-    // the spot, like a call's search, don't count) and at most FAST_LOOK_STILL_MS older: a
-    // conversation never opens in bathroom privacy, and he only turns on the spot in it. Otherwise the look takes the detector's slow path as before.
+    // frame after the preamble, and the line came at 7.3 s. Now the newest detected frame goes to
+    // Claude at once, with its labels, when it is at most FAST_LOOK_FRAME_MS old. Privacy first:
+    // only a frame the detector itself checked ever goes (review 2026-10-03: a streamed frame
+    // trusted an older detection, and a turn or an approach since could have brought a bathroom
+    // into view), and only when that detection shows no bathroom label at any score. Otherwise
+    // the look takes the detector's slow path as before. The camera keeps no extra frame copies.
 
     static final long FAST_LOOK_FRAME_MS = 1500;
-    static final long FAST_LOOK_CHECK_MS = 3000;
-    static final long FAST_LOOK_STILL_MS = 60000;
-    /** When he last drove forward or back (NEVER: not since start); turns on the spot don't count. */
-    private long lastDroveAt = NEVER;
 
     private CuriosityPort.LookResult fastToolLook(long now) {
-        RawFrame f = camera.latestRaw();
-        if (f == null || f.jpeg == null || now - f.frameMs > FAST_LOOK_FRAME_MS || bathroom || muted || quiet) {
-            return null;
-        }
         Look d = camera.latest();
-        if (d == null || d.frameMs > f.frameMs) {
+        if (d == null || d.jpeg == null || now - d.frameMs > FAST_LOOK_FRAME_MS || bathroom || muted || quiet) {
             return null;
         }
+        List<String> labels = new ArrayList<String>();
         for (Detection x : d.detections) {
             if (BATHROOM_STRONG.contains(x.label) || BATHROOM_WEAK.contains(x.label)) {
                 return null;
             }
-        }
-        boolean recent = f.frameMs - d.frameMs <= FAST_LOOK_CHECK_MS;
-        boolean stillSince = (lastDroveAt == NEVER || lastDroveAt < d.frameMs)
-                && f.frameMs - d.frameMs <= FAST_LOOK_STILL_MS;
-        if (!recent && !stillSince) {
-            return null;
-        }
-        List<String> labels = null;
-        if (d.frameMs == f.frameMs) {
-            labels = new ArrayList<String>();
-            for (Detection x : d.detections) {
-                if (!labels.contains(x.label)) {
-                    labels.add(x.label);
-                }
+            if (!labels.contains(x.label)) {
+                labels.add(x.label);
             }
         }
-        return CuriosityPort.LookResult.streamed(f.jpeg, labels, now - f.frameMs);
+        return CuriosityPort.LookResult.streamed(d.jpeg, labels, now - d.frameMs);
     }
 
     /** Why he can't drive now, or null when he can. */
@@ -1890,20 +1884,153 @@ final class ExploreBrain {
         return null;
     }
 
+    // ---- review 2026-10-03: a re-plan never re-drives into what just stalled him ----
+
+    /** A move that failed is not run again the same way from (about) the same heading for this long. */
+    static final long FAILED_MOVE_MS = 120000;
+    /** The heading a move started from (NaN: unknown), and the last failed move: its kind, heading and when. */
+    private double moveFromHeading = Double.NaN;
+    private String failedMoveKind;
+    private double failedMoveHeading = Double.NaN;
+    private long failedMoveAt = NEVER;
+
+    /**
+     * Why this move can't start now, or null: he can't drive (stillReason, RECOVER and the jam
+     * included), forward where a hazard or stall just stopped him (blockedAheadAt), back with
+     * behind blocked lately (behindEvidence), or the same move that just failed from here.
+     */
+    private String moveRefusal(long now, ChatActions.Act act) {
+        String still = stillReason(now);
+        if (still != null) {
+            return still;
+        }
+        boolean facing = compass.usable(now);
+        if ("forward".equals(act.kind) && facing && !Double.isNaN(blockedAheadAt)
+                && Math.abs(Heading.delta(compass.degrees(), blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return "something stopped him that way just now";
+        }
+        if ("back".equals(act.kind) && behindEvidence(now)) {
+            return "behind him is blocked";
+        }
+        if (act.kind != null && act.kind.equals(failedMoveKind) && now - failedMoveAt < FAILED_MOVE_MS
+                && (Double.isNaN(failedMoveHeading) || !facing
+                || Math.abs(Heading.delta(compass.degrees(), failedMoveHeading)) <= tuning.escapeProbeClearDeg)) {
+            return "the same move failed from here just now";
+        }
+        return null;
+    }
+
+    /** A move that failed (a hazard, a stall, RECOVER came first): not run again the same way from here for a while. */
+    void recordFailedMove(String kind, double heading, long at) {
+        failedMoveKind = kind;
+        failedMoveHeading = heading;
+        failedMoveAt = at;
+    }
+
+    /** For tests: as if a hazard or stall had just stopped him driving this way. */
+    void markBlockedAhead() {
+        blockedAheadAt = compass.usable(clock.nowMs()) ? compass.degrees() : Double.NaN;
+    }
+
+    /** For tests: as if a turn or back-up had just stalled against something behind him. */
+    void markBehindBlocked() {
+        behindBlockedAt = clock.nowMs();
+    }
+
+    /** For tests: as if a turn that way had just been blocked. */
+    void markBlockedSide(Direction d) {
+        blockSide(d);
+    }
+
+    // ---- review 2026-10-03: aimed turns (find_thing's approach, come_back, go_to_place) ----
+
+    /** At most this many re-aims before an aimed drive gives up rather than drive the wrong way. */
+    static final int AIM_TRIES = 2;
+    /** The heading an aimed turn is for (absolute degrees; NaN: none), checked again before the hop. */
+    private double aimHeading = Double.NaN;
+    private int aimTries;
+
+    /**
+     * An aimed turn: delta degrees (left positive) to face aim. Unlike enterLook's unaimed turns
+     * it never flips to the other side when this side was blocked lately (that ended about twice
+     * delta off, then drove); a blocked turn's own retry may still, and reaim() catches it.
+     */
+    private void enterAimedLook(long now, double delta, double aim) {
+        aimHeading = aim;
+        enterLookAs(now, delta > 0 ? Direction.LEFT : Direction.RIGHT, false, timedMs(Math.abs(delta)),
+                Math.abs(delta));
+    }
+
+    /** Why an aimed drive toward aim can't go (that way just stopped him; he can't drive), or null. */
+    private String aimBlocked(long now, double aim) {
+        String still = stillReason(now);
+        if (still != null) {
+            return still;
+        }
+        if (!Double.isNaN(aim) && !Double.isNaN(blockedAheadAt)
+                && Math.abs(Heading.delta(aim, blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return "something stopped him that way just now";
+        }
+        return null;
+    }
+
+    /**
+     * Before an aimed drive's hop: facing aimHeading (within the turn tolerance) or no compass,
+     * the hop goes (false); off, another aimed turn (up to AIM_TRIES), else the act fails rather
+     * than drive the wrong way.
+     */
+    private boolean reaim(long now) {
+        double aim = aimHeading;
+        if (!compass.usable(now)) {
+            aimHeading = Double.NaN;
+            return false;
+        }
+        double off = Heading.delta(compass.degrees(), aim);
+        String blocked = aimBlocked(now, aim);
+        if (blocked == null && Math.abs(off) < tuning.turnToleranceDeg) {
+            aimHeading = Double.NaN;
+            return false;
+        }
+        hopNext = false;
+        if (blocked != null || aimTries >= AIM_TRIES) {
+            aimHeading = Double.NaN;
+            plannedTicks = -1;
+            moveStarted = false;
+            dropIntent(blocked != null ? blocked : "he could not face that way");
+            enterPause(now, pauseMs(), false);
+            return true;
+        }
+        aimTries++;
+        note("act: re-aiming " + Math.round(off) + " deg before driving (" + aimTries + " of " + AIM_TRIES + ")");
+        enterAimedLook(now, off, aim);
+        return true;
+    }
+
     /** The newer acts' start (true when handled here); today's five fall through to the switch. */
     private boolean startNewAct(long now, ChatActions.Act act) {
         switch (act.action) {
-            case MOVE:
+            case MOVE: {
                 if (onCharger()) {
                     intentEnd(false, "on the charger: he does not drive off it");
+                    return true;
+                }
+                String refused = moveRefusal(now, act);
+                if (refused != null) {
+                    intentEnd(false, refused);
                     return true;
                 }
                 intent = act.action;
                 intentUntil = now + MOVE_MS;
                 moveDue = true;
                 awayLeg = null;
+                moveFromHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
                 return true;
+            }
             case COME_BACK:
+                if (stillReason(now) != null) {
+                    intentEnd(false, stillReason(now));
+                    return true;
+                }
                 intent = act.action;
                 intentUntil = now + MOVE_MS;
                 moveDue = true;
@@ -1955,6 +2082,15 @@ final class ExploreBrain {
                     || state == State.CORNERED) {
                 moveStarted = false;
                 moveBack = false;
+                aimHeading = Double.NaN;
+                if (intent == CuriosityPort.Action.FIND_THING) {
+                    // Review 2026-10-03: the approach ends where something stops him: that is the thing.
+                    intentDone("went over to it until something stopped him");
+                    return;
+                }
+                if (intent == CuriosityPort.Action.MOVE && intentAct != null) {
+                    recordFailedMove(intentAct.kind, moveFromHeading, now);
+                }
                 dropIntent("a hazard or a stall stopped it");
                 return;
             }
@@ -1993,10 +2129,17 @@ final class ExploreBrain {
                 return;
             }
             double off = -seen.centerX() * tuning.cameraHalfFovDeg;
+            float height = seen.y1 - seen.y0;
+            if (height >= FIND_NEAR_HEIGHT) {
+                // Review 2026-10-03: it already fills half the frame from the floor: he is there.
+                note("intent: find_thing: seen " + Math.round(off) + " deg off, close already");
+                intentDone("found it, close by");
+                return;
+            }
             actHeading = compass.usable(now) ? Heading.wrap(compass.degrees() + off) : Double.NaN;
-            actLegM = FIND_APPROACH_M;
+            actLegM = findApproachM(height);
             moveDue = true;
-            note("intent: find_thing: seen " + Math.round(off) + " deg off; going over");
+            note("intent: find_thing: seen " + Math.round(off) + " deg off; going over (" + fmt2(actLegM) + " m)");
         }
     }
 
@@ -2014,13 +2157,18 @@ final class ExploreBrain {
             enterPause(now, pauseMs(), false);
             return true;
         }
+        if (hopNext && !Double.isNaN(aimHeading)) {
+            // Review 2026-10-03: an aimed drive re-checks where he faces before it goes.
+            return reaim(now);
+        }
         if (intent == CuriosityPort.Action.GO_TO_PLACE && !Double.isNaN(actHeading)) {
             double delta = compass.usable(now) ? Heading.delta(compass.degrees(), actHeading) : 0;
+            double aim = actHeading;
             actHeading = Double.NaN;
             if (Math.abs(delta) >= tuning.turnToleranceDeg) {
                 plannedTicks = drawTicks();
-                enterLook(now, delta > 0 ? Direction.LEFT : Direction.RIGHT, false, timedMs(Math.abs(delta)),
-                        Math.abs(delta));
+                aimTries = 0;
+                enterAimedLook(now, delta, aim);
                 return true;
             }
             return false;
@@ -2052,11 +2200,18 @@ final class ExploreBrain {
             int ticks = Math.max(1, (int) Math.round(actLegM / MOVE_M_PER_TICK));
             double delta = Double.isNaN(actHeading) || !compass.usable(now) ? 0
                     : Heading.delta(compass.degrees(), actHeading);
+            double aim = actHeading;
             actHeading = Double.NaN;
+            String blocked = aimBlocked(now, aim);
+            if (blocked != null) {
+                moveStarted = false;
+                dropIntent(blocked);
+                return false;
+            }
             plannedTicks = ticks;
+            aimTries = 0;
             if (Math.abs(delta) >= tuning.turnToleranceDeg) {
-                enterLook(now, delta > 0 ? Direction.LEFT : Direction.RIGHT, false, timedMs(Math.abs(delta)),
-                        Math.abs(delta));
+                enterAimedLook(now, delta, aim);
             } else {
                 startHop(now);
             }
@@ -2250,12 +2405,7 @@ final class ExploreBrain {
                 Look l = camera.latest();
                 if (l != null && l.frameMs > taskStepAt) {
                     taskLooking = false;
-                    List<String> labels = new ArrayList<String>();
-                    for (Detection d : l.detections) {
-                        if (d.label != null && !labels.contains(d.label)) {
-                            labels.add(d.label);
-                        }
-                    }
+                    List<String> labels = shownLabels(l);
                     stepOutcome(now, true, labels.isEmpty() ? "saw nothing his detector could name"
                             : "saw: " + joinLabels(labels));
                 } else if (now >= taskWaitUntil) {
@@ -2317,6 +2467,11 @@ final class ExploreBrain {
                     stepOutcome(now, false, "on the charger");
                     return;
                 }
+                if (s.drives() && stillReason(now) != null) {
+                    // Review 2026-10-03: never a driving step while he waits for the board, is jammed, etc.
+                    stepOutcome(now, false, stillReason(now));
+                    return;
+                }
                 taskWait = TaskWait.ACT;
                 startAct(now, s, null);
                 if (intent == CuriosityPort.Action.NONE && intentEndWhy == null) {
@@ -2353,14 +2508,7 @@ final class ExploreBrain {
             rest.add(stepText(taskSteps.get(i)));
         }
         Look l = camera.latest();
-        List<String> labels = new ArrayList<String>();
-        if (l != null && now - l.frameMs < 30000) {
-            for (Detection d : l.detections) {
-                if (d.label != null && !labels.contains(d.label)) {
-                    labels.add(d.label);
-                }
-            }
-        }
+        List<String> labels = l != null && now - l.frameMs < 30000 ? shownLabels(l) : new ArrayList<String>();
         CuriosityPort.ToolFacts f = toolFactsNow(now, "carrying out an errand");
         port.taskPlan(new CuriosityPort.TaskConsult(task.goal, new ArrayList<String>(taskOutcomes), rest, f.status,
                 labels, ok ? "check" : "failed", TASK_MAX_CONSULTS - taskConsults,
@@ -2404,6 +2552,21 @@ final class ExploreBrain {
             b.append(" \"").append(s.text).append('"');
         }
         return b.toString();
+    }
+
+    /**
+     * A look's labels as a task step or a consult may tell Claude: each once, never a bathroom
+     * one at any score (review 2026-10-03, as toolFactsNow hides bathroom places).
+     */
+    private static List<String> shownLabels(Look l) {
+        List<String> labels = new ArrayList<String>();
+        for (Detection d : l.detections) {
+            if (d.label != null && !labels.contains(d.label) && !BATHROOM_STRONG.contains(d.label)
+                    && !BATHROOM_WEAK.contains(d.label)) {
+                labels.add(d.label);
+            }
+        }
+        return labels;
     }
 
     private static String joinLabels(List<String> labels) {
@@ -2483,6 +2646,7 @@ final class ExploreBrain {
         moveSawMotion = false;
         actHeading = Double.NaN;
         actLegM = 0;
+        aimHeading = Double.NaN;
         if (moveBack && state == State.BACK_OFF) {
             stopMotors();
             enterPause(clock.nowMs(), pauseMs(), false);
@@ -2530,9 +2694,11 @@ final class ExploreBrain {
     //
     // "If he thinks he's in a bathroom, he beeps every five seconds and tries to escape the
     // bathroom as quickly as possible." He has a camera, so this is privacy first. Decided on
-    // the robot from the detector's labels alone: a strong label (BATHROOM_STRONG) in one
-    // look, or two different weak ones (BATHROOM_WEAK) within the last BATHROOM_WEAK_LOOKS
-    // looks and BATHROOM_WEAK_WINDOW_MS. From then until he is out: no frame goes to Claude
+    // the robot from the detector's labels alone: a strong label (BATHROOM_STRONG) in
+    // BATHROOM_STRONG_LOOKS of the last BATHROOM_WEAK_LOOKS looks within BATHROOM_WEAK_WINDOW_MS
+    // (robot 2026-10-02 14:51: one look of a close office chair read "toilet" 0.62), a strong box
+    // that a non-bathroom label also claims counting only as weak, or two different weak ones
+    // (BATHROOM_WEAK) within the last BATHROOM_WEAK_LOOKS looks and BATHROOM_WEAK_WINDOW_MS. From then until he is out: no frame goes to Claude
     // (canAsk() is false, so every request takes its no-Claude path), the camera saves none
     // (Camera.setPrivate), no place print is kept (and those of the looks that decided it are
     // dropped), no curiosity stop, remark or conversation (a call gets a glance, as muted),
@@ -2558,6 +2724,15 @@ final class ExploreBrain {
     static final float BATHROOM_WEAK_MIN = 0.4f;
     static final int BATHROOM_WEAK_LOOKS = 3;
     static final long BATHROOM_WEAK_WINDOW_MS = 10000;
+    /**
+     * Robot 2026-10-02 14:51: the detector gave one full-frame box "toilet" 0.62 and "office chair"
+     * 0.33. A strong box that a non-bathroom label at BATHROOM_RIVAL_MIN or more also claims (IoU at
+     * least BATHROOM_RIVAL_IOU) counts only as a weak label.
+     */
+    static final float BATHROOM_RIVAL_IOU = 0.8f;
+    static final float BATHROOM_RIVAL_MIN = 0.25f;
+    /** The strong rule needs its label in this many of the last BATHROOM_WEAK_LOOKS looks, not one. */
+    static final int BATHROOM_STRONG_LOOKS = 2;
     static final long BATHROOM_BEEP_MS = 5000;
     static final String BATHROOM_BEEP = "privacy";
     static final double BATHROOM_OUT_M = 2.0;
@@ -2584,6 +2759,8 @@ final class ExploreBrain {
     /** The way in (NaN: none) and the spot's cells are avoided until then (NEVER: nothing avoided). */
     private double bathAvoidHeading = Double.NaN;
     private long bathAvoidUntil = NEVER;
+    /** A strong label in the newest look, not yet confirmed: frames are held until then (bathHeld). */
+    private long bathHoldUntil = NEVER;
 
     /** Privacy is on (bathroom), for the state page and tests. */
     boolean bathroomPrivate() {
@@ -2602,7 +2779,16 @@ final class ExploreBrain {
 
     /** Claude may be asked: never with a bathroom frame (privacy), else as the port says. */
     private boolean canAsk() {
-        return !bathroom && port.canAsk();
+        return !bathroom && !bathHeld(clock.nowMs()) && port.canAsk();
+    }
+
+    /**
+     * Review 2026-10-03: the newest look shows a strong bathroom label (no rival) that one look
+     * is no longer enough to call a bathroom: until the next look clears it or confirms it (at
+     * most BATHROOM_WEAK_WINDOW_MS), no frame leaves the robot, though he does not beep or leave.
+     */
+    private boolean bathHeld(long now) {
+        return bathHoldUntil != NEVER && now < bathHoldUntil;
     }
 
     /** {strong, weak} bathroom boxes in a look at their thresholds, each label once (its first box), in box order. */
@@ -2614,9 +2800,13 @@ final class ExploreBrain {
                 if ((d.x1 - d.x0) * (d.y1 - d.y0) < BATHROOM_MIN_AREA) {
                     continue;
                 }
-                if (BATHROOM_STRONG.contains(d.label) && d.score >= BATHROOM_STRONG_MIN && !hasLabel(strong, d.label)) {
-                    strong.add(d);
-                } else if (BATHROOM_WEAK.contains(d.label) && d.score >= BATHROOM_WEAK_MIN && !hasLabel(weak, d.label)) {
+                boolean strongLabel = BATHROOM_STRONG.contains(d.label) && d.score >= BATHROOM_STRONG_MIN;
+                if (strongLabel && !bathroomRival(d, look.detections)) {
+                    if (!hasLabel(strong, d.label)) {
+                        strong.add(d);
+                    }
+                } else if ((BATHROOM_WEAK.contains(d.label) || strongLabel) && d.score >= BATHROOM_WEAK_MIN
+                        && !hasLabel(weak, d.label)) {
                     weak.add(d);
                 }
             }
@@ -2625,6 +2815,25 @@ final class ExploreBrain {
         out.add(strong);
         out.add(weak);
         return out;
+    }
+
+    /** A non-bathroom label at BATHROOM_RIVAL_MIN or more claims (about) the same box as d. */
+    private static boolean bathroomRival(Detection d, List<Detection> all) {
+        for (Detection o : all) {
+            if (o != d && o.label != null && !BATHROOM_STRONG.contains(o.label) && !BATHROOM_WEAK.contains(o.label)
+                    && o.score >= BATHROOM_RIVAL_MIN && iou(d, o) >= BATHROOM_RIVAL_IOU) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static float iou(Detection a, Detection b) {
+        float w = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+        float h = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+        float inter = w > 0 && h > 0 ? w * h : 0f;
+        float union = (a.x1 - a.x0) * (a.y1 - a.y0) + (b.x1 - b.x0) * (b.y1 - b.y0) - inter;
+        return union > 0 ? inter / union : 0f;
     }
 
     private static boolean hasLabel(List<Detection> ds, String label) {
@@ -2661,14 +2870,24 @@ final class ExploreBrain {
             bathCleanLooks = strong.isEmpty() && weak.isEmpty() ? bathCleanLooks + 1 : 0;
             return;
         }
-        bathLooks.addLast(new Object[]{look.frameMs, weak});
+        bathLooks.addLast(new Object[]{look.frameMs, weak, strong});
         while (bathLooks.size() > BATHROOM_WEAK_LOOKS
                 || look.frameMs - (Long) bathLooks.peekFirst()[0] > BATHROOM_WEAK_WINDOW_MS) {
             bathLooks.pollFirst();
         }
-        if (!strong.isEmpty()) {
-            trig("bathroom", "strong", strong, 1);
-            enterBathroom(now, labelsOf(strong), look.frameMs);
+        int strongLooks = 0;
+        long strongSince = look.frameMs;
+        for (Object[] b : bathLooks) {
+            if (!((List<?>) b[2]).isEmpty()) {
+                strongLooks++;
+                strongSince = Math.min(strongSince, (Long) b[0]);
+            }
+        }
+        bathHoldUntil = strong.isEmpty() ? NEVER : now + BATHROOM_WEAK_WINDOW_MS;
+        if (!strong.isEmpty() && strongLooks >= BATHROOM_STRONG_LOOKS) {
+            bathHoldUntil = NEVER;
+            trig("bathroom", "strong", strong, strongLooks);
+            enterBathroom(now, labelsOf(strong), strongSince);
             return;
         }
         List<Detection> seen = new ArrayList<Detection>();
@@ -4760,9 +4979,6 @@ final class ExploreBrain {
 
     /** Tells the camera whether he is driving (U9: exposure is capped short while he is). */
     private void syncMoving() {
-        if (moving && (state == State.HOP || state == State.BACK_OFF || state.escapes())) {
-            lastDroveAt = clock.nowMs();
-        }
         if (movingShown == null || movingShown != moving) {
             movingShown = moving;
             camera.setMoving(moving);
@@ -10488,7 +10704,7 @@ final class ExploreBrain {
         // and do not disturb (muted, be_quiet) takes no look either; then the camera rule (KTD7).
         @Override
         public String lookBlocked() {
-            if (bathroom) {
+            if (bathroom || bathHeld(clock.nowMs())) {
                 return "privacy: he thinks he is in a bathroom, so his camera shares nothing";
             }
             if (muted || quiet) {
@@ -10944,8 +11160,12 @@ final class ExploreBrain {
     /** Eyes toward d, then a turn of ms, or deg once measured (0: timed only). */
     private void enterLook(long now, Direction d, boolean escapeTurn, long ms, double deg) {
         // Every turn through here is unaimed (its way doesn't matter, only its amount):
-        // it goes the unblocked way. Aimed ones (the steer's bend) come round already.
-        d = unblocked(d);
+        // it goes the unblocked way. Aimed ones (the steer's bend, enterAimedLook) come round already.
+        enterLookAs(now, unblocked(d), escapeTurn, ms, deg);
+    }
+
+    /** Eyes toward d, then a turn of ms, or deg once measured, exactly that way. */
+    private void enterLookAs(long now, Direction d, boolean escapeTurn, long ms, double deg) {
         state = State.LOOK;
         turnRetrying = false;
         heading = d;
@@ -10971,6 +11191,7 @@ final class ExploreBrain {
 
     private void startHop(long now) {
         hopNext = false;
+        aimHeading = Double.NaN;
         int ticks = plannedTicks > 0 ? plannedTicks : drawTicks();
         plannedTicks = -1;
         if (bathTurnAway(now, ticks)) {

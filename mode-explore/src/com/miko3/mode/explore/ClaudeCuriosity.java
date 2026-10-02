@@ -742,18 +742,12 @@ final class ClaudeCuriosity implements CuriosityPort {
         final ClaudeAccess settings = turnAccess();
         final long fetched = System.currentTimeMillis();
         final long[] earlyAt = {0};
-        final ClaudeApi.EarlyFields early = new ClaudeApi.EarlyFields() {
+        // Review 2026-10-03: ChatRound.fly hands the line over early from the last request only, and
+        // the whole reply after it with its act (or a corrected line), as the host harness runs it.
+        ChatRound.Outcome o = ChatRound.fly(body, request, new ChatRound.Asker() {
             @Override
-            public void complete(Map<String, String> fields) {
-                earlyAt[0] = System.currentTimeMillis();
-                // Owner 2026-10-02: "addressed" comes before the line; only a line known to be
-                // said to him goes early (unknown, as from an unstreamed reply: the whole decides).
-                flight.early(call, earlyTurn(fields));
-            }
-        };
-        ChatRound.Outcome o = ChatRound.run(body, request, new ChatRound.Sender() {
-            @Override
-            public ClaudeApi.MessageResult send(List<Map<String, Object>> messages, ClaudeApi.Tools tools) {
+            public ClaudeApi.MessageResult send(List<Map<String, Object>> messages, ClaudeApi.Tools tools,
+                    ClaudeApi.EarlyFields early) {
                 return claude.conversation(settings, body.system, messages, null, TURN_EFFORT, (int) timeoutMs,
                         ChatRound.EARLY_FIELDS, early, tools);
             }
@@ -782,6 +776,14 @@ final class ClaudeCuriosity implements CuriosityPort {
                     return null;
                 }
             }
+        }, flight, call, earlyAt, new ChatRound.BeforeWhole() {
+            @Override
+            public void outcome(ChatRound.Outcome o) {
+                int answered = flight.genOf(call);
+                if (answered != 0 && answered == turnInfoGen) {
+                    turnInfo = new CuriosityPort.TurnInfo(speculative, CuriosityPort.TurnInfo.joined(o.tools));
+                }
+            }
         });
         long ms = System.currentTimeMillis() - t0;
         if (o.dropped) {
@@ -789,12 +791,7 @@ final class ClaudeCuriosity implements CuriosityPort {
                     : "turn abandoned during its tool round") + " in " + ms + " ms");
             return;
         }
-        Turn t = turnOf(o);
-        int answered = flight.genOf(call);
-        if (answered != 0 && answered == turnInfoGen) {
-            turnInfo = new CuriosityPort.TurnInfo(speculative, CuriosityPort.TurnInfo.joined(o.tools));
-        }
-        flight.whole(call, t);
+        Turn t = ChatRound.turnOf(o);
         ClaudeApi.MessageResult r = o.result;
         int count = body.messages.size();
         String effort = settings.isSetUp() && ClaudeApi.takesEffort(settings.model) && !api.effortRefused()
@@ -805,24 +802,6 @@ final class ClaudeCuriosity implements CuriosityPort {
                 + (earlyAt[0] == 0 ? "-" : String.valueOf(earlyAt[0] - t0)) + " ms; system "
                 + body.system.length() + " chars, max_tokens " + ClaudeApi.CONVERSATION_MAX_TOKENS + ", respond tool"
                 + (o.tools == null ? "" : ", tool round: " + o.tools) + ", effort " + effort + ")");
-    }
-
-    /**
-     * The early fields as a LINE turn with no notes yet (the name through NameExtractor, as
-     * turnOf does), or null while it is not known to be said to him: a turn not addressed to
-     * him is never spoken, so it waits for the whole reply.
-     */
-    private static Turn earlyTurn(Map<String, String> fields) {
-        if (!"true".equals(fields.get("addressed"))) {
-            return null;
-        }
-        Map<String, Object> json = new LinkedHashMap<String, Object>(fields);
-        json.put("addressed", Boolean.TRUE);
-        Turn t = ClaudeReplies.turn(json, null);
-        if (t.status != Turn.Status.LINE || t.nameGiven == null) {
-            return t;
-        }
-        return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), false, false, null);
     }
 
     /** Owner 2026-10-03: a tool round's ask, handed to the brain through toolAsk(); a look waits for its answer. */
@@ -931,10 +910,12 @@ final class ClaudeCuriosity implements CuriosityPort {
     /**
      * The request with the owner's note about its partner (Settings page, by name), when one
      * is known yet. The launcher is asked once per name on the worker, so the turn that first
-     * knows the name goes without it and the next carries it. Never logged.
+     * knows the name goes without it and the next carries it. Never logged. Review 2026-10-03:
+     * asked only by request.noteName (a face-matched person's stored name, or the name they
+     * spoke), and the launcher matches the note's full name exactly.
      */
     private TurnRequest withOwnerNote(TurnRequest request) {
-        final String name = request.name == null ? null : request.name.trim();
+        final String name = request.noteName;
         if (name == null || name.isEmpty()) {
             return request;
         }
@@ -1026,42 +1007,6 @@ final class ClaudeCuriosity implements CuriosityPort {
         return v.ok() ? TaskPlan.revised(v.act.steps) : TaskPlan.abort(said);
     }
 
-    /**
-     * The client's reason as the brain's turn status, from the reply's fields (respond's
-     * input); a name given passes NameExtractor's word list first.
-     */
-    private static Turn turnOf(ChatRound.Outcome o) {
-        ClaudeApi.MessageResult r = o.result;
-        if (r.ok()) {
-            if (o.reply == null) {
-                return Turn.failed();
-            }
-            Object delta = o.reply.get("notes_update");
-            Turn t = ClaudeReplies.turn(o.reply, delta instanceof Map ? Json.write(delta) : null);
-            // Owner 2026-10-03: the action tool accepted this turn (ChatActions) is the turn's act.
-            if (o.act != null && t.status == Turn.Status.LINE && t.addressed) {
-                t = t.withAct(o.act);
-            }
-            if (t.status != Turn.Status.LINE || t.nameGiven == null) {
-                return t;
-            }
-            return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), t.endsConversation,
-                    t.deflected, t.notesUpdate).withFeedback(t.feedback).withAddressed(t.addressed)
-                    .withAct(t.act);
-        }
-        switch (r.reason) {
-            case REFUSED:
-                return Turn.refused();
-            case UNREACHABLE:
-            case OVERLOADED:
-            case RATE_LIMITED:
-            case ENDPOINT_ERROR:
-                return Turn.unreachable();
-            default:
-                return Turn.failed();
-        }
-    }
-
     @Override
     public Turn turnAnswer() {
         return turns.poll();
@@ -1082,6 +1027,11 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public boolean turnTailPending() {
         return flight.tailPending();
+    }
+
+    @Override
+    public Turn lateTurn() {
+        return flight.lateTurn();
     }
 
     @Override
@@ -1369,7 +1319,8 @@ final class ClaudeCuriosity implements CuriosityPort {
         // Owner 2026-10-03: the owner's note about them by name, fetched now (a worker thread) so the
         // opener has it; a meeting starts the cache afresh, so a note edited since is read again.
         ownerNotes.clear();
-        if (a.name != null && !a.name.trim().isEmpty()) {
+        if (a.status == CuriosityPort.MatchAnswer.Status.KNOWN && !a.faceless && a.name != null
+                && !a.name.trim().isEmpty()) {
             try {
                 String note = RobotPeopleClient.ownerNoteFor(app, a.name.trim());
                 ownerNotes.put(a.name.trim().toLowerCase(Locale.US), note == null ? NO_NOTE : note);

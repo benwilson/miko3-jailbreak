@@ -2,6 +2,7 @@ package com.miko3.mode.explore;
 
 import com.miko3.shared.ClaudeApi;
 import com.miko3.shared.Json;
+import com.miko3.shared.NameExtractor;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -247,6 +248,124 @@ final class ChatRound {
             return new Outcome(second, null, used.toString(), false);
         }
         return new Outcome(second, reply(second), used.toString(), false, act);
+    }
+
+    // ---- the turn into its flight (review 2026-10-03) ----
+
+    /** Sends one request of the turn, telling early its named fields as they stream (ClaudeApi.conversation). */
+    interface Asker {
+        ClaudeApi.MessageResult send(List<Map<String, Object>> messages, ClaudeApi.Tools tools,
+                ClaudeApi.EarlyFields early);
+    }
+
+    /** Told the turn's outcome just before its whole reply goes to the flight (the adapter's turn info). */
+    interface BeforeWhole {
+        void outcome(Outcome o);
+    }
+
+    /**
+     * Runs the turn (run()) into its flight: the line goes early from the request that turns out
+     * to be the last (ClaudeApi tells no fields of a reply that calls another tool first), the
+     * whole reply after it, with its act. Review 2026-10-03: an accepted action came only in the
+     * whole reply, which after an early line passed on only its notes, so the act was lost; now
+     * the flight passes it on (TurnFlight.lateTurn), and when a tool round replaced the line that
+     * went early (an action beside respond, refused), its line follows as a correction. The
+     * adapter (ClaudeCuriosity.oneTurn) and the host harness both run exactly this. earlyAt[0]
+     * gets when the line was known (0: never). A dropped turn gives the flight nothing.
+     */
+    static Outcome fly(final Body body, CuriosityPort.TurnRequest request, final Asker asker, Host host,
+            final CuriosityPort.TurnFlight flight, final CuriosityPort.TurnFlight.Call call, final long[] earlyAt,
+            BeforeWhole before) {
+        final int[] sends = {0};
+        final int[] earlyIn = {0};
+        final ClaudeApi.EarlyFields early = new ClaudeApi.EarlyFields() {
+            @Override
+            public void complete(Map<String, String> fields) {
+                CuriosityPort.Turn t = earlyTurn(fields);
+                if (t == null) {
+                    return;
+                }
+                if (earlyAt[0] == 0) {
+                    earlyAt[0] = System.currentTimeMillis();
+                }
+                if (earlyIn[0] == 0) {
+                    earlyIn[0] = sends[0];
+                }
+                // Owner 2026-10-02: "addressed" comes before the line; only a line known to be
+                // said to him goes early (unknown, as from an unstreamed reply: the whole decides).
+                flight.early(call, t);
+            }
+        };
+        Outcome o = run(body, request, new Sender() {
+            @Override
+            public ClaudeApi.MessageResult send(List<Map<String, Object>> messages, ClaudeApi.Tools tools) {
+                sends[0]++;
+                return asker.send(messages, tools, early);
+            }
+        }, host);
+        if (o.dropped) {
+            return o;
+        }
+        if (before != null) {
+            before.outcome(o);
+        }
+        flight.whole(call, turnOf(o), earlyIn[0] != 0 && earlyIn[0] < sends[0]);
+        return o;
+    }
+
+    /**
+     * The early fields as a LINE turn with no notes yet (the name through NameExtractor, as
+     * turnOf does), or null while it is not known to be said to him: a turn not addressed to
+     * him is never spoken, so it waits for the whole reply.
+     */
+    static CuriosityPort.Turn earlyTurn(Map<String, String> fields) {
+        if (!"true".equals(fields.get("addressed"))) {
+            return null;
+        }
+        Map<String, Object> json = new LinkedHashMap<String, Object>(fields);
+        json.put("addressed", Boolean.TRUE);
+        CuriosityPort.Turn t = ClaudeReplies.turn(json, null);
+        if (t.status != CuriosityPort.Turn.Status.LINE || t.nameGiven == null) {
+            return t;
+        }
+        return CuriosityPort.Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), false, false,
+                null);
+    }
+
+    /**
+     * The client's reason as the brain's turn status, from the reply's fields (respond's
+     * input); a name given passes NameExtractor's word list first.
+     */
+    static CuriosityPort.Turn turnOf(Outcome o) {
+        ClaudeApi.MessageResult r = o.result;
+        if (r.ok()) {
+            if (o.reply == null) {
+                return CuriosityPort.Turn.failed();
+            }
+            Object delta = o.reply.get("notes_update");
+            CuriosityPort.Turn t = ClaudeReplies.turn(o.reply, delta instanceof Map ? Json.write(delta) : null);
+            // Owner 2026-10-03: the action tool accepted this turn (ChatActions) is the turn's act.
+            if (o.act != null && t.status == CuriosityPort.Turn.Status.LINE && t.addressed) {
+                t = t.withAct(o.act);
+            }
+            if (t.status != CuriosityPort.Turn.Status.LINE || t.nameGiven == null) {
+                return t;
+            }
+            return CuriosityPort.Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven),
+                    t.endsConversation, t.deflected, t.notesUpdate).withFeedback(t.feedback)
+                    .withAddressed(t.addressed).withAct(t.act);
+        }
+        switch (r.reason) {
+            case REFUSED:
+                return CuriosityPort.Turn.refused();
+            case UNREACHABLE:
+            case OVERLOADED:
+            case RATE_LIMITED:
+            case ENDPOINT_ERROR:
+                return CuriosityPort.Turn.unreachable();
+            default:
+                return CuriosityPort.Turn.failed();
+        }
     }
 
     /** What a second action in the same reply is told. */

@@ -238,7 +238,7 @@ FIND_THING_DESCRIPTION = (
 )
 GO_TO_PLACE_DESCRIPTION = (
     'Go to a place they name, like the kitchen. Miko does not know rooms by name, only what his camera '
-    'saw: labels are the things his detector would see there (a kitchen: refrigerator, microwave, sink); '
+    'saw: labels are the things his detector would see there (a kitchen: refrigerator, microwave, oven); '
     'he heads for where he saw them lately, or searches through doorways for them. Do not call places '
     'first: this looks them up itself.'
 )

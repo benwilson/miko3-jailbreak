@@ -260,6 +260,17 @@ interface CuriosityPort extends AnswerParser.Names {
     }
 
     /**
+     * Review 2026-10-03: what a streamed turn's whole reply adds after its line was handed
+     * over, oldest first, or null when there is none: the accepted action tool's act (the
+     * early line carries none), and, when a tool round replaced the line that went early (an
+     * action beside respond that was refused), the corrected line to say next. A LINE turn
+     * whose line is empty when there is only the act.
+     */
+    default Turn lateTurn() {
+        return null;
+    }
+
+    /**
      * Owner 2026-10-02: pass one piece of feedback about the robot on to the launcher's
      * feedback log, from this stored person (null: someone unknown), with a few words of
      * context. Fire and forget; it carries no line and no transcript.
@@ -1452,9 +1463,24 @@ interface CuriosityPort extends AnswerParser.Names {
                     null, null);
         }
 
+        /**
+         * Review 2026-10-03: the name the owner's note may be looked up by: a face-matched known
+         * person's stored name, or the name the person spoke (the launcher matches the note's full
+         * name exactly); null when neither. Never sent, never logged.
+         */
+        final String noteName;
+
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
                     String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee,
                     ToolFacts facts, String ownerName, String ownerNote) {
+            this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called, cantSee, facts,
+                    ownerName, ownerNote, null);
+        }
+
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
+                    String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee,
+                    ToolFacts facts, String ownerName, String ownerNote, String noteName) {
+            this.noteName = noteName == null || noteName.trim().isEmpty() ? null : noteName.trim();
             boolean noted = ownerName != null && !ownerName.trim().isEmpty() && ownerNote != null
                     && !ownerNote.trim().isEmpty();
             this.ownerName = noted ? ownerName.trim() : null;
@@ -1475,31 +1501,37 @@ interface CuriosityPort extends AnswerParser.Names {
         /** This request again, with the repeated question to avoid. */
         TurnRequest avoiding(String question) {
             return new TurnRequest(persona, name, notes, transcript, heard, question, faceless, faceSeen, called,
-                    cantSee, facts, ownerName, ownerNote);
+                    cantSee, facts, ownerName, ownerNote, noteName);
         }
 
         /** This request as one in a conversation that opened faceless, with or without a face since. */
         TurnRequest face(boolean openedFaceless, boolean seenSince) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, openedFaceless, seenSince,
-                    called, cantSee, facts, ownerName, ownerNote);
+                    called, cantSee, facts, ownerName, ownerNote, noteName);
         }
 
         /** This request in a conversation a call opened (owner 2026-10-02), with or without the crouch invitation. */
         TurnRequest call(boolean openedOnACall, boolean cantSeeThem) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen,
-                    openedOnACall, cantSeeThem, facts, ownerName, ownerNote);
+                    openedOnACall, cantSeeThem, facts, ownerName, ownerNote, noteName);
+        }
+
+        /** Review 2026-10-03: this request with the name its owner's note may be looked up by (null: none). */
+        TurnRequest noteBy(String n) {
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
+                    cantSee, facts, ownerName, ownerNote, n);
         }
 
         /** This request with the owner's note about its partner, found by this name (null: none). */
         TurnRequest withOwnerNote(String byName, String note) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
-                    cantSee, facts, byName, note);
+                    cantSee, facts, byName, note, noteName);
         }
 
         /** This request with what robot_status and places answer (owner 2026-10-03). */
         TurnRequest withFacts(ToolFacts f) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
-                    cantSee, f, ownerName, ownerNote);
+                    cantSee, f, ownerName, ownerNote, noteName);
         }
 
         /** The opener: nothing heard yet. */
@@ -1541,6 +1573,8 @@ interface CuriosityPort extends AnswerParser.Names {
             Turn early;
             Turn whole;
             boolean earlyHandedOver;
+            /** Review 2026-10-03: the whole reply came from a later request than the line that went early. */
+            boolean replacesEarly;
 
             Call(String key, int gen) {
                 this.key = key;
@@ -1552,6 +1586,7 @@ interface CuriosityPort extends AnswerParser.Names {
         private Call speculation;
         private final List<String> late = new ArrayList<String>();
         private final List<Feedback> lateFeedback = new ArrayList<Feedback>();
+        private final List<Turn> lateTurns = new ArrayList<Turn>();
         private Call tail;
 
         TurnFlight(Deliver deliver) {
@@ -1627,9 +1662,18 @@ interface CuriosityPort extends AnswerParser.Names {
 
         /** Its whole reply (or failure): handed over, or only its notes when the line already went. */
         synchronized void whole(Call c, Turn t) {
+            whole(c, t, false);
+        }
+
+        /**
+         * As whole(c, t); replacesEarly: a tool round ran after the request whose line went early,
+         * so the whole reply's line (when it differs) is a correction to say next (lateTurn()).
+         */
+        synchronized void whole(Call c, Turn t, boolean replacesEarly) {
             if (c.whole != null) {
                 return;
             }
+            c.replacesEarly = replacesEarly;
             c.whole = t == null ? Turn.failed() : t;
             if (c.gen != 0 && c != speculation) {
                 handWhole(c);
@@ -1661,6 +1705,20 @@ interface CuriosityPort extends AnswerParser.Names {
             if (c.whole.status == Turn.Status.LINE && c.whole.feedback != null) {
                 lateFeedback.add(c.whole.feedback);
             }
+            // Review 2026-10-03: the act (and a corrected line) the early line could not carry.
+            if (c.whole.status == Turn.Status.LINE && c.whole.addressed) {
+                String said = c.early == null ? null : c.early.line;
+                String line = c.whole.line == null ? "" : c.whole.line.trim();
+                boolean correction = c.replacesEarly && !line.isEmpty() && !line.equals(said == null ? "" : said.trim());
+                if (correction || c.whole.act != null) {
+                    lateTurns.add(Turn.line(correction ? line : "").withAct(c.whole.act));
+                }
+            }
+        }
+
+        /** The oldest late act or corrected line, or null (CuriosityPort.lateTurn). */
+        synchronized Turn lateTurn() {
+            return lateTurns.isEmpty() ? null : lateTurns.remove(0);
         }
 
         /** The oldest late feedback, or null. */
@@ -1700,6 +1758,7 @@ interface CuriosityPort extends AnswerParser.Names {
             tail = null;
             late.clear();
             lateFeedback.clear();
+            lateTurns.clear();
         }
     }
 

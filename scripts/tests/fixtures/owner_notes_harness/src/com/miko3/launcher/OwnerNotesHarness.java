@@ -169,17 +169,18 @@ public final class OwnerNotesHarness {
             check(n, "alex-kim".equals(t.noteFor("Alex Kim")) && "alex-ng".equals(t.noteFor("alex ng")),
                     t.noteFor("Alex Kim"));
         });
-        scenario("first_name_matches_a_unique_entry", n -> {
+        scenario("a_first_name_alone_never_matches_a_full_name_entry", n -> {
+            // Review 2026-10-03: a spoken first name is unverified; only the note's full name matches.
             OwnerNotes t = team();
-            check(n, "priya-shah".equals(t.noteFor("Priya")), t.noteFor("Priya"));
+            check(n, t.noteFor("Priya") == null && t.noteFor("priya") == null, t.noteFor("Priya"));
         });
         scenario("first_name_shared_by_two_entries_matches_nothing", n -> {
             OwnerNotes t = team();
             check(n, t.noteFor("Alex") == null && t.noteFor("Alex Smith") == null, t.noteFor("Alex"));
         });
-        scenario("full_name_asked_matches_a_unique_first_name_entry", n -> {
+        scenario("a_full_name_asked_never_matches_a_first_name_entry", n -> {
             OwnerNotes t = team();
-            check(n, "sam".equals(t.noteFor("Sam Lee")), t.noteFor("Sam Lee"));
+            check(n, t.noteFor("Sam Lee") == null && "sam".equals(t.noteFor("Sam")), t.noteFor("Sam Lee"));
         });
         scenario("different_last_names_never_match", n -> {
             OwnerNotes t = team();

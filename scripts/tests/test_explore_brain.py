@@ -308,6 +308,12 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "act_stay_holds_him_still_and_a_call_is_answered_where_he_stands",
         "act_find_thing_ends_on_sight_and_goes_over_to_it",
         "act_go_to_place_is_done_when_a_look_shows_what_marks_it",
+        "act_an_aimed_turn_never_flips_from_a_blocked_side_and_drives_only_facing_its_aim",
+        "act_a_move_into_what_just_stopped_him_or_the_same_failed_move_is_refused",
+        "task_a_driving_step_never_starts_while_he_waits_for_the_motor_board",
+        "act_go_away_when_he_cant_drive_leaves_them_alone_with_no_leg_later",
+        "act_find_thing_close_already_drives_nothing_and_a_block_in_the_approach_ends_it_done",
+        "task_a_look_and_its_consult_never_name_a_bathroom_thing",
         "task_three_steps_run_in_order_and_end_done_with_a_record",
         "task_a_failed_step_consults_claude_and_the_revised_plan_succeeds",
         "task_out_of_consults_ends_it_with_a_spoken_line",
@@ -315,7 +321,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "task_bathroom_privacy_ends_it_with_no_consult_and_no_frame",
         "task_docked_ends_it_and_a_drive_is_refused_while_docked",
         "act_stop_in_a_conversation_ends_the_task_at_once_and_the_talk_goes_on",
-        "chat_tool_look_fast_path_sends_the_fresh_streamed_frame_at_once_with_no_unpark",
+        "chat_tool_look_fast_path_sends_only_a_fresh_frame_the_detector_checked_with_its_labels",
         # Robot 2026-10-03: backed up against a wall, he drives forward out.
         "stuck_wall_behind_a_turn_on_the_spot_stalls_and_he_drives_forward_out_no_jam_no_help",
         "stuck_a_back_up_that_goes_nowhere_makes_the_next_probe_forward",
@@ -524,6 +530,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "chat_tool_look_in_do_not_disturb_or_bathroom_privacy_is_refused_without_a_frame",
         "chat_lease_lost_mid_conversation_continues_without_the_look_and_a_6_s_sensor_stall_ends_it",
         "chat_eyes_only_wake_word_opens_a_stranger_conversation_without_a_turn_or_a_match_and_stores_nothing",
+        "chat_the_owners_note_is_looked_up_by_a_face_matched_stored_name_or_the_spoken_name_only",
         "chat_the_transcript_never_appears_in_the_trace",
         # The call: slot, verdict and answer (hey-miko plan U5; R1-R4, R11; KTD1-KTD5; AE1-AE3, AE6)
         "call_ae1_met_two_minutes_ago_a_wake_word_is_still_answered_and_searched",
@@ -729,6 +736,8 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "muted_mid_conversation_it_ends_at_once_with_no_sign_off",
         # Bathroom privacy (owner 2026-10-02)
         "bathroom_a_toilet_while_roaming_privacy_on_beeps_every_5_s_retraces_out_then_privacy_off",
+        "bathroom_the_1451_office_chair_read_as_a_toilet_never_triggers",
+        "bathroom_a_real_toilet_needs_two_of_three_looks",
         "bathroom_a_single_mirror_or_weak_labels_below_threshold_never_trigger",
         "bathroom_toilet_paper_alone_or_a_tiny_box_never_triggers",
         "bathroom_toilet_paper_and_a_sink_together_still_trigger",
@@ -755,6 +764,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "learn_a_claude_person_pick_conversation_is_marked_claude_pick_faceless_and_its_replies",
         "learn_log_keeps_only_records_as_logcat_lines_says_alive_and_rotates",
         "learn_tuning_stamp_is_a_hash_and_the_fields_off_their_defaults",
+        "learn_log_close_with_a_full_queue_stops_the_writer_without_blocking_the_caller",
     )
 
     @classmethod

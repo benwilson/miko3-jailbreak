@@ -5,7 +5,11 @@ ExploreCamera logs every look it runs ("look in N ms: [label score [x0,y0,x1,y1]
 This replays ExploreBrain's bathroom rule over those lines, so past logs can be checked for
 false bathroom triggers after the rule or its thresholds change:
 
-  * a strong label (toilet) at BATHROOM_STRONG_MIN or more in one look, or
+  * a strong label (toilet) at BATHROOM_STRONG_MIN or more in BATHROOM_STRONG_LOOKS of the last
+    BATHROOM_WEAK_LOOKS looks within BATHROOM_WEAK_WINDOW_MS (robot 2026-10-02 14:51: one look
+    was not enough), where a strong box that a non-bathroom label also claims (IoU at least
+    BATHROOM_RIVAL_IOU, score at least BATHROOM_RIVAL_MIN: a close office chair read "toilet")
+    counts only as a weak label, or
   * two different weak labels (toilet paper, sink, mirror, soap, paper towel, towel, bathtub)
     at BATHROOM_WEAK_MIN or more within the last BATHROOM_WEAK_LOOKS looks and
     BATHROOM_WEAK_WINDOW_MS of the newest;
@@ -43,6 +47,9 @@ BATHROOM_WEAK_MIN = 0.4
 BATHROOM_MIN_AREA = 0.006
 BATHROOM_WEAK_LOOKS = 3
 BATHROOM_WEAK_WINDOW_MS = 10000
+BATHROOM_RIVAL_IOU = 0.8
+BATHROOM_RIVAL_MIN = 0.25
+BATHROOM_STRONG_LOOKS = 2
 
 LOOK_RE = re.compile(r"^look in \d+ ms: \[(.*)\]$")
 BOX_RE = re.compile(r"\s*([^\[\],][^\[\]]*?) (\d+(?:\.\d+)?) \[([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)\]")
@@ -65,16 +72,35 @@ def parse_look(msg):
             for b in BOX_RE.finditer(m.group(1))]
 
 
+def iou(a, b):
+    """Intersection over union of two (x0, y0, x1, y1) boxes."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    inter = w * h if w > 0 and h > 0 else 0.0
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def rivalled(box, boxes):
+    """A non-bathroom label claims the same box (bathroomRival)."""
+    return any(lab not in BATHROOM_STRONG and lab not in BATHROOM_WEAK and s >= BATHROOM_RIVAL_MIN
+               and iou(box, b) >= BATHROOM_RIVAL_IOU for lab, s, b in boxes)
+
+
 def hits(boxes, strong_min, weak_min, min_area):
-    """(strong, weak) qualifying boxes, each label once (its first box), in box order (bathroomHits)."""
+    """(strong, weak) qualifying boxes, each label once (its first box), in box order (bathroomHits);
+    a strong box with a rival label counts as weak."""
     strong, weak = [], []
     for label, score, (x0, y0, x1, y1) in boxes:
         if (x1 - x0) * (y1 - y0) < min_area:
             continue
-        if label in BATHROOM_STRONG and score >= strong_min and label not in [b[0] for b in strong]:
-            strong.append((label, score, (x0, y0, x1, y1)))
-        elif label in BATHROOM_WEAK and score >= weak_min and label not in [b[0] for b in weak]:
-            weak.append((label, score, (x0, y0, x1, y1)))
+        box = (label, score, (x0, y0, x1, y1))
+        if label in BATHROOM_STRONG and score >= strong_min and not rivalled(box[2], boxes):
+            if label not in [b[0] for b in strong]:
+                strong.append(box)
+        elif ((label in BATHROOM_WEAK or label in BATHROOM_STRONG and score >= strong_min) and score >= weak_min
+              and label not in [b[0] for b in weak]):
+            weak.append(box)
     return strong, weak
 
 
@@ -85,15 +111,16 @@ def replay(looks, strong_min=BATHROOM_STRONG_MIN, weak_min=BATHROOM_WEAK_MIN, mi
         if p != pid:
             recent, pid = [], p
         strong, weak = hits(boxes, strong_min, weak_min, min_area)
-        recent.append((t, weak))
+        recent.append((t, weak, strong))
         while len(recent) > BATHROOM_WEAK_LOOKS or (t - recent[0][0]).total_seconds() * 1000 > BATHROOM_WEAK_WINDOW_MS:
             recent.pop(0)
-        if strong:
-            out.append({"time": t, "pid": p, "rule": "strong", "boxes": strong, "looks": 1})
+        strong_looks = sum(1 for r in recent if r[2])
+        if strong and strong_looks >= BATHROOM_STRONG_LOOKS:
+            out.append({"time": t, "pid": p, "rule": "strong", "boxes": strong, "looks": strong_looks})
             recent = []
             continue
         seen, looks_n = [], 0
-        for _, w in recent:
+        for _, w, _ in recent:
             added = False
             for b in w:
                 if b[0] not in [s[0] for s in seen]:
@@ -123,7 +150,9 @@ def evaluate(lines, strong_min=BATHROOM_STRONG_MIN, weak_min=BATHROOM_WEAK_MIN, 
     return {"looks": len(looks), "triggers": trig, "logged_triggers": len(logged),
             "logged_not_replayed": [t.isoformat(sep=" ") for t in missed],
             "thresholds": {"strong_min": strong_min, "weak_min": weak_min, "min_area": min_area,
-                           "weak_looks": BATHROOM_WEAK_LOOKS, "weak_window_ms": BATHROOM_WEAK_WINDOW_MS}}
+                           "weak_looks": BATHROOM_WEAK_LOOKS, "weak_window_ms": BATHROOM_WEAK_WINDOW_MS,
+                           "strong_looks": BATHROOM_STRONG_LOOKS, "rival_iou": BATHROOM_RIVAL_IOU,
+                           "rival_min": BATHROOM_RIVAL_MIN}}
 
 
 def render(r):
