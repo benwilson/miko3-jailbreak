@@ -10988,7 +10988,10 @@ final class ExploreBrain {
 
     /** Nothing else going on: no call or its conversation opening, no answer clip, nothing being said. */
     private boolean dockQuiet(long now) {
-        return call == null && !callChatOpening && now >= ackUntil && pendingLine == null && port.sayFinished();
+        // Not port.sayFinished(): on the robot that is a one-shot "a line just finished" event, never
+        // true before the first line, so a fresh start on the charger never looked (robot 2026-10-02
+        // 16:30-16:41). Lines are said in their own states, which return to DOCKED when done.
+        return call == null && !callChatOpening && now >= ackUntil && pendingLine == null;
     }
 
     /** One look: to Claude when it can be asked, else (or when Claude fails) the detector decides. */

@@ -730,6 +730,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "dock_power_off_for_two_readings_roams_again_and_one_is_not_enough",
         "dock_power_off_the_dock_with_a_faulted_tof_goes_back_to_eyes_only",
         "dock_power_missing_or_malformed_is_ignored",
+        "dock_a_fresh_start_on_the_charger_looks_without_having_said_anything",
         "dock_camera_closed_between_looks_and_opened_for_each",
         "dock_reopen_never_sooner_than_the_gap",
         "dock_a_conversation_opens_the_camera_and_it_closes_once_docked_again",

@@ -693,6 +693,10 @@ public final class ExploreBrainHarness {
         boolean sayWhileBusyAllowed;
         boolean sayNeverFinishes;
         long sayingUntil = Long.MIN_VALUE;
+        /** The robot's sayFinished() (ClaudeCuriosity): a one-shot event, true once per finished line, and
+         *  never before the first line. Off: the older "not speaking now" model most scenarios use. */
+        boolean sayEventsLikeRobot = false;
+        boolean sayEventPending = false;
         /** The fake people flow (U5): scripted answers, each after claudeDelayMs (a reply after replyMs). */
         final People people = new People();
         final List<String> meets = new ArrayList<String>();
@@ -1424,6 +1428,7 @@ public final class ExploreBrainHarness {
                 violations.add(now + ":say while the mic is open in " + brain.state());
             }
             sayingUntil = sayNeverFinishes ? Long.MAX_VALUE : now + speechMs;
+            sayEventPending = true;
             log.add(new Event(now, "say " + line));
         }
 
@@ -1458,6 +1463,13 @@ public final class ExploreBrainHarness {
 
         @Override
         public boolean sayFinished() {
+            if (sayEventsLikeRobot) {
+                if (sayEventPending && now >= sayingUntil) {
+                    sayEventPending = false;
+                    return true;
+                }
+                return false;
+            }
             return now >= sayingUntil;
         }
 
@@ -16752,6 +16764,19 @@ public final class ExploreBrainHarness {
         // CPU on the dock (robot 2026-10-02): camerahalserver ran ~68% of a core streaming
         // 15 fps for one look a minute. Docked, the camera is closed between looks and opened
         // for each (dockCameraCloses, on by default), and a conversation opens it as ever.
+        scenario("dock_a_fresh_start_on_the_charger_looks_without_having_said_anything", n -> {
+            // Robot 2026-10-02 16:30-16:41: started already on the charger, he never took a docked look
+            // until a conversation had spoken a line. dockQuiet asked port.sayFinished(), which on the robot
+            // is a one-shot "a line just finished" event, never true before the first line.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = dockRig(cueTuning().dockLookMs(5000), (r, req, nth) -> CuriosityPort.Answer.nothing(), EMPTY_ROOM);
+            rig.sayEventsLikeRobot = true;
+            rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+            rig.started();
+            rig.runUntil(30000);
+            check(n, notesWith(notes, "docked look") >= 3 && rig.violations.isEmpty(),
+                    "looks=" + notesWith(notes, "docked look") + " notes=" + lastNotes(notes, 12));
+        });
         scenario("dock_camera_closed_between_looks_and_opened_for_each", n -> {
             Rig rig = dockRig((r, req, nth) -> CuriosityPort.Answer.nothing(), EMPTY_ROOM);
             rig.started();
