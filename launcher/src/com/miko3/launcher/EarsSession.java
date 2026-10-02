@@ -459,6 +459,7 @@ final class EarsSession {
         answering = false; // the next chunk claims an utterance in progress if it started in time
         answerAnnounced = false;
         answerOverDue = false; // the mode's new listen replaces the old one's hold
+        diag.log("conversation listen open: " + (listenUntil - now) + " ms to start answering");
         reconcile();
         return true;
     }

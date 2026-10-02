@@ -1,0 +1,5 @@
+# A spoken command: call him, ask him to turn around, thank him.
+# python3 scripts/robot-say.py --script scripts/robot-say-scripts/commands.txt
+@wake
+can you turn around
+thanks

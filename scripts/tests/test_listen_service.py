@@ -56,6 +56,8 @@ EARS_TUNING = LAUNCHER / "EarsTuning.java"
 EARS_INTERFACE = SHARED / "RobotEars.java"
 EARS_CLIENT = SHARED / "RobotEarsClient.java"
 HOTWORDS = REPO / "launcher" / "assets" / "hotwords.txt"
+INJECT = LAUNCHER / "EarsInject.java"
+INJECT_RECEIVER = LAUNCHER / "EarsInjectReceiver.java"
 WAKEWORD_LIBS = ("libnative_wakeword_vad_lib.so", "libncnn.so", "libtensorflowlite_gpu_delegate.so")
 
 
@@ -177,6 +179,16 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_preroll_holds_nothing_from_before_the_deaf_window",
         "ears_preroll_holds_nothing_from_before_a_capture_restart",
         "ears_preroll_tuning_parses_and_clamps",
+        # robot-say.py (2026-10-02): debug-only heard-text injection, gated by a property.
+        "ears_inject_refused_while_the_property_is_off",
+        "ears_inject_wake_call_sends_the_early_cue_then_the_called_words",
+        "ears_inject_answer_runs_the_listens_answer_path",
+        "ears_inject_waits_out_the_deaf_window",
+        "ears_inject_ignores_real_audio_while_it_plays_then_passes_it_through",
+        "ears_inject_next_offer_starts_once_the_words_are_spent",
+        "ears_inject_stale_offer_is_dropped",
+        "ears_inject_normalises_like_the_models_tokens",
+        "ears_inject_logs_no_words",
         "keeper_acquire_renew_release",
         "keeper_ttl_expiry",
         "keeper_death_and_stale_death_ignored",
@@ -1014,14 +1026,45 @@ def _log_word_offenders(paths):
     return offenders
 
 
+class InjectWiringTest(unittest.TestCase):
+    """robot-say.py (2026-10-02): the debug-only heard-text injection is off by default,
+    reachable only by root, and enters at the ears session's own engine, gate and recogniser."""
+
+    def test_property_is_a_debug_prop_read_as_one(self):
+        src = _read(INJECT)
+        self.assertRegex(src, r'PROPERTY\s*=\s*"debug\.miko3\.ears_inject"')
+        self.assertIn('"1".equals(props.get(PROPERTY)', src)
+
+    def test_receiver_is_unexported_with_no_intent_filter(self):
+        manifest = MANIFEST.read_text()
+        self.assertRegex(manifest, r'<receiver android:name="\.EarsInjectReceiver" android:exported="false"\s*/>')
+
+    def test_receiver_checks_the_gate_before_reading_the_words(self):
+        body = _method_body(_read(INJECT_RECEIVER), "onReceive")
+        self.assertIsNotNone(body)
+        self.assertIn("EarsInject.ACTION.equals(intent.getAction())", body)
+        self.assertLess(body.index("armed()"), body.index("getStringExtra"))
+        self.assertIn("offer(", body)
+
+    def test_engine_wraps_the_real_engine_gate_and_recogniser(self):
+        src = _read(ENGINE)
+        for needle in ("inject.spotter(earsSpotter)", "inject.gate(earsGate)", "inject.recognizer(earsRecognizer)",
+                       "new EarsInject("):
+            self.assertIn(needle, src)
+
+    def test_a_listen_opening_is_logged_for_the_script_to_wait_on(self):
+        body = _method_body(_read(EARS), "listen")
+        self.assertIn('diag.log("conversation listen open', body)
+
+
 class ListenPrivacyLogTest(unittest.TestCase):
     def test_log_calls_never_carry_spoken_or_heard_words(self):
         self.assertEqual(_log_word_offenders((SERVICE, ENGINE, SESSION, APP, PROBE, LAUNCHER / "PeopleService.java",
                                               LAUNCHER / "PeopleStore.java", EARS, CLASSIFIER, KEEPER,
-                                              EARS_INTERFACE, EARS_CLIENT)), [])
+                                              EARS_INTERFACE, EARS_CLIENT, INJECT, INJECT_RECEIVER)), [])
 
     def test_ears_session_and_classifier_never_print(self):
-        for path in (EARS, CLASSIFIER, KEEPER):
+        for path in (EARS, CLASSIFIER, KEEPER, INJECT, INJECT_RECEIVER):
             src = _read(path)
             with self.subTest(file=path.name):
                 for needle in ("System.out", "System.err", "printStackTrace"):

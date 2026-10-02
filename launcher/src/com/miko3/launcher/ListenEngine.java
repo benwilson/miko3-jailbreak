@@ -112,6 +112,8 @@ final class ListenEngine implements ListenSession.Ears {
     private final Context context;
     private final ListenSession session;
     private final EarsSession ears;
+    /** robot-say.py's debug-only heard-text injection, wrapped around the ears' engine, gate and recogniser. */
+    private final EarsInject inject;
     private final SpeechTuning tuning;
     /** KTD2's threads, active paths and decoding unless a property switches them. */
     private final EarsTuning earsTuning;
@@ -163,18 +165,28 @@ final class ListenEngine implements ListenSession.Ears {
                 return settings.conversation().answersWhenSpokenTo;
             }
         };
-        this.ears = new EarsSession(new EarsSession.Clock() {
+        EarsSession.Clock earsClock = new EarsSession.Clock() {
             @Override
             public long nowMs() {
                 return SystemClock.elapsedRealtime();
             }
-        }, earsCapture, earsSpotter, earsGate, earsRecognizer, earsDirection, new CueClassifier(earsSwitch),
-                tuning.deafTailMs, new EarsSession.Diag() {
-                    @Override
-                    public void log(String note) {
-                        Log.i(TAG, "ears: " + note);
-                    }
-                }, earsTuning.gateWake, EarsSession.prerollMs(props.get(EarsSession.PREROLL_PROP)));
+        };
+        EarsSession.Diag earsDiag = new EarsSession.Diag() {
+            @Override
+            public void log(String note) {
+                Log.i(TAG, "ears: " + note);
+            }
+        };
+        // Debug only (robot-say.py): inert unless debug.miko3.ears_inject is 1 when an utterance is offered.
+        this.inject = new EarsInject(earsClock, new EarsInject.Props() {
+            @Override
+            public String get(String key) {
+                return SpeechEngine.systemProperty(key);
+            }
+        }, earsDiag);
+        this.ears = new EarsSession(earsClock, earsCapture, inject.spotter(earsSpotter), inject.gate(earsGate),
+                inject.recognizer(earsRecognizer), earsDirection, new CueClassifier(earsSwitch),
+                tuning.deafTailMs, earsDiag, earsTuning.gateWake, EarsSession.prerollMs(props.get(EarsSession.PREROLL_PROP)));
         // KTD1: the deaf window follows the speech queue's line start and idle.
         speech.setSpeaking(new SpeechQueue.Speaking() {
             @Override
@@ -195,6 +207,11 @@ final class ListenEngine implements ListenSession.Ears {
 
     EarsSession ears() {
         return ears;
+    }
+
+    /** For EarsInjectReceiver. */
+    EarsInject inject() {
+        return inject;
     }
 
     /** Loads the models on the listen thread (so a listen queued behind it waits),

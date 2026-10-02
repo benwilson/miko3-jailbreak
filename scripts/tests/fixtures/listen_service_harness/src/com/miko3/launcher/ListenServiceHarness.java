@@ -588,6 +588,15 @@ public final class ListenServiceHarness {
                     gateWake);
         }
 
+        /** robot-say.py's injection (2026-10-02): the fakes wrapped by an EarsInject reading props. */
+        EarsInject inject;
+
+        Rig(FakeProps props) {
+            inject = new EarsInject(clock, props, diag);
+            session = new EarsSession(clock, capture, inject.spotter(spotter), inject.gate(gate), inject.recognizer(rec),
+                    direction, new CueClassifier(sw), TAIL, diag);
+        }
+
         /** With an explicit pre-roll length. */
         Rig(boolean gateWake, long prerollMs) {
             session = new EarsSession(clock, capture, spotter, gate, rec, direction, new CueClassifier(sw), TAIL, diag,
@@ -682,6 +691,27 @@ public final class ListenServiceHarness {
                 }
             }
             return b.toString();
+        }
+    }
+
+    /** The debug property robot-say.py sets, as the inject gate reads it. */
+    static final class FakeProps implements EarsInject.Props {
+        String value;
+
+        FakeProps(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String get(String key) {
+            return EarsInject.PROPERTY.equals(key) && value != null ? value : "";
+        }
+    }
+
+    /** Silent chunks until the client has heard want utterances or ms of audio pass. */
+    static void runUntilHeard(Rig r, int want, long ms) {
+        for (long t = 0; t < ms && r.client.heard.size() < want; t += 80) {
+            r.step(false);
         }
     }
 
@@ -2207,6 +2237,175 @@ public final class ListenServiceHarness {
                 r.session.close("10001");
                 int lowest = r.rec.marks.isEmpty() ? -1 : Collections.min(r.rec.marks);
                 check(n, up && lowest >= restart, "restart=" + restart + " lowest=" + lowest);
+            }
+        });
+        // robot-say.py (2026-10-02): debug-only heard-text injection through the real ears path.
+        scenario("ears_inject_refused_while_the_property_is_off", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps(""));
+                r.open(false);
+                boolean offered = r.inject.offer("hey miko turn around", true);
+                runUntilHeard(r, 1, 6000);
+                boolean quiet = r.client.heard.isEmpty() && !r.inject.active();
+                // Real speech still goes through the wrapped fakes untouched.
+                r.spotter.hitNext = true;
+                r.utter("HEY MIKO HELLO", 3);
+                r.silence(EarsSession.ENDPOINT_HANGOVER_MS + 80);
+                EarsSession.Utterance u = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, !offered && quiet && u != null && "HEY MIKO HELLO".equals(u.text)
+                                && r.diag.mention("inject refused: " + EarsInject.PROPERTY + " is off"),
+                        "offered=" + offered + " quiet=" + quiet + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_inject_wake_call_sends_the_early_cue_then_the_called_words", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.open(false);
+                boolean offered = r.inject.offer("Turn around, please!", true);
+                runUntilHeard(r, 2, 6000);
+                EarsSession.Utterance cue = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, offered && cue != null && cue.text.isEmpty() && cue.kind == CueClassifier.KIND_WAKE_WORD
+                                && cue.tier == CueClassifier.TIER_STRONG
+                                && f != null && "HEY MIKO TURN AROUND PLEASE".equals(f.text) && f.called
+                                && "turn around please".equals(f.message) && f.at == cue.at && !f.partial
+                                && r.client.heard.size() == 2,
+                        "offered=" + offered + " heard=" + r.heard() + (f == null ? "" : " message=" + f.message));
+            }
+        });
+        scenario("ears_inject_answer_runs_the_listens_answer_path", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.sw.on = false;
+                r.open(false);
+                r.client.provisionalClock = r.clock;
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                boolean offered = r.inject.offer("yes, go find the printer", false);
+                runUntilHeard(r, 1, 8000);
+                long heardAt = r.clock.now;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                long speak = EarsInject.speakMs("YES GO FIND THE PRINTER", false);
+                long provisionalAfter = r.client.provisionalWhen.isEmpty() ? -1
+                        : r.client.provisionalWhen.get(0) - (u == null ? 0 : u.at);
+                check(n, offered && r.client.answering.size() == 1 && u != null
+                                && "YES GO FIND THE PRINTER".equals(u.text) && !u.called
+                                && java.util.Arrays.asList("YES GO FIND THE PRINTER").equals(r.client.provisional)
+                                && r.client.heardBeforeProvisional.equals(java.util.Arrays.asList(0))
+                                && provisionalAfter >= speak + EarsInject.ENDPOINT_AFTER_MS - 80
+                                && heardAt - u.at >= speak + EarsSession.ANSWER_SILENCE_MS - 80
+                                && r.client.answerOver.isEmpty() && !r.session.listening()
+                                && r.client.heard.size() == 1,
+                        "offered=" + offered + " answering=" + r.client.answering + " provisional=" + r.client.provisional
+                                + " provisionalAfter=" + provisionalAfter + " heard=" + r.heard() + " at " + heardAt);
+            }
+        });
+        scenario("ears_inject_waits_out_the_deaf_window", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.open(false);
+                r.session.lineStarted();
+                r.inject.offer("hello there", true);
+                r.steps(false, 3000);
+                boolean nothingWhileSpeaking = r.client.heard.isEmpty() && !r.inject.active();
+                r.session.playbackIdle();
+                long idleAt = r.clock.now;
+                runUntilHeard(r, 2, 6000);
+                EarsSession.Utterance cue = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, nothingWhileSpeaking && r.client.heard.size() == 2 && cue != null
+                                && cue.at > idleAt + Rig.TAIL && "HEY MIKO HELLO THERE".equals(r.client.heard.get(1).text),
+                        "nothingWhileSpeaking=" + nothingWhileSpeaking + " heard=" + r.heard() + " idleAt=" + idleAt);
+            }
+        });
+        scenario("ears_inject_ignores_real_audio_while_it_plays_then_passes_it_through", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.open(false);
+                r.inject.offer("what time is it", true);
+                // The microphone hears speech and a wake hit throughout: the injection's verdicts win.
+                for (int i = 0; i < 80 && r.inject.active() || i < 2; i++) {
+                    r.spotter.hitNext = true;
+                    r.rec.text = "SOMETHING ELSE";
+                    r.step(true);
+                }
+                int during = r.client.heard.size();
+                String words = during < 2 ? "" : r.client.heard.get(1).text;
+                long acceptedDuring = r.rec.accepted;
+                r.rec.text = "";
+                r.utter("HELLO MIKO", 3);
+                r.silence(EarsSession.ENDPOINT_HANGOVER_MS + 80);
+                EarsSession.Utterance after = r.client.heard.size() < 3 ? null : r.client.heard.get(r.client.heard.size() - 1);
+                check(n, during == 2 && "HEY MIKO WHAT TIME IS IT".equals(words) && acceptedDuring == 0
+                                && after != null && "HELLO MIKO".equals(after.text) && r.rec.accepted > 0,
+                        "during=" + during + " words=" + words + " accepted=" + acceptedDuring + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_inject_next_offer_starts_once_the_words_are_spent", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.sw.on = false;
+                r.open(false);
+                r.inject.offer("", true);
+                runUntilHeard(r, 2, 6000);
+                boolean spent = r.diag.mention("inject spent");
+                // The mode answers the call at once and listens: the answer must not wait out the tail.
+                r.session.listen("10001", 4000);
+                long opened = r.clock.now;
+                r.inject.offer("my name is sam", false);
+                runUntilHeard(r, 3, 8000);
+                EarsSession.Utterance u = r.client.heard.size() < 3 ? null : r.client.heard.get(2);
+                check(n, spent && u != null && "MY NAME IS SAM".equals(u.text) && u.at - opened <= 160
+                                && r.client.answering.size() == 1,
+                        "spent=" + spent + " heard=" + r.heard() + " opened=" + opened + " answering=" + r.client.answering);
+            }
+        });
+        scenario("ears_inject_stale_offer_is_dropped", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.open(false);
+                r.session.lineStarted();
+                r.inject.offer("are you there", false);
+                r.clock.now += EarsInject.STALE_MS + 1000;
+                r.session.playbackIdle();
+                runUntilHeard(r, 1, 4000);
+                check(n, r.client.heard.isEmpty() && r.diag.mention("inject dropped"), "heard=" + r.heard());
+            }
+        });
+        scenario("ears_inject_normalises_like_the_models_tokens", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                boolean ok = "YES GO FIND THE PRINTER".equals(EarsInject.normalize("yes, go find the printer!"))
+                        && "GO SEE IF ANYONE'S THERE".equals(EarsInject.normalize("  go see if anyone's  there? "))
+                        && "".equals(EarsInject.normalize(" ,.! ")) && "".equals(EarsInject.normalize(null))
+                        && EarsInject.normalize(new String(new char[1000]).replace('\0', 'a')).length() == EarsInject.MAX_CHARS;
+                boolean emptyRefused = !r.inject.offer(" ... ", false);
+                boolean bareWake = r.inject.offer("", true);
+                boolean armedWithSpaces = new EarsInject(r.clock, new FakeProps(" 1 "), r.diag).armed();
+                boolean offWithZero = !new EarsInject(r.clock, new FakeProps("0"), r.diag).armed();
+                r.open(false);
+                r.inject.offer("Hey Miko, hi", true);
+                runUntilHeard(r, 2, 6000);
+                String words = r.client.heard.size() < 2 ? "" : r.client.heard.get(1).text;
+                check(n, ok && emptyRefused && bareWake && armedWithSpaces && offWithZero && "HEY MIKO HI".equals(words),
+                        ok + " " + emptyRefused + " " + bareWake + " " + armedWithSpaces + " " + offWithZero + " " + words);
+            }
+        });
+        scenario("ears_inject_logs_no_words", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.inject.offer("the purple elephant", false);
+                runUntilHeard(r, 1, 8000);
+                boolean leaked = false;
+                synchronized (r.diag.lines) {
+                    for (String l : r.diag.lines) {
+                        leaked |= l.toUpperCase().contains("PURPLE") || l.toUpperCase().contains("ELEPHANT");
+                    }
+                }
+                check(n, !leaked && r.client.heard.size() == 1 && r.diag.mention("inject queued: an utterance, 3 word(s)"),
+                        "leaked=" + leaked + " lines=" + r.diag.lines);
             }
         });
         scenario("ears_preroll_tuning_parses_and_clamps", new Scenario() {
