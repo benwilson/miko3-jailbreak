@@ -142,8 +142,12 @@ class RequestShapeTest(unittest.TestCase):
 class SchemaTest(unittest.TestCase):
     def test_reply_schema_has_ktd9_fields_all_required_and_closed(self):
         s = bench.REPLY_SCHEMA
-        self.assertEqual(sorted(s["properties"]), sorted(
-            ["line", "question_asked", "name_given", "ends_conversation", "deflected", "notes_update", "feedback"]))
+        # Owner 2026-10-02: "addressed" comes first (before the line), the action and target after the name.
+        self.assertEqual(list(s["properties"]),
+                         ["addressed", "line", "question_asked", "name_given", "action", "target",
+                          "ends_conversation", "deflected", "notes_update", "feedback"])
+        self.assertEqual(s["properties"]["action"]["enum"],
+                         ["none", "go_away", "go_elsewhere", "find_person", "come_here", "be_quiet"])
         self.assertEqual(sorted(s["required"]), sorted(s["properties"]))
         self.assertIs(s["additionalProperties"], False)
         notes = s["properties"]["notes_update"]

@@ -139,6 +139,11 @@ final class ChatSession {
     static final String FORGET_FAILED = "That didn't work; I still remember you.";
     /** Owner 2026-10-02: a call's conversation, after an answer that ended without words: once, through the on-device voice. */
     static final String DIDNT_CATCH = "Sorry, I didn't catch that?";
+    /**
+     * Owner 2026-10-02: the polite end of a conversation nobody is having with him (turns not
+     * said to him, or no message said to him for chatNoReplyMs), through the on-device voice.
+     */
+    static final String LEAVE_THEM = "I'll leave you to it.";
     /** The whole utterance that confirms a forget (KTD9); anything else, a negation included, is a no. */
     static final String[] AFFIRMATIVES = {"yes", "yeah", "yep", "do it"};
     private static final String[] GOODBYES = {"bye", "goodbye", "see you", "see ya", "catch you later", "later miko",
@@ -277,6 +282,16 @@ final class ChatSession {
     /** This run of unanswered listens has had its "didn't catch that". */
     private boolean reasked;
 
+    // ---- turns not said to him, and instructions (owner 2026-10-02) ----
+    /** The run of unanswered listens before the message being answered: a reply not said to him adds to it. */
+    private int unansweredBefore;
+    /** When the message being answered was heard, and when the last one said to him was (or the opening). */
+    private long heardAt = ExploreBrain.NEVER;
+    private long lastAddressedAt;
+    /** An instruction he was given (the line said it), for the brain once the conversation is over. */
+    private CuriosityPort.Action action = CuriosityPort.Action.NONE;
+    private String actionTarget;
+
     // ---- the store ----
     private boolean keepPending;
     private long keepDeadline;
@@ -337,6 +352,16 @@ final class ChatSession {
         return repeats;
     }
 
+    /** Owner 2026-10-02: the instruction this conversation ended on, or NONE. */
+    CuriosityPort.Action action() {
+        return action;
+    }
+
+    /** Its target as Claude gave it (a short name or place), or null. Never traced. */
+    String actionTarget() {
+        return actionTarget;
+    }
+
     // ---- entry points from the brain ----
 
     /**
@@ -355,6 +380,7 @@ final class ChatSession {
      */
     void start(long now, CuriosityPort.MatchAnswer a, boolean faceless, boolean checkOpen, String settled) {
         open(a, faceless, checkOpen, settled);
+        lastAddressedAt = now;
         requestTurn(now, null);
     }
 
@@ -370,6 +396,7 @@ final class ChatSession {
         seeking = search;
         clipUntil = Math.max(clipUntil, quietUntil);
         open(a, true, false, null);
+        lastAddressedAt = now;
         if (search) {
             host.note("looking for the caller during the conversation");
         }
@@ -644,6 +671,13 @@ final class ChatSession {
 
     /** The robot's side of KTD9: the name, the sentence cap, the repeat check, the notes delta, then the line. */
     private void onLine(long now, CuriosityPort.Turn t) {
+        if (!t.addressed) {
+            notAddressed(now);
+            return;
+        }
+        if (heard != null && heardAt != ExploreBrain.NEVER) {
+            lastAddressedAt = Math.max(lastAddressedAt, heardAt);
+        }
         String given = validName(t.nameGiven);
         if (given == null) {
             given = heldGiven;
@@ -680,6 +714,16 @@ final class ChatSession {
             host.note("the line deflects a task");
         }
         turns++;
+        if (t.action != CuriosityPort.Action.NONE) {
+            // Owner 2026-10-02: an instruction he will try to follow. The line already said so:
+            // it ends the conversation with no sign-off, and the brain takes it from there.
+            action = t.action;
+            actionTarget = t.target;
+            host.note("an instruction (" + action.word() + "): the line, then the conversation ends");
+            speak(now, line, true);
+            endAfterLine = true;
+            return;
+        }
         if (lastNameNext) {
             // The held name matched someone stored whose face is weak for them (KTD6): the
             // last-name question replaces this line, as when the name comes with a face.
@@ -1354,6 +1398,9 @@ final class ChatSession {
     }
 
     private void onHeard(long now, String text) {
+        // A reply not said to him (owner 2026-10-02) puts the run back and adds to it.
+        unansweredBefore = unanswered;
+        heardAt = now;
         unanswered = 0;
         reasked = false;
         glanceIfNewcomer(now);
@@ -1406,6 +1453,50 @@ final class ChatSession {
         requestTurn(now, text);
     }
 
+    /**
+     * Owner 2026-10-02: Claude judged the message not said to him (people talking nearby):
+     * nothing is said, it counts as an unanswered listen, and the run's limit, or no message
+     * said to him for chatNoReplyMs, ends the conversation with a short "I'll leave you to it".
+     */
+    private void notAddressed(long now) {
+        unanswered = unansweredBefore + 1;
+        int max = called ? tuning.callChatUnansweredMax : 2;
+        if (unanswered >= max) {
+            host.note("not said to him: " + unanswered + " unanswered in a row: he leaves them to it");
+            leaveThem(now);
+            return;
+        }
+        if (noReplyTooLong(now)) {
+            return;
+        }
+        host.note("not said to him (" + unanswered + " of " + max + "): nothing said, listening again");
+        startListen(now);
+    }
+
+    /** No message said to him for chatNoReplyMs: true when that ended the conversation. */
+    private boolean noReplyTooLong(long now) {
+        if (tuning.chatNoReplyMs <= 0 || ending || now - lastAddressedAt < tuning.chatNoReplyMs) {
+            return false;
+        }
+        host.note("no message said to him for " + tuning.chatNoReplyMs / 1000 + " s or more: he leaves them to it");
+        leaveThem(now);
+        return true;
+    }
+
+    /** The polite end of a conversation nobody is having with him: the short line, then the notes. */
+    private void leaveThem(long now) {
+        confirmingForget = false;
+        if (askingLastName) {
+            askingLastName = false;
+            declineLastName(now);
+        }
+        port.cancelTurn();
+        ending = true;
+        endFaceRetries();
+        speak(now, LEAVE_THEM, false);
+        endAfterLine = true;
+    }
+
     private void onUnanswered(long now, boolean wordless) {
         if (called && wordless && !reasked && !endOnCharger && !confirmingForget && !askingLastName) {
             // Owner 2026-10-02: an answer that ended without words gets one re-ask, which does not count.
@@ -1430,6 +1521,9 @@ final class ChatSession {
             if (unanswered >= tuning.callChatUnansweredMax) {
                 host.note(unanswered + " unanswered listens in a row: the sign-off");
                 signOff(now);
+                return;
+            }
+            if (noReplyTooLong(now)) {
                 return;
             }
             host.note("unanswered listen " + unanswered + " of " + tuning.callChatUnansweredMax

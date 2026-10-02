@@ -86,7 +86,12 @@ final class ClaudeCuriosity implements CuriosityPort {
     private static final int FRAME_H = 480;
 
     private final Context app;
-    private final ClaudeApi api = new ClaudeApi(new ClaudeHttpsTransport());
+    /**
+     * Owner 2026-10-02: the stream's text as it arrives, per request thread, so the turn's
+     * "addressed" (a boolean ClaudeApi's early fields do not carry) is known when its line is.
+     */
+    private final StreamedText streamed = new StreamedText(new ClaudeHttpsTransport());
+    private final ClaudeApi api = new ClaudeApi(streamed);
     /**
      * Robot 2026-10-01: the key hit 429s, and each was retried 0.6 s later. One back-off
      * clock: a 429 or 529 pauses the look-type requests (curiosity, seek, doorway, way-out,
@@ -203,7 +208,8 @@ final class ClaudeCuriosity implements CuriosityPort {
      * Robot 2026-10-02: the reply fields a turn's line needs before it can be spoken (the
      * repeat check and the name both read them); the rest of the reply (the notes) follows.
      */
-    private static final List<String> EARLY_FIELDS = Arrays.asList("line", "question_asked", "name_given");
+    private static final List<String> EARLY_FIELDS = Arrays.asList("line", "question_asked", "name_given", "action",
+            "target");
     /** Robot 2026-10-02: the turns in flight, a speculative one among them (CuriosityPort.TurnFlight). */
     private final TurnFlight flight = new TurnFlight(new TurnFlight.Deliver() {
         @Override
@@ -764,12 +770,15 @@ final class ClaudeCuriosity implements CuriosityPort {
         ClaudeAccess settings = turnAccess();
         final long fetched = System.currentTimeMillis();
         final long[] earlyAt = {0};
+        streamed.reset();
         ClaudeApi.MessageResult r = claude.conversation(settings, body.system, body.messages, ExplorePrompts.REPLY_SCHEMA,
                 TURN_EFFORT, (int) timeoutMs, EARLY_FIELDS, new ClaudeApi.EarlyFields() {
                     @Override
                     public void complete(Map<String, String> fields) {
                         earlyAt[0] = System.currentTimeMillis();
-                        flight.early(call, earlyTurn(fields));
+                        // Owner 2026-10-02: "addressed" comes before the line; only a line known to be
+                        // said to him goes early (unknown, as from an unstreamed reply: the whole decides).
+                        flight.early(call, earlyTurn(fields, ClaudeReplies.addressedSoFar(streamed.text())));
                     }
                 });
         long ms = System.currentTimeMillis() - t0;
@@ -786,14 +795,84 @@ final class ClaudeCuriosity implements CuriosityPort {
                 + (api.schemaInPrompt() ? "schema in the prompt" : "json schema") + ", effort " + effort + ")");
     }
 
-    /** The early fields as a LINE turn with no notes yet (the name through NameExtractor, as turnOf does). */
-    private static Turn earlyTurn(Map<String, String> fields) {
+    /**
+     * The early fields as a LINE turn with no notes yet (the name through NameExtractor, as
+     * turnOf does), or null while it is not known to be said to him: a turn not addressed to
+     * him is never spoken, so it waits for the whole reply.
+     */
+    private static Turn earlyTurn(Map<String, String> fields, Boolean addressed) {
+        if (!Boolean.TRUE.equals(addressed)) {
+            return null;
+        }
         Map<String, Object> json = new LinkedHashMap<String, Object>(fields);
+        json.put("addressed", addressed);
         Turn t = ClaudeReplies.turn(json, null);
         if (t.status != Turn.Status.LINE || t.nameGiven == null) {
             return t;
         }
-        return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), false, false, null);
+        return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), false, false, null)
+                .withAction(t.action, t.target);
+    }
+
+    /**
+     * A transport that keeps the text of the reply streaming on this thread (owner 2026-10-02),
+     * read only by the turn's early check for "addressed"; nothing in it is logged.
+     */
+    private static final class StreamedText implements ClaudeApi.StreamingTransport {
+        private static final int MAX_CHARS = 4000;
+        private final ClaudeApi.StreamingTransport inner;
+        private final ThreadLocal<StringBuilder> text = new ThreadLocal<StringBuilder>() {
+            @Override
+            protected StringBuilder initialValue() {
+                return new StringBuilder();
+            }
+        };
+
+        StreamedText(ClaudeApi.StreamingTransport inner) {
+            this.inner = inner;
+        }
+
+        /** A new request on this thread starts with no text. */
+        void reset() {
+            text.get().setLength(0);
+        }
+
+        String text() {
+            return text.get().toString();
+        }
+
+        @Override
+        public ClaudeApi.Response send(ClaudeApi.Request request) throws IOException {
+            return inner.send(request);
+        }
+
+        @Override
+        public ClaudeApi.Response stream(ClaudeApi.Request request, final ClaudeApi.LineSink sink) throws IOException {
+            final StringBuilder b = text.get();
+            b.setLength(0);
+            return inner.stream(request, new ClaudeApi.LineSink() {
+                @Override
+                public void line(String l) {
+                    // Before the sink: its early fields are told from inside sink.line().
+                    if (l != null && l.startsWith("data:") && b.length() < MAX_CHARS) {
+                        Object ev;
+                        try {
+                            ev = Json.parse(l.substring(5).trim());
+                        } catch (RuntimeException e) {
+                            ev = null;
+                        }
+                        if (ev instanceof Map && "content_block_delta".equals(((Map<?, ?>) ev).get("type"))) {
+                            Object d = ((Map<?, ?>) ev).get("delta");
+                            Object t = d instanceof Map ? ((Map<?, ?>) d).get("text") : null;
+                            if (t instanceof String) {
+                                b.append((String) t);
+                            }
+                        }
+                    }
+                    sink.line(l);
+                }
+            });
+        }
     }
 
     /** The client's reason as the brain's turn status; a name given passes NameExtractor's word list first. */
@@ -805,7 +884,8 @@ final class ClaudeCuriosity implements CuriosityPort {
                 return t;
             }
             return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), t.endsConversation,
-                    t.deflected, t.notesUpdate).withFeedback(t.feedback);
+                    t.deflected, t.notesUpdate).withFeedback(t.feedback).withAddressed(t.addressed)
+                    .withAction(t.action, t.target);
         }
         switch (r.reason) {
             case REFUSED:

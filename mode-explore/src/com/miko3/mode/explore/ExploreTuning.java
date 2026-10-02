@@ -431,6 +431,15 @@ final class ExploreTuning {
      * first move is still the straight back-out.
      */
     final int recoverMaxPerSpell;
+    /**
+     * Robot 2026-10-02 11:57-12:00: three recoveries a minute apart, with driving between,
+     * never reset the spell's count; the fourth stall went to the escape ladder inside the
+     * cutout and he jammed falsely. The stuck spell ends (its recovery count back to 0) when a
+     * forward leg drives recoverSpellResetCounts cleanly (mean of the wheels), or after
+     * recoverSpellResetMs with no stall and no zero-movement attempt.
+     */
+    final long recoverSpellResetMs;
+    final long recoverSpellResetCounts;
     final float callPersonMinHeight;
     /**
      * The call search's own person-score floor, used instead of confidenceFloor only
@@ -484,6 +493,12 @@ final class ExploreTuning {
     final boolean callChatFirst;
     final long callUtteranceWaitMs;
     final int callChatUnansweredMax;
+    /**
+     * Owner 2026-10-02: a conversation with no message said to him (Claude's "addressed")
+     * for this long ends politely, however the unanswered count stands: office chatter
+     * nearby kept a call's conversation going for 20+ turns.
+     */
+    final long chatNoReplyMs;
     final long chatStallGraceMs;
     final long turnBudgetMs;
     final long turnRetryMs;
@@ -1007,6 +1022,8 @@ final class ExploreTuning {
         jamProbeAtMs = positiveSorted(b.jamProbeAtMs);
         stallRecoverWindowMs = Math.max(0, b.stallRecoverWindowMs);
         recoverMaxPerSpell = Math.max(1, b.recoverMaxPerSpell);
+        recoverSpellResetMs = Math.max(0, b.recoverSpellResetMs);
+        recoverSpellResetCounts = Math.max(0, b.recoverSpellResetCounts);
         callPersonMinHeight = Math.max(0f, b.callPersonMinHeight);
         callPersonMinScore = Math.max(0f, b.callPersonMinScore);
         callNearHeight = Math.max(0f, b.callNearHeight);
@@ -1022,6 +1039,7 @@ final class ExploreTuning {
         callChatFirst = b.callChatFirst;
         callUtteranceWaitMs = Math.max(0, b.callUtteranceWaitMs);
         callChatUnansweredMax = Math.max(1, b.callChatUnansweredMax);
+        chatNoReplyMs = Math.max(0, b.chatNoReplyMs);
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
         turnRetryMs = Math.max(0, b.turnRetryMs);
@@ -1411,6 +1429,8 @@ final class ExploreTuning {
         // Just past the longest cutout seen (29 s).
         private long stallRecoverWindowMs = 30000;
         private int recoverMaxPerSpell = 3;
+        private long recoverSpellResetMs = 45000;
+        private long recoverSpellResetCounts = 300;
         private float callPersonMinHeight = 0.12f;
         // Robot QA 2026-09-30: a floor-level caller scored person 0.27 and 0.32.
         private float callPersonMinScore = 0.25f;
@@ -1433,6 +1453,7 @@ final class ExploreTuning {
         private boolean callChatFirst = true;
         private long callUtteranceWaitMs = 2500;
         private int callChatUnansweredMax = 3;
+        private long chatNoReplyMs = 45000;
         private long chatStallGraceMs = 5000;
         private long turnBudgetMs = 5000;
         private long turnRetryMs = 3000;
@@ -1803,6 +1824,12 @@ final class ExploreTuning {
         }
         Builder stallRecoverWindowMs(long v) { stallRecoverWindowMs = v; return this; }
         Builder recoverMaxPerSpell(int v) { recoverMaxPerSpell = v; return this; }
+        Builder chatNoReplyMs(long v) { chatNoReplyMs = v; return this; }
+        Builder recoverSpellReset(long ms, long counts) {
+            recoverSpellResetMs = ms;
+            recoverSpellResetCounts = counts;
+            return this;
+        }
         Builder stallRecoverProbeBackTicks(int v) { stallRecoverProbeBackTicks = v; return this; }
         Builder blockedTurnWaitMs(long v) { blockedTurnWaitMs = v; return this; }
         /** The jammed rest's probe times, in ms after he was found jammed; then every jammedRestMs. */

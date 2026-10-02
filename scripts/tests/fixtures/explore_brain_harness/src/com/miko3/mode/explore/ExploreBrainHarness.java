@@ -308,11 +308,11 @@ public final class ExploreBrainHarness {
     }
 
     /** Something to do to the brain at a scheduled moment (lease changes, shutdown). */
-    static final class Action {
+    static final class TimedAction {
         final long at;
         final Runnable run;
 
-        Action(long at, Runnable run) {
+        TimedAction(long at, Runnable run) {
             this.at = at;
             this.run = run;
         }
@@ -620,7 +620,7 @@ public final class ExploreBrainHarness {
     static final class Rig implements ExploreBrain.Clock, ExploreBrain.Motor, ExploreBrain.Eyes, ExploreBrain.Sound,
             ExploreBrain.Camera, CuriosityPort, Ears, ExploreBrain.Gauges {
         final List<Event> log = new ArrayList<Event>();
-        final List<Action> actions = new ArrayList<Action>();
+        final List<TimedAction> actions = new ArrayList<TimedAction>();
         final List<String> violations = new ArrayList<String>();
         final ExploreTuning tuning;
         final ExploreBrain brain;
@@ -935,7 +935,7 @@ public final class ExploreBrainHarness {
         }
 
         Rig at(long t, Runnable r) {
-            actions.add(new Action(t, r));
+            actions.add(new TimedAction(t, r));
             return this;
         }
 
@@ -948,7 +948,7 @@ public final class ExploreBrainHarness {
                 if (simWheels) {
                     advanceWheels();
                 }
-                for (Action a : actions) {
+                for (TimedAction a : actions) {
                     if (a.at == now) {
                         a.run.run();
                     }
@@ -3727,6 +3727,17 @@ public final class ExploreBrainHarness {
     }
 
     private static void scenario(String name, Scenario s) {
+        // -Donly=a,b runs just the scenarios whose names contain one of these (a quick local loop).
+        String only = System.getProperty("only");
+        if (only != null && !only.isEmpty()) {
+            boolean want = false;
+            for (String o : only.split(",")) {
+                want |= name.contains(o);
+            }
+            if (!want) {
+                return;
+            }
+        }
         try {
             s.run(name);
         } catch (Throwable t) {
@@ -8174,6 +8185,60 @@ public final class ExploreBrainHarness {
                             && entered(rig, ExploreBrain.State.RETRACE, 0) < 0 && rig.violations.isEmpty(),
                     "stall@" + stall + " p2@" + p2 + " p5@" + p5 + " p10@" + p10 + " p20@" + p20 + " wriggle@" + wriggle
                             + " backs=" + backs + " turns=" + turns.size() + " notes=" + lastNotes(notes, 20));
+        });
+        scenario("recover_spell_resets_after_clean_driving_so_a_fourth_stall_two_minutes_on_still_waits", n -> {
+            // Robot 2026-10-02 11:57-12:00: three recoveries over two minutes, each followed by
+            // clean driving, never reset the stuck spell's count (recoverMaxPerSpell = 3); the
+            // fourth stall went straight to the escape ladder inside the cutout and he jammed
+            // falsely. Clean driving (a forward leg of recoverSpellResetCounts) or
+            // recoverSpellResetMs with no stall or zero move ends the spell: the fourth still waits.
+            Rig[] h = new Rig[1];
+            List<String> notes = new ArrayList<String>();
+            long[] nextStallAt = {2000};
+            long[] pinnedAt = {-1};
+            int[] stalls = {0};
+            Rig rig = escRig(escTuning().hopTicks(60).wedge(99, 99, 99), h, t -> {
+                Rig r = h[0];
+                if (r == null) {
+                    return clear(t);
+                }
+                if (pinnedAt[0] >= 0) {
+                    if (t >= pinnedAt[0] + 6000) {
+                        pin(r, false);
+                        pinnedAt[0] = -1;
+                        nextStallAt[0] = t + 30000;
+                    }
+                    return clear(t);
+                }
+                if (r.blockedFrom != Long.MAX_VALUE && r.brain.state() == ExploreBrain.State.STARTLE) {
+                    pin(r, true);
+                    pinnedAt[0] = t;
+                    stalls[0]++;
+                    return clear(t);
+                }
+                if (r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 700
+                        && t >= nextStallAt[0] && r.blockedFrom == Long.MAX_VALUE && stalls[0] < 4) {
+                    r.blockedFrom = t;
+                } else if (r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 3500
+                        && r.blockedFrom == Long.MAX_VALUE) {
+                    // Between stalls he drives cleanly, each leg ending at something ahead.
+                    return obstacle(t);
+                }
+                return clear(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 200000, r -> stalls[0] >= 4 && notedTimes(notes, "stall: waiting for the motor board").size() >= 4);
+            rig.runUntil(rig.now + 3000);
+            List<Long> waits = notedTimes(notes, "stall: waiting for the motor board to recover");
+            check(n, stalls[0] == 4 && waits.size() == 4 && waits.get(3) - waits.get(0) >= 100000
+                            && notesWith(notes, "fully jammed") == 0 && notesWith(notes, "wriggle") == 0
+                            && notesWith(notes, "(recovery 4") == 0 && notesWith(notes, "stuck spell over") >= 1
+                            && helpLines(rig, 0).isEmpty() && rig.violations.isEmpty(),
+                    "stalls=" + stalls[0] + " waits=" + waits + " recoveries=" + notesWith(notes, "(recovery ")
+                            + " r3=" + notesWith(notes, "(recovery 3 of 3)") + " jammed=" + notesWith(notes, "fully jammed")
+                            + " freed=" + notesWith(notes, "free after") + " notes=" + lastNotes(notes, 30));
         });
     }
 
@@ -13820,6 +13885,7 @@ public final class ExploreBrainHarness {
         usableFaceScenarios();
         facelessCallScenarios();
         callChatFirstScenarios();
+        instructionScenarios();
     }
 
     // ---- a roaming person is met only with a usable face (owner 2026-10-01) ----
@@ -13918,6 +13984,293 @@ public final class ExploreBrainHarness {
     // with the wake word are the first message), he looks for the caller between utterances, and
     // not seeing them never ends it: three unanswered listens do, and a wordless answer first
     // gets "Sorry, I didn't catch that?".
+
+    // ---- following instructions, and turns not said to him (owner 2026-10-02) ----
+    //
+    // "When someone gives him an instruction, he tries to follow it ... if they tell him to go
+    // away, or go to a different room, or go find a different person, he should try to do that.
+    // This however shouldn't take priority over being interrupted by someone else going 'Hey
+    // Miko'." The turn's action (go_away, go_elsewhere, find_person, come_here, be_quiet) ends
+    // the conversation after its line (no sign-off) and sets an intent his roaming carries out.
+    // And a call's conversation ran 20+ turns on office chatter nearby: the turn's "addressed"
+    // says whether the message was said to him; one that was not speaks nothing and counts as
+    // an unanswered listen, and 45 s with no message said to him ends the conversation.
+
+    private static CuriosityPort.Turn actionLine(int nth, CuriosityPort.Action a, String target) {
+        return turnLine(nth).withAction(a, target);
+    }
+
+    /** Claude's reply to a message not said to him: no line. */
+    private static CuriosityPort.Turn notAddressed() {
+        return CuriosityPort.Turn.line("", null, null, false, false, null).withAddressed(false);
+    }
+
+    private static int intentNotes(List<String> notes) {
+        return notesWith(notes, "intent: ");
+    }
+
+    private static void instructionScenarios() {
+        scenario("replies_turn_reads_addressed_action_and_target", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("addressed", Boolean.FALSE);
+            json.put("line", "");
+            json.put("action", "go_away");
+            json.put("target", "");
+            CuriosityPort.Turn chatter = ClaudeReplies.turn(json, null);
+            json.put("addressed", Boolean.TRUE);
+            json.put("line", "Okay, I'll give you some space.");
+            json.put("target", "  ");
+            CuriosityPort.Turn away = ClaudeReplies.turn(json, null);
+            json.put("action", "find_person");
+            json.put("target", "Priya");
+            CuriosityPort.Turn find = ClaudeReplies.turn(json, null);
+            json.put("action", "fetch_coffee");
+            CuriosityPort.Turn unknown = ClaudeReplies.turn(json, null);
+            json.remove("addressed");
+            json.remove("action");
+            json.remove("target");
+            CuriosityPort.Turn old = ClaudeReplies.turn(json, null);
+            json.put("addressed", Boolean.TRUE);
+            json.put("line", "");
+            CuriosityPort.Turn empty = ClaudeReplies.turn(json, null);
+            check(n, chatter.status == CuriosityPort.Turn.Status.LINE && !chatter.addressed && "".equals(chatter.line)
+                            && chatter.action == CuriosityPort.Action.NONE
+                            && away.addressed && away.action == CuriosityPort.Action.GO_AWAY && away.target == null
+                            && find.action == CuriosityPort.Action.FIND_PERSON && "Priya".equals(find.target)
+                            && unknown.action == CuriosityPort.Action.NONE && old.addressed
+                            && old.action == CuriosityPort.Action.NONE && empty.status == CuriosityPort.Turn.Status.FAILED,
+                    "chatter=" + chatter.status + "/" + chatter.addressed + "/" + chatter.action + " away=" + away.action
+                            + "/" + away.target + " find=" + find.action + " unknown=" + unknown.action + " empty="
+                            + empty.status);
+        });
+        scenario("replies_addressed_so_far_reads_the_streamed_prefix", n -> {
+            Boolean no = ClaudeReplies.addressedSoFar("```json\n{\"addressed\": false, \"li");
+            Boolean yes = ClaudeReplies.addressedSoFar("{\"addressed\":true,\"line\":\"Hi");
+            Boolean open = ClaudeReplies.addressedSoFar("{\"addre");
+            Boolean half = ClaudeReplies.addressedSoFar("{\"addressed\": fal");
+            Boolean none = ClaudeReplies.addressedSoFar("{\"line\":\"Hi.\"");
+            Boolean nul = ClaudeReplies.addressedSoFar(null);
+            check(n, Boolean.FALSE.equals(no) && Boolean.TRUE.equals(yes) && open == null && half == null
+                            && none == null && nul == null,
+                    no + " " + yes + " " + open + " " + half + " " + none + " " + nul);
+        });
+        scenario("intent_go_away_ends_after_the_line_turns_away_and_leaves_them_alone_10_min", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("could you go away please"));
+            rig.turns = turnsOf(turnLine(1), actionLine(2, CuriosityPort.Action.GO_AWAY, ""));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            rig.runUntil(over + 8000);
+            Rig stranger = sarahRig(false);
+            List<String> sNotes = traced(stranger);
+            stranger.people.listen = ListenScript.turns(hearWords("go away"));
+            stranger.turns = turnsOf(turnLine(1), actionLine(2, CuriosityPort.Action.GO_AWAY, ""));
+            long open2 = openChat(stranger);
+            long over2 = chatOver(stranger, open2);
+            check(n, open > 0 && over > 0 && rig.count("say Line 2.") == 1 && rig.count("react sign-off") == 0
+                            && rig.turnAsks.size() == 2 && noted(notes, "intent: go_away (no target)")
+                            && noted(notes, "first leg after the conversation: turning RIGHT")
+                            && noted(notes, "left alone for 600 s") && noted(notes, "their way avoided for 10 min")
+                            && noted(notes, "intent: done (turned away)") && rig.violations.isEmpty()
+                            && over2 > 0 && noted(sNotes, "their side (LEFT) left alone for 600 s")
+                            && stranger.violations.isEmpty(),
+                    "over@" + over + " notes=" + notesAfter(notes, open) + " stranger=" + notesAfter(sNotes, open2));
+        });
+        scenario("intent_go_elsewhere_seeks_at_once_and_avoids_this_spot_15_min", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("go to another room"));
+            rig.turns = turnsOf(turnLine(1), actionLine(2, CuriosityPort.Action.GO_ELSEWHERE, "the kitchen"));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            rig.runUntil(over + 30000);
+            long seek = notedAt(notes, "start trigger=intent", over);
+            check(n, over > 0 && rig.count("react sign-off") == 0 && noted(notes, "intent: go_elsewhere (target given)")
+                            && noted(notes, "this spot avoided for 15 min") && seek > over && seek - over < 20000
+                            && rig.violations.isEmpty(),
+                    "over@" + over + " seek@" + seek + " notes=" + notesAfter(notes, open));
+        });
+        scenario("intent_find_person_named_meets_only_that_face", n -> {
+            Rig ben = roamRig(t -> t > 3000, true);
+            ben.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Ben", "Hi {name}!", "Hello!")
+                    .withConversation(r.people.persona, "p-ben", null, null);
+            List<String> bNotes = traced(ben);
+            ben.started();
+            ben.brain.startIntent(CuriosityPort.Action.FIND_PERSON, "Priya", null);
+            long match = runUntilEvent(ben, "match", 0, 30000);
+            ben.runUntil(match + 5000);
+            Rig priya = roamRig(t -> t > 3000, true);
+            priya.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Priya Shah", "Hi {name}!", "Hello!")
+                    .withConversation(r.people.persona, "p-priya", null, null);
+            List<String> pNotes = traced(priya);
+            priya.started();
+            priya.brain.startIntent(CuriosityPort.Action.FIND_PERSON, "Priya", null);
+            long match2 = runUntilEvent(priya, "match", 0, 30000);
+            long chat = runUntilState(priya, ExploreBrain.State.CHAT_THINK, match2, match2 + 10000);
+            check(n, match > 0 && entered(ben, ExploreBrain.State.CHAT_THINK, 0) < 0
+                            && noted(bNotes, "intent: find_person: not the one asked for") && !noted(bNotes, "intent: done")
+                            && ben.violations.isEmpty()
+                            && match2 > 0 && chat > 0 && noted(pNotes, "intent: done (found the one asked for)")
+                            && priya.violations.isEmpty(),
+                    "ben match@" + match + " notes=" + bNotes + " priya chat@" + chat + " notes=" + pNotes);
+        });
+        scenario("intent_find_person_unnamed_takes_anyone_new_and_nobody_drops_it_after_5_min", n -> {
+            Rig anyone = roamRig(t -> t > 3000, true);
+            List<String> aNotes = traced(anyone);
+            anyone.started();
+            anyone.brain.startIntent(CuriosityPort.Action.FIND_PERSON, "", null);
+            long match = runUntilEvent(anyone, "match", 0, 30000);
+            long chat = runUntilState(anyone, ExploreBrain.State.CHAT_THINK, match, match + 10000);
+            Rig nobody = roamRig(t -> false, true);
+            List<String> nNotes = traced(nobody);
+            nobody.started();
+            nobody.brain.startIntent(CuriosityPort.Action.FIND_PERSON, "", null);
+            nobody.runUntil(320000);
+            long dropped = notedAt(nNotes, "intent: dropped (timed out)");
+            check(n, chat > 0 && noted(aNotes, "intent: find_person (no target)")
+                            && noted(aNotes, "intent: done (found someone)") && anyone.violations.isEmpty()
+                            && dropped >= 300000 && dropped < 302000 && nobody.count("react sign-off") == 0
+                            && nobody.violations.isEmpty(),
+                    "chat@" + chat + " dropped@" + dropped + " notes=" + aNotes);
+        });
+        scenario("intent_come_here_searches_toward_their_side_and_approaches_with_no_answer_clip", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("come over here"));
+            rig.turns = turnsOf(turnLine(1), actionLine(2, CuriosityPort.Action.COME_HERE, ""));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long search = runUntilState(rig, ExploreBrain.State.CUE_LOOK, over, over + 15000);
+            long again = runUntilState(rig, ExploreBrain.State.CHAT_THINK, over, over + 40000);
+            check(n, over > 0 && rig.count("react sign-off") == 0 && noted(notes, "intent: come_here (no target)")
+                            && search > 0 && rig.countPrefix("react answer", over, Long.MAX_VALUE) == 0 && again > search
+                            && rig.violations.isEmpty(),
+                    "over@" + over + " search@" + search + " again@" + again + " notes=" + notesAfter(notes, open));
+        });
+        scenario("intent_be_quiet_is_do_not_disturb_for_10_min_then_expires", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("please be quiet for a while"));
+            rig.turns = turnsOf(turnLine(1), actionLine(2, CuriosityPort.Action.BE_QUIET, ""));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            rig.cue(over + 60000, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, Float.NaN);
+            rig.runUntil(over + 595000);
+            boolean quiet = entered(rig, ExploreBrain.State.SCAN, over) < 0
+                    && entered(rig, ExploreBrain.State.CHAT_THINK, over) < 0
+                    && rig.countPrefix("say ", over, Long.MAX_VALUE) == 0 && rig.countPrefix("hop", over, Long.MAX_VALUE) > 0;
+            rig.runUntil(over + 605000);
+            long done = notedAt(notes, "intent: done (be_quiet: 10 min over)");
+            // Talking again: the next call is answered, not glanced at.
+            rig.cue(over + 606000, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, Float.NaN);
+            rig.runUntil(over + 615000);
+            long answered = notedAt(notes, "answering the call", over + 606000);
+            check(n, over > 0 && quiet && noted(notes, "intent: be_quiet (no target)")
+                            && noted(notes, "quiet: a call gets a glance") && done >= over + 600000
+                            && done < over + 601000 && answered >= over + 606000 && rig.violations.isEmpty(),
+                    "over@" + over + " quiet=" + quiet + " done@" + done + " answered@" + answered + " notes="
+                            + lastNotes(notes, 20));
+        });
+        scenario("intent_a_call_interrupts_it_and_the_intent_is_dropped", n -> {
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("go find another room"));
+            rig.turns = turnsOf(turnLine(1), actionLine(2, CuriosityPort.Action.GO_ELSEWHERE, ""));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            rig.cue(over + 3000, Ears.Kind.WAKE_WORD, Ears.Side.RIGHT, Float.NaN);
+            rig.runUntil(over + 20000);
+            long dropped = notedAt(notes, "intent: dropped (a call)");
+            long answered = notedAt(notes, "answering the call", over);
+            check(n, over > 0 && dropped >= over + 3000 && dropped < over + 3300 && answered >= dropped
+                            && notedAt(notes, "start trigger=intent", dropped) < 0 && rig.violations.isEmpty(),
+                    "over@" + over + " dropped@" + dropped + " answered@" + answered + " notes=" + notesAfter(notes, over));
+        });
+        scenario("intent_an_unable_request_is_action_none_with_an_honest_line_and_the_talk_goes_on", n -> {
+            java.util.Map<String, Object> json = new java.util.LinkedHashMap<String, Object>();
+            json.put("addressed", Boolean.TRUE);
+            json.put("line", "I can't carry coffee, sorry, no hands!");
+            json.put("action", "none");
+            json.put("target", "");
+            CuriosityPort.Turn honest = ClaudeReplies.turn(json, null);
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("get me a coffee"), hearWords("fair enough"), hearWords("bye"));
+            rig.turns = turnsOf(turnLine(1), honest, turnLine(3));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, honest.action == CuriosityPort.Action.NONE && over > 0 && rig.turnAsks.size() == 3
+                            && rig.count("say I can't carry coffee, sorry, no hands!") == 1 && intentNotes(notes) == 0
+                            && noted(notes, "they said goodbye") && rig.violations.isEmpty(),
+                    "asks=" + rig.turnAsks.size() + " notes=" + notesAfter(notes, open));
+        });
+        scenario("chat_three_turns_not_said_to_him_end_the_conversation", n -> {
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("so the quarterly numbers"), hearWords("yeah totally"),
+                    hearWords("did you get lunch"), hearWords("one more"));
+            rig.turns = turnsOf(turnLine(1), notAddressed(), notAddressed(), notAddressed());
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.LEFT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            check(n, over > 0 && rig.turnAsks.size() == 4 && notesWith(notes, "not said to him") == 3
+                            && rig.count("say " + ChatSession.LEAVE_THEM) == 1 && rig.countPrefix("say ", open, over) == 2
+                            && rig.count("react sign-off") == 0 && rig.violations.isEmpty(),
+                    "asks=" + rig.turnAsks.size() + " notes=" + notesAfter(notes, open) + " " + rig.tail());
+        });
+        scenario("chat_a_turn_said_to_him_resets_the_count_and_the_talk_goes_on", n -> {
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("so the quarterly numbers"), hearWords("miko what do you think"),
+                    hearWords("yeah totally"), hearWords("did you get lunch"), hearWords("miko are you there"),
+                    hearWords("bye"));
+            rig.turns = turnsOf(turnLine(1), notAddressed(), turnLine(3), notAddressed(), notAddressed(), turnLine(6));
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.LEFT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            check(n, over > 0 && rig.turnAsks.size() == 6 && notesWith(notes, "not said to him") == 3
+                            && rig.count("say " + ChatSession.LEAVE_THEM) == 0 && noted(notes, "they said goodbye")
+                            && rig.violations.isEmpty(),
+                    "asks=" + rig.turnAsks.size() + " notes=" + notesAfter(notes, open));
+        });
+        scenario("chat_no_reply_said_to_him_for_45_s_ends_it_politely", n -> {
+            // The cap shortened to 9 s so two slow not-addressed turns (under the three) reach it.
+            Rig rig = callChatRig(chatFirstTuning().chatNoReplyMs(9000), CLEAR, EMPTY_ROOM,
+                    hearWords("so the quarterly numbers").after(3500), hearWords("yeah totally").after(3500),
+                    hearWords("did you get lunch").after(3500));
+            rig.turns = turnsOf(turnLine(1), notAddressed(), notAddressed(), notAddressed());
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.LEFT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            ExploreTuning plain = new ExploreTuning.Builder().build();
+            check(n, plain.chatNoReplyMs == 45000 && over > 0 && notesWith(notes, "not said to him (") >= 1
+                            && notesWith(notes, "unanswered in a row") == 0
+                            && noted(notes, "no message said to him for 9 s") && rig.count("say " + ChatSession.LEAVE_THEM) == 1
+                            && rig.violations.isEmpty(),
+                    "asks=" + rig.turnAsks.size() + " over@" + over + " " + rig.tail() + " notes=" + notesAfter(notes, open));
+        });
+        scenario("chat_a_turn_not_said_to_him_speaks_nothing", n -> {
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("did you see the game"), hearWords("bye"));
+            rig.turns = turnsOf(turnLine(1), notAddressed());
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.LEFT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            long second = rig.turnAsks.size() >= 2 ? rig.turnAsks.get(1).t : -1;
+            check(n, over > 0 && second > 0 && rig.countPrefix("say ", second, over) == 0
+                            && noted(notes, "not said to him (1 of 3): nothing said") && noted(notes, "they said goodbye")
+                            && rig.violations.isEmpty(),
+                    "second@" + second + " notes=" + notesAfter(notes, open) + " " + rig.tail());
+        });
+    }
 
     private static ExploreTuning.Builder chatFirstTuning() {
         return cueTuning().callChatFirst(true);

@@ -1467,6 +1467,32 @@ interface CuriosityPort extends AnswerParser.Names {
         }
     }
 
+    /**
+     * Owner 2026-10-02: an instruction the person explicitly gave him in a turn, which he
+     * tries to follow ("go away", "go to another room", "go find someone", "come here",
+     * "be quiet"). Anything else he can't do is NONE, and his line says so.
+     */
+    enum Action {
+        NONE, GO_AWAY, GO_ELSEWHERE, FIND_PERSON, COME_HERE, BE_QUIET;
+
+        /** The schema's word ("go_away"), or NONE for anything else. */
+        static Action of(Object v) {
+            if (!(v instanceof String)) {
+                return NONE;
+            }
+            try {
+                return valueOf(((String) v).trim().toUpperCase(java.util.Locale.US));
+            } catch (IllegalArgumentException e) {
+                return NONE;
+            }
+        }
+
+        /** The schema's word, for the trace. */
+        String word() {
+            return name().toLowerCase(java.util.Locale.US);
+        }
+    }
+
     final class Turn {
         enum Status { LINE, REFUSED, UNREACHABLE, FAILED }
 
@@ -1479,14 +1505,24 @@ interface CuriosityPort extends AnswerParser.Names {
         final String notesUpdate;
         /** Owner 2026-10-02: feedback the person gave about the robot himself, or null. */
         final Feedback feedback;
+        /**
+         * Owner 2026-10-02: the message was said to him (Claude's judgement), not people talking
+         * to each other nearby; a turn that was not has no line to speak and counts as unanswered.
+         */
+        final boolean addressed;
+        /** Owner 2026-10-02: an instruction he was given, and its short target (a name or place), or null. */
+        final Action action;
+        final String target;
 
         private Turn(Status status, String line, String questionAsked, String nameGiven, boolean endsConversation,
                      boolean deflected, String notesUpdate) {
-            this(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, null);
+            this(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, null, true,
+                    Action.NONE, null);
         }
 
         private Turn(Status status, String line, String questionAsked, String nameGiven, boolean endsConversation,
-                     boolean deflected, String notesUpdate, Feedback feedback) {
+                     boolean deflected, String notesUpdate, Feedback feedback, boolean addressed, Action action,
+                     String target) {
             this.status = status;
             this.line = line;
             this.questionAsked = questionAsked;
@@ -1495,11 +1531,28 @@ interface CuriosityPort extends AnswerParser.Names {
             this.deflected = deflected;
             this.notesUpdate = notesUpdate;
             this.feedback = feedback;
+            this.addressed = addressed;
+            this.action = action == null ? Action.NONE : action;
+            this.target = target;
         }
 
         /** This turn carrying feedback (null: none). */
         Turn withFeedback(Feedback f) {
-            return new Turn(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, f);
+            return new Turn(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, f,
+                    addressed, action, target);
+        }
+
+        /** This turn, said to him or not. */
+        Turn withAddressed(boolean a) {
+            return new Turn(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, feedback,
+                    a, action, target);
+        }
+
+        /** This turn carrying an instruction and its target (null or blank: none). */
+        Turn withAction(Action a, String t) {
+            String tt = t == null || t.trim().isEmpty() ? null : t.trim();
+            return new Turn(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, feedback,
+                    addressed, a, tt);
         }
 
         static Turn line(String line, String questionAsked, String nameGiven, boolean endsConversation,

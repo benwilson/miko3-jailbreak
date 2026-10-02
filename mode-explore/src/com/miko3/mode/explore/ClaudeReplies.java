@@ -209,16 +209,54 @@ final class ClaudeReplies {
      * is a failure. The brain caps the sentences and validates the name.
      */
     static CuriosityPort.Turn turn(Map<String, Object> json, String notesUpdateJson) {
+        // Owner 2026-10-02: a message not said to him (people talking nearby) has no line to
+        // say and no action; "addressed" missing (an older reply) reads as said to him.
+        boolean addressed = !Boolean.FALSE.equals(json.get("addressed"));
         String line = text(json.get("line"));
-        if (line == null) {
+        if (line == null && addressed) {
             return CuriosityPort.Turn.failed();
         }
         String notes = notesUpdateJson == null || notesUpdateJson.trim().isEmpty() || "{}".equals(notesUpdateJson.trim())
                 ? null : notesUpdateJson;
-        return CuriosityPort.Turn.line(line, text(json.get("question_asked")), text(json.get("name_given")),
-                Boolean.TRUE.equals(json.get("ends_conversation")), Boolean.TRUE.equals(json.get("deflected")), notes)
+        CuriosityPort.Turn t = CuriosityPort.Turn.line(line == null ? "" : line, text(json.get("question_asked")),
+                text(json.get("name_given")), Boolean.TRUE.equals(json.get("ends_conversation")),
+                Boolean.TRUE.equals(json.get("deflected")), notes)
                 .withFeedback(feedback(json.get("feedback")));
+        if (!addressed) {
+            return t.withAddressed(false);
+        }
+        String target = text(json.get("target"));
+        if (target != null && target.length() > MAX_TARGET) {
+            target = target.substring(0, MAX_TARGET).trim();
+        }
+        return t.withAction(CuriosityPort.Action.of(json.get("action")), target);
     }
+
+    /** The longest action target kept: a short name or place. */
+    static final int MAX_TARGET = 60;
+
+    /**
+     * Owner 2026-10-02: the reply's "addressed", read off the start of a streamed reply
+     * (its first field, before the line): TRUE or FALSE once its value is complete, null
+     * while it is not (or the text has no such field before the line).
+     */
+    static Boolean addressedSoFar(String partial) {
+        if (partial == null) {
+            return null;
+        }
+        int open = partial.indexOf('{');
+        if (open < 0) {
+            return null;
+        }
+        java.util.regex.Matcher m = ADDRESSED.matcher(partial);
+        if (!m.find(open)) {
+            return null;
+        }
+        return Boolean.valueOf(m.group(1).equals("true"));
+    }
+
+    private static final java.util.regex.Pattern ADDRESSED =
+            java.util.regex.Pattern.compile("\\G\\{\\s*\"addressed\"\\s*:\\s*(true|false)\\b");
 
     /**
      * Owner 2026-10-02: the turn's "feedback" field, an object with string kind, summary

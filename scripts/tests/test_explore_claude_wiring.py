@@ -710,7 +710,10 @@ class FasterTurnWiringTest(unittest.TestCase):
         self.assertIn("TURN_EFFORT, (int) timeoutMs, EARLY_FIELDS,", turn)
         self.assertIn("flight.early(call, ", turn)
         self.assertIn("flight.whole(call, ", turn)
-        self.assertRegex(self.a, r'EARLY_FIELDS\s*=\s*Arrays\.asList\("line", "question_asked", "name_given"\)')
+        # Owner 2026-10-02: the action and its target follow the name, before the notes, so they
+        # come with the early line; "addressed" (a boolean, before the line) is read off the stream.
+        self.assertRegex(self.a, r'EARLY_FIELDS\s*=\s*Arrays\.asList\("line", "question_asked", "name_given", "action",'
+                                 r'\s*"target"\)')
         early = self.method("private static Turn earlyTurn(")
         self.assertIn("ClaudeReplies.turn(", early)
         self.assertIn("NameExtractor.validName(", early)
@@ -1208,10 +1211,6 @@ class SlimUploadWiringTest(unittest.TestCase):
             self.assertNotIn("JpegSlim", code_only(src(name)), name)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FeedbackWiringTest(unittest.TestCase):
     """Owner 2026-10-02: feedback about himself is detected in the turn, spoken past
     early, passed to the launcher's feedback log, and never traced."""
@@ -1229,11 +1228,12 @@ class FeedbackWiringTest(unittest.TestCase):
     def test_the_feedback_field_comes_last_so_the_line_still_streams_first(self):
         body = self.prompts().split("REPLY_SCHEMA = object(")[1].split(";")[0]
         top = re.findall(r'^            "(\w+)",', body, re.M)
-        self.assertEqual(top[0], "line")
+        self.assertEqual(top[0], "addressed")
+        self.assertEqual(top[1], "line")
         self.assertEqual(top[-1], "feedback")
         self.assertIn('enumOf("none", "suggestion", "complaint", "praise", "bug")', body)
         a = code_only(src("ClaudeCuriosity.java"))
-        early = re.search(r"EARLY_FIELDS = Arrays\.asList\((.*?)\);", a).group(1)
+        early = re.search(r"EARLY_FIELDS = Arrays\.asList\((.*?)\);", a, re.S).group(1)
         self.assertNotIn("feedback", early)
 
     def test_the_adapter_passes_feedback_to_the_launcher_and_never_logs_it(self):
@@ -1261,3 +1261,59 @@ class FeedbackWiringTest(unittest.TestCase):
         self.assertIn("passOn(t.feedback)", chat)
         self.assertIn("port.lateFeedback()", chat)
 
+
+
+class InstructionsAndAddressedTest(unittest.TestCase):
+    """Owner 2026-10-02: he follows a few explicit instructions (go away, go elsewhere, find
+    someone, come here, be quiet) through the turn's action field, and a turn not said to him
+    (office chatter nearby) is judged by Claude in "addressed", before the line, so a
+    not-addressed turn never speaks and counts as unanswered."""
+
+    def prompts(self):
+        return src("ExplorePrompts.java")
+
+    def test_the_schema_puts_addressed_first_and_the_action_after_the_name(self):
+        body = self.prompts().split("REPLY_SCHEMA = object(")[1].split(";")[0]
+        top = re.findall(r'^            "(\w+)",', body, re.M)
+        self.assertEqual(top, ["addressed", "line", "question_asked", "name_given", "action", "target",
+                               "ends_conversation", "deflected", "notes_update", "feedback"])
+        self.assertIn('"addressed", type("boolean")', body)
+        self.assertIn('enumOf("none", "go_away", "go_elsewhere", "find_person", "come_here", "be_quiet")', body)
+
+    def test_the_preamble_says_when_to_set_the_action_and_addressed(self):
+        pre = ConversationWiringTest.java_string(self.prompts(), "SCHEMA_PREAMBLE")
+        for phrase in ("addressed (true when their latest message was said to Miko", "talking to each other nearby",
+                       "line (what he says; empty when addressed is false)",
+                       "only when the person explicitly asks Miko", "go_away, go_elsewhere, find_person, come_here or "
+                       "be_quiet", "I'll give you some space", "target (", "action none",
+                       "says kindly and honestly that he can't"):
+            self.assertIn(phrase, pre, phrase)
+        guard = ConversationWiringTest.java_string(self.prompts(), "GUARD")
+        self.assertIn("moving himself as the action field allows", guard)
+
+    def test_the_early_line_waits_for_addressed_from_the_stream(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        early = re.search(r"private static Turn earlyTurn\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("addressed", early)
+        self.assertIn("Boolean.TRUE.equals(addressed)", early)
+        turn = re.search(r"private void oneTurn\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("ClaudeReplies.addressedSoFar(", turn)
+        self.assertIn("streamed.reset()", turn)
+        self.assertIn("new ClaudeApi(streamed)", a)
+        turn_of = re.search(r"private static Turn turnOf\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn(".withAddressed(t.addressed)", turn_of)
+        self.assertIn(".withAction(t.action, t.target)", turn_of)
+
+    def test_the_brain_never_traces_the_target(self):
+        brain = code_only(src("ExploreBrain.java"))
+        for call in re.findall(r"\bnote\((.*?)\);", brain, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"\bintentTarget\b(?!\s*==|\s*!=)", call)
+        chat = code_only(src("ChatSession.java"))
+        for call in re.findall(r"\bnote\((.*?)\);", chat, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"\b(target|actionTarget)\b(?!\s*==|\s*!=)", call)
+
+
+if __name__ == "__main__":
+    unittest.main()

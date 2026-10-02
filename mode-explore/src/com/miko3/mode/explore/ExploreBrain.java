@@ -1108,6 +1108,8 @@ final class ExploreBrain {
     /** A wait ran to its verdict this stuck spell: no second one until he drives off cleanly or is freed. */
     /** RECOVER waits entered this stuck spell (recoverMaxPerSpell); the cap once the jam path ran. */
     private int recoverCount;
+    /** The last stall or zero-movement attempt (or RECOVER entered): the spell's quiet clock. */
+    private long spellEventAt = NEVER;
     /** This STARTLE follows a drive stall: the wait comes before the escape. */
     private boolean recoverAfterStartle;
     /** The wait counts from recoverFrom (the stall); probes at each of recoverProbes, next recoverNext. */
@@ -1530,7 +1532,7 @@ final class ExploreBrain {
         if (!hushed()) {
             return;
         }
-        String why = muted ? "muted" : "bathroom";
+        String why = hushWhy();
         if (call != null || nextCall != null) {
             nextCall = null;
             clearCall();
@@ -1553,10 +1555,10 @@ final class ExploreBrain {
     /** A cue while muted: a call's glance toward the voice (no clip, no conversation), any other dropped. */
     private void mutedCue(long now, Ears.Cue c) {
         if (!isCall(c)) {
-            dropCue("cue " + c.tier + " " + c.side + " dropped: " + (muted ? "muted" : "bathroom"));
+            dropCue("cue " + c.tier + " " + c.side + " dropped: " + hushWhy());
             return;
         }
-        note((muted ? "muted" : "bathroom") + ": a call gets a glance from " + c.side);
+        note(hushWhy() + ": a call gets a glance from " + c.side);
         if (shownState != EyeState.GLANCE) {
             boolean still = shownState == null || shownState == EyeState.STARE || shownState == EyeState.LOOK;
             glanceBackState = still ? EyeState.IDLE : shownState;
@@ -1564,6 +1566,202 @@ final class ExploreBrain {
         }
         show(EyeState.GLANCE, sideOf(c));
         mutedGlanceUntil = now + MUTED_GLANCE_MS;
+    }
+
+    // ---- following instructions (owner 2026-10-02) ----
+    //
+    // "When someone gives him an instruction, he tries to follow it. Generally, he can't do a
+    // task, but if they tell him to go away, or go to a different room, or go find a different
+    // person, he should try to do that. This however shouldn't take priority over being
+    // interrupted by someone else going 'Hey Miko', it should just integrate with his explore
+    // ability." A conversation that ends on an instruction (ChatSession.action, its line
+    // already said he will) sets an intent his roaming carries out:
+    // - go_away: the first leg turns about, away from them; their way and this spot are
+    //   avoided and they are left alone for 10 min;
+    // - go_elsewhere: a seek at once (after one scan for its frames), a doorway back toward
+    //   them not taken; this spot avoided for 15 min;
+    // - find_person: a seek at once, roaming person picks even while seeking, for up to 5 min;
+    //   a named target counts only when the face check matches that name, anyone new otherwise;
+    // - come_here: the call's search and approach, with no answer clip;
+    // - be_quiet: do not disturb for 10 min, as muted, while he roams on.
+    // A call drops any intent at once (be_quiet's do-not-disturb gives it a glance, as muted);
+    // hazards, RECOVER, the jam, bathroom privacy and do-not-disturb all come first. The trace
+    // says the action and whether a target was given, never the target.
+
+    static final long INTENT_LEAVE_ALONE_MS = 10L * 60 * 1000;
+    static final long INTENT_AWAY_AVOID_MS = 10L * 60 * 1000;
+    static final long INTENT_ELSEWHERE_AVOID_MS = 15L * 60 * 1000;
+    static final long INTENT_SEEK_MS = 5L * 60 * 1000;
+    static final long INTENT_QUIET_MS = 10L * 60 * 1000;
+    static final double INTENT_AVOID_RADIUS_M = 1.0;
+    static final double INTENT_AVOID_DEG = 45;
+    /** go_away turns about, not the usual chatAwayDeg. */
+    static final double INTENT_AWAY_DEG = 180;
+    /** The person's side as a bearing (left positive) when only the side is known. */
+    static final double INTENT_SIDE_DEG = 45;
+
+    private CuriosityPort.Action intent = CuriosityPort.Action.NONE;
+    /** The person or place named with it, or null. Never traced. */
+    private String intentTarget;
+    private long intentUntil = NEVER;
+    /** be_quiet: do not disturb, as muted, until its time is over. */
+    private boolean quiet;
+    /** A seek is due at the next stop's end (go_elsewhere, find_person). */
+    private boolean intentSeekDue;
+    /** The way back toward them (NaN: none) and this spot, avoided until then. */
+    private double intentAvoidHeading = Double.NaN;
+    private long intentAvoidUntil = NEVER;
+    /** The first leg's turn after the conversation, when not chatAwayDeg (NaN). */
+    private double awayLegDeg = Double.NaN;
+    /** The call in the slot is come_here's: its search and approach, no conversation first. */
+    private boolean comeHereCall;
+
+    /** The intent under way, for tests and the state page. */
+    CuriosityPort.Action intent() {
+        return intent;
+    }
+
+    /**
+     * Starts an intent now, as a conversation ending on this instruction does (side: the
+     * person's side, null for ahead or unknown). Package-private for the harness.
+     */
+    void startIntent(CuriosityPort.Action a, String target, Direction side) {
+        startIntent(clock.nowMs(), a, target, side);
+    }
+
+    private void startIntent(long now, CuriosityPort.Action a, String target, Direction side) {
+        if (a == null || a == CuriosityPort.Action.NONE) {
+            return;
+        }
+        if (intent != CuriosityPort.Action.NONE) {
+            dropIntent("a new instruction");
+        }
+        intentTarget = target == null || target.trim().isEmpty() ? null : target.trim();
+        note("intent: " + a.word() + (intentTarget == null ? " (no target)" : " (target given)"));
+        double toward = Double.NaN;
+        if (compass.usable(now)) {
+            toward = Heading.wrap(compass.degrees()
+                    + (side == Direction.LEFT ? INTENT_SIDE_DEG : side == Direction.RIGHT ? -INTENT_SIDE_DEG : 0));
+        }
+        switch (a) {
+            case GO_AWAY:
+                intentAvoid(now, toward, INTENT_AWAY_AVOID_MS);
+                note("intent: go_away: their way avoided for " + span(INTENT_AWAY_AVOID_MS));
+                if (onCharger()) {
+                    intentDone("on the charger: no leg to drive");
+                    return;
+                }
+                intent = a;
+                intentUntil = now + INTENT_SEEK_MS;
+                awayLeg = side == null ? randomDirection() : side.opposite();
+                awayLegDeg = INTENT_AWAY_DEG;
+                break;
+            case GO_ELSEWHERE:
+                intentAvoid(now, toward, INTENT_ELSEWHERE_AVOID_MS);
+                note("intent: go_elsewhere: this spot avoided for " + span(INTENT_ELSEWHERE_AVOID_MS));
+                intent = a;
+                intentUntil = now + INTENT_SEEK_MS;
+                intentSeekDue = true;
+                break;
+            case FIND_PERSON:
+                intent = a;
+                intentUntil = now + INTENT_SEEK_MS;
+                intentSeekDue = true;
+                break;
+            case COME_HERE:
+                // The call's search and approach toward them (the answer clip skipped: he just
+                // said he's coming), then the meeting, where the conversation goes on.
+                Ears.Side es = !chatFaceless || side == null ? Ears.Side.UNKNOWN
+                        : side == Direction.LEFT ? Ears.Side.LEFT : Ears.Side.RIGHT;
+                nextCall = null;
+                call = new Ears.Cue(Ears.Kind.NAME, Ears.Tier.STRONG, es, Float.NaN, now);
+                callAnswered = true;
+                comeHereCall = true;
+                awayLeg = null;
+                intentDone("coming over, as for a call");
+                break;
+            case BE_QUIET:
+                intent = a;
+                intentUntil = now + INTENT_QUIET_MS;
+                quiet = true;
+                note("intent: be_quiet: do not disturb for " + span(INTENT_QUIET_MS)
+                        + " (no remarks, calls get a glance)");
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void intentAvoid(long now, double toward, long ms) {
+        intentAvoidHeading = toward;
+        intentAvoidUntil = now + ms;
+        coverage.avoid(INTENT_AVOID_RADIUS_M, intentAvoidUntil);
+    }
+
+    /** Once per step: an intent whose time is over ends (be_quiet's do-not-disturb with it). */
+    private void intentStep(long now) {
+        if (intent == CuriosityPort.Action.NONE || now < intentUntil) {
+            return;
+        }
+        if (intent == CuriosityPort.Action.BE_QUIET) {
+            intentDone("be_quiet: " + span(INTENT_QUIET_MS) + " over");
+        } else {
+            dropIntent("timed out");
+        }
+    }
+
+    private void intentDone(String why) {
+        note("intent: done (" + why + ")");
+        clearIntent();
+    }
+
+    private void dropIntent(String why) {
+        note("intent: dropped (" + why + ")");
+        clearIntent();
+    }
+
+    private void clearIntent() {
+        intent = CuriosityPort.Action.NONE;
+        intentTarget = null;
+        intentUntil = NEVER;
+        intentSeekDue = false;
+        quiet = false;
+    }
+
+    /** Whether a heading leads back toward the spot or the person an intent avoids. */
+    private boolean intentAvoided(long now, double heading) {
+        if (Double.isNaN(heading) || now >= intentAvoidUntil) {
+            return false;
+        }
+        if (!Double.isNaN(intentAvoidHeading)
+                && Math.abs(Heading.delta(Heading.wrap(heading), intentAvoidHeading)) <= INTENT_AVOID_DEG) {
+            return true;
+        }
+        return coverage.avoided(heading, BATHROOM_AVOID_REACH_M, now);
+    }
+
+    /** A way avoided: back toward the bathroom he left, or toward what an intent avoids. */
+    private boolean avoidedWay(long now, double heading) {
+        return bathAvoided(now, heading) || intentAvoided(now, heading);
+    }
+
+    /** Some way is avoided now (the bathroom's, or an intent's). */
+    private boolean avoiding(long now) {
+        return now < bathAvoidUntil || now < intentAvoidUntil;
+    }
+
+    /** A person met while finding someone named: whether this face check is them (true when no name was given). */
+    private boolean soughtPerson(CuriosityPort.MatchAnswer a) {
+        if (intentTarget == null || intentTarget.equalsIgnoreCase("someone") || intentTarget.equalsIgnoreCase("anyone")
+                || intentTarget.equalsIgnoreCase("somebody")) {
+            return true;
+        }
+        String n = a.name == null ? "" : a.name.trim();
+        if (n.isEmpty() || a.status == CuriosityPort.MatchAnswer.Status.NEW) {
+            return false;
+        }
+        return AnswerParser.same(n, intentTarget) || NameResolver.firstWord(n).equalsIgnoreCase(
+                NameResolver.firstWord(intentTarget));
     }
 
     // ---- bathroom privacy (owner 2026-10-02) ----
@@ -1626,7 +1824,12 @@ final class ExploreBrain {
 
     /** Do not disturb or bathroom privacy: nothing to say, a call gets a glance. */
     private boolean hushed() {
-        return muted || bathroom;
+        return muted || bathroom || quiet;
+    }
+
+    /** Why he is hushed, for the trace. */
+    private String hushWhy() {
+        return muted ? "muted" : bathroom ? "bathroom" : "quiet";
     }
 
     /** Claude may be asked: never with a bathroom frame (privacy), else as the port says. */
@@ -1808,7 +2011,7 @@ final class ExploreBrain {
     /** A look's openness for the steer: the bearings back toward the bathroom read closed. */
     private Openness.Profile open(long now, Look look) {
         Openness.Profile p = look == null ? null : look.openness;
-        if (p == null || p.bins == null || now >= bathAvoidUntil || !compass.usable(now)) {
+        if (p == null || p.bins == null || !avoiding(now) || !compass.usable(now)) {
             return p;
         }
         double facing = compass.degrees();
@@ -1816,7 +2019,7 @@ final class ExploreBrain {
         int n = p.bins.length;
         for (int i = 0; i < n; i++) {
             double x = -1 + (2 * i + 1) / (double) n;
-            if (bathAvoided(now, Heading.wrap(facing - x * tuning.cameraHalfFovDeg))) {
+            if (avoidedWay(now, Heading.wrap(facing - x * tuning.cameraHalfFovDeg))) {
                 if (bins == null) {
                     bins = p.bins.clone();
                 }
@@ -2028,7 +2231,9 @@ final class ExploreBrain {
         // steer, the place memory), and before what privacy ends (as muting) is ended.
         bathroomWatch(now);
         bathroomStep(now);
+        intentStep(now);
         mutedStep(now);
+        spellStep(now);
         // The call (hey-miko plan KTD1, KTD2): in every state, EYES_ONLY included, before
         // the state's own step, so a take and its answer clip land in this very step.
         callStep(now);
@@ -2416,13 +2621,19 @@ final class ExploreBrain {
             // The first leg after a conversation turns away from the person (R16).
             Direction d = awayLeg;
             awayLeg = null;
+            double deg = Double.isNaN(awayLegDeg) ? tuning.chatAwayDeg : awayLegDeg;
+            awayLegDeg = Double.NaN;
             note("first leg after the conversation: turning " + d + ", away from them");
-            enterLook(now, d, false, timedMs(tuning.chatAwayDeg), tuning.chatAwayDeg);
+            if (intent == CuriosityPort.Action.GO_AWAY) {
+                intentDone("turned away");
+            }
+            enterLook(now, d, false, timedMs(deg), deg);
         } else if (seekAsking) {
             // Claude is choosing where to go (seekStep): he stands and thinks.
             return;
-        } else if (!hopNext && !seeking() && around == null && camera.available() && now >= curiosityAt
-                && now >= curiosityOffUntil && !hushed()) {
+        } else if (!hopNext && !seeking() && around == null && camera.available()
+                && (now >= curiosityAt || intentSeekDue) && now >= curiosityOffUntil && !hushed()) {
+            // An intent's seek (owner 2026-10-02) scans first, for its frames, whatever the stop's timer.
             enterScan(now);
         } else if (hopNext) {
             startHop(now);
@@ -2660,7 +2871,7 @@ final class ExploreBrain {
         }
         final RoamSteer.Novelty base = places.steer(grid, facing, usable, placeNovelty(now, look), now);
         final boolean boxed = now < boxedAvoidUntil && !Double.isNaN(boxedAvoidHeading);
-        final boolean bath = now < bathAvoidUntil;
+        final boolean bath = avoiding(now);
         if (!usable || (!boxed && !bath)) {
             return base;
         }
@@ -2671,7 +2882,7 @@ final class ExploreBrain {
             @Override
             public double at(double bearing) {
                 double h = Heading.wrap(facing + bearing);
-                if ((boxed && Math.abs(Heading.delta(h, avoid)) <= tuning.boxedAvoidDeg) || (bath && bathAvoided(now, h))) {
+                if ((boxed && Math.abs(Heading.delta(h, avoid)) <= tuning.boxedAvoidDeg) || (bath && avoidedWay(now, h))) {
                     return 0;
                 }
                 return base == null ? Double.NaN : base.at(bearing);
@@ -3047,6 +3258,11 @@ final class ExploreBrain {
             long moved = Math.abs(r.wheelLeft - lastWheels.wheelLeft) + Math.abs(r.wheelRight - lastWheels.wheelRight);
             if (state == State.HOP) {
                 hopMoved += moved;
+                if (recoverCount > 0 && tuning.recoverSpellResetCounts > 0
+                        && hopMoved / 2 >= tuning.recoverSpellResetCounts) {
+                    // Robot 2026-10-02: a forward leg driving cleanly ends the stuck spell.
+                    spellOver("a forward leg drove " + hopMoved / 2 + " counts cleanly");
+                }
             }
             wheelMoves.addLast(new long[]{r.timestampMs, moved});
         } else {
@@ -3532,7 +3748,7 @@ final class ExploreBrain {
             return;
         }
         enterPause(now, pauseMs(), false);
-        if (seekable) {
+        if (seekable || intentSeekDue) {
             maybeSeek(now);
         }
     }
@@ -4305,6 +4521,16 @@ final class ExploreBrain {
         if ((roamingPick || cuePick) && !callsOwn() && !usableFace(a)) {
             phantomPerson(now, a);
             return;
+        }
+        if (intent == CuriosityPort.Action.FIND_PERSON && !callsOwn()) {
+            if (!soughtPerson(a)) {
+                // Owner 2026-10-02: someone else, while finding the one asked for: left alone, the search goes on.
+                note("intent: find_person: not the one asked for; carrying on");
+                met.addLast(new Met(port.metId(), now));
+                endCuriosity(now);
+                return;
+            }
+            intentDone(intentTarget == null ? "found someone" : "found the one asked for");
         }
         leanInMet |= leanInOpen;
         if (confirmable(a)) {
@@ -6545,6 +6771,10 @@ final class ExploreBrain {
             forgetBlockedDoorway();
             return Double.NaN;
         }
+        if (intentAvoided(now, doorway)) {
+            // An intent's avoided way (owner 2026-10-02): not taken now, still remembered.
+            return Double.NaN;
+        }
         return Heading.delta(compass.degrees(), doorway);
     }
 
@@ -6593,6 +6823,17 @@ final class ExploreBrain {
      */
     private void maybeSeek(long now) {
         if (seeking() || state != State.PAUSE || bathroom) {
+            return;
+        }
+        if (intentSeekDue && compass.usable(now)) {
+            // Owner 2026-10-02: asked to go elsewhere, or to find someone: a seek now, whatever the gap.
+            intentSeekDue = false;
+            seekNo = ++seekCount;
+            seekStartedAt = now;
+            note("seeking: " + intent.word() + " asked for");
+            note("seek#" + seekNo + " start trigger=intent");
+            familiarStops = 0;
+            startSeek(now);
             return;
         }
         String why = null;
@@ -6693,6 +6934,11 @@ final class ExploreBrain {
         if (doorwayRecent(now) && hazardToward(now, seekDoorway)) {
             // Review P2-4: a hazard lies that way now; the seek chooses afresh.
             note("seeking: the reported doorway at " + Math.round(seekDoorway) + " deg is blocked: not trusted");
+            seekDoorway = Double.NaN;
+        }
+        if (doorwayRecent(now) && intentAvoided(now, seekDoorway)) {
+            // Owner 2026-10-02: a doorway back toward where he was asked to leave is not taken.
+            note("seeking: the reported doorway at " + Math.round(seekDoorway) + " deg leads back that way: not taken");
             seekDoorway = Double.NaN;
         }
         if (doorwayRecent(now)) {
@@ -7084,6 +7330,9 @@ final class ExploreBrain {
      * seek goes elsewhere; the grid marked the ground he drove. No seek for seekGapMs.
      */
     private void endSeek(long now, boolean arrived, String why) {
+        if (intent == CuriosityPort.Action.GO_ELSEWHERE && seeking()) {
+            intentDone(arrived ? "the seek arrived somewhere new" : "the seek is over");
+        }
         if (!seeking()) {
             return;
         }
@@ -7158,7 +7407,7 @@ final class ExploreBrain {
             return false;
         }
         Detection p = personBox(look.detections);
-        if (p != null && seeking()) {
+        if (p != null && seeking() && intent != CuriosityPort.Action.FIND_PERSON) {
             // Robot 16:46:30: a roaming person pick ended a seek 0.7 s in; in a busy office that
             // cut nearly every seek, and most such meetings dropped for lack of a usable face.
             // Calls still interrupt a seek; Claude's picks at a stop don't arise (no stops while seeking).
@@ -7711,6 +7960,10 @@ final class ExploreBrain {
         if (call == null || state == State.STOPPED) {
             return;
         }
+        if (intent != CuriosityPort.Action.NONE && intent != CuriosityPort.Action.BE_QUIET) {
+            // Owner 2026-10-02: a call from anyone comes before any instruction.
+            dropIntent("a call");
+        }
         if (callTaken) {
             if (state.inStop()) {
                 return;
@@ -7803,7 +8056,7 @@ final class ExploreBrain {
             turnRetrying = false;
         }
         // Owner 2026-10-02: conversation first; its answer may wait for the end of what they are saying.
-        boolean chatFirst = tuning.callChatFirst && canAsk();
+        boolean chatFirst = tuning.callChatFirst && canAsk() && !comeHereCall;
         if (!callAnswered && !chatFirst) {
             answerCall(now);
         }
@@ -8296,6 +8549,7 @@ final class ExploreBrain {
 
     private void clearCall() {
         call = null;
+        comeHereCall = false;
         callBlockedTurns = 0;
         callTaken = false;
         callAnswered = false;
@@ -9132,16 +9386,22 @@ final class ExploreBrain {
     private void finishChat(long now) {
         boolean named = chat.named();
         boolean docked = onCharger();
+        // Owner 2026-10-02: the instruction it ended on, carried out once it is over.
+        CuriosityPort.Action asked = chat.action();
+        String askedTarget = chat.actionTarget();
+        Direction askedSide = chatSide;
         peopleIgnoredUntil = now + tuning.peopleCooldownMs;
         if (named) {
             met.addLast(new Met(port.metId(), now));
             note("conversation with someone named over: left alone for " + (tuning.metLeaveAloneMs / 1000) + " s ("
                     + met.size() + " met recently)");
         } else {
+            long alone = asked == CuriosityPort.Action.GO_AWAY
+                    ? Math.max(tuning.unnamedLeaveAloneMs, INTENT_LEAVE_ALONE_MS) : tuning.unnamedLeaveAloneMs;
             leaveAloneSide = chatSide;
-            leaveAloneUntil = now + tuning.unnamedLeaveAloneMs;
+            leaveAloneUntil = now + alone;
             note("conversation with someone unnamed over: their side (" + chatSide + ") left alone for "
-                    + (tuning.unnamedLeaveAloneMs / 1000) + " s");
+                    + (alone / 1000) + " s");
         }
         if (call != null) {
             note("a call waited for the conversation: it is answered now");
@@ -9158,6 +9418,11 @@ final class ExploreBrain {
             awayLeg = chatSide == null ? null : chatSide.opposite();
         }
         endCuriosity(now);
+        if (asked != CuriosityPort.Action.NONE && call == null) {
+            startIntent(now, asked, askedTarget, askedSide);
+        } else if (asked != CuriosityPort.Action.NONE) {
+            note("intent: " + asked.word() + " dropped (a call waited for the conversation)");
+        }
         // The guards the conversation held off (KTD7) apply again at once.
         if (!leaseHeld) {
             enterEyesOnly("lease lost");
@@ -10324,6 +10589,33 @@ final class ExploreBrain {
 
     private void stampStall(long now) {
         stallStampAt = now;
+        spellEventAt = now;
+    }
+
+    /**
+     * Robot 2026-10-02 11:57-12:00: the stuck spell ends after recoverSpellResetMs with no
+     * stall and no zero-movement attempt (each stamps the stall clock), so a stall a minute
+     * later waits for the board again. The clock stands still while he is still stuck: in
+     * RECOVER, a cornered rest, an escape (the planner's ladder included) or the jam path.
+     */
+    private void spellStep(long now) {
+        if (recoverCount == 0 || tuning.recoverSpellResetMs <= 0 || spellEventAt == NEVER) {
+            return;
+        }
+        if (state == State.RECOVER || state == State.CORNERED || state.escapes() || planner.active() || jammed
+                || wriggling) {
+            spellEventAt = now;
+            return;
+        }
+        if (now - spellEventAt >= tuning.recoverSpellResetMs) {
+            spellOver("no stall or zero move for " + span(tuning.recoverSpellResetMs));
+        }
+    }
+
+    /** The stuck spell is over: its recovery count back to 0, so the next stall waits again. */
+    private void spellOver(String why) {
+        note("stuck spell over (" + why + "): recoveries reset after " + recoverCount);
+        recoverDone();
     }
 
     /**
@@ -10376,6 +10668,7 @@ final class ExploreBrain {
         recoverWedged = wedgedAfter;
         recoverWhy = why;
         recoverCount++;
+        spellEventAt = now;
         recoverBackStill = 0;
         recoverBlockedWay = null;
         retryWaiting = false;
