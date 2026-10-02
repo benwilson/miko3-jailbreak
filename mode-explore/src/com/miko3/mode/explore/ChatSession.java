@@ -225,6 +225,28 @@ final class ChatSession {
     private boolean answerHeld;
     /** Robot 2026-10-02: the provisional answer this listen already started a turn on (or passed over), or null. */
     private String speculated;
+    /** When the speculation on the provisional answer went out (brain ms), NEVER for none this listen. */
+    private long speculatedAt = ExploreBrain.NEVER;
+
+    // ---- the turn: records (2026-10-03, the learning log): numbers and fixed words only ----
+    /** This conversation's number (the brain counts them), 0 when nobody set it. */
+    private int learnNo;
+    private int learnTurns;
+    /** The turn under way, and the last one that ended, its record held until the next begins or the end. */
+    private TurnRecord learnCur;
+    private TurnRecord learnDone;
+    /** Why the conversation ended, first reason wins; null until one is known. */
+    private String learnEndWhy;
+    private boolean learnFlushed;
+    /** Listens since the last turn that ended unanswered, and how many of those were an answer without words. */
+    private int learnUnanswered;
+    private int learnNoWords;
+    private boolean learnReask;
+    /** The meeting this conversation came from (call, cue, roaming, claude-pick, other), whether it opened faceless. */
+    private String learnKind = "other";
+    private boolean learnFaceless;
+    /** Turns that answered words the partner said to him (a call's own words not counted). */
+    private int learnReplies;
     private long lookFrom;
     private long lookDeadline;
     private ExploreBrain.Direction newcomerSide;
@@ -505,6 +527,7 @@ final class ChatSession {
                 if (!deltaInFlight && !keepPending && !photoPending && !heldResolving && !faceMatching
                         && !port.turnTailPending() && (!persistWanted || buffer.isEmpty() || personId == null)) {
                     finished = true;
+                    learnFinish(learnEndWhy == null ? "other" : learnEndWhy);
                     host.note("conversation over after " + turns + " turn(s), " + persisted + " note delta(s) kept");
                 }
                 break;
@@ -527,12 +550,14 @@ final class ChatSession {
             return;
         }
         host.note("ending the conversation: " + why);
+        learnEnd("stall");
         signOff(now);
     }
 
     // ---- CHAT_THINK ----
 
     private void requestTurn(long now, String heardText) {
+        learnBegin(now, heardText);
         state = State.CHAT_THINK;
         phase = Phase.WAIT_TURN;
         heard = heardText;
@@ -568,6 +593,9 @@ final class ChatSession {
             if (now + paused - heldSince > tuning.chatPauseWaitMs) {
                 turnHeld = false;
                 host.note("Claude is paused for " + paused + " ms: too long to wait, the sign-off ends the conversation");
+                if (learnCur != null) {
+                    learnCur.fail = "paused";
+                }
                 turnFailed(now);
                 return;
             }
@@ -583,6 +611,9 @@ final class ChatSession {
         }
         turnHeld = false;
         turnDeadline = now + budget;
+        if (learnCur != null && learnCur.reqAt < 0) {
+            learnCur.reqAt = now;
+        }
         port.turn(request, budget);
     }
 
@@ -600,7 +631,7 @@ final class ChatSession {
      * The port uses it only if the final answer makes exactly the same request; its line is
      * never spoken before that.
      */
-    private void speculate(String words) {
+    private void speculate(long now, String words) {
         String text = words == null ? "" : words.trim();
         if (text.isEmpty() || text.equals(speculated)) {
             return;
@@ -610,6 +641,7 @@ final class ChatSession {
             return;
         }
         host.note("a provisional answer: its turn starts early");
+        speculatedAt = now;
         port.speculateTurn(turnRequest(text), tuning.turnBudgetMs);
     }
 
@@ -655,6 +687,9 @@ final class ChatSession {
                 break;
             case REFUSED:
                 host.note("the line was refused: the deflection, and the conversation goes on");
+                if (learnCur != null) {
+                    learnCur.fail = "refused";
+                }
                 transcript.add(new CuriosityPort.Exchange(heard, DEFLECT_SAID));
                 playClip(now, CLIP_DEFLECT, Phase.CLIP_THEN_LISTEN);
                 break;
@@ -663,6 +698,9 @@ final class ChatSession {
                 break;
             default:
                 host.note("the turn failed: the local sign-off ends the conversation");
+                if (learnCur != null) {
+                    learnCur.fail = "failed";
+                }
                 turnFailed(now);
                 break;
         }
@@ -759,6 +797,7 @@ final class ChatSession {
      * plays first (face plan U6, KTD7).
      */
     private void turnFailed(long now) {
+        learnEnd("failure");
         if (opener && name != null && !greetedLocally) {
             greetedLocally = true;
             host.note("turn 1 failed for someone known: the local greeting, then the sign-off");
@@ -773,6 +812,10 @@ final class ChatSession {
     private void retryOrSignOff(long now, String why) {
         if (attempt == 1 && tuning.turnRetryMs > 0) {
             attempt = 2;
+            if (learnCur != null) {
+                learnCur.tries = 2;
+                learnCur.retry = failWord(why);
+            }
             // Robot 2026-10-01: never straight back into a rate limit; sendTurn waits out a short pause.
             host.note("turn attempt 1 failed (" + why + "): "
                     + (port.claudePausedMs() > 0 ? "a retry once Claude's pause is over" : "retrying once"));
@@ -780,11 +823,21 @@ final class ChatSession {
             return;
         }
         host.note("turn attempt " + attempt + " failed (" + why + "): the local sign-off ends the conversation");
+        if (learnCur != null) {
+            learnCur.fail = failWord(why);
+        }
         turnFailed(now);
     }
 
     /** The robot's side of KTD9: the name, the sentence cap, the repeat check, the notes delta, then the line. */
     private void onLine(long now, CuriosityPort.Turn t) {
+        if (learnCur != null) {
+            if (t.addressed && learnCur.words && learnCur.addr != 'y') {
+                learnReplies++;
+            }
+            learnCur.lineAt = now;
+            learnCur.addr = t.addressed ? 'y' : 'n';
+        }
         if (!t.addressed) {
             notAddressed(now);
             return;
@@ -834,6 +887,7 @@ final class ChatSession {
             action = t.action;
             actionTarget = t.target;
             host.note("an instruction (" + action.word() + "): the line, then the conversation ends");
+            learnEnd("instruction");
             speak(now, line, true);
             endAfterLine = true;
             return;
@@ -1389,6 +1443,9 @@ final class ChatSession {
                 }
                 phase = Phase.SAYING;
                 sayUntil = now + tuning.sayTimeoutMs;
+                if (lineIsTurn && learnCur != null && learnCur.soundAt < 0) {
+                    learnCur.soundAt = now;
+                }
                 if (opener) {
                     opener = false;
                     host.stamp(ExploreBrain.Gauges.Stage.FIRST_SOUND, now);
@@ -1425,6 +1482,10 @@ final class ChatSession {
         pendingLine = null;
         if (lineIsTurn) {
             transcript.add(new CuriosityPort.Exchange(heard, line));
+            if (learnCur != null) {
+                learnCur.doneAt = now;
+                learnTurnOver();
+            }
         }
         if (endAfterLine) {
             enterNotes(now);
@@ -1453,6 +1514,7 @@ final class ChatSession {
         listenDeadline = now + tuning.unansweredListenMs;
         answerHeld = false;
         speculated = null;
+        speculatedAt = ExploreBrain.NEVER;
         port.chatListen(tuning.unansweredListenMs, tuning.newcomerAngleDeg);
     }
 
@@ -1471,7 +1533,7 @@ final class ChatSession {
                     return;
                 }
                 if (h == null) {
-                    speculate(port.provisional());
+                    speculate(now, port.provisional());
                 }
                 if (answerHeld && h != null) {
                     // Review P2-2: the held answer ended without words (the launcher's "answer
@@ -1543,6 +1605,7 @@ final class ChatSession {
         }
         if (goodbye(text)) {
             host.note("they said goodbye: the sign-off");
+            learnEnd("goodbye");
             signOff(now);
             return;
         }
@@ -1566,10 +1629,12 @@ final class ChatSession {
      * said to him for chatNoReplyMs, ends the conversation with a short "I'll leave you to it".
      */
     private void notAddressed(long now) {
+        learnTurnOver();
         unanswered = unansweredBefore + 1;
         int max = called ? tuning.callChatUnansweredMax : 2;
         if (unanswered >= max) {
             host.note("not said to him: " + unanswered + " unanswered in a row: he leaves them to it");
+            learnEnd("notaddr");
             leaveThem(now);
             return;
         }
@@ -1586,6 +1651,7 @@ final class ChatSession {
             return false;
         }
         host.note("no message said to him for " + tuning.chatNoReplyMs / 1000 + " s or more: he leaves them to it");
+        learnEnd("noreply");
         leaveThem(now);
         return true;
     }
@@ -1605,10 +1671,15 @@ final class ChatSession {
     }
 
     private void onUnanswered(long now, boolean wordless) {
+        learnUnanswered++;
+        if (wordless) {
+            learnNoWords++;
+        }
         if (called && wordless && !reasked && !confirmingForget && !askingLastName) {
             // Owner 2026-10-02: an answer that ended without words gets one re-ask, which does not count.
             reasked = true;
             host.note("the answer ended without words: one \"didn't catch that\", not counted");
+            learnReask = true;
             speak(now, DIDNT_CATCH, false);
             return;
         }
@@ -1623,6 +1694,7 @@ final class ChatSession {
             // Owner 2026-10-02: not seeing them never ends a call's conversation; only silence does.
             if (unanswered >= tuning.callChatUnansweredMax) {
                 host.note(unanswered + " unanswered listens in a row: the sign-off");
+                learnEnd("noreply");
                 signOff(now);
                 return;
             }
@@ -1636,6 +1708,7 @@ final class ChatSession {
         }
         if (unanswered >= 2) {
             host.note("two unanswered listens: the sign-off");
+            learnEnd("noreply");
             signOff(now);
             return;
         }
@@ -1663,6 +1736,7 @@ final class ChatSession {
         }
         if (arrived && !host.facing(look)) {
             host.note("they have walked off: no sign-off");
+            learnEnd("walkedoff");
             walkedOff = true;
             enterNotes(now);
             return;
@@ -1891,6 +1965,156 @@ final class ChatSession {
             }
         }
         return false;
+    }
+
+    // ---- the turn: records (2026-10-03, the learning log) ----
+
+    /** The brain's number for this conversation, for its turn: records. */
+    void learnNumber(int n) {
+        learnNo = n;
+    }
+
+    /** The meeting it came from and whether it opened with nobody in view, for the turn: records. */
+    void learnMeeting(String kind, boolean faceless) {
+        learnKind = kind == null ? "other" : kind;
+        learnFaceless = faceless;
+    }
+
+    /**
+     * The brain ended the conversation itself (a stop, eyes only, muted): the records still
+     * open go out with this end reason. A no-op once the session wrote its own.
+     */
+    void learnCut(String why) {
+        learnFinish(why);
+    }
+
+    /** A new turn: the one before it, if its record is still held, goes out first. */
+    private void learnBegin(long now, String heardText) {
+        learnEmit(learnDone, null);
+        learnDone = null;
+        learnEmit(learnCur, null);
+        boolean afterWords = heardText != null && heardAt != ExploreBrain.NEVER;
+        TurnRecord r = new TurnRecord(learnNo, ++learnTurns, afterWords ? heardAt : now, opener);
+        r.words = afterWords;
+        if (afterWords && speculated != null && speculated.equals(heardText.trim())
+                && speculatedAt != ExploreBrain.NEVER) {
+            r.specAt = speculatedAt;
+        }
+        r.unanswered = learnUnanswered;
+        r.noWords = learnNoWords;
+        r.reask = learnReask;
+        learnUnanswered = 0;
+        learnNoWords = 0;
+        learnReask = false;
+        learnCur = r;
+    }
+
+    /** The turn under way is over (its line said, or not said to him): held until the next begins or the end. */
+    private void learnTurnOver() {
+        if (learnCur == null) {
+            return;
+        }
+        learnEmit(learnDone, null);
+        learnDone = learnCur;
+        learnCur = null;
+    }
+
+    private void learnEnd(String why) {
+        if (learnEndWhy == null) {
+            learnEndWhy = why;
+        }
+    }
+
+    /** The conversation is over: the held records go out, the last with the end reason. */
+    private void learnFinish(String why) {
+        if (learnFlushed) {
+            return;
+        }
+        if (learnCur != null) {
+            learnEmit(learnDone, null);
+            learnEmit(learnCur, why);
+        } else if (learnDone != null) {
+            learnEmit(learnDone, why);
+        } else {
+            host.note("turn: c=" + learnNo + " t=0 end=" + why + learnMeetingFields());
+        }
+        learnDone = null;
+        learnCur = null;
+        learnFlushed = true;
+    }
+
+    private void learnEmit(TurnRecord r, String end) {
+        if (r == null || learnFlushed) {
+            return;
+        }
+        host.note(r.record(port.turnInfo(), end) + learnMeetingFields());
+    }
+
+    /** The meeting's fields every turn: record ends with; replies counts up to the last. */
+    private String learnMeetingFields() {
+        return " meet=" + learnKind + " faceless=" + (learnFaceless ? "y" : "n") + " faceseen=" + (faceSeen ? "y" : "n")
+                + " replies=" + learnReplies;
+    }
+
+    /** A failed try's reason as one fixed word. */
+    static String failWord(String why) {
+        if (why == null) {
+            return "failed";
+        } else if (why.startsWith("no line in")) {
+            return "timeout";
+        } else if (why.contains("unreachable")) {
+            return "unreachable";
+        }
+        return "failed";
+    }
+
+    /**
+     * One conversation turn's record: from t0 (when the answer's words reached the brain;
+     * the request itself for the opener or a call's own words) the ms to the request
+     * (negative when a speculation on the provisional answer was used), to the line ready,
+     * to the line handed to speech, to speech finished. Never a word, never a name.
+     */
+    static final class TurnRecord {
+        final int conv;
+        final int no;
+        final long t0;
+        final boolean open;
+        long reqAt = -1;
+        long specAt = -1;
+        long lineAt = -1;
+        long soundAt = -1;
+        long doneAt = -1;
+        char addr = '?';
+        int tries = 1;
+        String retry = "-";
+        String fail = "-";
+        int unanswered;
+        int noWords;
+        boolean reask;
+        /** Its t0 is words the partner said in a conversation listen. */
+        boolean words;
+
+        TurnRecord(int conv, int no, long t0, boolean open) {
+            this.conv = conv;
+            this.no = no;
+            this.t0 = t0;
+            this.open = open;
+        }
+
+        private String ms(long at) {
+            return at < 0 ? "-" : String.valueOf(at - t0);
+        }
+
+        String record(CuriosityPort.TurnInfo info, String end) {
+            boolean spec = info != null && info.speculative;
+            long req = spec && specAt >= 0 ? specAt : reqAt;
+            return "turn: c=" + conv + " t=" + no + " open=" + (open ? "y" : "n") + " addr=" + addr
+                    + " req=" + ms(req) + " line=" + ms(lineAt) + " sound=" + ms(soundAt) + " done=" + ms(doneAt)
+                    + " spec=" + (info != null ? (spec ? "y" : "n") : specAt >= 0 ? "?" : "n")
+                    + " tools=" + (info == null || info.tools == null ? "?" : info.tools.isEmpty() ? "-" : info.tools)
+                    + " tries=" + tries + " retry=" + retry + " fail=" + fail + " unans=" + unanswered
+                    + " nowords=" + noWords + " reask=" + (reask ? "y" : "n") + " end=" + (end == null ? "-" : end);
+        }
     }
 
     @Override

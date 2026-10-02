@@ -1391,5 +1391,48 @@ class ToolRoundWiringTest(unittest.TestCase):
         self.assertLess(body.index("muted || quiet"), body.index("!leaseHeld"))
 
 
+class LearnLogWiringTest(unittest.TestCase):
+    """The learning log (2026-10-03): ModeApp feeds it the brain's notes and stamps each start."""
+
+    def test_the_trace_offers_every_note_and_only_the_log_filters_them(self):
+        app = code_only(src("ModeApp.java"))
+        m = re.search(r"ExploreBrain\.Trace trace = new ExploreBrain\.Trace\(\) \{(.*?)\n    \};", app, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn('l.offer("ExploreBrain", message)', m.group(1))
+
+    def test_the_log_opens_before_the_loop_with_the_build_and_tuning_and_closes_on_stop(self):
+        app = code_only(src("ModeApp.java"))
+        start = app.index("void startExplore()")
+        opened = app.index("new LearnLog(getFilesDir()", start)
+        self.assertLess(opened, app.index("new ExploreLoop(", start))
+        self.assertIn("LearnLog.startRecord(buildId(), tuning)", app)
+        self.assertIn("getPackageInfo(getPackageName(), 0).versionName", app)
+        stop = app[app.index("void stopExplore()"):]
+        self.assertLess(stop.index("loop.stop()"), stop.index(".close(500)"))
+
+    def test_the_log_writes_off_the_brain_thread_and_never_blocks(self):
+        log = code_only(src("LearnLog.java"))
+        offer = log[log.index("void offer("):log.index("void record(")]
+        self.assertIn("queue.offer(", offer)
+        self.assertNotIn("write(", offer)
+        self.assertNotIn(".put(", log)
+        self.assertIn("setDaemon(true)", log)
+        self.assertIn('"learn.log"', log)
+
+    def test_the_adapter_reports_a_turns_tools_and_speculation_for_its_own_generation_only(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertIn("public CuriosityPort.TurnInfo turnInfo()", a)
+        self.assertRegex(a, r"answered != 0 && answered == turnInfoGen")
+        self.assertIn("CuriosityPort.TurnInfo.joined(o.tools)", a)
+
+    def test_turn_records_carry_no_heard_text_and_no_name(self):
+        chat = code_only(src("ChatSession.java"))
+        rec = chat[chat.index("static final class TurnRecord"):chat.index("public String toString()")]
+        self.assertIsNone(re.search(r"\b(heard|heardText|name|text|transcript|pendingLine|personId)\b", rec))
+        begin = chat[chat.index("private void learnBegin("):chat.index("private void learnTurnOver(")]
+        # The heard words are only compared (to tell a used speculation), never put in the record.
+        self.assertNotIn("new TurnRecord(learnNo, ++learnTurns, heard", begin)
+
+
 if __name__ == "__main__":
     unittest.main()

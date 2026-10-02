@@ -33,7 +33,8 @@ PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java"
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
               "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "PlaceMemory.java", "Ears.java", "ChatSession.java",
-              "FaceMigration.java", "FaceMatcher.java", "AnswerParser.java", "NameResolver.java", "ChatTools.java")
+              "FaceMigration.java", "FaceMatcher.java", "AnswerParser.java", "NameResolver.java", "ChatTools.java",
+              "LearnLog.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -728,6 +729,14 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "navlog_a_seek_has_an_id_from_start_to_end_and_its_legs_and_turns_say_seek",
         "navlog_bathroom_privacy_legs_are_logged_without_their_frame",
         "navlog_mode_notes_only_on_a_change_eyes_only_docked_and_roam",
+        # The learning log (2026-10-03): trig: and turn: records, the app-private learn.log
+        "learn_each_conversation_turn_is_one_turn_record_with_latencies_and_no_words",
+        "learn_a_failed_turn_records_its_retry_and_the_failure_end",
+        "learn_a_bathroom_trigger_is_one_trig_record_strong_or_two_weak",
+        "learn_a_roaming_person_writes_a_person_pick_and_a_meet_trig_record",
+        "learn_a_claude_person_pick_conversation_is_marked_claude_pick_faceless_and_its_replies",
+        "learn_log_keeps_only_records_as_logcat_lines_says_alive_and_rotates",
+        "learn_tuning_stamp_is_a_hash_and_the_fields_off_their_defaults",
     )
 
     @classmethod

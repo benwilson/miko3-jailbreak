@@ -659,6 +659,8 @@ final class ClaudeCuriosity implements CuriosityPort {
         final byte[] face = request.heard == null && request.transcript.isEmpty() && met != null
                 ? met.storeCrop : null;
         final ChatRound.Body body = ChatRound.body(request, face);
+        turnInfoGen = g;
+        turnInfo = null;
         // Robot 2026-10-02: a turn started on the provisional answer answers this one if it asked the same.
         if (flight.adopt(body.key, g) != null) {
             Log.i(TAG, "turn: the request started on the provisional answer is used");
@@ -671,6 +673,15 @@ final class ClaudeCuriosity implements CuriosityPort {
                 oneTurn(body, request, call, timeoutMs, false);
             }
         }, turns, g, Turn.failed());
+    }
+
+    /** 2026-10-03, the learning log: the last turn()'s generation and how it was answered, once known. */
+    private volatile int turnInfoGen;
+    private volatile CuriosityPort.TurnInfo turnInfo;
+
+    @Override
+    public CuriosityPort.TurnInfo turnInfo() {
+        return turnInfo;
     }
 
     /**
@@ -773,6 +784,10 @@ final class ClaudeCuriosity implements CuriosityPort {
             return;
         }
         Turn t = turnOf(o);
+        int answered = flight.genOf(call);
+        if (answered != 0 && answered == turnInfoGen) {
+            turnInfo = new CuriosityPort.TurnInfo(speculative, CuriosityPort.TurnInfo.joined(o.tools));
+        }
         flight.whole(call, t);
         ClaudeApi.MessageResult r = o.result;
         int count = body.messages.size();

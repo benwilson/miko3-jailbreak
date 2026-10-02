@@ -4,7 +4,18 @@ The running list of what is left to do on the robot's modes. Add to it when some
 
 Everything below that needs the robot is sequenced into one session in `docs/robot-return.md`. Start there when the robot is back.
 
+## How to learn from a robot day
+
+The robot gathers, the code changes off the robot. After a run:
+
+1. `python3 scripts/pull-learn-log.py` pulls the learning log (`files/learn.log`, records only) into `out/learn/<date>.log` (gitignored). A logcat capture (`adb logcat -v time`) adds the camera's look lines, the launcher's "answer over" details and the Claude request timings.
+2. `scripts/nav-report.py DAY.log` and `scripts/chat-report.py DAY.log` give the day's navigation and conversation scorecards (`--json` for both).
+3. `scripts/daily-diff.py OLD.log NEW.log` lists what moved between two days, per roaming hour with sample counts, and the commits between the two builds.
+4. `scripts/eval-explore-triggers.py CAPTURE.log` replays the bathroom rule over a capture's looks, to check a rule change against past days.
+
 ## Explore mode
+
+- [ ] **Learning log (2026-10-03, host-tested only): check it on the robot.** After a run, `pull-learn-log.py` should find `learn.log` with a `learn: start build=` line, `leg:`, `trig:` and `turn:` records and a `learn: alive` a minute when quiet; check the file stays small (rotates at 5 MB) and Explore's CPU is unchanged. The `turn:` timings start when the answer's words reach the brain; "sound" is when the line goes to speech, not the first audio. Each `turn:` record also carries the meeting kind (call, cue, roaming, claude-pick), whether it opened faceless and how many turns answered the partner's words (`replies`): use `chat-report.py`'s "By meeting" line to decide whether faceless Claude-pick conversations (robot 2026-10-03: all faceless, half with a real person replying) should be gated.
 
 - [ ] **Stuck spell reset (robot 2026-10-02 11:57-12:00): check it on the robot.** A spell's recovery count (`recoverMaxPerSpell` 3) now resets on a forward leg of `recoverSpellResetCounts` (300) or after `recoverSpellResetMs` (45 s) with no stall or zero move outside RECOVER, cornered rests, escapes and the jam path; logcat "stuck spell over (...): recoveries reset after N". Watch that a genuinely latched board still reaches the jam path, not an endless wait-escape cycle.
 

@@ -1367,6 +1367,8 @@ final class ExploreBrain {
     // ---- the conversation (meeting plan U8; KTD7, KTD8, KTD10, R16) ----
     /** The conversation running in the CHAT states, or null. */
     private ChatSession chat;
+    /** Conversations so far this run, for the turn: records' numbers. */
+    private int chatCount;
     // ---- confirming a close match and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12) ----
     private enum IdStep { NONE, ASKING, LISTENING, RESOLVING, ADDING, KEEPING }
     private IdStep idStep = IdStep.NONE;
@@ -1845,25 +1847,42 @@ final class ExploreBrain {
         return !bathroom && port.canAsk();
     }
 
-    /** {strong, weak} bathroom labels in a look at their thresholds, each label once, in box order. */
-    private static List<List<String>> bathroomLabels(Look look) {
-        List<String> strong = new ArrayList<String>();
-        List<String> weak = new ArrayList<String>();
+    /** {strong, weak} bathroom boxes in a look at their thresholds, each label once (its first box), in box order. */
+    private static List<List<Detection>> bathroomHits(Look look) {
+        List<Detection> strong = new ArrayList<Detection>();
+        List<Detection> weak = new ArrayList<Detection>();
         if (look.detections != null) {
             for (Detection d : look.detections) {
                 if ((d.x1 - d.x0) * (d.y1 - d.y0) < BATHROOM_MIN_AREA) {
                     continue;
                 }
-                if (BATHROOM_STRONG.contains(d.label) && d.score >= BATHROOM_STRONG_MIN && !strong.contains(d.label)) {
-                    strong.add(d.label);
-                } else if (BATHROOM_WEAK.contains(d.label) && d.score >= BATHROOM_WEAK_MIN && !weak.contains(d.label)) {
-                    weak.add(d.label);
+                if (BATHROOM_STRONG.contains(d.label) && d.score >= BATHROOM_STRONG_MIN && !hasLabel(strong, d.label)) {
+                    strong.add(d);
+                } else if (BATHROOM_WEAK.contains(d.label) && d.score >= BATHROOM_WEAK_MIN && !hasLabel(weak, d.label)) {
+                    weak.add(d);
                 }
             }
         }
-        List<List<String>> out = new ArrayList<List<String>>();
+        List<List<Detection>> out = new ArrayList<List<Detection>>();
         out.add(strong);
         out.add(weak);
+        return out;
+    }
+
+    private static boolean hasLabel(List<Detection> ds, String label) {
+        for (Detection d : ds) {
+            if (d.label.equals(label)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<String> labelsOf(List<Detection> ds) {
+        List<String> out = new ArrayList<String>();
+        for (Detection d : ds) {
+            out.add(d.label);
+        }
         return out;
     }
 
@@ -1877,9 +1896,9 @@ final class ExploreBrain {
             return;
         }
         bathLook = look;
-        List<List<String>> labels = bathroomLabels(look);
-        List<String> strong = labels.get(0);
-        List<String> weak = labels.get(1);
+        List<List<Detection>> hits = bathroomHits(look);
+        List<Detection> strong = hits.get(0);
+        List<Detection> weak = hits.get(1);
         if (bathroom) {
             bathCleanLooks = strong.isEmpty() && weak.isEmpty() ? bathCleanLooks + 1 : 0;
             return;
@@ -1890,24 +1909,89 @@ final class ExploreBrain {
             bathLooks.pollFirst();
         }
         if (!strong.isEmpty()) {
-            enterBathroom(now, strong, look.frameMs);
+            trig("bathroom", "strong", strong, 1);
+            enterBathroom(now, labelsOf(strong), look.frameMs);
             return;
         }
-        List<String> seen = new ArrayList<String>();
+        List<Detection> seen = new ArrayList<Detection>();
         long since = look.frameMs;
+        int looks = 0;
         for (Object[] b : bathLooks) {
             @SuppressWarnings("unchecked")
-            List<String> w = (List<String>) b[1];
-            for (String l : w) {
-                if (!seen.contains(l)) {
-                    seen.add(l);
+            List<Detection> w = (List<Detection>) b[1];
+            boolean added = false;
+            for (Detection d : w) {
+                if (!hasLabel(seen, d.label)) {
+                    seen.add(d);
+                    added = true;
                     since = Math.min(since, (Long) b[0]);
                 }
             }
+            looks += added ? 1 : 0;
         }
         if (seen.size() >= 2) {
-            enterBathroom(now, seen, since);
+            trig("bathroom", "weak2", seen, looks);
+            enterBathroom(now, labelsOf(seen), since);
         }
+    }
+
+    // ---- the trig: records (2026-10-03, the learning log) ----
+
+    /**
+     * One record per decision a detection set off: its kind (bathroom, person-pick, meet,
+     * remark, curiosity), the rule branch that fired, the deciding boxes (label, score,
+     * box as frame fractions; several joined by "+") and how many looks agreed. Labels are
+     * the detector's class names (spaces as "_"); a living thing is only "person" or
+     * "animal", never a description or a name.
+     */
+    private void trig(String kind, String rule, List<Detection> boxes, int looks) {
+        StringBuilder label = new StringBuilder();
+        StringBuilder score = new StringBuilder();
+        StringBuilder box = new StringBuilder();
+        for (Detection d : boxes) {
+            String sep = label.length() == 0 ? "" : "+";
+            label.append(sep).append(trigLabel(d.label));
+            score.append(sep).append(two(d.score));
+            box.append(sep).append(two(d.x0)).append(',').append(two(d.y0)).append(',').append(two(d.x1))
+                    .append(',').append(two(d.y1));
+        }
+        note("trig: kind=" + kind + " rule=" + rule + " label=" + (label.length() == 0 ? "-" : label)
+                + " score=" + (score.length() == 0 ? "-" : score) + " box=" + (box.length() == 0 ? "-" : box)
+                + " looks=" + looks);
+    }
+
+    private void trig(String kind, String rule, Detection box, int looks) {
+        List<Detection> one = new ArrayList<Detection>();
+        if (box != null) {
+            one.add(box);
+        }
+        trig(kind, rule, one, looks);
+    }
+
+    /** A label as one token: whitespace and the record's separators become "_". */
+    static String trigLabel(String label) {
+        if (label == null || label.trim().isEmpty()) {
+            return "-";
+        }
+        return label.trim().replaceAll("[\\s+=,]+", "_");
+    }
+
+    /**
+     * What kind of meeting this is, for the learning log's records (2026-10-03): a call's (the
+     * wake word or his name, a come-here), a voice cue's, a roaming person pick's, Claude's
+     * person pick at a stop, or other.
+     */
+    private String meetKind() {
+        return callTaken || callChatCue != null ? "call" : cuePick ? "cue" : roamingPick ? "roaming"
+                : claudeStop ? "claude-pick" : "other";
+    }
+
+    /** The box as a record may show it: a living thing's label (Claude's description of them) is only its kind. */
+    private static Detection trigBox(Detection d, CuriosityPort.Kind kind) {
+        if (d == null || kind == null || !kind.isLiving()) {
+            return d;
+        }
+        return new Detection(kind == CuriosityPort.Kind.PERSON ? "person" : "animal", d.score, d.x0, d.y0, d.x1, d.y1);
     }
 
     /** Privacy on: everything that could see, keep or say anything ends here; the escape is due. */
@@ -3802,6 +3886,9 @@ final class ExploreBrain {
         wheellessMeeting = false;
         roamingPick = false;
         cuePick = false;
+        if (chat != null) {
+            chat.learnCut(muted ? "muted" : "cut");
+        }
         chat = null;
         chatCueSide = null;
         chatNoWheels = false;
@@ -4143,6 +4230,9 @@ final class ExploreBrain {
         float cx = a.box.centerX();
         pickRecentred = Math.abs(cx) > tuning.centreTolerance;
         Detection agree = remark ? null : detectorAgrees(scanned.get(look).detections, a);
+        trig(remark ? "remark" : a.kind == CuriosityPort.Kind.PERSON ? "person-pick" : "curiosity",
+                remark ? "met_recently" : agree != null ? "claude_detector" : "claude",
+                trigBox(agree != null ? agree : a.box, a.kind), scanned.size());
         if (agree != null) {
             note("the detector sees it too, as a " + agree.label + ": approaching");
             target = agree;
@@ -4486,6 +4576,7 @@ final class ExploreBrain {
 
     /** MEET: thinking eyes while Claude compares the face in this frame's person box with the stored ones. */
     private void enterMeet(long now, byte[] frameJpeg, Detection personBox) {
+        trig("meet", meetKind(), trigBox(personBox, CuriosityPort.Kind.PERSON), 1);
         stopMotors();
         state = State.MEET;
         meetingHeld = true;
@@ -7483,6 +7574,7 @@ final class ExploreBrain {
 
     private void approachPerson(long now, Look look, Detection p) {
         note("a person while roaming: going over to meet them");
+        trig("person-pick", "roaming", p, 1);
         lookForLeg = false;
         hopNext = false;
         plannedTicks = -1;
@@ -7532,6 +7624,7 @@ final class ExploreBrain {
         metCheckAt = now;
         metNextCheckAt = now + tuning.metCheckIntervalMs;
         note("asking Claude whether this person was just met (" + ids.size() + " met recently)");
+        trig("person-pick", "met_check", trigBox(box, CuriosityPort.Kind.PERSON), 1);
         port.recentlyMet(new CuriosityPort.RecentlyMetRequest(jpeg, box, ids), tuning.metCheckTimeoutMs);
         return true;
     }
@@ -9346,12 +9439,15 @@ final class ExploreBrain {
             port.touch();
         }
         note("the meeting becomes a conversation" + (faceless ? " with nobody in view" : "") + " (" + a.status + ")");
+        String kind = meetKind();
         if (callTaken) {
             // KTD1: the call is kept until the conversation opens.
             gauges.stamp(Gauges.Stage.CALL_ARRIVED, now);
             clearCall();
         }
         chat = new ChatSession(tuning, port, chatHost);
+        chat.learnNumber(++chatCount);
+        chat.learnMeeting(kind, faceless);
         state = State.CHAT_THINK;
         syncPark();
         if (callChatCue != null) {
@@ -9876,6 +9972,7 @@ final class ExploreBrain {
             return;
         }
         note("docked look: something new, the " + thing + ": saying it");
+        trig("remark", "docked", a.box, 1);
         pick = a;
         pickAt = now;
         pickRecentred = false;
@@ -9971,6 +10068,9 @@ final class ExploreBrain {
         wheellessMeeting = false;
         roamingPick = false;
         cuePick = false;
+        if (chat != null) {
+            chat.learnCut("eyes");
+        }
         chat = null;
         chatCueSide = null;
         chatNoWheels = false;

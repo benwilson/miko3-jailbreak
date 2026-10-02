@@ -282,6 +282,40 @@ interface CuriosityPort extends AnswerParser.Names {
     }
 
     /**
+     * 2026-10-03, the learning log: how the last turn() was answered (a speculation used, the
+     * tools its round ran), or null while that is not known. Names of tools only, never words.
+     */
+    default TurnInfo turnInfo() {
+        return null;
+    }
+
+    /** How a turn was answered, for its turn: record. */
+    final class TurnInfo {
+        final boolean speculative;
+        /** The tools its round ran, "+"-joined; "" for none. */
+        final String tools;
+
+        TurnInfo(boolean speculative, String tools) {
+            this.speculative = speculative;
+            this.tools = tools == null ? "" : tools;
+        }
+
+        /** ChatRound's "a, b" tool list as "a+b" ("" for none). */
+        static String joined(String tools) {
+            if (tools == null || tools.trim().isEmpty()) {
+                return "";
+            }
+            StringBuilder b = new StringBuilder();
+            for (String t : tools.split("[,\\s]+")) {
+                if (!t.isEmpty()) {
+                    b.append(b.length() == 0 ? "" : "+").append(t);
+                }
+            }
+            return b.toString();
+        }
+    }
+
+    /**
      * Merge a notes delta into this person's record through the People store
      * (KTD10, drain-on-persist). Carries no lines and no transcript.
      */
@@ -1375,6 +1409,11 @@ interface CuriosityPort extends AnswerParser.Names {
 
         TurnFlight(Deliver deliver) {
             this.deliver = deliver;
+        }
+
+        /** The turn() generation this call answers now (0: a speculation nobody has asked for). */
+        synchronized int genOf(Call c) {
+            return c.gen;
         }
 
         /** A new speculation for this key (replacing any other), or null when one for it is already running. */

@@ -13948,6 +13948,7 @@ public final class ExploreBrainHarness {
         facelessCallScenarios();
         callChatFirstScenarios();
         instructionScenarios();
+        learnScenarios();
     }
 
     // ---- a roaming person is met only with a usable face (owner 2026-10-01) ----
@@ -16305,6 +16306,211 @@ public final class ExploreBrainHarness {
             check(n, !m.isEmpty() && m.get(0).equals("EYES_ONLY") && docked > 0 && m.lastIndexOf("ROAM") > docked
                             && noRepeats(m) && rig.violations.isEmpty(),
                     "modes=" + m + " " + lastNotes(notes));
+        });
+    }
+
+    // ---- the learning log (2026-10-03): trig: and turn: records, and LearnLog itself ----
+
+    /** The notes that start (after the "<ms> " stamp) with this prefix, stamp dropped. */
+    private static List<String> records(List<String> notes, String prefix) {
+        List<String> out = new ArrayList<String>();
+        for (String x : notes) {
+            String m = x.substring(x.indexOf(' ') + 1);
+            if (m.startsWith(prefix)) {
+                out.add(m);
+            }
+        }
+        return out;
+    }
+
+    /** key=value from a record, else null. */
+    private static String field(String record, String key) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?:^| )" + key + "=(\\S+)").matcher(record);
+        return m.find() ? m.group(1) : null;
+    }
+
+    private static final java.util.regex.Pattern TURN_RECORD = java.util.regex.Pattern.compile(
+            "turn: c=\\d+ t=\\d+ open=[yn] addr=[yn?] req=(-|-?\\d+) line=(-|\\d+) sound=(-|\\d+) done=(-|\\d+)"
+                    + " spec=[yn?] tools=\\S+ tries=[12] retry=(\\w+|-) fail=\\S+ unans=\\d+ nowords=\\d+ reask=[yn]"
+                    + " end=\\S+ meet=(call|cue|roaming|claude-pick|other) faceless=[yn] faceseen=[yn] replies=\\d+");
+
+    private static void learnScenarios() {
+        scenario("learn_each_conversation_turn_is_one_turn_record_with_latencies_and_no_words", n -> {
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords("so the quarterly numbers"), hearWords("miko what do you think"),
+                    hearWords("yeah totally"), hearWords("did you get lunch"), hearWords("miko are you there"),
+                    hearWords("bye"));
+            rig.turns = turnsOf(turnLine(1), notAddressed(), turnLine(3), notAddressed(), notAddressed(), turnLine(6));
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.LEFT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            List<String> turns = records(notes, "turn: ");
+            StringBuilder addr = new StringBuilder();
+            boolean shape = true;
+            boolean wordless = true;
+            boolean ordered = true;
+            for (int i = 0; i < turns.size(); i++) {
+                String r = turns.get(i);
+                shape &= TURN_RECORD.matcher(r).matches() && "1".equals(field(r, "c"))
+                        && String.valueOf(i + 1).equals(field(r, "t"))
+                        && (i == turns.size() - 1 ? "goodbye" : "-").equals(field(r, "end"));
+                addr.append(field(r, "addr"));
+                for (String w : new String[]{"quarterly", "lunch", "totally", "miko", "Miko", "think", "there"}) {
+                    wordless &= !r.contains(w);
+                }
+                if ("y".equals(field(r, "addr"))) {
+                    long req = Long.parseLong(field(r, "req"));
+                    long line = Long.parseLong(field(r, "line"));
+                    long sound = Long.parseLong(field(r, "sound"));
+                    long done = Long.parseLong(field(r, "done"));
+                    ordered &= req >= 0 && line >= req && sound >= line && done > sound;
+                } else {
+                    ordered &= "-".equals(field(r, "sound")) && "-".equals(field(r, "done"));
+                }
+            }
+            String last = turns.isEmpty() ? "" : turns.get(turns.size() - 1);
+            check(n, over > 0 && turns.size() == 6 && shape && wordless && ordered
+                            && "call".equals(field(last, "meet")) && "y".equals(field(last, "faceless"))
+                            && "2".equals(field(last, "replies")) && "0".equals(field(turns.get(0), "replies"))
+                            && addr.toString().equals("ynynny") && "y".equals(field(turns.get(0), "open"))
+                            && "n".equals(field(turns.get(1), "open")) && rig.violations.isEmpty(),
+                    "turns=" + turns);
+        });
+        scenario("learn_a_failed_turn_records_its_retry_and_the_failure_end", n -> {
+            Rig rig = sarahRig(false);
+            rig.turns = turnsOf(CuriosityPort.Turn.unreachable(), CuriosityPort.Turn.unreachable());
+            List<String> notes = traced(rig);
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            List<String> turns = records(notes, "turn: ");
+            String r = turns.isEmpty() ? "" : turns.get(0);
+            check(n, over > 0 && turns.size() == 1 && TURN_RECORD.matcher(r).matches() && "2".equals(field(r, "tries"))
+                            && "unreachable".equals(field(r, "retry")) && "unreachable".equals(field(r, "fail"))
+                            && "?".equals(field(r, "addr")) && "failure".equals(field(r, "end"))
+                            && "Sarah".length() > 0 && !r.contains("Sarah") && rig.violations.isEmpty(),
+                    "turns=" + turns);
+        });
+        scenario("learn_a_bathroom_trigger_is_one_trig_record_strong_or_two_weak", n -> {
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning(), TOILET_ALWAYS, notes);
+            rig.started();
+            rig.runUntil(20000);
+            List<String> strong = records(notes, "trig: ");
+            List<String> notes2 = new ArrayList<String>();
+            Rig weak = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("toilet paper", 0.5f, 0.4f, 0.6f, 0.15f, 0.2f),
+                    box("sink", 0.4f, 0.7f, 0.5f, 0.3f, 0.3f)) : list()), notes2);
+            weak.started();
+            weak.runUntil(20000);
+            List<String> two = records(notes2, "trig: ");
+            List<String> notes3 = new ArrayList<String>();
+            Rig apart = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.5f, 0.4f, 0.6f, 0.3f, 0.3f))
+                    : k == 4 ? list(box("soap", 0.45f, 0.6f, 0.6f, 0.2f, 0.2f)) : list()), notes3);
+            apart.started();
+            apart.runUntil(20000);
+            List<String> looks2 = records(notes3, "trig: ");
+            check(n, strong.size() == 1 && strong.get(0).equals(
+                            "trig: kind=bathroom rule=strong label=toilet score=0.60 box=0.35,0.40,0.65,0.80 looks=1")
+                            && two.size() == 1 && two.get(0).startsWith("trig: kind=bathroom rule=weak2 label=toilet_paper+sink"
+                            + " score=0.50+0.40 box=") && two.get(0).endsWith(",0.65 looks=1")
+                            && field(two.get(0), "box").split("\\+").length == 2
+                            && looks2.size() == 1 && "sink+soap".equals(field(looks2.get(0), "label"))
+                            && "2".equals(field(looks2.get(0), "looks")) && rig.violations.isEmpty(),
+                    "strong=" + strong + " two=" + two + " apart=" + looks2);
+        });
+        scenario("learn_a_roaming_person_writes_a_person_pick_and_a_meet_trig_record", n -> {
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> true));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(15000);
+            List<String> trigs = records(notes, "trig: ");
+            String pick = trigs.isEmpty() ? "" : trigs.get(0);
+            String meet = null;
+            for (String t : trigs) {
+                meet = meet == null && "meet".equals(field(t, "kind")) ? t : meet;
+            }
+            check(n, pick.startsWith("trig: kind=person-pick rule=roaming label=person score=0.90 box=0.35,")
+                            && pick.endsWith(" looks=1") && meet != null && "person".equals(field(meet, "label"))
+                            && "roaming".equals(field(meet, "rule"))
+                            && !String.join(" ", trigs).contains("Sarah") && rig.violations.isEmpty(),
+                    "trigs=" + trigs);
+        });
+        scenario("learn_a_claude_person_pick_conversation_is_marked_claude_pick_faceless_and_its_replies", n -> {
+            // Robot 2026-10-03: from the floor faces are rarely usable, so Claude's person picks open
+            // faceless conversations; half had a real person who replied. The records tell them apart.
+            Rig rig = meetRig();
+            rig.people.persona = PERSONA;
+            rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.faceless().withMatch(null, null, Float.NaN, 5L)
+                    .withConversation(r.people.persona, null, null, null);
+            rig.people.listen = ListenScript.turns(hearWords("oh hello there"), hearWords("bye"));
+            rig.turns = turnsOf(turnLine(1), turnLine(2));
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(40000);
+            List<String> turns = records(notes, "turn: ");
+            String meet = null;
+            for (String t : records(notes, "trig: ")) {
+                meet = meet == null && "meet".equals(field(t, "kind")) ? t : meet;
+            }
+            // The first conversation's last record (a second may follow with nobody there).
+            String last = turns.size() < 2 ? "" : turns.get(1);
+            check(n, turns.size() >= 2 && TURN_RECORD.matcher(last).matches() && "claude-pick".equals(field(last, "meet"))
+                            && "1".equals(field(last, "c")) && "0".equals(field(turns.get(0), "replies"))
+                            && "y".equals(field(last, "faceless")) && "1".equals(field(last, "replies"))
+                            && "goodbye".equals(field(last, "end")) && meet != null
+                            && "claude-pick".equals(field(meet, "rule")) && rig.violations.isEmpty(),
+                    "turns=" + turns + " meet=" + meet + " notes=" + lastNotes(notes, 8));
+        });
+        scenario("learn_log_keeps_only_records_as_logcat_lines_says_alive_and_rotates", n -> {
+            java.io.File dir = java.nio.file.Files.createTempDirectory("learnlog").toFile();
+            LearnLog log = new LearnLog(dir, 1234, 600, 150, () -> 1790887142327L);
+            log.record("ExploreModeApp", "learn: start build=abc123 tuning=0badf00d diff=-");
+            log.offer("ExploreBrain", "leg: id=1 src=steer side=S");
+            log.offer("ExploreBrain", "Claude picked a person (look 1)");
+            log.offer("ExploreBrain", "the answer: two\nlines");
+            log.offer("ExploreBrain", "turn: c=1 t=1\nend=-");
+            Thread.sleep(450);
+            java.io.File f = new java.io.File(dir, LearnLog.FILE_NAME);
+            List<String> first = java.nio.file.Files.readAllLines(f.toPath());
+            java.util.regex.Pattern logcat = java.util.regex.Pattern.compile(
+                    "^\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\.\\d{3} I/(ExploreBrain|ExploreModeApp|ExploreLearn)\\( 1234\\): .*$");
+            boolean shape = !first.isEmpty();
+            for (String l : first) {
+                shape &= logcat.matcher(l).matches();
+            }
+            // Rotation is checked between batches: four batches of ten lines (~950 bytes each).
+            for (int i = 0; i < 40; i++) {
+                log.offer("ExploreBrain", "leg: id=" + i + " src=steer side=S bend=0 open=0.50 end=done");
+                if (i % 10 == 9) {
+                    Thread.sleep(60);
+                }
+            }
+            Thread.sleep(200);
+            log.close(1000);
+            java.io.File old = new java.io.File(dir, LearnLog.FILE_NAME + LearnLog.OLD_SUFFIX);
+            boolean rotated = old.exists() && old.length() < 1700 && f.length() < 1700;
+            log.offer("ExploreBrain", "leg: id=99 after close");
+            String all = new String(java.nio.file.Files.readAllBytes(f.toPath()), "UTF-8")
+                    + new String(java.nio.file.Files.readAllBytes(old.toPath()), "UTF-8");
+            check(n, shape && first.size() >= 4 && first.get(0).endsWith("): learn: start build=abc123 tuning=0badf00d diff=-")
+                            && first.get(1).endsWith("): leg: id=1 src=steer side=S")
+                            && first.get(2).endsWith("): turn: c=1 t=1 end=-") && first.get(3).contains("learn: alive")
+                            && rotated && !all.contains("after close") && !all.contains("Claude picked")
+                            && LearnLog.wanted("escape#3 end outcome=freed ms=900") && LearnLog.wanted("mode: ROAM")
+                            && !LearnLog.wanted("look in 791 ms: [chair 0.73]") && !LearnLog.wanted(null),
+                    "first=" + first + " rotated=" + rotated);
+        });
+        scenario("learn_tuning_stamp_is_a_hash_and_the_fields_off_their_defaults", n -> {
+            String plain = LearnLog.tuningStamp(new ExploreTuning.Builder().build());
+            String look = LearnLog.tuningStamp(new ExploreTuning.Builder()
+                    .navigation(ExploreTuning.Navigation.LOOK_THEN_GO).build());
+            String start = LearnLog.startRecord("1a2b3c4d5e6f+deadbeef", new ExploreTuning.Builder().build());
+            check(n, plain.matches("tuning=[0-9a-f]{8} diff=-") && look.matches("tuning=[0-9a-f]{8} diff=navigation=LOOK_THEN_GO")
+                            && !plain.substring(0, 15).equals(look.substring(0, 15))
+                            && start.equals("learn: start build=1a2b3c4d5e6f+deadbeef " + plain)
+                            && LearnLog.startRecord(null, new ExploreTuning.Builder().build()).startsWith("learn: start build=- "),
+                    "plain=" + plain + " look=" + look + " start=" + start);
         });
     }
 }

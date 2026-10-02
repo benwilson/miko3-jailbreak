@@ -185,6 +185,12 @@ public class ModeApp extends Application {
                     ? ExploreTuning.Navigation.LOOK_THEN_GO : ExploreTuning.Navigation.CONTINUOUS;
             Log.i(TAG, "navigation: " + navigation);
             final ExploreTuning tuning = ExploreTuning.defaults(calibration, gyro, navigation);
+            // The learning log opens before the brain notes anything; its first line says which
+            // build and tuning this run is, so scripts/daily-diff.py can compare two days' code.
+            learnLog = new LearnLog(getFilesDir(), android.os.Process.myPid());
+            String stamp = LearnLog.startRecord(buildId(), tuning);
+            learnLog.record("ExploreModeApp", stamp);
+            Log.i(TAG, stamp);
             clips = new ClipPlayer(this);
             // Open whenever he roams, escapes or is curious, closed while he talks
             // (explore nav plan U4, KTD2); the recognizer loads on the camera's
@@ -239,6 +245,12 @@ public class ModeApp extends Application {
                 return;
             }
             loop.stop();
+            LearnLog l = learnLog;
+            learnLog = null;
+            if (l != null) {
+                l.record("ExploreModeApp", "learn: stop");
+                l.close(500);
+            }
             drive.setReadingListener(null);
             ears.release();
             curiosity.release();
@@ -390,12 +402,28 @@ public class ModeApp extends Application {
         }
     }
 
+    /** The learning log (2026-10-03): the brain's records, appended for a developer to pull. Null while stopped. */
+    private volatile LearnLog learnLog;
+
     private final ExploreBrain.Trace trace = new ExploreBrain.Trace() {
         @Override
         public void note(String message) {
             Log.i("ExploreBrain", message);
+            LearnLog l = learnLog;
+            if (l != null) {
+                l.offer("ExploreBrain", message);
+            }
         }
     };
+
+    /** The build id the APK carries (its versionName, scripts/build_common.py build_id()), or null. */
+    private String buildId() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     /** Called when a MainActivity instance (re)establishes itself as the active
      * one: bumps and returns the new generation and marks the mode present. */
