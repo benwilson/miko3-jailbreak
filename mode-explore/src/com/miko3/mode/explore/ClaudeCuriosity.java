@@ -74,6 +74,12 @@ final class ClaudeCuriosity implements CuriosityPort {
      * storage, never image data in the log.
      */
     static final String FACE_DEBUG_TAG = "MikoExploreFaceDebug";
+    /**
+     * Debug only (owner 2026-10-02, testing with robot-say.py): with log.tag.MikoExploreSayDebug at
+     * DEBUG, each turn's spoken line and tool calls are logged, so an injected test conversation can
+     * be read back. Off by default; robot-say.py sets it for its run and always clears it.
+     */
+    static final String SAY_DEBUG_TAG = "MikoExploreSayDebug";
     static final String LAST_FACE = "last-face.jpg";
     static final String LAST_FACE_SRC = "last-face-src.jpg";
     /** With the switch on, each meeting's source frame is also kept here, newest FACE_FRAMES_KEPT (U9's bench). */
@@ -802,6 +808,15 @@ final class ClaudeCuriosity implements CuriosityPort {
                 + (earlyAt[0] == 0 ? "-" : String.valueOf(earlyAt[0] - t0)) + " ms; system "
                 + body.system.length() + " chars, max_tokens " + ClaudeApi.CONVERSATION_MAX_TOKENS + ", respond tool"
                 + (o.tools == null ? "" : ", tool round: " + o.tools) + ", effort " + effort + ")");
+        if (Log.isLoggable(SAY_DEBUG_TAG, Log.DEBUG)) {
+            StringBuilder calls = new StringBuilder();
+            if (r != null && r.toolUses != null) {
+                for (ClaudeApi.ToolUse u : r.toolUses) {
+                    calls.append(calls.length() == 0 ? "" : "; ").append(u.name).append(' ').append(u.input);
+                }
+            }
+            Log.d(SAY_DEBUG_TAG, "line: " + t.line + " | tool round: " + o.tools + " | final calls: " + calls);
+        }
     }
 
     /** Owner 2026-10-03: a tool round's ask, handed to the brain through toolAsk(); a look waits for its answer. */

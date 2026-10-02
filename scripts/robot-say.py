@@ -43,7 +43,9 @@ from pathlib import Path
 PROPERTY = "debug.miko3.ears_inject"
 COMPONENT = "com.miko3.launcher/.EarsInjectReceiver"
 ACTION = "com.miko3.launcher.action.EARS_INJECT"
-TAGS = ("ListenEngine", "EarsInject", "ExploreBrain", "ExploreClaude")
+# Explore logs each turn's line and tool calls under this tag while it is at DEBUG (test runs only).
+SAY_DEBUG_TAG = "MikoExploreSayDebug"
+TAGS = ("ListenEngine", "EarsInject", "ExploreBrain", "ExploreClaude", SAY_DEBUG_TAG)
 DEFAULT_TIMEOUT_S = 45.0
 DEFAULT_TAIL_S = 20.0
 ACK_S = 5.0
@@ -53,7 +55,7 @@ SPENT = "ears: inject spent"
 CONVERSATION_OVER = "conversation over"
 # The lines worth showing, by the start of their message.
 RELEVANT = ("turn:", "act:", "task:", "intent:", CONVERSATION_OVER, "listening for a reply", "answering the call",
-            "listen past", "ears: conversation listen", "ears: inject", "queued ", "refused ", "ignored: ")
+            "listen past", "ears: conversation listen", "ears: inject", "queued ", "refused ", "ignored: ", "line: ")
 _LOG = re.compile(r"^(?:\d\d-\d\d \d\d:\d\d:\d\d\.\d+\s+)?[VDIWEF]/\s*([\w.$-]+)\s*\(\s*\d+\):\s?(.*)$")
 
 
@@ -164,8 +166,10 @@ class Robot:
         if left == "1":
             print(f"note: {PROPERTY} was already 1 (an interrupted run?); it is cleared on exit")
         self.shell(f"setprop {PROPERTY} 1")
+        self.shell(f"setprop log.tag.{SAY_DEBUG_TAG} DEBUG", check=False)
 
     def disarm(self):
+        self.shell(f'setprop log.tag.{SAY_DEBUG_TAG} ""', check=False)
         self.shell(f'setprop {PROPERTY} ""', check=False)
 
     def device_time(self):
@@ -185,7 +189,7 @@ class LogStream:
         # `adb logcat` hands its arguments over as they are (robot 2026-10-02: a quoted time
         # reached logcat with its quotes, "not in time format", and the reader saw nothing).
         args = ["logcat", "-v", "time"] + (["-T", since] if since else ["-T", "1"]) + ["-s"]
-        args += [f"{t}:I" for t in TAGS]
+        args += [f"{t}:D" for t in TAGS]
         self.proc = subprocess.Popen(robot.cmd(*args), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                      text=True, errors="replace")
         self.lines = queue.Queue()

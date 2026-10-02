@@ -607,12 +607,35 @@ class NothingPrivateIsLoggedTest(unittest.TestCase):
         offenders = []
         for f in self.FILES:
             for call in re.findall(r"Log\.[diwe]\((.*?)\);", code_only(src(f)), re.S):
+                if call.lstrip().startswith("SAY_DEBUG_TAG,"):
+                    # Debug-gated test logging; SayDebugLogIsGatedTest checks the gate.
+                    continue
                 args = call.split(",", 1)[1] if "," in call else call
                 # Drop the string literals: fixed text is fine.
                 bare = re.sub(r'"(?:\\.|[^"\\])*"', "", args)
                 if self.PRIVATE.search(bare):
                     offenders.append(f"{f}: Log({call.strip()})")
         self.assertEqual(offenders, [])
+
+
+class SayDebugLogIsGatedTest(unittest.TestCase):
+    """Owner 2026-10-02: robot-say.py test runs read each turn's line and tool calls back
+    from the log. Those words are logged only under SAY_DEBUG_TAG, and only inside a
+    Log.isLoggable(SAY_DEBUG_TAG, Log.DEBUG) check, which is off unless the script sets it."""
+
+    def test_every_say_debug_log_is_inside_its_isloggable_gate(self):
+        body = code_only(src("ClaudeCuriosity.java"))
+        starts = [m.start() for m in re.finditer(r"Log\.[diwe]\(\s*SAY_DEBUG_TAG\s*,", body)]
+        self.assertTrue(starts, "no SAY_DEBUG_TAG log found")
+        for at in starts:
+            before = body[max(0, at - 700):at]
+            self.assertIn("Log.isLoggable(SAY_DEBUG_TAG, Log.DEBUG)", before)
+
+    def test_robot_say_sets_and_clears_the_tag(self):
+        script = (REPO / "scripts" / "robot-say.py").read_text()
+        self.assertIn('SAY_DEBUG_TAG = "MikoExploreSayDebug"', script)
+        self.assertIn("setprop log.tag.{SAY_DEBUG_TAG} DEBUG", script)
+        self.assertIn("setprop log.tag.{SAY_DEBUG_TAG} \"\"", script)
 
 
 class ClaudeLatencyIsLoggedTest(unittest.TestCase):
