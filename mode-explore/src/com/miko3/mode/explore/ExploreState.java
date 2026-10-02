@@ -228,9 +228,20 @@ final class ExploreState {
             // Resting (cornered cool-down): drowsy, slowly breathing lids.
             + "@keyframes drowse{from{transform:scale(1,.6);opacity:.85}to{transform:scale(1,.3);opacity:.55}}"
             + "#rig.s-" + RESTING + " .glow-core{animation:drowse 2.4s ease-in-out infinite alternate!important}"
-            // Thinking (waiting for Claude): a slow bright-dim pulse; the gaze goes up (GAZE_JS).
-            + "@keyframes ponder{from{filter:brightness(.8)}to{filter:brightness(1.25)}}"
-            + "#rig.s-" + THINKING + " .glow-core{animation:ponder 1.2s ease-in-out infinite alternate!important}"
+            // Thinking (waiting for Claude): the eye keeps its normal glow but two
+            // gold arcs spin around the hot centre once a second, a "working on it"
+            // pinwheel; the gaze goes up (GAZE_JS). The core stops its blink
+            // (!important: the blink is inline), which would squash the spinner
+            // with it. The spinner is a pseudo-element of the core, so it follows
+            // the gaze and vanishes the instant the class changes. Only its
+            // transform animates (one composited layer, no repaint per frame).
+            // Border arcs, not conic-gradient: the robot's WebView is old.
+            + "@keyframes pinwheel{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"
+            + "#rig.s-" + THINKING + " .glow-core{animation:none!important;position:relative}"
+            + "#rig.s-" + THINKING + " .glow-core::after{content:'';position:absolute;"
+            + "left:21%;top:21%;width:58%;height:58%;box-sizing:border-box;border-radius:50%;"
+            + "border:2.6vmin solid transparent;border-top-color:#ffd23f;border-bottom-color:#ffd23f;"
+            + "opacity:.9;will-change:transform;animation:pinwheel 1s linear infinite}"
             // Listening (meeting plan KTD12): wide open and bright, a slow attentive swell, no blink.
             + "@keyframes attend{from{transform:scale(1.06,1.1);filter:brightness(1.1)}"
             + "to{transform:scale(1.1,1.16);filter:brightness(1.25)}}"

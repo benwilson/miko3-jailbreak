@@ -73,6 +73,26 @@ class ExploreStatePageTest(unittest.TestCase):
             self.assertIsNotNone(rule, state)
             self.assertRegex(rule.group(1), r"animation:[^;]*!important", state)
 
+    def test_thinking_spins_a_pinwheel_rather_than_only_dimming(self):
+        # Owner request: while he waits for Claude's reply each eye shows a turning
+        # "working on it" spinner, not just the old bright-dim "ponder" pulse. The
+        # spinner is one pseudo-element per eye under the thinking class (so it
+        # goes the instant the class changes), turned by a single transform
+        # rotate keyframe, no per-frame JS.
+        self.assertNotIn("animation:ponder", self.page)
+        spin = re.search(r"@keyframes (\w+)\{from\{transform:rotate\(0(?:deg)?\)\}to\{transform:rotate\(360deg\)\}\}",
+                         self.page)
+        self.assertIsNotNone(spin, "a rotate-only keyframe for the spinner")
+        rule = re.search(r"#rig\.s-thinking \.glow-core::(?:before|after)\{([^}]*)\}", self.page)
+        self.assertIsNotNone(rule, "the spinner rides a pseudo-element of each core")
+        self.assertRegex(rule.group(1), r"animation:" + spin.group(1) + r" [0-9.]+s linear infinite")
+        self.assertIn("content:''", rule.group(1))
+        # It sits on the core, so it follows the gaze; the core itself stops the blink
+        # (inline, so !important), which would otherwise squash the spinner with it.
+        core = re.search(r"#rig\.s-thinking \.glow-core\{([^}]*)\}", self.page)
+        self.assertIsNotNone(core)
+        self.assertIn("animation:none!important", core.group(1))
+
     def test_glances_slide_the_gaze_to_the_voices_side_and_listening_keeps_it_still(self):
         # Meeting plan R3, KTD12: a glance holds the eyes on the side the voice came from (the
         # page shows the robot's left as +x, as the look state does) as soon as it lands.
