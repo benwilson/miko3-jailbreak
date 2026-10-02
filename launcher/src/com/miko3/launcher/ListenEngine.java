@@ -168,7 +168,7 @@ final class ListenEngine implements ListenSession.Ears {
                     public void log(String note) {
                         Log.i(TAG, "ears: " + note);
                     }
-                }, earsTuning.gateWake);
+                }, earsTuning.gateWake, EarsSession.prerollMs(props.get(EarsSession.PREROLL_PROP)));
         // KTD1: the deaf window follows the speech queue's line start and idle.
         speech.setSpeaking(new SpeechQueue.Speaking() {
             @Override

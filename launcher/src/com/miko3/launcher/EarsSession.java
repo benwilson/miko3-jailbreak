@@ -73,6 +73,17 @@ final class EarsSession {
     static final long LISTEN_HARD_CAP_MS = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS;
     /** Speech that began this soon before a listen opened (they answered as his question ended) is its answer. */
     static final long LISTEN_EARLY_START_MS = 500;
+    /**
+     * The pre-roll (TODO 2026-10-01): the VAD opens after a word has begun, so the
+     * recogniser first hears this much of the audio just before the onset, or
+     * "Miko" decodes as "O". Host sweep on synthetic clips (relative guidance only),
+     * launcher decoding, at 0/160/240/300/400/500 ms: name hits 44/102/101/98/98/105
+     * of 162 (flat past 160), greetings 7/19/24/26/22/21 of 54, chatter WER
+     * 42.7/30.1/27.5/22.1/23.9/24.4 %, decode CPU +9/+15/+18/+25/+28 %.
+     */
+    static final long DEFAULT_PREROLL_MS = 300;
+    static final long MAX_PREROLL_MS = 1000;
+    static final String PREROLL_PROP = "persist.miko3.ears.preroll_ms";
     static final long SUMMARY_MS = 60000;
     /** The wake gate holds at most this much of an utterance (the oldest goes first). */
     static final int HELD_MAX_SAMPLES = SAMPLE_RATE * 10;
@@ -217,6 +228,7 @@ final class EarsSession {
     private final Diag diag;
     private final LeaseKeeper keeper;
     private final boolean gateWake;
+    private final long prerollMs;
 
     // Guarded by this.
     private Client client;
@@ -237,6 +249,16 @@ final class EarsSession {
     // The capture thread's own state (feed() is serialized on feedLock).
     private final Object feedLock = new Object();
     private final float[] samples = new float[CHUNK_SAMPLES];
+    /**
+     * The pre-roll ring: the latest heard audio no recogniser or hold has taken,
+     * oldest at preStart. Emptied at every onset (it is fed first), in and after
+     * the deaf window, and when a capture starts, so it never repeats audio or
+     * carries the robot's own line.
+     */
+    private final short[] pre;
+    private final float[] preOut;
+    private int preStart;
+    private int preLen;
     private boolean wasDeaf;
     private boolean inSpeech;
     private boolean partialHead;
@@ -280,9 +302,16 @@ final class EarsSession {
         this(clock, capture, spotter, gate, recognizer, direction, classifier, deafTailMs, diag, false);
     }
 
-    /** gateWake: EarsTuning's wake gate (see the class comment); false is the plain session. */
     EarsSession(Clock clock, Capture capture, Spotter spotter, Gate gate, Recognizer recognizer, Direction direction,
                 CueClassifier classifier, long deafTailMs, Diag diag, boolean gateWake) {
+        this(clock, capture, spotter, gate, recognizer, direction, classifier, deafTailMs, diag, gateWake,
+                DEFAULT_PREROLL_MS);
+    }
+
+    /** gateWake: EarsTuning's wake gate (see the class comment); false is the plain session.
+     * prerollMs: how much audio before the VAD onset the recogniser hears first (0: none). */
+    EarsSession(Clock clock, Capture capture, Spotter spotter, Gate gate, Recognizer recognizer, Direction direction,
+                CueClassifier classifier, long deafTailMs, Diag diag, boolean gateWake, long prerollMs) {
         this.clock = clock;
         this.capture = capture;
         this.spotter = spotter;
@@ -293,6 +322,9 @@ final class EarsSession {
         this.deafTailMs = deafTailMs;
         this.diag = diag;
         this.gateWake = gateWake;
+        this.prerollMs = Math.max(0, Math.min(MAX_PREROLL_MS, prerollMs));
+        this.pre = new short[(int) (this.prerollMs * SAMPLE_RATE / 1000)];
+        this.preOut = new float[pre.length];
         this.keeper = new LeaseKeeper(TTL_MS, new LeaseKeeper.Released() {
             @Override
             public void released(String holder, String reason) {
@@ -581,6 +613,9 @@ final class EarsSession {
         Mic mic = null;
         try {
             mic = capture.open();
+            synchronized (feedLock) {
+                preLen = 0; // a new capture: the last one's audio is not this utterance's head
+            }
             capturing = true;
             diag.log("capture open");
             short[] pcm = new short[CHUNK_SAMPLES];
@@ -639,6 +674,7 @@ final class EarsSession {
                 if (inSpeech) {
                     endUtterance(now, true);
                 }
+                preLen = 0;
                 wasDeaf = true;
                 dropped++;
                 return;
@@ -648,6 +684,7 @@ final class EarsSession {
                 gate.reset();
                 spotter.reset();
                 resets++;
+                preLen = 0;
                 wasDeaf = false;
                 hearingSince = now;
             }
@@ -668,6 +705,15 @@ final class EarsSession {
                     heldLen = 0;
                     uttDecodeNs = 0;
                     uttFed = 0;
+                    // The word began before the gate saw it: its head goes in first.
+                    int head = drainPreroll();
+                    if (head > 0) {
+                        if (recognising) {
+                            decode(preOut, head);
+                        } else {
+                            hold(preOut, head);
+                        }
+                    }
                 }
                 lastSpeechMs = now;
             }
@@ -717,7 +763,54 @@ final class EarsSession {
                 if (endpoint || now >= uttCapAt || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
                     endUtterance(now, false);
                 }
+            } else {
+                keepPreroll(pcm, n); // nobody took it: the next onset's head
             }
+        }
+    }
+
+    /** Caller holds feedLock. Appends a chunk no one took to the pre-roll ring, the oldest audio going first. */
+    private void keepPreroll(short[] pcm, int n) {
+        int cap = pre.length;
+        if (cap == 0) {
+            return;
+        }
+        int from = 0;
+        if (n > cap) {
+            from = n - cap;
+        }
+        for (int i = from; i < n; i++) {
+            if (preLen < cap) {
+                pre[(preStart + preLen) % cap] = pcm[i];
+                preLen++;
+            } else {
+                pre[preStart] = pcm[i];
+                preStart = (preStart + 1) % cap;
+            }
+        }
+    }
+
+    /** Caller holds feedLock. Empties the ring into preOut, oldest first, as samples; returns how many. */
+    private int drainPreroll() {
+        int cap = pre.length;
+        int len = preLen;
+        for (int i = 0; i < len; i++) {
+            preOut[i] = pre[(preStart + i) % cap] / 32768f;
+        }
+        preLen = 0;
+        preStart = 0;
+        return len;
+    }
+
+    /** "persist.miko3.ears.preroll_ms": a length in ms within [0, MAX_PREROLL_MS], else the default. */
+    static long prerollMs(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return DEFAULT_PREROLL_MS;
+        }
+        try {
+            return Math.max(0, Math.min(MAX_PREROLL_MS, Long.parseLong(raw.trim())));
+        } catch (NumberFormatException e) {
+            return DEFAULT_PREROLL_MS;
         }
     }
 
@@ -845,6 +938,7 @@ final class EarsSession {
         angles.clear();
         recordDecode();
         recognizer.reset();
+        preLen = 0;
         if (uttCapAt != Long.MAX_VALUE) {
             uttCapAt = Long.MAX_VALUE;
             answerEnded(clock.nowMs());

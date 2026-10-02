@@ -244,6 +244,20 @@ public final class ListenServiceHarness {
         }
     }
 
+    /** Null when marks run first..last, each sample once and in order; else what went wrong. */
+    static String contiguous(List<Integer> marks, int first, int last) {
+        if (marks.size() != last - first + 1) {
+            return "fed " + marks.size() + " marks, want " + (last - first + 1) + " (" + first + ".." + last + ")"
+                    + (marks.isEmpty() ? "" : " from " + marks.get(0));
+        }
+        for (int i = 0; i < marks.size(); i++) {
+            if (marks.get(i) != first + i) {
+                return "mark " + i + " is " + marks.get(i) + ", want " + (first + i);
+            }
+        }
+        return null;
+    }
+
     static String describe(ListenSession.Result r) {
         return r.outcome + "/" + r.stop + " \"" + r.text + "\" " + r.audioMs + " ms " + r.reason;
     }
@@ -364,10 +378,19 @@ public final class ListenServiceHarness {
         FakeClock clock;
         long decodeNsPerChunk;
 
+        /** Every non-silent sample handed over, in order, as the short it was captured as (the pre-roll scenarios). */
+        final List<Integer> marks = new ArrayList<Integer>();
+
         @Override
         public void accept(float[] samples, int n) {
             accepted++;
             this.samples += n;
+            for (int i = 0; i < n; i++) {
+                int v = Math.round(samples[i] * 32768f);
+                if (v != 0) {
+                    marks.add(v);
+                }
+            }
             if (clock != null) {
                 clock.nanos += decodeNsPerChunk * ((n + CHUNK - 1) / CHUNK);
             }
@@ -537,8 +560,35 @@ public final class ListenServiceHarness {
                     gateWake);
         }
 
+        /** With an explicit pre-roll length. */
+        Rig(boolean gateWake, long prerollMs) {
+            session = new EarsSession(clock, capture, spotter, gate, rec, direction, new CueClassifier(sw), TAIL, diag,
+                    gateWake, prerollMs);
+        }
+
         void open(boolean charger) {
             session.open("10001", token, client, charger);
+        }
+
+        /** The next mark to capture: each marked sample is its own position in the audio, from 1. */
+        int mark = 1;
+
+        /** One chunk whose samples are numbered, so the recogniser's input shows what was fed, in what order. */
+        void marked(boolean speech) {
+            for (int i = 0; i < CHUNK; i++) {
+                pcm[i] = (short) mark++;
+            }
+            chunk(speech);
+            Arrays.fill(pcm, (short) 0);
+        }
+
+        /** n marked speech chunks, then a marked chunk carrying the endpoint. */
+        void markedUtter(int n) {
+            for (int i = 0; i < n; i++) {
+                marked(true);
+            }
+            rec.endpoint = true;
+            marked(true);
         }
 
         /** Advances the clock one 80 ms chunk and feeds it, with speech present or not. */
@@ -1654,6 +1704,106 @@ public final class ListenServiceHarness {
                 double[] five = {1, 2, 3, 4, 100};
                 check(n, first && EarsSession.percentile(five, 95) == 100 && EarsSession.percentile(five, 50) == 3
                         && EarsSession.percentile(new double[] {7}, 95) == 7, String.valueOf(r.diag.lines));
+            }
+        });
+
+        // ---- the pre-roll: the audio just before the VAD's onset reaches the recogniser first ----
+
+        scenario("ears_preroll_feeds_the_head_before_the_onset_in_order", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(); // the default pre-roll, never opened: no capture thread feeds
+                int pre = (int) (EarsSession.DEFAULT_PREROLL_MS * EarsSession.SAMPLE_RATE / 1000);
+                for (int i = 0; i < 6; i++) {
+                    r.marked(false); // the word's first 150 ms and more sit here, before the gate opens
+                }
+                int onset = r.mark;
+                r.markedUtter(3);
+                String bad = contiguous(r.rec.marks, onset - pre, r.mark - 1);
+                check(n, bad == null && pre >= CHUNK * 15 / 8, "pre=" + pre + " " + bad);
+            }
+        });
+        scenario("ears_preroll_never_feeds_a_sample_twice", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(false, 300);
+                for (int i = 0; i < 5; i++) {
+                    r.marked(false);
+                }
+                int first = r.mark - 300 * 16;
+                r.markedUtter(3);
+                int gap = r.mark;
+                r.marked(false); // one chunk between the endpoint and the next onset
+                r.rec.endpoint = false;
+                r.markedUtter(2);
+                // The second utterance's pre-roll is the gap alone: nothing the first one fed comes back.
+                String bad = contiguous(r.rec.marks, first, r.mark - 1);
+                check(n, bad == null, "gap=" + gap + " " + bad);
+            }
+        });
+        scenario("ears_preroll_is_held_with_the_utterance_under_the_wake_gate", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true, 300);
+                r.sw.on = false;
+                for (int i = 0; i < 4; i++) {
+                    r.marked(false);
+                }
+                int first = r.mark - 300 * 16;
+                r.marked(true);
+                r.marked(true); // held, pre-roll first
+                int before = r.rec.marks.size();
+                r.spotter.hitNext = true;
+                r.marked(true); // the engine fires: pre-roll, the held chunks, this one
+                r.rec.endpoint = true;
+                r.marked(true);
+                String bad = contiguous(r.rec.marks, first, r.mark - 1);
+                check(n, before == 0 && bad == null, "before=" + before + " " + bad);
+            }
+        });
+        scenario("ears_preroll_holds_nothing_from_before_the_deaf_window", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(false, 500);
+                for (int i = 0; i < 6; i++) {
+                    r.marked(false); // hearing, before the robot speaks
+                }
+                r.session.lineStarted();
+                for (int i = 0; i < 3; i++) {
+                    r.marked(false); // the robot's own line: deaf
+                }
+                r.session.playbackIdle();
+                while (r.clock.now + 80 < r.session.deafUntilMs()) {
+                    r.marked(false); // the tail: deaf
+                }
+                int heard = r.mark;
+                r.marked(false);
+                r.marked(false); // 160 ms heard, shorter than the pre-roll
+                r.markedUtter(2);
+                // The utterance leads with the heard audio alone: nothing from before or inside the window.
+                String bad = contiguous(r.rec.marks, heard, r.mark - 1);
+                check(n, bad == null, "heard=" + heard + " " + bad);
+            }
+        });
+        scenario("ears_preroll_holds_nothing_from_before_a_capture_restart", new Scenario() {
+            public void run(String n) throws Exception {
+                Rig r = new Rig(false, 500);
+                for (int i = 0; i < 6; i++) {
+                    r.marked(false); // fed before any capture runs: a previous capture's last audio
+                }
+                int restart = r.mark;
+                r.open(false);
+                boolean up = r.awaitMic(true);
+                r.markedUtter(2); // the fake mic's silent chunks may interleave; only marks count
+                r.session.close("10001");
+                int lowest = r.rec.marks.isEmpty() ? -1 : Collections.min(r.rec.marks);
+                check(n, up && lowest >= restart, "restart=" + restart + " lowest=" + lowest);
+            }
+        });
+        scenario("ears_preroll_tuning_parses_and_clamps", new Scenario() {
+            public void run(String n) {
+                long d = EarsSession.DEFAULT_PREROLL_MS;
+                check(n, EarsSession.prerollMs(null) == d && EarsSession.prerollMs(" ") == d
+                        && EarsSession.prerollMs("junk") == d && EarsSession.prerollMs(" 160 ") == 160
+                        && EarsSession.prerollMs("0") == 0 && EarsSession.prerollMs("-40") == 0
+                        && EarsSession.prerollMs("99999") == EarsSession.MAX_PREROLL_MS
+                        && d >= 160 && d <= 500, "default=" + d);
             }
         });
 

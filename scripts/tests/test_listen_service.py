@@ -154,6 +154,12 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_gate_stays_open_with_the_switch_on",
         "ears_gate_opens_for_a_conversation_listen",
         "ears_summary_reports_decode_ms_per_chunk",
+        "ears_preroll_feeds_the_head_before_the_onset_in_order",
+        "ears_preroll_never_feeds_a_sample_twice",
+        "ears_preroll_is_held_with_the_utterance_under_the_wake_gate",
+        "ears_preroll_holds_nothing_from_before_the_deaf_window",
+        "ears_preroll_holds_nothing_from_before_a_capture_restart",
+        "ears_preroll_tuning_parses_and_clamps",
         "keeper_acquire_renew_release",
         "keeper_ttl_expiry",
         "keeper_death_and_stale_death_ignored",
@@ -389,8 +395,13 @@ class EngineWiringTest(unittest.TestCase):
         for prop, name in (("DECODING_PROP", "decoding"), ("PATHS_PROP", "paths"), ("THREADS_PROP", "threads"),
                            ("GATE_PROP", "gate")):
             self.assertRegex(tuning, prop + r'\s*=\s*"persist\.miko3\.ears\.' + name + '"')
-        self.assertIn("earsTuning.gateWake)", self.src)
+        self.assertIn("earsTuning.gateWake,", self.src)
         self.assertIn("earsTuning + \")\")", self.src, "the ready line names the switches for the QA script")
+
+    def test_ears_preroll_is_a_property_read_at_start(self):
+        """TODO 2026-10-01: the recogniser hears the last N ms before the VAD onset first; N is tunable."""
+        self.assertRegex(_read(EARS), r'PREROLL_PROP\s*=\s*"persist\.miko3\.ears\.preroll_ms"')
+        self.assertRegex(self.src, r"earsTuning\.gateWake,\s*EarsSession\.prerollMs\(props\.get\(EarsSession\.PREROLL_PROP\)\)\)")
 
     def test_ears_feed_the_wake_word_engine_a_silero_gate_and_the_direction_sampler(self):
         for needle in ("new WakeWord(", "processChunk(", "SileroVadModelConfig", "new Vad(", "isSpeechDetected()",
