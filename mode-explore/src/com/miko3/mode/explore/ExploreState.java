@@ -46,9 +46,11 @@ final class ExploreState {
 
     static final ExploreState IDLE_STATE = new ExploreState(IDLE, 0, 0);
 
-    /** Page poll interval while the mode is up (KTD10: about 150 ms, so a "look"
-     * lands within one poll of the brain's ~500 ms lead before a turn). */
-    static final int POLL_MS = 150;
+    /** Page poll interval while the mode is up (KTD10: a "look" lands within one poll of
+     * the brain's ~500 ms lead before a turn). 400 ms, not 150: robot 2026-10-02 on the
+     * dock, Explore's main thread ran ~45% of a core and WebView's IO thread ~10-14% with
+     * the detector parked, and every poll is a full HTTP round trip. */
+    static final int POLL_MS = 400;
 
     /** The page's "s-" class suffix and /state's "state" field: lowercase letters,
      * digits and dashes only, so it drops into CSS and JSON without escaping. */
