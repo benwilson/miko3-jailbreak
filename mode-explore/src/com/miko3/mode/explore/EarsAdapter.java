@@ -73,6 +73,9 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
 
         /** Robot 2026-10-01: the launcher says this listen's answer has started (speech began at at). */
         void answering(long at);
+
+        /** Review 2026-10-01 (P2-2): the launcher says that answer ended without words. */
+        void answerOver(long at);
     }
 
     private final Context app;
@@ -275,6 +278,21 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         }
         if (r != null) {
             r.answering(at);
+        }
+    }
+
+    /**
+     * Review 2026-10-01 (P2-2): the answer the launcher announced ended without words. It
+     * goes to the armed reply (which ends its hold); with none armed it is dropped: no cue.
+     */
+    @Override
+    public void onAnswerOver(long at) {
+        Reply r;
+        synchronized (lock) {
+            r = open ? reply : null;
+        }
+        if (r != null) {
+            r.answerOver(at);
         }
     }
 

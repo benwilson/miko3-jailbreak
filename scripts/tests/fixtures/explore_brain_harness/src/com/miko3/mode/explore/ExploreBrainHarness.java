@@ -2790,6 +2790,428 @@ public final class ExploreBrainHarness {
         });
     }
 
+    // ---- review fixes (review 2026-10-01) ----
+
+    private static void reviewFixScenarios() {
+        scenario("review_lease_lost_in_the_back_up_wait_the_next_short_back_up_still_stops_on_a_stall_and_waits", n -> {
+            // Review P2-1: the lease drops during the 3 s wait after a short back-up. With
+            // retryWaiting left set, the next blocked turn's back-up ran blind for its full
+            // time (no stall check) and turned at once (no wait): the motor board's latch.
+            Rig rig = new Rig(escTuning().turnChance(1.0).build(), CLEAR, NOTHING, true);
+            List<String> notes = traced(rig);
+            rig.simWheels = true;
+            rig.yaw.blockFirstTurnsSide = true;
+            rig.started();
+            runUntil(rig, 30000, r -> notedAt(notes, "backed up: waiting") >= 0);
+            long waited = notedAt(notes, "backed up: waiting");
+            rig.runUntil(rig.now + 1000);
+            rig.brain.onLeaseChanged(false);
+            rig.runUntil(rig.now + 500);
+            long regained = rig.now;
+            // Every turn is blocked from here on, and reversing goes nowhere.
+            rig.yaw.stuck = true;
+            rig.backBlocked = true;
+            rig.brain.onLeaseChanged(true);
+            runUntil(rig, regained + 30000, r -> notedAfter(notes, "backing up a little", regained) >= 0
+                    && r.brain.state() != ExploreBrain.State.BACK_OFF);
+            long second = notedAfter(notes, "backing up a little", regained);
+            long stalled = notedAfter(notes, "wheels stalled backing up", regained);
+            check(n, waited > 0 && second > regained && stalled > second && rig.violations.isEmpty(),
+                    "waited@" + waited + " second@" + second + " stalled@" + stalled + " notes="
+                            + notesAfter(notes, regained));
+        });
+    }
+
+    private static void reviewAnswerOverScenarios() {
+        scenario("review_chat_an_answer_that_ends_without_words_is_unanswered_as_it_ends_not_at_the_fallback", n -> {
+            // Review P2-2: a cough at 3.5 s says answering; the launcher's "answer over" at 5 s ends
+            // the port's listen as silence (NOTHING). The conversation must not hold to 23 s.
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("hi").after(300),
+                    hearSilence().after(5000).answeringAfter(3500));
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long second = nthListenAt(rig, open, 2);
+            long held = noteAt(notes, "an answer has started");
+            long first = noteAt(notes, "first unanswered listen");
+            check(n, open > 0 && over > 0 && second > 0 && held - second >= 4000 && held - second <= 4150
+                            && first - second >= 5000 && first - second <= 5150 && rig.violations.isEmpty(),
+                    "second@" + second + " held@" + held + " first unanswered@" + first + " notes=" + notes);
+        });
+    }
+
+    private static void reviewMeetAnswerOverScenarios() {
+        scenario("review_meet_a_wordless_answer_ends_the_listen_when_the_port_says_silence_not_at_29_s", n -> {
+            // Review P2-2, the brain's side: answering at 1 s, then the launcher's "answer over"
+            // (the port's NOTHING) at 12 s, past the listen's deadline: "no reply" then, not at 29 s.
+            Rig rig = meetRig();
+            List<String> notes = traced(rig);
+            rig.people.match = (r, k) -> STRANGER;
+            rig.people.listen = ListenScript.always(hearSilence().after(12000).answeringAfter(1000));
+            rig.started();
+            rig.runUntil(60000);
+            int listen = rig.first("listen", 0);
+            long noReply = noteAt(notes, "no reply");
+            check(n, listen >= 0 && noteAt(notes, "an answer has started") > rig.timeOf(listen)
+                            && noReply - rig.timeOf(listen) >= 12000 && noReply - rig.timeOf(listen) <= 12200
+                            && rig.violations.isEmpty(),
+                    "listen@" + rig.timeOf(listen) + " noReply@" + noReply + " notes=" + notes);
+        });
+    }
+
+    private static void reviewCplEpisodeScenarios() {
+        scenario("review_one_cpl_hiccup_episode_counts_once_toward_boxed_in_and_its_retry_still_runs", n -> {
+            // Review P2-3: on plain floor, a hiccup, CPL again on its retry (one episode), then a
+            // second hiccup on a later leg: two episodes, not three refusals. He is not boxed in,
+            // and the second hiccup's retry leg is driven.
+            Rig[] h = new Rig[1];
+            long[] cpls = {0};
+            long[] lastAt = {-1};
+            Rig rig = escRig(escTuning().hopTicks(8), h, t -> {
+                Rig r = h[0];
+                if (r == null || !"hop".equals(r.motion) || r.brain.state() != ExploreBrain.State.HOP) {
+                    return clear(t);
+                }
+                long into = t - r.legStartT;
+                boolean due = cpls[0] == 0 ? into >= 300
+                        : cpls[0] == 1 ? into >= 100 && t - lastAt[0] >= 300
+                        : cpls[0] == 2 ? t - lastAt[0] >= 8000 && into >= 300 : false;
+                if (!due) {
+                    return clear(t);
+                }
+                cpls[0]++;
+                lastAt[0] = t;
+                return cpl2(t);
+            }, null);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(40000);
+            List<Long> hiccups = noteTimes(notes, "controller refused forward (CPL) on plain floor");
+            long second = hiccups.size() >= 2 ? hiccups.get(1) : -1;
+            int retry = second < 0 ? -1 : rig.firstAfter("hop", second + 1);
+            check(n, cpls[0] == 3 && hiccups.size() == 2 && notedAt(notes, "hazard while HOP: CPL") > 0
+                            && notedAt(notes, "boxed in:") < 0 && entered(rig, ExploreBrain.State.RETRACE, 0) < 0
+                            && retry >= 0 && rig.timeOf(retry) - second <= 1000 && rig.violations.isEmpty(),
+                    "cpls=" + cpls[0] + " hiccups=" + hiccups + " retry@" + (retry < 0 ? -1 : rig.timeOf(retry))
+                            + " notes=" + lastNotes(notes, 30));
+        });
+        scenario("review_a_hiccup_that_would_be_the_third_refusal_still_gets_its_retry_first", n -> {
+            // Review P2-3: two hiccup episodes (each a hiccup and CPL again on its retry), then a
+            // third hiccup: three refusals, so boxed in may follow, but only after that hiccup's
+            // own retry leg has been driven (boxedIn used to pre-empt hopNext).
+            Rig[] h = new Rig[1];
+            long[] cpls = {0};
+            long[] lastAt = {-1};
+            Rig rig = escRig(escTuning().hopTicks(8).cap(10, 20000, 30000).wedge(10, 2, 1), h, t -> {
+                Rig r = h[0];
+                if (r == null || !"hop".equals(r.motion) || r.brain.state() != ExploreBrain.State.HOP || cpls[0] >= 5) {
+                    return clear(t);
+                }
+                long into = t - r.legStartT;
+                boolean hiccup = cpls[0] % 2 == 0;
+                boolean due = hiccup ? into >= 300 && (lastAt[0] < 0 || t - lastAt[0] >= 3000)
+                        : into >= 100 && t - lastAt[0] >= 300;
+                if (!due) {
+                    return clear(t);
+                }
+                cpls[0]++;
+                lastAt[0] = t;
+                return cpl2(t);
+            }, null);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(50000);
+            List<Long> hiccups = noteTimes(notes, "controller refused forward (CPL) on plain floor");
+            long third = hiccups.size() >= 3 ? hiccups.get(2) : -1;
+            int retry = third < 0 ? -1 : rig.firstAfter("hop", third + 1);
+            long boxed = notedAt(notes, "boxed in:");
+            check(n, cpls[0] == 5 && third > 0 && retry >= 0 && rig.timeOf(retry) - third <= 1000
+                            && boxed > rig.timeOf(retry) && rig.violations.isEmpty(),
+                    "cpls=" + cpls[0] + " hiccups=" + hiccups + " retry@" + (retry < 0 ? -1 : rig.timeOf(retry))
+                            + " boxed@" + boxed + " notes=" + lastNotes(notes, 30));
+        });
+    }
+
+    private static void reviewSeekDoorwayScenarios() {
+        scenario("review_a_doorway_forgotten_after_a_hazard_is_not_the_next_seeks_trusted_target", n -> {
+            // Review P2-4: Claude reports a doorway; the trusted short leg toward it hits an
+            // obstacle ("forgotten"). A seek that starts within seekDoorwayMs must not head for it.
+            List<String> notes = new ArrayList<String>();
+            long[] obstAt = {Long.MAX_VALUE};
+            Rig[] h = new Rig[1];
+            Rig rig = doorRig(doorTuning().curiosityMs(15000, 15000).scan(3, 500).scanTurnDeg(40).ask(1, 4000)
+                            .placeMemory(1800000, 300, 500, 5000).seekEvery(15000).seekAskTimeoutMs(5000),
+                    t -> {
+                        if (obstAt[0] == Long.MAX_VALUE && h[0] != null) {
+                            long tr = notedAt(notes, "reads blocked");
+                            if (tr >= 0 && h[0].firstAfter("hop", tr) >= 0) {
+                                obstAt[0] = t + 200;
+                            }
+                        }
+                        return t >= obstAt[0] && t < obstAt[0] + 300 ? obstacle(t) : clear(t);
+                    },
+                    (r, t) -> r.doorwayAnswerStates.isEmpty() ? prof(0.9f, 0.9f, 0.9f, 0.9f)
+                            : prof(0.9f, 0.9f, 0.1f, 0.9f),
+                    (r, k) -> k == 1 ? CuriosityPort.Doorway.door(0f) : CuriosityPort.Doorway.none());
+            h[0] = rig;
+            rig.seeks = (r, req, k) -> CuriosityPort.WayOut.none();
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 120000, r -> notedAt(notes, "seeking:") >= 0);
+            rig.runUntil(rig.now + 2000);
+            long forgotten = notedAt(notes, "a hazard on the leg toward it: forgotten");
+            long seek = notedAt(notes, "seeking:");
+            check(n, forgotten > 0 && seek > forgotten && seek - forgotten < 180000
+                            && notedAt(notes, "seeking: heading for the doorway") < 0 && rig.violations.isEmpty(),
+                    "forgotten@" + forgotten + " seek@" + seek + " notes=" + lastNotes(notes, 25));
+        });
+    }
+
+    private static void reviewLookAroundScenarios() {
+        scenario("review_clutter_reading_0_25_everywhere_looks_around_at_most_three_times_in_3_min_and_still_drives", n -> {
+            // Review P2-5: every heading reads 0.25 (over boxedInOpen, under steerBlocked): each
+            // look-around ends facing a "best" for one short leg, and the next decision started
+            // another 6-look spin. A cooldown (lookAroundCooldownMs, unless he has driven
+            // lookAroundCooldownCounts since) leaves him driving between look-arounds: 11 look-arounds
+            // and 10 legs in 3 min before, 3 and 20 or more with 60 s.
+            Rig rig = doorRig(doorTuning(), CLEAR, worldView(hd -> 0.25), (r, k) -> CuriosityPort.Doorway.none());
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(180000);
+            int arounds = notedTimes(notes, "everything ahead closed: looking around").size();
+            int legs = rig.count("hop") > 0 ? drivesIn(rig, "HOP", "hop", 0, Long.MAX_VALUE).size() : 0;
+            ExploreTuning d = new ExploreTuning.Builder().build();
+            check(n, arounds >= 1 && arounds <= 3 && legs >= 20 && d.lookAroundCooldownMs == 60000
+                            && d.lookAroundCooldownCounts == 1500 && rig.violations.isEmpty(),
+                    "arounds=" + arounds + " legs=" + legs + " notes=" + lastNotes(notes, 20));
+        });
+    }
+
+    private static void reviewJamMemoryScenarios() {
+        scenario("review_jammed_a_lease_drop_and_regain_rests_on_and_never_drives_into_the_jam", n -> {
+            // Review P2-6: fully jammed, the lease drops (someone picks him up) and comes back. He
+            // went to PAUSE and drove a full forward leg into the jam he had just declared.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = pinnedRig(notes);
+            rig.started();
+            runUntil(rig, 120000, r -> notedAt(notes, "fully jammed") >= 0);
+            long jamAt = rig.now;
+            rig.runUntil(jamAt + 5000);
+            rig.brain.onLeaseChanged(false);
+            rig.runUntil(rig.now + 1000);
+            long back = rig.now;
+            rig.brain.onLeaseChanged(true);
+            rig.runUntil(jamAt + 29000);
+            int pushes = rig.countPrefix("hop", back, Long.MAX_VALUE) + rig.countPrefix("turn", back, Long.MAX_VALUE);
+            long rest = entered(rig, ExploreBrain.State.CORNERED, back);
+            List<Long> probes = backDrives(rig, back, Long.MAX_VALUE);
+            rig.runUntil(jamAt + 32000);
+            List<Long> probesAfter = backDrives(rig, back, Long.MAX_VALUE);
+            check(n, jamAt > 0 && pushes == 0 && rest >= back && rest - back < 300 && probes.isEmpty()
+                            && probesAfter.size() == 1 && withinTick(probesAfter.get(0), jamAt + 30000)
+                            && rig.violations.isEmpty(),
+                    "jam@" + jamAt + " back@" + back + " pushes=" + pushes + " rest@" + rest + " probes=" + probesAfter
+                            + " notes=" + notesAfter(notes, back));
+        });
+        scenario("review_jammed_a_call_met_in_place_goes_back_to_the_jammed_rest_not_roaming", n -> {
+            // Review P2-6: a call while jammed is met where he is (IN_PLACE); when the meeting ends
+            // he must not roam straight into the jam.
+            List<String> notes = new ArrayList<String>();
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().turnChance(1.0), h, CLEAR, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            pin(rig, true);
+            rig.blockedFrom = 0;
+            rig.started();
+            runUntil(rig, 120000, r -> notedAt(notes, "fully jammed") >= 0);
+            long jamAt = rig.now;
+            rig.cue(jamAt + 2000, Ears.Kind.WAKE_WORD, Ears.Side.LEFT, -40f);
+            rig.runUntil(jamAt + 25000);
+            long met = notedAt(notes, "the call's stop is over");
+            int pushes = rig.countPrefix("hop", jamAt, Long.MAX_VALUE) + rig.countPrefix("turn", jamAt, Long.MAX_VALUE);
+            long rest = met < 0 ? -1 : entered(rig, ExploreBrain.State.CORNERED, met);
+            long over = met;
+            check(n, jamAt > 0 && notedAt(notes, "answering the call") > jamAt && met > 0 && pushes == 0
+                            && rest >= met && rest - met < 300 && rig.violations.isEmpty(),
+                    "jam@" + jamAt + " over@" + over + " pushes=" + pushes + " notes=" + notesAfter(notes, jamAt));
+        });
+    }
+
+    private static void reviewNowhereLegScenarios() {
+        scenario("review_a_leg_that_went_nowhere_keeps_the_stuck_spells_recovery_count", n -> {
+            // Review P2-6: a short roaming leg whose wheels never moved (too short for the stall
+            // watch) ran "driven away cleanly": the RECOVER count went back to 0, so the next
+            // zero turn started a fresh 3-spell cycle and pushed the latched board again.
+            Rig[] h = new Rig[1];
+            List<String> notes = new ArrayList<String>();
+            int[] phase = {0};
+            long[] hopFrom = {Long.MAX_VALUE};
+            Rig rig = escRig(escTuning().turnChance(1.0), h, t -> {
+                Rig r = h[0];
+                if (r == null) {
+                    return clear(t);
+                }
+                if (phase[0] == 0 && r.brain.state() == ExploreBrain.State.TURN && r.now > 2000) {
+                    phase[0] = 1;
+                    pin(r, true);
+                } else if (phase[0] == 1 && notedAt(notes, "stall: waiting for the motor board") >= 0
+                        && r.now >= notedAt(notes, "stall: waiting for the motor board") + 3000) {
+                    // The board is back for turns and reversing; forward still goes nowhere.
+                    phase[0] = 2;
+                    pin(r, false);
+                    r.blockedFrom = r.now;
+                    hopFrom[0] = r.now;
+                } else if (phase[0] == 2 && r.countPrefix("hop", hopFrom[0], Long.MAX_VALUE) > 0
+                        && r.brain.state() == ExploreBrain.State.TURN) {
+                    phase[0] = 3;
+                    r.yaw.stuck = true;
+                    r.turnWheelsBlocked = true;
+                    r.backBlocked = true;
+                }
+                return clear(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 120000, r -> phase[0] == 3 && notedTimes(notes, "stall: waiting for the motor board").size() >= 2);
+            List<String> waits = new ArrayList<String>();
+            for (String x : notes) {
+                if (x.contains("stall: waiting for the motor board")) {
+                    waits.add(x);
+                }
+            }
+            check(n, phase[0] == 3 && waits.size() >= 2 && waits.get(1).contains("(recovery 2 of ")
+                            && rig.violations.isEmpty(),
+                    "phase=" + phase[0] + " waits=" + waits + " notes=" + lastNotes(notes, 30));
+        });
+    }
+
+    private static void reviewTrustLegScenarios() {
+        scenario("review_a_trusted_leg_cut_off_by_a_cue_or_a_lease_drop_leaves_no_trust_behind", n -> {
+            // Review P3: the trusted short leg toward Claude's doorway starts with a turn; a voice
+            // mid-turn takes over (leaveForCue), or the lease drops (enterEyesOnly). The trust flag
+            // stayed set, so a later leg reached without a leg decision (the turn away after a
+            // conversation, a hiccup's retry) ran full length with the camera's blocked-ahead
+            // stop and re-aim off. Neither interruption may leave it set.
+            boolean[] left = new boolean[2];
+            String[] detail = new String[2];
+            for (int k = 0; k < 2; k++) {
+                List<String> notes = new ArrayList<String>();
+                Rig[] h = new Rig[1];
+                Rig rig = doorRig(doorTuning(), CLEAR,
+                        (r, t) -> r.doorwayAnswerStates.isEmpty() ? prof(0.9f, 0.9f, 0.9f, 0.9f)
+                                : worldView(hd -> Math.abs(Heading.delta(hd, 341)) < 12 ? 0.1 : 0.9).at(r, t),
+                        (r, q) -> q == 1 ? CuriosityPort.Doorway.door(0.6f) : CuriosityPort.Doorway.none());
+                h[0] = rig;
+                rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+                rig.started();
+                runUntil(rig, 30000, r -> notedAt(notes, "to face the doorway") >= 0
+                        && r.brain.state() == ExploreBrain.State.TURN);
+                boolean armed = rig.brain.trustLegPending();
+                if (k == 0) {
+                    rig.cue(rig.now + 10, Ears.Tier.WEAK, Ears.Side.LEFT, Float.NaN);
+                    rig.runUntil(rig.now + 300);
+                } else {
+                    rig.brain.onLeaseChanged(false);
+                    rig.runUntil(rig.now + 300);
+                }
+                left[k] = armed && !rig.brain.trustLegPending();
+                detail[k] = "armed=" + armed + " after=" + rig.brain.trustLegPending() + " state=" + rig.brain.state()
+                        + " notes=" + lastNotes(notes, 12);
+            }
+            check(n, left[0] && left[1], "cue: " + detail[0] + " | lease: " + detail[1]);
+        });
+    }
+
+    private static void reviewRecoverStampScenarios() {
+        scenario("review_a_zero_turn_long_after_a_bump_waits_the_full_recovery_from_the_turn", n -> {
+            // Review P3: a bump stamps the stall clock; a turn reading 0 deg and 0 counts some
+            // seconds later entered RECOVER timed from the bump, so the early probes were already
+            // past and the board's wait was mostly skipped. The zero turn is itself fresh
+            // evidence: the wait runs from it, probes at 2, 5, 10 and 20 s.
+            Rig[] h = new Rig[1];
+            long[] bumpAt = {-1};
+            List<String> notes = new ArrayList<String>();
+            Rig rig = escRig(escTuning().turnChance(1.0), h, t -> {
+                Rig r = h[0];
+                if (r == null) {
+                    return clear(t);
+                }
+                if (bumpAt[0] < 0 && r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 700) {
+                    bumpAt[0] = t;
+                    return obstacle(t);
+                }
+                if (bumpAt[0] >= 0 && t >= bumpAt[0] + 2500 && !r.yaw.stuck) {
+                    // The board latches 2.5 s after the bump, while he is still escaping.
+                    pin(r, true);
+                }
+                return clear(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.creepPer100 = 0;
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "stall: waiting for the motor board") >= 0);
+            long wait = notedAt(notes, "stall: waiting for the motor board");
+            String w = firstNote(notes, "stall: waiting for the motor board");
+            rig.runUntil(wait + 1900);
+            int early = rig.countPrefix("back", wait + 1, wait + 1900);
+            check(n, bumpAt[0] > 0 && wait - bumpAt[0] > 2000 && w != null && w.contains("(probes at 2, 5, 10, 20 s)")
+                            && early == 0 && rig.violations.isEmpty(),
+                    "bump@" + bumpAt[0] + " wait@" + wait + " note=" + w + " early backs=" + early
+                            + " notes=" + notesAfter(notes, bumpAt[0]) + " states=" + rig.stateLog.subList(Math.max(0, rig.stateLog.size() - 12), rig.stateLog.size()) + " tail=" + rig.tail());
+        });
+    }
+
+    private static void reviewLeanInScenarios() {
+        scenario("review_a_lean_in_cut_off_by_a_lease_drop_does_not_start_a_cooldown_at_a_later_stop", n -> {
+            // Review P3: a lean-in interrupted by a lease drop left leanInOpen set; the next
+            // unrelated curiosity stop's end, a minute later, started the 60 s cooldown, and a
+            // voice just after it was ignored.
+            Rig rig = cueRig(cueTuning().curiosityMs(70000, 70000), CLEAR, EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.cue(400, Ears.Tier.WEAK, Ears.Side.LEFT, -90f);
+            rig.at(700, () -> rig.brain.onLeaseChanged(false));
+            rig.at(1700, () -> rig.brain.onLeaseChanged(true));
+            runUntil(rig, 150000, r -> notedAt(notes, "curiosity stop") >= 0);
+            long stop = notedAt(notes, "curiosity stop");
+            long ended = runUntilState(rig, ExploreBrain.State.PAUSE, rig.now, rig.now + 40000);
+            long cueT = rig.now + 2000;
+            rig.cue(cueT, Ears.Tier.WEAK, Ears.Side.LEFT, -90f);
+            rig.runUntil(cueT + 500);
+            List<Long> leanIns = noteTimes(notes, "a lean-in from");
+            long ignored = notedAfter(notes, "cue ignored: lean-in cooldown", cueT);
+            check(n, stop > 60000 && ended > stop && leanIns.size() == 2 && leanIns.get(1) >= cueT && ignored < 0
+                            && rig.violations.isEmpty(),
+                    "stop@" + stop + " ended@" + ended + " leanIns=" + leanIns + " ignored@" + ignored
+                            + " notes=" + lastNotes(notes, 15));
+        });
+    }
+
+    /** When the brain first noted part at or after from, else -1. */
+    private static long notedAfter(List<String> notes, String part, long from) {
+        for (String x : notes) {
+            long t = Long.parseLong(x.substring(0, x.indexOf(' ')));
+            if (t >= from && x.contains(part)) {
+                return t;
+            }
+        }
+        return -1;
+    }
+
+    /** The notes at or after from, for a failure's detail. */
+    private static List<String> notesAfter(List<String> notes, long from) {
+        List<String> out = new ArrayList<String>();
+        for (String x : notes) {
+            if (Long.parseLong(x.substring(0, x.indexOf(' '))) >= from) {
+                out.add(x);
+            }
+        }
+        return out.size() > 30 ? out.subList(0, 30) : out;
+    }
+
     // ---- harness plumbing ----
 
     private static void check(String name, boolean ok, String detail) {
@@ -2858,6 +3280,17 @@ public final class ExploreBrainHarness {
         faceMigrationScenarios();
         faceConfirmScenarios();
         remarkRateScenarios();
+        reviewFixScenarios();
+        reviewAnswerOverScenarios();
+        reviewMeetAnswerOverScenarios();
+        reviewCplEpisodeScenarios();
+        reviewSeekDoorwayScenarios();
+        reviewLookAroundScenarios();
+        reviewJamMemoryScenarios();
+        reviewNowhereLegScenarios();
+        reviewTrustLegScenarios();
+        reviewRecoverStampScenarios();
+        reviewLeanInScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -10172,7 +10605,9 @@ public final class ExploreBrainHarness {
             runUntil(rig, 90000, r -> notedAt(notes, "free after") >= 0);
             rig.runUntil(rig.now + 3000);
             List<Long> cpl = refusals(notes);
-            long third = cpl.size() >= 3 ? cpl.get(2) : -1;
+            // Review P2-3: a hiccup and CPL again on its retry are one refusal: the third episode counts.
+            List<Long> episodes = noteTimes(notes, "controller refused forward (CPL)");
+            long third = episodes.size() >= 3 ? episodes.get(2) : -1;
             long boxed = notedAt(notes, "boxed in: 3 forward refusals in ");
             String boxedNote = firstNote(notes, "boxed in: 3 forward refusals in ");
             long retrace = notedAt(notes, "retrace: facing 180 deg for ");

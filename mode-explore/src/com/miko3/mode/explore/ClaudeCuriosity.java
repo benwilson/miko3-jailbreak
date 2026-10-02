@@ -745,10 +745,15 @@ final class ClaudeCuriosity implements CuriosityPort {
      * was replaced or answered meanwhile. newcomerAngleDeg is NaN for a meeting listen.
      * Robot 2026-10-01: once the launcher says the answer has started (answering,
      * before maxMs), the maxMs timer leaves the listen open for the words, and it
-     * ends as silence only at LauncherProtocol.EARS_ANSWER_HOLD_MS from its start.
+     * ends as silence only at LauncherProtocol.EARS_ANSWER_HOLD_MS from its start,
+     * or (review 2026-10-01) as soon as the launcher says that answer ended without
+     * words ("answer over"; before maxMs the timer then ends it as a silent listen).
      */
     private void earsListen(final EarsAdapter s, final long maxMs, float newcomerAngleDeg) {
         final int g = hearings.start();
+        // Review P2-2: whether the maxMs timer has run, so an "answer over" after it ends the listen at once.
+        final AtomicBoolean pastMax = new AtomicBoolean();
+        final Runnable[] silence = new Runnable[1];
         // A newer listen retires this reply by replacing it in the session, and the
         // session's close or loss clears it; the silence deadline retires it below.
         final EarsAdapter.Reply reply = new EarsAdapter.Reply() {
@@ -765,8 +770,20 @@ final class ClaudeCuriosity implements CuriosityPort {
                             + LauncherProtocol.EARS_ANSWER_HOLD_MS + " ms from its start");
                 }
             }
+
+            @Override
+            public void answerOver(long at) {
+                // Review P2-2: the answer ended without words (a cough, a door): no more hold.
+                if (answeringGen == g) {
+                    answeringGen = 0;
+                    Log.i(TAG, "the listen's answer ended without words: no longer holding it");
+                    if (pastMax.get()) {
+                        silence[0].run();
+                    }
+                }
+            }
         };
-        final Runnable silence = new Runnable() {
+        silence[0] = new Runnable() {
             @Override
             public void run() {
                 if (hearings.current(g) && hearings.poll() == null) {
@@ -782,19 +799,20 @@ final class ClaudeCuriosity implements CuriosityPort {
             timer.schedule(new Runnable() {
                 @Override
                 public void run() {
+                    pastMax.set(true);
                     if (answeringGen == g) {
                         if (hearings.current(g) && hearings.poll() == null) {
                             Log.i(TAG, "listen past " + maxMs + " ms: an answer is in progress");
                         }
                         try {
-                            timer.schedule(silence, Math.max(0, LauncherProtocol.EARS_ANSWER_HOLD_MS - maxMs),
+                            timer.schedule(silence[0], Math.max(0, LauncherProtocol.EARS_ANSWER_HOLD_MS - maxMs),
                                     TimeUnit.MILLISECONDS);
                         } catch (RuntimeException e) {
                             // Shut down with Explore meanwhile.
                         }
                         return;
                     }
-                    silence.run();
+                    silence[0].run();
                 }
             }, maxMs, TimeUnit.MILLISECONDS);
         } catch (RuntimeException e) {

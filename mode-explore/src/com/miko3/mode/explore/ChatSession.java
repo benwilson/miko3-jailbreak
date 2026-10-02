@@ -1075,6 +1075,13 @@ final class ChatSession {
                     onHeard(now, h.text.trim());
                     return;
                 }
+                if (answerHeld && h != null) {
+                    // Review P2-2: the held answer ended without words (the launcher's "answer
+                    // over" ends the port's listen as silence): unanswered now, not at the hold.
+                    host.note("the answer ended without words: an unanswered listen");
+                    onUnanswered(now);
+                    return;
+                }
                 // Silence or a failure before the timer: the timer is the authority (KTD2).
                 if (now >= listenDeadline) {
                     if (!answerHeld && port.answering()) {

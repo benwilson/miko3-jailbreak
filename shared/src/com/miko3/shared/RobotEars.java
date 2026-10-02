@@ -21,7 +21,9 @@ import android.os.RemoteException;
  * conversation listen; clipWindow() opens the deaf window for a local clip;
  * shoved() stamps a shove or collision stop for the classifier. A listen's
  * answer that has started is announced first, one-way, by Callback.answering
- * (robot 2026-10-01), so the mode holds the listen for its words. The launcher
+ * (robot 2026-10-01), so the mode holds the listen for its words, and one
+ * that ends without words by Callback.answerOver (review 2026-10-01), so the
+ * hold ends with it. The launcher
  * checks the caller on every call (SecurityException to any app that isn't
  * ours) and binds renew, close, listen, clipWindow and shoved to the uid that
  * opened the session.
@@ -98,10 +100,22 @@ public interface RobotEars extends IInterface {
          */
         void answering(long at) throws RemoteException;
 
+        /**
+         * Review 2026-10-01 (P2-2): the listen that said answering(at) ended without
+         * delivering words (a cough, a door, speech the recogniser heard as ""), so the
+         * mode stops holding it and ends it as silence. At most once per listen, after
+         * its answering(), one-way. Appended as its own code (3), handled exactly like
+         * code 2: an older mode's Stub has no case for it (onTransact returns false,
+         * which a one-way sender never sees) and holds the listen as before; a newer
+         * mode under an older launcher never receives it and holds as before.
+         */
+        void answerOver(long at) throws RemoteException;
+
         abstract class Stub extends Binder implements Callback {
             private static final String DESCRIPTOR = "com.miko3.shared.RobotEars.Callback";
             static final int TRANSACTION_heard = 1;
             static final int TRANSACTION_answering = 2;
+            static final int TRANSACTION_answerOver = 3;
 
             public Stub() {
                 attachInterface(this, DESCRIPTOR);
@@ -142,6 +156,11 @@ public interface RobotEars extends IInterface {
                     case TRANSACTION_answering: {
                         data.enforceInterface(DESCRIPTOR);
                         answering(data.readLong());
+                        return true;
+                    }
+                    case TRANSACTION_answerOver: {
+                        data.enforceInterface(DESCRIPTOR);
+                        answerOver(data.readLong());
                         return true;
                     }
                     case IBinder.INTERFACE_TRANSACTION:
@@ -193,6 +212,19 @@ public interface RobotEars extends IInterface {
                         data.writeInterfaceToken(DESCRIPTOR);
                         data.writeLong(at);
                         remote.transact(TRANSACTION_answering, data, null, IBinder.FLAG_ONEWAY);
+                    } finally {
+                        data.recycle();
+                    }
+                }
+
+                /** One-way, like answering(). */
+                @Override
+                public void answerOver(long at) throws RemoteException {
+                    Parcel data = Parcel.obtain();
+                    try {
+                        data.writeInterfaceToken(DESCRIPTOR);
+                        data.writeLong(at);
+                        remote.transact(TRANSACTION_answerOver, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();
                     }

@@ -633,6 +633,20 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "claude_familiar_pick_with_no_line_or_a_repeated_line_is_as_good_as_nothing",
         "claude_look_request_carries_what_he_reacted_to_and_said_but_no_person_or_name",
         "prompt_lists_reacted_things_and_said_lines_and_asks_for_a_fresh_line",
+        # The 2026-10-01 review's findings (P2-1..P2-6 and the P3s)
+        "review_lease_lost_in_the_back_up_wait_the_next_short_back_up_still_stops_on_a_stall_and_waits",
+        "review_chat_an_answer_that_ends_without_words_is_unanswered_as_it_ends_not_at_the_fallback",
+        "review_meet_a_wordless_answer_ends_the_listen_when_the_port_says_silence_not_at_29_s",
+        "review_one_cpl_hiccup_episode_counts_once_toward_boxed_in_and_its_retry_still_runs",
+        "review_a_hiccup_that_would_be_the_third_refusal_still_gets_its_retry_first",
+        "review_a_doorway_forgotten_after_a_hazard_is_not_the_next_seeks_trusted_target",
+        "review_clutter_reading_0_25_everywhere_looks_around_at_most_three_times_in_3_min_and_still_drives",
+        "review_jammed_a_lease_drop_and_regain_rests_on_and_never_drives_into_the_jam",
+        "review_jammed_a_call_met_in_place_goes_back_to_the_jammed_rest_not_roaming",
+        "review_a_leg_that_went_nowhere_keeps_the_stuck_spells_recovery_count",
+        "review_a_trusted_leg_cut_off_by_a_cue_or_a_lease_drop_leaves_no_trust_behind",
+        "review_a_zero_turn_long_after_a_bump_waits_the_full_recovery_from_the_turn",
+        "review_a_lean_in_cut_off_by_a_lease_drop_does_not_start_a_cooldown_at_a_later_stop",
     )
 
     @classmethod

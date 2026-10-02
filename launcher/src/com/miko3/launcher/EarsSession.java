@@ -74,6 +74,14 @@ final class EarsSession {
     /** Speech that began this soon before a listen opened (they answered as his question ended) is its answer. */
     static final long LISTEN_EARLY_START_MS = 500;
     /**
+     * Review 2026-10-01 (P3-10): an answer must start this much before maxMs to be claimed. The
+     * mode's own maxMs timer starts when it queues the listen, before the window opens
+     * here (its worker queue and the Binder hop), so an answer claimed in the window's
+     * last moments told the mode "answering" after it had already ended the listen as
+     * silence. 300 ms covers the 80 ms chunk that claims it plus both hops.
+     */
+    static final long LISTEN_EDGE_MS = 300;
+    /**
      * The pre-roll (TODO 2026-10-01): the VAD opens after a word has begun, so the
      * recogniser first hears this much of the audio just before the onset, or
      * "Miko" decodes as "O". Host sweep on synthetic clips (relative guidance only),
@@ -173,6 +181,14 @@ final class EarsSession {
          * the answer's delivery. Called on the capture thread; must not block.
          */
         void answering(long at);
+
+        /**
+         * Review 2026-10-01 (P2-2): the listen that said answering(at) has ended
+         * without delivering words (a cough, a door, speech the recogniser heard as
+         * ""), so the mode stops holding it. At most once per listen, after its
+         * answering(). Called on the capture or ticker thread; must not block.
+         */
+        void answerOver(long at);
     }
 
     /** Where counters and refusals go. Never given words. */
@@ -237,6 +253,8 @@ final class EarsSession {
     private long listenCapAt; // listenOpenedAt + LISTEN_HARD_CAP_MS
     private boolean answering; // the utterance in progress is the open listen's answer
     private boolean answerAnnounced; // Client.answering went out for this listen (robot 2026-10-01)
+    private long answerStartMs; // the announced answer's speech start
+    private boolean answerOverDue; // review P2-2: the announced listen ended without words; tell the client
     private Thread captureThread;
     private boolean captureWanted;
     private long captureFailedAt = Long.MIN_VALUE / 4;
@@ -355,6 +373,7 @@ final class EarsSession {
         }
         this.client = client;
         closeListen();
+        answerOverDue = false;
         this.lastSummaryMs = clock.nowMs();
         diag.log("opened by uid " + holder + (chargerLatched ? " (charger latched)" : ""));
         reconcile();
@@ -382,7 +401,8 @@ final class EarsSession {
     /**
      * A conversation listen: the switch does not apply while it is open. maxMs
      * (clamped as a one-shot listen's cap) is the window to start answering
-     * (robot 2026-10-01): an utterance that starts inside it, or at most
+     * (robot 2026-10-01): an utterance that starts inside it (up to LISTEN_EDGE_MS
+     * before its end), or at most
      * LISTEN_EARLY_START_MS before it opened, is its answer and holds it open
      * to the utterance's own end (the endpoint or the hangover), cut at
      * LISTEN_HARD_CAP_MS after the listen opened with the words so far. Ends
@@ -401,14 +421,48 @@ final class EarsSession {
         listenCapAt = now + LISTEN_HARD_CAP_MS;
         answering = false; // the next chunk claims an utterance in progress if it started in time
         answerAnnounced = false;
+        answerOverDue = false; // the mode's new listen replaces the old one's hold
         reconcile();
         return true;
     }
 
-    /** Caller holds the lock. No conversation listen. */
+    /**
+     * Caller holds the lock. No conversation listen. A listen that said answering and
+     * ends here without words owes the client "answer over" (review P2-2), sent by
+     * flushAnswerOver outside the lock.
+     */
     private void closeListen() {
+        if (listenUntil != 0 && answerAnnounced) {
+            answerOverDue = true;
+        }
         listenUntil = 0;
         answering = false;
+        answerAnnounced = false;
+    }
+
+    /**
+     * Review P2-2: tells the client its announced answer ended without words, once.
+     * Called without this lock held (the client may be a one-way Binder).
+     */
+    private void flushAnswerOver() {
+        Client c;
+        long at;
+        synchronized (this) {
+            if (!answerOverDue) {
+                return;
+            }
+            answerOverDue = false;
+            c = client;
+            at = answerStartMs;
+            diag.log("conversation listen answer over: no words");
+        }
+        if (c != null) {
+            try {
+                c.answerOver(at);
+            } catch (RuntimeException e) {
+                diag.log("answer over delivery failed: " + e.getClass().getSimpleName());
+            }
+        }
     }
 
     /**
@@ -420,7 +474,10 @@ final class EarsSession {
         Client announce = null;
         long cap;
         synchronized (this) {
-            if (listenUntil == 0 || startMs < listenOpenedAt - LISTEN_EARLY_START_MS || startMs >= listenUntil) {
+            // Review P3-10: speech begun in the window's last LISTEN_EDGE_MS is not claimed: its
+            // "answering" would reach the mode after its own maxMs had already ended the listen.
+            if (listenUntil == 0 || startMs < listenOpenedAt - LISTEN_EARLY_START_MS
+                    || startMs >= listenUntil - LISTEN_EDGE_MS) {
                 return Long.MAX_VALUE;
             }
             answering = true;
@@ -428,6 +485,7 @@ final class EarsSession {
             if (!answerAnnounced) {
                 // Robot 2026-10-01: the mode hears once that the answer started, so it holds its listen.
                 answerAnnounced = true;
+                answerStartMs = startMs;
                 announce = client;
                 diag.log("conversation listen answering: speech began " + (startMs - listenOpenedAt)
                         + " ms after it opened");
@@ -443,13 +501,19 @@ final class EarsSession {
         return cap;
     }
 
-    /** Caller holds feedLock. The answer in progress ended; past its start window the listen ends with it. */
-    private void answerEnded(long now) {
+    /**
+     * Caller holds feedLock. The answer in progress ended; past its start window the listen
+     * ends with it. withWords: it is about to be delivered with words, so no "answer over".
+     */
+    private void answerEnded(long now, boolean withWords) {
         synchronized (this) {
             if (!answering) {
                 return;
             }
             answering = false;
+            if (withWords) {
+                answerAnnounced = false;
+            }
             if (listenUntil != 0 && now >= listenUntil) {
                 closeListen();
             }
@@ -491,7 +555,14 @@ final class EarsSession {
     }
 
     /** The keeper's TTL, the listen cap, a capture retry and the summary; run about twice a second. */
-    synchronized void tick() {
+    void tick() {
+        synchronized (this) {
+            tickLocked();
+        }
+        flushAnswerOver();
+    }
+
+    private void tickLocked() {
         long now = clock.nowMs();
         keeper.check(now);
         // An answer in progress holds the listen open; the capture cuts it at the hard
@@ -897,18 +968,19 @@ final class EarsSession {
         synchronized (this) {
             listening = listenUntil != 0;
         }
+        int tier = classifier.tier(text, wasWake, listening, at);
         if (uttCapAt != Long.MAX_VALUE) {
             // The listen's answer: tiered as heard in it, and the listen ends with it once its window is over.
             uttCapAt = Long.MAX_VALUE;
-            answerEnded(now);
+            answerEnded(now, !text.isEmpty() && tier != CueClassifier.TIER_NONE);
         }
-        int tier = classifier.tier(text, wasWake, listening, at);
         int side = CueClassifier.side(angle);
         if (direction.sideOnly()) {
             // The chip's -90/+90 is a side, not a bearing: the brain searches that side.
             angle = null;
         }
         if (tier == CueClassifier.TIER_NONE || (text.isEmpty() && !wasWake && side == CueClassifier.SIDE_NONE)) {
+            flushAnswerOver();
             return;
         }
         if (partial) {
@@ -917,6 +989,7 @@ final class EarsSession {
         int kind = CueClassifier.kind(text, wasWake, tier);
         // wasWake: the early cue for this at already went out (every in-speech hit sends one).
         deliver(new Utterance(text, side, angle, tier, at, partial, kind, wasWake));
+        flushAnswerOver();
     }
 
     /** Caller holds feedLock. The median of every angle drained this utterance, or null when none. */
@@ -941,8 +1014,9 @@ final class EarsSession {
         preLen = 0;
         if (uttCapAt != Long.MAX_VALUE) {
             uttCapAt = Long.MAX_VALUE;
-            answerEnded(clock.nowMs());
+            answerEnded(clock.nowMs(), false);
         }
+        flushAnswerOver();
     }
 
     private void deliver(Utterance u) {
@@ -960,6 +1034,9 @@ final class EarsSession {
                 weak++;
             }
             if (endsListen && listenUntil != 0 && (!u.text.isEmpty() || u.tier == CueClassifier.TIER_STRONG)) {
+                if (!u.text.isEmpty()) {
+                    answerAnnounced = false; // the words answer it: no "answer over"
+                }
                 closeListen();
                 reconcile();
             }

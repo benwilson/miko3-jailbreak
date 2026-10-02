@@ -271,6 +271,25 @@ class EarsAdapterWiringTest(unittest.TestCase):
         tuning = src("ExploreTuning.java")
         self.assertEqual(int(re.search(r"private long answerHoldMs = (\d+);", tuning).group(1)), cap + extra)
 
+    def test_an_answer_over_ends_the_held_ears_listen_as_silence(self):
+        """Review 2026-10-01 (P2-2): the launcher's "answer over" (RobotEars.Callback,
+        code 3) reaches the armed reply; it drops the hold (answering() turns false) and,
+        once the maxMs timer has passed, ends the listen as silence at once instead of at
+        EARS_ANSWER_HOLD_MS. Before maxMs the timer ends it as a silent listen."""
+        a = code_only(src("EarsAdapter.java"))
+        on = re.search(r"public void onAnswerOver\(long at\) \{(.*?)\n    \}", a, re.S)
+        self.assertIsNotNone(on, "EarsAdapter has no onAnswerOver")
+        self.assertRegex(on.group(1), r"synchronized \(lock\) \{\s*r = open \? reply : null;")
+        self.assertIn("r.answerOver(at);", on.group(1))
+        c = code_only(src("ClaudeCuriosity.java"))
+        ears_listen = re.search(r"private void earsListen\((.*?)\n    \}", c, re.S).group(1)
+        over = re.search(r"public void answerOver\(long at\) \{(.*?)\n            \}", ears_listen, re.S)
+        self.assertIsNotNone(over, "the ears listen's reply has no answerOver")
+        self.assertRegex(over.group(1), r"if \(answeringGen == g\) \{\s*answeringGen = 0;")
+        self.assertRegex(over.group(1), r"if \(pastMax\.get\(\)\) \{\s*silence\[0\]\.run\(\);")
+        # The maxMs timer marks itself passed before it looks at the hold, so neither order misses the end.
+        self.assertRegex(ears_listen, r"pastMax\.set\(true\);\s*if \(answeringGen == g\) \{")
+
     def test_a_lost_session_closes_its_client_outside_the_lock(self):
         a = code_only(src("EarsAdapter.java"))
         lost = re.search(r"public void onLost\(String reason\) \{(.*?)\n    \}", a, re.S)

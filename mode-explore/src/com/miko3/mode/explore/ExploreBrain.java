@@ -1090,6 +1090,9 @@ final class ExploreBrain {
     private double aroundDoor = Double.NaN;
     /** It has ended, turning to its most open heading: the next leg decision goes on as a normal leg. */
     private boolean aroundFaced;
+    /** Review P2-5: when the last look-around ended, and forwardCounts then (the cooldown). */
+    private long aroundEndedAt = NEVER;
+    private long aroundEndedCounts;
     /** His last clean forward leg: its heading (NaN: none) and length (counts, one wheel). */
     private double inHeading = Double.NaN;
     private long inCounts;
@@ -1374,6 +1377,11 @@ final class ExploreBrain {
         return doorway;
     }
 
+    /** A trusted short leg (openness off) is set up for the next hop (review 2026-10-01), for tests. */
+    boolean trustLegPending() {
+        return trustLeg;
+    }
+
     void setTrace(Trace trace) {
         this.trace = trace;
     }
@@ -1557,7 +1565,11 @@ final class ExploreBrain {
                 if (curiosityAt == Long.MAX_VALUE) {
                     scheduleCuriosity(now);
                 }
-                enterPause(now, pauseMs(), false);
+                if (jammed) {
+                    resumeJam(now, "the lease or the sensors came back");
+                } else {
+                    enterPause(now, pauseMs(), false);
+                }
             }
             return;
         }
@@ -1866,10 +1878,11 @@ final class ExploreBrain {
             }
             blockedSides.clear();
             blockedAheadAt = Double.NaN;
+            // Driven away cleanly: whatever cornered him is behind him. Review P2-6: only a
+            // leg that moved; one that went nowhere keeps the jam and the stuck spell's count.
+            jammed = false;
+            recoverDone();
         }
-        // Driven away cleanly: whatever cornered him is behind him.
-        jammed = false;
-        recoverDone();
         compass.droveOffCleanly();
         hazardTimes.clear();
         stallStreak = 0;
@@ -1980,8 +1993,7 @@ final class ExploreBrain {
             if (hazardToward(now, doorway)) {
                 // Blocked by a hazard there, not just the camera: that still blocks.
                 note("the doorway at " + Math.round(doorway) + " deg reads blocked and a hazard was there just now: forgotten");
-                forgetDoorway();
-                doorwayReported = Double.NaN;
+                forgetBlockedDoorway();
                 door = Double.NaN;
             } else {
                 // Robot 2026-10-01 16:35: openness read open hallway carpet 0.00. Claude's doorway
@@ -2018,7 +2030,13 @@ final class ExploreBrain {
             boolean faced = aroundFaced;
             aroundFaced = false;
             boolean closed = steer.mostOpen(look.openness) <= tuning.steerBlocked;
-            if (closed && !faced && !plan.towardDoorway && tuning.lookAroundLooks > 1 && compass.usable(now)) {
+            boolean cooling = closed && !faced && !plan.towardDoorway && !aroundAllowed(now);
+            if (cooling) {
+                note("everything ahead closed, but looked around " + (now - aroundEndedAt) / 1000
+                        + " s ago: the steer's own plan");
+            }
+            if (closed && !faced && !plan.towardDoorway && tuning.lookAroundLooks > 1 && compass.usable(now)
+                    && !cooling) {
                 // Nothing in view open: look all the way round before choosing, rather
                 // than a blind 60 deg guess (robot 2026-10-01 15:55).
                 startAround(now, look, plan.side == RoamSteer.RIGHT ? Direction.RIGHT : Direction.LEFT);
@@ -2188,7 +2206,7 @@ final class ExploreBrain {
         HazardClassifier.Hazard h = classifier.hazard();
         note("hazard at start: " + h);
         if (h != null && h.kind == HazardClassifier.Kind.CPL) {
-            recordRefusal(now);
+            recordRefusal(now, true);
         }
         trustLegHazard();
         if (seeking()) {
@@ -2223,7 +2241,7 @@ final class ExploreBrain {
             return false;
         }
         int left = ticksRemaining(now);
-        recordRefusal(now);
+        recordRefusal(now, false);
         note("controller refused forward (CPL) on plain floor: a hiccup; " + left
                 + " ticks to go, trying once more in " + tuning.cplRetryPauseMs + " ms");
         stopMotors();
@@ -2294,7 +2312,7 @@ final class ExploreBrain {
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
         recoverAfterStartle = false;
         if (h != null && h.kind == HazardClassifier.Kind.CPL) {
-            recordRefusal(now);
+            recordRefusal(now, true);
         }
         trustLegHazard();
         if (h == null) {
@@ -2965,6 +2983,11 @@ final class ExploreBrain {
         boolean seekable = stopSeekable && !meetingHeld;
         stopMotors();
         clearStop();
+        if (jammed) {
+            // Review P2-6: a call met where he stood (IN_PLACE) while jammed: still jammed.
+            resumeJam(now, "the stop");
+            return;
+        }
         enterPause(now, pauseMs(), false);
         if (seekable) {
             maybeSeek(now);
@@ -2974,6 +2997,8 @@ final class ExploreBrain {
     /** Forgets everything about the current stop (the camera closes as the state leaves curiosity). */
     private void clearStop() {
         stopSeekable = false;
+        trustLeg = false;
+        trustLegDoor = false;
         if (leanInOpen) {
             leanInOpen = false;
             if (!leanInMet) {
@@ -4474,6 +4499,9 @@ final class ExploreBrain {
             stampStall(now);
         }
         if (state == State.TURN && zeroTurn() && recoverDue(now)) {
+            // Review P3: the zero turn is fresh evidence the board is latched now: the wait
+            // runs from it, not from an older stall or bump stamp whose early probes are past.
+            stampStall(now);
             if (recoverCount > 0) {
                 // After the board came back: a cutout or a side blocked for real; either way try
                 // the other side next (cleared on a clean drive-off).
@@ -4514,6 +4542,9 @@ final class ExploreBrain {
         int ticks = tuning.blockedTurnBackTicks;
         state = State.BACK_OFF;
         backForTurn = true;
+        // Review P2-1: a wait left over from an earlier back-up (a lease drop inside it)
+        // would skip this one's stall check and its wait.
+        retryWaiting = false;
         ticksLeft = ticks - 1;
         nextTickAt = now + tuning.backTickMs;
         phaseUntil = now + ticks * tuning.backTickMs;
@@ -4540,6 +4571,7 @@ final class ExploreBrain {
         if (!Double.isNaN(doorway)) {
             note("wedged: the doorway at " + Math.round(doorway) + " deg is forgotten");
             forgetDoorway();
+            seekDoorway = Double.NaN; // review P2-4: no later seek trusts it
         }
         hopNext = false;
         plannedTicks = -1;
@@ -4663,10 +4695,21 @@ final class ExploreBrain {
         enterLook(now, aroundDir, false, timedMs(deg), compass.usable(now) ? deg : 0);
     }
 
+    /**
+     * Review P2-5: a new look-around only lookAroundCooldownMs after the last one ended,
+     * or once he has driven lookAroundCooldownCounts since (a new place, a new view).
+     */
+    private boolean aroundAllowed(long now) {
+        return aroundEndedAt == NEVER || now - aroundEndedAt >= tuning.lookAroundCooldownMs
+                || forwardCounts - aroundEndedCounts >= tuning.lookAroundCooldownCounts;
+    }
+
     /** The look-around is over: boxed in when it found nothing open all round, else face its most open heading. */
     private void endAround(long now, Look look) {
         List<double[]> looks = around;
         around = null;
+        aroundEndedAt = now;
+        aroundEndedCounts = forwardCounts;
         double[] best = null;
         for (double[] l : looks) {
             if (!Double.isNaN(l[2]) && (best == null || l[1] > best[1])) {
@@ -4762,8 +4805,16 @@ final class ExploreBrain {
         aroundFaced = false;
     }
 
-    /** A forward refusal by the controller (a CPL hiccup or hazard): boxedInRefusals in boxedInWindowMs is boxed in. */
-    private void recordRefusal(long now) {
+    /**
+     * A forward refusal by the controller (a CPL hiccup or hazard): boxedInRefusals in
+     * boxedInWindowMs is boxed in. Review P2-3: a hiccup and CPL again on its retry (at
+     * its start or within cplRetryWindowMs, before cplRetryUntil) are one episode and count
+     * once: hazard is true for a CPL hazard, which inside that episode adds nothing.
+     */
+    private void recordRefusal(long now, boolean hazard) {
+        if (hazard && now < cplRetryUntil) {
+            return;
+        }
         cplRefusals.addLast(now);
         while (!cplRefusals.isEmpty() && now - cplRefusals.peekFirst() > tuning.boxedInWindowMs) {
             cplRefusals.pollFirst();
@@ -4785,6 +4836,10 @@ final class ExploreBrain {
         }
         boolean refused = tuning.boxedInRefusals > 0 && cplRefusals.size() >= tuning.boxedInRefusals;
         boolean closed = tuning.boxedInLookAround && aroundFoundNothing;
+        if (hopNext && now < cplRetryUntil) {
+            // Review P2-3: a CPL hiccup's retry is due: it drives first (a hiccup is not a hazard).
+            return false;
+        }
         if (!(refused || closed) || state != State.PAUSE || !compass.usable(now) || jammed || planner.active()) {
             return false;
         }
@@ -4801,6 +4856,7 @@ final class ExploreBrain {
         stopMotors();
         if (!Double.isNaN(doorway)) {
             forgetDoorway();
+            seekDoorway = Double.NaN; // review P2-4: no later seek trusts it
         }
         hopNext = false;
         plannedTicks = -1;
@@ -5357,6 +5413,7 @@ final class ExploreBrain {
             stampStall(now);
         }
         if (nowhere && zeroTurn() && recoverDue(now)) {
+            stampStall(now); // review P3: the wait runs from this zero turn, as above
             if (recoverCount > 0) {
                 blockSide(escDir);
             }
@@ -5926,6 +5983,16 @@ final class ExploreBrain {
         doorwayLeg = false;
     }
 
+    /**
+     * A hazard proved the doorway blocked: forgotten for steering, as reported, and
+     * (review P2-4) for the next seek, which would otherwise trust it and drive back at it.
+     */
+    private void forgetBlockedDoorway() {
+        forgetDoorway();
+        doorwayReported = Double.NaN;
+        seekDoorway = Double.NaN;
+    }
+
     // ---- seeking the unfamiliar (owner 2026-10-01) ----
 
     /** A scan's look, for a seek: its heading at capture and how familiar it looked (scored once). */
@@ -6049,6 +6116,11 @@ final class ExploreBrain {
 
     /** Ask Claude which of the stop's frames to go to; without Claude, the least familiar one. */
     private void startSeek(long now) {
+        if (doorwayRecent(now) && hazardToward(now, seekDoorway)) {
+            // Review P2-4: a hazard lies that way now; the seek chooses afresh.
+            note("seeking: the reported doorway at " + Math.round(seekDoorway) + " deg is blocked: not trusted");
+            seekDoorway = Double.NaN;
+        }
         if (doorwayRecent(now)) {
             headForDoorway(now);
             return;
@@ -6423,8 +6495,7 @@ final class ExploreBrain {
         }
         note("the doorway at " + Math.round(Double.isNaN(doorway) ? doorwayReported : doorway)
                 + " deg: a hazard on the leg toward it: forgotten");
-        forgetDoorway();
-        doorwayReported = Double.NaN;
+        forgetBlockedDoorway();
     }
 
     /**
@@ -7120,6 +7191,7 @@ final class ExploreBrain {
             }
             leaveForCue();
             backForTurn = false;
+            retryWaiting = false;
             turnRetrying = false;
         }
         if (!callAnswered) {
@@ -7871,6 +7943,9 @@ final class ExploreBrain {
         hopNext = false;
         plannedTicks = -1;
         doorwayLeg = false;
+        // Review P3: a trusted short leg cut off here leaves no trust for a later leg.
+        trustLeg = false;
+        trustLegDoor = false;
         lookForLeg = false;
         steerWaitUntil = NO_WAIT;
         escape = false;
@@ -8423,7 +8498,18 @@ final class ExploreBrain {
         probeThen = null;
         escShortBack = false;
         backForTurn = false;
+        retryWaiting = false;
         turnRetrying = false;
+        trustLeg = false;
+        trustLegDoor = false;
+        if (leanInOpen) {
+            // Review P3: the lean-in ends here, so its cooldown (if it met nobody) runs from
+            // now, not from whatever later stop's clearStop would have found the flag still set.
+            leanInOpen = false;
+            if (!leanInMet) {
+                leanInOver(clock.nowMs());
+            }
+        }
         cancelDoorway(clock.nowMs(), "lease or sensors lost");
         endSeek(clock.nowMs(), false, "lease or sensors lost");
         cancelMetCheck();
@@ -8612,6 +8698,18 @@ final class ExploreBrain {
         note("fully jammed: " + why + "; no more pushing (jam " + jams + " since start)");
         jamRests = 0;
         jammedAt = now;
+        jamRest(now);
+    }
+
+    /**
+     * Review P2-6: still jammed after a lease or sensor drop, or after a meeting held where
+     * he stood: back to the jammed rest (never a roaming leg into the jam). The rest that
+     * was cut short is taken again, keeping its probe time on the jam's schedule.
+     */
+    private void resumeJam(long now, String after) {
+        note("still jammed after " + after + ": back to the jammed rest");
+        awayLeg = null;
+        jamRests = Math.max(0, jamRests - 1);
         jamRest(now);
     }
 

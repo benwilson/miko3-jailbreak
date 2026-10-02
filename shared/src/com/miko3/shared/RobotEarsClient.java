@@ -44,6 +44,12 @@ public final class RobotEarsClient {
          */
         void onAnswering(long at);
 
+        /**
+         * Review 2026-10-01 (P2-2): the listen that said onAnswering ended without words;
+         * see RobotEars.Callback.answerOver. At most once per listen, after its onAnswering.
+         */
+        void onAnswerOver(long at);
+
         /** The session is gone; reason is fixed text. Called at most once per open(). */
         void onLost(String reason);
     }
@@ -394,6 +400,22 @@ public final class RobotEarsClient {
                 public void run() {
                     if (!ended) {
                         listener.onAnswering(at);
+                    }
+                }
+            });
+        }
+
+        /** On the worker, in order with answering(): the hold it ends always started first. */
+        @Override
+        public void answerOver(final long at) {
+            if (ended) {
+                return;
+            }
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!ended) {
+                        listener.onAnswerOver(at);
                     }
                 }
             });

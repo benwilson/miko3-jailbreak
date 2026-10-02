@@ -271,6 +271,25 @@ final class ListenEngine implements ListenSession.Ears {
                     // Shutting down.
                 }
             }
+
+            /** Review P2-2: on the same delivery thread too, so it follows the answer's answering(). */
+            @Override
+            public void answerOver(final long at) {
+                try {
+                    deliver.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                callback.answerOver(at);
+                            } catch (RemoteException | RuntimeException e) {
+                                // The client is gone; its death releases the session.
+                            }
+                        }
+                    });
+                } catch (RejectedExecutionException ignored) {
+                    // Shutting down.
+                }
+            }
         };
         ears.open(String.valueOf(uid), token, client, chargerLatched);
     }

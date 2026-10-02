@@ -144,6 +144,12 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_answer_begun_just_before_the_listen_says_answering",
         "ears_silent_or_unlistened_speech_says_no_answering",
         "ears_each_listen_says_answering_at_most_once",
+        # Review P2-2: a wordless answer ends the mode's hold ("answer over", code 3).
+        "ears_wordless_answer_says_answer_over_once_when_the_listen_ends",
+        "ears_wordless_answer_past_the_window_says_answer_over_as_it_ends",
+        "ears_answer_with_words_or_no_answer_says_no_answer_over",
+        # Review P3-10: the start window closes early enough for "answering" to reach the mode in time.
+        "ears_speech_in_the_last_300_ms_of_the_window_is_not_claimed",
         "ears_logs_counters_not_words",
         # Ears CPU switches (2026-09-30): off by default, KTD2 unchanged.
         "ears_tuning_unset_is_ktd2",
@@ -610,9 +616,10 @@ class InterfaceAndClientTest(unittest.TestCase):
         codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", ears)]
         self.assertEqual([n for n, _ in codes], ["open", "renew", "close", "listen", "clipWindow", "shoved"])
         self.assertEqual([c for _, c in codes], list(range(1, 7)))
-        # The callback's codes are appended too: heard stays 1, answering (robot 2026-10-01) is 2.
+        # The callback's codes are appended too: heard stays 1, answering (robot 2026-10-01) is 2,
+        # answerOver (review 2026-10-01, P2-2) is 3.
         callback_codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", callback)]
-        self.assertEqual(callback_codes, [("heard", 1), ("answering", 2)])
+        self.assertEqual(callback_codes, [("heard", 1), ("answering", 2), ("answerOver", 3)])
 
     def test_ears_callback_answering_is_a_one_way_appended_transaction(self):
         """Robot 2026-10-01: "answering" tells the mode a conversation listen's
@@ -642,6 +649,29 @@ class InterfaceAndClientTest(unittest.TestCase):
         answering = _method_body(client, "public void answering")
         self.assertIsNotNone(answering)
         self.assertIn("listener.onAnswering(at)", answering)
+
+    def test_ears_callback_answer_over_is_a_one_way_appended_transaction(self):
+        """Review 2026-10-01 (P2-2): "answer over" tells the mode the listen that said
+        answering ended without words, so it stops holding it. Code 3, one-way, handled
+        like code 2: an older mode's Stub has no case for it (onTransact returns false,
+        which a one-way sender never sees) and holds as before; a newer mode under an
+        older launcher never receives it and holds to EARS_ANSWER_HOLD_MS as before."""
+        src = _read(EARS_INTERFACE)
+        head = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(head, r"void answerOver\(long at\) throws RemoteException;")
+        stub = _method_body(src, "public boolean onTransact")
+        self.assertRegex(stub, r"case TRANSACTION_answerOver: \{\s*data\.enforceInterface\(DESCRIPTOR\);\s*"
+                               r"answerOver\(data\.readLong\(\)\);\s*return true;")
+        proxy = src.split("private static class Proxy implements Callback", 1)[1].split("abstract class Stub", 1)[0]
+        self.assertRegex(proxy, r"data\.writeLong\(at\);\s*"
+                                r"remote\.transact\(TRANSACTION_answerOver, data, null, IBinder\.FLAG_ONEWAY\);")
+        self.assertRegex(_read(EARS), r"void answerOver\(long at\);")
+        self.assertIn("callback.answerOver(at);", _read(LAUNCHER / "ListenEngine.java"))
+        client = _read(EARS_CLIENT)
+        self.assertRegex(client, r"void onAnswerOver\(long \w+\);")
+        over = _method_body(client, "public void answerOver")
+        self.assertIsNotNone(over)
+        self.assertIn("listener.onAnswerOver(at)", over)
 
     def test_ears_client_binds_renews_and_closes(self):
         src = _read(EARS_CLIENT)

@@ -33,6 +33,13 @@ public final class EarsAdapterHarness {
         public void answering(long at) {
             answering.add(at);
         }
+
+        final List<Long> answerOver = new ArrayList<Long>();
+
+        @Override
+        public void answerOver(long at) {
+            answerOver.add(at);
+        }
     }
 
     public static void main(String[] args) {
@@ -46,6 +53,8 @@ public final class EarsAdapterHarness {
         run("answering_goes_to_the_armed_reply_and_its_words_still_answer_it",
                 EarsAdapterHarness::answeringGoesToArmedReply);
         run("answering_with_no_armed_reply_is_ignored_and_queues_nothing", EarsAdapterHarness::answeringUnarmedIgnored);
+        run("answer_over_goes_to_the_armed_reply_and_queues_nothing", EarsAdapterHarness::answerOverGoesToArmedReply);
+        run("answer_over_with_no_armed_reply_is_ignored", EarsAdapterHarness::answerOverUnarmedIgnored);
         System.exit(failures == 0 ? 0 : 1);
     }
 
@@ -273,6 +282,37 @@ public final class EarsAdapterHarness {
         closed.onAnswering(300);
         if (!r.answering.isEmpty() || !c.answering.isEmpty() || !a.drain().isEmpty()) {
             return "an unarmed or closed adapter passed answering on: " + r.answering + " " + c.answering;
+        }
+        return null;
+    }
+
+    /** Review P2-2: the launcher's "answer over" reaches the armed reply, which stays armed; no cue. */
+    private static String answerOverGoesToArmedReply() {
+        EarsAdapter a = opened();
+        Recorder r = new Recorder();
+        a.listen(4000, r);
+        a.onAnswering(1000);
+        a.onAnswerOver(1000);
+        if (!r.answerOver.equals(java.util.Collections.singletonList(1000L)) || !r.heard.isEmpty()
+                || !a.drain().isEmpty()) {
+            return "the reply was told over=" + r.answerOver + " heard=" + r.heard;
+        }
+        return null;
+    }
+
+    /** "answer over" for a retired listen (or a closed adapter) goes nowhere. */
+    private static String answerOverUnarmedIgnored() {
+        EarsAdapter a = opened();
+        Recorder r = new Recorder();
+        a.listen(4000, r);
+        a.listenOver(r);
+        a.onAnswerOver(2500);
+        EarsAdapter closed = new EarsAdapter(new Context());
+        Recorder c = new Recorder();
+        closed.listen(4000, c);
+        closed.onAnswerOver(300);
+        if (!r.answerOver.isEmpty() || !c.answerOver.isEmpty() || !a.drain().isEmpty()) {
+            return "an unarmed or closed adapter passed answer over on: " + r.answerOver + " " + c.answerOver;
         }
         return null;
     }

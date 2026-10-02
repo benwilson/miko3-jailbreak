@@ -60,6 +60,9 @@ class EarsAdapterHarnessTest(unittest.TestCase):
         # Robot 2026-10-01: the launcher's "answering" for a conversation listen.
         "answering_goes_to_the_armed_reply_and_its_words_still_answer_it",
         "answering_with_no_armed_reply_is_ignored_and_queues_nothing",
+        # Review P2-2: the launcher's "answer over" for a wordless answer.
+        "answer_over_goes_to_the_armed_reply_and_queues_nothing",
+        "answer_over_with_no_armed_reply_is_ignored",
     )
 
     @classmethod

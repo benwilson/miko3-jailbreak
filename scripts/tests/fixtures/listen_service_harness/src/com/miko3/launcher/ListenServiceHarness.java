@@ -474,6 +474,19 @@ public final class ListenServiceHarness {
             answering.add(at);
             heardBeforeAnswering.add(heard.size());
         }
+
+        /** Review P2-2: each "answer over" (the announced answer ended without words), with when it came. */
+        final List<Long> answerOver = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Integer> heardBeforeAnswerOver = Collections.synchronizedList(new ArrayList<Integer>());
+        FakeClock overClock;
+        final List<Long> answerOverWhen = Collections.synchronizedList(new ArrayList<Long>());
+
+        @Override
+        public void answerOver(long at) {
+            answerOver.add(at);
+            heardBeforeAnswerOver.add(heard.size());
+            answerOverWhen.add(overClock == null ? -1 : overClock.now);
+        }
     }
 
     static final class FakeToken implements LeaseKeeper.Token {
@@ -1562,6 +1575,105 @@ public final class ListenServiceHarness {
                 r.steps(true, 400);
                 check(n, stillOpen && afterTwo == 1 && r.client.answering.size() == 2, "stillOpen=" + stillOpen
                         + " afterTwo=" + afterTwo + " answering=" + r.client.answering + " heard=" + r.heard());
+            }
+        });
+        // ---- Review P2-2: an announced answer that ends without words says "answer over" ----
+        scenario("ears_wordless_answer_says_answer_over_once_when_the_listen_ends", new Scenario() {
+            public void run(String n) {
+                // A cough 1 s into a 4 s listen: answering, the recogniser hears "", no side. The
+                // launcher's listen ends at its window with no words: the mode hears "answer over".
+                Rig r = new Rig();
+                r.client.overClock = r.clock;
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                long opened = r.clock.now;
+                r.steps(false, 1000);
+                long start = r.clock.now + 80;
+                r.steps(true, 300);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                boolean noneYet = r.client.answerOver.isEmpty();
+                r.steps(false, 4000);
+                long when = r.client.answerOverWhen.isEmpty() ? -1 : r.client.answerOverWhen.get(0);
+                check(n, r.client.answering.equals(Collections.singletonList(start)) && noneYet
+                                && r.client.answerOver.equals(Collections.singletonList(start)) && r.client.heard.isEmpty()
+                                && when - opened >= 3600 && when - opened <= 4100 && !r.session.listening(),
+                        "answering=" + r.client.answering + " over=" + r.client.answerOver + " @" + (when - opened)
+                                + " noneYet=" + noneYet + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_wordless_answer_past_the_window_says_answer_over_as_it_ends", new Scenario() {
+            public void run(String n) {
+                // Speech begun at 3 s that runs to 5 s with no words: the listen ends with it, and so
+                // does the mode's hold.
+                Rig r = new Rig();
+                r.client.overClock = r.clock;
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                long opened = r.clock.now;
+                r.steps(false, 3000);
+                r.steps(true, 2000);
+                r.rec.endpoint = true;
+                r.step(false);
+                long ended = r.clock.now;
+                r.steps(false, 400);
+                long when = r.client.answerOverWhen.isEmpty() ? -1 : r.client.answerOverWhen.get(0);
+                check(n, r.client.answering.size() == 1 && r.client.answerOver.size() == 1 && when == ended
+                                && !r.session.listening(),
+                        "answering=" + r.client.answering + " over=" + r.client.answerOver + " @" + (when - opened)
+                                + " ended@" + (ended - opened));
+            }
+        });
+        scenario("ears_answer_with_words_or_no_answer_says_no_answer_over", new Scenario() {
+            public void run(String n) {
+                // An answer with words, a silent listen, and an older-style flow: never "answer over".
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                for (int i = 0; i < 10; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH";
+                }
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                r.steps(false, 5000);
+                Rig q = new Rig();
+                q.sw.on = false;
+                q.open(false);
+                q.session.listen("10001", 4000);
+                q.steps(false, 5000);
+                check(n, r.client.answering.size() == 1 && r.client.heard.size() == 1 && r.client.answerOver.isEmpty()
+                                && q.client.answering.isEmpty() && q.client.answerOver.isEmpty(),
+                        "words: answering=" + r.client.answering + " over=" + r.client.answerOver + " heard=" + r.heard()
+                                + " silent: over=" + q.client.answerOver);
+            }
+        });
+        scenario("ears_speech_in_the_last_300_ms_of_the_window_is_not_claimed", new Scenario() {
+            public void run(String n) {
+                // Review P3-10: the mode's timer starts before the launcher's window opens, so an
+                // answer claimed at the window's very end reached the mode after it had given up.
+                // The start window closes LISTEN_EDGE_MS early so "answering" always arrives in time.
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 3760);
+                r.steps(true, 400);
+                Rig q = new Rig();
+                q.sw.on = false;
+                q.open(false);
+                q.session.listen("10001", 4000);
+                q.steps(false, 3520);
+                q.steps(true, 400);
+                check(n, r.client.answering.isEmpty() && q.client.answering.size() == 1
+                                && EarsSession.LISTEN_EDGE_MS == 300,
+                        "late=" + r.client.answering + " in time=" + q.client.answering);
             }
         });
         scenario("ears_logs_counters_not_words", new Scenario() {

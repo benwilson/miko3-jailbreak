@@ -256,6 +256,19 @@ final class ExploreTuning {
     final int lookAroundLooks;
     final double lookAroundStepDeg;
     final float lookAroundOpen;
+    /**
+     * Review 2026-10-01 (P2-5): no new look-around within lookAroundCooldownMs of the
+     * last one's end unless he has driven lookAroundCooldownCounts forward since; the
+     * closed view then gets the steer's own plan (a short leg or a turn). 60 s: a full
+     * look-around is 6 looks and 5 turns, about 15-20 s, so in clutter that reads 0.1-0.35
+     * everywhere he spends about a quarter of his time looking around instead of nearly
+     * all of it (harness: 3 in 3 min, was 11), and a spot just found hopeless is not
+     * re-read within the same horizon boxedInWindowMs uses. 1500 counts (about 0.5 m, the
+     * retrace distance) re-arms it at once: from a new spot the view all round has
+     * changed and a fresh look-around can find something new. 0 ms: no cooldown.
+     */
+    final long lookAroundCooldownMs;
+    final long lookAroundCooldownCounts;
     final long boxedAvoidMs;
     final double boxedAvoidDeg;
     final float newcomerAngleDeg;
@@ -924,6 +937,8 @@ final class ExploreTuning {
         lookAroundLooks = Math.max(0, b.lookAroundLooks);
         lookAroundStepDeg = Math.max(1, b.lookAroundStepDeg);
         lookAroundOpen = b.lookAroundOpen;
+        lookAroundCooldownMs = Math.max(0, b.lookAroundCooldownMs);
+        lookAroundCooldownCounts = Math.max(0, b.lookAroundCooldownCounts);
         boxedAvoidMs = Math.max(0, b.boxedAvoidMs);
         boxedAvoidDeg = Math.max(0, b.boxedAvoidDeg);
         newcomerAngleDeg = Math.max(0f, b.newcomerAngleDeg);
@@ -1292,6 +1307,8 @@ final class ExploreTuning {
         private int lookAroundLooks = 6;
         private double lookAroundStepDeg = 60;
         private float lookAroundOpen = 0.5f;
+        private long lookAroundCooldownMs = 60000;
+        private long lookAroundCooldownCounts = 1500;
         private long boxedAvoidMs = 60000;
         private double boxedAvoidDeg = 45;
         private float newcomerAngleDeg = 45f;
@@ -1705,6 +1722,12 @@ final class ExploreTuning {
         }
         /** No look-around: a closed view gets the steer's blind turns, as before 2026-10-01 15:55. */
         Builder lookAroundOff() { lookAroundLooks = 0; return this; }
+        /** Review P2-5: the look-around cooldown (0 ms: none, every closed decision looks around). */
+        Builder lookAroundCooldown(long ms, long counts) {
+            lookAroundCooldownMs = ms;
+            lookAroundCooldownCounts = counts;
+            return this;
+        }
         Builder boxedAvoid(long ms, double deg) { boxedAvoidMs = ms; boxedAvoidDeg = deg; return this; }
         /** Never boxed in: the refusals and closed look-arounds run as before 2026-10-01. */
         Builder boxedInOff() { boxedInRefusals = 0; boxedInLookAround = false; return this; }
