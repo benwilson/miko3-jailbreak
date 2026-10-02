@@ -1329,6 +1329,10 @@ final class ExploreBrain {
     private boolean onDock;
     private long dockLookAt = NEVER;
     private boolean dockLooking;
+    /** POWER's dock verdict, debounced (2026-10-02): set by one reading saying docked,
+     * cleared by dockOffReadings in a row saying off; offStreak counts those. */
+    private boolean powerDocked;
+    private int powerOffStreak;
     private long dockLookAfter;
     private long dockLookDeadline;
     private boolean dockAsking;
@@ -1452,6 +1456,7 @@ final class ExploreBrain {
             return;
         }
         classifier.offer(reading);
+        trackPower(reading);
         trackWheels(reading);
         countEscapeWheels(reading);
         countJamWheels(reading);
@@ -1585,6 +1590,14 @@ final class ExploreBrain {
         // the state's own step, so a take and its answer clip land in this very step.
         callStep(now);
         if (state == State.EYES_ONLY) {
+            if (leaseHeld && dockable() && onCharger()) {
+                // On the dock with the ToF faulted (the owner's charger, 2026-10-02) he never
+                // drives, so only POWER can say docked; the look needs the camera, not the ToF.
+                enterDocked(now);
+                watchLooks(now);
+                dockStep(now);
+                return;
+            }
             if (leaseHeld && s != HazardClassifier.Status.UNAVAILABLE) {
                 if (!faceHoldReleased) {
                     // The first roam waits for the start-up face migration, with the
@@ -1621,7 +1634,20 @@ final class ExploreBrain {
                 note("lease lost during the conversation: no wheels and no look until it ends");
             }
         }
-        if (s == HazardClassifier.Status.UNAVAILABLE && !wheellessMeeting) {
+        // Docked (owner 2026-10-02): on the charger he sits still and quiet instead of roaming.
+        // Before the sensor check: DOCKED never drives, so a faulted ToF does not end it.
+        if (state != State.DOCKED && dockable() && onCharger()) {
+            enterDocked(now);
+        }
+        if (state == State.DOCKED) {
+            watchLooks(now);
+            dockStep(now);
+            return;
+        }
+        // A docked look's remark (SPEAK, from DOCKED) never drives: a faulted ToF on the dock
+        // must not cut it short, or finishPick never marks the thing seen and it is said again.
+        boolean dockRemark = onDock && onCharger() && state == State.SPEAK;
+        if (s == HazardClassifier.Status.UNAVAILABLE && !wheellessMeeting && !dockRemark) {
             if (!state.chats()) {
                 enterEyesOnly("sensors unavailable: " + classifier.reason());
                 return;
@@ -1634,15 +1660,6 @@ final class ExploreBrain {
             }
         } else if (state.chats()) {
             chatStallSince = NEVER;
-        }
-        // Docked (owner 2026-10-02): on the charger he sits still and quiet instead of roaming.
-        if (state != State.DOCKED && dockable() && classifier.charger()) {
-            enterDocked(now);
-        }
-        if (state == State.DOCKED) {
-            watchLooks(now);
-            dockStep(now);
-            return;
         }
         boolean hazard = s == HazardClassifier.Status.HAZARD;
         watchLooks(now);
@@ -2383,7 +2400,7 @@ final class ExploreBrain {
         corneredAfterStartle |= wedgedNow(now);
         // One "whoa" per stall streak: repeat stalls flinch quietly. On the charger (the
         // latch refuses the leg he drove onto it with) he settles without a sound.
-        if (classifier.charger()) {
+        if (onCharger()) {
             note("on the charger: no startle");
         } else if (!stalledNow || stallStreak == 1) {
             sound.playStartle();
@@ -7218,7 +7235,7 @@ final class ExploreBrain {
         if (state.converses()) {
             return CallVerdict.WAIT;
         }
-        if (classifier.charger()) {
+        if (onCharger()) {
             return CallVerdict.IN_PLACE;
         }
         if (state == State.STARTLE || state == State.BACK_OFF) {
@@ -8443,7 +8460,7 @@ final class ExploreBrain {
 
     /** Whether a search turn may start now: a fresh, clear reading, the wheels, off the charger, turns that turn. */
     private boolean chatMayTurn() {
-        return chatFresh && !chatHazard && leaseHeld && !chatNoWheels && !wheellessMeeting && !classifier.charger()
+        return chatFresh && !chatHazard && leaseHeld && !chatNoWheels && !wheellessMeeting && !onCharger()
                 && !jammed && chatSeekBlocked < tuning.callBlockedTurnsMax && state.chats();
     }
 
@@ -8562,7 +8579,7 @@ final class ExploreBrain {
         if (callChatCue != null) {
             // Owner 2026-10-02: the call's conversation, opened before he has seen them.
             Ears.Cue c = callChatCue;
-            boolean search = callChatSearch && !classifier.charger() && leaseHeld;
+            boolean search = callChatSearch && !onCharger() && leaseHeld;
             planChatSeek(c, search);
             String message = callChatMessage;
             callChatCue = null;
@@ -8602,7 +8619,7 @@ final class ExploreBrain {
      */
     private void finishChat(long now) {
         boolean named = chat.named();
-        boolean docked = classifier.charger();
+        boolean docked = onCharger();
         peopleIgnoredUntil = now + tuning.peopleCooldownMs;
         if (named) {
             met.addLast(new Met(port.metId(), now));
@@ -8746,7 +8763,7 @@ final class ExploreBrain {
 
         @Override
         public boolean charger() {
-            return classifier.charger();
+            return onCharger();
         }
 
         @Override
@@ -8846,10 +8863,39 @@ final class ExploreBrain {
     // to this session, with a line he has not said. Anything else is silence. Calls
     // still take him out of DOCKED (callStep runs first) and come back to it after.
 
-    /** States DOCKED may replace: roaming, escaping and resting, never a stop, a call or a conversation. */
+    /** States DOCKED may replace: roaming, escaping, resting and eyes-only (a faulted ToF on the dock),
+     * never a stop, a call or a conversation. */
     private boolean dockable() {
-        return (state.roams() || state == State.CORNERED || state == State.RECOVER)
+        return (state.roams() || state == State.CORNERED || state == State.RECOVER || state == State.EYES_ONLY)
                 && call == null && !callChatOpening && chat == null;
+    }
+
+    /** On the charger: POWER says so (debounced, trackPower), or the CPL=3 latch is set. */
+    private boolean onCharger() {
+        return powerDocked || classifier.charger();
+    }
+
+    /**
+     * POWER's dock verdict (2026-10-02, SensorReply.Power.docked()). The CPL=3 latch needs a
+     * motion command, and on the owner's dock the ToF reads 16383 so he never sends one;
+     * POWER rides on every poll. One reading saying docked docks him; leaving takes
+     * dockOffReadings in a row saying off. A reading without a readable POWER counts neither way.
+     */
+    private void trackPower(SensorReading r) {
+        if (r.docked == null) {
+            return;
+        }
+        if (r.docked) {
+            powerOffStreak = 0;
+            if (!powerDocked) {
+                powerDocked = true;
+                note("power: on the charger (POWER says docked)");
+            }
+        } else if (powerDocked && ++powerOffStreak >= tuning.dockOffReadings) {
+            powerDocked = false;
+            powerOffStreak = 0;
+            note("power: off the charger for " + tuning.dockOffReadings + " readings");
+        }
     }
 
     private void enterDocked(long now) {
@@ -8900,7 +8946,7 @@ final class ExploreBrain {
 
     /** DOCKED, each step: off the charger roams again; else the next look, or the one being waited for or asked about. */
     private void dockStep(long now) {
-        if (!classifier.charger()) {
+        if (!onCharger()) {
             onDock = false;
             dropDockLook(null);
             note("docked: off the charger; roaming again");
@@ -9948,7 +9994,7 @@ final class ExploreBrain {
     }
 
     private void show(EyeState s, Direction gaze) {
-        if ((s == EyeState.RESTING || s == EyeState.EYES_ONLY) && classifier.charger()) {
+        if ((s == EyeState.RESTING || s == EyeState.EYES_ONLY) && onCharger()) {
             // On the charger every still look is the docked one: ModeApp sings only for these two.
             s = EyeState.DOCKED;
             gaze = null;

@@ -325,9 +325,12 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         // The wheel counts are signed (reverse counts down past 0): presence is its own flag.
         // The charger latch (meeting plan U1, KTD6) is the driver's, not the reply's:
         // it rides on the next reading after the acknowledgement that set or cleared it.
+        // POWER's dock verdict (2026-10-02) is the reply's own and rides on every poll, tof
+        // fault or not: on the owner's dock tof reads 16383 and the latch never comes.
         lastReading = new SensorReading(s.timestampMs, s.tof, s.ir1, s.ir2, cpl, false,
                 s.hasWheels, s.wheelLeft, s.wheelRight, s.hasGyro, s.gyroX, s.gyroY, s.gyroZ,
-                d.chargerLatched(), s.hasAccel, s.accelX, s.accelY, s.accelZ);
+                d.chargerLatched(), s.hasAccel, s.accelX, s.accelY, s.accelZ,
+                s.power == null ? null : Boolean.valueOf(s.power.docked()));
         ReadingListener l = readingListener;
         if (l != null) {
             l.onReading(lastReading);

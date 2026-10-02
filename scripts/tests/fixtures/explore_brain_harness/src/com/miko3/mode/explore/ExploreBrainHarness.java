@@ -109,6 +109,18 @@ public final class ExploreBrainHarness {
                 true, false, 0, 0, 0);
     }
 
+    /** r with POWER's dock verdict (2026-10-02): true docked, false off the dock, null none or malformed. */
+    static SensorReading powered(SensorReading r, Boolean docked) {
+        return new SensorReading(r.timestampMs, r.tof, r.ir1, r.ir2, r.cpl, r.fault, r.hasWheels(), r.wheelLeft,
+                r.wheelRight, r.hasGyro, r.gyroX, r.gyroY, r.gyroZ, r.charger, r.hasAccel, r.accelX, r.accelY,
+                r.accelZ, docked);
+    }
+
+    /** The owner's dock (2026-10-02): tof at its fault value 16383, POWER=2 (charging), no CPL latch. */
+    static SensorReading dockFaulted(long t) {
+        return powered(new SensorReading(t, 16383, 100, 100, null, false), true);
+    }
+
     interface Feed {
         SensorReading at(long t);
     }
@@ -215,7 +227,7 @@ public final class ExploreBrainHarness {
             int raw = rawAt(r.timestampMs);
             return new SensorReading(r.timestampMs, r.tof, r.ir1, r.ir2, r.cpl, r.fault, hasWheels, wl, wr,
                     true, gyro.axis == 0 ? raw : 0, gyro.axis == 1 ? raw : 0, gyro.axis == 2 ? raw : 0,
-                    r.charger, r.hasAccel, r.accelX, r.accelY, r.accelZ);
+                    r.charger, r.hasAccel, r.accelX, r.accelY, r.accelZ, r.docked);
         }
 
         double wrapped() {
@@ -14755,6 +14767,80 @@ public final class ExploreBrainHarness {
                             && rig.brain.state() == ExploreBrain.State.DOCKED && rig.violations.isEmpty(),
                     "before=" + rig.motions(0, 20000) + " startles=" + rig.countPrefix("startle", 20000, 120001)
                             + " after=" + rig.motions(20500, 120001) + " state=" + rig.brain.state() + " " + rig.tail());
+        });
+        scenario("dock_power_with_a_faulted_tof_docks_without_moving_and_remarks_only_on_something_new", n -> {
+            // The owner's dock (2026-10-02): tof reads 16383, so the sensors are unavailable and
+            // he never drives, so the CPL=3 latch never comes; POWER=2 alone must dock him.
+            Rig rig = new Rig(cueTuning().build(), t -> dockFaulted(t), KETTLE_FROM_100S, true, KETTLE_PICKS);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(200000);
+            int said = rig.firstAfter("say ", 0);
+            check(n, rig.brain.state() == ExploreBrain.State.DOCKED && rig.motions(0, 200001) == 0
+                            && rig.asks.size() >= 2 && rig.countPrefix("say ", 0, 200001) == 1
+                            && rig.timeOf(said) > 100000 && rig.what(said).startsWith("say Ooh, a kettle")
+                            && sounds(rig, 0, 100000) == 0 && rig.count("startle") == 0
+                            && singingEyes(rig, 500, 200001) == 0
+                            && notesWith(notes, "docked: on the charger") == 1
+                            && notesWith(notes, "power: on the charger") == 1 && rig.violations.isEmpty(),
+                    "state=" + rig.brain.state() + " motions=" + rig.motions(0, 200001) + " asks=" + rig.asks.size()
+                            + " lines=" + spoken(rig) + " singing=" + singingEyes(rig, 500, 200001) + " docked="
+                            + notesWith(notes, "docked: on the charger") + " power="
+                            + notesWith(notes, "power: on the charger") + " " + rig.tail());
+        });
+        scenario("dock_power_off_the_dock_never_docks", n -> {
+            Rig rig = cueRig(cueTuning(), t -> powered(clear(t), false), EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(60000);
+            check(n, !rig.statesSeen.contains(ExploreBrain.State.DOCKED) && rig.motions(0, 60001) > 0
+                            && notesWith(notes, "docked") == 0 && notesWith(notes, "power: on the charger") == 0
+                            && rig.violations.isEmpty(),
+                    "seen=" + rig.statesSeen + " motions=" + rig.motions(0, 60001) + " " + rig.tail());
+        });
+        scenario("dock_power_off_for_two_readings_roams_again_and_one_is_not_enough", n -> {
+            // One stray off reading at 30 s is ignored; from 60 s POWER says off and stays off.
+            Rig rig = cueRig(cueTuning(), t -> powered(clear(t), t < 60000 && t != 30000), EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(40000);
+            ExploreBrain.State at40 = rig.brain.state();
+            int offAt40 = notesWith(notes, "docked: off the charger");
+            rig.runUntil(60050);
+            ExploreBrain.State afterOne = rig.brain.state();
+            rig.runUntil(90000);
+            check(n, at40 == ExploreBrain.State.DOCKED && offAt40 == 0 && afterOne == ExploreBrain.State.DOCKED
+                            && rig.brain.state() != ExploreBrain.State.DOCKED && rig.motions(0, 60000) == 0
+                            && rig.motions(60000, 90001) > 0 && notesWith(notes, "docked: off the charger") == 1
+                            && notesWith(notes, "power: off the charger") == 1 && rig.violations.isEmpty(),
+                    "at40=" + at40 + " offAt40=" + offAt40 + " afterOne=" + afterOne + " now=" + rig.brain.state()
+                            + " motions after=" + rig.motions(60000, 90001) + " " + rig.tail());
+        });
+        scenario("dock_power_off_the_dock_with_a_faulted_tof_goes_back_to_eyes_only", n -> {
+            Rig rig = cueRig(cueTuning(), t -> t < 30000 ? dockFaulted(t)
+                    : powered(new SensorReading(t, 16383, 100, 100, null, false), false), EMPTY_ROOM);
+            rig.started();
+            rig.runUntil(29000);
+            ExploreBrain.State docked = rig.brain.state();
+            rig.runUntil(40000);
+            check(n, docked == ExploreBrain.State.DOCKED && rig.brain.state() == ExploreBrain.State.EYES_ONLY
+                            && rig.motions(0, 40001) == 0 && rig.violations.isEmpty(),
+                    "docked=" + docked + " now=" + rig.brain.state() + " " + rig.tail());
+        });
+        scenario("dock_power_missing_or_malformed_is_ignored", n -> {
+            // Docked by POWER, then readings without a readable POWER: no verdict either way.
+            Rig rig = cueRig(cueTuning(), t -> powered(clear(t), t < 20000 ? Boolean.TRUE : null), EMPTY_ROOM);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(60000);
+            Rig never = cueRig(cueTuning(), t -> powered(clear(t), null), EMPTY_ROOM);
+            never.started();
+            never.runUntil(30000);
+            check(n, rig.brain.state() == ExploreBrain.State.DOCKED && rig.motions(0, 60001) == 0
+                            && notesWith(notes, "docked: off the charger") == 0
+                            && !never.statesSeen.contains(ExploreBrain.State.DOCKED) && never.motions(0, 30001) > 0
+                            && rig.violations.isEmpty() && never.violations.isEmpty(),
+                    "state=" + rig.brain.state() + " never seen=" + never.statesSeen + " " + rig.tail());
         });
         scenario("dock_taken_off_the_charger_he_roams_again", n -> {
             Rig rig = cueRig(cueTuning(), t -> t < 60000 ? charger(t) : clear(t), EMPTY_ROOM);

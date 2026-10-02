@@ -55,6 +55,12 @@ final class SensorReading {
     final int accelX;
     final int accelY;
     final int accelZ;
+    /** The dock as the reply's POWER section says it (2026-10-02, SensorReply.Power.docked()):
+     * TRUE on the dock, FALSE off it, null when the reply had no readable POWER. Unlike
+     * the charger latch it needs no motion command, and it is read whatever the ToF says:
+     * on the owner's dock tof is at its fault value while POWER says charging. The brain
+     * debounces leaving the dock (ExploreTuning.dockOffReadings). */
+    final Boolean docked;
 
     /** No wheel counts and no gyro. */
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault) {
@@ -81,10 +87,19 @@ final class SensorReading {
                 gyroZ, false, false, 0, 0, 0);
     }
 
-    /** Every field, with the wheels', the gyro's and the accelerometer's presence explicit. */
+    /** Every field but POWER's dock verdict, with the wheels', the gyro's and the accelerometer's presence explicit. */
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault, boolean hasWheels,
                   long wheelLeft, long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ,
                   boolean charger, boolean hasAccel, int accelX, int accelY, int accelZ) {
+        this(timestampMs, tof, ir1, ir2, cpl, fault, hasWheels, wheelLeft, wheelRight, hasGyro, gyroX, gyroY, gyroZ,
+                charger, hasAccel, accelX, accelY, accelZ, null);
+    }
+
+    /** Every field, POWER's dock verdict included (null for none). */
+    SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault, boolean hasWheels,
+                  long wheelLeft, long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ,
+                  boolean charger, boolean hasAccel, int accelX, int accelY, int accelZ, Boolean docked) {
+        this.docked = docked;
         this.charger = charger;
         this.hasAccel = hasAccel;
         this.accelX = hasAccel ? accelX : 0;
@@ -115,6 +130,6 @@ final class SensorReading {
                 + " cpl=" + cpl + (hasWheels() ? " wheels=" + wheelLeft + "/" + wheelRight : "")
                 + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "")
                 + (hasAccel ? " accel=" + accelX + "," + accelY + "," + accelZ : "")
-                + (charger ? " CHARGER" : "") + (fault ? " FAULT" : "");
+                + (charger ? " CHARGER" : "") + (docked == null ? "" : docked ? " DOCKED" : " UNDOCKED") + (fault ? " FAULT" : "");
     }
 }

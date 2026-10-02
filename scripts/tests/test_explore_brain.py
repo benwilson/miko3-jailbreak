@@ -666,6 +666,11 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "dock_a_call_is_answered_and_the_conversation_runs_without_turning",
         "dock_driving_onto_the_charger_is_no_startle_and_he_settles",
         "dock_taken_off_the_charger_he_roams_again",
+        "dock_power_with_a_faulted_tof_docks_without_moving_and_remarks_only_on_something_new",
+        "dock_power_off_the_dock_never_docks",
+        "dock_power_off_for_two_readings_roams_again_and_one_is_not_enough",
+        "dock_power_off_the_dock_with_a_faulted_tof_goes_back_to_eyes_only",
+        "dock_power_missing_or_malformed_is_ignored",
     )
 
     @classmethod

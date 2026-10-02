@@ -47,6 +47,10 @@ public final class SensorSnapshot {
     public final int accelX;
     public final int accelY;
     public final int accelZ;
+    /** The reply's POWER section (SensorReply.Power: dock state, signed current,
+     * percentage), or null when it had none or it was malformed. Read whatever the ToF
+     * says: on the owner's dock tof is 16383 (fault) while POWER says charging. */
+    public final SensorReply.Power power;
 
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2) {
         this(timestampMs, tof, ir1, ir2, ABSENT, ABSENT);
@@ -73,11 +77,20 @@ public final class SensorSnapshot {
                 false, ABSENT, ABSENT, ABSENT);
     }
 
-    /** Every field, with explicit presence for the signed wheel counts, gyro rates and
-     * accelerometer values. */
+    /** Every field but POWER, with explicit presence for the signed wheel counts, gyro
+     * rates and accelerometer values. */
     public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, boolean hasWheels, long wheelLeft,
                           long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ,
                           boolean hasAccel, int accelX, int accelY, int accelZ) {
+        this(timestampMs, tof, ir1, ir2, hasWheels, wheelLeft, wheelRight, hasGyro, gyroX, gyroY, gyroZ,
+                hasAccel, accelX, accelY, accelZ, null);
+    }
+
+    /** Every field, POWER included (null for none). */
+    public SensorSnapshot(long timestampMs, int tof, int ir1, int ir2, boolean hasWheels, long wheelLeft,
+                          long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ,
+                          boolean hasAccel, int accelX, int accelY, int accelZ, SensorReply.Power power) {
+        this.power = power;
         this.timestampMs = timestampMs;
         this.tof = tof;
         this.ir1 = ir1;
@@ -102,6 +115,6 @@ public final class SensorSnapshot {
                 + (hasWheels ? " wheels=" + wheelLeft + "/" + wheelRight : "")
                 + (hasGyro ? " gyro=" + gyroX + "," + gyroY + "," + gyroZ : "")
                 + (hasAccel ? " accel=" + accelX + "," + accelY + "," + accelZ : "")
-                + (fault ? " FAULT" : "") + "}";
+                + (power != null ? " " + power : "") + (fault ? " FAULT" : "") + "}";
     }
 }

@@ -124,11 +124,24 @@ class DockedQuietWiringTest(unittest.TestCase):
         self.assertIn("enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING, GLANCE, LISTENING, DOCKED }",
                       brain)
         show = re.search(r"private void show\(EyeState s, Direction gaze\)\s*\{(.*?)eyes\.show", brain, re.S).group(1)
-        self.assertIn("classifier.charger()", show)
+        self.assertIn("onCharger()", show)
         self.assertIn("EyeState.DOCKED", show)
-        startle = re.search(r"if \(classifier\.charger\(\)\)\s*\{[^}]*\}\s*else if \([^)]*\)\s*\{\s*sound\.playStartle\(\);",
+        startle = re.search(r"if \(onCharger\(\)\)\s*\{[^}]*\}\s*else if \([^)]*\)\s*\{\s*sound\.playStartle\(\);",
                             brain)
         self.assertIsNotNone(startle)
+
+    def test_on_the_charger_is_power_or_the_cpl_latch(self):
+        # 2026-10-02: on the owner's dock the ToF reads 16383, so he never drives and the CPL=3
+        # latch never comes; POWER's dock verdict is the other source, read on every poll.
+        brain = code_only(src("ExploreBrain.java"))
+        on = re.search(r"private boolean onCharger\(\)\s*\{(.*?)\n    \}", brain, re.S)
+        self.assertIsNotNone(on)
+        self.assertIn("powerDocked", on.group(1))
+        self.assertIn("classifier.charger()", on.group(1))
+        self.assertEqual(brain.count("classifier.charger()"), 1, "every other charger check goes through onCharger()")
+        self.assertIn("trackPower(reading);", brain)
+        drive = code_only(src("ExploreDrive.java"))
+        self.assertIn("s.power == null ? null : Boolean.valueOf(s.power.docked())", drive)
 
 
 class EarsAdapterWiringTest(unittest.TestCase):
@@ -238,6 +251,7 @@ class EarsAdapterWiringTest(unittest.TestCase):
         sync = re.search(r"private void syncEars\(long now\)\s*\{(.*?)\n    \}", brain, re.S)
         self.assertIsNotNone(sync)
         self.assertNotIn("classifier.charger()", sync.group(1))
+        self.assertNotIn("onCharger()", sync.group(1))
         self.assertIn("port.earsOpen()", sync.group(1))
         self.assertIn("port.earsClose()", sync.group(1))
         # A session the launcher dropped is noticed here too (the reopen backoff below).
