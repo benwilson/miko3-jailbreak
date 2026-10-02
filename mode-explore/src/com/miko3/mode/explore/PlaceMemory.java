@@ -440,6 +440,30 @@ final class PlaceMemory {
         return out;
     }
 
+    /**
+     * Owner 2026-10-03 (go_to_place): the heading of the newest kept look whose labels include
+     * any of these and whose heading was usable; NaN when none.
+     */
+    double headingOf(Collection<String> labels, long nowMs) {
+        forget(nowMs);
+        if (labels == null || labels.isEmpty()) {
+            return Double.NaN;
+        }
+        java.util.Iterator<Kept> it = kept.descendingIterator();
+        while (it.hasNext()) {
+            Kept k = it.next();
+            if (Double.isNaN(k.headingDeg)) {
+                continue;
+            }
+            for (String l : k.labels) {
+                if (labels.contains(l)) {
+                    return k.headingDeg;
+                }
+            }
+        }
+        return Double.NaN;
+    }
+
     int size() {
         return kept.size();
     }

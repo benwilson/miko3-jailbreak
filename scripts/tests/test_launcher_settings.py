@@ -49,6 +49,9 @@ SETTINGS_PATHS = (
     "SETTINGS_FACE_STATE_PATH",
     "SETTINGS_FEEDBACK_CLEAR_PATH",
     "SETTINGS_FEEDBACK_STATE_PATH",
+    "SETTINGS_OWNER_NOTES_ADD_PATH",
+    "SETTINGS_OWNER_NOTES_EDIT_PATH",
+    "SETTINGS_OWNER_NOTES_DELETE_PATH",
 )
 PROBE = LAUNCHER / "EarsProbe.java"
 CONVERSATION = SHARED_SRC / "com" / "miko3" / "shared" / "ConversationSettings.java"
@@ -257,6 +260,9 @@ class SettingsPageSourceTest(unittest.TestCase):
             "SETTINGS_FACE_STATE_PATH": "/settings/face/state",
             "SETTINGS_FEEDBACK_CLEAR_PATH": "/settings/feedback/clear",
             "SETTINGS_FEEDBACK_STATE_PATH": "/settings/feedback/state",
+            "SETTINGS_OWNER_NOTES_ADD_PATH": "/settings/owner-notes/add",
+            "SETTINGS_OWNER_NOTES_EDIT_PATH": "/settings/owner-notes/edit",
+            "SETTINGS_OWNER_NOTES_DELETE_PATH": "/settings/owner-notes/delete",
         }
         for name, path in expected.items():
             self.assertRegex(src, rf'public static final String {name} = "{re.escape(path)}";')
@@ -483,6 +489,13 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "feedback_clear_needs_the_token_and_empties_the_log",
         "feedback_state_needs_the_token_and_carries_entries_newest_first_without_ids",
         "forget_on_page_deletes_their_feedback",
+        # Owner 2026-10-03: the owner's notes about people by name.
+        "owner_notes_section_explains_and_offers_an_add_form",
+        "owner_notes_add_lists_the_entry_escaped_with_edit_and_delete",
+        "owner_notes_edit_and_delete_change_only_that_entry",
+        "owner_notes_need_the_token_and_post",
+        "owner_notes_refusals_and_statuses_never_echo_the_name_or_note",
+        "owner_notes_paths_are_tls_only",
     )
 
     @classmethod

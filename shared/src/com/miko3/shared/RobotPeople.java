@@ -143,6 +143,13 @@ public interface RobotPeople extends IInterface {
     boolean recordFeedback(String id, String kind, String summary, String quote, String context)
             throws RemoteException;
 
+    // Owner 2026-10-03 (the owner's notes about people by name). Appended as above.
+
+    /** The owner's note about the person with this name (OwnerNotes.noteFor's
+     * rules: a full name, or a first name only one note has), or null. The
+     * caller may only use it to shape how it approaches that person. */
+    String ownerNoteFor(String name) throws RemoteException;
+
     /** One stored photo as gallery() answers it: never a name or an image. */
     final class GalleryPhoto {
         public final String id;
@@ -203,6 +210,7 @@ public interface RobotPeople extends IInterface {
         static final int TRANSACTION_recordCheck = 15;
         static final int TRANSACTION_updateCheck = 16;
         static final int TRANSACTION_recordFeedback = 17;
+        static final int TRANSACTION_ownerNoteFor = 18;
 
         public Stub() {
             attachInterface(this, DESCRIPTOR);
@@ -399,6 +407,13 @@ public interface RobotPeople extends IInterface {
                     boolean kept = recordFeedback(id, kind, summary, quote, data.readString());
                     reply.writeNoException();
                     reply.writeInt(kept ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_ownerNoteFor: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String note = ownerNoteFor(data.readString());
+                    reply.writeNoException();
+                    reply.writeString(note);
                     return true;
                 }
                 case IBinder.INTERFACE_TRANSACTION: {
@@ -783,6 +798,24 @@ public interface RobotPeople extends IInterface {
                     }
                     reply.readException();
                     return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public String ownerNoteFor(String name) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(name);
+                    if (!remote.transact(TRANSACTION_ownerNoteFor, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readString();
                 } finally {
                     reply.recycle();
                     data.recycle();

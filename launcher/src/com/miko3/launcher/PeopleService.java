@@ -161,6 +161,13 @@ public class PeopleService extends Service {
             Feedback f = Feedback.of(kind, summary, quote);
             return f != null && people().recordFeedback(id, f, context);
         }
+
+        @Override
+        public String ownerNoteFor(String name) {
+            enforceCaller();
+            // Owner 2026-10-03: never logged; only the matched note goes back.
+            return people().ownerNotes().noteFor(name);
+        }
     };
 
     @Override

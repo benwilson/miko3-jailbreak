@@ -281,6 +281,19 @@ interface CuriosityPort extends AnswerParser.Names {
     default void lookAnswer(LookResult result) {
     }
 
+    /** Owner 2026-10-03: ask Claude for the rest of a task's plan (TaskConsult). Default: no Claude. */
+    default void taskPlan(TaskConsult request, long timeoutMs) {
+    }
+
+    /** The answer to the last taskPlan(), or null while it runs. Default: FAILED at once. */
+    default TaskPlan taskPlanAnswer() {
+        return TaskPlan.failed();
+    }
+
+    /** Abandon the running taskPlan(), if any. */
+    default void cancelTaskPlan() {
+    }
+
     /**
      * 2026-10-03, the learning log: how the last turn() was answered (a speculation used, the
      * tools its round ran), or null while that is not known. Names of tools only, never words.
@@ -1209,10 +1222,102 @@ interface CuriosityPort extends AnswerParser.Names {
 
         final String status;
         final String places;
+        /**
+         * Owner 2026-10-03, the action tools (ChatActions): why he can't drive now (on the
+         * charger, bathroom privacy, no wheels, stuck), or null when he can.
+         */
+        final String still;
+        /** The names his detector knows, lower case; empty when unknown (any label is tried). */
+        final java.util.Set<String> vocabulary;
+        /** The places he looked at lately, newest first, bathroom ones left out (go_to_place). */
+        final List<ChatTools.Place> placeList;
 
         ToolFacts(String status, String places) {
-            this.status = status == null || status.trim().isEmpty() ? NONE.status : status.trim();
-            this.places = places == null || places.trim().isEmpty() ? NONE.places : places.trim();
+            this(status, places, null, null, null);
+        }
+
+        ToolFacts(String status, String places, String still, java.util.Collection<String> vocabulary,
+                List<ChatTools.Place> placeList) {
+            this.status = status == null || status.trim().isEmpty() ? "Nothing is known about his state right now."
+                    : status.trim();
+            this.places = places == null || places.trim().isEmpty() ? "He remembers no places right now." : places.trim();
+            this.still = still == null || still.trim().isEmpty() ? null : still.trim();
+            java.util.Set<String> v = new java.util.TreeSet<String>();
+            if (vocabulary != null) {
+                for (String w : vocabulary) {
+                    if (w != null && !w.trim().isEmpty()) {
+                        v.add(w.trim().toLowerCase(java.util.Locale.US));
+                    }
+                }
+            }
+            this.vocabulary = Collections.unmodifiableSet(v);
+            this.placeList = placeList == null ? Collections.<ChatTools.Place>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<ChatTools.Place>(placeList));
+        }
+
+        /** These facts with the detector's vocabulary (the adapter knows it; the brain does not). */
+        ToolFacts withVocabulary(java.util.Collection<String> names) {
+            return new ToolFacts(status, places, still, names, placeList);
+        }
+    }
+
+    /**
+     * Owner 2026-10-03: a task's consult (ExploreBrain's run_task runner): the goal in the
+     * person's words, each step done so far with its outcome, the steps still planned, his
+     * status, the detector's latest labels, why he asks ("failed" or "check"), and what is
+     * left of the budget. Never a frame. The adapter sends it and never logs it.
+     */
+    final class TaskConsult {
+        final String goal;
+        final List<String> done;
+        final List<String> rest;
+        final String status;
+        final List<String> labels;
+        final String why;
+        final int consultsLeft;
+        final long msLeft;
+        /** For checking the revised steps (what drives now, the vocabulary, the places). */
+        final ToolFacts facts;
+
+        TaskConsult(String goal, List<String> done, List<String> rest, String status, List<String> labels, String why,
+                    int consultsLeft, long msLeft, ToolFacts facts) {
+            this.goal = goal == null ? "" : goal;
+            this.done = done == null ? Collections.<String>emptyList() : Collections.unmodifiableList(done);
+            this.rest = rest == null ? Collections.<String>emptyList() : Collections.unmodifiableList(rest);
+            this.status = status == null ? "" : status;
+            this.labels = labels == null ? Collections.<String>emptyList() : Collections.unmodifiableList(labels);
+            this.why = why;
+            this.consultsLeft = consultsLeft;
+            this.msLeft = msLeft;
+            this.facts = facts == null ? ToolFacts.NONE : facts;
+        }
+    }
+
+    /** A consult's answer: the revised rest of the plan, an abort (with the line he says), or FAILED. */
+    final class TaskPlan {
+        enum Status { REVISED, ABORT, FAILED }
+
+        final Status status;
+        final List<ChatActions.Act> steps;
+        final String line;
+
+        TaskPlan(Status status, List<ChatActions.Act> steps, String line) {
+            this.status = status;
+            this.steps = steps == null ? Collections.<ChatActions.Act>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<ChatActions.Act>(steps));
+            this.line = line == null || line.trim().isEmpty() ? null : line.trim();
+        }
+
+        static TaskPlan revised(List<ChatActions.Act> steps) {
+            return new TaskPlan(Status.REVISED, steps, null);
+        }
+
+        static TaskPlan abort(String line) {
+            return new TaskPlan(Status.ABORT, null, line);
+        }
+
+        static TaskPlan failed() {
+            return new TaskPlan(Status.FAILED, null, null);
         }
     }
 
@@ -1238,15 +1343,32 @@ interface CuriosityPort extends AnswerParser.Names {
         /** Null when the frame is here; else a short reason Claude can read. */
         final String refused;
 
+        /** Robot 2026-10-03: whether the labels are the detector's for this very frame (false: it did not run on it). */
+        final boolean detected;
+        /** How old the frame was when it was handed over (-1: a frame captured for this look). */
+        final long ageMs;
+
         private LookResult(byte[] jpeg, List<String> labels, String refused) {
+            this(jpeg, labels, refused, true, -1);
+        }
+
+        private LookResult(byte[] jpeg, List<String> labels, String refused, boolean detected, long ageMs) {
             this.jpeg = jpeg;
             this.labels = labels == null ? Collections.<String>emptyList()
                     : Collections.unmodifiableList(new ArrayList<String>(labels));
             this.refused = refused;
+            this.detected = detected;
+            this.ageMs = ageMs;
         }
 
         static LookResult of(byte[] jpeg, List<String> labels) {
             return jpeg == null ? refused("the camera gave no picture") : new LookResult(jpeg, labels, null);
+        }
+
+        /** The camera's newest streamed frame, this old, with its detection's labels or none (null). */
+        static LookResult streamed(byte[] jpeg, List<String> labelsOrNull, long ageMs) {
+            return jpeg == null ? refused("the camera gave no picture")
+                    : new LookResult(jpeg, labelsOrNull, null, labelsOrNull != null, ageMs);
         }
 
         static LookResult refused(String why) {
@@ -1315,9 +1437,28 @@ interface CuriosityPort extends AnswerParser.Names {
             this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called, cantSee, null);
         }
 
+        /**
+         * Owner 2026-10-03: the owner's note about the person he is talking to, by name (from the
+         * launcher's Settings page), and the name it was found by; null when none. Goes into the
+         * system context only (ExplorePrompts.systemPrefix), never into a tool's answer or a log.
+         */
+        final String ownerName;
+        final String ownerNote;
+
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
                     String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee,
                     ToolFacts facts) {
+            this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called, cantSee, facts,
+                    null, null);
+        }
+
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
+                    String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee,
+                    ToolFacts facts, String ownerName, String ownerNote) {
+            boolean noted = ownerName != null && !ownerName.trim().isEmpty() && ownerNote != null
+                    && !ownerNote.trim().isEmpty();
+            this.ownerName = noted ? ownerName.trim() : null;
+            this.ownerNote = noted ? ownerNote.trim() : null;
             this.facts = facts == null ? ToolFacts.NONE : facts;
             this.called = called;
             this.cantSee = cantSee;
@@ -1334,25 +1475,31 @@ interface CuriosityPort extends AnswerParser.Names {
         /** This request again, with the repeated question to avoid. */
         TurnRequest avoiding(String question) {
             return new TurnRequest(persona, name, notes, transcript, heard, question, faceless, faceSeen, called,
-                    cantSee, facts);
+                    cantSee, facts, ownerName, ownerNote);
         }
 
         /** This request as one in a conversation that opened faceless, with or without a face since. */
         TurnRequest face(boolean openedFaceless, boolean seenSince) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, openedFaceless, seenSince,
-                    called, cantSee, facts);
+                    called, cantSee, facts, ownerName, ownerNote);
         }
 
         /** This request in a conversation a call opened (owner 2026-10-02), with or without the crouch invitation. */
         TurnRequest call(boolean openedOnACall, boolean cantSeeThem) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen,
-                    openedOnACall, cantSeeThem, facts);
+                    openedOnACall, cantSeeThem, facts, ownerName, ownerNote);
+        }
+
+        /** This request with the owner's note about its partner, found by this name (null: none). */
+        TurnRequest withOwnerNote(String byName, String note) {
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
+                    cantSee, facts, byName, note);
         }
 
         /** This request with what robot_status and places answer (owner 2026-10-03). */
         TurnRequest withFacts(ToolFacts f) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
-                    cantSee, f);
+                    cantSee, f, ownerName, ownerNote);
         }
 
         /** The opener: nothing heard yet. */
@@ -1610,7 +1757,9 @@ interface CuriosityPort extends AnswerParser.Names {
      * "be quiet"). Anything else he can't do is NONE, and his line says so.
      */
     enum Action {
-        NONE, GO_AWAY, GO_ELSEWHERE, FIND_PERSON, COME_HERE, BE_QUIET;
+        NONE, GO_AWAY, GO_ELSEWHERE, FIND_PERSON, COME_HERE, BE_QUIET,
+        // Owner 2026-10-03: the action tools (ChatActions), and a task's own steps (say, look, come_back).
+        MOVE, STOP, STAY, WAIT, FIND_THING, GO_TO_PLACE, RUN_TASK, SAY, LOOK, COME_BACK;
 
         /** The schema's word ("go_away"), or NONE for anything else. */
         static Action of(Object v) {
@@ -1650,16 +1799,18 @@ interface CuriosityPort extends AnswerParser.Names {
         /** Owner 2026-10-02: an instruction he was given, and its short target (a name or place), or null. */
         final Action action;
         final String target;
+        /** Owner 2026-10-03: the action tool call behind it (ChatActions), with its details; null for none. */
+        final ChatActions.Act act;
 
         private Turn(Status status, String line, String questionAsked, String nameGiven, boolean endsConversation,
                      boolean deflected, String notesUpdate) {
             this(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, null, true,
-                    Action.NONE, null);
+                    null);
         }
 
         private Turn(Status status, String line, String questionAsked, String nameGiven, boolean endsConversation,
-                     boolean deflected, String notesUpdate, Feedback feedback, boolean addressed, Action action,
-                     String target) {
+                     boolean deflected, String notesUpdate, Feedback feedback, boolean addressed,
+                     ChatActions.Act act) {
             this.status = status;
             this.line = line;
             this.questionAsked = questionAsked;
@@ -1669,27 +1820,33 @@ interface CuriosityPort extends AnswerParser.Names {
             this.notesUpdate = notesUpdate;
             this.feedback = feedback;
             this.addressed = addressed;
-            this.action = action == null ? Action.NONE : action;
-            this.target = target;
+            this.act = act == null || act.action == Action.NONE ? null : act;
+            this.action = this.act == null ? Action.NONE : this.act.action;
+            this.target = this.act == null ? null : this.act.target;
         }
 
         /** This turn carrying feedback (null: none). */
         Turn withFeedback(Feedback f) {
             return new Turn(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, f,
-                    addressed, action, target);
+                    addressed, act);
         }
 
         /** This turn, said to him or not. */
         Turn withAddressed(boolean a) {
             return new Turn(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, feedback,
-                    a, action, target);
+                    a, act);
         }
 
         /** This turn carrying an instruction and its target (null or blank: none). */
         Turn withAction(Action a, String t) {
             String tt = t == null || t.trim().isEmpty() ? null : t.trim();
+            return withAct(a == null || a == Action.NONE ? null : ChatActions.Act.of(a, tt));
+        }
+
+        /** Owner 2026-10-03: this turn carrying an action tool's act (null: none). */
+        Turn withAct(ChatActions.Act a) {
             return new Turn(status, line, questionAsked, nameGiven, endsConversation, deflected, notesUpdate, feedback,
-                    addressed, a, tt);
+                    addressed, a);
         }
 
         static Turn line(String line, String questionAsked, String nameGiven, boolean endsConversation,

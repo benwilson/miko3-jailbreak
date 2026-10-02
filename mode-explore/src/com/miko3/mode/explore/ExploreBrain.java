@@ -364,6 +364,14 @@ final class ExploreBrain {
 
         /** The newest recognized frame since open(), or null. */
         Look latest();
+        /**
+         * Robot 2026-10-03 (the look tool took ~4.7 s waiting for a detected frame): the newest
+         * streamed frame, detected or not, kept even while the detector is parked (never in
+         * bathroom privacy); null when there is none. Default: none, so the look waits as before.
+         */
+        default RawFrame latestRaw() {
+            return null;
+        }
 
         /**
          * Closed and idle: close() has taken effect and no detector run is in
@@ -409,6 +417,17 @@ final class ExploreBrain {
          * calibration frame ring). The brain sets it on each change. No-op by default.
          */
         default void setPrivate(boolean on) {
+        }
+    }
+
+    /** A streamed camera frame: when it was captured (brain clock) and its JPEG. */
+    static final class RawFrame {
+        final long frameMs;
+        final byte[] jpeg;
+
+        RawFrame(long frameMs, byte[] jpeg) {
+            this.frameMs = frameMs;
+            this.jpeg = jpeg;
         }
     }
 
@@ -966,7 +985,7 @@ final class ExploreBrain {
     private EscThen escThen;
     /** A short forward try (ExploreTuning.escapeProbeTicks) is under way, and what follows it if blocked. */
     private boolean probing;
-    private enum ProbeThen { STEP, REST, AFTER_REST }
+    private enum ProbeThen { STEP, REST, AFTER_REST, BACK_OUT }
     private ProbeThen probeThen;
     private long probeSince;
     /** Where a forward drive last hit a hazard or stalled (NaN: none since a clean drive). */
@@ -1635,15 +1654,38 @@ final class ExploreBrain {
         startIntent(clock.nowMs(), a, target, side);
     }
 
+    /** Owner 2026-10-03: starts an action tool's act now (side as above). Package-private for the harness. */
+    void startAct(ChatActions.Act act, Direction side) {
+        startAct(clock.nowMs(), act, side);
+    }
+
     private void startIntent(long now, CuriosityPort.Action a, String target, Direction side) {
-        if (a == null || a == CuriosityPort.Action.NONE) {
+        startAct(now, a == null ? null : ChatActions.Act.of(a, target), side);
+    }
+
+    private void startAct(long now, ChatActions.Act act, Direction side) {
+        CuriosityPort.Action a = act == null ? CuriosityPort.Action.NONE : act.action;
+        String target = act == null ? null : act.target;
+        if (a == CuriosityPort.Action.NONE) {
+            return;
+        }
+        if (a == CuriosityPort.Action.RUN_TASK) {
+            startTask(now, act);
             return;
         }
         if (intent != CuriosityPort.Action.NONE) {
             dropIntent("a new instruction");
         }
+        intentAct = act;
+        intentStartedAt = now;
+        intentEndOk = false;
+        intentEndWhy = null;
         intentTarget = target == null || target.trim().isEmpty() ? null : target.trim();
         note("intent: " + a.word() + (intentTarget == null ? " (no target)" : " (target given)"));
+        note("act: start " + act.describe() + (task != null ? " (task " + taskNo + " step " + (taskIdx + 1) + ")" : ""));
+        if (startNewAct(now, act)) {
+            return;
+        }
         double toward = Double.NaN;
         if (compass.usable(now)) {
             toward = Heading.wrap(compass.degrees()
@@ -1690,11 +1732,710 @@ final class ExploreBrain {
                 intent = a;
                 intentUntil = now + INTENT_QUIET_MS;
                 quiet = true;
-                note("intent: be_quiet: do not disturb for " + span(INTENT_QUIET_MS)
+                long quietMs = act.ms > 0 ? act.ms : INTENT_QUIET_MS;
+                intentUntil = now + quietMs;
+                note("intent: be_quiet: do not disturb for " + span(quietMs)
                         + " (no remarks, calls get a glance)");
                 break;
             default:
                 break;
+        }
+    }
+
+    // ---- the action tools (owner 2026-10-03) ----
+    //
+    // "The AI response could control the robot damn near completely, or at least launch it on
+    // a workflow": Claude chooses (ChatActions, ChatRound), his own code drives. Each act runs
+    // as an intent, so a call drops it (be_quiet's and stay's calls are answered in place) and
+    // hazards, RECOVER, the jam, bathroom privacy and the charger always come first:
+    // - move: one turn (left, right, around, a spin) or a short straight drive forward or back,
+    //   through the usual LOOK/TURN, HOP and BACK_OFF steps and their floor-sensor, CPL and stall
+    //   rules; done when he is still again, failed when a hazard, a stall or RECOVER came first;
+    // - stay and wait: no legs or scans until the time is over; a call is answered where he stands;
+    // - find_thing: a seek at once; the first look whose labels name it ends the seek and he
+    //   turns to it and drives a short leg toward it (done when he stops);
+    // - go_to_place: a turn and a leg toward where he last saw one of its labels (place memory),
+    //   then a seek; done when a look shows one;
+    // - come_back (a task's step): a turn toward where the task started (dead reckoning) and one
+    //   leg of at most COME_BACK_MAX_M.
+    // Each act's start and end are records ("act: "), with its tool, kind and amount only.
+
+    /** Metres per forward or back tick at the fixed speed (~0.25 m/s, 250 ms ticks; not measured). */
+    static final double MOVE_M_PER_TICK = 0.0625;
+    static final long MOVE_MS = 60000;
+    static final double FIND_APPROACH_M = 0.6;
+    static final double COME_BACK_MAX_M = 3.0;
+    static final double COME_BACK_NEAR_M = 0.3;
+
+    /** The act behind the intent under way, with its details. */
+    private ChatActions.Act intentAct;
+    private long intentStartedAt;
+    /** The last intent's end, for a task's step: done (true) or dropped, and the fixed words why. */
+    private boolean intentEndOk;
+    private String intentEndWhy;
+    /** stay, wait: no legs or scans until then, and a call is answered in place. */
+    private long stayUntil = NEVER;
+    /** move, come_back, find_thing's approach: the motion is due at the next decision (false: started). */
+    private boolean moveDue;
+    /** ... its motion has started; and has been seen moving. */
+    private boolean moveStarted;
+    private boolean moveSawMotion;
+    /** A back move: BACK_OFF ends in a pause, not the escape's turn. */
+    private boolean moveBack;
+    /** find_thing's approach, come_back's and go_to_place's way to turn to (absolute degrees; NaN: none). */
+    private double actHeading = Double.NaN;
+    /** ... and the metres to drive after it (0: none). */
+    private double actLegM;
+    /** The look the label check last read. */
+    private Look actLook;
+
+    /** The intent's act, for tests. */
+    ChatActions.Act intentAct() {
+        return intentAct;
+    }
+
+    /**
+     * What the conversation's tools answer from (owner 2026-10-03): robot_status's text, the
+     * places (bathroom ones left out), and why he can't drive now (ChatActions refuses motion
+     * then), as fixed words.
+     */
+    private CuriosityPort.ToolFacts toolFactsNow(long now, String doing) {
+        List<String> hidden = new ArrayList<String>(BATHROOM_STRONG);
+        hidden.addAll(BATHROOM_WEAK);
+        List<ChatTools.Place> recent = places.recent(now, tuning.placeMax);
+        List<ChatTools.Place> shown = new ArrayList<ChatTools.Place>();
+        for (ChatTools.Place p : recent) {
+            boolean hide = false;
+            for (String l : p.labels) {
+                hide |= hidden.contains(l);
+            }
+            if (!hide) {
+                shown.add(p);
+            }
+        }
+        return new CuriosityPort.ToolFacts(
+                ChatTools.statusText(batteryPercent, onCharger(), muted, quiet || muted,
+                        started ? now - startedAtMs : 0, doing),
+                ChatTools.placesText(recent, hidden), stillReason(now), null, shown);
+    }
+
+    // ---- the look tool's fast path (robot 2026-10-03) ----
+    //
+    // The first live look tool call waited ~4.7 s for the detector to unpark and run on a fresh
+    // frame after the preamble, and the line came at 7.3 s. Now the camera's newest streamed
+    // frame goes to Claude at once when it is at most FAST_LOOK_FRAME_MS old, with the
+    // detector's labels only when that very frame was detected. Privacy still comes first: the
+    // newest detection must show no bathroom label at all (any score), and be at most
+    // FAST_LOOK_CHECK_MS older than the frame, or have been taken with no driving since (turns on
+    // the spot, like a call's search, don't count) and at most FAST_LOOK_STILL_MS older: a
+    // conversation never opens in bathroom privacy, and he only turns on the spot in it. Otherwise the look takes the detector's slow path as before.
+
+    static final long FAST_LOOK_FRAME_MS = 1500;
+    static final long FAST_LOOK_CHECK_MS = 3000;
+    static final long FAST_LOOK_STILL_MS = 60000;
+    /** When he last drove forward or back (NEVER: not since start); turns on the spot don't count. */
+    private long lastDroveAt = NEVER;
+
+    private CuriosityPort.LookResult fastToolLook(long now) {
+        RawFrame f = camera.latestRaw();
+        if (f == null || f.jpeg == null || now - f.frameMs > FAST_LOOK_FRAME_MS || bathroom || muted || quiet) {
+            return null;
+        }
+        Look d = camera.latest();
+        if (d == null || d.frameMs > f.frameMs) {
+            return null;
+        }
+        for (Detection x : d.detections) {
+            if (BATHROOM_STRONG.contains(x.label) || BATHROOM_WEAK.contains(x.label)) {
+                return null;
+            }
+        }
+        boolean recent = f.frameMs - d.frameMs <= FAST_LOOK_CHECK_MS;
+        boolean stillSince = (lastDroveAt == NEVER || lastDroveAt < d.frameMs)
+                && f.frameMs - d.frameMs <= FAST_LOOK_STILL_MS;
+        if (!recent && !stillSince) {
+            return null;
+        }
+        List<String> labels = null;
+        if (d.frameMs == f.frameMs) {
+            labels = new ArrayList<String>();
+            for (Detection x : d.detections) {
+                if (!labels.contains(x.label)) {
+                    labels.add(x.label);
+                }
+            }
+        }
+        return CuriosityPort.LookResult.streamed(f.jpeg, labels, now - f.frameMs);
+    }
+
+    /** Why he can't drive now, or null when he can. */
+    private String stillReason(long now) {
+        if (onCharger()) {
+            return "he is on his charger and does not drive off it when asked";
+        }
+        if (bathroom) {
+            return "privacy: he thinks he is in a bathroom and is only leaving it";
+        }
+        if (!leaseHeld || chatNoWheels) {
+            return "his wheels are not his right now";
+        }
+        if (classifier.status(now) == HazardClassifier.Status.UNAVAILABLE) {
+            return "his floor sensor is not answering, so he can't drive safely";
+        }
+        if (jammed || state == State.RECOVER) {
+            return "he is stuck and waiting for his motors to come back";
+        }
+        return null;
+    }
+
+    /** The newer acts' start (true when handled here); today's five fall through to the switch. */
+    private boolean startNewAct(long now, ChatActions.Act act) {
+        switch (act.action) {
+            case MOVE:
+                if (onCharger()) {
+                    intentEnd(false, "on the charger: he does not drive off it");
+                    return true;
+                }
+                intent = act.action;
+                intentUntil = now + MOVE_MS;
+                moveDue = true;
+                awayLeg = null;
+                return true;
+            case COME_BACK:
+                intent = act.action;
+                intentUntil = now + MOVE_MS;
+                moveDue = true;
+                awayLeg = null;
+                return true;
+            case STAY:
+            case WAIT:
+                intent = act.action;
+                stayUntil = now + Math.max(1000, act.ms);
+                intentUntil = stayUntil;
+                awayLeg = null;
+                note("intent: " + act.action.word() + ": no legs for " + (act.ms / 1000) + " s (calls answered in place)");
+                return true;
+            case FIND_THING:
+                intent = act.action;
+                intentUntil = now + (task != null ? TASK_SEEK_MS : INTENT_SEEK_MS);
+                intentSeekDue = true;
+                actLook = camera.latest();
+                return true;
+            case GO_TO_PLACE:
+                intent = act.action;
+                intentUntil = now + (task != null ? TASK_SEEK_MS : INTENT_SEEK_MS);
+                intentSeekDue = true;
+                actLook = camera.latest();
+                double h = places.headingOf(act.labels, now);
+                if (!Double.isNaN(h) && compass.usable(now)) {
+                    actHeading = h;
+                    actLegM = 0;
+                    note("intent: go_to_place: heading for where he saw it (" + Math.round(h) + " deg)");
+                } else {
+                    note("intent: go_to_place: not seen lately; searching");
+                }
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Once per step, the newer acts: move's watcher (done when still again, failed when a
+     * hazard, a stall or RECOVER came first) and the label check of find_thing and go_to_place.
+     */
+    private void actStep(long now) {
+        if (intent == CuriosityPort.Action.NONE) {
+            return;
+        }
+        if (moveStarted) {
+            if (state == State.STARTLE || state == State.RECOVER || state.escapes() || jammed || wriggling
+                    || state == State.CORNERED) {
+                moveStarted = false;
+                moveBack = false;
+                dropIntent("a hazard or a stall stopped it");
+                return;
+            }
+            if (state == State.LOOK || state == State.TURN || state == State.HOP || state == State.BACK_OFF) {
+                moveSawMotion = true;
+            } else if (moveSawMotion && state == State.PAUSE && !hopNext) {
+                moveStarted = false;
+                intentDone(intent == CuriosityPort.Action.FIND_THING ? "found it and went over"
+                        : intent == CuriosityPort.Action.COME_BACK ? "came back" : "moved");
+                return;
+            }
+        }
+        if ((intent == CuriosityPort.Action.FIND_THING || intent == CuriosityPort.Action.GO_TO_PLACE)
+                && intentAct != null && !moveStarted && !moveDue && !state.converses() && !state.chats()) {
+            Look look = camera.latest();
+            if (look == null || look == actLook) {
+                return;
+            }
+            actLook = look;
+            Detection seen = null;
+            for (Detection d : look.detections) {
+                if (d.label != null && intentAct.labels.contains(d.label.toLowerCase(java.util.Locale.US))) {
+                    seen = d;
+                    break;
+                }
+            }
+            if (seen == null) {
+                return;
+            }
+            if (seeking()) {
+                endSeek(now, true, "saw what he was asked to find");
+            }
+            intentSeekDue = false;
+            if (intent == CuriosityPort.Action.GO_TO_PLACE) {
+                intentDone("saw what marks the place");
+                return;
+            }
+            double off = -seen.centerX() * tuning.cameraHalfFovDeg;
+            actHeading = compass.usable(now) ? Heading.wrap(compass.degrees() + off) : Double.NaN;
+            actLegM = FIND_APPROACH_M;
+            moveDue = true;
+            note("intent: find_thing: seen " + Math.round(off) + " deg off; going over");
+        }
+    }
+
+    /**
+     * At a leg decision (decide()): the act's motion, when due. True when it took the decision
+     * (a turn or a drive started, or a stay held him still).
+     */
+    private boolean actDecide(long now) {
+        if (now < stayUntil) {
+            enterPause(now, pauseMs(), false);
+            return true;
+        }
+        if (task != null && taskWait != TaskWait.ACT || taskLine != null) {
+            // A task's step that does not drive (say, look, wait, a consult): he holds still.
+            enterPause(now, pauseMs(), false);
+            return true;
+        }
+        if (intent == CuriosityPort.Action.GO_TO_PLACE && !Double.isNaN(actHeading)) {
+            double delta = compass.usable(now) ? Heading.delta(compass.degrees(), actHeading) : 0;
+            actHeading = Double.NaN;
+            if (Math.abs(delta) >= tuning.turnToleranceDeg) {
+                plannedTicks = drawTicks();
+                enterLook(now, delta > 0 ? Direction.LEFT : Direction.RIGHT, false, timedMs(Math.abs(delta)),
+                        Math.abs(delta));
+                return true;
+            }
+            return false;
+        }
+        if (!moveDue || intentAct == null) {
+            return false;
+        }
+        moveDue = false;
+        moveStarted = true;
+        moveSawMotion = false;
+        if (intent == CuriosityPort.Action.COME_BACK) {
+            if (!taskStartKnown || !coverage.tracking() || !compass.usable(now)) {
+                moveStarted = false;
+                dropIntent("he lost track of where it started");
+                return false;
+            }
+            double dx = taskStartX - coverage.x();
+            double dy = taskStartY - coverage.y();
+            double dist = Math.hypot(dx, dy);
+            if (dist < COME_BACK_NEAR_M) {
+                moveStarted = false;
+                intentDone("already back");
+                return false;
+            }
+            actHeading = Heading.wrap(Math.toDegrees(Math.atan2(dy, dx)));
+            actLegM = Math.min(dist, COME_BACK_MAX_M);
+        }
+        if (intent == CuriosityPort.Action.COME_BACK || intent == CuriosityPort.Action.FIND_THING) {
+            int ticks = Math.max(1, (int) Math.round(actLegM / MOVE_M_PER_TICK));
+            double delta = Double.isNaN(actHeading) || !compass.usable(now) ? 0
+                    : Heading.delta(compass.degrees(), actHeading);
+            actHeading = Double.NaN;
+            plannedTicks = ticks;
+            if (Math.abs(delta) >= tuning.turnToleranceDeg) {
+                enterLook(now, delta > 0 ? Direction.LEFT : Direction.RIGHT, false, timedMs(Math.abs(delta)),
+                        Math.abs(delta));
+            } else {
+                startHop(now);
+            }
+            return true;
+        }
+        String kind = intentAct.kind == null ? "" : intentAct.kind;
+        double amount = intentAct.amount;
+        if ("forward".equals(kind)) {
+            plannedTicks = Math.max(1, (int) Math.round(amount / MOVE_M_PER_TICK));
+            startHop(now);
+        } else if ("back".equals(kind)) {
+            startMoveBack(now, Math.max(1, (int) Math.round(amount / MOVE_M_PER_TICK)));
+        } else {
+            Direction d = "turn_left".equals(kind) ? Direction.LEFT : "turn_right".equals(kind) ? Direction.RIGHT
+                    : randomDirection();
+            plannedTicks = 0;
+            enterLook(now, d, false, timedMs(amount), amount);
+            if (heading != d && ("turn_left".equals(kind) || "turn_right".equals(kind))) {
+                note("act: move: that way is blocked lately; turning " + heading + " instead");
+            }
+        }
+        return true;
+    }
+
+    /** A back move: straight back this many ticks, then a pause (no escape turn). */
+    private void startMoveBack(long now, int ticks) {
+        stopMotors();
+        moveBack = true;
+        state = State.BACK_OFF;
+        ticksLeft = ticks - 1;
+        nextTickAt = now + tuning.backTickMs;
+        phaseUntil = now + ticks * tuning.backTickMs;
+        // The stall watch from here, as the blocked turn's short back-up.
+        hopStartedAt = now;
+        lastWheels = null;
+        wheelMoves.clear();
+        moving = true;
+        backTick();
+        compass.startLeg(true, now);
+    }
+
+    /** An intent's end as a task's step reads it, with the act's record. */
+    private void intentEnd(boolean ok, String why) {
+        intentEndOk = ok;
+        intentEndWhy = why;
+        note("intent: " + (ok ? "done" : "dropped") + " (" + why + ")");
+        if (intentAct != null) {
+            note("act: end " + intentAct.describe() + " " + (ok ? "done" : "failed") + " ms="
+                    + (clock.nowMs() - intentStartedAt));
+        }
+        clearIntent();
+    }
+
+    // ---- tasks: run_task's workflow (owner 2026-10-03) ----
+    //
+    // Claude plans the steps; the robot runs them in order, deterministically: say, look and
+    // wait here, the rest as acts (above). On a failed step, after a look (so later lines can
+    // use what he saw) and at a step marked check, he consults Claude (CuriosityPort.taskPlan:
+    // the goal, the steps so far with their outcomes, his status and the latest labels; never a
+    // frame) for the rest of the plan or an abort. At most TASK_MAX_CONSULTS consults and
+    // TASK_MAX_MS per task, then it ends with a spoken line. Reflexes always win: hazards and
+    // stalls fail a step; bathroom privacy, the charger, lost wheels, a call and "stop" end the
+    // task. A conversation that opens on its own pauses it. Its record ("task: ") has the step
+    // tools, their outcomes as ok/fail, the consults, the end and the time; never the goal or
+    // anything said.
+
+    static final int TASK_MAX_CONSULTS = 10;
+    static final long TASK_MAX_MS = 5L * 60 * 1000;
+    static final long TASK_CONSULT_TIMEOUT_MS = 15000;
+    static final long TASK_LOOK_MS = 5000;
+    /** A task's search step (find_thing, go_to_place) gets this much of the task's five minutes. */
+    static final long TASK_SEEK_MS = 2L * 60 * 1000;
+    static final String TASK_ABORT_LINE = "Sorry, I couldn't finish that errand.";
+    static final String TASK_PRIVACY_LINE = "I'll stop that errand here.";
+
+    private enum TaskWait { NONE, ACT, SAY_READY, SAY, LOOK, WAIT, CONSULT }
+
+    /** A line the task's end says, once the camera is closed and quiet (KTD6, as every line off the conversation). */
+    private String taskLine;
+
+    private ChatActions.Act task;
+    private final List<ChatActions.Act> taskSteps = new ArrayList<ChatActions.Act>();
+    private final List<String> taskOutcomes = new ArrayList<String>();
+    private final List<Boolean> taskOk = new ArrayList<Boolean>();
+    private int taskIdx;
+    private int taskNo;
+    private int taskCount;
+    private int taskConsults;
+    private long taskStartedAt;
+    private long taskStepAt;
+    private long taskWaitUntil;
+    private TaskWait taskWait = TaskWait.NONE;
+    private boolean taskLooking;
+    private boolean taskStartKnown;
+    private double taskStartX;
+    private double taskStartY;
+
+    /** The task under way, or null; for tests and the state page. */
+    ChatActions.Act task() {
+        return task;
+    }
+
+    /** A task's line is due or being said (its camera stays closed), for tests. */
+    boolean speaksForTask() {
+        return taskLine != null || task != null && (taskWait == TaskWait.SAY_READY || taskWait == TaskWait.SAY);
+    }
+
+    /** Steps done so far in the task under way (or the last one), for tests. */
+    int taskStepsDone() {
+        return taskOutcomes.size();
+    }
+
+    private void startTask(long now, ChatActions.Act t) {
+        if (task != null) {
+            endTask(now, "a new instruction", null);
+        }
+        if (intent != CuriosityPort.Action.NONE) {
+            dropIntent("a new instruction");
+        }
+        task = t;
+        taskNo = ++taskCount;
+        taskSteps.clear();
+        taskSteps.addAll(t.steps);
+        taskOutcomes.clear();
+        taskOk.clear();
+        taskIdx = 0;
+        taskConsults = 0;
+        taskStartedAt = now;
+        taskWait = TaskWait.NONE;
+        taskLooking = false;
+        awayLeg = null;
+        taskStartKnown = coverage.tracking();
+        taskStartX = coverage.x();
+        taskStartY = coverage.y();
+        note("task: start n=" + taskNo + " steps=" + ChatActions.stepTools(taskSteps));
+    }
+
+    /** Once per step: the task's next move. */
+    private void taskStep(long now) {
+        if (taskLine != null) {
+            if (state.chats() || state.converses()) {
+                taskLine = null;
+            } else if (!cameraOpen && camera.quiet()) {
+                port.say(taskLine);
+                taskLine = null;
+            }
+        }
+        if (task == null) {
+            return;
+        }
+        if (bathroom) {
+            // Privacy first: no consult, no look, no frame; the task ends here.
+            endTask(now, "bathroom", TASK_PRIVACY_LINE);
+            return;
+        }
+        if (state == State.DOCKED || onCharger()) {
+            endTask(now, "docked", TASK_ABORT_LINE);
+            return;
+        }
+        if (state == State.EYES_ONLY) {
+            endTask(now, "no wheels or sensors", TASK_ABORT_LINE);
+            return;
+        }
+        if (now - taskStartedAt >= TASK_MAX_MS) {
+            endTask(now, "out of time", TASK_ABORT_LINE);
+            return;
+        }
+        if (state.converses() || state.chats() || call != null) {
+            // A conversation or a call's search comes first (a call itself ends the task in callStep).
+            return;
+        }
+        switch (taskWait) {
+            case ACT:
+                if (intent == CuriosityPort.Action.NONE) {
+                    stepOutcome(now, intentEndOk, intentEndWhy == null ? "ended" : intentEndWhy);
+                }
+                return;
+            case SAY_READY:
+                // Speech starts once the camera and the detector are closed (KTD6).
+                if (!cameraOpen && camera.quiet()) {
+                    port.say(taskSteps.get(taskIdx).text);
+                    taskWait = TaskWait.SAY;
+                }
+                return;
+            case SAY:
+                if (port.sayFinished()) {
+                    stepOutcome(now, true, "said it");
+                }
+                return;
+            case LOOK: {
+                Look l = camera.latest();
+                if (l != null && l.frameMs > taskStepAt) {
+                    taskLooking = false;
+                    List<String> labels = new ArrayList<String>();
+                    for (Detection d : l.detections) {
+                        if (d.label != null && !labels.contains(d.label)) {
+                            labels.add(d.label);
+                        }
+                    }
+                    stepOutcome(now, true, labels.isEmpty() ? "saw nothing his detector could name"
+                            : "saw: " + joinLabels(labels));
+                } else if (now >= taskWaitUntil) {
+                    taskLooking = false;
+                    stepOutcome(now, false, "his camera gave no picture in time");
+                }
+                return;
+            }
+            case WAIT:
+                if (now >= taskWaitUntil) {
+                    stepOutcome(now, true, "waited");
+                }
+                return;
+            case CONSULT: {
+                CuriosityPort.TaskPlan p = port.taskPlanAnswer();
+                if (p != null) {
+                    applyPlan(now, p);
+                } else if (now >= taskWaitUntil) {
+                    port.cancelTaskPlan();
+                    endTask(now, "the consult timed out", TASK_ABORT_LINE);
+                }
+                return;
+            }
+            default:
+                startStep(now);
+        }
+    }
+
+    private void startStep(long now) {
+        if (taskIdx >= taskSteps.size()) {
+            endTask(now, "done", null);
+            return;
+        }
+        ChatActions.Act s = taskSteps.get(taskIdx);
+        taskStepAt = now;
+        switch (s.action) {
+            case SAY:
+                if (muted || quiet) {
+                    stepOutcome(now, false, "he is in do not disturb, so he said nothing");
+                    return;
+                }
+                taskWait = TaskWait.SAY_READY;
+                return;
+            case LOOK:
+                if (!camera.available() || !leaseHeld) {
+                    stepOutcome(now, false, "his camera is not available");
+                    return;
+                }
+                taskLooking = true;
+                taskWaitUntil = now + TASK_LOOK_MS;
+                taskWait = TaskWait.LOOK;
+                return;
+            case WAIT:
+                taskWaitUntil = now + Math.max(1000, s.ms);
+                taskWait = TaskWait.WAIT;
+                return;
+            default:
+                if (s.drives() && onCharger()) {
+                    stepOutcome(now, false, "on the charger");
+                    return;
+                }
+                taskWait = TaskWait.ACT;
+                startAct(now, s, null);
+                if (intent == CuriosityPort.Action.NONE && intentEndWhy == null) {
+                    intentEndOk = true;
+                    intentEndWhy = "started";
+                }
+        }
+    }
+
+    private void stepOutcome(long now, boolean ok, String why) {
+        ChatActions.Act s = taskSteps.get(taskIdx);
+        taskOutcomes.add(s.tool + ": " + (ok ? "" : "failed: ") + why);
+        taskOk.add(ok);
+        taskWait = TaskWait.NONE;
+        intentEndWhy = null;
+        note("task: step n=" + taskNo + " i=" + (taskIdx + 1) + " tool=" + s.tool + " " + (ok ? "ok" : "fail")
+                + " ms=" + (now - taskStepAt));
+        boolean consult = !ok || s.check || s.action == CuriosityPort.Action.LOOK;
+        if (consult && ok && s.action != CuriosityPort.Action.LOOK && taskIdx + 1 >= taskSteps.size()) {
+            // A check on the last step: nothing left to revise (a last look may still add a line about it).
+            consult = false;
+        }
+        if (!consult) {
+            taskIdx++;
+            return;
+        }
+        if (taskConsults >= TASK_MAX_CONSULTS) {
+            endTask(now, "out of consults", TASK_ABORT_LINE);
+            return;
+        }
+        taskConsults++;
+        List<String> rest = new ArrayList<String>();
+        for (int i = taskIdx + 1; i < taskSteps.size(); i++) {
+            rest.add(stepText(taskSteps.get(i)));
+        }
+        Look l = camera.latest();
+        List<String> labels = new ArrayList<String>();
+        if (l != null && now - l.frameMs < 30000) {
+            for (Detection d : l.detections) {
+                if (d.label != null && !labels.contains(d.label)) {
+                    labels.add(d.label);
+                }
+            }
+        }
+        CuriosityPort.ToolFacts f = toolFactsNow(now, "carrying out an errand");
+        port.taskPlan(new CuriosityPort.TaskConsult(task.goal, new ArrayList<String>(taskOutcomes), rest, f.status,
+                labels, ok ? "check" : "failed", TASK_MAX_CONSULTS - taskConsults,
+                TASK_MAX_MS - (now - taskStartedAt), f), TASK_CONSULT_TIMEOUT_MS);
+        taskWaitUntil = now + TASK_CONSULT_TIMEOUT_MS + 2000;
+        taskWait = TaskWait.CONSULT;
+        note("task: consult n=" + taskNo + " #" + taskConsults + " after=" + (ok ? "check" : "failure"));
+    }
+
+    private void applyPlan(long now, CuriosityPort.TaskPlan p) {
+        if (p.status == CuriosityPort.TaskPlan.Status.FAILED) {
+            endTask(now, "the consult failed", TASK_ABORT_LINE);
+            return;
+        }
+        if (p.status == CuriosityPort.TaskPlan.Status.ABORT) {
+            endTask(now, "abandoned", p.line == null ? TASK_ABORT_LINE : p.line);
+            return;
+        }
+        while (taskSteps.size() > taskIdx + 1) {
+            taskSteps.remove(taskSteps.size() - 1);
+        }
+        taskSteps.addAll(p.steps);
+        taskIdx++;
+        taskWait = TaskWait.NONE;
+        note("task: revised n=" + taskNo + " rest=" + ChatActions.stepTools(p.steps));
+    }
+
+    /** One step as the consult reads it: the tool and its arguments (to Claude only, never logged). */
+    private static String stepText(ChatActions.Act s) {
+        StringBuilder b = new StringBuilder(s.tool);
+        if (s.kind != null) {
+            b.append(' ').append(s.kind).append(' ').append(s.amount);
+        }
+        if (s.ms > 0) {
+            b.append(' ').append(s.ms / 1000).append(" s");
+        }
+        if (s.target != null) {
+            b.append(" \"").append(s.target).append('"');
+        }
+        if (s.text != null) {
+            b.append(" \"").append(s.text).append('"');
+        }
+        return b.toString();
+    }
+
+    private static String joinLabels(List<String> labels) {
+        StringBuilder b = new StringBuilder();
+        for (String l : labels) {
+            b.append(b.length() == 0 ? "" : ", ").append(l);
+        }
+        return b.toString();
+    }
+
+    /** The task ends (why: fixed words), with this line said (null: none); its record. */
+    private void endTask(long now, String why, String line) {
+        if (task == null) {
+            return;
+        }
+        if (taskWait == TaskWait.CONSULT) {
+            port.cancelTaskPlan();
+        }
+        StringBuilder outs = new StringBuilder();
+        for (Boolean ok : taskOk) {
+            outs.append(outs.length() == 0 ? "" : ",").append(ok ? "ok" : "fail");
+        }
+        note("task: n=" + taskNo + " steps=" + ChatActions.stepTools(taskSteps) + " outcomes="
+                + (outs.length() == 0 ? "-" : outs.toString()) + " consults=" + taskConsults + " end=" + why
+                + " ms=" + (now - taskStartedAt));
+        ChatActions.Act ended = task;
+        task = null;
+        taskWait = TaskWait.NONE;
+        taskLooking = false;
+        if (intent != CuriosityPort.Action.NONE && ended != null && !"a call".equals(why)) {
+            dropIntent("the task ended");
+        }
+        if (line != null && !muted && !quiet && !state.chats() && state != State.STOPPED) {
+            taskLine = line;
         }
     }
 
@@ -1710,20 +2451,21 @@ final class ExploreBrain {
             return;
         }
         if (intent == CuriosityPort.Action.BE_QUIET) {
-            intentDone("be_quiet: " + span(INTENT_QUIET_MS) + " over");
+            intentDone("be_quiet: " + span(intentAct != null && intentAct.ms > 0 ? intentAct.ms : INTENT_QUIET_MS)
+                    + " over");
+        } else if (intent == CuriosityPort.Action.STAY || intent == CuriosityPort.Action.WAIT) {
+            intentDone("stayed");
         } else {
             dropIntent("timed out");
         }
     }
 
     private void intentDone(String why) {
-        note("intent: done (" + why + ")");
-        clearIntent();
+        intentEnd(true, why);
     }
 
     private void dropIntent(String why) {
-        note("intent: dropped (" + why + ")");
-        clearIntent();
+        intentEnd(false, why);
     }
 
     private void clearIntent() {
@@ -1732,6 +2474,18 @@ final class ExploreBrain {
         intentUntil = NEVER;
         intentSeekDue = false;
         quiet = false;
+        intentAct = null;
+        stayUntil = NEVER;
+        moveDue = false;
+        moveStarted = false;
+        moveSawMotion = false;
+        actHeading = Double.NaN;
+        actLegM = 0;
+        if (moveBack && state == State.BACK_OFF) {
+            stopMotors();
+            enterPause(clock.nowMs(), pauseMs(), false);
+        }
+        moveBack = false;
     }
 
     /** Whether a heading leads back toward the spot or the person an intent avoids. */
@@ -2330,6 +3084,8 @@ final class ExploreBrain {
         bathroomWatch(now);
         bathroomStep(now);
         intentStep(now);
+        actStep(now);
+        taskStep(now);
         mutedStep(now);
         spellStep(now);
         // The call (hey-miko plan KTD1, KTD2): in every state, EYES_ONLY included, before
@@ -2494,7 +3250,7 @@ final class ExploreBrain {
                     ticksLeft--;
                     nextTickAt += tuning.hopTickMs;
                     legSent++;
-                    motor.hopTick();
+                    hopTick();
                 }
                 break;
             case STARTLE:
@@ -2512,6 +3268,30 @@ final class ExploreBrain {
             case BACK_OFF:
                 // Blind (nothing watches behind him): bounded by time, hazards ignored; the
                 // short back-up before a retried turn also stops on a stall.
+                if (moveBack) {
+                    // Owner 2026-10-03: the move tool's back-up. A stall waits out the board (RECOVER).
+                    if (now < phaseUntil && wheelsStalled(now)) {
+                        note("wheels stalled backing up");
+                        stampStall(now);
+                        stopMotors();
+                        moveBack = false;
+                        if (recoverDue(now)) {
+                            enterRecover(now, false, "the back-up went nowhere");
+                        } else {
+                            dropIntent("the back-up stalled");
+                            enterPause(now, pauseMs(), false);
+                        }
+                    } else if (now >= phaseUntil) {
+                        stopMotors();
+                        moveBack = false;
+                        enterPause(now, pauseMs(), false);
+                    } else if (ticksLeft > 0 && now >= nextTickAt) {
+                        ticksLeft--;
+                        nextTickAt += tuning.backTickMs;
+                        backTick();
+                    }
+                    break;
+                }
                 if (backForTurn && !retryWaiting && now < phaseUntil && wheelsStalled(now)) {
                     note("wheels stalled backing up");
                     stampStall(now);
@@ -2544,7 +3324,7 @@ final class ExploreBrain {
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
                     nextTickAt += tuning.backTickMs;
-                    motor.backTick();
+                    backTick();
                 }
                 break;
             case SCAN:
@@ -2714,6 +3494,9 @@ final class ExploreBrain {
             return;
         } else if (boxedIn(now)) {
             // Leaving the way he came (robot 2026-10-01): the retrace has started.
+            return;
+        } else if (actDecide(now)) {
+            // Owner 2026-10-03: an action tool's motion, a stay, or a task's still step.
             return;
         } else if (awayLeg != null) {
             // The first leg after a conversation turns away from the person (R16).
@@ -3153,6 +3936,10 @@ final class ExploreBrain {
     /** As above, for a hazard the classifier did not see (h null: side unknown). */
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
         recoverAfterStartle = false;
+        if (state == State.HOP && h != null) {
+            // Robot 2026-10-03: a hazard driving forward blocks this heading ahead (frontClear).
+            aheadBlocked();
+        }
         if (h != null && h.kind == HazardClassifier.Kind.CPL) {
             recordRefusal(now, true);
         }
@@ -3349,7 +4136,8 @@ final class ExploreBrain {
      * while hopping: turns and back-offs move the wheels differently.
      */
     private void trackWheels(SensorReading r) {
-        if (!(state == State.HOP || escapeDriving() || (state == State.BACK_OFF && backForTurn)) || !r.hasWheels()) {
+        if (!(state == State.HOP || escapeDriving() || (state == State.BACK_OFF && (backForTurn || moveBack)))
+                || !r.hasWheels()) {
             return;
         }
         if (lastWheels != null) {
@@ -3737,7 +4525,7 @@ final class ExploreBrain {
         nextTickAt = now + tuning.hopTickMs;
         phaseUntil = now + tuning.approachTicks * tuning.hopTickMs;
         moving = true;
-        motor.hopTick();
+        hopTick();
         compass.startLeg(false, now);
     }
 
@@ -3761,7 +4549,7 @@ final class ExploreBrain {
         } else if (ticksLeft > 0 && now >= nextTickAt) {
             ticksLeft--;
             nextTickAt += tuning.hopTickMs;
-            motor.hopTick();
+            hopTick();
         }
     }
 
@@ -3914,6 +4702,11 @@ final class ExploreBrain {
         if (!camera.available() || !leaseHeld || now < curiosityOffUntil) {
             return false;
         }
+        if (!state.chats() && (taskLine != null
+                || task != null && (taskWait == TaskWait.SAY_READY || taskWait == TaskWait.SAY))) {
+            // Owner 2026-10-03: a task's line is said with the camera closed, as any line off the conversation.
+            return false;
+        }
         if (state.curious() || state.cueSearch() || state.chats() || state == State.DOCKED) {
             // Docked: opened once and kept open, the detector parked between looks (syncPark).
             return true;
@@ -3926,7 +4719,7 @@ final class ExploreBrain {
             return false;
         }
         if (tuning.navigation == ExploreTuning.Navigation.LOOK_THEN_GO) {
-            return state == State.PAUSE && lookForLeg;
+            return state == State.PAUSE && (lookForLeg || taskLooking);
         }
         return true;
     }
@@ -3965,6 +4758,9 @@ final class ExploreBrain {
 
     /** Tells the camera whether he is driving (U9: exposure is capped short while he is). */
     private void syncMoving() {
+        if (moving && (state == State.HOP || state == State.BACK_OFF || state.escapes())) {
+            lastDroveAt = clock.nowMs();
+        }
         if (movingShown == null || movingShown != moving) {
             movingShown = moving;
             camera.setMoving(moving);
@@ -5434,7 +6230,7 @@ final class ExploreBrain {
         lastWheels = null;
         wheelMoves.clear();
         moving = true;
-        motor.backTick();
+        backTick();
         // Not logged as a leg: a retrace of it would only drive him back into the spot
         // it freed him from (and call that a clean escape).
     }
@@ -5505,6 +6301,8 @@ final class ExploreBrain {
 
     /** The ladder's state for a new escape, at its first step (RETRACE), not yet entered. */
     private void beginLadder(long now, boolean turnBlocked) {
+        escForwardFirstTried = false;
+        jamForwardTried = false;
         endSeek(now, false, "an escape");
         boxedLadder = false;
         hazardTimes.clear();
@@ -5800,6 +6598,15 @@ final class ExploreBrain {
             case RETRACE:
                 state = State.RETRACE;
                 show(EyeState.IDLE, null);
+                if (escBackUpFirst && !escForwardFirstTried && preferForward(now)) {
+                    // Robot 2026-10-03: behind is blocked (the wall he backed into): forward first;
+                    // blocked, the step restarts and backs up as before.
+                    escForwardFirstTried = true;
+                    if (tryForwardFirst(now, "behind is blocked (" + behindWhy + "), so forward before backing up",
+                            false, ProbeThen.STEP)) {
+                        return;
+                    }
+                }
                 if (escBackUpFirst) {
                     // Straight back first, blind and bounded like a blocked turn's back-up
                     // (its time, the stall watch), not logged as a leg.
@@ -5975,7 +6782,7 @@ final class ExploreBrain {
                 escTicks = 1;
                 nextTickAt = now + tuning.hopTickMs;
                 esc = Esc.DRIVING;
-                motor.hopTick();
+                hopTick();
                 compass.startLeg(false, now);
                 break;
             case DRIVING:
@@ -5988,7 +6795,7 @@ final class ExploreBrain {
                             : escGoal > 0 ? tuning.backOutMaxMs : tuning.backTicks * tuning.backTickMs);
                     nextTickAt = now + tuning.backTickMs;
                     esc = Esc.BACKING;
-                    motor.backTick();
+                    backTick();
                     if (!escShortBack) {
                         // The short back-up is not a leg (see startShortBack).
                         compass.startLeg(true, now);
@@ -6105,7 +6912,7 @@ final class ExploreBrain {
         } else if (now >= nextTickAt) {
             escTicks++;
             nextTickAt += tuning.hopTickMs;
-            motor.hopTick();
+            hopTick();
         }
     }
 
@@ -6124,6 +6931,9 @@ final class ExploreBrain {
         boolean stalled = (escGoal > 0 || escShortBack) && wheelsStalled(now);
         if (reached || stalled || now >= escUntil) {
             stopMotors();
+            if (!reached && escFrom != null && escMoved < BACK_FREE_COUNTS) {
+                behindBlocked(now, "a back-up moved " + escMoved + " counts");
+            }
             if (!reached && escFrom != null && escMoved < tuning.stallMinCounts) {
                 stampStall(now);
                 if (recoverDue(now)) {
@@ -6168,7 +6978,7 @@ final class ExploreBrain {
             }
         } else if (now >= nextTickAt) {
             nextTickAt += tuning.backTickMs;
-            motor.backTick();
+            backTick();
         }
     }
 
@@ -6602,6 +7412,7 @@ final class ExploreBrain {
     /** A forward drive hit a hazard or stalled facing this way. */
     private void aheadBlocked() {
         blockedAheadAt = compass.usable(clock.nowMs()) ? compass.degrees() : Double.NaN;
+        frontBlocked(clock.nowMs());
     }
 
     /**
@@ -6651,7 +7462,7 @@ final class ExploreBrain {
                 escTicks = 1;
                 nextTickAt = now + tuning.hopTickMs;
                 esc = Esc.DRIVING;
-                motor.hopTick();
+                hopTick();
                 compass.startLeg(false, now);
                 break;
             case DRIVING: {
@@ -6674,7 +7485,7 @@ final class ExploreBrain {
                 } else if (now >= nextTickAt) {
                     escTicks++;
                     nextTickAt += tuning.hopTickMs;
-                    motor.hopTick();
+                    hopTick();
                 }
                 break;
             }
@@ -6684,7 +7495,7 @@ final class ExploreBrain {
                     escUntil = now + tuning.backTicks * tuning.backTickMs;
                     nextTickAt = now + tuning.backTickMs;
                     esc = Esc.BACKING;
-                    motor.backTick();
+                    backTick();
                     compass.startLeg(true, now);
                 }
                 break;
@@ -6694,7 +7505,7 @@ final class ExploreBrain {
                     probeDone(now);
                 } else if (now >= nextTickAt) {
                     nextTickAt += tuning.backTickMs;
-                    motor.backTick();
+                    backTick();
                 }
                 break;
             default:
@@ -6721,7 +7532,11 @@ final class ExploreBrain {
         probing = false;
         probeThen = null;
         esc = null;
-        if (then == ProbeThen.STEP) {
+        if (then == ProbeThen.BACK_OUT) {
+            // Robot 2026-10-03: forward was blocked too; the straight back-out, as before.
+            state = State.PAUSE;
+            startBackOff(now);
+        } else if (then == ProbeThen.STEP) {
             planner.restartStep(now);
             escapePhase(now);
         } else if (then == ProbeThen.REST) {
@@ -6743,6 +7558,7 @@ final class ExploreBrain {
      */
     private void escapeFreed(long now, String how, boolean droveForward) {
         stopMotors();
+        blockedWaysForgotten();
         note("free after " + (now - (planner.active() ? planner.startedAt() : probeSince)) + " ms: " + how);
         escapeEnd(now, "freed");
         if (boxedLadder) {
@@ -8067,7 +8883,12 @@ final class ExploreBrain {
         if (call == null || state == State.STOPPED) {
             return;
         }
-        if (intent != CuriosityPort.Action.NONE && intent != CuriosityPort.Action.BE_QUIET) {
+        if (task != null && !comeHereCall) {
+            // Owner 2026-10-03: a call ends a task at once (its come_here step's own call aside).
+            endTask(now, "a call", null);
+        }
+        if (intent != CuriosityPort.Action.NONE && intent != CuriosityPort.Action.BE_QUIET
+                && intent != CuriosityPort.Action.STAY && intent != CuriosityPort.Action.WAIT) {
             // Owner 2026-10-02: a call from anyone comes before any instruction.
             dropIntent("a call");
         }
@@ -8108,6 +8929,10 @@ final class ExploreBrain {
             return CallVerdict.WAIT;
         }
         if (onCharger()) {
+            return CallVerdict.IN_PLACE;
+        }
+        if (now < stayUntil) {
+            // Owner 2026-10-03: asked to stay, he answers where he stands.
             return CallVerdict.IN_PLACE;
         }
         if (state == State.STARTLE || state == State.BACK_OFF) {
@@ -9499,6 +10324,7 @@ final class ExploreBrain {
         // Owner 2026-10-02: the instruction it ended on, carried out once it is over.
         CuriosityPort.Action asked = chat.action();
         String askedTarget = chat.actionTarget();
+        ChatActions.Act askedAct = chat.act();
         Direction askedSide = chatSide;
         peopleIgnoredUntil = now + tuning.peopleCooldownMs;
         if (named) {
@@ -9529,7 +10355,10 @@ final class ExploreBrain {
         }
         endCuriosity(now);
         if (asked != CuriosityPort.Action.NONE && call == null) {
-            startIntent(now, asked, askedTarget, askedSide);
+            if (task != null) {
+                endTask(now, "a new instruction", null);
+            }
+            startAct(now, askedAct != null ? askedAct : ChatActions.Act.of(asked, askedTarget), askedSide);
         } else if (asked != CuriosityPort.Action.NONE) {
             note("intent: " + asked.word() + " dropped (a call waited for the conversation)");
         }
@@ -9671,13 +10500,25 @@ final class ExploreBrain {
 
         @Override
         public CuriosityPort.ToolFacts toolFacts() {
+            return toolFactsNow(clock.nowMs(), "talking with someone");
+        }
+
+        @Override
+        public CuriosityPort.LookResult fastLook(long now) {
+            return fastToolLook(now);
+        }
+
+        @Override
+        public void stopActs() {
+            // Owner 2026-10-03: "stop" ends any errand or task at once; he stays put.
             long now = clock.nowMs();
-            List<String> hidden = new ArrayList<String>(BATHROOM_STRONG);
-            hidden.addAll(BATHROOM_WEAK);
-            return new CuriosityPort.ToolFacts(
-                    ChatTools.statusText(batteryPercent, onCharger(), muted, quiet || muted,
-                            started ? now - startedAtMs : 0, "talking with someone"),
-                    ChatTools.placesText(places.recent(now, tuning.placeMax), hidden));
+            if (task != null) {
+                endTask(now, "stopped", null);
+            }
+            if (intent != CuriosityPort.Action.NONE) {
+                dropIntent("told to stop");
+            }
+            awayLeg = null;
         }
 
         @Override
@@ -10145,7 +10986,7 @@ final class ExploreBrain {
         hopMoved = 0;
         moving = true;
         legStart(now, ticks);
-        motor.hopTick();
+        hopTick();
         compass.startLeg(false, now);
     }
 
@@ -10351,7 +11192,7 @@ final class ExploreBrain {
         nextTickAt = now + tuning.backTickMs;
         phaseUntil = now + ticks * tuning.backTickMs;
         moving = true;
-        motor.backTick();
+        backTick();
         compass.startLeg(true, now);
     }
 
@@ -10366,6 +11207,14 @@ final class ExploreBrain {
     private boolean jamCheck(long now) {
         if (tuning.jamTurnDeg <= 0 || !jamBackStalled || jamBlockedWays.size() < 2) {
             return false;
+        }
+        if (!jamForwardTried && planner.active() && frontClear(now)) {
+            // Robot 2026-10-03: never a jam before forward was tried while the front reads clear.
+            jamForwardTried = true;
+            if (tryForwardFirst(now, "behind and both turns are blocked; forward before calling it a jam", false,
+                    ProbeThen.STEP)) {
+                return true;
+            }
         }
         endEscapeForJam();
         String why = "the back-up went nowhere and turns both ways turned under " + Math.round(tuning.jamTurnDeg)
@@ -10399,6 +11248,9 @@ final class ExploreBrain {
     /** Fully jammed: no more pushing, the help line when due, the long rests and their probes. */
     private void enterJammed(long now, String why) {
         escapeEnd(now, "jam");
+        // Robot 2026-10-03: behind was blocked last: the jam's probes alternate, forward first.
+        jamAlternate = behindEvidence(now);
+        jamProbeFwd = false;
         jams++;
         jammed = true;
         note("fully jammed: " + why + "; no more pushing (jam " + jams + " since start)");
@@ -10475,10 +11327,19 @@ final class ExploreBrain {
             port.say(HELP_LINE);
         }
         if (jamProbing) {
+            if (jamProbeFwd && now < jamProbeUntil && classifier.status(now) == HazardClassifier.Status.HAZARD) {
+                stopMotors();
+                jamProbeUntil = now;
+                frontBlocked(now);
+            }
             if (now < jamProbeUntil) {
                 if (now >= nextTickAt) {
-                    nextTickAt += tuning.backTickMs;
-                    motor.backTick();
+                    nextTickAt += jamProbeFwd ? tuning.hopTickMs : tuning.backTickMs;
+                    if (jamProbeFwd) {
+                        hopTick();
+                    } else {
+                        backTick();
+                    }
                 }
                 return;
             }
@@ -10493,6 +11354,8 @@ final class ExploreBrain {
             if (jamFrom != null && jamMoved >= tuning.stallMinCounts) {
                 jamFreed(now);
             } else {
+                // Robot 2026-10-03: nothing moved says nothing about either side (the cutout reads
+                // zero every way); with behind blocked the next probe tries the other way.
                 note("jam probe went nowhere (" + (jamFrom == null ? "no encoders" : jamMoved + " counts")
                         + "): resting again");
                 jamRest(now);
@@ -10516,15 +11379,24 @@ final class ExploreBrain {
 
     /** The one gentle probe: jamProbeTicks back ticks, blind and bounded by their time. */
     private void startJamProbe(long now, String why) {
-        note("jam probe: " + why + "; backing up " + tuning.jamProbeTicks + " ticks");
+        // Robot 2026-10-03: forward when behind was blocked last and the front reads clear;
+        // the probes alternate rather than repeat the way that failed.
+        jamProbeFwd = jamAlternate && !jamProbeFwd && frontClear(now);
+        note("jam probe: " + why + (jamProbeFwd ? "; behind is blocked (" + behindWhy + "): driving forward "
+                : "; backing up ") + tuning.jamProbeTicks + " ticks");
         jamPoke = null;
         jamProbing = true;
         jamMoved = 0;
         jamFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
-        jamProbeUntil = now + tuning.jamProbeTicks * tuning.backTickMs;
-        nextTickAt = now + tuning.backTickMs;
+        long tickMs = jamProbeFwd ? tuning.hopTickMs : tuning.backTickMs;
+        jamProbeUntil = now + tuning.jamProbeTicks * tickMs;
+        nextTickAt = now + tickMs;
         moving = true;
-        motor.backTick();
+        if (jamProbeFwd) {
+            hopTick();
+        } else {
+            backTick();
+        }
     }
 
     /** The probe moved: he is free, and roams again with today's escape state cleared. */
@@ -10536,6 +11408,7 @@ final class ExploreBrain {
     /** Out of a jam (the probe or the wriggle moved): roams again with today's escape state cleared. */
     private void freedFromJam(long now) {
         jammed = false;
+        blockedWaysForgotten();
         recoverDone();
         jamHelpPending = false;
         blockedSides.clear();
@@ -10642,7 +11515,7 @@ final class ExploreBrain {
             if (now < wriggleBackUntil) {
                 if (now >= nextTickAt) {
                     nextTickAt += tuning.backTickMs;
-                    motor.backTick();
+                    backTick();
                 }
                 return;
             }
@@ -10687,7 +11560,7 @@ final class ExploreBrain {
             wriggleBackUntil = now + tuning.jamProbeTicks * tuning.backTickMs;
             nextTickAt = now + tuning.backTickMs;
             moving = true;
-            motor.backTick();
+            backTick();
             return;
         }
         if (wriggleWheelsStill(now)) {
@@ -10734,6 +11607,14 @@ final class ExploreBrain {
     private void stampStall(long now) {
         stallStampAt = now;
         spellEventAt = now;
+        // Robot 2026-10-03: what stalled says which way is blocked. A turn on the spot stalls when
+        // his tail swings into something; a back-up when something is behind; a forward leg ahead.
+        if (lastPush == Push.TURN || lastPush == Push.BACK) {
+            behindBlocked(now, lastPush == Push.TURN ? "a turn stalled" : "a back-up stalled");
+        } else if (lastPush == Push.FORWARD) {
+            // This heading is blocked ahead (tryForwardFirst and frontClear read it).
+            aheadBlocked();
+        }
     }
 
     /**
@@ -10815,6 +11696,7 @@ final class ExploreBrain {
         spellEventAt = now;
         recoverBackStill = 0;
         recoverBlockedWay = null;
+        recoverLastFwd = false;
         retryWaiting = false;
         recoverFrom = stallStampAt == NEVER ? now : stallStampAt;
         long since = now - recoverFrom;
@@ -10845,10 +11727,20 @@ final class ExploreBrain {
             return;
         }
         if (recoverProbing) {
+            if (recoverProbeFwd && now < recoverProbeUntil
+                    && classifier.status(now) == HazardClassifier.Status.HAZARD) {
+                // The forward probe keeps the forward safety: a hazard stops it at once.
+                stopMotors();
+                recoverProbeUntil = now;
+                frontBlocked(now);
+            }
             if (now < recoverProbeUntil) {
                 if (recoverProbeBack && now >= nextTickAt) {
                     nextTickAt += tuning.backTickMs;
-                    motor.backTick();
+                    backTick();
+                } else if (recoverProbeFwd && now >= nextTickAt) {
+                    nextTickAt += tuning.hopTickMs;
+                    hopTick();
                 }
                 return;
             }
@@ -10885,6 +11777,19 @@ final class ExploreBrain {
         recoverHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
         measured = false;
         moving = true;
+        // Robot 2026-10-03: behind is blocked (the move that stalled was a turn or a back-up, or a
+        // back-up barely moved) and the front reads clear: the probe drives forward instead.
+        recoverProbeFwd = tuning.stallRecoverProbeBackTicks > 0 && recoverFromReading != null
+                && probeForward(now, recoverLastFwd);
+        recoverLastFwd = recoverProbeFwd;
+        if (recoverProbeFwd) {
+            recoverProbeBack = false;
+            note("recover probe: behind is blocked (" + behindWhy + "): probing forward");
+            recoverProbeUntil = now + tuning.stallRecoverProbeBackTicks * tuning.hopTickMs;
+            nextTickAt = now + tuning.hopTickMs;
+            hopTick();
+            return;
+        }
         // Back the way he came first (robot 15:19); a turn only after two back-ups moved nothing,
         // or with no encoders to judge a back-up by.
         recoverProbeBack = tuning.stallRecoverProbeBackTicks > 0 && recoverFromReading != null
@@ -10892,7 +11797,7 @@ final class ExploreBrain {
         if (recoverProbeBack) {
             recoverProbeUntil = now + tuning.stallRecoverProbeBackTicks * tuning.backTickMs;
             nextTickAt = now + tuning.backTickMs;
-            motor.backTick();
+            backTick();
             return;
         }
         recoverProbeUntil = now + tuning.stallRecoverProbeMs;
@@ -10944,7 +11849,17 @@ final class ExploreBrain {
             return;
         }
         boolean wheels = counts && recoverMoved >= tuning.stallMinCounts;
-        if (recoverProbeBack) {
+        if (recoverProbeFwd) {
+            if (wheels) {
+                note("recover probe at " + at + " s: moved " + recoverMoved + " counts driving forward: the board is back");
+                recovered(now);
+                return;
+            }
+        } else if (recoverProbeBack) {
+            if (wheels && recoverMoved < BACK_FREE_COUNTS) {
+                // It moved, but barely: something is behind him (nothing moved at all is the cutout).
+                behindBlocked(now, "a back-up probe moved only " + recoverMoved + " counts");
+            }
             if (wheels) {
                 note("recover probe at " + at + " s: moved " + recoverMoved + " counts backing up: the board is back");
                 recovered(now);
@@ -11025,6 +11940,10 @@ final class ExploreBrain {
         if (escapeDir == null) {
             escapeDir = unblocked(escapeSide != null ? escapeSide : randomDirection());
         }
+        if (recoverBackFirst && preferForward(now) && tryForwardFirst(now, "the board is back, and behind is blocked ("
+                + behindWhy + "), so forward instead of backing out", false, ProbeThen.BACK_OUT)) {
+            return;
+        }
         startBackOff(now);
     }
 
@@ -11081,7 +12000,109 @@ final class ExploreBrain {
     }
 
     /** Starts the wheels turning d, noting the sign for KTD7's heading history. */
+    // ---- which way he last pushed, and which ways are blocked (robot 2026-10-03) ----
+    //
+    // Owner, 14:10: "He thinks he's stuck... He's backed up against the wall. He's definitely
+    // not stuck. All he has to do is drive forward." A turn on the spot by a wall stalled; the
+    // board-back move, the recover probes, the ladder's first move and the jam probes all
+    // backed up, into the wall, and he called a jam three times. They assumed behind is clear
+    // because he drove in, which is false when the move that stalled was a turn (his tail
+    // swings into the wall) or a back-up, or when a back-up barely moves. Now the stalled move
+    // and every back-up under BACK_FREE_COUNTS mark behind as blocked, and every forward stall
+    // or block marks the front; while behind was blocked last and the front reads clear (the
+    // floor sensor, no hazard driving this way just now, the camera's openness), those moves go
+    // forward instead, through the usual forward safety, and a failed forward sends the next
+    // one back: they alternate rather than repeat the way that failed.
+
+    private enum Push { NONE, FORWARD, BACK, TURN }
+
+    /** A back-up that moved fewer counts than this (both wheels) says behind is blocked. */
+    static final long BACK_FREE_COUNTS = 50;
+    /** Evidence that behind is blocked counts for this long. */
+    static final long BEHIND_BLOCKED_MS = 120000;
+
+    private Push lastPush = Push.NONE;
+    /** This ladder tried forward before its back-up, and before calling a jam. */
+    private boolean escForwardFirstTried;
+    /** The recover probe under way drives forward; and the last one did. */
+    private boolean recoverProbeFwd;
+    private boolean recoverLastFwd;
+    /** The jam probe under way drives forward; and the jam's probes alternate (behind was blocked last). */
+    private boolean jamProbeFwd;
+    private boolean jamAlternate;
+    private boolean jamForwardTried;
+    private long behindBlockedAt = NEVER;
+    private String behindWhy;
+    private long frontBlockedAt = NEVER;
+
+    private void hopTick() {
+        lastPush = Push.FORWARD;
+        motor.hopTick();
+    }
+
+    private void backTick() {
+        lastPush = Push.BACK;
+        motor.backTick();
+    }
+
+    /** Behind him is blocked: this says why (fixed words, counts). */
+    private void behindBlocked(long now, String why) {
+        behindBlockedAt = now;
+        behindWhy = why;
+    }
+
+    /** Ahead of him is blocked (a forward stall, a hazard driving forward, a forward try blocked). */
+    private void frontBlocked(long now) {
+        frontBlockedAt = now;
+    }
+
+    /** Free again (a clean drive-off, out of a jam): what blocked him is behind him. */
+    private void blockedWaysForgotten() {
+        behindBlockedAt = NEVER;
+        frontBlockedAt = NEVER;
+        behindWhy = null;
+    }
+
+    /**
+     * The front reads clear: the floor sensor and CPL (no hazard now), no hazard or stall
+     * driving this way just now, and the camera's openness (when it has a look since he last
+     * turned) not a hard block. tryForwardFirst's tests.
+     */
+    private boolean frontClear(long now) {
+        if (classifier.status(now) != HazardClassifier.Status.CLEAR) {
+            return false;
+        }
+        if (compass.usable(now) && !Double.isNaN(blockedAheadAt)
+                && Math.abs(Heading.delta(compass.degrees(), blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return false;
+        }
+        Look look = camera.latest();
+        return look == null || look.openness == null || look.frameMs < headingSettledAt
+                || !steer.blockedAhead(look.openness);
+    }
+
+    /** Behind was blocked last, and lately. */
+    private boolean behindEvidence(long now) {
+        return behindBlockedAt != NEVER && now - behindBlockedAt <= BEHIND_BLOCKED_MS
+                && (frontBlockedAt == NEVER || behindBlockedAt >= frontBlockedAt);
+    }
+
+    /** The next move out goes forward: behind was blocked last (and lately), and the front reads clear. */
+    private boolean preferForward(long now) {
+        return behindEvidence(now) && frontClear(now);
+    }
+
+    /**
+     * A probe's way (RECOVER's, the jam's): a probe that moved nothing says nothing about either
+     * side (the board's cutout reads zero every way), so with behind blocked they alternate,
+     * forward first while the front reads clear; with no sign behind is blocked, back as before.
+     */
+    private boolean probeForward(long now, boolean lastWasForward) {
+        return !lastWasForward && behindEvidence(now) && frontClear(now);
+    }
+
     private void turnWheels(Direction d) {
+        lastPush = Push.TURN;
         turnSign = d == Direction.LEFT ? Heading.LEFT : Heading.RIGHT;
         turnCounts = 0;
         turnCountFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;

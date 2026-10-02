@@ -93,6 +93,21 @@ final class ChatSession {
         CuriosityPort.ToolFacts toolFacts();
 
         /**
+         * Owner 2026-10-03: the stop tool, at once: any errand or task under way ends and he
+         * stays put. The conversation goes on.
+         */
+        default void stopActs() {
+        }
+
+        /**
+         * Robot 2026-10-03: the look tool's fast path, the camera's newest streamed frame when it
+         * is fresh and privacy allows it (ExploreBrain.fastToolLook); null to take the slow path.
+         */
+        default CuriosityPort.LookResult fastLook(long now) {
+            return null;
+        }
+
+        /**
          * Owner 2026-10-02: the next move of the search for a caller during the conversation.
          * TURNING: a short turn toward the plan's next bearing started; LOOK: he faces a bearing
          * not yet looked at; DONE: the plan is spent (or the caller is faced); HELD: he cannot
@@ -323,6 +338,8 @@ final class ChatSession {
     /** An instruction he was given (the line said it), for the brain once the conversation is over. */
     private CuriosityPort.Action action = CuriosityPort.Action.NONE;
     private String actionTarget;
+    /** Owner 2026-10-03: the action tool's act behind it (ChatActions), or null. */
+    private ChatActions.Act act;
 
     // ---- the store ----
     private boolean keepPending;
@@ -404,6 +421,11 @@ final class ChatSession {
     /** Its target as Claude gave it (a short name or place), or null. Never traced. */
     String actionTarget() {
         return actionTarget;
+    }
+
+    /** Owner 2026-10-03: the act the conversation ended on (its details), or null. */
+    ChatActions.Act act() {
+        return act;
     }
 
     // ---- entry points from the brain ----
@@ -731,6 +753,17 @@ final class ChatSession {
                 port.say(ask.preamble);
             }
             lookAfterPreamble = ask.look;
+            if (ask.look && host.lookBlocked() == null) {
+                // Robot 2026-10-03: a fresh streamed frame goes at once, while the preamble plays;
+                // no detector run, so nothing unparks while he speaks.
+                CuriosityPort.LookResult fast = host.fastLook(now);
+                if (fast != null) {
+                    lookAfterPreamble = false;
+                    host.note("the tool's look: a streamed frame for Claude, " + fast.ageMs + " ms old, "
+                            + (fast.detected ? "with its labels" : "no labels"));
+                    port.lookAnswer(fast);
+                }
+            }
         }
         if (lookAfterPreamble && !preambleSaying) {
             lookAfterPreamble = false;
@@ -744,7 +777,8 @@ final class ChatSession {
             dropToolLook();
             // The fresh frame itself may have just put him in bathroom privacy: nothing goes then.
             String blocked = host.lookBlocked();
-            host.note(blocked == null ? "the tool's look: a fresh frame for Claude" : "the tool's look: refused");
+            host.note(blocked == null ? "the tool's look: a fresh frame for Claude, " + (now - look.frameMs) + " ms old"
+                    : "the tool's look: refused");
             port.lookAnswer(blocked == null ? CuriosityPort.LookResult.of(look.jpeg, labels(look))
                     : CuriosityPort.LookResult.refused(blocked));
         } else if (now >= toolLookDeadline) {
@@ -881,12 +915,18 @@ final class ChatSession {
             host.note("the line deflects a task");
         }
         turns++;
-        if (t.action != CuriosityPort.Action.NONE) {
+        if (t.act != null && t.act.continuesConversation()) {
+            // Owner 2026-10-03: "stop" takes effect at once, and the conversation goes on.
+            host.note("an instruction (" + t.act.describe() + "): done at once; the conversation goes on");
+            host.stopActs();
+        } else if (t.action != CuriosityPort.Action.NONE) {
             // Owner 2026-10-02: an instruction he will try to follow. The line already said so:
             // it ends the conversation with no sign-off, and the brain takes it from there.
             action = t.action;
             actionTarget = t.target;
-            host.note("an instruction (" + action.word() + "): the line, then the conversation ends");
+            act = t.act;
+            host.note("an instruction (" + (act == null ? action.word() : act.describe())
+                    + "): the line, then the conversation ends");
             learnEnd("instruction");
             speak(now, line, true);
             endAfterLine = true;

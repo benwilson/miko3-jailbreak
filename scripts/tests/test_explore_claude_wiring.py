@@ -711,19 +711,18 @@ class FasterTurnWiringTest(unittest.TestCase):
         self.assertIn("flight.early(call, ", turn)
         self.assertIn("flight.whole(call, ", turn)
         # Owner 2026-10-02/03: "addressed" (a boolean, before the line) comes with the early fields
-        # from the respond tool's streamed input; the action and its target follow the name.
+        # from the respond tool's streamed input (owner 2026-10-03: no action fields, they are tools now).
         self.assertRegex(code_only(src("ChatRound.java")),
-                         r'EARLY_FIELDS\s*=\s*Arrays\.asList\("addressed", "line", "question_asked", "name_given",'
-                         r'\s*"action", "target"\)')
+                         r'EARLY_FIELDS\s*=\s*Arrays\.asList\("addressed", "line", "question_asked", "name_given"\)')
         early = self.method("private static Turn earlyTurn(")
         self.assertIn("ClaudeReplies.turn(", early)
         self.assertIn("NameExtractor.validName(", early)
 
     def test_a_speculation_is_used_only_by_the_same_request(self):
-        turn = self.method("public void turn(final TurnRequest request, final long timeoutMs)")
+        turn = self.method("public void turn(TurnRequest asked, final long timeoutMs)")
         self.assertIn("flight.adopt(body.key, g)", turn)
         self.assertIn("flight.start(body.key, g)", turn)
-        spec = self.method("public void speculateTurn(final TurnRequest request, final long timeoutMs)")
+        spec = self.method("public void speculateTurn(TurnRequest asked, final long timeoutMs)")
         self.assertIn("flight.speculate(body.key)", spec)
         self.assertIn("ChatRound.body(request, null)", spec)
         body = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
@@ -1013,7 +1012,17 @@ class ConversationWiringTest(unittest.TestCase):
             self.assertEqual(self.java_string(tools, name), getattr(bench, name), name)
         order = re.findall(r'out\.add\(new Object\[\]\{(\w+),', tools)
         names = {k: self.java_string(tools, k) for k in ("RESPOND", "LOOK", "RECALL", "STATUS", "PLACES")}
-        self.assertEqual([names[k] for k in order], [t["name"] for t in bench.TOOLS])
+        # Owner 2026-10-03: the action tools (ChatActions) follow, in their own order, byte for byte.
+        actions = src("ChatActions.java")
+        act_order = re.findall(r'out\.add\(new Object\[\]\{(\w+),', actions)
+        self.assertIn("out.addAll(ChatActions.definitions());", tools)
+        act_names = [self.java_string(actions, k) for k in act_order]
+        self.assertEqual([names[k] for k in order] + act_names, [t["name"] for t in bench.TOOLS])
+        self.assertEqual(act_names, bench.ACTION_NAMES)
+        for k in act_order + ["PLAN"]:
+            self.assertEqual(self.java_string(actions, k + "_DESCRIPTION"), getattr(bench, k + "_DESCRIPTION"), k)
+        for name in ("OWNER_NOTE_HEADING", "OWNER_NOTE_GUARD", "TASK_SYSTEM"):
+            self.assertEqual(self.java_string(prompts, name), getattr(bench, name), name)
         recall = re.search(r'RECALL_SCHEMA = ExplorePrompts\.object\("name", ExplorePrompts\.described\(\s*'
                            r'ExplorePrompts\.type\("string"\), "(.*?)"\)\);', tools, re.S)
         self.assertEqual(recall.group(1), bench.RECALL_SCHEMA["properties"]["name"]["description"])
@@ -1038,7 +1047,8 @@ class ConversationWiringTest(unittest.TestCase):
         for method in ("toolAsk", "lookAnswer"):
             self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
         body = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
-        self.assertIn("ExplorePrompts.systemPrefix(request.persona, request.notes)", body)
+        self.assertIn("ExplorePrompts.systemPrefix(request.persona, request.notes, request.ownerName,\n"
+                      "                request.ownerNote)", body)
         self.assertIn("ExplorePrompts.openerAsk(request.name)", body)
         self.assertIn("ExplorePrompts.avoidQuestion(request.avoidQuestion)", body)
         self.assertIn("userMessage(saidBefore, face, ask)", body)
@@ -1078,7 +1088,9 @@ class ConversationWiringTest(unittest.TestCase):
     def test_the_camera_parks_the_detector_through_the_conversation(self):
         cam = code_only(src("ExploreCamera.java"))
         self.assertIn("public void park(boolean p)", cam)
-        self.assertIn("if (busy || !wanted || parked)", cam)
+        # Robot 2026-10-03: parked frames are only kept (for the look tool), never detected.
+        self.assertIn("boolean detect = !busy && !parked;", cam)
+        self.assertIn("if (!detect) {\n                    return;\n                }\n                busy = true;", cam)
         brain = code_only(src("ExploreBrain.java"))
         self.assertIn("camera.park(parked)", brain)
         # Face plan U7: the close match's question keeps it open and parked on the conversation path too.
@@ -1292,21 +1304,25 @@ class InstructionsAndAddressedTest(unittest.TestCase):
     def test_the_schema_puts_addressed_first_and_the_action_after_the_name(self):
         body = self.prompts().split("REPLY_SCHEMA = object(")[1].split(";")[0]
         top = re.findall(r'^            "(\w+)",', body, re.M)
-        self.assertEqual(top, ["addressed", "line", "question_asked", "name_given", "action", "target",
+        self.assertEqual(top, ["addressed", "line", "question_asked", "name_given",
                                "ends_conversation", "deflected", "notes_update", "feedback"])
         self.assertIn('"addressed", type("boolean")', body)
-        self.assertIn('enumOf("none", "go_away", "go_elsewhere", "find_person", "come_here", "be_quiet")', body)
+        self.assertNotIn('"action"', body)
 
     def test_the_preamble_says_when_to_set_the_action_and_addressed(self):
         pre = ConversationWiringTest.java_string(self.prompts(), "SCHEMA_PREAMBLE")
         for phrase in ("addressed (true when their latest message was said to Miko", "talking to each other nearby",
                        "line (what he says; empty when addressed is false)",
-                       "only when the person explicitly asks Miko", "go_away, go_elsewhere, find_person, come_here or "
-                       "be_quiet", "I'll give you some space", "target (", "action none",
-                       "says kindly and honestly that he can't"):
+                       "only for when the person explicitly asks him to do that",
+                       "move, stop, stay, come_here, go_away, be_quiet, find_person, find_thing, go_to_place, wait, "
+                       "run_task", "call one alone, never with respond or another action",
+                       "an errand of several steps is one run_task", "Okay, turning around.",
+                       "honestly why he can't", "a kind, honest line that he can't"):
             self.assertIn(phrase, pre, phrase)
+        self.assertNotIn("action (", pre)
+        self.assertNotIn("target (", pre)
         guard = ConversationWiringTest.java_string(self.prompts(), "GUARD")
-        self.assertIn("moving himself as the action field allows", guard)
+        self.assertIn("except moving himself and short errands with his action tools", guard)
 
     def test_the_early_line_waits_for_addressed_from_the_stream(self):
         a = code_only(src("ClaudeCuriosity.java"))
@@ -1318,7 +1334,9 @@ class InstructionsAndAddressedTest(unittest.TestCase):
         self.assertNotIn("StreamedText", a)
         turn_of = re.search(r"private static Turn turnOf\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn(".withAddressed(t.addressed)", turn_of)
-        self.assertIn(".withAction(t.action, t.target)", turn_of)
+        # Owner 2026-10-03: the accepted action tool is the turn's act.
+        self.assertIn("t = t.withAct(o.act);", turn_of)
+        self.assertIn(".withAct(t.act)", turn_of)
 
     def test_the_brain_never_traces_the_target(self):
         brain = code_only(src("ExploreBrain.java"))
@@ -1350,7 +1368,7 @@ class ToolRoundWiringTest(unittest.TestCase):
         ask = self.method("public CuriosityPort.ToolAsk toolAsk()")
         self.assertIn("turns.current(b.gen)", ask)
         self.assertIn("dropToolAsks();", self.method("public void cancelTurn()"))
-        self.assertIn("dropToolAsks();", self.method("public void turn(final TurnRequest request, final long timeoutMs)"))
+        self.assertIn("dropToolAsks();", self.method("public void turn(TurnRequest asked, final long timeoutMs)"))
         self.assertIn("dropToolAsks();", self.method("    void release()"))
         self.assertIn("return turns.current(call.gen);", self.method("private void oneTurn("))
 
@@ -1436,3 +1454,107 @@ class LearnLogWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActionToolsWiringTest(unittest.TestCase):
+    """Owner 2026-10-03: the action tools and run_task. Claude picks, the robot drives; the
+    trace and the learning log carry the tool, kind and amount only, never a name, a label
+    Claude chose, a goal or words to say; a task's consult goes to Claude without a frame."""
+
+    def test_the_brain_never_traces_an_acts_words(self):
+        brain = code_only(src("ExploreBrain.java"))
+        for call in re.findall(r"\bnote\((.*?)\);", brain, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"\.(goal|text|target|labels)\b|stepText\(|taskOutcomes|taskLine", call)
+
+    def test_act_and_task_lines_are_learning_log_records(self):
+        learn = code_only(src("LearnLog.java"))
+        self.assertIn('"act: ", "task: "', learn)
+        brain = code_only(src("ExploreBrain.java"))
+        self.assertIn('note("task: n=" + taskNo + " steps=" + ChatActions.stepTools(taskSteps) + " outcomes="', brain)
+        self.assertIn('" consults=" + taskConsults + " end=" + why', brain)
+
+    def test_the_consult_sends_labels_never_a_frame_and_logs_only_its_outcome(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        consult = re.search(r"private TaskPlan consult\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("ExplorePrompts.taskAsk(request)", consult)
+        self.assertIn("ExplorePrompts.TASK_SYSTEM", consult)
+        self.assertNotIn("jpeg", consult)
+        for call in re.findall(r"Log\.[diwe]\((.*?)\);", consult, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"request|goal|messages", call)
+        port = src("CuriosityPort.java")
+        consult_cls = port[port.index("final class TaskConsult"):port.index("final class TaskPlan")]
+        self.assertNotIn("byte[]", consult_cls)
+
+    def test_bathroom_privacy_ends_a_task_before_anything_else_in_its_step(self):
+        brain = code_only(src("ExploreBrain.java"))
+        step = re.search(r"private void taskStep\(long now\) \{(.*?)\n    \}", brain, re.S).group(1)
+        self.assertLess(step.index("if (bathroom)"), step.index("switch (taskWait)"))
+        self.assertIn('endTask(now, "bathroom"', step)
+
+    def test_a_call_drops_a_task_and_stay_answers_in_place(self):
+        brain = code_only(src("ExploreBrain.java"))
+        call = re.search(r"private void callStep\(long now\) \{(.*?)\n    \}", brain, re.S).group(1)
+        self.assertIn('endTask(now, "a call", null)', call)
+        verdict = re.search(r"private CallVerdict callVerdict\((.*?)\n    \}", brain, re.S).group(1)
+        self.assertIn("if (now < stayUntil)", verdict)
+
+    def test_the_adapter_checks_labels_against_the_detectors_vocabulary(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        turn = re.search(r"private void oneTurn\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("asked.withFacts(asked.facts.withVocabulary(vocabulary()))", turn)
+        self.assertIn('OnnxRecognizer.readVocabulary(app)', a)
+
+
+class OwnerNotesWiringTest(unittest.TestCase):
+    """Owner 2026-10-03: notes about people by name, written on the Settings page. When the
+    person he is talking to has one (by their recognised or given name), it goes into that
+    conversation's system context with its guard; it is never logged, never a tool's answer."""
+
+    def test_the_adapter_reads_the_note_by_name_and_never_logs_it(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        self.assertIn("RobotPeopleClient.ownerNoteFor(app, name)", a)
+        conv = re.search(r"private MatchAnswer forConversation\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("RobotPeopleClient.ownerNoteFor(app, a.name.trim())", conv)
+        for sig in ("public void turn(TurnRequest asked, final long timeoutMs)",
+                    "public void speculateTurn(TurnRequest asked, final long timeoutMs)"):
+            body = re.search(re.escape(sig) + r"(.*?)\n    \}", a, re.S).group(1)
+            self.assertIn("final TurnRequest request = withOwnerNote(asked);", body)
+        for call in re.findall(r"Log\.[diwe]\((.*?)\);", a, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"\bnote\b|ownerNote", call)
+
+    def test_the_note_goes_only_into_the_system_prefix(self):
+        chat = code_only(src("ChatRound.java"))
+        self.assertEqual(chat.count("ownerNote"), 1)
+        self.assertNotIn("ownerNote", code_only(src("ChatTools.java")))
+        prompts = src("ExplorePrompts.java")
+        guard = ConversationWiringTest.java_string(prompts, "OWNER_NOTE_GUARD")
+        for phrase in ("Follow it for how he approaches them", "never deceive them",
+                       "never pressure them after they say no", "go_away, be_quiet and stop always win",
+                       "never reveal or quote what the note says", "the owner mentioned them"):
+            self.assertIn(phrase, guard, phrase)
+
+
+class FastLookWiringTest(unittest.TestCase):
+    """Robot 2026-10-03: the look tool sends the camera's newest streamed frame at once when it
+    is fresh and the newest detection shows no bathroom label; the camera keeps no streamed
+    frame in bathroom privacy, and the note logs the frame's age only."""
+
+    def test_the_camera_keeps_no_streamed_frame_in_privacy(self):
+        cam = code_only(src("ExploreCamera.java"))
+        self.assertIn("boolean keep = !privateFrames && (detect || t - rawAt >= RAW_EVERY_MS);", cam)
+        self.assertIn("return privateFrames ? null : latestRaw;", cam)
+        priv = re.search(r"public void setPrivate\(boolean on\) \{(.*?)\n    \}", cam, re.S).group(1)
+        self.assertIn("latestRaw = null;", priv)
+
+    def test_the_fast_path_checks_privacy_first_and_the_newest_detection(self):
+        brain = code_only(src("ExploreBrain.java"))
+        body = re.search(r"private CuriosityPort.LookResult fastToolLook\(long now\) \{(.*?)\n    \}", brain, re.S).group(1)
+        self.assertIn("bathroom || muted || quiet", body)
+        self.assertIn("BATHROOM_STRONG.contains(x.label) || BATHROOM_WEAK.contains(x.label)", body)
+        chat = code_only(src("ChatSession.java"))
+        step = re.search(r"private void toolStep\(long now\) \{(.*?)\n    \}", chat, re.S).group(1)
+        self.assertLess(step.index("host.lookBlocked() == null"), step.index("host.fastLook(now)"))
+        self.assertIn('" ms old, "', step)

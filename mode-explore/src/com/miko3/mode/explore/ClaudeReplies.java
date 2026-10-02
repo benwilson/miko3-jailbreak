@@ -229,7 +229,11 @@ final class ClaudeReplies {
         if (target != null && target.length() > MAX_TARGET) {
             target = target.substring(0, MAX_TARGET).trim();
         }
-        return t.withAction(CuriosityPort.Action.of(json.get("action")), target);
+        // Owner 2026-10-03: instructions now come as action tools (ChatActions); a reply that still
+        // writes the old action field is taken only for its five instructions, never a tool's.
+        CuriosityPort.Action a = CuriosityPort.Action.of(json.get("action"));
+        return t.withAction(a.ordinal() <= CuriosityPort.Action.BE_QUIET.ordinal() ? a : CuriosityPort.Action.NONE,
+                target);
     }
 
     /** The longest action target kept: a short name or place. */

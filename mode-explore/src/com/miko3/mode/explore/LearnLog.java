@@ -25,7 +25,7 @@ import java.util.zip.CRC32;
  * Each line is written exactly as `adb logcat -v time` would show it ("MM-dd HH:mm:ss.SSS
  * I/Tag( pid): message"), so every script reads a pulled learn.log and a logcat capture alike.
  * Which notes go in is a fixed list of prefixes (RECORD_PREFIXES): the per-decision records
- * (leg:, trig:, turn:, escape#, seek#, mode:), the episodes nav-report counts (bathroom,
+ * (leg:, trig:, turn:, act:, task:, escape#, seek#, mode:), the episodes nav-report counts (bathroom,
  * power, docked, stalls, recover, jams), and this log's own "learn:" lines. None of them
  * carries a word said or heard, a name or a pixel.
  *
@@ -44,7 +44,7 @@ final class LearnLog {
 
     /** The notes that are records, by prefix. */
     static final String[] RECORD_PREFIXES = {
-        "leg: ", "trig: ", "turn: ", "learn: ", "escape#", "seek#", "mode: ",
+        "leg: ", "trig: ", "turn: ", "learn: ", "escape#", "seek#", "mode: ", "act: ", "task: ",
         "bathroom: ", "power: ", "docked: ", "docked look: something new", "on the charger: ", "eyes only:",
         "sensors available and lease held", "hazard ", "controller refused forward", "collision stop",
         "camera reads the way ahead blocked", "wheels stalled", "back-up stalled", "back-out stalled",

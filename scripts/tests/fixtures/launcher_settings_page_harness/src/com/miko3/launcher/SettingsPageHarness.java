@@ -2034,6 +2034,102 @@ public final class SettingsPageHarness {
             }
         });
 
+        // ---- owner 2026-10-03: the owner's notes about people by name ----
+        scenario("owner_notes_section_explains_and_offers_an_add_form", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sec = section(get(f), "owner-notes");
+                String add = form(sec, LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH);
+                check(n, sec.contains("Notes about people by name") && sec.contains(SettingsPage.OWNER_NOTES_EMPTY)
+                                && sec.contains("never logged") && sec.contains("never reveals")
+                                && fieldNames(add).equals(java.util.Arrays.asList("t", "name", "note"))
+                                && textarea(add, "note").contains("maxlength=\"600\""),
+                        sec);
+            }
+        });
+        scenario("owner_notes_add_lists_the_entry_escaped_with_edit_and_delete", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=" + enc("Priya <b>Shah</b>") + "&note=" + enc("Ask about <i>runs</i> & dogs"));
+                String sec = section(get(f), "owner-notes");
+                String id = f.people.ownerNotes().all().get(0).id;
+                String edit = form(sec, LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH);
+                String del = form(sec, LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH);
+                check(n, SettingsPage.OWNER_NOTE_ADDED.equals(r.status())
+                                && sec.contains("Priya &lt;b&gt;Shah&lt;/b&gt;") && !sec.contains("<b>Shah")
+                                && sec.contains("Ask about &lt;i&gt;runs&lt;/i&gt; &amp; dogs") && !sec.contains("<i>runs")
+                                && edit.contains("value=\"" + id + "\"") && del.contains("value=\"" + id + "\"")
+                                && fieldNames(edit).equals(java.util.Arrays.asList("t", "id", "name", "note"))
+                                && !sec.contains(SettingsPage.OWNER_NOTES_EMPTY)
+                                && "Ask about <i>runs</i> & dogs".equals(f.people.ownerNotes().noteFor("priya")),
+                        r.status() + " | " + sec);
+            }
+        });
+        scenario("owner_notes_edit_and_delete_change_only_that_entry", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String a = f.people.ownerNotes().add("Sam", "old");
+                f.people.ownerNotes().add("Ann", "keep");
+                Resp e = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH, "",
+                        "t=" + token(f) + "&id=" + a + "&name=Sam+Lee&note=new");
+                String afterEdit = f.people.ownerNotes().noteFor("Sam Lee");
+                Resp d = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=" + a);
+                Resp unknown = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=" + a);
+                check(n, SettingsPage.OWNER_NOTE_SAVED.equals(e.status()) && "new".equals(afterEdit)
+                                && SettingsPage.OWNER_NOTE_DELETED.equals(d.status())
+                                && SettingsPage.OWNER_NOTE_UNKNOWN.equals(unknown.status())
+                                && f.people.ownerNotes().all().size() == 1 && "keep".equals(f.people.ownerNotes().noteFor("ann")),
+                        e.status() + "|" + d.status() + "|" + unknown.status());
+            }
+        });
+        scenario("owner_notes_need_the_token_and_post", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp stale = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=deadbeef&name=Sam&note=x");
+                Resp get = request(f, "GET", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH,
+                        "t=" + token(f) + "&name=Sam&note=x", null);
+                String a = f.people.ownerNotes().add("Ann", "keep");
+                Resp staleDel = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH, "",
+                        "t=nope&id=" + a);
+                check(n, get.code() == 405 && f.people.ownerNotes().all().size() == 1
+                                && stale.status() != null && stale.status().contains("expired")
+                                && staleDel.status() != null && staleDel.status().contains("expired"),
+                        stale.head);
+            }
+        });
+        scenario("owner_notes_refusals_and_statuses_never_echo_the_name_or_note", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp noName = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=&note=" + enc("secret plan"));
+                Resp noNote = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=Zelda&note=+");
+                Resp tooLong = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=Zelda&note=" + repeat('a', 601));
+                Resp ok = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=Zelda&note=" + enc("secret plan"));
+                String all = noName.head + noNote.head + tooLong.head + ok.head;
+                check(n, SettingsPage.OWNER_NOTE_NO_NAME.equals(noName.status())
+                                && SettingsPage.OWNER_NOTE_EMPTY.equals(noNote.status())
+                                && SettingsPage.OWNER_NOTE_TOO_LONG.equals(tooLong.status())
+                                && SettingsPage.OWNER_NOTE_ADDED.equals(ok.status())
+                                && !all.contains("Zelda") && !all.contains("secret") && f.people.ownerNotes().all().size() == 1,
+                        all);
+            }
+        });
+        scenario("owner_notes_paths_are_tls_only", new Scenario() {
+            public void run(String n) throws Exception {
+                check(n, LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH.startsWith(LauncherProtocol.SETTINGS_PATH + "/")
+                                && LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH.startsWith(LauncherProtocol.SETTINGS_PATH + "/")
+                                && LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH.startsWith(LauncherProtocol.SETTINGS_PATH + "/"),
+                        "");
+            }
+        });
+
         if (failures > 0) {
             System.exit(1);
         }

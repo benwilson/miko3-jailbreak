@@ -34,7 +34,7 @@ PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java"
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
               "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "PlaceMemory.java", "Ears.java", "ChatSession.java",
               "FaceMigration.java", "FaceMatcher.java", "AnswerParser.java", "NameResolver.java", "ChatTools.java",
-              "LearnLog.java")
+              "LearnLog.java", "ChatActions.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -301,6 +301,23 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "intent_be_quiet_is_do_not_disturb_for_10_min_then_expires",
         "intent_a_call_interrupts_it_and_the_intent_is_dropped",
         "intent_an_unable_request_is_action_none_with_an_honest_line_and_the_talk_goes_on",
+        # Owner 2026-10-03: the action tools and run_task's workflows.
+        "act_move_turn_around_turns_and_is_done_once_he_is_still_with_no_leg",
+        "act_move_forward_drives_one_capped_leg_and_back_backs_up_with_no_escape_turn",
+        "act_stay_holds_him_still_and_a_call_is_answered_where_he_stands",
+        "act_find_thing_ends_on_sight_and_goes_over_to_it",
+        "act_go_to_place_is_done_when_a_look_shows_what_marks_it",
+        "task_three_steps_run_in_order_and_end_done_with_a_record",
+        "task_a_failed_step_consults_claude_and_the_revised_plan_succeeds",
+        "task_out_of_consults_ends_it_with_a_spoken_line",
+        "task_a_hey_miko_call_drops_it_at_once",
+        "task_bathroom_privacy_ends_it_with_no_consult_and_no_frame",
+        "task_docked_ends_it_and_a_drive_is_refused_while_docked",
+        "act_stop_in_a_conversation_ends_the_task_at_once_and_the_talk_goes_on",
+        "chat_tool_look_fast_path_sends_the_fresh_streamed_frame_at_once_with_no_unpark",
+        # Robot 2026-10-03: backed up against a wall, he drives forward out.
+        "stuck_wall_behind_a_turn_on_the_spot_stalls_and_he_drives_forward_out_no_jam_no_help",
+        "stuck_a_back_up_that_goes_nowhere_makes_the_next_probe_forward",
         "chat_three_turns_not_said_to_him_end_the_conversation",
         "chat_a_turn_said_to_him_resets_the_count_and_the_talk_goes_on",
         "chat_no_reply_said_to_him_for_45_s_ends_it_politely",
@@ -328,7 +345,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "side_both_blocked_alternates_instead_of_one_side_for_ever",
         # Wedged: a straight back-up first, then the free way round (live 2026-09-25: nose to a wall)
         "wedged_nose_to_wall_backs_up_first_then_turns_the_free_way_and_drives_off",
-        "wedged_back_up_blocked_behind_goes_on_with_the_ladder",
+        "wedged_back_up_blocked_behind_tries_forward_first_and_drives_off",
         "wedged_retrace_long_way_round_past_a_blocked_side_is_skipped",
         # The learned turn rate: completed turns only (live 2026-09-25: collapsed to the floor)
         "turn_rate_learns_only_from_completed_turns",

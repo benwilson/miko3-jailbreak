@@ -50,6 +50,18 @@ class ChatRoundHarnessTest(unittest.TestCase):
         "round_a_turn_abandoned_during_its_tool_round_sends_no_second_request",
         "round_a_prose_reply_is_a_line_said_to_him_and_an_empty_one_is_no_reply",
         "round_a_failed_first_or_second_request_carries_its_reason",
+        # Owner 2026-10-03: the action tools (ChatActions) and the owner's notes.
+        "round_an_action_alone_is_checked_its_honest_result_goes_back_and_the_act_comes_out",
+        "round_a_drive_he_cant_make_is_a_tool_error_saying_why_and_no_act_but_be_quiet_still_works",
+        "round_one_action_per_reply_a_second_is_refused_and_not_done",
+        "round_an_accepted_action_beside_respond_is_taken_with_that_reply_in_one_request",
+        "round_a_refused_action_beside_respond_runs_the_round_so_the_line_says_why",
+        "round_find_thing_and_go_to_place_check_labels_against_his_vocabulary_and_places",
+        "round_run_task_checks_every_step_and_a_bad_step_or_a_drive_he_cant_make_refuses_it",
+        "round_move_stay_and_wait_amounts_are_capped_and_said_so",
+        "round_the_owners_note_goes_in_the_system_context_with_its_guard_and_no_tool_returns_it",
+        "round_tool_definitions_printed",
+        "round_a_streamed_frame_the_detector_never_saw_goes_with_no_labels_said_so",
     )
 
     @classmethod
@@ -63,12 +75,15 @@ class ChatRoundHarnessTest(unittest.TestCase):
         cls.compiled = c.returncode == 0
         cls.compile_output = (c.stdout + c.stderr)[-3000:]
         cls.results = {}
+        cls.printed = {}
         cls.run_output = ""
         if cls.compiled:
             r = subprocess.run([jdk[1], "-cp", out, "com.miko3.mode.explore.ChatRoundHarness"],
                                capture_output=True, text=True, timeout=60)
             cls.run_output = (r.stdout + r.stderr)[-6000:]
             cls.results = jvm_harness.parse_verdicts(r.stdout)
+            cls.printed = {k: v for k, _, v in (line.partition(" ") for line in r.stdout.splitlines())
+                           if k in ("TOOLS", "PLAN")}
 
     @classmethod
     def tearDownClass(cls):
@@ -84,6 +99,18 @@ class ChatRoundHarnessTest(unittest.TestCase):
 
     def test_harness_reports_exactly_the_expected_scenarios(self):
         self.assertEqual(sorted(self.results), sorted(self.SCENARIOS), self.run_output)
+
+
+    def test_the_bench_sends_the_robots_tool_definitions_byte_for_byte(self):
+        """Owner 2026-10-03: every tool's name, description and schema, in order, as ChatRound sends them."""
+        import importlib.util
+        import json
+        spec = importlib.util.spec_from_file_location("claude_chat_bench", REPO / "scripts" / "claude-chat-bench.py")
+        bench = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench)
+        self.assertIn("TOOLS", self.printed, self.run_output)
+        self.assertEqual(json.dumps(json.loads(self.printed["TOOLS"])), json.dumps(bench.TOOLS))
+        self.assertEqual(json.dumps(json.loads(self.printed["PLAN"])), json.dumps(bench.PLAN_TOOL))
 
 
 jvm_harness.add_scenario_tests(ChatRoundHarnessTest)

@@ -247,6 +247,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
     public void close() {
         final int gen = ++generation;
         latest = null;
+        latestRaw = null;
         closedDone = false;
         cameraHandler.post(new Runnable() {
             @Override
@@ -278,6 +279,19 @@ final class ExploreCamera implements ExploreBrain.Camera {
     @Override
     public void setPrivate(boolean on) {
         privateFrames = on;
+        if (on) {
+            latestRaw = null;
+        }
+    }
+
+    /** The look tool's fast path keeps one streamed frame at most this often. */
+    private static final long RAW_EVERY_MS = 300;
+    private volatile ExploreBrain.RawFrame latestRaw;
+    private long rawAt = Long.MIN_VALUE / 4;
+
+    @Override
+    public ExploreBrain.RawFrame latestRaw() {
+        return privateFrames ? null : latestRaw;
     }
 
     /** Closed on the camera thread, and no detector run in flight (the brain speaks only then, R6). */
@@ -599,15 +613,30 @@ final class ExploreCamera implements ExploreBrain.Camera {
             }
             try {
                 // Parked (meeting plan U8, KTD7): the stream runs, the detector does not.
-                if (busy || !wanted || parked) {
+                if (!wanted) {
+                    return;
+                }
+                boolean detect = !busy && !parked;
+                long t = clock.nowMs();
+                // Robot 2026-10-03: the newest streamed frame for the look tool's fast path, at most
+                // one copy every RAW_EVERY_MS, never in bathroom privacy.
+                boolean keep = !privateFrames && (detect || t - rawAt >= RAW_EVERY_MS);
+                if (!detect && !keep) {
                     return;
                 }
                 ByteBuffer buf = image.getPlanes()[0].getBuffer();
                 long wallMs = System.currentTimeMillis();
                 byte[] jpeg = new byte[buf.remaining()];
                 buf.get(jpeg);
+                if (keep) {
+                    rawAt = t;
+                    latestRaw = new ExploreBrain.RawFrame(t, jpeg);
+                }
+                if (!detect) {
+                    return;
+                }
                 busy = true;
-                recognize(jpeg, clock.nowMs(), wallMs, generation, floorClear);
+                recognize(jpeg, t, wallMs, generation, floorClear);
             } finally {
                 image.close();
             }

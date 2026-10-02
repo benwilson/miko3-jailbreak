@@ -273,7 +273,9 @@ class OpennessIsPrivateTest(unittest.TestCase):
         self.assertIn("openness.score(", cam)
         self.assertIn("new ExploreBrain.Look(frameMs, found, jpeg, profile, lastPrint)", cam)
         # The flag rides with each captured frame, read on the camera thread.
-        self.assertRegex(cam, r"recognize\(jpeg, clock\.nowMs\(\), wallMs, generation, floorClear\)")
+        # Robot 2026-10-03: the capture time is read once (t), shared with the look tool's streamed frame.
+        self.assertRegex(cam, r"long t = clock\.nowMs\(\);")
+        self.assertRegex(cam, r"recognize\(jpeg, t, wallMs, generation, floorClear\)")
 
 
 if __name__ == "__main__":

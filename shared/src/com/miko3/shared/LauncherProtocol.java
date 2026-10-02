@@ -126,6 +126,10 @@ public final class LauncherProtocol {
     /** POST with the page token answers the feedback log as JSON, newest
      * first, with no person ids. Owner tooling: scripts/pull-feedback.py. */
     public static final String SETTINGS_FEEDBACK_STATE_PATH = "/settings/feedback/state";
+    /** Owner 2026-10-03: add, edit and delete the owner's notes about people by name (POST, page token). */
+    public static final String SETTINGS_OWNER_NOTES_ADD_PATH = "/settings/owner-notes/add";
+    public static final String SETTINGS_OWNER_NOTES_EDIT_PATH = "/settings/owner-notes/edit";
+    public static final String SETTINGS_OWNER_NOTES_DELETE_PATH = "/settings/owner-notes/delete";
 
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;

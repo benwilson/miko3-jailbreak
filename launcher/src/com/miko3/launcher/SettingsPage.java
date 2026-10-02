@@ -8,6 +8,7 @@ import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.Json;
 import com.miko3.shared.LauncherProtocol;
+import com.miko3.shared.OwnerNotes;
 import com.miko3.shared.PageToken;
 import com.miko3.shared.PersonNotes;
 
@@ -124,6 +125,19 @@ final class SettingsPage {
     // Owner 2026-10-02: the feedback log.
     static final String FEEDBACK_EMPTY = "No feedback yet.";
     static final String FEEDBACK_CLEARED = "Feedback log cleared.";
+    // Owner 2026-10-03: the owner's notes about people by name. Fixed text: never the name or the note.
+    static final String OWNER_NOTES_EMPTY = "No notes yet.";
+    static final String OWNER_NOTE_ADDED = "Note added.";
+    static final String OWNER_NOTE_SAVED = "Note saved.";
+    static final String OWNER_NOTE_DELETED = "Note deleted.";
+    static final String OWNER_NOTE_UNKNOWN = "Nothing changed: that note is not stored.";
+    static final String OWNER_NOTE_NO_NAME = "Not saved: give the person's name (at most "
+            + OwnerNotes.MAX_NAME_CHARS + " characters).";
+    static final String OWNER_NOTE_EMPTY = "Not saved: write a note.";
+    static final String OWNER_NOTE_TOO_LONG = "Not saved: a note is at most " + OwnerNotes.MAX_NOTE_CHARS
+            + " characters.";
+    static final String OWNER_NOTE_FULL = "Not saved: there are already " + OwnerNotes.MAX_ENTRIES + " notes.";
+    static final String OWNER_NOTE_NOT_SAVED = "Nothing changed: the change could not be saved.";
 
     /** What the photo route answers for a slot whose photo was replaced or deleted. */
     static final String REPLACED_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"112\" height=\"112\" "
@@ -249,7 +263,52 @@ final class SettingsPage {
             people.feedback().clear();
             return FEEDBACK_CLEARED;
         }
+        if (LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH.equals(path)) {
+            return addOwnerNote(form.get("name"), form.get("note"), people.ownerNotes());
+        }
+        if (LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH.equals(path)) {
+            return editOwnerNote(form.get("id"), form.get("name"), form.get("note"), people.ownerNotes());
+        }
+        if (LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH.equals(path)) {
+            return people.ownerNotes().delete(form.get("id")) ? OWNER_NOTE_DELETED : OWNER_NOTE_UNKNOWN;
+        }
         return "Nothing changed: unknown action.";
+    }
+
+    /** Owner 2026-10-03: fixed text only, never the name or note typed. */
+    private static String addOwnerNote(String name, String note, OwnerNotesStore notes) {
+        try {
+            return notes.add(name, note) != null ? OWNER_NOTE_ADDED : OWNER_NOTE_NOT_SAVED;
+        } catch (IllegalArgumentException e) {
+            return ownerNoteRefusal(e.getMessage());
+        }
+    }
+
+    private static String editOwnerNote(String id, String name, String note, OwnerNotesStore notes) {
+        if (!notes.has(id)) {
+            return OWNER_NOTE_UNKNOWN;
+        }
+        try {
+            return notes.edit(id, name, note) ? OWNER_NOTE_SAVED : OWNER_NOTE_NOT_SAVED;
+        } catch (IllegalArgumentException e) {
+            return ownerNoteRefusal(e.getMessage());
+        }
+    }
+
+    private static String ownerNoteRefusal(String reason) {
+        if (OwnerNotes.REFUSE_NAME.equals(reason)) {
+            return OWNER_NOTE_NO_NAME;
+        }
+        if (OwnerNotes.REFUSE_NOTE_EMPTY.equals(reason)) {
+            return OWNER_NOTE_EMPTY;
+        }
+        if (OwnerNotes.REFUSE_NOTE_TOO_LONG.equals(reason)) {
+            return OWNER_NOTE_TOO_LONG;
+        }
+        if (OwnerNotes.REFUSE_FULL.equals(reason)) {
+            return OWNER_NOTE_FULL;
+        }
+        return OWNER_NOTE_NOT_SAVED;
     }
 
     /** The face JPEG for ?id=, or 404 for anything that isn't a remembered
@@ -696,6 +755,7 @@ final class SettingsPage {
         appendThresholds(html, face);
         appendPeople(html, t, people);
         appendFeedback(html, t, people.feedback());
+        appendOwnerNotes(html, t, people.ownerNotes());
 
         html.append("</main></body></html>");
         return html.toString();
@@ -811,6 +871,52 @@ final class SettingsPage {
             tokenForm(html, t, LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, "Clear the feedback log", "contrast");
         }
         html.append("</section>");
+    }
+
+    /**
+     * Owner 2026-10-03: the owner's notes about people by name, each with an edit form
+     * and a delete button, and a form to add one. Names and notes are escaped (typed).
+     * Ids are digits only (OwnerNotes.isValidId), so safe in an attribute.
+     */
+    private static void appendOwnerNotes(StringBuilder html, String t, OwnerNotesStore store) {
+        List<OwnerNotes.Entry> entries = store.all();
+        html.append("<section id=\"owner-notes\"><h2>Notes about people by name</h2>");
+        html.append("<p>A note per person, by the name they give him: these notes stay on the robot and are never "
+                + "logged; Miko follows them for how to approach that person, but never reveals them, never "
+                + "deceives anyone and always leaves when asked.</p>");
+        if (entries.isEmpty()) {
+            html.append("<p id=\"owner-notes-empty\">").append(OWNER_NOTES_EMPTY).append("</p>");
+        }
+        for (OwnerNotes.Entry e : entries) {
+            String id = escapeHtml(e.id);
+            html.append("<article class=\"owner-note\">");
+            html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH)
+                    .append("\">");
+            html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+            html.append("<input type=\"hidden\" name=\"id\" value=\"").append(id).append("\">");
+            ownerNoteFields(html, e.name, e.note);
+            html.append("<button type=\"submit\" class=\"secondary\">Save</button></form>");
+            html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH)
+                    .append("\">");
+            html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+            html.append("<input type=\"hidden\" name=\"id\" value=\"").append(id).append("\">");
+            html.append("<button type=\"submit\" class=\"contrast\">Delete</button></form>");
+            html.append("</article>");
+        }
+        html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH)
+                .append("\">");
+        html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+        ownerNoteFields(html, "", "");
+        html.append("<button type=\"submit\">Add note</button></form>");
+        html.append("</section>");
+    }
+
+    private static void ownerNoteFields(StringBuilder html, String name, String note) {
+        html.append("<label>Name<input type=\"text\" name=\"name\" value=\"").append(escapeHtml(name))
+                .append("\" maxlength=\"").append(OwnerNotes.MAX_NAME_CHARS).append("\" autocomplete=\"off\">")
+                .append("</label>");
+        html.append("<label>Note<textarea name=\"note\" rows=\"4\" maxlength=\"").append(OwnerNotes.MAX_NOTE_CHARS)
+                .append("\">").append(escapeHtml(note)).append("</textarea></label>");
     }
 
     /**

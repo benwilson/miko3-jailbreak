@@ -195,6 +195,8 @@ final class PeopleStore {
     private final Map<String, Entry[]> slots = new HashMap<String, Entry[]>();
     /** What people told him about himself (owner 2026-10-02); forget() deletes a person's entries. */
     private final FeedbackStore feedback;
+    /** The owner's notes about people by name (owner 2026-10-03); keyed by name, not by id. */
+    private final OwnerNotesStore ownerNotes;
 
     PeopleStore(File dir, Clock clock) {
         this(dir, clock, FILE_OPENER);
@@ -206,6 +208,12 @@ final class PeopleStore {
         this.indexOpener = indexOpener;
         load();
         this.feedback = new FeedbackStore(new File(dir, FeedbackStore.FILE), clock);
+        this.ownerNotes = new OwnerNotesStore(new File(dir, OwnerNotesStore.FILE));
+    }
+
+    /** The owner's notes about people by name, for the Settings page and PeopleService. */
+    OwnerNotesStore ownerNotes() {
+        return ownerNotes;
     }
 
     /** The feedback log, for the Settings page. */

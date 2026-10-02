@@ -47,8 +47,7 @@ final class ChatTools {
     static final String STATUS_DESCRIPTION = "Miko's own state: battery and charging, his sound and do not disturb, "
             + "how long he has been exploring and what he is doing. Use it only when they ask about those.";
     static final String PLACES_DESCRIPTION = "The places Miko has looked at lately, newest first, each described by "
-            + "what his camera saw there. Use it only when they ask where he has been, or to work out a place they "
-            + "named for go_elsewhere.";
+            + "what his camera saw there. Use it only when they ask where he has been.";
 
     /** The tool definitions' parts, in the order they are sent: {name, description, input schema}. */
     static List<Object[]> definitions() {
@@ -58,6 +57,8 @@ final class ChatTools {
         out.add(new Object[]{RECALL, RECALL_DESCRIPTION, RECALL_SCHEMA});
         out.add(new Object[]{STATUS, STATUS_DESCRIPTION, ExplorePrompts.object()});
         out.add(new Object[]{PLACES, PLACES_DESCRIPTION, ExplorePrompts.object()});
+        // Owner 2026-10-03: the action tools after them (ChatActions), one per reply.
+        out.addAll(ChatActions.definitions());
         return out;
     }
 
@@ -88,8 +89,6 @@ final class ChatTools {
         m.put("line", said == null ? "" : said);
         m.put("question_asked", "");
         m.put("name_given", "");
-        m.put("action", "none");
-        m.put("target", "");
         m.put("ends_conversation", Boolean.FALSE);
         m.put("deflected", Boolean.FALSE);
         Map<String, Object> notes = new LinkedHashMap<String, Object>();
@@ -129,8 +128,11 @@ final class ChatTools {
         return t;
     }
 
-    /** The look tool's caption beside the photo. */
+    /** The look tool's caption beside the photo: its labels, or none when the detector did not run on it (null). */
     static String lookCaption(Collection<String> labels) {
+        if (labels == null) {
+            return "A photo Miko just took. His detector has not looked at this one, so there are no labels.";
+        }
         if (labels == null || labels.isEmpty()) {
             return "A photo Miko just took. His detector named nothing in it.";
         }

@@ -123,8 +123,11 @@ class RequestShapeTest(unittest.TestCase):
         self.assertEqual(body["system"], "SYSTEM")
         self.assertEqual(body["messages"], [{"role": "user", "content": "hi"}])
         # Owner 2026-10-03: the reply is the respond tool's input; no JSON-schema format.
+        # Owner 2026-10-03: the action tools follow the fact tools (ChatActions).
         self.assertEqual([t["name"] for t in body["tools"]],
-                         ["respond", "look", "recall_person", "robot_status", "places"])
+                         ["respond", "look", "recall_person", "robot_status", "places", "move", "stop", "stay",
+                          "come_here", "go_away", "be_quiet", "find_person", "find_thing", "go_to_place", "wait",
+                          "run_task"])
         self.assertEqual(body["tools"][0]["input_schema"], bench.REPLY_SCHEMA)
         self.assertEqual(body["tool_choice"], {"type": "auto"})
         self.assertEqual(body["output_config"], {"effort": "low"})
@@ -166,12 +169,11 @@ class RequestShapeTest(unittest.TestCase):
 class SchemaTest(unittest.TestCase):
     def test_reply_schema_has_ktd9_fields_all_required_and_closed(self):
         s = bench.REPLY_SCHEMA
-        # Owner 2026-10-02: "addressed" comes first (before the line), the action and target after the name.
+        # Owner 2026-10-02: "addressed" comes first (before the line). Owner 2026-10-03: instructions are
+        # action tools now, so the action and target fields are gone.
         self.assertEqual(list(s["properties"]),
-                         ["addressed", "line", "question_asked", "name_given", "action", "target",
+                         ["addressed", "line", "question_asked", "name_given",
                           "ends_conversation", "deflected", "notes_update", "feedback"])
-        self.assertEqual(s["properties"]["action"]["enum"],
-                         ["none", "go_away", "go_elsewhere", "find_person", "come_here", "be_quiet"])
         self.assertEqual(sorted(s["required"]), sorted(s["properties"]))
         self.assertIs(s["additionalProperties"], False)
         notes = s["properties"]["notes_update"]
@@ -472,6 +474,28 @@ class MainTest(unittest.TestCase):
             bench.credentials({}, None, None)
         with self.assertRaises(bench.BenchError):
             bench.credentials({"ANTHROPIC_API_KEY": "k"}, "http://plain.example", None)
+
+
+class ActionToolsAndOwnerNotesTest(unittest.TestCase):
+    """Owner 2026-10-03: the action tools, run_task's consult wording and the owner's note."""
+
+    def test_the_owners_note_sits_after_the_notes_and_before_the_preamble_with_its_guard(self):
+        plain = bench.system_prefix(None, {})
+        noted = bench.system_prefix(None, {}, "Sarah", 'Training for a "marathon".')
+        block = (bench.OWNER_NOTE_HEADING + '\nThe owner\'s note about Sarah: """Training for a "marathon"."""\n\n'
+                 + bench.OWNER_NOTE_GUARD + "\n\n" + bench.SCHEMA_PREAMBLE)
+        self.assertTrue(noted.endswith(block))
+        self.assertNotIn("owner's note", plain)
+        self.assertEqual(plain.replace(bench.SCHEMA_PREAMBLE, ""), noted.split(bench.OWNER_NOTE_HEADING)[0])
+
+    def test_action_tools_answer_started_and_a_respond_in_the_round_is_not_said(self):
+        r = bench.tool_result({"name": "move", "id": "toolu_1", "input": {"kind": "spin", "amount": 0}})
+        self.assertTrue(r["content"].startswith("started:"))
+        self.assertEqual(bench.tool_result({"name": "respond", "id": "toolu_2"})["content"], bench.NOT_SAID)
+        self.assertEqual(bench.ACTION_NAMES, ["move", "stop", "stay", "come_here", "go_away", "be_quiet",
+                                              "find_person", "find_thing", "go_to_place", "wait", "run_task"])
+        self.assertIn("commands", bench.SCRIPTS)
+        self.assertEqual(bench.PLAN_TOOL["name"], "revise_plan")
 
 
 if __name__ == "__main__":

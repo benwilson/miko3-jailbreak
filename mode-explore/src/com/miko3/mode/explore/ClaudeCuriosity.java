@@ -192,6 +192,8 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<Recently> recents = new Slot<Recently>();
     /** The conversation (meeting plan U8): one turn, a notes delta, a forget and a keep at a time. */
     private final Slot<Turn> turns = new Slot<Turn>();
+    /** Owner 2026-10-03: a task's consult (taskPlan). */
+    private final Slot<TaskPlan> taskPlans = new Slot<TaskPlan>();
     private final Slot<Done> notes = new Slot<Done>();
     private final Slot<Done> forgets = new Slot<Done>();
     private final Slot<Kept> keeps = new Slot<Kept>();
@@ -651,7 +653,8 @@ final class ClaudeCuriosity implements CuriosityPort {
      * Nothing said or heard is logged.
      */
     @Override
-    public void turn(final TurnRequest request, final long timeoutMs) {
+    public void turn(TurnRequest asked, final long timeoutMs) {
+        final TurnRequest request = withOwnerNote(asked);
         final int g = turns.start();
         dropToolAsks();
         // The opener carries the current meeting's own crop, never one a late match left behind.
@@ -691,7 +694,8 @@ final class ClaudeCuriosity implements CuriosityPort {
      * dropped before it says or looks at anything (owner 2026-10-03).
      */
     @Override
-    public void speculateTurn(final TurnRequest request, final long timeoutMs) {
+    public void speculateTurn(TurnRequest asked, final long timeoutMs) {
+        final TurnRequest request = withOwnerNote(asked);
         final ChatRound.Body body = ChatRound.body(request, null);
         final TurnFlight.Call call = flight.speculate(body.key);
         if (call == null || released) {
@@ -730,9 +734,11 @@ final class ClaudeCuriosity implements CuriosityPort {
      * count, system prefix size, max_tokens, the tools run, effort), when the line was known
      * and the total, in counts only; nothing said or heard.
      */
-    private void oneTurn(final ChatRound.Body body, TurnRequest request, final TurnFlight.Call call, final long timeoutMs,
+    private void oneTurn(final ChatRound.Body body, TurnRequest asked, final TurnFlight.Call call, final long timeoutMs,
             boolean speculative) {
         final long t0 = System.currentTimeMillis();
+        // Owner 2026-10-03: the action tools check labels against the detector's vocabulary.
+        TurnRequest request = asked.withFacts(asked.facts.withVocabulary(vocabulary()));
         final ClaudeAccess settings = turnAccess();
         final long fetched = System.currentTimeMillis();
         final long[] earlyAt = {0};
@@ -816,8 +822,7 @@ final class ClaudeCuriosity implements CuriosityPort {
         if (t.status != Turn.Status.LINE || t.nameGiven == null) {
             return t;
         }
-        return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), false, false, null)
-                .withAction(t.action, t.target);
+        return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), false, false, null);
     }
 
     /** Owner 2026-10-03: a tool round's ask, handed to the brain through toolAsk(); a look waits for its answer. */
@@ -901,6 +906,126 @@ final class ClaudeCuriosity implements CuriosityPort {
         }
     }
 
+    // ---- owner 2026-10-03: the detector's vocabulary, the owner's notes, a task's consult ----
+
+    private volatile List<String> vocabulary;
+
+    /** The detector's names (assets/vocabulary.txt), read once; empty when they can't be read. */
+    private List<String> vocabulary() {
+        List<String> v = vocabulary;
+        if (v == null) {
+            try {
+                v = java.util.Arrays.asList(OnnxRecognizer.readVocabulary(app));
+            } catch (IOException | RuntimeException e) {
+                v = new ArrayList<String>();
+            }
+            vocabulary = v;
+        }
+        return v;
+    }
+
+    /** Owner notes asked for by name: the note, or NO_NOTE; fetched off the brain's thread. */
+    private final Map<String, String> ownerNotes = new java.util.concurrent.ConcurrentHashMap<String, String>();
+    private static final String NO_NOTE = "";
+
+    /**
+     * The request with the owner's note about its partner (Settings page, by name), when one
+     * is known yet. The launcher is asked once per name on the worker, so the turn that first
+     * knows the name goes without it and the next carries it. Never logged.
+     */
+    private TurnRequest withOwnerNote(TurnRequest request) {
+        final String name = request.name == null ? null : request.name.trim();
+        if (name == null || name.isEmpty()) {
+            return request;
+        }
+        final String key = name.toLowerCase(java.util.Locale.US);
+        String note = ownerNotes.get(key);
+        if (note == null) {
+            ownerNotes.put(key, NO_NOTE);
+            try {
+                worker.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            String n = RobotPeopleClient.ownerNoteFor(app, name);
+                            ownerNotes.put(key, n == null ? NO_NOTE : n);
+                        } catch (IOException | RuntimeException e) {
+                            ownerNotes.remove(key);
+                        }
+                    }
+                });
+            } catch (RuntimeException e) {
+                ownerNotes.remove(key);
+            }
+            return request;
+        }
+        return note.isEmpty() ? request : request.withOwnerNote(name, note);
+    }
+
+    /**
+     * A task's consult (owner 2026-10-03): ExplorePrompts.TASK_SYSTEM, the consult as one
+     * message, revise_plan forced. The revised steps are checked as run_task's are (ChatActions);
+     * a plan that fails the check is an abort with his own line. Logged: the outcome and the time.
+     */
+    @Override
+    public void taskPlan(final TaskConsult request, final long timeoutMs) {
+        final int g = taskPlans.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                taskPlans.finish(g, consult(request, timeoutMs));
+            }
+        }, taskPlans, g, TaskPlan.failed());
+    }
+
+    @Override
+    public TaskPlan taskPlanAnswer() {
+        return taskPlans.poll();
+    }
+
+    @Override
+    public void cancelTaskPlan() {
+        taskPlans.cancel();
+    }
+
+    private TaskPlan consult(TaskConsult request, long timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        ClaudeAccess settings = turnAccess();
+        List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
+        messages.add(ClaudeApi.message("user", ExplorePrompts.taskAsk(request)));
+        List<Map<String, Object>> defs = new ArrayList<Map<String, Object>>();
+        defs.add(ClaudeApi.tool(ChatActions.PLAN, ChatActions.PLAN_DESCRIPTION, ChatActions.PLAN_SCHEMA));
+        ClaudeApi.Tools tools = new ClaudeApi.Tools(defs).replyTool(ChatActions.PLAN).choice(ChatActions.PLAN);
+        ClaudeApi.MessageResult r = claude.conversation(settings, ExplorePrompts.TASK_SYSTEM, messages, null,
+                TURN_EFFORT, (int) timeoutMs, null, null, tools);
+        TaskPlan plan = planOf(r, request.facts.withVocabulary(vocabulary()));
+        Log.i(TAG, "task consult: " + (r.ok() ? plan.status.toString() : r.describe()) + " in "
+                + (System.currentTimeMillis() - t0) + " ms");
+        return plan;
+    }
+
+    /** revise_plan's input as a plan: abort, or the steps checked as run_task's are. */
+    static TaskPlan planOf(ClaudeApi.MessageResult r, ToolFacts facts) {
+        if (!r.ok()) {
+            return TaskPlan.failed();
+        }
+        ClaudeApi.ToolUse u = r.toolUse(ChatActions.PLAN);
+        if (u == null) {
+            return TaskPlan.failed();
+        }
+        Object line = u.input.get("line");
+        String said = line instanceof String ? ((String) line).trim() : null;
+        if (Boolean.TRUE.equals(u.input.get("abort"))) {
+            return TaskPlan.abort(said);
+        }
+        Object steps = u.input.get("steps");
+        if (!(steps instanceof List) || ((List<?>) steps).isEmpty()) {
+            return TaskPlan.revised(null);
+        }
+        ChatActions.Verdict v = ChatActions.steps((List<?>) steps, facts);
+        return v.ok() ? TaskPlan.revised(v.act.steps) : TaskPlan.abort(said);
+    }
+
     /**
      * The client's reason as the brain's turn status, from the reply's fields (respond's
      * input); a name given passes NameExtractor's word list first.
@@ -913,12 +1038,16 @@ final class ClaudeCuriosity implements CuriosityPort {
             }
             Object delta = o.reply.get("notes_update");
             Turn t = ClaudeReplies.turn(o.reply, delta instanceof Map ? Json.write(delta) : null);
+            // Owner 2026-10-03: the action tool accepted this turn (ChatActions) is the turn's act.
+            if (o.act != null && t.status == Turn.Status.LINE && t.addressed) {
+                t = t.withAct(o.act);
+            }
             if (t.status != Turn.Status.LINE || t.nameGiven == null) {
                 return t;
             }
             return Turn.line(t.line, t.questionAsked, NameExtractor.validName(t.nameGiven), t.endsConversation,
                     t.deflected, t.notesUpdate).withFeedback(t.feedback).withAddressed(t.addressed)
-                    .withAction(t.action, t.target);
+                    .withAct(t.act);
         }
         switch (r.reason) {
             case REFUSED:
@@ -1235,6 +1364,17 @@ final class ClaudeCuriosity implements CuriosityPort {
                 Log.i(TAG, "notes for the conversation: " + n.byteLength() + " bytes, " + asked.size() + " question(s)");
             } catch (IOException e) {
                 Log.w(TAG, "notes unavailable; the conversation runs without them: " + e.getMessage());
+            }
+        }
+        // Owner 2026-10-03: the owner's note about them by name, fetched now (a worker thread) so the
+        // opener has it; a meeting starts the cache afresh, so a note edited since is read again.
+        ownerNotes.clear();
+        if (a.name != null && !a.name.trim().isEmpty()) {
+            try {
+                String note = RobotPeopleClient.ownerNoteFor(app, a.name.trim());
+                ownerNotes.put(a.name.trim().toLowerCase(Locale.US), note == null ? NO_NOTE : note);
+            } catch (IOException e) {
+                Log.w(TAG, "owner notes unavailable for this conversation: " + e.getMessage());
             }
         }
         return a.withConversation(persona, personId, notesJson, asked);

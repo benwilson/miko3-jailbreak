@@ -57,6 +57,19 @@ As implemented on PR #29 (branch `feat/explore-hey-miko-always-answers`; unmerge
 5. **Re-enter RECOVER on every zero move within a stuck spell, up to `recoverMaxPerSpell` (3).** Only then run the long wriggle, the help line and the jam rest. The jam rest probes by backing up at 30, 60 and 120 s (`jamProbeAtMs`), not just once after 2 minutes.
 6. **Never grind.** The wriggle stops a direction as soon as the wheels move fewer than 30 counts in 1.5 s. A jam stops all motion, and a shove or outside movement probes at once.
 
+### Correction (2026-10-02): behind is not always clear
+
+Rule 2 assumed "he drove in, so behind him is usually clear". On 2026-10-02 (14:07-14:09) he was backed up against a wall: a turn on the spot stalled (his tail swung into the wall), and the board-back move ("backing straight out 8 back ticks"), the recover probes, the ladder's "backing up first" and the jam probe all backed into the wall. He called a jam three times; the owner: "All he has to do is drive forward."
+
+Now (ExploreBrain, "which way he last pushed"):
+
+- The move that stalled says which side is blocked: a turn or a back-up marks **behind** as blocked; a forward leg, a hazard driving forward or a blocked forward try marks the **front** (and its heading). A back-up that moves under `BACK_FREE_COUNTS` (50) also marks behind.
+- While behind was blocked last (within 2 minutes) and the front reads clear (no floor-sensor or CPL hazard now, no hazard or stall driving this heading just now, the camera's openness not a hard block), the board-back move, the RECOVER probes, the ladder's first move and the jam probes go **forward** instead, through the usual forward safety. Log: "recover probe: behind is blocked (a turn stalled): probing forward", "trying a short leg forward first: the board is back, and behind is blocked (...)", "jam probe: ...; behind is blocked (...): driving forward 4 ticks".
+- A probe that moved nothing says nothing about either side (the cutout reads zero every way), so RECOVER and jam probes alternate forward and back rather than repeat one way. The jam rule ("back-up and both turns blocked") tries forward once first when the front reads clear.
+- Front and back both blocked is still a jam, as before.
+
+The floor sensor is a downward cliff sensor, so "the front reads clear" cannot see a wall ahead; a forward try into one is caught by the stall watch and marks the front.
+
 ## Why This Matters
 
 Without the wait, every bump into furniture looked like a hard jam: he asked for help, rested, and pushed again, which is exactly what latches the board for good. After the RECOVER wait went in, his first three bumps on the robot all recovered at the 10 s probe and he carried on, with no help line and no human.

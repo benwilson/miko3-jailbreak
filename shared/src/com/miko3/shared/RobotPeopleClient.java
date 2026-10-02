@@ -236,6 +236,17 @@ public final class RobotPeopleClient {
         });
     }
 
+    /** The owner's note about the person with this name (owner 2026-10-03), or
+     * null when the owner wrote none for them. Never log the name or the note. */
+    public static String ownerNoteFor(Context context, final String name) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<String>() {
+            @Override
+            public String run(RobotPeople people) throws RemoteException {
+                return people.ownerNoteFor(name);
+            }
+        });
+    }
+
     private static PersonNotes parseNotes(String json) {
         try {
             return PersonNotes.parse(json);

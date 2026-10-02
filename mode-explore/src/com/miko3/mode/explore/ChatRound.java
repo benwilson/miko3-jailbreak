@@ -32,11 +32,10 @@ final class ChatRound {
     /**
      * The reply fields the turn's line needs before it is spoken: "addressed" (a boolean,
      * first, so a turn not said to him is known before its empty line), then the line,
-     * the question and the name (the repeat check and the name read them), and the action
-     * and its target. The rest (the notes, the feedback) follow as the tail.
+     * the question and the name (the repeat check and the name read them). The rest (the
+     * notes, the feedback) follow as the tail.
      */
-    static final List<String> EARLY_FIELDS = Arrays.asList("addressed", "line", "question_asked", "name_given",
-            "action", "target");
+    static final List<String> EARLY_FIELDS = Arrays.asList("addressed", "line", "question_asked", "name_given");
 
     /** Sends one request of the turn: these messages, with these tools. */
     interface Sender {
@@ -84,12 +83,20 @@ final class ChatRound {
         final String tools;
         /** A speculation that wanted a tool, or a turn abandoned during its tool round: nothing comes of it. */
         final boolean dropped;
+        /** Owner 2026-10-03: the action tool call accepted this turn (ChatActions), or null. */
+        final ChatActions.Act act;
 
         Outcome(ClaudeApi.MessageResult result, Map<String, Object> reply, String tools, boolean dropped) {
+            this(result, reply, tools, dropped, null);
+        }
+
+        Outcome(ClaudeApi.MessageResult result, Map<String, Object> reply, String tools, boolean dropped,
+                ChatActions.Act act) {
             this.result = result;
             this.reply = reply;
             this.tools = tools;
             this.dropped = dropped;
+            this.act = act;
         }
     }
 
@@ -116,7 +123,8 @@ final class ChatRound {
      * turn 1, with the face crop sent that once), its reminders appended.
      */
     static Body body(CuriosityPort.TurnRequest request, byte[] face) {
-        String system = ExplorePrompts.systemPrefix(request.persona, request.notes);
+        String system = ExplorePrompts.systemPrefix(request.persona, request.notes, request.ownerName,
+                request.ownerNote);
         List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
         // A conversation that opened faceless invites them down instead of asking the name (robot 2026-10-01);
         // one a call opened greets them first, before he has seen them (owner 2026-10-02).
@@ -174,7 +182,14 @@ final class ChatRound {
         return ClaudeApi.message("assistant", content);
     }
 
-    /** Runs the turn: the first request, then at most one tool round and its forced respond. */
+    /**
+     * Runs the turn: the first request, then at most one tool round and its forced respond.
+     * Owner 2026-10-03, the action tools (ChatActions): at most one action per reply, checked
+     * against the turn's facts; its honest result goes back to Claude in the round, and the
+     * accepted act comes out with the reply. An action called beside respond (the prompt asks
+     * for it alone) is taken with that reply when it is accepted; refused, the round runs so
+     * the line says why.
+     */
     static Outcome run(Body body, CuriosityPort.TurnRequest request, Sender sender, Host host) {
         List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>(body.messages);
         ClaudeApi.Tools tools = tools();
@@ -182,8 +197,15 @@ final class ChatRound {
         if (!first.ok()) {
             return new Outcome(first, null, null, false);
         }
+        ClaudeApi.ToolUse action = firstAction(first);
         if (first.toolUse(ChatTools.RESPOND) != null || first.toolUses.isEmpty()) {
-            return new Outcome(first, reply(first), null, false);
+            if (action == null) {
+                return new Outcome(first, reply(first), null, false);
+            }
+            ChatActions.Verdict v = ChatActions.check(action.name, action.input, request.facts);
+            if (v.ok()) {
+                return new Outcome(first, reply(first), action.name, false, v.act);
+            }
         }
         if (!host.mayUseTools()) {
             return new Outcome(first, null, null, true);
@@ -192,13 +214,28 @@ final class ChatRound {
         StringBuilder used = new StringBuilder();
         for (ClaudeApi.ToolUse u : first.toolUses) {
             look |= ChatTools.LOOK.equals(u.name);
-            used.append(used.length() == 0 ? "" : ",").append(u.name);
+            if (!ChatTools.RESPOND.equals(u.name)) {
+                used.append(used.length() == 0 ? "" : ",").append(u.name);
+            }
         }
         CuriosityPort.LookResult seen = host.ask(ChatTools.preamble(first.text), look,
                 ChatTools.ADAPTER_LOOK_WAIT_MS);
         List<Map<String, Object>> results = new ArrayList<Map<String, Object>>();
+        ChatActions.Act act = null;
         for (ClaudeApi.ToolUse u : first.toolUses) {
-            results.add(result(u, request, seen, host));
+            if (ChatActions.isAction(u.name)) {
+                if (u != action) {
+                    results.add(ClaudeApi.toolError(u.id, ONE_ACTION));
+                    continue;
+                }
+                ChatActions.Verdict v = ChatActions.check(u.name, u.input, request.facts);
+                act = v.act;
+                results.add(v.ok() ? ClaudeApi.toolResult(u.id, v.result) : ClaudeApi.toolError(u.id, v.result));
+            } else if (ChatTools.RESPOND.equals(u.name)) {
+                results.add(ClaudeApi.toolResult(u.id, NOT_SAID));
+            } else {
+                results.add(result(u, request, seen, host));
+            }
         }
         if (!host.stillAsked()) {
             return new Outcome(first, null, used.toString(), true);
@@ -209,7 +246,22 @@ final class ChatRound {
         if (!second.ok()) {
             return new Outcome(second, null, used.toString(), false);
         }
-        return new Outcome(second, reply(second), used.toString(), false);
+        return new Outcome(second, reply(second), used.toString(), false, act);
+    }
+
+    /** What a second action in the same reply is told. */
+    static final String ONE_ACTION = "Only one action per reply: this one was not done.";
+    /** What a respond call answered in the round is told (its line is replaced by the next one). */
+    static final String NOT_SAID = "not said: reply again after the tool results";
+
+    /** The reply's first action tool call, or null. */
+    private static ClaudeApi.ToolUse firstAction(ClaudeApi.MessageResult r) {
+        for (ClaudeApi.ToolUse u : r.toolUses) {
+            if (ChatActions.isAction(u.name)) {
+                return u;
+            }
+        }
+        return null;
     }
 
     /** One tool call's result block. */
@@ -222,7 +274,7 @@ final class ChatRound {
             if (seen.refused != null) {
                 return ClaudeApi.toolError(u.id, ChatTools.cantLook(seen.refused));
             }
-            return ClaudeApi.toolResultImage(u.id, seen.jpeg, ChatTools.lookCaption(seen.labels));
+            return ClaudeApi.toolResultImage(u.id, seen.jpeg, ChatTools.lookCaption(seen.detected ? seen.labels : null));
         }
         if (ChatTools.RECALL.equals(u.name)) {
             Object asked = u.input.get("name");
