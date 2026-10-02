@@ -96,16 +96,17 @@ class AdapterWiringTest(unittest.TestCase):
 
 class DockedQuietWiringTest(unittest.TestCase):
     """Docked means quiet (owner 2026-10-02): the brain shows EyeState.DOCKED on the charger,
-    ModeApp sings only for RESTING and EYES_ONLY, and the song elsewhere is occasional."""
+    ModeApp sings only for RESTING (not EYES_ONLY: on the dock the floor sensor reads a fault, so
+    he sat in EYES_ONLY there), and the song is occasional."""
 
     def test_docked_eyes_are_mapped_and_never_sing(self):
         app = code_only(src("ModeApp.java"))
         self.assertRegex(app, r"case DOCKED:\s*setExploreState\(ExploreState\.IDLE_STATE\)")
-        sing = re.search(r"if \((.*?)\)\s*\{\s*c\.startSinging\(\);", app, re.S)
+        sing = re.search(r"if \(([^{;]*?)\)\s*\{\s*c\.startSinging\(\);", app, re.S)
         self.assertIsNotNone(sing)
         self.assertNotIn("DOCKED", sing.group(1))
         self.assertIn("EyeState.RESTING", sing.group(1))
-        self.assertIn("EyeState.EYES_ONLY", sing.group(1))
+        self.assertNotIn("EYES_ONLY", sing.group(1))
 
     def test_the_song_gap_is_45_to_90_s_and_there_is_no_quick_first_phrase(self):
         player = code_only(src("ClipPlayer.java"))
