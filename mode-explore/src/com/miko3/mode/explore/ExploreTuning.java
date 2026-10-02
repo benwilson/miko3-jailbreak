@@ -1362,8 +1362,8 @@ final class ExploreTuning {
         // About one look a minute on the charger: new things get noticed, the look budget barely notices.
         private long dockLookMs = 60000;
         // Closed between docked looks: the HAL's streaming CPU goes to speech instead.
-        // Off until fixed: on the robot (2026-10-02 16:30) a fresh start on the dock with it on never took a docked look.
-        private boolean dockCameraCloses = false;
+        // On: the robot's missing docked looks (2026-10-02 16:30) were dockQuiet's one-shot sayFinished, not this.
+        private boolean dockCameraCloses = true;
         // Two off readings in a row leave the dock: one stray reading is not enough.
         private int dockOffReadings = 2;
         // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
