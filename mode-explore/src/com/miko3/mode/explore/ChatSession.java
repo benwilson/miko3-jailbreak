@@ -77,10 +77,20 @@ final class ChatSession {
         boolean faceLooksAllowed();
 
         /**
-         * The charger latch (KTD6): a conversation it arrives in finishes and no resume leg
-         * is driven; one opened on the charger (a call there, hey-miko plan KTD5) goes on.
+         * The charger latch (KTD6). Owner 2026-10-03: a conversation it arrives in goes on;
+         * the brain drives no resume leg after it and docks once it is over. Read for the
+         * feedback's context.
          */
         boolean charger();
+
+        /**
+         * Owner 2026-10-03: why the look tool can't take a frame now (bathroom privacy, do
+         * not disturb, no lease or camera), as a few words Claude can read; null when it can.
+         */
+        String lookBlocked();
+
+        /** Owner 2026-10-03: what robot_status and places answer with, as the brain sees it now. */
+        CuriosityPort.ToolFacts toolFacts();
 
         /**
          * Owner 2026-10-02: the next move of the search for a caller during the conversation.
@@ -301,9 +311,21 @@ final class ChatSession {
     private long forgetDeadline;
     private int persisted;
 
+    // ---- a turn's tool round (owner 2026-10-03) ----
+    /** This turn's deadline has been moved for its tool round. */
+    private boolean toolRound;
+    /** The tool round's preamble is being said: the line waits for it, until preambleUntil. */
+    private boolean preambleSaying;
+    private long preambleUntil;
+    /** The look tool's frame is taken once the preamble is said (KTD7: the detector parks while he speaks). */
+    private boolean lookAfterPreamble;
+    /** The look tool's fresh frame is wanted: one captured from toolLookFrom, until toolLookDeadline. */
+    private boolean toolLooking;
+    private long toolLookFrom;
+    private long toolLookDeadline;
+
     // ---- how it ends ----
-    private boolean endOnCharger;
-    /** Opened on the charger (hey-miko plan KTD5, R11): he talks there without moving, so the latch ends nothing. */
+    /** Opened on the charger (hey-miko plan KTD5, R11): for the feedback's context. */
     private boolean startedOnCharger;
     private boolean finished;
     private boolean signedOff;
@@ -457,10 +479,6 @@ final class ChatSession {
         if (finished) {
             return;
         }
-        if (host.charger() && !endOnCharger && !startedOnCharger) {
-            endOnCharger = true;
-            host.note("charger connected: the conversation finishes and no resume leg is driven");
-        }
         // Robot 2026-10-02: a streamed turn's notes, which came after its line, join the buffer.
         for (String late = port.lateNotes(); late != null; late = port.lateNotes()) {
             buffer.add(late);
@@ -525,6 +543,10 @@ final class ChatSession {
         turnHeld = false;
         secSaid = false;
         heldSince = -1;
+        toolRound = false;
+        preambleSaying = false;
+        lookAfterPreamble = false;
+        dropToolLook();
         host.eyes(ExploreBrain.EyeState.THINKING, null);
         if (opener) {
             host.stamp(ExploreBrain.Gauges.Stage.LINE_REQUESTED, now);
@@ -567,7 +589,7 @@ final class ChatSession {
     /** The turn request for what was heard, as it stands now; building it changes nothing. */
     private CuriosityPort.TurnRequest turnRequest(String heardText) {
         return new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
-                .face(openedFaceless, faceSeen && name == null).call(called, cantSeeDue);
+                .face(openedFaceless, faceSeen && name == null).call(called, cantSeeDue).withFacts(host.toolFacts());
     }
 
     /**
@@ -584,7 +606,7 @@ final class ChatSession {
             return;
         }
         speculated = text;
-        if (askingLastName || confirmingForget || endOnCharger || goodbye(text) || forgetMe(text)) {
+        if (askingLastName || confirmingForget || goodbye(text) || forgetMe(text)) {
             return;
         }
         host.note("a provisional answer: its turn starts early");
@@ -609,6 +631,13 @@ final class ChatSession {
             if (now >= turnHeldUntil) {
                 sendTurn(now, heldBudget);
             }
+            return;
+        }
+        if (preambleSaying && (port.sayFinished() || now >= preambleUntil)) {
+            preambleSaying = false;
+        }
+        toolStep(now);
+        if (preambleSaying || toolLooking) {
             return;
         }
         CuriosityPort.Turn t = port.turnAnswer();
@@ -637,6 +666,91 @@ final class ChatSession {
                 turnFailed(now);
                 break;
         }
+    }
+
+    /**
+     * Owner 2026-10-03: the turn's tool round. Its ask (once) moves the deadline out by
+     * toolRoundMs, says the preamble (the line then waits for it to finish), and for a look
+     * asks the camera for a frame captured from now: the port gets it with the detector's
+     * labels, or why not (bathroom privacy and do not disturb first; no frame in
+     * toolLookMs). Nothing heard or said is traced, only that a round ran.
+     */
+    private void toolStep(long now) {
+        CuriosityPort.ToolAsk ask = port.toolAsk();
+        if (ask != null) {
+            if (!toolRound) {
+                toolRound = true;
+                turnDeadline = Math.max(turnDeadline, now + tuning.toolRoundMs);
+            }
+            host.note("a tool round" + (ask.look ? " with a look" : "") + (ask.preamble != null ? ", said first" : "")
+                    + ": the turn may take " + tuning.toolRoundMs + " ms");
+            if (ask.preamble != null) {
+                // As every line (KTD7): still, and the detector parked while he speaks.
+                host.holdStill();
+                dropFaceLook(true);
+                preambleSaying = true;
+                preambleUntil = now + ChatTools.PREAMBLE_WAIT_MS;
+                port.say(ask.preamble);
+            }
+            lookAfterPreamble = ask.look;
+        }
+        if (lookAfterPreamble && !preambleSaying) {
+            lookAfterPreamble = false;
+            startToolLook(now);
+        }
+        if (!toolLooking) {
+            return;
+        }
+        ExploreBrain.Look look = host.look();
+        if (look != null && look.frameMs >= toolLookFrom && look.jpeg != null) {
+            dropToolLook();
+            // The fresh frame itself may have just put him in bathroom privacy: nothing goes then.
+            String blocked = host.lookBlocked();
+            host.note(blocked == null ? "the tool's look: a fresh frame for Claude" : "the tool's look: refused");
+            port.lookAnswer(blocked == null ? CuriosityPort.LookResult.of(look.jpeg, labels(look))
+                    : CuriosityPort.LookResult.refused(blocked));
+        } else if (now >= toolLookDeadline) {
+            dropToolLook();
+            host.note("the tool's look: no frame in " + tuning.toolLookMs + " ms");
+            port.lookAnswer(CuriosityPort.LookResult.refused("his camera gave no picture in time"));
+        }
+    }
+
+    private void startToolLook(long now) {
+        String blocked = host.lookBlocked();
+        if (blocked != null) {
+            host.note("the tool's look: refused (privacy, do not disturb or no camera)");
+            port.lookAnswer(CuriosityPort.LookResult.refused(blocked));
+            return;
+        }
+        toolLooking = true;
+        toolLookFrom = now;
+        toolLookDeadline = now + tuning.toolLookMs;
+        host.wantLook(true);
+    }
+
+    /** The tool's look, if one is wanted, is no longer: the detector parks unless a face look still runs. */
+    private void dropToolLook() {
+        if (!toolLooking) {
+            return;
+        }
+        toolLooking = false;
+        if (!faceLooking && phase != Phase.LOOKING) {
+            host.wantLook(false);
+        }
+    }
+
+    /** The look's labels, each once, in box order. */
+    private static List<String> labels(ExploreBrain.Look look) {
+        List<String> out = new ArrayList<String>();
+        if (look.detections != null) {
+            for (Detection d : look.detections) {
+                if (!out.contains(d.label)) {
+                    out.add(d.label);
+                }
+            }
+        }
+        return out;
     }
 
     /**
@@ -1219,7 +1333,7 @@ final class ChatSession {
             faceTries--;
         }
         seekLooking = false;
-        if (phase != Phase.LOOKING) {
+        if (phase != Phase.LOOKING && !toolLooking) {
             host.wantLook(false);
         }
     }
@@ -1243,6 +1357,7 @@ final class ChatSession {
         host.holdStill();
         // The detector parks before he speaks (KTD7): a face look not yet in is asked again later.
         dropFaceLook(true);
+        dropToolLook();
         state = State.CHAT_SPEAK;
         phase = Phase.WAIT_CLIP;
         pendingLine = line;
@@ -1317,10 +1432,6 @@ final class ChatSession {
         }
         if (signOffAfterLine) {
             signOffAfterLine = false;
-            signOff(now);
-            return;
-        }
-        if (endOnCharger && !confirmingForget) {
             signOff(now);
             return;
         }
@@ -1430,10 +1541,6 @@ final class ChatSession {
             }
             return;
         }
-        if (endOnCharger) {
-            signOff(now);
-            return;
-        }
         if (goodbye(text)) {
             host.note("they said goodbye: the sign-off");
             signOff(now);
@@ -1498,7 +1605,7 @@ final class ChatSession {
     }
 
     private void onUnanswered(long now, boolean wordless) {
-        if (called && wordless && !reasked && !endOnCharger && !confirmingForget && !askingLastName) {
+        if (called && wordless && !reasked && !confirmingForget && !askingLastName) {
             // Owner 2026-10-02: an answer that ended without words gets one re-ask, which does not count.
             reasked = true;
             host.note("the answer ended without words: one \"didn't catch that\", not counted");
@@ -1512,10 +1619,6 @@ final class ChatSession {
             declineLastName(now);
         }
         glanceIfNewcomer(now);
-        if (endOnCharger) {
-            signOff(now);
-            return;
-        }
         if (called) {
             // Owner 2026-10-02: not seeing them never ends a call's conversation; only silence does.
             if (unanswered >= tuning.callChatUnansweredMax) {

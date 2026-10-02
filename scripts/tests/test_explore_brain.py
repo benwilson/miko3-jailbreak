@@ -33,7 +33,7 @@ PLAIN_JAVA = ("SensorReading.java", "HazardClassifier.java", "ExploreBrain.java"
               "Sighting.java", "Detection.java", "CuriosityPort.java", "FaceCrop.java", "ClaudeReplies.java",
               "ExplorePrompts.java", "Openness.java", "Brightness.java", "Heading.java", "ExploreCalibration.java",
               "RoamSteer.java", "EscapePlanner.java", "Coverage.java", "PlaceMemory.java", "Ears.java", "ChatSession.java",
-              "FaceMigration.java", "FaceMatcher.java", "AnswerParser.java", "NameResolver.java")
+              "FaceMigration.java", "FaceMatcher.java", "AnswerParser.java", "NameResolver.java", "ChatTools.java")
 
 
 class BrainIsPlainJavaTest(unittest.TestCase):
@@ -292,7 +292,6 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "recover_motors_that_never_come_back_three_recoveries_then_wriggle_then_the_help_line",
         "recover_spell_resets_after_clean_driving_so_a_fourth_stall_two_minutes_on_still_waits",
         "replies_turn_reads_addressed_action_and_target",
-        "replies_addressed_so_far_reads_the_streamed_prefix",
         "intent_go_away_ends_after_the_line_turns_away_and_leaves_them_alone_10_min",
         "intent_go_elsewhere_seeks_at_once_and_avoids_this_spot_15_min",
         "intent_find_person_named_meets_only_that_face",
@@ -500,7 +499,10 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "chat_unreachable_twice_ends_with_the_local_sign_off_within_the_budget_and_merges_the_notes_once",
         "chat_a_refusal_plays_the_deflection_and_the_conversation_continues",
         "chat_a_persona_edit_between_turns_is_heard_only_in_the_next_conversation",
-        "chat_the_charger_mid_conversation_lets_it_finish_and_drives_no_resume_leg",
+        "chat_docking_mid_conversation_keeps_it_going_then_docks_quietly_with_no_resume_leg",
+        "chat_tools_texts_share_no_one_elses_notes_and_no_bathroom",
+        "chat_tool_round_says_the_preamble_then_looks_with_the_detector_and_waits_for_the_line",
+        "chat_tool_look_in_do_not_disturb_or_bathroom_privacy_is_refused_without_a_frame",
         "chat_lease_lost_mid_conversation_continues_without_the_look_and_a_6_s_sensor_stall_ends_it",
         "chat_eyes_only_wake_word_opens_a_stranger_conversation_without_a_turn_or_a_match_and_stores_nothing",
         "chat_the_transcript_never_appears_in_the_trace",

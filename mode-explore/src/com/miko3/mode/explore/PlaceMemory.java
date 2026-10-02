@@ -423,6 +423,23 @@ final class PlaceMemory {
     }
 
     /** Prints kept now. */
+    /**
+     * Owner 2026-10-03: the kept looks with labels, newest first, as the places tool lists
+     * them (how long ago, the labels); at most max. Nothing else of a print leaves here.
+     */
+    List<ChatTools.Place> recent(long nowMs, int max) {
+        forget(nowMs);
+        List<ChatTools.Place> out = new ArrayList<ChatTools.Place>();
+        java.util.Iterator<Kept> it = kept.descendingIterator();
+        while (it.hasNext() && out.size() < max) {
+            Kept k = it.next();
+            if (!k.labels.isEmpty()) {
+                out.add(new ChatTools.Place(nowMs - k.atMs, k.labels));
+            }
+        }
+        return out;
+    }
+
     int size() {
         return kept.size();
     }

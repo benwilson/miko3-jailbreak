@@ -729,6 +729,10 @@ final class ExploreBrain {
     private Trace trace;
     private State state = State.EYES_ONLY;
     private boolean started;
+    /** When start() ran (brain clock), for robot_status's "exploring for". */
+    private long startedAtMs;
+    /** Owner 2026-10-03: POWER's last battery percentage, or -1 before any. */
+    private int batteryPercent = -1;
     private boolean leaseHeld;
     private boolean moving;
     private boolean stepping;
@@ -2070,6 +2074,7 @@ final class ExploreBrain {
             return;
         }
         started = true;
+        startedAtMs = clock.nowMs();
         faceHoldUntil = clock.nowMs() + tuning.faceHoldMs;
         enterEyesOnly(classifier.reason());
     }
@@ -9543,6 +9548,33 @@ final class ExploreBrain {
             return onCharger();
         }
 
+        // Owner 2026-10-03: the look tool. Privacy first: in a bathroom no frame goes to Claude,
+        // and do not disturb (muted, be_quiet) takes no look either; then the camera rule (KTD7).
+        @Override
+        public String lookBlocked() {
+            if (bathroom) {
+                return "privacy: he thinks he is in a bathroom, so his camera shares nothing";
+            }
+            if (muted || quiet) {
+                return "he is in do not disturb";
+            }
+            if (!leaseHeld || chatNoWheels || !cameraOpen || !camera.available()) {
+                return "his camera is not available right now";
+            }
+            return null;
+        }
+
+        @Override
+        public CuriosityPort.ToolFacts toolFacts() {
+            long now = clock.nowMs();
+            List<String> hidden = new ArrayList<String>(BATHROOM_STRONG);
+            hidden.addAll(BATHROOM_WEAK);
+            return new CuriosityPort.ToolFacts(
+                    ChatTools.statusText(batteryPercent, onCharger(), muted, quiet || muted,
+                            started ? now - startedAtMs : 0, "talking with someone"),
+                    ChatTools.placesText(places.recent(now, tuning.placeMax), hidden));
+        }
+
         @Override
         public ChatSession.Seek seek(long now) {
             if (chatSeekPlan == null || chatSeekIndex >= chatSeekPlan.length) {
@@ -9659,6 +9691,9 @@ final class ExploreBrain {
      * dockOffReadings in a row saying off. A reading without a readable POWER counts neither way.
      */
     private void trackPower(SensorReading r) {
+        if (r.batteryPercent >= 0) {
+            batteryPercent = r.batteryPercent;
+        }
         if (r.docked == null) {
             return;
         }

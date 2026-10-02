@@ -677,7 +677,7 @@ class ClaudeRateLimitWiringTest(unittest.TestCase):
         self.assertIn('"): pausing Claude requests for "', rec)
 
     def test_a_rate_limited_or_paused_turn_is_unreachable_so_the_conversation_can_wait(self):
-        turn_of = self.body(r"private static Turn turnOf\(ClaudeApi\.MessageResult r\)")
+        turn_of = self.body(r"private static Turn turnOf\(ChatRound\.Outcome o\)")
         m = re.search(r"case OVERLOADED:\s*case RATE_LIMITED:.*?return Turn\.unreachable\(\);", turn_of, re.S)
         self.assertIsNotNone(m)
 
@@ -707,13 +707,14 @@ class FasterTurnWiringTest(unittest.TestCase):
 
     def test_a_turn_streams_and_hands_its_line_over_early(self):
         turn = self.method("private void oneTurn(")
-        self.assertIn("TURN_EFFORT, (int) timeoutMs, EARLY_FIELDS,", turn)
+        self.assertIn("TURN_EFFORT, (int) timeoutMs,\n                        ChatRound.EARLY_FIELDS, early, tools)", turn)
         self.assertIn("flight.early(call, ", turn)
         self.assertIn("flight.whole(call, ", turn)
-        # Owner 2026-10-02: the action and its target follow the name, before the notes, so they
-        # come with the early line; "addressed" (a boolean, before the line) is read off the stream.
-        self.assertRegex(self.a, r'EARLY_FIELDS\s*=\s*Arrays\.asList\("line", "question_asked", "name_given", "action",'
-                                 r'\s*"target"\)')
+        # Owner 2026-10-02/03: "addressed" (a boolean, before the line) comes with the early fields
+        # from the respond tool's streamed input; the action and its target follow the name.
+        self.assertRegex(code_only(src("ChatRound.java")),
+                         r'EARLY_FIELDS\s*=\s*Arrays\.asList\("addressed", "line", "question_asked", "name_given",'
+                         r'\s*"action", "target"\)')
         early = self.method("private static Turn earlyTurn(")
         self.assertIn("ClaudeReplies.turn(", early)
         self.assertIn("NameExtractor.validName(", early)
@@ -724,9 +725,11 @@ class FasterTurnWiringTest(unittest.TestCase):
         self.assertIn("flight.start(body.key, g)", turn)
         spec = self.method("public void speculateTurn(final TurnRequest request, final long timeoutMs)")
         self.assertIn("flight.speculate(body.key)", spec)
-        self.assertIn("turnBody(request, null)", spec)
-        body = self.method("private TurnBody turnBody(")
+        self.assertIn("ChatRound.body(request, null)", spec)
+        body = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
         self.assertIn("Json.write(messages)", body)
+        # Owner 2026-10-03: a speculation never says or looks at anything; a tool round needs a turn() asking.
+        self.assertIn("return flight.claimForTools(call);", self.method("private void oneTurn("))
         cancel = self.method("public void cancelTurn()")
         self.assertIn("turns.cancel();", cancel)
         self.assertIn("flight.cancel();", cancel)
@@ -1003,6 +1006,17 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertEqual(java_props, bench_props)
         self.assertEqual(bench.REPLY_SCHEMA["properties"]["feedback"]["properties"]["kind"]["enum"],
                          ["none", "suggestion", "complaint", "praise", "bug"])
+        # Owner 2026-10-03: the tools, their descriptions and order are the robot's (ChatTools).
+        tools = src("ChatTools.java")
+        for name in ("RESPOND_DESCRIPTION", "LOOK_DESCRIPTION", "RECALL_DESCRIPTION", "STATUS_DESCRIPTION",
+                     "PLACES_DESCRIPTION"):
+            self.assertEqual(self.java_string(tools, name), getattr(bench, name), name)
+        order = re.findall(r'out\.add\(new Object\[\]\{(\w+),', tools)
+        names = {k: self.java_string(tools, k) for k in ("RESPOND", "LOOK", "RECALL", "STATUS", "PLACES")}
+        self.assertEqual([names[k] for k in order], [t["name"] for t in bench.TOOLS])
+        recall = re.search(r'RECALL_SCHEMA = ExplorePrompts\.object\("name", ExplorePrompts\.described\(\s*'
+                           r'ExplorePrompts\.type\("string"\), "(.*?)"\)\);', tools, re.S)
+        self.assertEqual(recall.group(1), bench.RECALL_SCHEMA["properties"]["name"]["description"])
         self.assertIn("closed_threads", java_props)
         # The prefix order the bench renders: guard, quoted persona, reminder, notes heading, preamble.
         prefix = re.search(r"static String systemPrefix\((.*?)\n    \}", prompts, re.S).group(1)
@@ -1018,13 +1032,17 @@ class ConversationWiringTest(unittest.TestCase):
                        "forgetAnswer", "cancelForget", "chatListen", "keep", "keptAnswer", "cancelKeep"):
             self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
         turn = re.search(r"private void oneTurn\((.*?)\n    \}", a, re.S).group(1)
-        self.assertIn("claude.conversation(settings, body.system, body.messages, ExplorePrompts.REPLY_SCHEMA", turn)
-        self.assertIn("TURN_EFFORT", turn)
-        body = re.search(r"private TurnBody turnBody\((.*?)\n    \}", a, re.S).group(1)
+        # Owner 2026-10-03: the reply is the respond tool's input, so no JSON schema is sent.
+        self.assertIn("claude.conversation(settings, body.system, messages, null, TURN_EFFORT", turn)
+        self.assertIn("ChatRound.run(body, request,", turn)
+        for method in ("toolAsk", "lookAnswer"):
+            self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
+        body = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
         self.assertIn("ExplorePrompts.systemPrefix(request.persona, request.notes)", body)
         self.assertIn("ExplorePrompts.openerAsk(request.name)", body)
         self.assertIn("ExplorePrompts.avoidQuestion(request.avoidQuestion)", body)
-        self.assertIn("ClaudeApi.jpegBlock(face)", body)
+        self.assertIn("userMessage(saidBefore, face, ask)", body)
+        self.assertIn("ClaudeApi.jpegBlock(face)", code_only(src("ChatRound.java")))
         self.assertIn("request.heard == null && request.transcript.isEmpty() && met != null\n                ? met.storeCrop : null", a)
         self.assertIn("NameExtractor.validName(t.nameGiven)", a)
         self.assertIn("RobotPeopleClient.mergeNotes(app, personId, notesUpdate)", a)
@@ -1133,7 +1151,7 @@ class FacelessOpenerTest(unittest.TestCase):
         self.assertIn("ask their name if he does not know it yet", self.constant("FACE_SEEN"))
 
     def test_the_turn_picks_the_opener_by_the_request_and_appends_face_seen(self):
-        turn = re.search(r"private TurnBody turnBody\((.*?)\n    \}", code_only(src("ClaudeCuriosity.java")), re.S).group(1)
+        turn = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
         self.assertIn("request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name)", turn)
         self.assertIn("e.heard == null ? first : e.heard", turn)
         self.assertIn("request.heard == null ? first : request.heard", turn)
@@ -1166,14 +1184,14 @@ class CallConversationTest(unittest.TestCase):
             self.assertIn(words, cant)
 
     def test_the_turn_picks_the_call_opener_first_and_appends_the_call_notes(self):
-        turn = re.search(r"private TurnBody turnBody\((.*?)\n    \}", code_only(src("ClaudeCuriosity.java")), re.S).group(1)
+        turn = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
         self.assertRegex(turn, r"String first = request\.called \? ExplorePrompts\.CALL_OPENER\s*"
                                r": request\.faceless \? ExplorePrompts\.FACELESS_OPENER")
         self.assertRegex(turn, r"if \(request\.called && request\.heard != null && request\.transcript\.isEmpty\(\)\) \{\s*"
                                r"ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CALL_WORDS;")
         self.assertRegex(turn, r"if \(request\.cantSee\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CANT_SEE;")
         session = code_only(src("ChatSession.java"))
-        self.assertIn(".call(called, cantSeeDue);", session)
+        self.assertIn(".call(called, cantSeeDue).withFacts(host.toolFacts());", session)
 
     def test_opening_a_call_conversation_reads_the_persona_and_sends_nothing_to_claude(self):
         c = code_only(src("ClaudeCuriosity.java"))
@@ -1232,8 +1250,7 @@ class FeedbackWiringTest(unittest.TestCase):
         self.assertEqual(top[1], "line")
         self.assertEqual(top[-1], "feedback")
         self.assertIn('enumOf("none", "suggestion", "complaint", "praise", "bug")', body)
-        a = code_only(src("ClaudeCuriosity.java"))
-        early = re.search(r"EARLY_FIELDS = Arrays\.asList\((.*?)\);", a, re.S).group(1)
+        early = re.search(r"EARLY_FIELDS = Arrays\.asList\((.*?)\);", code_only(src("ChatRound.java")), re.S).group(1)
         self.assertNotIn("feedback", early)
 
     def test_the_adapter_passes_feedback_to_the_launcher_and_never_logs_it(self):
@@ -1295,11 +1312,10 @@ class InstructionsAndAddressedTest(unittest.TestCase):
         a = code_only(src("ClaudeCuriosity.java"))
         early = re.search(r"private static Turn earlyTurn\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn("addressed", early)
-        self.assertIn("Boolean.TRUE.equals(addressed)", early)
-        turn = re.search(r"private void oneTurn\((.*?)\n    \}", a, re.S).group(1)
-        self.assertIn("ClaudeReplies.addressedSoFar(", turn)
-        self.assertIn("streamed.reset()", turn)
-        self.assertIn("new ClaudeApi(streamed)", a)
+        self.assertIn('"true".equals(fields.get("addressed"))', early)
+        # Owner 2026-10-03: the shared client tells the streamed boolean itself; no transport wrapper.
+        self.assertIn("new ClaudeApi(new ClaudeHttpsTransport())", a)
+        self.assertNotIn("StreamedText", a)
         turn_of = re.search(r"private static Turn turnOf\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn(".withAddressed(t.addressed)", turn_of)
         self.assertIn(".withAction(t.action, t.target)", turn_of)
@@ -1313,6 +1329,66 @@ class InstructionsAndAddressedTest(unittest.TestCase):
         for call in re.findall(r"\bnote\((.*?)\);", chat, re.S):
             bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
             self.assertNotRegex(bare, r"\b(target|actionTarget)\b(?!\s*==|\s*!=)", call)
+
+
+class ToolRoundWiringTest(unittest.TestCase):
+    """Owner 2026-10-03: the conversation replies through the respond tool and may run one
+    tool round (look, recall_person, robot_status, places). The adapter hands the round's
+    ask to the turn that posted it only, a cancelled turn's look stops waiting, recall
+    asks the store by name without logging it, and the conversation traces no words."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.a = code_only(src("ClaudeCuriosity.java"))
+
+    def method(self, sig):
+        m = re.search(re.escape(sig) + r"(.*?)\n    \}", self.a, re.S)
+        self.assertIsNotNone(m, sig)
+        return m.group(1)
+
+    def test_an_ask_goes_only_to_the_turn_that_posted_it_and_a_new_or_cancelled_turn_drops_it(self):
+        ask = self.method("public CuriosityPort.ToolAsk toolAsk()")
+        self.assertIn("turns.current(b.gen)", ask)
+        self.assertIn("dropToolAsks();", self.method("public void cancelTurn()"))
+        self.assertIn("dropToolAsks();", self.method("public void turn(final TurnRequest request, final long timeoutMs)"))
+        self.assertIn("dropToolAsks();", self.method("    void release()"))
+        self.assertIn("return turns.current(call.gen);", self.method("private void oneTurn("))
+
+    def test_recall_asks_the_store_by_name_and_logs_nothing_of_it(self):
+        turn = self.method("private void oneTurn(")
+        self.assertIn("RobotPeopleClient.idsNamed(app, name)", turn)
+        for call in re.findall(r"Log\.[diwe]\((.*?)\);", turn, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"\bname\b|preamble|messages|reply", call)
+        self.assertIn('", tool round: "', turn)
+
+    def test_the_conversation_traces_no_words_of_the_round_and_charger_ends_nothing(self):
+        chat = code_only(src("ChatSession.java"))
+        step = re.search(r"private void toolStep\(long now\) \{(.*?)\n    \}", chat, re.S).group(1)
+        for call in re.findall(r"host\.note\((.*?)\);", step, re.S):
+            bare = re.sub(r'"(?:\\.|[^"\\])*"', "", call)
+            self.assertNotRegex(bare, r"ask\.preamble(?!\s*!=)|labels|jpeg|blocked(?!\s*==)", call)
+        self.assertIn("port.say(ask.preamble);", step)
+        self.assertIn("dropFaceLook(true);", step)
+        self.assertNotIn("endOnCharger", chat)
+        self.assertNotIn("charger connected", src("ChatSession.java"))
+
+    def test_the_adapter_waits_longer_than_the_preamble_and_the_brains_look(self):
+        tools = code_only(src("ChatTools.java"))
+        look = int(re.search(r"LOOK_WAIT_MS = (\d+);", tools).group(1))
+        pre = int(re.search(r"PREAMBLE_WAIT_MS = (\d+);", tools).group(1))
+        tuning = code_only(src("ExploreTuning.java"))
+        self.assertEqual(int(re.search(r"private long toolLookMs = (\d+);", tuning).group(1)), look)
+        self.assertIn("ADAPTER_LOOK_WAIT_MS = PREAMBLE_WAIT_MS + LOOK_WAIT_MS + 1000;", tools)
+        round_ms = int(re.search(r"private long toolRoundMs = (\d+);", tuning).group(1))
+        budget = int(re.search(r"private long turnBudgetMs = (\d+);", tuning).group(1))
+        self.assertGreaterEqual(round_ms, pre + look + budget)
+
+    def test_the_look_tool_is_gated_by_privacy_first(self):
+        brain = code_only(src("ExploreBrain.java"))
+        body = re.search(r"public String lookBlocked\(\) \{(.*?)\n        \}", brain, re.S).group(1)
+        self.assertLess(body.index("if (bathroom)"), body.index("muted || quiet"))
+        self.assertLess(body.index("muted || quiet"), body.index("!leaseHeld"))
 
 
 if __name__ == "__main__":

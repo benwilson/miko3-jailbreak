@@ -503,6 +503,12 @@ final class ExploreTuning {
     final long turnBudgetMs;
     final long turnRetryMs;
     /**
+     * Owner 2026-10-03: a turn that runs a tool round (ChatTools) gets until toolRoundMs after
+     * its ask: the preamble, the look's frame (at most toolLookMs) and the second request.
+     */
+    final long toolRoundMs;
+    final long toolLookMs;
+    /**
      * Robot 2026-10-01: a turn that meets a Claude rate-limit pause this long or shorter
      * says "one sec" and waits it out; a longer pause ends the conversation with the sign-off.
      */
@@ -1043,6 +1049,8 @@ final class ExploreTuning {
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
         turnRetryMs = Math.max(0, b.turnRetryMs);
+        toolRoundMs = Math.max(0, b.toolRoundMs);
+        toolLookMs = Math.max(1, b.toolLookMs);
         chatPauseWaitMs = Math.max(0, b.chatPauseWaitMs);
         sentenceCap = Math.max(1, b.sentenceCap);
         transcriptWindow = Math.max(1, b.transcriptWindow);
@@ -1457,6 +1465,8 @@ final class ExploreTuning {
         private long chatStallGraceMs = 5000;
         private long turnBudgetMs = 5000;
         private long turnRetryMs = 3000;
+        private long toolRoundMs = 12000;
+        private long toolLookMs = 4000; // ChatTools.LOOK_WAIT_MS: the adapter waits on it
         private long chatPauseWaitMs = 10000;
         private int sentenceCap = 2;
         private int transcriptWindow = 30;

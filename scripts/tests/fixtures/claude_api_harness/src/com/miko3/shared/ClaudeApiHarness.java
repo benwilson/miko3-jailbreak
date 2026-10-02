@@ -930,6 +930,15 @@ public final class ClaudeApiHarness {
                 "x".equals(part.get("a")) && !part.containsKey("line") && !part.containsKey("c") && part.size() == 1
                         && open.isEmpty(),
                 part + " " + open);
+        // Owner 2026-10-03: a named boolean (the reply's "addressed") is told once its literal is closed.
+        Map<String, String> bools = ClaudeApi.completeStringFields(
+                "{\"addressed\": true, \"n\": {\"x\": false}, \"count\": 3, \"deflected\":false,\"late\": tru");
+        Map<String, String> openBool = ClaudeApi.completeStringFields("{\"addressed\": false");
+        check("partial_json_scanner_reads_closed_top_level_booleans_as_words",
+                "true".equals(bools.get("addressed")) && "false".equals(bools.get("deflected"))
+                        && !bools.containsKey("x") && !bools.containsKey("count") && !bools.containsKey("late")
+                        && openBool.isEmpty(),
+                bools + " " + openBool);
     }
 
     // ---- keep-warm (robot 2026-10-02: a cold connection costs ~0.4 s on the first turn) ----
@@ -1319,6 +1328,28 @@ public final class ClaudeApiHarness {
                         && "respond".equals(rr.toolUses.get(0).name),
                 describeTools(rr) + " calls=" + re.calls + " fields=" + re.fields + " atLine=" + re.atLine
                         + " want " + rEarly);
+        // Owner 2026-10-03: a named boolean before the line ("addressed") is told with the line, as a word.
+        FakeStreamingTransport bt = new FakeStreamingTransport();
+        Sse bs = new Sse().toolStart(0, "toolu_B", "respond").json(0, "{\"addressed\": tr")
+                .json(0, "ue, \"line\": \"Hi there.\", \"question_asked\": \"\", \"name_given\": \"\"");
+        int bEarly = bs.lines.size() - 1;
+        bs.json(0, ", \"ends_conversation\": false}").stop(0);
+        bt.sse(bs.end("tool_use"));
+        Early be = new Early(bt);
+        List<String> withAddressed = Arrays.asList("addressed", "line", "question_asked", "name_given");
+        ClaudeApi.MessageResult br = new ClaudeApi(bt).conversation(ACCESS, "PREFIX", chat(), null, null, 5000,
+                withAddressed, be, new ClaudeApi.Tools(withRespond).replyTool("respond"));
+        FakeTransport bp = new FakeTransport().reply(200, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_B\","
+                + "\"name\":\"respond\",\"input\":{\"addressed\":false,\"line\":\"\",\"question_asked\":\"\","
+                + "\"name_given\":\"\"}}],\"stop_reason\":\"tool_use\"}");
+        Early bpe = new Early(null);
+        new ClaudeApi(bp).conversation(ACCESS, "PREFIX", chat(), null, null, 5000, withAddressed, bpe,
+                new ClaudeApi.Tools(withRespond).replyTool("respond"));
+        check("conversation_reply_tool_tells_a_named_boolean_as_a_word_streamed_or_whole",
+                br.ok() && be.calls == 1 && "true".equals(be.fields.get("addressed")) && be.atLine == bEarly
+                        && "Hi there.".equals(be.fields.get("line")) && Boolean.TRUE.equals(br.json.get("addressed"))
+                        && bpe.calls == 1 && "false".equals(bpe.fields.get("addressed")),
+                "streamed=" + be.fields + " atLine=" + be.atLine + " want " + bEarly + " whole=" + bpe.fields);
         // ...and without a streaming transport, from the whole reply.
         FakeTransport rp = new FakeTransport().reply(200, "{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_R\","
                 + "\"name\":\"respond\",\"input\":{\"line\":\"Hi.\",\"question_asked\":\"\",\"name_given\":\"Sam\"}}],"

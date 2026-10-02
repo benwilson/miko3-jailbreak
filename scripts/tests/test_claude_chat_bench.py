@@ -29,28 +29,39 @@ bench = load("claude_chat_bench", SCRIPT)
 
 
 def reply(line="Hello there. Nice to see you.", question="", name="", ends=False, deflected=False):
-    return {"line": line, "question_asked": question, "name_given": name, "ends_conversation": ends,
-            "deflected": deflected,
-            "notes_update": {"interests": [], "open_threads": [], "topics": [], "questions_asked": []}}
+    r = bench.said_input(line)
+    r.update(question_asked=question, name_given=name, ends_conversation=ends, deflected=deflected)
+    return r
 
 
-def sse(reply_obj, input_tokens=1500, cache_creation=0, cache_read=1400, stop_reason="end_turn",
-        output_tokens=40):
-    """The Messages stream for one reply, as the lines the transport yields."""
+def sse(reply_obj, input_tokens=1500, cache_creation=0, cache_read=1400, stop_reason="tool_use",
+        output_tokens=40, tool="respond", preamble=None, tool_id="toolu_1"):
+    """The Messages stream for one reply (a preamble text block, then a tool call whose input
+    streams in two halves), as the lines the transport yields."""
     text = json.dumps(reply_obj)
     half = len(text) // 2
     events = [
         ("message_start", {"type": "message_start", "message": {
             "id": "msg_1", "type": "message", "role": "assistant", "content": [], "model": "x",
             "usage": {"input_tokens": input_tokens, "cache_creation_input_tokens": cache_creation,
-                      "cache_read_input_tokens": cache_read, "output_tokens": 1}}}),
-        ("content_block_start", {"type": "content_block_start", "index": 0,
-                                 "content_block": {"type": "text", "text": ""}}),
-        ("content_block_delta", {"type": "content_block_delta", "index": 0,
-                                 "delta": {"type": "text_delta", "text": text[:half]}}),
-        ("content_block_delta", {"type": "content_block_delta", "index": 0,
-                                 "delta": {"type": "text_delta", "text": text[half:]}}),
-        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                      "cache_read_input_tokens": cache_read, "output_tokens": 1}}})]
+    index = 0
+    if preamble is not None:
+        events += [
+            ("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "text", "text": ""}}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "text_delta", "text": preamble}}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0})]
+        index = 1
+    events += [
+        ("content_block_start", {"type": "content_block_start", "index": index,
+                                 "content_block": {"type": "tool_use", "id": tool_id, "name": tool, "input": {}}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": index,
+                                 "delta": {"type": "input_json_delta", "partial_json": text[:half]}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": index,
+                                 "delta": {"type": "input_json_delta", "partial_json": text[half:]}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": index}),
         ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                            "usage": {"output_tokens": output_tokens}}),
         ("message_stop", {"type": "message_stop"}),
@@ -106,24 +117,37 @@ class RequestShapeTest(unittest.TestCase):
     """The body and headers mirror shared/ClaudeApi.messagesRequest and headers()."""
 
     def test_body_mirrors_the_java_client(self):
-        body = bench.build_body("claude-sonnet-5", "SYSTEM", [{"role": "user", "content": "hi"}],
-                                bench.REPLY_SCHEMA, effort="low", schema_in_prompt=False)
+        body = bench.build_body("claude-sonnet-5", "SYSTEM", [{"role": "user", "content": "hi"}], effort="low")
         self.assertEqual(body["model"], "claude-sonnet-5")
         self.assertEqual(body["max_tokens"], 400)  # robot 2026-10-02: ClaudeApi.CONVERSATION_MAX_TOKENS
         self.assertEqual(body["system"], "SYSTEM")
         self.assertEqual(body["messages"], [{"role": "user", "content": "hi"}])
-        self.assertEqual(body["output_config"]["format"], {"type": "json_schema", "schema": bench.REPLY_SCHEMA})
-        self.assertEqual(body["output_config"]["effort"], "low")
+        # Owner 2026-10-03: the reply is the respond tool's input; no JSON-schema format.
+        self.assertEqual([t["name"] for t in body["tools"]],
+                         ["respond", "look", "recall_person", "robot_status", "places"])
+        self.assertEqual(body["tools"][0]["input_schema"], bench.REPLY_SCHEMA)
+        self.assertEqual(body["tool_choice"], {"type": "auto"})
+        self.assertEqual(body["output_config"], {"effort": "low"})
         self.assertTrue(body["stream"])
         self.assertEqual(body["cache_control"], {"type": "ephemeral"})
-        self.assertEqual(list(body)[:4], ["model", "max_tokens", "system", "messages"])
+        self.assertEqual(list(body), ["model", "max_tokens", "system", "messages", "tools", "tool_choice",
+                                      "output_config", "cache_control", "stream"])
+        forced = bench.build_body("m", "S", [], effort=None, tool_choice="respond")
+        self.assertEqual(forced["tool_choice"], {"type": "tool", "name": "respond"})
+        self.assertNotIn("output_config", forced)
 
-    def test_schema_in_prompt_fallback_matches_the_java_wording(self):
-        body = bench.build_body("m", "SYSTEM", [], bench.REPLY_SCHEMA, effort=None, schema_in_prompt=True)
-        self.assertNotIn("format", body.get("output_config", {}))
-        self.assertTrue(body["system"].startswith("SYSTEM\n\nReply with only a JSON object that matches "
-                                                  "this JSON schema, and no other text: "))
-        self.assertNotIn("output_config", body)
+    def test_history_is_respond_calls_each_answered_by_said(self):
+        m = bench.build_messages([("Hey Miko.", "Hi! Who are you?"), ("I'm Sam.", "Nice to meet you, Sam.")],
+                                 "How's it going?")
+        self.assertEqual([x["role"] for x in m], ["user", "assistant", "user", "assistant", "user"])
+        self.assertEqual(m[0], {"role": "user", "content": "Hey Miko."})
+        use = m[1]["content"][0]
+        self.assertEqual((use["type"], use["id"], use["name"]), ("tool_use", "toolu_said_0", "respond"))
+        self.assertEqual(use["input"]["line"], "Hi! Who are you?")
+        self.assertEqual(list(use["input"]), list(bench.REPLY_SCHEMA["properties"]))
+        self.assertEqual(m[2]["content"][0], {"type": "tool_result", "tool_use_id": "toolu_said_0", "content": "said"})
+        self.assertEqual(m[4]["content"][0]["tool_use_id"], "toolu_said_1")
+        self.assertEqual(m[4]["content"][1], {"type": "text", "text": "How's it going?"})
 
     def test_headers_carry_the_key_both_ways_and_the_version(self):
         h = bench.headers("sk-ant-test")
@@ -197,8 +221,7 @@ class EffortGateTest(unittest.TestCase):
         b = bench.Bench(transport, clock, model="claude-haiku-4-5", api_key="k", base_url="https://x.example")
         quiet(b.run, bench.SCRIPT[:2])
         for _, _, body in transport.requests:
-            self.assertNotIn("effort", body.get("output_config", {}))
-            self.assertIn("format", body["output_config"])
+            self.assertNotIn("output_config", body)
 
     def test_a_400_naming_effort_drops_it_for_the_rest_of_the_run(self):
         clock = FakeClock()
@@ -211,23 +234,11 @@ class EffortGateTest(unittest.TestCase):
         bodies = [r[2] for r in transport.requests]
         self.assertEqual(len(bodies), 3)
         self.assertEqual(bodies[0]["output_config"]["effort"], "low")
-        self.assertNotIn("effort", bodies[1]["output_config"])
-        self.assertNotIn("effort", bodies[2]["output_config"])
-        # The JSON-schema format survives the retry (KTD9).
-        self.assertIn("format", bodies[1]["output_config"])
+        self.assertNotIn("output_config", bodies[1])
+        self.assertNotIn("output_config", bodies[2])
+        # The tools survive the retry.
+        self.assertEqual(bodies[1]["tools"], bodies[0]["tools"])
         self.assertFalse(records[0]["effort_sent"])
-
-    def test_a_400_naming_output_config_but_not_effort_moves_the_schema_into_the_prompt(self):
-        clock = FakeClock()
-        bad = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
-                                                     "message": "output_config: unknown field"}})
-        transport = FakeTransport(clock, answers=[(400, bad), (200, sse(reply()))])
-        b = bench.Bench(transport, clock, model="claude-sonnet-5", api_key="k", base_url="https://x.example")
-        quiet(b.run, bench.SCRIPT[:1])
-        bodies = [r[2] for r in transport.requests]
-        self.assertNotIn("format", bodies[1].get("output_config", {}))
-        self.assertIn("JSON schema", bodies[1]["system"])
-        self.assertEqual(bodies[1]["output_config"]["effort"], "low")
 
     def test_any_other_error_status_stops_the_run_with_the_status_and_no_body_echo(self):
         clock = FakeClock()
@@ -243,7 +254,7 @@ class StreamParseTest(unittest.TestCase):
     def test_usage_text_stop_reason_and_first_token_time(self):
         clock = FakeClock()
         lines = sse(reply("One. Two."), input_tokens=1700, cache_creation=1500, cache_read=0,
-                    stop_reason="end_turn", output_tokens=33)
+                    stop_reason="tool_use", output_tokens=33)
         started = clock()
 
         def stream():
@@ -253,8 +264,9 @@ class StreamParseTest(unittest.TestCase):
                 yield line
 
         result = bench.parse_stream(stream(), clock, started)
-        self.assertEqual(json.loads(result.text)["line"], "One. Two.")
-        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertEqual(bench.respond_input(result)["line"], "One. Two.")
+        self.assertEqual(result.stop_reason, "tool_use")
+        self.assertIsNotNone(result.line_s)
         self.assertEqual(result.input_tokens, 1700)
         self.assertEqual(result.cache_creation_input_tokens, 1500)
         self.assertEqual(result.cache_read_input_tokens, 0)
@@ -263,9 +275,10 @@ class StreamParseTest(unittest.TestCase):
 
     def test_a_stream_with_no_text_has_no_first_token_time(self):
         clock = FakeClock()
-        lines = [ln for ln in sse(reply()) if "text_delta" not in ln]
+        lines = [ln for ln in sse(reply()) if "input_json_delta" not in ln]
         result = bench.parse_stream(iter(lines), clock, clock())
         self.assertIsNone(result.ttft_s)
+        self.assertIsNone(result.line_s)
         self.assertEqual(result.text, "")
 
     def test_an_error_event_mid_stream_is_a_bench_error(self):
@@ -311,20 +324,50 @@ class ConversationTest(unittest.TestCase):
         for n, (url, headers, body) in enumerate(transport.requests, start=1):
             self.assertEqual(url, "https://x.example/v1/messages")
             self.assertEqual(len(body["messages"]), 2 * n - 1)
-            self.assertEqual(body["messages"][-1], {"role": "user", "content": bench.SCRIPT[n - 1]})
+            last = body["messages"][-1]
+            if n == 1:
+                self.assertEqual(last, {"role": "user", "content": bench.SCRIPT[0]})
+            else:
+                self.assertEqual(last["content"][-1], {"type": "text", "text": bench.SCRIPT[n - 1]})
             self.assertEqual(body["system"], transport.requests[0][2]["system"])
         for r in records:
             for key in ("turn", "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
-                        "ttft_ms", "total_ms", "stop_reason", "question_asked", "trimmed", "repeat",
-                        "max_tokens_hit", "effort_sent", "line"):
+                        "ttft_ms", "line_ms", "total_ms", "tools", "stop_reason", "question_asked", "trimmed",
+                        "repeat", "max_tokens_hit", "effort_sent", "line"):
                 self.assertIn(key, r)
         self.assertEqual(records[0]["turn"], 1)
         self.assertAlmostEqual(records[0]["ttft_ms"], 400, delta=1)
         self.assertAlmostEqual(records[0]["total_ms"], 1200, delta=1)
         self.assertTrue(records[0]["effort_sent"])
         self.assertFalse(records[0]["max_tokens_hit"])
-        # The assistant's own JSON is what goes back in the transcript.
-        json.loads(transport.requests[1][2]["messages"][1]["content"])
+        # His line goes back as the respond call that said it.
+        said = transport.requests[1][2]["messages"][1]["content"][0]
+        self.assertEqual((said["name"], said["input"]["line"]), ("respond", records[0]["line"]))
+
+    def test_a_tool_call_gets_one_round_and_respond_is_forced_after_it(self):
+        clock = FakeClock()
+        transport = FakeTransport(clock, answers=[
+            (200, sse({}, tool="look", preamble="Let me look.", tool_id="toolu_L")),
+            (200, sse(reply("My camera's off on the bench, sorry.")))])
+        b = bench.Bench(transport, clock, model="claude-haiku-4-5-20251001", api_key="k",
+                        base_url="https://x.example")
+        records = quiet(b.run, ("What can you see right now?",))
+        self.assertEqual(len(transport.requests), 2)
+        first, second = transport.requests[0][2], transport.requests[1][2]
+        self.assertEqual(first["tool_choice"], {"type": "auto"})
+        self.assertEqual(second["tool_choice"], {"type": "tool", "name": "respond"})
+        asked, answered = second["messages"][-2], second["messages"][-1]
+        self.assertEqual(asked["role"], "assistant")
+        self.assertEqual([c["type"] for c in asked["content"]], ["text", "tool_use"])
+        self.assertEqual(answered["content"][0]["tool_use_id"], "toolu_L")
+        self.assertTrue(answered["content"][0]["is_error"])
+        self.assertEqual(records[0]["tools"], ["look"])
+        self.assertEqual(records[0]["line"], "My camera's off on the bench, sorry.")
+        self.assertGreater(records[0]["line_ms"], 1200)
+        # With an image the look answers with it and the caption.
+        image = bench.tool_result({"name": "look", "id": "toolu_L"}, b"\xff\xd8jpeg")
+        self.assertEqual([c["type"] for c in image["content"]], ["image", "text"])
+        self.assertEqual(bench.tool_result({"name": "robot_status", "id": "x"})["content"], bench.BENCH_STATUS)
 
     def test_max_tokens_stop_is_flagged(self):
         clock = FakeClock()
@@ -335,11 +378,12 @@ class ConversationTest(unittest.TestCase):
 
     def test_transcript_window_keeps_the_last_30_exchanges(self):
         self.assertEqual(bench.TRANSCRIPT_WINDOW, 30)
-        msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)} for i in range(70)]
-        kept = bench.window(msgs)
-        self.assertEqual(len(kept), 60)
-        self.assertEqual(kept[0]["role"], "user")
-        self.assertEqual(kept[-1], msgs[-1])
+        exchanges = [(str(i), "said " + str(i)) for i in range(35)]
+        kept = bench.window(exchanges)
+        self.assertEqual(len(kept), 30)
+        self.assertEqual(kept[0], ("5", "said 5"))
+        # The window starts clean: no "said" result for a call it dropped.
+        self.assertEqual(bench.build_messages(kept, "now")[0], {"role": "user", "content": "5"})
 
 
 def canned_records(overrides=None, n=10):

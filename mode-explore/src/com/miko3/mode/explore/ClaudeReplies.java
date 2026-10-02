@@ -236,29 +236,6 @@ final class ClaudeReplies {
     static final int MAX_TARGET = 60;
 
     /**
-     * Owner 2026-10-02: the reply's "addressed", read off the start of a streamed reply
-     * (its first field, before the line): TRUE or FALSE once its value is complete, null
-     * while it is not (or the text has no such field before the line).
-     */
-    static Boolean addressedSoFar(String partial) {
-        if (partial == null) {
-            return null;
-        }
-        int open = partial.indexOf('{');
-        if (open < 0) {
-            return null;
-        }
-        java.util.regex.Matcher m = ADDRESSED.matcher(partial);
-        if (!m.find(open)) {
-            return null;
-        }
-        return Boolean.valueOf(m.group(1).equals("true"));
-    }
-
-    private static final java.util.regex.Pattern ADDRESSED =
-            java.util.regex.Pattern.compile("\\G\\{\\s*\"addressed\"\\s*:\\s*(true|false)\\b");
-
-    /**
      * Owner 2026-10-02: the turn's "feedback" field, an object with string kind, summary
      * and quote, or null. JSON null, the kind "none", an empty summary or anything
      * malformed is no feedback; the line goes on either way.

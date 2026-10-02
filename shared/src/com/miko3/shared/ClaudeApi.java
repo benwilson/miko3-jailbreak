@@ -153,8 +153,9 @@ public final class ClaudeApi {
     /**
      * Told once, on the request's thread, when every named top-level string field
      * of a conversation reply is complete: from the stream as soon as the last one
-     * closes, or from the whole reply when the transport cannot stream. Never told
-     * for a reply that fails before they are complete.
+     * closes, or from the whole reply when the transport cannot stream. A named
+     * boolean field comes as the word "true" or "false". Never told for a reply that
+     * fails before they are complete.
      */
     public interface EarlyFields {
         void complete(Map<String, String> fields);
@@ -854,7 +855,7 @@ public final class ClaudeApi {
             Map<String, String> fields = new LinkedHashMap<String, String>();
             for (String name : earlyNames) {
                 Object v = r.json.get(name);
-                fields.put(name, v instanceof String ? (String) v : "");
+                fields.put(name, v instanceof String || v instanceof Boolean ? String.valueOf(v) : "");
             }
             early.complete(fields);
         }
@@ -1056,8 +1057,10 @@ public final class ClaudeApi {
 
     /**
      * The top-level string fields of a JSON object that are already complete in this
-     * prefix of it (from its first '{'; a ```json fence before it is skipped). A field
-     * still open, a nested one, or any non-string value is not in the map. Never throws.
+     * prefix of it (from its first '{'; a ```json fence before it is skipped), and its
+     * top-level booleans as the words "true" and "false" once the value is closed by the
+     * next ',' or '}' (owner 2026-10-03: the reply's "addressed" comes before the line).
+     * A field still open, a nested one, or any other value is not in the map. Never throws.
      */
     static Map<String, String> completeStringFields(String partial) {
         Map<String, String> out = new LinkedHashMap<String, String>();
@@ -1103,9 +1106,14 @@ public final class ClaudeApi {
                 i = end;
                 continue;
             }
+            int start = i;
             i = valueEnd(partial, i);
             if (i < 0) {
                 return out;
+            }
+            String scalar = partial.substring(start, i).trim();
+            if (key instanceof String && (scalar.equals("true") || scalar.equals("false"))) {
+                out.put((String) key, scalar);
             }
         }
     }

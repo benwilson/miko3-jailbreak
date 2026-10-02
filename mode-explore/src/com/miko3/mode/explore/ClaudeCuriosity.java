@@ -86,12 +86,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     private static final int FRAME_H = 480;
 
     private final Context app;
-    /**
-     * Owner 2026-10-02: the stream's text as it arrives, per request thread, so the turn's
-     * "addressed" (a boolean ClaudeApi's early fields do not carry) is known when its line is.
-     */
-    private final StreamedText streamed = new StreamedText(new ClaudeHttpsTransport());
-    private final ClaudeApi api = new ClaudeApi(streamed);
+    private final ClaudeApi api = new ClaudeApi(new ClaudeHttpsTransport());
     /**
      * Robot 2026-10-01: the key hit 429s, and each was retried 0.6 s later. One back-off
      * clock: a 429 or 529 pauses the look-type requests (curiosity, seek, doorway, way-out,
@@ -118,9 +113,10 @@ final class ClaudeCuriosity implements CuriosityPort {
         // always sent, whatever the pause; only the background looks wait it out.
         ClaudeApi.MessageResult conversation(ClaudeAccess access, String system, List<Map<String, Object>> messages,
                 Map<String, ?> schema, String effort, int timeoutMs, List<String> earlyNames,
-                ClaudeApi.EarlyFields early) {
+                ClaudeApi.EarlyFields early, ClaudeApi.Tools tools) {
             lastRequestAt = System.currentTimeMillis();
-            return recorded(api.conversation(access, system, messages, schema, effort, timeoutMs, earlyNames, early));
+            return recorded(api.conversation(access, system, messages, schema, effort, timeoutMs, earlyNames, early,
+                    tools));
         }
     }
 
@@ -205,11 +201,12 @@ final class ClaudeCuriosity implements CuriosityPort {
     /** The recommended effort for a turn (KTD9); the client's gate drops it where a model refuses it. */
     private static final String TURN_EFFORT = "low";
     /**
-     * Robot 2026-10-02: the reply fields a turn's line needs before it can be spoken (the
-     * repeat check and the name both read them); the rest of the reply (the notes) follows.
+     * Owner 2026-10-03: the tool round's ask for the brain (a preamble, a look), waiting for
+     * toolAsk() to take it, and the one whose look is waiting for lookAnswer(). Only the
+     * turns generation that posted it is ever given it.
      */
-    private static final List<String> EARLY_FIELDS = Arrays.asList("line", "question_asked", "name_given", "action",
-            "target");
+    private volatile ToolBox pendingTool;
+    private volatile ToolBox lookBox;
     /** Robot 2026-10-02: the turns in flight, a speculative one among them (CuriosityPort.TurnFlight). */
     private final TurnFlight flight = new TurnFlight(new TurnFlight.Deliver() {
         @Override
@@ -340,6 +337,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     void release() {
         released = true;
         flight.clear();
+        dropToolAsks();
         speech.cancel();
         // A new adapter is built per Explore start: give back the clients' threads.
         speech.close();
@@ -645,20 +643,22 @@ final class ClaudeCuriosity implements CuriosityPort {
     // ---- the conversation (meeting plan U8; KTD9, KTD10): one multi-turn request per turn, the store, the ears ----
 
     /**
-     * One turn (KTD9): the frozen system prefix from the request's persona snapshot
-     * and notes, the transcript window as user and assistant messages, what was just
-     * heard as the last user message (the opener ask instead for turn 1, with the
-     * face crop sent that once), the reply schema, effort low behind the client's
-     * gate, and this try's budget as the read timeout. Nothing said or heard is logged.
+     * One turn (KTD9; owner 2026-10-03, ChatRound): the frozen system prefix from the
+     * request's persona snapshot and notes, the transcript window as respond calls and the
+     * messages they answered, what was just heard as the last user message (the opener ask
+     * instead for turn 1, with the face crop sent that once), the tools with respond as the
+     * reply, effort low behind the client's gate, and this try's budget as the read timeout.
+     * Nothing said or heard is logged.
      */
     @Override
     public void turn(final TurnRequest request, final long timeoutMs) {
         final int g = turns.start();
+        dropToolAsks();
         // The opener carries the current meeting's own crop, never one a late match left behind.
         final MetFace met = meeting;
         final byte[] face = request.heard == null && request.transcript.isEmpty() && met != null
                 ? met.storeCrop : null;
-        final TurnBody body = turnBody(request, face);
+        final ChatRound.Body body = ChatRound.body(request, face);
         // Robot 2026-10-02: a turn started on the provisional answer answers this one if it asked the same.
         if (flight.adopt(body.key, g) != null) {
             Log.i(TAG, "turn: the request started on the provisional answer is used");
@@ -668,7 +668,7 @@ final class ClaudeCuriosity implements CuriosityPort {
         run(new Runnable() {
             @Override
             public void run() {
-                oneTurn(body, call, timeoutMs, false);
+                oneTurn(body, request, call, timeoutMs, false);
             }
         }, turns, g, Turn.failed());
     }
@@ -676,11 +676,12 @@ final class ClaudeCuriosity implements CuriosityPort {
     /**
      * Robot 2026-10-02: the turn the final answer would ask for, started on the launcher's
      * provisional answer. Its reply waits in the flight, never handed over, until turn()
-     * asks for the same request; a different turn() discards it.
+     * asks for the same request; a different turn() discards it. One that wants a tool is
+     * dropped before it says or looks at anything (owner 2026-10-03).
      */
     @Override
     public void speculateTurn(final TurnRequest request, final long timeoutMs) {
-        final TurnBody body = turnBody(request, null);
+        final ChatRound.Body body = ChatRound.body(request, null);
         final TurnFlight.Call call = flight.speculate(body.key);
         if (call == null || released) {
             return;
@@ -689,60 +690,12 @@ final class ClaudeCuriosity implements CuriosityPort {
             worker.execute(new Runnable() {
                 @Override
                 public void run() {
-                    oneTurn(body, call, timeoutMs, true);
+                    oneTurn(body, request, call, timeoutMs, true);
                 }
             });
         } catch (RuntimeException e) {
             // Shut down with Explore: no speculation.
         }
-    }
-
-    /** One turn's request: the system prefix, the messages, and the key a speculation is matched by. */
-    private static final class TurnBody {
-        final String system;
-        final List<Map<String, Object>> messages;
-        final String key;
-
-        TurnBody(String system, List<Map<String, Object>> messages, String key) {
-            this.system = system;
-            this.messages = messages;
-            this.key = key;
-        }
-    }
-
-    private TurnBody turnBody(TurnRequest request, byte[] face) {
-        String system = ExplorePrompts.systemPrefix(request.persona, request.notes);
-        List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
-        // A conversation that opened faceless invites them down instead of asking the name (robot 2026-10-01);
-        // one a call opened greets them first, before he has seen them (owner 2026-10-02).
-        String first = request.called ? ExplorePrompts.CALL_OPENER
-                : request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name);
-        for (Exchange e : request.transcript) {
-            messages.add(ClaudeApi.message("user", e.heard == null ? first : e.heard));
-            messages.add(ClaudeApi.message("assistant", ExplorePrompts.saidAsJson(e.said == null ? "" : e.said)));
-        }
-        String ask = request.heard == null ? first : request.heard;
-        if (request.avoidQuestion != null) {
-            ask = ask + "\n\n" + ExplorePrompts.avoidQuestion(request.avoidQuestion);
-        }
-        if (request.called && request.heard != null && request.transcript.isEmpty()) {
-            ask = ask + "\n\n" + ExplorePrompts.CALL_WORDS;
-        }
-        if (request.cantSee) {
-            ask = ask + "\n\n" + ExplorePrompts.CANT_SEE;
-        }
-        if (request.faceSeen) {
-            ask = ask + "\n\n" + ExplorePrompts.FACE_SEEN;
-        }
-        if (face != null) {
-            List<Map<String, Object>> content = new ArrayList<Map<String, Object>>();
-            content.add(ClaudeApi.jpegBlock(face));
-            content.add(ClaudeApi.textBlock(ask));
-            messages.add(ClaudeApi.message("user", content));
-        } else {
-            messages.add(ClaudeApi.message("user", ask));
-        }
-        return new TurnBody(system, messages, system + "\u0000" + Json.write(messages));
     }
 
     /**
@@ -760,30 +713,68 @@ final class ClaudeCuriosity implements CuriosityPort {
     }
 
     /**
-     * One turn's request, streamed (robot 2026-10-02): the line goes to the flight as soon as
-     * the line, question and name are known, the whole reply after it. Logged: the request's
-     * shape (message count, system prefix size, max_tokens, schema, effort), when the line was
-     * known and the total, in counts only; nothing said or heard.
+     * One turn's requests, streamed (robot 2026-10-02): the line goes to the flight as soon as
+     * "addressed", the line, question and name are known, the whole reply after it; a tool
+     * round in between (owner 2026-10-03, ChatRound). Logged: the request's shape (message
+     * count, system prefix size, max_tokens, the tools run, effort), when the line was known
+     * and the total, in counts only; nothing said or heard.
      */
-    private void oneTurn(TurnBody body, final TurnFlight.Call call, long timeoutMs, boolean speculative) {
+    private void oneTurn(final ChatRound.Body body, TurnRequest request, final TurnFlight.Call call, final long timeoutMs,
+            boolean speculative) {
         final long t0 = System.currentTimeMillis();
-        ClaudeAccess settings = turnAccess();
+        final ClaudeAccess settings = turnAccess();
         final long fetched = System.currentTimeMillis();
         final long[] earlyAt = {0};
-        streamed.reset();
-        ClaudeApi.MessageResult r = claude.conversation(settings, body.system, body.messages, ExplorePrompts.REPLY_SCHEMA,
-                TURN_EFFORT, (int) timeoutMs, EARLY_FIELDS, new ClaudeApi.EarlyFields() {
-                    @Override
-                    public void complete(Map<String, String> fields) {
-                        earlyAt[0] = System.currentTimeMillis();
-                        // Owner 2026-10-02: "addressed" comes before the line; only a line known to be
-                        // said to him goes early (unknown, as from an unstreamed reply: the whole decides).
-                        flight.early(call, earlyTurn(fields, ClaudeReplies.addressedSoFar(streamed.text())));
-                    }
-                });
+        final ClaudeApi.EarlyFields early = new ClaudeApi.EarlyFields() {
+            @Override
+            public void complete(Map<String, String> fields) {
+                earlyAt[0] = System.currentTimeMillis();
+                // Owner 2026-10-02: "addressed" comes before the line; only a line known to be
+                // said to him goes early (unknown, as from an unstreamed reply: the whole decides).
+                flight.early(call, earlyTurn(fields));
+            }
+        };
+        ChatRound.Outcome o = ChatRound.run(body, request, new ChatRound.Sender() {
+            @Override
+            public ClaudeApi.MessageResult send(List<Map<String, Object>> messages, ClaudeApi.Tools tools) {
+                return claude.conversation(settings, body.system, messages, null, TURN_EFFORT, (int) timeoutMs,
+                        ChatRound.EARLY_FIELDS, early, tools);
+            }
+        }, new ChatRound.Host() {
+            @Override
+            public boolean mayUseTools() {
+                return flight.claimForTools(call);
+            }
+
+            @Override
+            public CuriosityPort.LookResult ask(String preamble, boolean look, long waitMs) {
+                return askTheBrain(call, preamble, look, waitMs);
+            }
+
+            @Override
+            public boolean stillAsked() {
+                return turns.current(call.gen);
+            }
+
+            @Override
+            public Boolean knows(String name) {
+                try {
+                    String[] ids = RobotPeopleClient.idsNamed(app, name);
+                    return Boolean.valueOf(ids != null && ids.length > 0);
+                } catch (IOException | RuntimeException e) {
+                    return null;
+                }
+            }
+        });
         long ms = System.currentTimeMillis() - t0;
-        Turn t = turnOf(r);
+        if (o.dropped) {
+            Log.i(TAG, (speculative && o.tools == null ? "speculative turn wanted a tool: dropped"
+                    : "turn abandoned during its tool round") + " in " + ms + " ms");
+            return;
+        }
+        Turn t = turnOf(o);
         flight.whole(call, t);
+        ClaudeApi.MessageResult r = o.result;
         int count = body.messages.size();
         String effort = settings.isSetUp() && ClaudeApi.takesEffort(settings.model) && !api.effortRefused()
                 ? TURN_EFFORT : "none";
@@ -791,8 +782,8 @@ final class ClaudeCuriosity implements CuriosityPort {
                 + (count == 1 ? " (the opener)" : "") + ": " + (r.ok() ? t.status.toString() : r.describe())
                 + " in " + ms + " ms (settings " + (fetched - t0) + " ms, line at "
                 + (earlyAt[0] == 0 ? "-" : String.valueOf(earlyAt[0] - t0)) + " ms; system "
-                + body.system.length() + " chars, max_tokens " + ClaudeApi.CONVERSATION_MAX_TOKENS + ", "
-                + (api.schemaInPrompt() ? "schema in the prompt" : "json schema") + ", effort " + effort + ")");
+                + body.system.length() + " chars, max_tokens " + ClaudeApi.CONVERSATION_MAX_TOKENS + ", respond tool"
+                + (o.tools == null ? "" : ", tool round: " + o.tools) + ", effort " + effort + ")");
     }
 
     /**
@@ -800,12 +791,12 @@ final class ClaudeCuriosity implements CuriosityPort {
      * turnOf does), or null while it is not known to be said to him: a turn not addressed to
      * him is never spoken, so it waits for the whole reply.
      */
-    private static Turn earlyTurn(Map<String, String> fields, Boolean addressed) {
-        if (!Boolean.TRUE.equals(addressed)) {
+    private static Turn earlyTurn(Map<String, String> fields) {
+        if (!"true".equals(fields.get("addressed"))) {
             return null;
         }
         Map<String, Object> json = new LinkedHashMap<String, Object>(fields);
-        json.put("addressed", addressed);
+        json.put("addressed", Boolean.TRUE);
         Turn t = ClaudeReplies.turn(json, null);
         if (t.status != Turn.Status.LINE || t.nameGiven == null) {
             return t;
@@ -814,72 +805,99 @@ final class ClaudeCuriosity implements CuriosityPort {
                 .withAction(t.action, t.target);
     }
 
-    /**
-     * A transport that keeps the text of the reply streaming on this thread (owner 2026-10-02),
-     * read only by the turn's early check for "addressed"; nothing in it is logged.
-     */
-    private static final class StreamedText implements ClaudeApi.StreamingTransport {
-        private static final int MAX_CHARS = 4000;
-        private final ClaudeApi.StreamingTransport inner;
-        private final ThreadLocal<StringBuilder> text = new ThreadLocal<StringBuilder>() {
-            @Override
-            protected StringBuilder initialValue() {
-                return new StringBuilder();
+    /** Owner 2026-10-03: a tool round's ask, handed to the brain through toolAsk(); a look waits for its answer. */
+    private static final class ToolBox {
+        final int gen;
+        final CuriosityPort.ToolAsk ask;
+        private final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        private volatile CuriosityPort.LookResult result;
+
+        ToolBox(int gen, CuriosityPort.ToolAsk ask) {
+            this.gen = gen;
+            this.ask = ask;
+        }
+
+        void complete(CuriosityPort.LookResult r) {
+            result = r;
+            done.countDown();
+        }
+
+        CuriosityPort.LookResult await(long ms) {
+            try {
+                done.await(ms, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
-        };
-
-        StreamedText(ClaudeApi.StreamingTransport inner) {
-            this.inner = inner;
-        }
-
-        /** A new request on this thread starts with no text. */
-        void reset() {
-            text.get().setLength(0);
-        }
-
-        String text() {
-            return text.get().toString();
-        }
-
-        @Override
-        public ClaudeApi.Response send(ClaudeApi.Request request) throws IOException {
-            return inner.send(request);
-        }
-
-        @Override
-        public ClaudeApi.Response stream(ClaudeApi.Request request, final ClaudeApi.LineSink sink) throws IOException {
-            final StringBuilder b = text.get();
-            b.setLength(0);
-            return inner.stream(request, new ClaudeApi.LineSink() {
-                @Override
-                public void line(String l) {
-                    // Before the sink: its early fields are told from inside sink.line().
-                    if (l != null && l.startsWith("data:") && b.length() < MAX_CHARS) {
-                        Object ev;
-                        try {
-                            ev = Json.parse(l.substring(5).trim());
-                        } catch (RuntimeException e) {
-                            ev = null;
-                        }
-                        if (ev instanceof Map && "content_block_delta".equals(((Map<?, ?>) ev).get("type"))) {
-                            Object d = ((Map<?, ?>) ev).get("delta");
-                            Object t = d instanceof Map ? ((Map<?, ?>) d).get("text") : null;
-                            if (t instanceof String) {
-                                b.append((String) t);
-                            }
-                        }
-                    }
-                    sink.line(l);
-                }
-            });
+            return result;
         }
     }
 
-    /** The client's reason as the brain's turn status; a name given passes NameExtractor's word list first. */
-    private static Turn turnOf(ClaudeApi.MessageResult r) {
+    /** Posts the ask for the turn this call answers; with a look, waits for the frame (null: none came). */
+    private CuriosityPort.LookResult askTheBrain(TurnFlight.Call call, String preamble, boolean look, long waitMs) {
+        ToolBox box = new ToolBox(call.gen, new CuriosityPort.ToolAsk(preamble, look));
+        if (box.ask.preamble == null && !look) {
+            return null;
+        }
+        pendingTool = box;
+        if (!look) {
+            return null;
+        }
+        Log.i(TAG, "tool round: waiting for a look");
+        return box.await(waitMs);
+    }
+
+    @Override
+    public CuriosityPort.ToolAsk toolAsk() {
+        ToolBox b = pendingTool;
+        if (b == null) {
+            return null;
+        }
+        pendingTool = null;
+        if (!turns.current(b.gen)) {
+            b.complete(null);
+            return null;
+        }
+        if (b.ask.look) {
+            lookBox = b;
+        }
+        return b.ask;
+    }
+
+    @Override
+    public void lookAnswer(CuriosityPort.LookResult result) {
+        ToolBox b = lookBox;
+        lookBox = null;
+        if (b != null) {
+            b.complete(result);
+        }
+    }
+
+    /** A new or abandoned turn: an ask not yet taken is dropped, and a look still waited for ends now. */
+    private void dropToolAsks() {
+        ToolBox p = pendingTool;
+        pendingTool = null;
+        if (p != null) {
+            p.complete(null);
+        }
+        ToolBox l = lookBox;
+        lookBox = null;
+        if (l != null) {
+            l.complete(null);
+        }
+    }
+
+    /**
+     * The client's reason as the brain's turn status, from the reply's fields (respond's
+     * input); a name given passes NameExtractor's word list first.
+     */
+    private static Turn turnOf(ChatRound.Outcome o) {
+        ClaudeApi.MessageResult r = o.result;
         if (r.ok()) {
-            Object delta = r.json.get("notes_update");
-            Turn t = ClaudeReplies.turn(r.json, delta instanceof Map ? Json.write(delta) : null);
+            if (o.reply == null) {
+                return Turn.failed();
+            }
+            Object delta = o.reply.get("notes_update");
+            Turn t = ClaudeReplies.turn(o.reply, delta instanceof Map ? Json.write(delta) : null);
             if (t.status != Turn.Status.LINE || t.nameGiven == null) {
                 return t;
             }
@@ -909,6 +927,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     public void cancelTurn() {
         turns.cancel();
         flight.cancel();
+        dropToolAsks();
     }
 
     @Override

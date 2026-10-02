@@ -767,6 +767,12 @@ public final class ExploreBrainHarness {
         CuriosityPort.Turn pendingTurn;
         long pendingTurnAt;
         int turnCancels;
+        /** Owner 2026-10-03: a tool round asked on the nth turn, once; its answer waits for the look's answer. */
+        final java.util.Map<Integer, CuriosityPort.ToolAsk> toolAsksOn = new java.util.HashMap<Integer, CuriosityPort.ToolAsk>();
+        CuriosityPort.ToolAsk pendingToolAsk;
+        boolean awaitingLook;
+        final List<CuriosityPort.LookResult> lookAnswers = new ArrayList<CuriosityPort.LookResult>();
+        final List<Long> lookAnswerTimes = new ArrayList<Long>();
         /** Every notes delta and forget the brain asked for ("id: delta"; id), and what the store answers. */
         final List<String> notesDeltas = new ArrayList<String>();
         CuriosityPort.Done notesResult = CuriosityPort.Done.OK;
@@ -1723,12 +1729,35 @@ public final class ExploreBrainHarness {
             turnAsks.add(new TurnAsk(now, brain.state().name(), request, timeoutMs));
             pendingTurn = turns == null ? null : turns.answer(this, request, turnAsks.size());
             pendingTurnAt = now + turnDelayMs;
+            pendingToolAsk = toolAsksOn.remove(turnAsks.size());
+            awaitingLook = pendingToolAsk != null && pendingToolAsk.look;
             log.add(new Event(now, "turn"));
         }
 
         @Override
+        public CuriosityPort.ToolAsk toolAsk() {
+            CuriosityPort.ToolAsk a = pendingToolAsk;
+            pendingToolAsk = null;
+            if (a != null) {
+                log.add(new Event(now, "tool ask" + (a.look ? " look" : "") + (a.preamble != null ? " preamble" : "")));
+            }
+            return a;
+        }
+
+        @Override
+        public void lookAnswer(CuriosityPort.LookResult r) {
+            lookAnswers.add(r);
+            lookAnswerTimes.add(now);
+            awaitingLook = false;
+            // The second request starts once the look is in.
+            pendingTurnAt = Math.max(pendingTurnAt, now + turnDelayMs);
+            log.add(new Event(now, "look answer " + (r.refused == null
+                    ? new String(r.jpeg, java.nio.charset.StandardCharsets.US_ASCII) + " " + r.labels : "refused")));
+        }
+
+        @Override
         public CuriosityPort.Turn turnAnswer() {
-            if (pendingTurn == null || now < pendingTurnAt) {
+            if (pendingTurn == null || now < pendingTurnAt || awaitingLook) {
                 return null;
             }
             CuriosityPort.Turn t = pendingTurn;
@@ -14043,17 +14072,6 @@ public final class ExploreBrainHarness {
                             + "/" + away.target + " find=" + find.action + " unknown=" + unknown.action + " empty="
                             + empty.status);
         });
-        scenario("replies_addressed_so_far_reads_the_streamed_prefix", n -> {
-            Boolean no = ClaudeReplies.addressedSoFar("```json\n{\"addressed\": false, \"li");
-            Boolean yes = ClaudeReplies.addressedSoFar("{\"addressed\":true,\"line\":\"Hi");
-            Boolean open = ClaudeReplies.addressedSoFar("{\"addre");
-            Boolean half = ClaudeReplies.addressedSoFar("{\"addressed\": fal");
-            Boolean none = ClaudeReplies.addressedSoFar("{\"line\":\"Hi.\"");
-            Boolean nul = ClaudeReplies.addressedSoFar(null);
-            check(n, Boolean.FALSE.equals(no) && Boolean.TRUE.equals(yes) && open == null && half == null
-                            && none == null && nul == null,
-                    no + " " + yes + " " + open + " " + half + " " + none + " " + nul);
-        });
         scenario("intent_go_away_ends_after_the_line_turns_away_and_leaves_them_alone_10_min", n -> {
             Rig rig = sarahRig(true);
             List<String> notes = traced(rig);
@@ -15368,7 +15386,9 @@ public final class ExploreBrainHarness {
                     "first=" + first + " asks=" + rig.turnAsks.size() + " open2@" + open2 + " " + gauges(rig) + " "
                             + states(rig));
         });
-        scenario("chat_the_charger_mid_conversation_lets_it_finish_and_drives_no_resume_leg", n -> {
+        scenario("chat_docking_mid_conversation_keeps_it_going_then_docks_quietly_with_no_resume_leg", n -> {
+            // Owner 2026-10-03: the charger arriving mid-conversation no longer ends it; it goes on
+            // until it ends as any would, then DOCKED's quiet applies and no resume leg is driven.
             long[] dock = {Long.MAX_VALUE};
             Rig rig = chatRig(cueTuning(), t -> t >= dock[0] ? charger(t) : clear(t), personAt(bearingOf(-90f), 25), true);
             rig.traceNotes = traced(rig);
@@ -15377,16 +15397,122 @@ public final class ExploreBrainHarness {
             long open = openChat(rig);
             long say2 = runUntilEvent(rig, "say Line 2.", open, open + 30000);
             dock[0] = say2 + 100;
+            long say3 = runUntilEvent(rig, "say Line 3.", say2, say2 + 30000);
+            long say4 = runUntilEvent(rig, "say Line 4.", say2, say2 + 30000);
             long over = chatOver(rig, say2);
-            int closed = rig.firstAfter("ears close", say2);
+            long docked = runUntilState(rig, ExploreBrain.State.DOCKED, over - 1, over + 5000);
             rig.runUntil(over + 15000);
             List<String> notes = rig.traceNotes;
-            check(n, open > 0 && say2 > 0 && over > 0 && rig.count("react sign-off") == 1 && rig.turnAsks.size() == 2
-                            && closed < 0 && rig.count("ears close") == 0 && rig.notesDeltas.size() == 2
+            check(n, open > 0 && say2 > 0 && say3 > say2 && say4 > say3 && over > say4 && docked >= over
+                            && rig.turnAsks.size() == 4 && rig.count("react sign-off") == 1
                             && rig.countPrefix("turn RIGHT", over, over + 6000) == 0
+                            && rig.countPrefix("turn LEFT", over, over + 6000) == 0
                             && rig.countPrefix("hop", over, over + 6000) == 0
+                            && !anyContains(notes, "charger connected")
                             && anyContains(notes, "on the charger: no resume leg") && rig.violations.isEmpty(),
-                    "say2@" + say2 + " over@" + over + " closed@" + rig.timeOf(closed) + " " + rig.tail());
+                    "say2@" + say2 + " say3@" + say3 + " say4@" + say4 + " over@" + over + " docked@" + docked
+                            + " asks=" + rig.turnAsks.size() + " " + rig.tail());
+        });
+        scenario("chat_tools_texts_share_no_one_elses_notes_and_no_bathroom", n -> {
+            // Owner 2026-10-03: recall_person gives the current person's notes only; about anyone
+            // else, only whether he knows the name. places leaves bathroom looks out; a preamble is
+            // one short sentence, and a long text is no preamble (never said twice).
+            String self = ChatTools.recall("", "Sarah", "{\"interests\":[\"climbing\"]}", null);
+            String byName = ChatTools.recall("sarah", "Sarah", "{\"interests\":[\"climbing\"]}", null);
+            String other = ChatTools.recall("Tom", "Sarah", "{\"interests\":[\"climbing\"]}", Boolean.TRUE);
+            String stranger = ChatTools.recall("Tom", "Sarah", "{}", Boolean.FALSE);
+            String noStore = ChatTools.recall("Tom", null, null, null);
+            String places = ChatTools.placesText(java.util.Arrays.asList(
+                    new ChatTools.Place(60000, java.util.Arrays.asList("chair", "desk")),
+                    new ChatTools.Place(120000, java.util.Arrays.asList("sink", "toilet")),
+                    new ChatTools.Place(180000, java.util.Arrays.asList("chair", "desk")),
+                    new ChatTools.Place(600000, java.util.Arrays.asList("potted plant"))),
+                    ExploreBrain.BATHROOM_STRONG);
+            String none = ChatTools.placesText(new ArrayList<ChatTools.Place>(), ExploreBrain.BATHROOM_STRONG);
+            String status = ChatTools.statusText(56, true, false, false, 23 * 60000L, null);
+            check(n, self.contains("Sarah") && self.contains("climbing") && byName.contains("climbing")
+                            && other.contains("has met someone called Tom") && !other.contains("climbing")
+                            && stranger.contains("doesn't know anyone called Tom") && noStore.contains("can't check")
+                            && places.contains("1 min ago: chair, desk") && !places.contains("toilet")
+                            && !places.contains("sink") && !places.contains("3 min") && places.contains("10 min ago: potted plant")
+                            && none.contains("no places") && status.contains("about 56%") && status.contains("charging")
+                            && status.contains("23 min")
+                            && "Let me look.".equals(ChatTools.preamble("  Let me look.  "))
+                            && "Hmm, one second!".equals(ChatTools.preamble("Hmm, one second! I'll check."))
+                            && ChatTools.preamble("") == null
+                            && ChatTools.preamble("Well, I can see a really lovely desk with three monitors and a coffee "
+                                    + "mug on it right now") == null
+                            && ChatTools.saidInput("Hi.").keySet().toString().equals(
+                                    ExplorePrompts.REPLY_SCHEMA.get("required").toString()),
+                    self + " | " + other + " | " + places + " | " + status);
+        });
+        scenario("chat_tool_round_says_the_preamble_then_looks_with_the_detector_and_waits_for_the_line", n -> {
+            // Owner 2026-10-03: a turn that calls look says its preamble first (the detector parked,
+            // KTD7), then unparks for one fresh frame, which goes to the port with its labels;
+            // the line comes after, and the turn's deadline was moved out for the round.
+            Rig rig = sarahRig(true);
+            List<String> notes = traced(rig);
+            rig.people.listen = ListenScript.turns(hearWords("what can you see"));
+            rig.toolAsksOn.put(2, new CuriosityPort.ToolAsk("Let me look.", true));
+            long open = openChat(rig);
+            long say1 = runUntilEvent(rig, "say Line 1.", open, open + 30000);
+            long pre = runUntilEvent(rig, "say Let me look.", say1, say1 + 30000);
+            long say2 = runUntilEvent(rig, "say Line 2.", say1, say1 + 30000);
+            long ask = rig.timeOf(rig.firstAfter("tool ask look preamble", say1));
+            long unpark = rig.timeOf(rig.firstAfter("unpark", pre));
+            long answered = rig.lookAnswerTimes.isEmpty() ? -1 : rig.lookAnswerTimes.get(0);
+            CuriosityPort.LookResult r = rig.lookAnswers.isEmpty() ? null : rig.lookAnswers.get(0);
+            String jpeg = r == null || r.jpeg == null ? "" : new String(r.jpeg, java.nio.charset.StandardCharsets.US_ASCII);
+            long shot = jpeg.startsWith("jpeg@") ? Long.parseLong(jpeg.substring(5)) : -1;
+            check(n, open > 0 && say1 > 0 && ask > say1 && pre >= ask && unpark >= pre + rig.speechMs
+                            && r != null && r.refused == null && shot >= unpark && r.labels.contains("person")
+                            && answered >= shot && say2 > answered && rig.turnAsks.size() == 2
+                            && rig.lookAnswers.size() == 1 && anyContains(notes, "a tool round with a look, said first")
+                            && rig.violations.isEmpty(),
+                    "ask@" + ask + " pre@" + pre + " unpark@" + unpark + " answered@" + answered + " shot=" + jpeg
+                            + " say2@" + say2 + " " + rig.tail());
+        });
+        scenario("chat_tool_look_in_do_not_disturb_or_bathroom_privacy_is_refused_without_a_frame", n -> {
+            // Owner 2026-10-03: the look tool's frame never leaves in bathroom privacy, nor in do
+            // not disturb. A frame that itself shows a bathroom ends the conversation quietly
+            // (privacy first) and nothing is handed to the port; with the lease lost the camera
+            // rule refuses the look at once, with no unpark, and the line still comes.
+            long[] toilet = {Long.MAX_VALUE};
+            Vision person = personAt(bearingOf(-90f), 25);
+            Rig bath = chatRig(cueTuning(), CLEAR, (r, t) -> {
+                List<Detection> seen = new ArrayList<Detection>(person.see(r, t));
+                if (t >= toilet[0]) {
+                    seen.add(box("toilet", 0.6f, 0.5f, 0.6f, 0.3f, 0.4f));
+                }
+                return seen;
+            }, true).started();
+            List<String> notes = traced(bath);
+            bath.people.listen = ListenScript.turns(hearWords("what can you see"));
+            bath.toolAsksOn.put(2, new CuriosityPort.ToolAsk(null, true));
+            long open = openChat(bath);
+            long say1 = runUntilEvent(bath, "say Line 1.", open, open + 30000);
+            toilet[0] = say1 + 100;
+            long over = chatOver(bath, say1);
+            boolean noFrame = true;
+            for (CuriosityPort.LookResult r : bath.lookAnswers) {
+                noFrame &= r.jpeg == null;
+            }
+            Rig lost = sarahRig(true);
+            lost.people.listen = ListenScript.turns(hearWords("look at this"));
+            lost.toolAsksOn.put(2, new CuriosityPort.ToolAsk(null, true));
+            long open2 = openChat(lost);
+            long say21 = runUntilEvent(lost, "say Line 1.", open2, open2 + 30000);
+            lost.at(say21 + 100, () -> lost.brain.onLeaseChanged(false));
+            long say22 = runUntilEvent(lost, "say Line 2.", say21, say21 + 30000);
+            CuriosityPort.LookResult r2 = lost.lookAnswers.isEmpty() ? null : lost.lookAnswers.get(0);
+            int unparks = lost.countPrefix("unpark", say21, say22);
+            check(n, open > 0 && say1 > 0 && over > say1 && noFrame && bath.count("say Line 2.") == 0
+                            && anyContains(notes, "the conversation ends quietly") && bath.brain.bathroomPrivate()
+                            && open2 > 0 && say22 > say21 && r2 != null && r2.jpeg == null && r2.refused != null
+                            && r2.refused.contains("camera") && unparks == 0
+                            && bath.violations.isEmpty() && lost.violations.isEmpty(),
+                    "bath: over@" + over + " answers=" + bath.lookAnswers.size() + " lost: refused="
+                            + (r2 == null ? null : r2.refused) + " unparks=" + unparks + " " + bath.tail());
         });
         scenario("chat_lease_lost_mid_conversation_continues_without_the_look_and_a_6_s_sensor_stall_ends_it", n -> {
             Rig lost = sarahRig(true);

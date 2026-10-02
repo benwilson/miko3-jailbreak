@@ -61,6 +61,8 @@ final class SensorReading {
      * on the owner's dock tof is at its fault value while POWER says charging. The brain
      * debounces leaving the dock (ExploreTuning.dockOffReadings). */
     final Boolean docked;
+    /** Owner 2026-10-03: POWER's battery percentage (its 7th field), or -1 when the reply had none. */
+    final int batteryPercent;
 
     /** No wheel counts and no gyro. */
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault) {
@@ -95,11 +97,21 @@ final class SensorReading {
                 charger, hasAccel, accelX, accelY, accelZ, null);
     }
 
-    /** Every field, POWER's dock verdict included (null for none). */
+    /** Every field but the battery, POWER's dock verdict included (null for none). */
     SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault, boolean hasWheels,
                   long wheelLeft, long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ,
                   boolean charger, boolean hasAccel, int accelX, int accelY, int accelZ, Boolean docked) {
+        this(timestampMs, tof, ir1, ir2, cpl, fault, hasWheels, wheelLeft, wheelRight, hasGyro, gyroX, gyroY, gyroZ,
+                charger, hasAccel, accelX, accelY, accelZ, docked, -1);
+    }
+
+    /** Every field, POWER's dock verdict and battery percentage (-1 for none) included. */
+    SensorReading(long timestampMs, int tof, int ir1, int ir2, Integer cpl, boolean fault, boolean hasWheels,
+                  long wheelLeft, long wheelRight, boolean hasGyro, int gyroX, int gyroY, int gyroZ,
+                  boolean charger, boolean hasAccel, int accelX, int accelY, int accelZ, Boolean docked,
+                  int batteryPercent) {
         this.docked = docked;
+        this.batteryPercent = batteryPercent >= 0 && batteryPercent <= 100 ? batteryPercent : -1;
         this.charger = charger;
         this.hasAccel = hasAccel;
         this.accelX = hasAccel ? accelX : 0;

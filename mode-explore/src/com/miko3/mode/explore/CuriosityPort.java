@@ -268,6 +268,20 @@ interface CuriosityPort extends AnswerParser.Names {
     }
 
     /**
+     * Owner 2026-10-03: the turn under way called a tool (look, recall_person, robot_status,
+     * places) and asks the conversation for its part, once: a short preamble to say now
+     * (null for none) and, for look, a fresh camera frame (answered through lookAnswer).
+     * Null when there is nothing to ask. Only the turn() asked last ever asks.
+     */
+    default ToolAsk toolAsk() {
+        return null;
+    }
+
+    /** The answer to the last ToolAsk's look: a fresh frame and its labels, or why there is none. */
+    default void lookAnswer(LookResult result) {
+    }
+
+    /**
      * Merge a notes delta into this person's record through the People store
      * (KTD10, drain-on-persist). Carries no lines and no transcript.
      */
@@ -1151,6 +1165,62 @@ interface CuriosityPort extends AnswerParser.Names {
     }
 
     /**
+     * Owner 2026-10-03: what a turn's tools may tell Claude about him, as the brain saw it
+     * when the request was built (robot_status and places): fixed-format text, never a
+     * frame, a transcript or anyone's notes. NONE when the brain gave nothing.
+     */
+    final class ToolFacts {
+        static final ToolFacts NONE = new ToolFacts("Nothing is known about his state right now.",
+                "He remembers no places right now.");
+
+        final String status;
+        final String places;
+
+        ToolFacts(String status, String places) {
+            this.status = status == null || status.trim().isEmpty() ? NONE.status : status.trim();
+            this.places = places == null || places.trim().isEmpty() ? NONE.places : places.trim();
+        }
+    }
+
+    /** Owner 2026-10-03: a tool round's ask of the conversation: a preamble to say (or null), and a look. */
+    final class ToolAsk {
+        final String preamble;
+        final boolean look;
+
+        ToolAsk(String preamble, boolean look) {
+            String p = preamble == null ? "" : preamble.trim();
+            this.preamble = p.isEmpty() ? null : p;
+            this.look = look;
+        }
+    }
+
+    /**
+     * Owner 2026-10-03: the look tool's frame and the detector's labels in it, or why he
+     * can't look now (refused: bathroom privacy, do not disturb, no camera, no frame in time).
+     */
+    final class LookResult {
+        final byte[] jpeg;
+        final List<String> labels;
+        /** Null when the frame is here; else a short reason Claude can read. */
+        final String refused;
+
+        private LookResult(byte[] jpeg, List<String> labels, String refused) {
+            this.jpeg = jpeg;
+            this.labels = labels == null ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(labels));
+            this.refused = refused;
+        }
+
+        static LookResult of(byte[] jpeg, List<String> labels) {
+            return jpeg == null ? refused("the camera gave no picture") : new LookResult(jpeg, labels, null);
+        }
+
+        static LookResult refused(String why) {
+            return new LookResult(null, null, why == null || why.trim().isEmpty() ? "he can't look right now" : why);
+        }
+    }
+
+    /**
      * One turn's request (KTD9): the persona snapshot taken when the conversation
      * began (KTD11), the person's name (null for a stranger), their notes
      * rendered as data (null when none), the transcript window, and what was
@@ -1189,6 +1259,8 @@ interface CuriosityPort extends AnswerParser.Names {
          * them with no usable face): this turn invites them down to his level. Once.
          */
         final boolean cantSee;
+        /** Owner 2026-10-03: what robot_status and places answer with for this turn. */
+        final ToolFacts facts;
 
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard) {
             this(persona, name, notes, transcript, heard, null);
@@ -1206,6 +1278,13 @@ interface CuriosityPort extends AnswerParser.Names {
 
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
                     String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee) {
+            this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called, cantSee, null);
+        }
+
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
+                    String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee,
+                    ToolFacts facts) {
+            this.facts = facts == null ? ToolFacts.NONE : facts;
             this.called = called;
             this.cantSee = cantSee;
             this.persona = persona;
@@ -1221,19 +1300,25 @@ interface CuriosityPort extends AnswerParser.Names {
         /** This request again, with the repeated question to avoid. */
         TurnRequest avoiding(String question) {
             return new TurnRequest(persona, name, notes, transcript, heard, question, faceless, faceSeen, called,
-                    cantSee);
+                    cantSee, facts);
         }
 
         /** This request as one in a conversation that opened faceless, with or without a face since. */
         TurnRequest face(boolean openedFaceless, boolean seenSince) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, openedFaceless, seenSince,
-                    called, cantSee);
+                    called, cantSee, facts);
         }
 
         /** This request in a conversation a call opened (owner 2026-10-02), with or without the crouch invitation. */
         TurnRequest call(boolean openedOnACall, boolean cantSeeThem) {
             return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen,
-                    openedOnACall, cantSeeThem);
+                    openedOnACall, cantSeeThem, facts);
+        }
+
+        /** This request with what robot_status and places answer (owner 2026-10-03). */
+        TurnRequest withFacts(ToolFacts f) {
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
+                    cantSee, f);
         }
 
         /** The opener: nothing heard yet. */
@@ -1328,6 +1413,19 @@ interface CuriosityPort extends AnswerParser.Names {
         synchronized Call start(String key, int g) {
             dropTail();
             return new Call(key, g);
+        }
+
+        /**
+         * Owner 2026-10-03: whether this call may run a tool round (say a preamble, take a
+         * look): true once a turn() it answers is still asked. A speculation nobody has asked
+         * for yet is dropped instead, so the turn() that follows starts afresh.
+         */
+        synchronized boolean claimForTools(Call c) {
+            if (c == speculation) {
+                speculation = null;
+                return false;
+            }
+            return c.gen > 0;
         }
 
         /** Its line is known (a LINE turn with no notes yet): handed over now when its turn() asked for it. */
