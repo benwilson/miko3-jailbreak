@@ -1352,7 +1352,11 @@ class InstructionsAndAddressedTest(unittest.TestCase):
         self.assertNotIn("action (", pre)
         self.assertNotIn("target (", pre)
         guard = ConversationWiringTest.java_string(self.prompts(), "GUARD")
-        self.assertIn("except moving himself and short errands with his action tools", guard)
+        # Robot 2026-10-02 15:22: "errands for other people" made Haiku decline "go to the kitchen and
+        # see if anyone's there"; he declines only what he physically can't do.
+        self.assertIn("he declines only what he physically can't do", guard)
+        self.assertIn("he does with his action tools", guard)
+        self.assertNotIn("errands for other people", guard)
 
     def test_the_early_line_waits_for_addressed_from_the_stream(self):
         a = code_only(src("ClaudeCuriosity.java"))
