@@ -291,7 +291,7 @@ final class ChatActions {
         }
 
         static Verdict cant(String why) {
-            return new Verdict(null, "can't: " + why + ". Say so honestly in the line.");
+            return new Verdict(null, "can't: " + why + ". Say so plainly in the line; don't offer to do it in a moment.");
         }
     }
 

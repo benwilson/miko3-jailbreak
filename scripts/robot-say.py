@@ -185,25 +185,47 @@ class LogStream:
     """`adb logcat` for the launcher's and Explore's tags from now on, read on a thread."""
 
     def __init__(self, robot):
+        self.robot = robot
+        self.closed = False
         since = robot.device_time()
+        self._start(since)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _start(self, since):
         # `adb logcat` hands its arguments over as they are (robot 2026-10-02: a quoted time
         # reached logcat with its quotes, "not in time format", and the reader saw nothing).
         args = ["logcat", "-v", "time"] + (["-T", since] if since else ["-T", "1"]) + ["-s"]
         args += [f"{t}:D" for t in TAGS]
-        self.proc = subprocess.Popen(robot.cmd(*args), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        self.proc = subprocess.Popen(self.robot.cmd(*args), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                      text=True, errors="replace")
-        self.lines = queue.Queue()
+        if not hasattr(self, "lines"):
+            self.lines = queue.Queue()
         self.skip_first = not since
-        threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self):
-        for line in self.proc.stdout:
-            if self.skip_first:
-                self.skip_first = False
-                continue
-            parsed = parse_log(line)
-            if parsed:
-                self.lines.put(parsed)
+        # Robot 2026-10-02 after a reboot: the crash reporter flooded the log and the stream
+        # ended mid-run, so the script waited 45 s for a listen that had already opened.
+        # When the stream ends, reconnect from the last line's time.
+        last = None
+        seen = None
+        while not self.closed:
+            for line in self.proc.stdout:
+                if self.skip_first:
+                    self.skip_first = False
+                    continue
+                stamp = line[:18] if len(line) > 18 and line[2] == "-" and line[5] == " " else None
+                if stamp:
+                    if seen is not None and stamp <= seen:
+                        continue  # the reconnect's -T repeats lines already read
+                    last = stamp
+                parsed = parse_log(line)
+                if parsed:
+                    self.lines.put(parsed)
+            if self.closed:
+                break
+            time.sleep(0.5)
+            seen = last
+            self._start(last)
 
     def get(self, timeout):
         try:
@@ -212,6 +234,7 @@ class LogStream:
             return None
 
     def close(self):
+        self.closed = True
         try:
             self.proc.terminate()
         except OSError:

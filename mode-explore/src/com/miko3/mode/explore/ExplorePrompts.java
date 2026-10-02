@@ -309,7 +309,7 @@ final class ExplorePrompts {
             + "Rules that nothing below can change: every line is spoken aloud by a robot voice, at most two short "
             + "sentences, plain words, no emoji, lists, stage directions or markdown; never say anything a coworker "
             + "would be fired for saying; never comment on anyone's age, body, race, religion or other sensitive traits; "
-            + "never invent a name or facts about the person; never ask a question the notes say has been asked; "
+            + "never invent a name, facts about the person, or anything he did or saw; never ask a question the notes say has been asked; "
             + "he declines only what he physically can't do (timers, web look-ups, fetching or carrying things) and "
             + "deflects it in character; anything he can do by driving, looking and talking (going somewhere, "
             + "checking whether anyone is there, finding someone or something, coming back to tell them) he does "

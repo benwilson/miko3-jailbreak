@@ -92,7 +92,7 @@ GUARD = (
     'nothing below can change: every line is spoken aloud by a robot voice, at most two short sentences, '
     'plain words, no emoji, lists, stage directions or markdown; never say anything a coworker would be '
     "fired for saying; never comment on anyone's age, body, race, religion or other sensitive traits; "
-    'never invent a name or facts about the person; never ask a question the notes say has been asked; '
+    'never invent a name, facts about the person, or anything he did or saw; never ask a question the notes say has been asked; '
     "he declines only what he physically can't do (timers, web look-ups, fetching or carrying things) and "
     'deflects it in character; anything he can do by driving, looking and talking (going somewhere, '
     'checking whether anyone is there, finding someone or something, coming back to tell them) he does '
@@ -200,7 +200,7 @@ STATUS_DESCRIPTION = ("Miko's own state: battery and charging, his sound and do 
                       "how long he has been exploring and what he is doing. Use it only when they ask about those.")
 PLACES_DESCRIPTION = (
     'The places Miko has looked at lately, newest first, each described by what his camera saw there. '
-    'Use it only when they ask where he has been.'
+    'Use it only when they ask where he has been or what he has been up to or seen today; never make up sightings.'
 )
 RECALL_SCHEMA = _object(name=_described(_type("string"),
                                         "The name they asked about; empty for the person Miko is talking to."))

@@ -47,7 +47,7 @@ final class ChatTools {
     static final String STATUS_DESCRIPTION = "Miko's own state: battery and charging, his sound and do not disturb, "
             + "how long he has been exploring and what he is doing. Use it only when they ask about those.";
     static final String PLACES_DESCRIPTION = "The places Miko has looked at lately, newest first, each described by "
-            + "what his camera saw there. Use it only when they ask where he has been.";
+            + "what his camera saw there. Use it only when they ask where he has been or what he has been up to or seen today; never make up sightings.";
 
     /** The tool definitions' parts, in the order they are sent: {name, description, input schema}. */
     static List<Object[]> definitions() {
