@@ -111,26 +111,16 @@ class GeneratedClipsTest(unittest.TestCase):
         bodies = [p.read_bytes() for p in self.reacts()]
         self.assertEqual(len(set(bodies)), len(bodies))
 
-    def test_reactions_sit_in_the_deeper_register(self):
-        # Same voice as the songs, deeper than the startle chirps (camera plan U6): the median
-        # voiced window of every reaction crosses zero less often than any startle window.
-        def rates(p):
+    def test_startles_are_a_soft_oops_quieter_than_everything_else(self):
+        # Owner 2026-10-02: the old rising "whoa" chirp was "pretty loud and annoying" when the
+        # floor sensor fires often; the startle is now a soft falling "oops" in the same voice.
+        def peak(p):
             with wave.open(str(p)) as w:
-                samples = array.array("h", w.readframes(w.getnframes()))
-            win = gen.RATE // 20
-            out = []
-            for start in range(0, len(samples) - win, win):
-                chunk = samples[start:start + win]
-                if max(abs(x) for x in chunk) < 3000:
-                    continue
-                out.append(sum(1 for a, b in zip(chunk, chunk[1:]) if (a < 0) != (b < 0)))
-            return out
-        startle_floor = min(min(rates(p)) for p in self.startles())
-        for p in self.reacts():
-            r = sorted(rates(p))
-            self.assertTrue(r, f"{p.name} has no voiced window")
-            median = r[len(r) // 2]
-            self.assertLess(median, startle_floor, p.name)
+                return max(abs(x) for x in array.array("h", w.readframes(w.getnframes())))
+        loudest_startle = max(peak(p) for p in self.startles())
+        self.assertLessEqual(loudest_startle, int(0.22 * 32767))
+        for p in self.songs() + self.reacts():
+            self.assertLess(loudest_startle, peak(p), p.name)
 
     # The bathroom privacy beep (owner 2026-10-02: "he beeps every five seconds and tries
     # to escape the bathroom"): one short, unmistakable two-tone beep, played through the
@@ -179,7 +169,9 @@ class GeneratedClipsTest(unittest.TestCase):
             with wave.open(str(p)) as w:
                 samples = array.array("h", w.readframes(w.getnframes()))
             peak = max(abs(s) for s in samples)
-            self.assertGreater(peak, 8000, f"{p.name} is too quiet")
+            # The startle "oops" is deliberately soft (owner 2026-10-02); still clearly audible.
+            floor = 3000 if p.name.startswith("startle-") else 8000
+            self.assertGreater(peak, floor, f"{p.name} is too quiet")
             self.assertLess(peak, 32767, f"{p.name} clips")
 
     def test_clip_starts_and_ends_near_silence(self):
@@ -202,6 +194,19 @@ class GeneratedClipsTest(unittest.TestCase):
             committed = ASSETS / p.name
             self.assertTrue(committed.exists(), f"{committed} missing; run scripts/gen-explore-sounds.py")
             self.assertEqual(committed.read_bytes(), p.read_bytes(), p.name)
+
+
+class StartleGapTest(unittest.TestCase):
+    """The startle plays at most once every 20 s (owner 2026-10-02)."""
+
+    def test_clip_player_spaces_startles_20_s_apart(self):
+        src = (Path(__file__).resolve().parents[2] / "mode-explore" / "src" / "com" / "miko3" / "mode"
+               / "explore" / "ClipPlayer.java").read_text()
+        self.assertRegex(src, r"STARTLE_MIN_GAP_MS\s*=\s*20000")
+        body = src[src.index("void playStartle()"):]
+        body = body[:body.index("handler.post")]
+        self.assertIn("now - lastStartleMs < STARTLE_MIN_GAP_MS", body)
+        self.assertIn("return;", body)
 
 
 if __name__ == "__main__":

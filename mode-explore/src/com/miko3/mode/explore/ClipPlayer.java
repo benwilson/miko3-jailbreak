@@ -114,9 +114,19 @@ final class ClipPlayer {
         }
     }
 
-    /** One of the startle clips, chosen at random so repeated startles vary. Returns at
-     * once; a clip that failed to prepare is skipped. */
+    /** Startles at most this often (owner 2026-10-02: the floor sensor fires often and a
+     * startle each time was annoying); later ones in the gap are silent flinches. */
+    static final long STARTLE_MIN_GAP_MS = 20000;
+    private long lastStartleMs = Long.MIN_VALUE / 2;
+
+    /** One of the startle clips, chosen at random so repeated startles vary, at most once
+     * per STARTLE_MIN_GAP_MS. Returns at once; a clip that failed to prepare is skipped. */
     void playStartle() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastStartleMs < STARTLE_MIN_GAP_MS) {
+            return;
+        }
+        lastStartleMs = now;
         final int i = random.nextInt(STARTLE_CLIPS.length);
         handler.post(new Runnable() {
             @Override

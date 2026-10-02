@@ -25,14 +25,20 @@ import wave
 from pathlib import Path
 
 RATE = 22050
-PEAK = 0.62  # of full scale; loud enough for the robot's small speaker without clipping
 
-# (name, seconds, start Hz, top Hz, end Hz): three voicings so repeated startles vary.
-VARIANTS = (
-    ("startle-1", 0.34, 520.0, 1180.0, 640.0),
-    ("startle-2", 0.28, 600.0, 1320.0, 760.0),
-    ("startle-3", 0.40, 460.0, 1040.0, 520.0),
+# Startles: a soft, falling "oops" in the songs' voice (owner 2026-10-02: the old rising
+# "whoa" chirp at 0.62 of full scale was "pretty loud and annoying" when the floor sensor fires often).
+# Three voicings so repeated startles vary; rendered by render_song at STARTLE_PEAK.
+STARTLE_PEAK = 0.2
+STARTLES = (
+    ("startle-1", [("oo", 0.09, 392, 370, "glide", 0.0, 0.0, 0.03),
+                   ("ah", 0.16, 330, 247, "down", 0.012, 0.05, 0.0)]),
+    ("startle-2", [("oh", 0.08, 349, 330, "glide", 0.0, 0.0, 0.03),
+                   ("oo", 0.17, 311, 233, "down", 0.012, 0.05, 0.0)]),
+    ("startle-3", [("oo", 0.10, 415, 392, "glide", 0.0, 0.0, 0.02),
+                   ("oh", 0.15, 349, 262, "down", 0.015, 0.05, 0.0)]),
 )
+STARTLE_SEED = 900  # seeds for startles, clear of the songs', reactions' and beeps' seeds
 
 # Idle songs: WALL-E-style babble rather than tunes. Each song is a run of voiced
 # syllables, like the processed-voice warbles, "ooh?" rises, "bip-bip" chirps and
@@ -177,40 +183,6 @@ BEEPS = (
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "mode-explore" / "assets"
 
 
-def pitch_at(t, seconds, start, top, end):
-    """Rises to the top in the first 30% of the clip, then falls to the end pitch."""
-    rise = 0.3 * seconds
-    if t < rise:
-        x = t / rise
-        return start + (top - start) * math.sin(x * math.pi / 2)
-    x = (t - rise) / (seconds - rise)
-    return top + (end - top) * (1 - math.cos(x * math.pi / 2))
-
-
-def envelope(t, seconds):
-    """Short fade in and a longer fade out, so the clip has no click at either end."""
-    attack, release = 0.015, 0.12 * seconds
-    if t < attack:
-        return t / attack
-    if t > seconds - release:
-        return max(0.0, (seconds - t) / release)
-    return 1.0
-
-
-def render(seconds, start, top, end):
-    n = int(seconds * RATE)
-    samples = array.array("h")
-    phase = 0.0
-    for i in range(n):
-        t = i / RATE
-        freq = pitch_at(t, seconds, start, top, end) * (1 + 0.025 * math.sin(2 * math.pi * 11 * t))
-        phase += 2 * math.pi * freq / RATE
-        # A touch of second harmonic keeps it from sounding like a pure test tone.
-        value = math.sin(phase) + 0.25 * math.sin(2 * phase)
-        samples.append(int(round(value / 1.25 * PEAK * envelope(t, seconds) * 32767)))
-    return samples
-
-
 def syllable_pitch(x, f0, f1, shape):
     """Pitch at fraction x (0-1) through a syllable."""
     if shape == "up":
@@ -222,7 +194,7 @@ def syllable_pitch(x, f0, f1, shape):
     return f0 + (f1 - f0) * x
 
 
-def render_song(syllables, seed):
+def render_song(syllables, seed, peak=None):
     """One song: each voiced syllable glides in pitch, wobbles, and is shaped by its own
     short envelope; gaps are silence. Deterministic for a given seed."""
     rng = random.Random(seed)
@@ -243,7 +215,7 @@ def render_song(syllables, seed):
             value = sum(w * math.sin((k + 1) * phase) for k, w in enumerate(weights)) / norm
             buzz = 1 - rasp * (0.5 + 0.5 * math.sin(2 * math.pi * rasp_hz * t))
             edge = min(1.0, t / 0.015, (dur - t) / 0.03)
-            samples.append(int(round(value * buzz * edge * SONG_PEAK * 32767)))
+            samples.append(int(round(value * buzz * edge * (SONG_PEAK if peak is None else peak) * 32767)))
         t_song += dur
         samples.extend([0] * int(gap * RATE))
         t_song += gap
@@ -281,9 +253,9 @@ def generate(out_dir):
     out_dir; returns their paths in that order."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
-    for name, seconds, start, top, end in VARIANTS:
+    for n, (name, syllables) in enumerate(STARTLES):
         path = out_dir / f"{name}.wav"
-        write_wav(path, render(seconds, start, top, end))
+        write_wav(path, render_song(syllables, STARTLE_SEED + n, peak=STARTLE_PEAK))
         paths.append(path)
     for seed, (name, syllables) in enumerate(SONGS):
         path = out_dir / f"{name}.wav"
