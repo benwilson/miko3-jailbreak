@@ -4920,7 +4920,7 @@ final class ExploreBrain {
      * except at a leg decision.
      */
     private boolean cameraWanted(long now) {
-        if (!camera.available() || !leaseHeld || now < curiosityOffUntil) {
+        if (!cameraUsable(now)) {
             return false;
         }
         if (!state.chats() && (taskLine != null
@@ -4928,8 +4928,14 @@ final class ExploreBrain {
             // Owner 2026-10-03: a task's line is said with the camera closed, as any line off the conversation.
             return false;
         }
-        if (state.curious() || state.cueSearch() || state.chats() || state == State.DOCKED) {
-            // Docked: opened once and kept open, the detector parked between looks (syncPark).
+        if (state == State.DOCKED) {
+            // Docked (robot 2026-10-02): open only for each look, closed between them, as the
+            // HAL's streaming cost ~68% of a core for one look a minute. dockStep starts a look
+            // only once the reopen gap since the last close has passed. With dockCameraCloses
+            // off: opened once and kept open, the detector parked between looks (syncPark).
+            return !tuning.dockCameraCloses || dockLooking;
+        }
+        if (state.curious() || state.cueSearch() || state.chats()) {
             return true;
         }
         if ((state == State.MEET || state.confirms()) && chatLikely()) {
@@ -4943,6 +4949,11 @@ final class ExploreBrain {
             return state == State.PAUSE && (lookForLeg || taskLooking);
         }
         return true;
+    }
+
+    /** The camera could open now: it exists, he holds the lease, and no failure's back-off is running (R5). */
+    private boolean cameraUsable(long now) {
+        return camera.available() && leaseHeld && now >= curiosityOffUntil;
     }
 
     private void syncCamera() {
@@ -10830,8 +10841,9 @@ final class ExploreBrain {
     // On the charger the latch refuses every leg, so roaming there was refusals,
     // escape turns that whirred, startles and the resting song. Now any roaming,
     // escaping or resting state becomes DOCKED the moment the latch is seen: no wheels,
-    // eyes DOCKED (no song), the camera open with the detector parked. Every
-    // dockLookMs, while nothing else is going on, he unparks for one look; Claude
+    // eyes DOCKED (no song), the camera closed (dockCameraCloses; else open with the
+    // detector parked). Every dockLookMs, while nothing else is going on, he opens it
+    // (or unparks) for one look and closes it again; Claude
     // (else the detector) decides, and he speaks only for a thing he has not reacted
     // to this session, with a line he has not said. Anything else is silence. Calls
     // still take him out of DOCKED (callStep runs first) and come back to it after.
@@ -10945,12 +10957,18 @@ final class ExploreBrain {
             if (now < dockLookAt || !dockQuiet(now)) {
                 return;
             }
-            if (!cameraOpen) {
+            if (tuning.dockCameraCloses ? !cameraUsable(now) : !cameraOpen) {
                 note("docked look: no camera now; the next in " + tuning.dockLookMs + " ms");
                 dockLookAt = now + tuning.dockLookMs;
                 return;
             }
-            // The detector unparks at the end of this step; the look must be taken after it settles.
+            if (!cameraOpen && now < cameraClosedAt + tuning.reopenGapMs) {
+                // Closed between looks: never reopened inside the gap (a reopen within ~50 ms of a
+                // close hangs the HAL, err -110). ExploreCamera waits for onClosed() too.
+                return;
+            }
+            // The detector unparks at the end of this step (and the camera opens, when it was
+            // closed between looks); the look must be taken after it settles.
             dockLooking = true;
             dockLookAfter = now + tuning.lookSettleMs;
             dockLookDeadline = Math.max(now, cameraClosedAt + tuning.reopenGapMs) + tuning.firstLookTimeoutMs;

@@ -199,6 +199,13 @@ final class ExploreTuning {
      */
     final long dockLookMs;
     /**
+     * Docked, the camera is closed between looks and opened for each one (robot
+     * 2026-10-02: camerahalserver ran ~68% of a core streaming 15 fps on the dock for
+     * one look a minute). A conversation on the dock still opens it as always. false
+     * keeps the old way: opened once on the dock, the detector parked between looks.
+     */
+    final boolean dockCameraCloses;
+    /**
      * Docked by POWER (2026-10-02): how many readings in a row whose POWER says off
      * the dock it takes to leave DOCKED. Entering needs one (POWER=2 or a charging
      * current is unmistakable); leaving needs more, so one odd reading (the current
@@ -979,6 +986,7 @@ final class ExploreTuning {
         reactedLabelsMax = Math.max(0, b.reactedLabelsMax);
         saidLinesMax = Math.max(0, b.saidLinesMax);
         dockLookMs = Math.max(1000, b.dockLookMs);
+        dockCameraCloses = b.dockCameraCloses;
         dockOffReadings = Math.max(1, b.dockOffReadings);
         meetTimeoutMs = b.meetTimeoutMs;
         faceHoldMs = Math.max(0, b.faceHoldMs);
@@ -1353,6 +1361,8 @@ final class ExploreTuning {
         private int saidLinesMax = 10;
         // About one look a minute on the charger: new things get noticed, the look budget barely notices.
         private long dockLookMs = 60000;
+        // Closed between docked looks: the HAL's streaming CPU goes to speech instead.
+        private boolean dockCameraCloses = true;
         // Two off readings in a row leave the dock: one stray reading is not enough.
         private int dockOffReadings = 2;
         // One try each; the match sends up to 11 small images, so it gets a little longer than a look try.
@@ -1867,6 +1877,7 @@ final class ExploreTuning {
         Builder reactedLabelsMax(int v) { reactedLabelsMax = v; return this; }
         Builder saidLinesMax(int v) { saidLinesMax = v; return this; }
         Builder dockLookMs(long v) { dockLookMs = v; return this; }
+        Builder dockCameraCloses(boolean on) { dockCameraCloses = on; return this; }
         Builder dockOffReadings(int v) { dockOffReadings = v; return this; }
         Builder meet(long timeoutMs, long listenMs, long listenMarginMs) {
             meetTimeoutMs = timeoutMs;

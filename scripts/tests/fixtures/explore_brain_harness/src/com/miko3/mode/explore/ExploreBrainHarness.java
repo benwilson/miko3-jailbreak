@@ -2192,7 +2192,8 @@ public final class ExploreBrainHarness {
                 // Open with the detector parked (KTD7), unless the lease was lost mid-conversation.
                 return null;
             case DOCKED:
-                // Docked (owner 2026-10-02): open with the detector parked between looks, never toggled per look.
+                // Docked (owner 2026-10-02): open only for each look (dockCameraCloses), or with it off open
+                // throughout, the detector parked between looks; the dock_camera_ scenarios pin which.
                 if (open && !available) {
                     return "camera open without a camera in " + s;
                 }
@@ -16662,7 +16663,11 @@ public final class ExploreBrainHarness {
 
     /** Docked from the first reading: Claude as given, the cue rig's people. */
     private static Rig dockRig(Claude claude, Vision v) {
-        Rig rig = new Rig(cueTuning().build(), t -> charger(t), v, true, claude);
+        return dockRig(cueTuning(), claude, v);
+    }
+
+    private static Rig dockRig(ExploreTuning.Builder b, Claude claude, Vision v) {
+        Rig rig = new Rig(b.build(), t -> charger(t), v, true, claude);
         rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.known("Sarah", "Hi {name}!", "Hello again!");
         rig.people.lines = STRANGER;
         return rig;
@@ -16687,7 +16692,125 @@ public final class ExploreBrainHarness {
                 + rig.countPrefix("name ", from, to) + rig.countPrefix("say ", from, to);
     }
 
+    /** How long the camera was open in [from, to), from the rig's open and close events. */
+    private static long cameraOpenMs(Rig rig, long from, long to) {
+        long total = 0;
+        long openedAt = -1;
+        for (Event e : rig.log) {
+            if (e.what.equals("camera open") && openedAt < 0) {
+                openedAt = e.t;
+            } else if (e.what.equals("camera close") && openedAt >= 0) {
+                total += Math.max(0, Math.min(e.t, to) - Math.max(openedAt, from));
+                openedAt = -1;
+            }
+        }
+        return openedAt >= 0 ? total + Math.max(0, to - Math.max(openedAt, from)) : total;
+    }
+
+    /** The shortest time from a camera close to the next open, or Long.MAX_VALUE with no reopen. */
+    private static long shortestReopen(Rig rig) {
+        long closedAt = -1;
+        long shortest = Long.MAX_VALUE;
+        for (Event e : rig.log) {
+            if (e.what.equals("camera close")) {
+                closedAt = e.t;
+            } else if (e.what.equals("camera open") && closedAt >= 0) {
+                shortest = Math.min(shortest, e.t - closedAt);
+            }
+        }
+        return shortest;
+    }
+
+    /** Every ask came from a look the camera was opened for, and it closed again in that same step. */
+    private static boolean eachAskBracketedByOpenAndClose(Rig rig) {
+        boolean open = false;
+        long askAt = -1;
+        int asks = 0;
+        for (Event e : rig.log) {
+            if (askAt >= 0 && e.t > askAt) {
+                return false;   // the step that asked ended with the camera still open
+            }
+            if (e.what.equals("camera open")) {
+                open = true;
+            } else if (e.what.equals("camera close")) {
+                open = false;
+                askAt = -1;
+            } else if (e.what.startsWith("ask ")) {
+                if (!open) {
+                    return false;
+                }
+                askAt = e.t;
+                asks++;
+            }
+        }
+        return asks > 0 && askAt < 0;
+    }
+
     private static void dockScenarios() {
+        // CPU on the dock (robot 2026-10-02): camerahalserver ran ~68% of a core streaming
+        // 15 fps for one look a minute. Docked, the camera is closed between looks and opened
+        // for each (dockCameraCloses, on by default), and a conversation opens it as ever.
+        scenario("dock_camera_closed_between_looks_and_opened_for_each", n -> {
+            Rig rig = dockRig((r, req, nth) -> CuriosityPort.Answer.nothing(), EMPTY_ROOM);
+            rig.started();
+            rig.runUntil(30000);
+            boolean closedAt30 = !rig.cameraOpen;
+            rig.runUntil(290000);
+            int asks = rig.asks.size();
+            long openMs = cameraOpenMs(rig, 0, 290000);
+            check(n, closedAt30 && !rig.cameraOpen && asks >= 4 && rig.count("camera open") == asks
+                            && rig.count("camera close") == asks && eachAskBracketedByOpenAndClose(rig)
+                            && openMs <= asks * 3000L && rig.brain.state() == ExploreBrain.State.DOCKED
+                            && rig.violations.isEmpty(),
+                    "closedAt30=" + closedAt30 + " asks=" + asks + " opens=" + rig.count("camera open") + " closes="
+                            + rig.count("camera close") + " openMs=" + openMs + " " + rig.tail());
+        });
+        scenario("dock_reopen_never_sooner_than_the_gap", n -> {
+            // Looks due every second: each still waits out the reopen gap after the last close
+            // (memory: a reopen within ~50 ms of a close hangs the camera HAL, err -110).
+            Rig rig = dockRig(cueTuning().reopenGapMs(3000).dockLookMs(1000),
+                    (r, req, nth) -> CuriosityPort.Answer.nothing(), EMPTY_ROOM);
+            rig.reopenGapMs = 3000;
+            rig.started();
+            rig.runUntil(60000);
+            long shortest = shortestReopen(rig);
+            check(n, rig.count("camera open") >= 6 && shortest >= 3000 && shortest < 6000
+                            && rig.asks.size() >= 6 && rig.violations.isEmpty(),
+                    "opens=" + rig.count("camera open") + " shortest=" + shortest + " asks=" + rig.asks.size()
+                            + " " + rig.tail());
+        });
+        scenario("dock_a_conversation_opens_the_camera_and_it_closes_once_docked_again", n -> {
+            Rig rig = callChatRig(chatFirstTuning(), t -> charger(t), EMPTY_ROOM, hearWords("hi"), hearWords("bye"));
+            rig.started();
+            rig.runUntil(70000);
+            boolean closedBefore = !rig.cameraOpen && rig.brain.state() == ExploreBrain.State.DOCKED;
+            heyMiko(rig, 75000, Ears.Side.LEFT, 800, "anyone home");
+            rig.runUntil(75000);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 75000, 95000);
+            long over = chatOver(rig, open);
+            rig.runUntil(Math.max(rig.now, over) + 5000);
+            boolean chatOpen = false;
+            for (ExploreBrain.State st : rig.openStates) {
+                chatOpen |= st.chats();
+            }
+            int opened = rig.firstAfter("camera open", 75000);
+            check(n, closedBefore && open > 0 && over > 0 && chatOpen && opened >= 0 && rig.timeOf(opened) <= open
+                            && rig.brain.state() == ExploreBrain.State.DOCKED && !rig.cameraOpen
+                            && rig.violations.isEmpty(),
+                    "closedBefore=" + closedBefore + " open@" + open + " over@" + over + " openIn=" + rig.openStates
+                            + " opened@" + rig.timeOf(opened) + " after=" + rig.brain.state() + " camera="
+                            + rig.cameraOpen + " " + rig.tail());
+        });
+        scenario("dock_camera_closing_off_keeps_it_open_between_looks", n -> {
+            Rig rig = dockRig(cueTuning().dockCameraCloses(false), (r, req, nth) -> CuriosityPort.Answer.nothing(),
+                    EMPTY_ROOM);
+            rig.started();
+            rig.runUntil(290000);
+            check(n, rig.asks.size() >= 4 && rig.count("camera open") == 1 && rig.count("camera close") == 0
+                            && rig.cameraOpen && rig.violations.isEmpty(),
+                    "asks=" + rig.asks.size() + " opens=" + rig.count("camera open") + " closes="
+                            + rig.count("camera close") + " " + rig.tail());
+        });
         scenario("dock_five_minutes_docked_no_songs_no_startles_no_wheels", n -> {
             Rig rig = dockRig((r, req, nth) -> CuriosityPort.Answer.nothing(), EMPTY_ROOM);
             List<String> notes = traced(rig);
@@ -16699,7 +16822,7 @@ public final class ExploreBrainHarness {
             check(n, rig.brain.state() == ExploreBrain.State.DOCKED && rig.count("eyes DOCKED") >= 1
                             && singingEyes(rig, 500, 300001) == 0 && sounds(rig, 0, 300001) == 0
                             && rig.motions(0, 300001) == 0 && asks >= 4 && asks <= 5
-                            && rig.count("camera open") == 1 && rig.count("camera close") == 0
+                            && rig.count("camera open") >= asks && rig.count("camera open") <= asks + 1
                             && notesWith(notes, "docked: on the charger") == 1
                             && notesWith(notes, "docked look: nothing new") == asks && rig.violations.isEmpty(),
                     "state=" + rig.brain.state() + " singing=" + singingEyes(rig, 500, 300001) + " sounds="

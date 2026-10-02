@@ -14,7 +14,7 @@ import com.miko3.shared.EyesPage;
  * /state route never takes a lock the brain holds.
  *
  * STATE_CSS and GAZE_JS restyle the shared eyes per state and hold the gaze
- * on the look direction; the shared EyesPage itself is unchanged.
+ * on the look direction; the shared EyesPage itself carries no explore logic.
  *
  * Polling rather than pushing into the WebView so the same page works in a
  * LAN browser, as the voice mode's does. No android.* here: host-JVM tests
@@ -212,10 +212,13 @@ final class ExploreState {
     // Per-state looks, as overrides on the shared eyes keyed by a class on #rig.
     // idle is the other modes' look unchanged (R6). The animations go on
     // .glow-core, never .glow: .glow's transform carries the gaze, and a keyframe
-    // transform on the same element would override it. The shared eyes start
-    // their blink as an inline style on each .glow-core, and an inline animation
-    // beats any stylesheet rule, so every look that replaces the blink says so
-    // with !important (an !important declaration also outranks the animation).
+    // transform on the same element would override it. Every look that replaces
+    // the blink says so with !important: the shared eyes' blink used to be an
+    // inline style, which beat any other rule. It is now a one-shot .blink class
+    // their script adds every 6.5 s, which these selectors outrank anyway.
+    // Idle (also the docked look) runs no endless animation, so a still face
+    // costs the WebView's compositor nothing between glances and blinks; the
+    // endless ones (resting, thinking, listening) last only as long as their state.
     private static final String STATE_CSS =
             // Look: a slightly brighter core while he eyes the way ahead.
             "#rig.s-" + LOOK + " .glow-core{filter:brightness(1.15)}"
@@ -233,7 +236,7 @@ final class ExploreState {
             // Thinking (waiting for Claude): the eye keeps its normal glow but two
             // gold arcs spin around the hot centre once a second, a "working on it"
             // pinwheel; the gaze goes up (GAZE_JS). The core stops its blink
-            // (!important: the blink is inline), which would squash the spinner
+            // (animation:none!important), which would squash the spinner
             // with it. The spinner is a pseudo-element of the core, so it follows
             // the gaze and vanishes the instant the class changes. Only its
             // transform animates (one composited layer, no repaint per frame).

@@ -105,7 +105,7 @@ enum VoiceState {
     // Per-state looks, as overrides on the shared eyes keyed by a class on #rig.
     // Listening has no rules: it is the remote-control mode's idle look unchanged.
     // Only opacity is animated (the speaking/closing pulse), the same cheap
-    // compositor-only kind of animation the blink already runs.
+    // compositor-only kind of animation the blink runs.
     private static final String STATE_CSS =
             // Engaged: a warmer, brighter core than the idle red.
             "#rig.s-connecting .glow-core,#rig.s-conversing .glow-core,#rig.s-speaking .glow-core{"
@@ -118,13 +118,15 @@ enum VoiceState {
             // Closing keeps the pulse (the goodbye may still be playing) but slower,
             // on the idle colors, so it reads as winding down.
             + "#rig.s-closing .glow{animation:talk 1.2s ease-in-out infinite alternate}"
-            // Unreachable: dimmed bezel, cold grey-blue core, and a slower blink.
-            // !important because the blink's duration is set inline by the eyes' script.
+            // Unreachable: dimmed bezel, cold grey-blue core, and a slower blink:
+            // GAZE_JS doubles the blink period and this doubles the one-shot blink
+            // itself, the same 13 s cycle with a 1.3 s blink the infinite one had.
             + "#rig.s-unreachable .housing{opacity:.55}"
             + "#rig.s-unreachable .glow{opacity:.7}"
             + "#rig.s-unreachable .glow-core{"
             + "background:radial-gradient(circle at center,#e3edf5 0%,#a9bccd 10%,#6784a0 28%,"
-            + "#314b66 48%,#111e2c 64%,rgba(0,0,0,0) 78%);animation-duration:13s!important}";
+            + "#314b66 48%,#111e2c 64%,rgba(0,0,0,0) 78%)}"
+            + "#rig.s-unreachable .glow-core.blink{animation-duration:1.3s!important}";
 
     // The poll. setTimeout chained off each answer (not setInterval) so the next
     // delay follows the state that answer just showed: the rate switches on the
@@ -156,13 +158,15 @@ enum VoiceState {
     // it steadies the gaze while engaged without touching the shared eyes' timing.
     // Connecting looks straight ahead; conversing and speaking keep small movements
     // so the eyes stay on the person rather than freezing.
+    // It also slows the blink while unreachable (blinkEvery, see the shared eyes).
     private static final String GAZE_JS =
             "var eyesGazeTo=gazeTo;"
             + "gazeTo=function(x,y,speedMs){"
             + "if(voiceState==='connecting'){x=0;y=0;}"
             + "else if(voiceState==='conversing'||voiceState==='speaking'){x*=0.3;y*=0.3;}"
             + "eyesGazeTo(x,y,speedMs);"
-            + "};";
+            + "};"
+            + "blinkEvery=function(){return voiceState==='unreachable'?13000:6500;};";
 
     /** GET /device-view: the shared eyes plus the state hook. */
     static final String DEVICE_VIEW_HTML = EyesPage.build(
