@@ -141,6 +141,11 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_endless_answer_is_cut_at_the_hard_cap",
         "ears_answer_begun_just_before_the_listen_is_its_answer",
         "ears_wake_word_inside_a_long_answer_keeps_the_early_cue",
+        # Owner 2026-10-02: the answer ends on 2 s of no speech; its segments are joined.
+        "ears_answer_with_pauses_is_delivered_once_joined_after_the_silence",
+        "ears_a_40_s_answer_is_delivered_whole_not_cut_at_20_s",
+        "ears_a_line_mid_answer_delivers_the_joined_words_as_partial",
+        "ears_outside_a_listen_utterances_still_end_at_the_fast_endpoint",
         # Robot 2026-10-01: "answering", once per listen, as its answer starts.
         "ears_answer_started_in_the_window_says_answering_once_before_the_words",
         "ears_answer_begun_just_before_the_listen_says_answering",
@@ -646,6 +651,19 @@ class InterfaceAndClientTest(unittest.TestCase):
         callback_codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", callback)]
         self.assertEqual(callback_codes, [("heard", 1), ("answering", 2), ("answerOver", 3)])
 
+    def test_no_per_utterance_cap_is_shorter_than_the_answer_cap(self):
+        """Owner 2026-10-02: a 40 s run-on answer is not cut at 20 s. The Silero VAD's
+        max-speech split and the recogniser's rule 3 (longest utterance) were both 20 s;
+        both now follow the conversation listen's hard cap."""
+        engine = _read(LAUNCHER / "ListenEngine.java")
+        self.assertIn("LONGEST_UTTERANCE_S = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS / 1000f;", engine)
+        self.assertIn(".setMaxSpeechDuration(LONGEST_UTTERANCE_S)", engine)
+        self.assertRegex(engine, r"\.setRule3\(EndpointRule\.builder\(\)\.setMustContainNonSilence\(false\)\s*"
+                                 r"\.setMinTrailingSilence\(0f\)\.setMinUtteranceLength\(LONGEST_UTTERANCE_S\)")
+        self.assertNotIn("VAD_MAX_SPEECH_S", engine)
+        ears = _read(EARS)
+        self.assertIn("static final long ANSWER_SILENCE_MS = 2000;", ears)
+
     def test_ears_callback_answering_is_a_one_way_appended_transaction(self):
         """Robot 2026-10-01: "answering" tells the mode a conversation listen's
         answer has started. A new one-way code (2) on the callback, appended:
@@ -656,7 +674,7 @@ class InterfaceAndClientTest(unittest.TestCase):
         head = src.split("abstract class Stub", 1)[0]
         self.assertRegex(head, r"void answering\(long at\) throws RemoteException;")
         protocol = _read(SHARED / "LauncherProtocol.java")
-        self.assertRegex(protocol, r"public static final long EARS_LISTEN_HARD_CAP_MS = 20000;")
+        self.assertRegex(protocol, r"public static final long EARS_LISTEN_HARD_CAP_MS = 60000;")
         self.assertRegex(protocol, r"public static final long EARS_ANSWER_HOLD_MS = EARS_LISTEN_HARD_CAP_MS \+ 3000;")
         stub = _method_body(src, "public boolean onTransact")
         self.assertRegex(stub, r"case TRANSACTION_answering: \{\s*data\.enforceInterface\(DESCRIPTOR\);\s*"

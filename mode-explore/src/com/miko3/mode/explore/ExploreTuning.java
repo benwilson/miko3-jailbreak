@@ -448,7 +448,7 @@ final class ExploreTuning {
     /**
      * Robot 2026-10-01: how long from its start a listen whose answer has started
      * (CuriosityPort.answering()) is held for the words: the launcher's hard cap on
-     * a conversation listen's answer (LauncherProtocol.EARS_LISTEN_HARD_CAP_MS, 20 s) plus 3 s
+     * a conversation listen's answer (LauncherProtocol.EARS_LISTEN_HARD_CAP_MS, 60 s) plus 3 s
      * for the decode and the delivery. The brain cannot see shared/, so the value
      * is mirrored here; LauncherProtocol.EARS_ANSWER_HOLD_MS is the one the port uses, and a
      * wiring test pins the two equal.
@@ -1410,8 +1410,8 @@ final class ExploreTuning {
         // Meeting plan Assumptions: an unanswered listen is 4 s; the chat sensor-stall grace 5 s;
         // a turn has 5 s plus a 3 s retry; two sentences; a window of 30 exchanges; a 500 ms deaf tail.
         private long unansweredListenMs = 4000;
-        // Robot 2026-10-01: LauncherProtocol.EARS_ANSWER_HOLD_MS (the 20 s answer cap plus 3 s).
-        private long answerHoldMs = 23000;
+        // Robot 2026-10-01: LauncherProtocol.EARS_ANSWER_HOLD_MS (the answer cap, 60 s since 2026-10-02, plus 3 s).
+        private long answerHoldMs = 63000;
         // Robot 2026-10-01: about three tries, a few seconds apart, after the crouch invitation.
         private int chatFaceTries = 3;
         private long chatFaceDelayMs = 1000;

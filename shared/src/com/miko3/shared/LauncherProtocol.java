@@ -37,10 +37,11 @@ public final class LauncherProtocol {
 
     /**
      * Robot 2026-10-01: an ears conversation listen's maxMs is the window to start
-     * answering; an answer begun in it runs to its endpoint, but the launcher cuts
-     * it this long after the listen opened (EarsSession.LISTEN_HARD_CAP_MS).
+     * answering; an answer begun in it runs until 2 s with no speech
+     * (EarsSession.ANSWER_SILENCE_MS, owner 2026-10-02), but the launcher cuts it
+     * this long after the listen opened (EarsSession.LISTEN_HARD_CAP_MS).
      */
-    public static final long EARS_LISTEN_HARD_CAP_MS = 20000;
+    public static final long EARS_LISTEN_HARD_CAP_MS = 60000;
     /**
      * How long from its start a mode holds an ears listen whose answer has started
      * (RobotEars.Callback.answering): the hard cap plus 3 s for the decode and the

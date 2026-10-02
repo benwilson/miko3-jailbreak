@@ -14018,7 +14018,7 @@ public final class ExploreBrainHarness {
             long gaveUp = noteAt(notes, "the answer's words never came");
             long first = noteAt(notes, "first unanswered listen");
             long hold = rig.tuning.answerHoldMs;
-            check(n, open > 0 && over > 0 && second > 0 && hold == 23000
+            check(n, open > 0 && over > 0 && second > 0 && hold == 63000
                             && held - second >= 4000 && held - second <= 4150
                             && gaveUp - second >= hold && gaveUp - second <= hold + 150 && first == gaveUp
                             && rig.violations.isEmpty(),

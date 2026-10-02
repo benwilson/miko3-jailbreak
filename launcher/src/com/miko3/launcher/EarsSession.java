@@ -70,8 +70,15 @@ final class EarsSession {
     /** Speech already present this soon after the deaf window closed lost its head. */
     static final long PARTIAL_HEAD_MS = 120;
     /** Robot 2026-10-01: a conversation listen's maxMs is the window to start answering; an
-     * answer begun in it runs to its endpoint, but never past this long after the listen opened. */
+     * answer begun in it runs until ANSWER_SILENCE_MS of no speech, but never past this long
+     * after the listen opened (60 s since owner 2026-10-02). */
     static final long LISTEN_HARD_CAP_MS = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS;
+    /**
+     * Owner 2026-10-02 ("it cuts me off"): a conversation listen's answer ends after this much
+     * with no speech, not at the recogniser's 0.8 s endpoint. The segments the recogniser
+     * endpoints inside it are joined into one answer, delivered once.
+     */
+    static final long ANSWER_SILENCE_MS = 2000;
     /** Speech that began this soon before a listen opened (they answered as his question ended) is its answer. */
     static final long LISTEN_EARLY_START_MS = 500;
     /**
@@ -311,6 +318,8 @@ final class EarsSession {
     private long uttFed;
     /** When the utterance in progress, a listen's answer, is cut; Long.MAX_VALUE when it is no answer. */
     private long uttCapAt = Long.MAX_VALUE;
+    /** The words of the segments the recogniser already endpointed in this utterance (an answer's), joined. */
+    private final StringBuilder segmentWords = new StringBuilder();
 
     // Decode cost per utterance (ms per chunk) and the worst chunk, since the last summary.
     private final Object statsLock = new Object();
@@ -420,7 +429,8 @@ final class EarsSession {
      * (robot 2026-10-01): an utterance that starts inside it (up to LISTEN_EDGE_MS
      * before its end), or at most
      * LISTEN_EARLY_START_MS before it opened, is its answer and holds it open
-     * to the utterance's own end (the endpoint or the hangover), cut at
+     * until ANSWER_SILENCE_MS with no speech (owner 2026-10-02: the recogniser's
+     * endpoints inside it only close segments, joined into one answer), cut at
      * LISTEN_HARD_CAP_MS after the listen opened with the words so far. Ends
      * at the first utterance delivered with words or strong (an early wake cue
      * does not end it), at an answer's end once the start window is over, or,
@@ -797,6 +807,7 @@ final class EarsSession {
                     heldLen = 0;
                     uttDecodeNs = 0;
                     uttFed = 0;
+                    segmentWords.setLength(0);
                     // The word began before the gate saw it: its head goes in first.
                     int head = drainPreroll();
                     uttHeadMs = head * 1000L / SAMPLE_RATE;
@@ -852,14 +863,40 @@ final class EarsSession {
                     hold(samples, n);
                 }
                 boolean endpoint = recognising && recognizer.isEndpoint();
-                // A listen's answer that will not stop is cut at the hard cap with the words so far.
-                if (endpoint || now >= uttCapAt || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
+                if (uttCapAt != Long.MAX_VALUE) {
+                    // Owner 2026-10-02: a listen's answer ends on ANSWER_SILENCE_MS of no speech, so a
+                    // pause mid-answer does not cut it; the recogniser's endpoint closes a segment.
+                    // An answer that will not stop is cut at the hard cap with the words so far.
+                    if (now >= uttCapAt || (!speech && now - lastSpeechMs >= ANSWER_SILENCE_MS)) {
+                        endUtterance(now, false);
+                    } else if (endpoint) {
+                        closeSegment();
+                    }
+                } else if (endpoint || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
                     endUtterance(now, false);
                 }
             } else {
                 keepPreroll(pcm, n); // nobody took it: the next onset's head
             }
         }
+    }
+
+    /** Caller holds feedLock. An answer's segment ended: its words are kept, the recogniser starts afresh. */
+    private void closeSegment() {
+        appendWords(recognizer.text());
+        recognizer.reset();
+    }
+
+    /** Caller holds feedLock. Adds words to the segments so far, a space between. */
+    private void appendWords(String words) {
+        String t = words == null ? "" : words.trim();
+        if (t.isEmpty()) {
+            return;
+        }
+        if (segmentWords.length() > 0) {
+            segmentWords.append(' ');
+        }
+        segmentWords.append(t);
     }
 
     /** Caller holds feedLock. Appends a chunk no one took to the pre-roll ring, the oldest audio going first. */
@@ -971,8 +1008,9 @@ final class EarsSession {
         }
         long fedHere = uttFed;
         recordDecode();
-        String text = recognising ? recognizer.text() : "";
-        text = text == null ? "" : text.trim();
+        appendWords(recognising ? recognizer.text() : "");
+        String text = segmentWords.toString();
+        segmentWords.setLength(0);
         Float angle = latchAngle();
         if (sampling != null) {
             sampling.stop();
@@ -1042,6 +1080,7 @@ final class EarsSession {
         angles.clear();
         recordDecode();
         recognizer.reset();
+        segmentWords.setLength(0);
         preLen = 0;
         if (uttCapAt != Long.MAX_VALUE) {
             uttCapAt = Long.MAX_VALUE;

@@ -23,6 +23,7 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig;
 import com.k2fsa.sherpa.onnx.Vad;
 import com.k2fsa.sherpa.onnx.VadModelConfig;
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotEars;
 import com.miko3.shared.VoiceDirection;
 
@@ -93,7 +94,12 @@ final class ListenEngine implements ListenSession.Ears {
     private static final float VAD_MIN_SILENCE_S = 0.25f;
     private static final float VAD_MIN_SPEECH_S = 0.1f;
     private static final int VAD_WINDOW = 512;
-    private static final float VAD_MAX_SPEECH_S = 20f;
+    /**
+     * Owner 2026-10-02: the longest single utterance, for the Silero VAD's max-speech split and
+     * the recogniser's rule 3. Both were 20 s, so a run-on answer was split at about 20 s; they
+     * now follow a conversation listen's hard cap, which cuts any answer anyway.
+     */
+    private static final float LONGEST_UTTERANCE_S = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS / 1000f;
     private static final long TICK_MS = 500;
     /** Silence handed to the model after a capped listen, so its last words come out. */
     private static final int TAIL_SAMPLES = ListenSession.SAMPLE_RATE * 3 / 10;
@@ -395,14 +401,15 @@ final class ListenEngine implements ListenSession.Ears {
         // KTD2: an utterance ends 0.8 s after its last word (rule 2) or after about
         // 2 s of nothing decoded (rule 1); the brain keeps the unanswered-listen
         // clock, and the one-shot's cap stops anything longer, so rule 3 is only a
-        // far backstop.
+        // far backstop. A conversation listen's answer runs past rule 2's endpoint
+        // (EarsSession.ANSWER_SILENCE_MS): there it only closes a segment.
         EndpointConfig endpoint = EndpointConfig.builder()
                 .setRule1(EndpointRule.builder().setMustContainNonSilence(false)
                         .setMinTrailingSilence(2.0f).setMinUtteranceLength(0f).build())
                 .setRule2(EndpointRule.builder().setMustContainNonSilence(true)
                         .setMinTrailingSilence(0.8f).setMinUtteranceLength(0f).build())
                 .setRule3(EndpointRule.builder().setMustContainNonSilence(false)
-                        .setMinTrailingSilence(0f).setMinUtteranceLength(20f).build())
+                        .setMinTrailingSilence(0f).setMinUtteranceLength(LONGEST_UTTERANCE_S).build())
                 .build();
         OnlineRecognizerConfig.Builder b = OnlineRecognizerConfig.builder()
                 .setFeatureConfig(FeatureConfig.builder().setSampleRate(ListenSession.SAMPLE_RATE)
@@ -427,7 +434,7 @@ final class ListenEngine implements ListenSession.Ears {
                         .setMinSilenceDuration(VAD_MIN_SILENCE_S)
                         .setMinSpeechDuration(VAD_MIN_SPEECH_S)
                         .setWindowSize(VAD_WINDOW)
-                        .setMaxSpeechDuration(VAD_MAX_SPEECH_S)
+                        .setMaxSpeechDuration(LONGEST_UTTERANCE_S)
                         .build())
                 .setSampleRate(ListenSession.SAMPLE_RATE)
                 .setNumThreads(1)
