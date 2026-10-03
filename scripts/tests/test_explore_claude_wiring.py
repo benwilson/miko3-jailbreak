@@ -1346,7 +1346,7 @@ class InstructionsAndAddressedTest(unittest.TestCase):
                        "only for when the person explicitly asks him to do that",
                        "move, stop, stay, come_here, go_away, be_quiet, find_person, find_thing, go_to_place, wait, "
                        "run_task", "call one alone, never with respond or another action",
-                       "an errand of several steps is one run_task", "Okay, turning around.",
+                       "an errand of several steps is one run_task", "Write nothing outside a tool",
                        "honestly why he can't", "a kind, honest line that he can't"):
             self.assertIn(phrase, pre, phrase)
         self.assertNotIn("action (", pre)

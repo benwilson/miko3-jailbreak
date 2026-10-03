@@ -335,9 +335,8 @@ final class ExplorePrompts {
             + "a message that needs one, at most one round per reply; small talk needs none. His action tools (move, "
             + "stop, stay, come_here, go_away, be_quiet, find_person, find_thing, go_to_place, wait, run_task) are "
             + "only for when the person explicitly asks him to do that: call one alone, never with respond or "
-            + "another action, and an errand of several steps is one run_task. Before calling a tool, you may write "
-            + "a few words he says while it runs, like \"Let me look.\" or \"Okay, turning around.\", and nothing "
-            + "else outside a tool; after its result, reply with respond: the line says what he is about to do "
+            + "another action, and an errand of several steps is one run_task. Write nothing outside a tool; "
+            + "after a tool's result, reply with respond: the line says what he is about to do "
             + "(an action starts after the line, so never say how it turned out), or honestly why he can't, in his "
             + "own words.";
     /** The re-request's reminder (KTD9), with the repeated question quoted. */

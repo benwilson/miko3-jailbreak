@@ -119,8 +119,7 @@ SCHEMA_PREAMBLE = (
     'reply; small talk needs none. His action tools (move, stop, stay, come_here, go_away, be_quiet, '
     'find_person, find_thing, go_to_place, wait, run_task) are only for when the person explicitly asks '
     'him to do that: call one alone, never with respond or another action, and an errand of several '
-    'steps is one run_task. Before calling a tool, you may write a few words he says while it runs, like '
-    '"Let me look." or "Okay, turning around.", and nothing else outside a tool; after its result, reply '
+    "steps is one run_task. Write nothing outside a tool; after a tool's result, reply "
     'with respond: the line says what he is about to do (an action starts after the line, so never say '
     "how it turned out), or honestly why he can't, in his own words."
 )
@@ -365,7 +364,7 @@ def headers(key):
             "content-type": "application/json", "user-agent": "miko3-chat-bench/1.0"}
 
 
-def build_body(model, system, messages, effort, tool_choice="auto", stream=True):
+def build_body(model, system, messages, effort, tool_choice="any", stream=True):
     """The JSON body in ClaudeApi.conversationRequest's key order: the message list, the
     tools and tool_choice ("auto", or a tool's name to force it), effort, the top-level
     cache breakpoint and streaming. No output_config.format: the reply is respond's input."""
@@ -632,7 +631,7 @@ class Bench:
         """One turn as ChatRound runs it: the first request (tools auto), then at most one tool
         round answered from the bench's facts and a second request with respond forced."""
         messages = build_messages(window(self.exchanges), words)
-        first, first_s, effort_sent = self._send(messages, "auto")
+        first, first_s, effort_sent = self._send(messages, "any")
         uses = [b for b in first.content if b["type"] == "tool_use"]
         actions = [u for u in uses if u["name"] in ACTION_NAMES]
         self.last_actions = [{"name": u["name"], "input": u.get("input")} for u in actions[:1]]

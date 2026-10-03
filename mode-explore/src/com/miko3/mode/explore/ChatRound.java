@@ -112,9 +112,13 @@ final class ChatRound {
         return defs;
     }
 
-    /** The first request's tools: every tool, Claude's choice, respond's input the reply. */
+    /**
+     * The first request's tools: every tool, respond's input the reply. tool_choice "any": Claude
+     * must call a tool, so it can write no free text at all (robot 2026-10-02 at home: text Claude
+     * wrote before a tool, its reasoning, was spoken aloud as the preamble).
+     */
     static ClaudeApi.Tools tools() {
-        return new ClaudeApi.Tools(definitions()).replyTool(ChatTools.RESPOND);
+        return new ClaudeApi.Tools(definitions()).replyTool(ChatTools.RESPOND).choice("any");
     }
 
     /**
@@ -219,7 +223,8 @@ final class ChatRound {
                 used.append(used.length() == 0 ? "" : ",").append(u.name);
             }
         }
-        CuriosityPort.LookResult seen = host.ask(ChatTools.preamble(first.text), look,
+        // Never Claude's own text (with tool_choice "any" there is none): a fixed few words per tool.
+        CuriosityPort.LookResult seen = host.ask(preambleFor(first.toolUses), look,
                 ChatTools.ADAPTER_LOOK_WAIT_MS);
         List<Map<String, Object>> results = new ArrayList<Map<String, Object>>();
         ChatActions.Act act = null;
@@ -423,12 +428,32 @@ final class ChatRound {
             return r.json;
         }
         String text = r.text == null ? "" : r.text.trim();
-        if (text.isEmpty()) {
+        if (text.isEmpty() || looksLikeReasoning(text)) {
+            // Robot 2026-10-02: never speak Claude talking about the conversation ("I should respond...").
             return null;
         }
         Map<String, Object> json = new LinkedHashMap<String, Object>();
         json.put("addressed", Boolean.TRUE);
         json.put("line", text);
         return json;
+    }
+
+    /** Words that are Claude reasoning about the reply rather than a line Miko would say. */
+    static boolean looksLikeReasoning(String text) {
+        String t = text.toLowerCase(java.util.Locale.ROOT);
+        return t.contains("i should") || t.contains("the person") || t.contains("the user") || t.contains("respond")
+                || t.contains("let me think") || t.contains("tool") || t.contains("miko should") || t.contains("they said");
+    }
+
+    /** The few words said while a tool runs: fixed per tool, never Claude's text (null: none). */
+    static String preambleFor(List<ClaudeApi.ToolUse> uses) {
+        if (uses != null) {
+            for (ClaudeApi.ToolUse u : uses) {
+                if (ChatTools.LOOK.equals(u.name)) {
+                    return "Let me look.";
+                }
+            }
+        }
+        return null;
     }
 }

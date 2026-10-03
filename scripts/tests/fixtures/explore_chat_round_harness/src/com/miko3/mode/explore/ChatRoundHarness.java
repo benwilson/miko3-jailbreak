@@ -220,7 +220,7 @@ public final class ChatRoundHarness {
                 b != null && names.equals(Arrays.asList("respond", "look", "recall_person", "robot_status", "places",
                         "move", "stop", "stay", "come_here", "go_away", "be_quiet", "find_person", "find_thing",
                         "go_to_place", "wait", "run_task"))
-                        && ((Map<?, ?>) b.get("tool_choice")).get("type").equals("auto")
+                        && ((Map<?, ?>) b.get("tool_choice")).get("type").equals("any")
                         && !b.containsKey("output_config") && !String.valueOf(b.get("system")).contains("Reply with only a JSON")
                         && String.valueOf(b.get("system")).contains("Reply by calling the respond tool")
                         && Json.write(((Map<?, ?>) respond.get("input_schema")).get("properties"))
@@ -285,13 +285,18 @@ public final class ChatRoundHarness {
         run(t2, request("Look at this."), none, new Early());
         Map<String, Object> r1 = t.bodies.size() == 2 ? lastResult(t.bodies.get(1)) : null;
         Map<String, Object> r2 = t2.bodies.size() == 2 ? lastResult(t2.bodies.get(1)) : null;
+        check("round_reasoning_text_is_never_a_line",
+                ChatRound.looksLikeReasoning("Okay, I should respond to what the person said.")
+                        && ChatRound.looksLikeReasoning("The user is asking about the weather, so I'll use the respond tool.")
+                        && !ChatRound.looksLikeReasoning("Hi there! Nice to meet you."),
+                "reasoning filter");
         check("round_a_look_he_cant_take_is_a_tool_error_saying_why_and_sends_no_image",
                 o.result.ok() && r1 != null && Boolean.TRUE.equals(r1.get("is_error"))
                         && String.valueOf(r1.get("content")).contains("bathroom")
                         && String.valueOf(r1.get("content")).contains("can't look") && !Json.write(t.bodies.get(1)).contains("\"image\"")
                         && r2 != null && Boolean.TRUE.equals(r2.get("is_error"))
                         && String.valueOf(r2.get("content")).contains("no picture in time")
-                        && host.asks.equals(Arrays.asList("null|true|" + ChatTools.ADAPTER_LOOK_WAIT_MS)),
+                        && host.asks.equals(Arrays.asList("Let me look.|true|" + ChatTools.ADAPTER_LOOK_WAIT_MS)),
                 "r1=" + r1 + " r2=" + r2 + " asks=" + host.asks);
     }
 
@@ -398,7 +403,7 @@ public final class ChatRoundHarness {
                         && o.act.amount == 180 && "move".equals(o.tools) && o.reply != null
                         && r != null && r.get("is_error") == null
                         && String.valueOf(r.get("content")).startsWith("started: turning around")
-                        && host.asks.equals(Arrays.asList("Okay, turning around.|false|" + ChatTools.ADAPTER_LOOK_WAIT_MS))
+                        && host.asks.equals(Arrays.asList("null|false|" + ChatTools.ADAPTER_LOOK_WAIT_MS))
                         && choice != null && "respond".equals(choice.get("name")),
                 "act=" + (o.act == null ? null : o.act.describe()) + " result=" + r + " asks=" + host.asks);
     }

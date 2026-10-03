@@ -129,7 +129,7 @@ class RequestShapeTest(unittest.TestCase):
                           "come_here", "go_away", "be_quiet", "find_person", "find_thing", "go_to_place", "wait",
                           "run_task"])
         self.assertEqual(body["tools"][0]["input_schema"], bench.REPLY_SCHEMA)
-        self.assertEqual(body["tool_choice"], {"type": "auto"})
+        self.assertEqual(body["tool_choice"], {"type": "any"})
         self.assertEqual(body["output_config"], {"effort": "low"})
         self.assertTrue(body["stream"])
         self.assertEqual(body["cache_control"], {"type": "ephemeral"})
@@ -356,7 +356,7 @@ class ConversationTest(unittest.TestCase):
         records = quiet(b.run, ("What can you see right now?",))
         self.assertEqual(len(transport.requests), 2)
         first, second = transport.requests[0][2], transport.requests[1][2]
-        self.assertEqual(first["tool_choice"], {"type": "auto"})
+        self.assertEqual(first["tool_choice"], {"type": "any"})
         self.assertEqual(second["tool_choice"], {"type": "tool", "name": "respond"})
         asked, answered = second["messages"][-2], second["messages"][-1]
         self.assertEqual(asked["role"], "assistant")

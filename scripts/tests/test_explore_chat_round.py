@@ -44,6 +44,7 @@ class ChatRoundHarnessTest(unittest.TestCase):
         "round_first_request_offers_every_tool_with_auto_choice_and_no_json_format",
         "round_a_respond_reply_is_one_request_with_addressed_told_early",
         "round_a_look_says_the_preamble_waits_for_the_frame_and_forces_respond",
+        "round_reasoning_text_is_never_a_line",
         "round_a_look_he_cant_take_is_a_tool_error_saying_why_and_sends_no_image",
         "round_status_places_and_recall_answer_from_the_turns_facts_and_share_no_ones_notes",
         "round_a_speculation_that_wants_a_tool_is_dropped_before_any_preamble_or_look",
