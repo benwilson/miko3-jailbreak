@@ -10956,7 +10956,10 @@ final class ExploreBrain {
     /** States DOCKED may replace: roaming, escaping, resting and eyes-only (a faulted ToF on the dock),
      * never a stop, a call or a conversation. */
     private boolean dockable() {
-        return (state.roams() || state == State.CORNERED || state == State.RECOVER || state == State.EYES_ONLY)
+        // TIP too (home 2026-10-02 21:46): set on the dock mid-tip, the dock's ~12 deg slope never
+        // read flat, so he waited in TIP for good and never saw the charger.
+        return (state.roams() || state == State.CORNERED || state == State.RECOVER || state == State.EYES_ONLY
+                || state == State.TIP)
                 && call == null && !callChatOpening && chat == null;
     }
 
