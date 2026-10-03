@@ -268,6 +268,46 @@ public final class RobotPeopleClient {
         });
     }
 
+    /** Enrols the voice of the answer at at to this person (owner 2026-10-02); false when it has no embedding. */
+    public static boolean enrolVoice(Context context, final String id, final long at) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.enrolVoice(id, at);
+            }
+        });
+    }
+
+    /** How many voice embeddings this person has. */
+    public static int voiceCount(Context context, final String id) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Integer>() {
+            @Override
+            public Integer run(RobotPeople people) throws RemoteException {
+                return people.voiceCount(id);
+            }
+        });
+    }
+
+    /** How close the answer at at is to this person's voice; NaN when unknown. */
+    public static float voiceScore(Context context, final String id, final long at) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Float>() {
+            @Override
+            public Float run(RobotPeople people) throws RemoteException {
+                return people.voiceScore(id, at);
+            }
+        });
+    }
+
+    /** How close two answers' voices are; NaN when unknown. */
+    public static float voiceSimilarity(Context context, final long atA, final long atB) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Float>() {
+            @Override
+            public Float run(RobotPeople people) throws RemoteException {
+                return people.voiceSimilarity(atA, atB);
+            }
+        });
+    }
+
     private static PersonNotes parseNotes(String json) {
         try {
             return PersonNotes.parse(json);

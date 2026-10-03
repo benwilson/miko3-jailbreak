@@ -467,6 +467,14 @@ public final class ExploreBrainHarness {
             this(heard, afterMs, answeringAfterMs, null, -1);
         }
 
+        /** Owner 2026-10-02: the answer's voice identification (person, score, band), or band -1 for none. */
+        String voicePerson;
+        float voiceScore = Float.NaN;
+        int voiceBand = -1;
+        long voiceAfterMs = 100;
+        /** What the voice gate's score of this answer against the partner answers (NaN: unknown). */
+        float gateScore = Float.NaN;
+
         Hearing(CuriosityPort.Heard heard, long afterMs, long answeringAfterMs, String provisional,
                 long provisionalAfterMs) {
             this.heard = heard;
@@ -476,9 +484,46 @@ public final class ExploreBrainHarness {
             this.provisionalAfterMs = provisionalAfterMs;
         }
 
+        /** This hearing with its voice identification, arriving voiceAfterMs after its words. */
+        Hearing voice(String person, float score, int band) {
+            Hearing h = copy();
+            h.voicePerson = person;
+            h.voiceScore = score;
+            h.voiceBand = band;
+            return h;
+        }
+
+        Hearing voiceAfter(long ms) {
+            Hearing h = copy();
+            h.voiceAfterMs = ms;
+            return h;
+        }
+
+        Hearing gate(float score) {
+            Hearing h = copy();
+            h.gateScore = score;
+            return h;
+        }
+
+        private Hearing copy() {
+            Hearing h = new Hearing(heard, afterMs, answeringAfterMs, provisional, provisionalAfterMs);
+            h.voicePerson = voicePerson;
+            h.voiceScore = voiceScore;
+            h.voiceBand = voiceBand;
+            h.voiceAfterMs = voiceAfterMs;
+            h.gateScore = gateScore;
+            return h;
+        }
+
         /** The same hearing, arriving this long after the listen starts. */
         Hearing after(long ms) {
-            return new Hearing(heard, ms, answeringAfterMs, provisional, provisionalAfterMs);
+            Hearing h = new Hearing(heard, ms, answeringAfterMs, provisional, provisionalAfterMs);
+            h.voicePerson = voicePerson;
+            h.voiceScore = voiceScore;
+            h.voiceBand = voiceBand;
+            h.voiceAfterMs = voiceAfterMs;
+            h.gateScore = gateScore;
+            return h;
         }
 
         /** The same hearing, with the answer starting (the port's answering()) this long after the listen starts. */
@@ -617,6 +662,9 @@ public final class ExploreBrainHarness {
         long storeDelayMs = 300;
         /** Owner 2026-10-02: the named people remembered by name alone (no face yet). */
         final java.util.Set<String> nameOnly = new java.util.HashSet<String>();
+        /** Owner 2026-10-02: each id's voice print count, and how this conversation's answers score against them. */
+        final java.util.Map<String, Integer> voicePrints = new java.util.HashMap<String, Integer>();
+        final java.util.Map<String, Float> voiceScore = new java.util.HashMap<String, Float>();
     }
 
     static final class Rig implements ExploreBrain.Clock, ExploreBrain.Motor, ExploreBrain.Eyes, ExploreBrain.Sound,
@@ -803,6 +851,15 @@ public final class ExploreBrainHarness {
         final List<String> recalls = new ArrayList<String>();
         CuriosityPort.Recalled pendingRecall;
         long pendingRecallAt;
+        /** Owner 2026-10-02: voices: the identifications waiting, ids looked up by voice, enrolments, gate scores. */
+        Hearing pendingHearing;
+        final List<Object[]> voiceQueue = new ArrayList<Object[]>();
+        final java.util.Map<Long, Float> gateScores = new java.util.HashMap<Long, Float>();
+        final List<String> voiceRecalls = new ArrayList<String>();
+        final List<String> enrolled = new ArrayList<String>();
+        final List<Long> voiceScoreAsks = new ArrayList<Long>();
+        Float pendingVoiceScore;
+        long pendingVoiceScoreAt;
         CuriosityPort.Resolved pendingResolved;
         long pendingResolvedAt;
         CuriosityPort.MatchAnswer pendingPhoto;
@@ -1551,6 +1608,7 @@ public final class ExploreBrainHarness {
             listens++;
             Hearing h = people.listen == null ? null : people.listen.hear(this, listens);
             pendingHeard = h == null ? null : h.heard;
+            pendingHearing = h;
             pendingHeardAt = now + (h == null || h.afterMs < 0 ? people.replyMs : h.afterMs);
             pendingAnsweringAt = h == null || h.answeringAfterMs < 0 ? Long.MAX_VALUE : now + h.answeringAfterMs;
             pendingProvisional = h == null ? null : h.provisional;
@@ -1603,6 +1661,14 @@ public final class ExploreBrainHarness {
             }
             CuriosityPort.Heard h = pendingHeard;
             pendingHeard = null;
+            Hearing hearing = pendingHearing;
+            pendingHearing = null;
+            if (hearing != null && hearing.voiceBand >= 0 && h.status == CuriosityPort.Heard.Status.WORDS) {
+                long at = 100000L + listens;
+                voiceQueue.add(new Object[] {now + hearing.voiceAfterMs,
+                        new Ears.Voice(at, hearing.voicePerson, hearing.voiceScore, hearing.voiceBand)});
+                gateScores.put(at, hearing.gateScore);
+            }
             pendingAnsweringAt = Long.MAX_VALUE;
             pendingProvisional = null;
             pendingProvisionalAt = Long.MAX_VALUE;
@@ -2034,8 +2100,71 @@ public final class ExploreBrainHarness {
 
         @Override
         public void cancelRecallName() {
-            pendingRecall = null;
             log.add(new Event(now, "cancel recall"));
+            pendingRecall = null;
+        }
+
+        @Override
+        public Ears.Voice voice() {
+            for (int i = 0; i < voiceQueue.size(); i++) {
+                if ((Long) voiceQueue.get(i)[0] <= now) {
+                    return (Ears.Voice) voiceQueue.remove(i)[1];
+                }
+            }
+            return null;
+        }
+
+        @Override
+        public void recallName(String name, long[] voiceAts, long timeoutMs) {
+            recallName(name, timeoutMs);
+            CuriosityPort.Recalled r = pendingRecall;
+            if (r != null && r.status == CuriosityPort.Recalled.Status.FOUND) {
+                Float score = people.voiceScore.get(r.personId);
+                pendingRecall = r.withVoice(people.voicePrints.getOrDefault(r.personId, 0),
+                        voiceAts.length == 0 || score == null ? Float.NaN : score);
+            }
+        }
+
+        @Override
+        public void recallPerson(String personId, long timeoutMs) {
+            voiceRecalls.add(personId);
+            String stored = people.named.get(personId);
+            pendingRecall = CuriosityPort.Recalled.found(personId, stored, people.notes.get(personId),
+                    people.asked.get(personId), !people.nameOnly.contains(personId))
+                    .withVoice(people.voicePrints.getOrDefault(personId, 0), Float.NaN);
+            pendingRecallAt = now + people.storeDelayMs;
+            log.add(new Event(now, "recall by voice"));
+        }
+
+        @Override
+        public void enrolVoice(String personId, long[] ats) {
+            for (long at : ats) {
+                enrolled.add(personId + "@" + at);
+            }
+        }
+
+        @Override
+        public void voiceScore(String personId, long refAt, long at, long timeoutMs) {
+            voiceScoreAsks.add(at);
+            Float score = gateScores.get(at);
+            pendingVoiceScore = score == null ? Float.NaN : score;
+            pendingVoiceScoreAt = now + 20;
+        }
+
+        @Override
+        public Float voiceScored() {
+            if (pendingVoiceScore == null || now < pendingVoiceScoreAt) {
+                return null;
+            }
+            Float s = pendingVoiceScore;
+            pendingVoiceScore = null;
+            return s;
+        }
+
+        @Override
+        public void cancelVoiceScore() {
+            pendingVoiceScore = null;
+            log.add(new Event(now, "cancel voice score"));
         }
 
         @Override
@@ -14400,6 +14529,7 @@ public final class ExploreBrainHarness {
         });
         usableFaceScenarios();
         facelessCallScenarios();
+        voiceScenarios();
         callChatFirstScenarios();
         instructionScenarios();
         actScenarios();
@@ -15554,6 +15684,247 @@ public final class ExploreBrainHarness {
                             && wheelMoves(rig, 4000, over) == 0 && rig.chatTurns == 0 && rig.violations.isEmpty(),
                     "open@" + open + " over@" + over + " first=" + first + " moves=" + wheelMoves(rig, 4000, Math.max(4000, over))
                             + " " + rig.tail());
+        });
+    }
+
+    // ---- whose voice (owner 2026-10-02: "rely on voice recognition first, then facial recognition") ----
+
+    private static final int STRONG = Ears.Voice.STRONG;
+    private static final int WEAK = Ears.Voice.WEAK;
+    private static final int NO_VOICE = Ears.Voice.NONE;
+
+    /** The turn requests carrying this voice cue. */
+    private static List<TurnAsk> cued(Rig rig, CuriosityPort.TurnRequest.IdCue cue) {
+        List<TurnAsk> out = new ArrayList<TurnAsk>();
+        for (TurnAsk t : rig.turnAsks) {
+            if (t.request.cue == cue) {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    private static boolean enrolledOnlyTo(Rig rig, String id) {
+        for (String e : rig.enrolled) {
+            if (!e.startsWith(id + "@")) {
+                return false;
+            }
+        }
+        return !rig.enrolled.isEmpty();
+    }
+
+    /** No identity line names a person or an id. */
+    private static boolean identityLinesClean(List<String> notes, String... secrets) {
+        for (String x : notes) {
+            if (x.contains("identity:") || x.contains("voice:")) {
+                for (String secret : secrets) {
+                    if (x.contains(secret)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private static void voiceScenarios() {
+        scenario("voice_a_strong_voice_with_nobody_known_adopts_them_and_says_their_name_once", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                    hearWords("not bad, busy day").voice("p-sam", 0.8f, STRONG), hearWords("sure"), hearWords("sure"),
+                    hearWords("bye"));
+            rig.people.named.put("p-sam", "Sam");
+            rig.people.notes.put("p-sam", "{\"interests\":[\"chess\"]}");
+            rig.people.voicePrints.put("p-sam", 4);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            List<TurnAsk> byVoice = cued(rig, CuriosityPort.TurnRequest.IdCue.BY_VOICE);
+            TurnAsk said = byVoice.size() == 1 ? byVoice.get(0) : null;
+            TurnAsk last = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(rig.turnAsks.size() - 1);
+            List<String> turns = records(notes, "turn: ");
+            check(n, open > 0 && over > 0 && rig.voiceRecalls.equals(java.util.Arrays.asList("p-sam")) && said != null
+                            && said.request.recalled && "Sam".equals(said.request.name)
+                            && said.request.notes.contains("chess") && recalledAsks(rig).size() == 1
+                            && last != null && "Sam".equals(last.request.name) && !last.request.recalled
+                            && rig.recalls.isEmpty() && rig.enrolled.isEmpty() && !rig.notesDeltas.isEmpty()
+                            && allStartWith(rig.notesDeltas, "p-sam: ") && noted(notes, "identity: voice strong → known")
+                            && noted(turns, " voice=strong ") && noted(turns, " voice=- ")
+                            && identityLinesClean(notes, "Sam", "p-sam") && rig.violations.isEmpty(),
+                    "voiceRecalls=" + rig.voiceRecalls + " byVoice=" + byVoice + " turns=" + turns + " " + rig.tail());
+        });
+        scenario("voice_a_weak_voice_asks_the_name_and_adopts_nobody", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                    hearWords("just getting coffee").voice("p-sam", 0.5f, WEAK), hearWords("sure"), hearWords("bye"));
+            rig.people.named.put("p-sam", "Sam");
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            List<TurnAsk> asks = cued(rig, CuriosityPort.TurnRequest.IdCue.ASK_NAME);
+            check(n, open > 0 && over > 0 && rig.voiceRecalls.isEmpty() && asks.size() == 1
+                            && asks.get(0).request.name == null && asks.get(0).request.heard != null
+                            && rig.notesDeltas.isEmpty() && rig.enrolled.isEmpty()
+                            && noted(notes, "identity: voice weak") && rig.violations.isEmpty(),
+                    "asks=" + asks + " " + rig.tail());
+        });
+        scenario("voice_a_name_the_voice_agrees_with_is_accepted_and_a_few_answers_enrolled", n -> {
+            Rig rig = facelessCallRig(0, turnsOf(turnLine(1), named(2, "Priya")),
+                    hearWords("hi there").voice("p-priya", 0.55f, WEAK),
+                    hearWords("yes I'm Priya").voice("p-priya", 0.6f, WEAK),
+                    hearWords("sure thing").voice("p-priya", 0.6f, WEAK),
+                    hearWords("of course").voice("p-priya", 0.6f, WEAK),
+                    hearWords("yes indeed").voice("p-priya", 0.6f, WEAK), hearWords("bye"));
+            rig.people.named.put("p-priya", "Priya");
+            rig.people.notes.put("p-priya", "{\"interests\":[\"bouldering\"]}");
+            rig.people.voicePrints.put("p-priya", 4);
+            rig.people.voiceScore.put("p-priya", 0.55f);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.recalls.equals(java.util.Arrays.asList("Priya"))
+                            && enrolledOnlyTo(rig, "p-priya") && rig.enrolled.size() == 3
+                            && new java.util.HashSet<String>(rig.enrolled).size() == 3
+                            && cued(rig, CuriosityPort.TurnRequest.IdCue.ASK_LAST_NAME).isEmpty()
+                            && allStartWith(rig.notesDeltas, "p-priya: ") && noted(notes, "identity: name confirms voice")
+                            && identityLinesClean(notes, "Priya", "p-priya") && rig.violations.isEmpty(),
+                    "enrolled=" + rig.enrolled + " recalls=" + rig.recalls + " " + rig.tail());
+        });
+        scenario("voice_a_name_whose_voice_is_far_off_asks_the_last_name_and_the_same_full_name_is_that_person", n -> {
+            Rig rig = facelessCallRig(0, turnsOf(turnLine(1), named(2, "Sam"), turnLine(3), named(4, "Jones")),
+                    hearWords("hey").voice(null, 0.1f, NO_VOICE), hearWords("I'm Sam").voice(null, 0.1f, NO_VOICE),
+                    hearWords("sure"), hearWords("it's Jones"), hearWords("sure"), hearWords("bye"));
+            rig.people.named.put("p-sam1", "Sam Jones");
+            rig.people.voicePrints.put("p-sam1", 5);
+            rig.people.voiceScore.put("p-sam1", 0.1f);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            List<TurnAsk> lastAsk = cued(rig, CuriosityPort.TurnRequest.IdCue.ASK_LAST_NAME);
+            check(n, open > 0 && over > 0 && rig.recalls.equals(java.util.Arrays.asList("Sam", "Sam Jones"))
+                            && lastAsk.size() == 1 && "Sam".equals(lastAsk.get(0).request.name)
+                            && noted(notes, "identity: voice far off → last name asked")
+                            && noted(notes, "identity: the full name is someone stored → the same person")
+                            && enrolledOnlyTo(rig, "p-sam1") && allStartWith(rig.notesDeltas, "p-sam1: ")
+                            && rig.people.named.size() == 1 && identityLinesClean(notes, "Sam", "Jones", "p-sam1")
+                            && rig.violations.isEmpty(),
+                    "recalls=" + rig.recalls + " lastAsk=" + lastAsk + " enrolled=" + rig.enrolled + " deltas="
+                            + rig.notesDeltas + " " + rig.tail());
+        });
+        scenario("voice_far_off_and_a_different_full_name_is_a_new_person_with_the_voice", n -> {
+            Rig rig = facelessCallRig(0, turnsOf(turnLine(1), named(2, "Sam"), turnLine(3), named(4, "Smith")),
+                    hearWords("hey").voice(null, 0.1f, NO_VOICE), hearWords("I'm Sam").voice(null, 0.1f, NO_VOICE),
+                    hearWords("sure"), hearWords("Smith"), hearWords("sure"), hearWords("bye"));
+            rig.people.named.put("p-sam1", "Sam Jones");
+            rig.people.voicePrints.put("p-sam1", 5);
+            rig.people.voiceScore.put("p-sam1", 0.1f);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.recalls.equals(java.util.Arrays.asList("Sam", "Sam Smith"))
+                            && "Sam Smith".equals(rig.people.named.get("named-2")) && enrolledOnlyTo(rig, "named-2")
+                            && allStartWith(rig.notesDeltas, "named-2: ")
+                            && noted(notes, "identity: the full name is someone new → a new person")
+                            && rig.violations.isEmpty(),
+                    "recalls=" + rig.recalls + " named=" + rig.people.named + " enrolled=" + rig.enrolled + " "
+                            + rig.tail());
+        });
+        scenario("voice_someone_who_says_they_are_someone_else_is_that_name_and_the_voice_goes_there", n -> {
+            Rig rig = facelessCallRig(0, turnsOf(turnLine(1), turnLine(2), turnLine(3), named(4, "Priya")),
+                    hearWords("hello").voice("p-sam", 0.8f, STRONG), hearWords("not quite"),
+                    hearWords("I'm actually Priya"), hearWords("sure"), hearWords("bye"));
+            rig.people.named.put("p-sam", "Sam");
+            rig.people.voicePrints.put("p-sam", 4);
+            rig.people.named.put("p-priya", "Priya");
+            rig.people.voicePrints.put("p-priya", 4);
+            rig.people.voiceScore.put("p-priya", 0.1f);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk last = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(rig.turnAsks.size() - 1);
+            check(n, open > 0 && over > 0 && rig.voiceRecalls.equals(java.util.Arrays.asList("p-sam"))
+                            && rig.recalls.equals(java.util.Arrays.asList("Priya")) && last != null
+                            && "Priya".equals(last.request.name) && enrolledOnlyTo(rig, "p-priya")
+                            && cued(rig, CuriosityPort.TurnRequest.IdCue.ASK_LAST_NAME).isEmpty()
+                            && noted(notes, "identity: they say they are someone else → the name wins")
+                            && !rig.notesDeltas.isEmpty()
+                            && rig.notesDeltas.get(rig.notesDeltas.size() - 1).startsWith("p-priya: ")
+                            && rig.violations.isEmpty(),
+                    "voiceRecalls=" + rig.voiceRecalls + " recalls=" + rig.recalls + " enrolled=" + rig.enrolled
+                            + " deltas=" + rig.notesDeltas + " " + rig.tail());
+        });
+        scenario("voice_a_face_that_disagrees_keeps_the_voice_identity_and_stores_no_face", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                    hearWords("hello").voice("p-sam", 0.8f, STRONG), replies(6)[0], replies(6)[1], replies(6)[2],
+                    replies(6)[3], replies(6)[4], hearWords("bye"));
+            rig.people.named.put("p-sam", "Sam");
+            rig.people.voicePrints.put("p-sam", 4);
+            rig.people.match = (r, k) -> k >= 3
+                    ? CuriosityPort.MatchAnswer.known("Ben").withMatch(FaceMatcher.Band.CONFIDENT, "p-ben", 0.8f, 40L + k)
+                            .withConversation(r.people.persona, "p-ben", "{\"interests\":[\"golf\"]}", null)
+                    : noFace(r);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk last = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(rig.turnAsks.size() - 1);
+            check(n, open > 0 && over > 0 && noted(notes, "identity: face disagrees") && rig.photos.isEmpty()
+                            && rig.kept.isEmpty() && last != null && "Sam".equals(last.request.name)
+                            && (last.request.notes == null || !last.request.notes.contains("golf"))
+                            && allStartWith(rig.notesDeltas, "p-sam: ") && rig.violations.isEmpty(),
+                    "photos=" + rig.photos + " last=" + (last == null ? null : last.request.name) + " " + rig.tail());
+        });
+        scenario("voice_gate_an_answer_in_another_voice_is_not_said_to_him", n -> {
+            String tv = "'S CURIOUS U 'S 'S AND THERE'S A HUNDRED TWENTY WOMEN";
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                    hearWords("hello there").voice(null, 0.2f, NO_VOICE),
+                    hearWords(tv).voice(null, 0.1f, NO_VOICE).gate(0.05f),
+                    hearWords("so anyway").voice(null, 0.2f, NO_VOICE).gate(0.7f),
+                    hearWords("bye").voice(null, 0.2f, NO_VOICE).gate(0.7f));
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            boolean tvAsked = false;
+            boolean anywayAsked = false;
+            for (TurnAsk t : rig.turnAsks) {
+                tvAsked |= tv.equals(t.request.heard);
+                anywayAsked |= "so anyway".equals(t.request.heard);
+            }
+            List<String> turns = records(notes, "turn: ");
+            check(n, open > 0 && over > 0 && !tvAsked && anywayAsked && rig.voiceScoreAsks.size() == 3
+                            && noted(notes, "voice: not the partner (likely someone else or the TV)")
+                            && noted(turns, " addr=n ") && noted(notes, "they said goodbye")
+                            && !noted(notes, tv) && rig.violations.isEmpty(),
+                    "scoreAsks=" + rig.voiceScoreAsks + " asks=" + rig.turnAsks.size() + " turns=" + turns + " "
+                            + rig.tail());
+        });
+        scenario("voice_gate_with_no_voice_in_time_the_turn_goes_as_before", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                    hearWords("hello there").voice(null, 0.2f, NO_VOICE),
+                    hearWords("quick one").voice(null, 0.1f, NO_VOICE).voiceAfter(900).gate(0.05f),
+                    hearWords("short"), hearWords("bye"));
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long askedQuick = -1;
+            for (TurnAsk t : rig.turnAsks) {
+                if ("quick one".equals(t.request.heard)) {
+                    askedQuick = t.t;
+                }
+            }
+            boolean shortAsked = false;
+            for (TurnAsk t : rig.turnAsks) {
+                shortAsked |= "short".equals(t.request.heard);
+            }
+            check(n, open > 0 && over > 0 && askedQuick > 0 && shortAsked && rig.voiceScoreAsks.isEmpty()
+                            && !noted(notes, "voice: not the partner") && rig.violations.isEmpty(),
+                    "askedQuick=" + askedQuick + " scoreAsks=" + rig.voiceScoreAsks + " " + rig.tail());
         });
     }
 
@@ -18151,7 +18522,7 @@ public final class ExploreBrainHarness {
     private static final java.util.regex.Pattern TURN_RECORD = java.util.regex.Pattern.compile(
             "turn: c=\\d+ t=\\d+ open=[yn] addr=[yn?] req=(-|-?\\d+) line=(-|\\d+) sound=(-|\\d+) done=(-|\\d+)"
                     + " spec=[yn?] tools=\\S+ tries=[12] retry=(\\w+|-) fail=\\S+ unans=\\d+ nowords=\\d+ reask=[yn]"
-                    + " end=\\S+ meet=(call|cue|roaming|claude-pick|other) faceless=[yn] faceseen=[yn] replies=\\d+");
+                    + " voice=(strong|weak|none|-) end=\\S+ meet=(call|cue|roaming|claude-pick|other) faceless=[yn] faceseen=[yn] replies=\\d+");
 
     private static void learnScenarios() {
         scenario("learn_each_conversation_turn_is_one_turn_record_with_latencies_and_no_words", n -> {

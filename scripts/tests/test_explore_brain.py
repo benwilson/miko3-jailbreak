@@ -687,6 +687,16 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "call_faceless_a_new_face_later_is_enrolled_to_the_person_kept_by_name",
         "call_faceless_usable_face_before_the_name_stores_name_and_face",
         "call_faceless_unnamed_with_no_face_keeps_nothing",
+        # Whose voice (owner 2026-10-02: voice first, the face verifies; a TV is not the partner)
+        "voice_a_strong_voice_with_nobody_known_adopts_them_and_says_their_name_once",
+        "voice_a_weak_voice_asks_the_name_and_adopts_nobody",
+        "voice_a_name_the_voice_agrees_with_is_accepted_and_a_few_answers_enrolled",
+        "voice_a_name_whose_voice_is_far_off_asks_the_last_name_and_the_same_full_name_is_that_person",
+        "voice_far_off_and_a_different_full_name_is_a_new_person_with_the_voice",
+        "voice_someone_who_says_they_are_someone_else_is_that_name_and_the_voice_goes_there",
+        "voice_a_face_that_disagrees_keeps_the_voice_identity_and_stores_no_face",
+        "voice_gate_an_answer_in_another_voice_is_not_said_to_him",
+        "voice_gate_with_no_voice_in_time_the_turn_goes_as_before",
         # Conversation first, the caller found during it (owner 2026-10-02)
         "callchat_wake_with_words_opens_with_their_words_as_the_first_message_within_2_s",
         "callchat_bare_wake_opens_at_once_with_a_greeting_question_and_searches_during_it",

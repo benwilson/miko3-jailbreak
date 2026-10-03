@@ -208,6 +208,7 @@ final class ClaudeCuriosity implements CuriosityPort {
     private final Slot<MatchAnswer> photoAdds = new Slot<MatchAnswer>();
     /** Owner 2026-10-02: a name given with no usable face, looked up by name alone. */
     private final Slot<CuriosityPort.Recalled> recalls = new Slot<CuriosityPort.Recalled>();
+    private final Slot<Float> voiceScores = new Slot<Float>();
     /** The recommended effort for a turn (KTD9); the client's gate drops it where a model refuses it. */
     private static final String TURN_EFFORT = "low";
     /**
@@ -1761,13 +1762,139 @@ final class ClaudeCuriosity implements CuriosityPort {
      */
     @Override
     public void recallName(final String name, final long timeoutMs) {
+        recallName(name, new long[0], timeoutMs);
+    }
+
+    /**
+     * Owner 2026-10-02: as recallName, and for a person found, how many voice prints they have
+     * and the best score of this conversation's answers at voiceAts against them. Logs no ids.
+     */
+    @Override
+    public void recallName(final String name, final long[] voiceAts, final long timeoutMs) {
+        final int g = recalls.start();
+        final long[] ats = voiceAts == null ? new long[0] : voiceAts.clone();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                recalls.finish(g, withVoice(recallNow(name), ats));
+            }
+        }, recalls, g, CuriosityPort.Recalled.FAILED);
+    }
+
+    /** A FOUND answer with the person's voice print count and best score; unchanged on any failure. */
+    private CuriosityPort.Recalled withVoice(CuriosityPort.Recalled r, long[] ats) {
+        if (r.status != CuriosityPort.Recalled.Status.FOUND) {
+            return r;
+        }
+        try {
+            int prints = RobotPeopleClient.voiceCount(app, r.personId);
+            float best = Float.NaN;
+            for (long at : ats) {
+                float s = RobotPeopleClient.voiceScore(app, r.personId, at);
+                if (!Float.isNaN(s) && (Float.isNaN(best) || s > best)) {
+                    best = s;
+                }
+            }
+            Log.i(TAG, "voice prints of the person found: " + prints + ", " + ats.length + " answer(s) compared");
+            return r.withVoice(prints, best);
+        } catch (IOException e) {
+            Log.w(TAG, "voice prints: the people store refused or is unavailable: " + e.getMessage());
+            return r;
+        }
+    }
+
+    /**
+     * Owner 2026-10-02: a strong voice match names a stored person by id: their stored name,
+     * notes, questions, face flag and voice print count, as recallName's FOUND. Logs no ids.
+     */
+    @Override
+    public void recallPerson(final String personId, final long timeoutMs) {
         final int g = recalls.start();
         run(new Runnable() {
             @Override
             public void run() {
-                recalls.finish(g, recallNow(name));
+                recalls.finish(g, personNow(personId));
             }
         }, recalls, g, CuriosityPort.Recalled.FAILED);
+    }
+
+    private CuriosityPort.Recalled personNow(String personId) {
+        if (personId == null) {
+            return CuriosityPort.Recalled.FAILED;
+        }
+        try {
+            String n = RobotPeopleClient.nameOf(app, personId);
+            if (n == null || n.trim().isEmpty()) {
+                Log.i(TAG, "the voice matched a record with no name: nothing is loaded");
+                return CuriosityPort.Recalled.FAILED;
+            }
+            PersonNotes notes = RobotPeopleClient.notesOf(app, personId);
+            boolean faced = RobotPeopleClient.hasFace(app, personId);
+            int prints = RobotPeopleClient.voiceCount(app, personId);
+            return CuriosityPort.Recalled.found(personId, n, notes.toJson(), notes.questionsAsked, faced)
+                    .withVoice(prints, Float.NaN);
+        } catch (IOException e) {
+            Log.w(TAG, "voice look-up: the people store refused or is unavailable: " + e.getMessage());
+            return CuriosityPort.Recalled.FAILED;
+        }
+    }
+
+    /** Owner 2026-10-02: the voices of these answers, enrolled to the person (fire and forget). */
+    @Override
+    public void enrolVoice(final String personId, final long[] ats) {
+        if (personId == null || ats == null || ats.length == 0) {
+            return;
+        }
+        final long[] copy = ats.clone();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                int ok = 0;
+                try {
+                    for (long at : copy) {
+                        ok += RobotPeopleClient.enrolVoice(app, personId, at) ? 1 : 0;
+                    }
+                    Log.i(TAG, "voice: " + ok + " of " + copy.length + " answer(s) enrolled to the person");
+                } catch (IOException e) {
+                    Log.w(TAG, "voice enrolment: the people store refused or is unavailable: " + e.getMessage());
+                }
+            }
+        }, null, 0, null);
+    }
+
+    /** The voice gate's score (owner 2026-10-02): the answer against the partner's prints or first answer. */
+    @Override
+    public void voiceScore(final String personId, final long refAt, final long at, long timeoutMs) {
+        final int g = voiceScores.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                float score;
+                try {
+                    score = personId != null ? RobotPeopleClient.voiceScore(app, personId, at)
+                            : RobotPeopleClient.voiceSimilarity(app, refAt, at);
+                } catch (IOException e) {
+                    score = Float.NaN;
+                }
+                voiceScores.finish(g, score);
+            }
+        }, voiceScores, g, Float.NaN);
+    }
+
+    @Override
+    public Float voiceScored() {
+        return voiceScores.poll();
+    }
+
+    @Override
+    public void cancelVoiceScore() {
+        voiceScores.cancel();
+    }
+
+    @Override
+    public Ears.Voice voice() {
+        EarsAdapter s = session;
+        return s == null ? null : s.pollVoice();
     }
 
     private CuriosityPort.Recalled recallNow(String name) {

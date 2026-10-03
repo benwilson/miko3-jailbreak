@@ -89,6 +89,7 @@ class VoiceIdHarnessTest(unittest.TestCase):
         "embedding_runs_on_one_low_priority_background_thread",
         "a_known_voice_is_reported_with_its_band",
         "enrol_by_utterance_time_then_match_then_forget",
+        "score_an_answer_against_a_person_or_another_answer",
         "only_the_most_recent_embeddings_are_kept_for_enrolment",
         "a_failing_embedder_is_logged_by_kind_and_reports_nothing",
     )

@@ -208,4 +208,43 @@ interface Ears {
             return null;
         }
     };
+
+    /**
+     * One conversation answer's voice identification (owner 2026-10-02): at is the answer's
+     * speech start (the launcher's key for its embedding), personId the closest stored voice
+     * or null, band one of NONE, WEAK, STRONG (RobotEars.VOICE_*). The id is never logged.
+     */
+    final class Voice {
+        static final int NONE = 0;
+        static final int WEAK = 1;
+        static final int STRONG = 2;
+
+        final long at;
+        final String personId;
+        final float score;
+        final int band;
+
+        Voice(long at, String personId, float score, int band) {
+            this.at = at;
+            this.band = band == STRONG || band == WEAK ? band : NONE;
+            this.personId = this.band == NONE || personId == null || personId.isEmpty() ? null : personId;
+            this.score = score;
+        }
+
+        boolean strong() {
+            return band == STRONG && personId != null;
+        }
+
+        /** strong, weak or none, for the learning log. */
+        String word() {
+            return band == STRONG ? "strong" : band == WEAK ? "weak" : "none";
+        }
+
+        /** The band only: never the id or the score. */
+        @Override
+        public String toString() {
+            return "voice " + word();
+        }
+    }
+
 }

@@ -451,7 +451,8 @@ final class ExplorePrompts {
             + "with a question that shows he is glad to be called and curious about them, built on one specific "
             + "thing, like what they are up to, how their day is going, or a true remark about what he was just "
             + "doing (never invent anything). Not a bare \"what's up\". Do not ask their name yet. They called him, "
-            + "so everything said in this conversation is said to him: addressed is always true.";
+            + "so what is said in this conversation is said to him: addressed is true unless it is clearly not them "
+            + "(another voice, a TV or radio).";
 
     /**
      * Owner 2026-10-02 ("he doesn't really talk to us"): the turn asked once a run of
@@ -480,6 +481,27 @@ final class ExplorePrompts {
      * mid-conversation: the name they gave found someone he remembers, or a background face
      * check matched them. The notes in the system prefix are theirs from this turn on.
      */
+    /**
+     * Owner 2026-10-02 ("if the voice print is super far off, maybe a different person, ask their
+     * last name"): appended to the turn after a name they gave found someone stored whose voice
+     * is far from theirs. Never says why, and never about their face.
+     */
+    static final String LAST_NAME_ASK = "(The name they gave matches someone he knows, but he is not sure it is the "
+            + "same person: after answering them, ask their last name naturally in this line, like \"And what's your "
+            + "last name?\". Never say why he asks, and never mention their voice or face. When they tell him, give "
+            + "their full name, first and last, as name_given.)";
+
+    /**
+     * Owner 2026-10-02 ("rely on voice recognition first"): appended once, to the turn right after
+     * a strong voice match told him who they are: he says their name naturally once.
+     */
+    static String recalledByVoice(String name) {
+        return "(He has just recognised " + (name == null ? "" : name.trim()) + " by their voice, someone he "
+                + "remembers: the notes above are what he knows of them. Answer what they said first, using their name "
+                + "naturally once in this line; if it fits, pick up one thing from the notes. If they say he has the "
+                + "wrong person, believe them and ask their name. Never mention their face.)";
+    }
+
     static String recalled(String name) {
         return "(He has just realised this is " + (name == null ? "" : name.trim()) + ", someone he remembers: "
                 + "the notes above are what he knows of them. Answer what they said first; if it fits, pick up one "

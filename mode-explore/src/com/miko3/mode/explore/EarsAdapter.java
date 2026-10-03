@@ -60,6 +60,8 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     private static final String TAG = "ExploreEars";
     /** Cues waiting for the brain's next tick; older ones are dropped when it fills. */
     static final int QUEUE_MAX = 8;
+    /** Owner 2026-10-02: voice identifications waiting for the conversation; older ones are dropped when it fills. */
+    static final int VOICE_MAX = 6;
     /** A whole utterance this soon after a clipped one is the same address. */
     static final long PARTIAL_JOIN_MS = 1500;
     /**
@@ -101,6 +103,7 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     private Ears.Shove shove;
     private Ears.Cue partial;
     private Reply reply;
+    private final ArrayDeque<Ears.Voice> voices = new ArrayDeque<Ears.Voice>();
     /** The conversation listen's newcomer angle (KTD8), or NaN for a meeting listen. */
     private float replyAngleDeg = Float.NaN;
     private volatile boolean charger;
@@ -153,6 +156,7 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         open = false;
         client = null;
         queue.clear();
+        voices.clear();
         partial = null;
         reply = null;
     }
@@ -323,6 +327,30 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         }
         if (r != null && text != null) {
             r.provisional(text);
+        }
+    }
+
+    /**
+     * Owner 2026-10-02: whose voice said a conversation answer (after its words). It waits for
+     * the conversation (pollVoice), never a cue; the id is opaque and never logged.
+     */
+    @Override
+    public void onVoice(long at, String person, float score, int band) {
+        synchronized (lock) {
+            if (!open) {
+                return;
+            }
+            if (voices.size() >= VOICE_MAX) {
+                voices.pollFirst();
+            }
+            voices.addLast(new Ears.Voice(at, person, score, band));
+        }
+    }
+
+    /** The oldest waiting voice identification, or null. */
+    Ears.Voice pollVoice() {
+        synchronized (lock) {
+            return voices.pollFirst();
         }
     }
 

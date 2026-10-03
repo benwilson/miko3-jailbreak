@@ -516,3 +516,47 @@ class NameOnlyBinderTest(unittest.TestCase):
         client = _read(CLIENT)
         self.assertIn("public static String addNamed(Context context, final String name) throws IOException", client)
         self.assertIn("public static boolean hasFace(Context context, final String id) throws IOException", client)
+
+
+class VoiceBinderTest(unittest.TestCase):
+    """Owner 2026-10-02: one person record holds name, notes, faces and voice prints. The mode
+    enrols an answer's voice to a person, counts and scores their prints, and compares two answers
+    (the voice gate) through four appended transactions backed by the ears' VoicePrints; Forget
+    wipes the voice prints with the rest of the record (LauncherApp registers the hook)."""
+
+    CALLS = (("enrolVoice", 21, "boolean enrolVoice(String id, long at) throws RemoteException;"),
+             ("voiceCount", 22, "int voiceCount(String id) throws RemoteException;"),
+             ("voiceScore", 23, "float voiceScore(String id, long at) throws RemoteException;"),
+             ("voiceSimilarity", 24, "float voiceSimilarity(long atA, long atB) throws RemoteException;"))
+
+    def test_the_voice_calls_are_appended_transactions(self):
+        iface = _read(INTERFACE)
+        for name, code, decl in self.CALLS:
+            self.assertIn(f"static final int TRANSACTION_{name} = {code};", iface)
+            self.assertIn(decl, iface.split("abstract class Stub", 1)[0])
+            self.assertRegex(iface, rf"case TRANSACTION_{name}: \{{\s*data\.enforceInterface\(DESCRIPTOR\);")
+            self.assertRegex(iface, rf"if\s*\(\s*!remote\.transact\(\s*TRANSACTION_{name}")
+
+    def test_the_service_checks_the_caller_and_asks_the_voice_prints(self):
+        service = _read(SERVICE)
+        for name in ("public boolean enrolVoice", "public int voiceCount", "public float voiceScore",
+                     "public float voiceSimilarity"):
+            body = _method_body(service, name) or ""
+            self.assertIn("enforceCaller();", body, name)
+            self.assertIn("voicePrints()", body, name)
+            self.assertNotIn("Log.", body, name)
+        self.assertIn("((LauncherApp) getApplication()).voicePrints()", service)
+        client = _read(CLIENT)
+        for sig in ("public static boolean enrolVoice(Context context, final String id, final long at)",
+                    "public static int voiceCount(Context context, final String id)",
+                    "public static float voiceScore(Context context, final String id, final long at)",
+                    "public static float voiceSimilarity(Context context, final long atA, final long atB)"):
+            self.assertIn(sig, client)
+
+    def test_forget_wipes_the_voice_prints_through_the_hook_launcher_app_registers(self):
+        app = _read(LAUNCHER / "LauncherApp.java")
+        on_create = _method_body(app, "public void onCreate") or ""
+        self.assertIn("people.addForgetHook(", on_create)
+        self.assertIn(".forgetVoice(", on_create)
+        # After the ears exist, so the voice prints are there to wipe.
+        self.assertLess(on_create.index("listen = new ListenEngine("), on_create.index("people.addForgetHook("))

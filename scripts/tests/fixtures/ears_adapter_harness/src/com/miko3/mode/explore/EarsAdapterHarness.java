@@ -67,6 +67,8 @@ public final class EarsAdapterHarness {
         run("a_partial_answer_with_words_still_answers_the_armed_reply", EarsAdapterHarness::partialAnswerAnswers);
         run("a_provisional_answer_goes_to_the_armed_reply_only_and_queues_nothing",
                 EarsAdapterHarness::provisionalGoesToArmedReply);
+        run("voice_identifications_wait_in_order_for_the_brain_and_queue_no_cue",
+                EarsAdapterHarness::voiceWaitsForTheBrain);
         System.exit(failures == 0 ? 0 : 1);
     }
 
@@ -330,6 +332,31 @@ public final class EarsAdapterHarness {
                 || !r.heard.equals(java.util.Collections.singletonList("we went to the beach"))
                 || !q.provisional.isEmpty() || !a.drain().isEmpty()) {
             return "provisional=" + r.provisional + " heard=" + r.heard + " retired=" + q.provisional;
+        }
+        return null;
+    }
+
+    /** Owner 2026-10-02: each answer's voice waits, oldest first and capped, until polled; closing drops them. */
+    private static String voiceWaitsForTheBrain() {
+        EarsAdapter a = opened();
+        a.onVoice(1000, "pid-1", 0.8f, RobotEars.VOICE_STRONG);
+        a.onVoice(2000, null, 0.2f, RobotEars.VOICE_NONE);
+        Ears.Voice first = a.pollVoice();
+        Ears.Voice second = a.pollVoice();
+        Ears.Voice none = a.pollVoice();
+        for (int i = 0; i < EarsAdapter.VOICE_MAX + 2; i++) {
+            a.onVoice(10 + i, "pid-2", 0.5f, RobotEars.VOICE_WEAK);
+        }
+        Ears.Voice oldest = a.pollVoice();
+        a.close();
+        Ears.Voice afterClose = a.pollVoice();
+        EarsAdapter closed = new EarsAdapter(new Context());
+        closed.onVoice(5, "pid-3", 0.9f, RobotEars.VOICE_STRONG);
+        if (first == null || first.at != 1000 || !"pid-1".equals(first.personId) || !first.strong()
+                || second == null || second.at != 2000 || second.personId != null || second.band != Ears.Voice.NONE
+                || none != null || oldest == null || oldest.at != 12 || afterClose != null || closed.pollVoice() != null
+                || !a.drain().isEmpty()) {
+            return "first=" + first + " second=" + second + " oldest=" + (oldest == null ? null : oldest.at);
         }
         return null;
     }

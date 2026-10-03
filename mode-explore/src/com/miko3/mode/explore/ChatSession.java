@@ -1,6 +1,7 @@
 package com.miko3.mode.explore;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -183,7 +184,7 @@ final class ChatSession {
             "will not forget"};
 
     private enum Phase { NONE, WAIT_TURN, RESOLVING, WAIT_CLIP, SAYING, CLIP_THEN_LISTEN, CLIP_THEN_END, LISTENING,
-        LOOKING, FORGETTING, PERSISTING }
+        VOICE_GATE, LOOKING, FORGETTING, PERSISTING }
 
     /** Which answer the resolver owes (face plan U7, KTD6): a spoken name's, or the last name's. */
     private enum Resolving { NONE, NAME, LAST_NAME }
@@ -337,6 +338,48 @@ final class ChatSession {
     private boolean enrolling;
     /** He has just found out who they are: the next turn says so (TurnRequest.recalled), once. */
     private boolean recalledDue;
+
+    // ---- whose voice (owner 2026-10-02: "rely on voice recognition first, then facial recognition") ----
+    /** This conversation's partner answers that have a voice embedding, oldest first. */
+    static final int VOICE_ATS = 4;
+    private final List<Long> voiceAts = new ArrayList<Long>();
+    /** Their voice identifications so far, for checking a name they give. */
+    private final List<Ears.Voice> voices = new ArrayList<Ears.Voice>();
+    private final Set<Long> voiceEnrolledAts = new HashSet<Long>();
+    /** The person this conversation's answers are enrolled to (a name, a full name or a face settled it), or null. */
+    private String voiceOwner;
+    /** Who they are came from a strong voice match (their prints are this speaker's). */
+    private boolean identityByVoice;
+    /** The recall under way is a strong voice match's (port.recallPerson), not a name's. */
+    private boolean voiceRecall;
+    /** The next turn says he recognised them by voice (with recalledDue). */
+    private boolean byVoiceDue;
+    /** A weak voice match with no name yet: the next turn may ask the name, once. */
+    private boolean nameAskDue;
+    private boolean nameAskedByVoice;
+    /** The name they gave found someone whose voice is far off: the next turn asks the last name. */
+    private boolean lastNameDue;
+    /** That first name, waiting for the last name. */
+    private String voiceFirst;
+    /** The turn (learnTurns) whose request asked the last name; -1 when none is waiting. */
+    private int voiceAskTurn = -1;
+    /** The name under recall replaces a name or a voice identity already held: the name wins. */
+    private boolean nameCorrection;
+    /** The name under recall is the full name given after the last-name question. */
+    private boolean lastNameRecall;
+    /** The conversation's first voice (the voice gate's reference), or null before one came. */
+    private Ears.Voice partnerVoice;
+    /** The identified person's voice print count (identity by voice). */
+    private int partnerPrints;
+    // The voice gate (owner 2026-10-02, a TV in the background): words held for their voice.
+    private String gateText;
+    private long gateFrom = ExploreBrain.NEVER;
+    private long gateDeadline;
+    private Ears.Voice gateVoice;
+    /** 0 undecided, 1 the partner (or unknown), 2 not the partner. */
+    private int gateVerdict;
+    private boolean gateScoring;
+    private long gateScoreDeadline;
     /** The face retry's box when the look has no person box: the whole frame. */
     private static final Detection WHOLE_FRAME = new Detection("person", 1f, 0f, 0f, 1f, 1f);
 
@@ -513,6 +556,10 @@ final class ChatSession {
         while (port.lateTurn() != null) {
             // dropped
         }
+        // Owner 2026-10-02: and a voice identification of another conversation's answer.
+        while (port.voice() != null) {
+            // dropped
+        }
         this.checkOpen = checkOpen;
         this.settledName = settled;
         startedOnCharger = host.charger();
@@ -597,6 +644,7 @@ final class ChatSession {
             default:
                 break;
         }
+        voiceStep(now);
     }
 
     /** A strong utterance outside the newcomer angle, held by the brain (KTD8): a glance and "one sec" at the listen's end. */
@@ -628,6 +676,13 @@ final class ChatSession {
         reRequested = false;
         request = turnRequest(heardText);
         recalledDue = false;
+        byVoiceDue = false;
+        if (request.cue == CuriosityPort.TurnRequest.IdCue.ASK_LAST_NAME) {
+            lastNameDue = false;
+            voiceAskTurn = learnTurns;
+        } else if (request.cue == CuriosityPort.TurnRequest.IdCue.ASK_NAME) {
+            nameAskDue = false;
+        }
         turnHeld = false;
         secSaid = false;
         heldSince = -1;
@@ -684,7 +739,22 @@ final class ChatSession {
     private CuriosityPort.TurnRequest turnRequest(String heardText) {
         return new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
                 .face(openedFaceless).call(called).withFacts(host.toolFacts()).noteBy(noteName)
-                .recalledNow(recalledDue);
+                .recalledNow(recalledDue).cue(idCue(heardText));
+    }
+
+    /** Owner 2026-10-02: what the turn for heardText is told about who they are, from their voice. */
+    private CuriosityPort.TurnRequest.IdCue idCue(String heardText) {
+        if (recalledDue && byVoiceDue) {
+            return CuriosityPort.TurnRequest.IdCue.BY_VOICE;
+        }
+        if (heardText == null) {
+            return CuriosityPort.TurnRequest.IdCue.NONE;
+        }
+        if (lastNameDue) {
+            return CuriosityPort.TurnRequest.IdCue.ASK_LAST_NAME;
+        }
+        return nameAskDue && name == null ? CuriosityPort.TurnRequest.IdCue.ASK_NAME
+                : CuriosityPort.TurnRequest.IdCue.NONE;
     }
 
     /**
@@ -982,6 +1052,21 @@ final class ChatSession {
             askLastName(now);
             return;
         }
+        if (voiceAskTurn >= 0 && learnTurns > voiceAskTurn) {
+            // Owner 2026-10-02: the reply to the last-name question (LAST_NAME_ASK). A lone word
+            // that is not the first name is the last name; their full name decides who they are.
+            voiceAskTurn = -1;
+            if (given != null && voiceFirst != null && given.trim().indexOf(' ') < 0
+                    && !AnswerParser.same(given, voiceFirst)) {
+                given = NameResolver.fullName(voiceFirst, given);
+            }
+            if (given == null || sameName(given)) {
+                host.note("identity: no last name came; the name is used, nothing is loaded or stored by it");
+                voiceFirst = null;
+            } else {
+                lastNameRecall = true;
+            }
+        }
         if (given != null && nameGiven(now, given, line)) {
             // The line waits for the resolver: the last-name question may replace it (KTD6).
             return;
@@ -1061,6 +1146,12 @@ final class ChatSession {
             // under it lends their notes, else they are kept under the name alone (R19), and a
             // usable face from the background checks is enrolled to them later.
             host.note("a name given with no usable face yet: looking the name up in the people stored");
+            // Owner 2026-10-02: someone who says they are a different person: the name wins.
+            nameCorrection = !lastNameRecall && (name != null || personId != null);
+            voiceRecall = false;
+            identityByVoice = false;
+            voiceOwner = null;
+            lastNameDue = false;
             name = given;
             noteName = given;
             personId = null;
@@ -1072,7 +1163,7 @@ final class ChatSession {
             }
             recallPending = true;
             recallDeadline = now + tuning.meetTimeoutMs;
-            port.recallName(given, tuning.meetTimeoutMs);
+            port.recallName(given, voiceAtsArray(), tuning.meetTimeoutMs);
             return false;
         }
         if (heldResolving) {
@@ -1260,6 +1351,7 @@ final class ChatSession {
             personId = photoFor;
             persistWanted = true;
             host.note("the photo joined them: the notes persist to them now");
+            settleVoice(personId);
             if (checkOpen) {
                 checkOpen = false;
                 port.checkOutcome(CuriosityPort.Outcome.JOINED, photoFor);
@@ -1288,6 +1380,7 @@ final class ChatSession {
             personId = k.personId;
             host.note("kept under a new record; the notes persist now");
             persistWanted = true;
+            settleVoice(personId);
         } else {
             host.note("the store refused the keep; the conversation runs unnamed");
         }
@@ -1312,6 +1405,23 @@ final class ChatSession {
             r = CuriosityPort.Recalled.FAILED;
         }
         recallPending = false;
+        boolean byVoice = voiceRecall;
+        voiceRecall = false;
+        boolean full = lastNameRecall;
+        lastNameRecall = false;
+        boolean correction = nameCorrection;
+        nameCorrection = false;
+        if (byVoice && (name != null || personId != null)) {
+            return;
+        }
+        if (r.status == CuriosityPort.Recalled.Status.FOUND && !byVoice && !full && !correction && voiceFarOff(r)) {
+            // Owner 2026-10-02: "if the voice print is super far off (maybe a different person), ask
+            // their last name": the name is used meanwhile; nothing is loaded or stored by it yet.
+            host.note("identity: voice far off → last name asked");
+            voiceFirst = name;
+            lastNameDue = !ending;
+            return;
+        }
         switch (r.status) {
             case FOUND:
                 personId = r.personId;
@@ -1327,14 +1437,34 @@ final class ChatSession {
                 }
                 persistWanted = true;
                 recalledDue = !ending;
+                voiceFirst = null;
+                if (byVoice) {
+                    // As a face match: the stored name may find the owner's note about them.
+                    noteName = name;
+                    identityByVoice = true;
+                    partnerPrints = Math.max(0, r.voicePrints);
+                    byVoiceDue = recalledDue;
+                    host.note("identity: voice strong → known: their notes join the conversation (" + asked.size()
+                            + " questions on record)");
+                    break;
+                }
                 host.note("the name belongs to someone stored" + (r.hasFace ? "" : " by name alone")
                         + ": their notes join the conversation (" + asked.size() + " questions on record)");
+                host.note(full ? "identity: the full name is someone stored → the same person"
+                        : correction ? "identity: they say they are someone else → the name wins"
+                        : voiceAgrees(r.personId) ? "identity: name confirms voice"
+                        : "identity: name accepted, no voice match to compare");
+                settleVoice(r.personId);
                 break;
             case CREATED:
                 personId = r.personId;
                 nameOnly = true;
                 persistWanted = true;
+                voiceFirst = null;
                 host.note("nobody stored has that name: kept under the name alone, no face yet; the notes persist to it");
+                host.note(full ? "identity: the full name is someone new → a new person"
+                        : "identity: a new person by the name given");
+                settleVoice(r.personId);
                 break;
             case SHARED:
                 host.note("several people stored share that first name: nothing is loaded or stored by it");
@@ -1465,6 +1595,11 @@ final class ChatSession {
         // a voice match is primary and the face verifies it; a confident face alone still
         // identifies them when no voice match is available, as here.
         if (name == null) {
+            if (known && voiceRecall && recallPending) {
+                // Owner 2026-10-02: voice first; the face waits for the voice's look-up.
+                host.note("identity: a face while the voice is being looked up: the voice decides");
+                return;
+            }
             if (known) {
                 name = a.name.trim();
                 noteName = name;
@@ -1482,6 +1617,9 @@ final class ChatSession {
                 recalledDue = true;
                 host.note("a usable face on check " + faceTries + " matches someone stored: the conversation goes on"
                         + " as them, with their notes (" + asked.size() + " questions on record)");
+                if (personId != null && !strongOther(personId)) {
+                    settleVoice(personId);
+                }
             } else {
                 host.note("a usable new face on check " + faceTries + ": kept for when they give their name");
             }
@@ -1491,6 +1629,7 @@ final class ChatSession {
             if (known && personId.equals(a.personId)) {
                 checkOpen = false;
                 host.note("a usable face on check " + faceTries + " matches the person the name found");
+                host.note("identity: face agrees");
             } else if (!known && nameOnly) {
                 host.note("a usable new face on check " + faceTries + ": enrolling it to the person kept by name alone");
                 checkOpen = false;
@@ -1502,6 +1641,7 @@ final class ChatSession {
             } else {
                 host.note("a usable face on check " + faceTries + " that is not the stored face of the person the name"
                         + " found: the name stands and nothing more is stored");
+                host.note("identity: face disagrees");
             }
             return;
         }
@@ -1794,7 +1934,7 @@ final class ChatSession {
                 CuriosityPort.Heard h = port.heard();
                 if (h != null && h.status == CuriosityPort.Heard.Status.WORDS && h.text != null
                         && !h.text.trim().isEmpty()) {
-                    onHeard(now, h.text.trim());
+                    heardWords(now, h.text.trim());
                     return;
                 }
                 if (h == null) {
@@ -1824,6 +1964,9 @@ final class ChatSession {
                 }
                 break;
             }
+            case VOICE_GATE:
+                gateStep(now);
+                break;
             case LOOKING:
                 lookStep(now);
                 break;
@@ -1835,10 +1978,228 @@ final class ChatSession {
         }
     }
 
+    // ---- whose voice (owner 2026-10-02) ----
+
+    /**
+     * An answer's words. Owner 2026-10-02 (a TV in the background was answered): once this
+     * conversation has a voice of its partner, the words wait up to chatVoiceGateMs for their own
+     * voice; one clearly not the partner's is not said to him. Past the wait they go as before.
+     */
+    private void heardWords(long now, String text) {
+        if (partnerVoice == null || ending || tuning.chatVoiceGateMs <= 0) {
+            onHeard(now, text);
+            return;
+        }
+        phase = Phase.VOICE_GATE;
+        gateText = text;
+        gateFrom = now;
+        gateDeadline = now + tuning.chatVoiceGateMs;
+        gateVoice = null;
+        gateVerdict = 0;
+        gateScoring = false;
+    }
+
+    /** The voice the gate compares with: the identified person's prints when a voice match named them. */
+    private String gateRefPerson() {
+        return identityByVoice && personId != null && partnerPrints > 0 ? personId : null;
+    }
+
+    /** The held words' voice came: decided by the ids when both are strong matches, else by its score. */
+    private void gateArrived(long now) {
+        String ref = gateRefPerson();
+        String refId = ref != null ? ref : partnerVoice.strong() ? partnerVoice.personId : null;
+        if (refId != null && gateVoice.strong()) {
+            gateVerdict = refId.equals(gateVoice.personId) ? 1 : 2;
+            return;
+        }
+        gateScoring = true;
+        gateScoreDeadline = now + tuning.chatVoiceScoreMs;
+        port.voiceScore(ref, partnerVoice.at, gateVoice.at, tuning.chatVoiceScoreMs);
+    }
+
+    private void gateStep(long now) {
+        if (gateVerdict == 0 && gateScoring) {
+            Float score = port.voiceScored();
+            if (score == null && now < gateScoreDeadline) {
+                return;
+            }
+            if (score == null) {
+                port.cancelVoiceScore();
+            }
+            gateScoring = false;
+            gateVerdict = score != null && !score.isNaN() && score < tuning.voiceFarScore ? 2 : 1;
+        }
+        if (gateVerdict == 0 && (gateVoice != null || now < gateDeadline)) {
+            return;
+        }
+        String text = gateText;
+        Ears.Voice v = gateVoice;
+        boolean drop = gateVerdict == 2;
+        gateText = null;
+        gateVoice = null;
+        gateVerdict = 0;
+        if (drop) {
+            host.note("voice: not the partner (likely someone else or the TV)");
+            unansweredBefore = unanswered;
+            heardAt = gateFrom;
+            gateFrom = ExploreBrain.NEVER;
+            learnBegin(now, text);
+            if (learnCur != null) {
+                learnCur.addr = 'n';
+                learnCur.voice = v == null ? "-" : v.word();
+            }
+            notAddressed(now);
+            return;
+        }
+        onHeard(now, text);
+        if (v != null) {
+            handleVoice(now, v);
+        }
+    }
+
+    /** Each tick, after the state's step: the voice identifications that came, oldest first. */
+    private void voiceStep(long now) {
+        if (finished) {
+            return;
+        }
+        for (Ears.Voice v = port.voice(); v != null; v = port.voice()) {
+            if (phase == Phase.VOICE_GATE && gateText != null && gateVoice == null) {
+                gateVoice = v;
+                gateArrived(now);
+                continue;
+            }
+            handleVoice(now, v);
+        }
+    }
+
+    /**
+     * One partner answer's voice: kept for the name's check and enrolment, and (owner 2026-10-02)
+     * a strong match with nobody known yet looks the person up to go on as them; a weak one with
+     * no name yet lets the next turn ask the name. Never logs the id or the score.
+     */
+    private void handleVoice(long now, Ears.Voice v) {
+        learnVoice(v);
+        voices.add(v);
+        voiceAts.add(v.at);
+        while (voiceAts.size() > VOICE_ATS) {
+            voiceAts.remove(0);
+        }
+        if (partnerVoice == null) {
+            partnerVoice = v;
+        }
+        if (ending || state == State.CHAT_NOTES) {
+            return;
+        }
+        if (voiceOwner != null && !(v.strong() && !v.personId.equals(voiceOwner))) {
+            enrolVoices(voiceOwner, Collections.singletonList(v.at));
+        }
+        if (v.strong()) {
+            if (name == null && personId == null && !recallPending && !heldResolving && resolving == Resolving.NONE
+                    && !keepPending && !photoPending && !askingLastName) {
+                host.note("a strong voice match with nobody known yet: looking them up by their voice");
+                voiceRecall = true;
+                recallPending = true;
+                recallDeadline = now + tuning.meetTimeoutMs;
+                port.recallPerson(v.personId, tuning.meetTimeoutMs);
+            }
+        } else if (v.band == Ears.Voice.WEAK && name == null && personId == null && !nameAskedByVoice) {
+            nameAskedByVoice = true;
+            nameAskDue = true;
+            host.note("identity: voice weak → the next turn may ask the name");
+        }
+    }
+
+    /** This conversation's answers with a voice, for a name's check. */
+    private long[] voiceAtsArray() {
+        long[] out = new long[voiceAts.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = voiceAts.get(i);
+        }
+        return out;
+    }
+
+    /**
+     * The name they gave found someone whose voice is far from theirs: one of their answers
+     * matched someone else strongly, or the person has enough prints and every answer scores
+     * far below the weak band against them.
+     */
+    private boolean voiceFarOff(CuriosityPort.Recalled r) {
+        if (strongOther(r.personId)) {
+            return true;
+        }
+        return r.voicePrints >= tuning.voiceFarPrints && !Float.isNaN(r.voiceScore)
+                && r.voiceScore < tuning.voiceFarScore;
+    }
+
+    /** One of this conversation's answers matched someone other than id strongly. */
+    private boolean strongOther(String id) {
+        for (Ears.Voice v : voices) {
+            if (v.strong() && !v.personId.equals(id)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** One of this conversation's answers matched id (strong or weak). */
+    private boolean voiceAgrees(String id) {
+        for (Ears.Voice v : voices) {
+            if (id != null && id.equals(v.personId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Who they are is settled on id: this conversation's answers so far are enrolled to them, and later ones. */
+    private void settleVoice(String id) {
+        if (id == null) {
+            return;
+        }
+        if (!id.equals(voiceOwner)) {
+            voiceOwner = id;
+            voiceEnrolledAts.clear();
+        }
+        enrolVoices(id, voiceAts);
+    }
+
+    /** At most voiceEnrolMax answers of a conversation, each once. */
+    private void enrolVoices(String id, List<Long> ats) {
+        List<Long> fresh = new ArrayList<Long>();
+        for (Long at : ats) {
+            if (voiceEnrolledAts.size() + fresh.size() >= tuning.voiceEnrolMax) {
+                break;
+            }
+            if (!voiceEnrolledAts.contains(at)) {
+                fresh.add(at);
+            }
+        }
+        if (fresh.isEmpty()) {
+            return;
+        }
+        long[] arr = new long[fresh.size()];
+        for (int i = 0; i < arr.length; i++) {
+            arr[i] = fresh.get(i);
+        }
+        voiceEnrolledAts.addAll(fresh);
+        port.enrolVoice(id, arr);
+        host.note("voice: " + arr.length + " answer(s) enrolled to the person");
+    }
+
+    /** The voice band joins the record of the turn its answer opened. */
+    private void learnVoice(Ears.Voice v) {
+        TurnRecord r = learnCur != null && learnCur.words && "-".equals(learnCur.voice) ? learnCur
+                : learnDone != null && learnDone.words && "-".equals(learnDone.voice) ? learnDone : null;
+        if (r != null) {
+            r.voice = v.word();
+        }
+    }
+
     private void onHeard(long now, String text) {
         // A reply not said to him (owner 2026-10-02) puts the run back and adds to it.
         unansweredBefore = unanswered;
-        heardAt = now;
+        heardAt = gateFrom != ExploreBrain.NEVER ? gateFrom : now;
+        gateFrom = ExploreBrain.NEVER;
         unanswered = 0;
         reasked = 0;
         nudged = false;
@@ -2382,6 +2743,8 @@ final class ChatSession {
         boolean reask;
         /** Its t0 is words the partner said in a conversation listen. */
         boolean words;
+        /** Owner 2026-10-02: that answer's voice band (strong, weak, none), or - when none came. */
+        String voice = "-";
 
         TurnRecord(int conv, int no, long t0, boolean open) {
             this.conv = conv;
@@ -2402,7 +2765,8 @@ final class ChatSession {
                     + " spec=" + (info != null ? (spec ? "y" : "n") : specAt >= 0 ? "?" : "n")
                     + " tools=" + (info == null || info.tools == null ? "?" : info.tools.isEmpty() ? "-" : info.tools)
                     + " tries=" + tries + " retry=" + retry + " fail=" + fail + " unans=" + unanswered
-                    + " nowords=" + noWords + " reask=" + (reask ? "y" : "n") + " end=" + (end == null ? "-" : end);
+                    + " nowords=" + noWords + " reask=" + (reask ? "y" : "n") + " voice=" + voice
+                    + " end=" + (end == null ? "-" : end);
         }
     }
 

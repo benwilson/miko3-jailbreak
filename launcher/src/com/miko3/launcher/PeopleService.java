@@ -141,6 +141,35 @@ public class PeopleService extends Service {
         }
 
         @Override
+        public boolean enrolVoice(String id, long at) {
+            enforceCaller();
+            // Owner 2026-10-02: the voice prints sit in the same person record, keyed by the same id.
+            VoicePrints v = voicePrints();
+            return v != null && v.enrolVoice(id, at);
+        }
+
+        @Override
+        public int voiceCount(String id) {
+            enforceCaller();
+            VoicePrints v = voicePrints();
+            return v == null ? 0 : v.voiceCount(id);
+        }
+
+        @Override
+        public float voiceScore(String id, long at) {
+            enforceCaller();
+            VoicePrints v = voicePrints();
+            return v == null ? Float.NaN : v.voiceScore(id, at);
+        }
+
+        @Override
+        public float voiceSimilarity(long atA, long atB) {
+            enforceCaller();
+            VoicePrints v = voicePrints();
+            return v == null ? Float.NaN : v.voiceSimilarity(atA, atB);
+        }
+
+        @Override
         public boolean setEmbedding(String id, int slot, long addedAtMillis, String modelId, float[] embedding) {
             enforceCaller();
             return people().setEmbedding(id, slot, addedAtMillis, modelId, embedding);
@@ -190,6 +219,11 @@ public class PeopleService extends Service {
 
     private PeopleStore people() {
         return ((LauncherApp) getApplication()).people();
+    }
+
+    /** The ears' voice prints (owner 2026-10-02), or null before the ears exist. */
+    private VoicePrints voicePrints() {
+        return ((LauncherApp) getApplication()).voicePrints();
     }
 
     private FaceChecks checks() {

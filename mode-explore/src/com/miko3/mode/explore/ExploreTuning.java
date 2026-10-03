@@ -540,6 +540,20 @@ final class ExploreTuning {
     final long chatFaceDelayMs;
     final long chatFaceGapMs;
     /**
+     * Owner 2026-10-02 ("rely on voice recognition first, then facial recognition"): a voice
+     * score below voiceFarScore is far off (well under the launcher's weak band, 0.45). A name
+     * given that finds someone with at least voiceFarPrints prints whose voice is far off from
+     * this conversation's answers gets the last-name question; at most voiceEnrolMax answers of
+     * a conversation are enrolled to the person it settles on. The voice gate (a TV in the
+     * background): an answer's words wait up to chatVoiceGateMs for its voice, then up to
+     * chatVoiceScoreMs for its score against the partner; past either, the turn goes as before.
+     */
+    final float voiceFarScore;
+    final int voiceFarPrints;
+    final int voiceEnrolMax;
+    final long chatVoiceGateMs;
+    final long chatVoiceScoreMs;
+    /**
      * Owner 2026-10-02: conversation first. A call opens the conversation at once (no search
      * before it) and he looks for the caller during it, between utterances; false keeps the
      * search-first call (find them, then the meeting). callUtteranceWaitMs: an early wake cue's
@@ -1120,6 +1134,11 @@ final class ExploreTuning {
         answerHoldMs = Math.max(unansweredListenMs, b.answerHoldMs);
         chatFaceDelayMs = Math.max(0, b.chatFaceDelayMs);
         chatFaceGapMs = Math.max(0, b.chatFaceGapMs);
+        voiceFarScore = b.voiceFarScore;
+        voiceFarPrints = Math.max(1, b.voiceFarPrints);
+        voiceEnrolMax = Math.max(0, b.voiceEnrolMax);
+        chatVoiceGateMs = Math.max(0, b.chatVoiceGateMs);
+        chatVoiceScoreMs = Math.max(0, b.chatVoiceScoreMs);
         callChatFirst = b.callChatFirst;
         callUtteranceWaitMs = Math.max(0, b.callUtteranceWaitMs);
         callChatUnansweredMax = Math.max(1, b.callChatUnansweredMax);
@@ -1564,6 +1583,12 @@ final class ExploreTuning {
         // Owner 2026-10-02: one silent face check about every 8 s for the whole conversation.
         private long chatFaceDelayMs = 1000;
         private long chatFaceGapMs = 8000;
+        // Owner 2026-10-02: voice first; far off is well under the weak band (0.45); the gate waits ~300 ms.
+        private float voiceFarScore = 0.30f;
+        private int voiceFarPrints = 3;
+        private int voiceEnrolMax = 3;
+        private long chatVoiceGateMs = 300;
+        private long chatVoiceScoreMs = 200;
         // Owner 2026-10-02: conversation first; the answer waits for the wake utterance's end
         // (a worded "Hey Miko, ..." runs about 1.5-2 s past the wake); three unanswered listens.
         private boolean callChatFirst = true;
@@ -2266,6 +2291,16 @@ final class ExploreTuning {
             this.sentenceCap = sentenceCap;
             this.transcriptWindow = transcriptWindow;
             this.deafTailMs = deafTailMs;
+            return this;
+        }
+
+        Builder chatVoiceGateMs(long ms) {
+            this.chatVoiceGateMs = ms;
+            return this;
+        }
+
+        Builder voiceFarScore(float score) {
+            this.voiceFarScore = score;
             return this;
         }
 

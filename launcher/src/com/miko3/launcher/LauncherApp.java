@@ -256,6 +256,15 @@ public class LauncherApp extends Application {
         // the listen thread; each listen waits for the speech queue to go idle.
         listen = new ListenEngine(this, speech.queue(), claudeSettings);
         listen.start();
+        // Owner 2026-10-02: one person record holds name, notes, faces and voice prints, so a
+        // Forget also wipes the voice prints kept under the same id.
+        final VoicePrints prints = listen.voicePrints();
+        people.addForgetHook(new PeopleStore.ForgetHook() {
+            @Override
+            public void forgotten(String id) {
+                prints.forgetVoice(id);
+            }
+        });
         wifi = new WifiHttpHandler(this);
         startServer();
 
@@ -287,6 +296,12 @@ public class LauncherApp extends Application {
     /** The robot's voice and its queue of lines, for SpeechService. */
     SpeechEngine speech() {
         return speech;
+    }
+
+    /** The ears' voice prints (owner 2026-10-02), for PeopleService; null before the ears exist. */
+    VoicePrints voicePrints() {
+        ListenEngine l = listen;
+        return l == null ? null : l.voicePrints();
     }
 
     /** The robot's ears, for ListenService. */

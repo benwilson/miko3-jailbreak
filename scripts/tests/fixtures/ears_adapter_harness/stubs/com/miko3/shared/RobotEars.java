@@ -9,6 +9,9 @@ public interface RobotEars {
     int TIER_NONE = 0;
     int TIER_WEAK = 1;
     int TIER_STRONG = 2;
+    int VOICE_NONE = 0;
+    int VOICE_WEAK = 1;
+    int VOICE_STRONG = 2;
     int SIDE_LEFT = -1;
     int SIDE_NONE = 0;
     int SIDE_RIGHT = 1;

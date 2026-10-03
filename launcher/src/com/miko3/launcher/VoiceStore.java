@@ -145,6 +145,25 @@ final class VoiceStore {
         return new Match(band == BAND_NONE ? null : bestId, best, band);
     }
 
+    /**
+     * Owner 2026-10-02: how close embedding is to one person's stored voice (the cosine with
+     * their mean), or NaN when they have none of its size or embedding is unusable.
+     */
+    synchronized float score(String id, float[] embedding) {
+        load();
+        float[] probe = embedding == null ? null : unit(embedding);
+        List<float[]> list = id == null ? null : people.get(id);
+        float[] centroid = probe == null || list == null ? null : centroid(list, probe.length);
+        return centroid == null ? Float.NaN : dot(probe, centroid);
+    }
+
+    /** The cosine between two embeddings of the same size, or NaN. */
+    static float similarity(float[] a, float[] b) {
+        float[] ua = a == null ? null : unit(a);
+        float[] ub = b == null ? null : unit(b);
+        return ua == null || ub == null || ua.length != ub.length ? Float.NaN : dot(ua, ub);
+    }
+
     private static float[] centroid(List<float[]> list, int dim) {
         float[] sum = null;
         for (float[] v : list) {

@@ -475,6 +475,30 @@ public final class VoiceIdHarness {
                         "enrolled=" + enrolled + " m=" + m + " count=" + count + " lines=" + lines.all());
             }
         });
+        scenario("score_an_answer_against_a_person_or_another_answer", new Scenario() {
+            public void run(String n) throws Exception {
+                // Owner 2026-10-02: the mode asks how close an answer is to a person's prints (a name
+                // given) or to another answer of the same conversation (the voice gate).
+                VoiceStore store = new VoiceStore(tempFile(), 10, new Lines());
+                VoiceId v = new VoiceId(store, tuning(), new Lines());
+                v.remember(1, axis(8, 3));
+                v.remember(2, axis(8, 3));
+                v.remember(3, axis(8, 5));
+                VoicePrints prints = v;
+                boolean enrolled = prints.enrolVoice("pid-3", 1);
+                float same = prints.voiceScore("pid-3", 2);
+                float other = prints.voiceScore("pid-3", 3);
+                float nobody = prints.voiceScore("pid-9", 2);
+                float noAnswer = prints.voiceScore("pid-3", 999);
+                float alike = prints.voiceSimilarity(1, 2);
+                float apart = prints.voiceSimilarity(1, 3);
+                float missing = prints.voiceSimilarity(1, 999);
+                check(n, enrolled && Math.abs(same - 1f) < 1e-4 && Math.abs(other) < 1e-4 && Float.isNaN(nobody)
+                                && Float.isNaN(noAnswer) && Math.abs(alike - 1f) < 1e-4 && Math.abs(apart) < 1e-4
+                                && Float.isNaN(missing) && Float.isNaN(prints.voiceScore(null, 2)),
+                        "same=" + same + " other=" + other + " nobody=" + nobody + " alike=" + alike + " apart=" + apart);
+            }
+        });
         scenario("only_the_most_recent_embeddings_are_kept_for_enrolment", new Scenario() {
             public void run(String n) throws Exception {
                 VoiceId v = new VoiceId(new VoiceStore(tempFile(), 10, new Lines()), tuning(), new Lines());

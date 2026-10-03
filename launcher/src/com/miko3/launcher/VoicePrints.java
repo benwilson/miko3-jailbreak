@@ -24,4 +24,13 @@ interface VoicePrints {
 
     /** How many embeddings are stored for personId. */
     int voiceCount(String personId);
+
+    /**
+     * How close the answer whose speech began at at is to personId's stored voice (cosine with
+     * their mean): NaN when that answer has no embedding or they have no voice stored.
+     */
+    float voiceScore(String personId, long at);
+
+    /** How close two answers' voices are (cosine): NaN when either has no embedding. */
+    float voiceSimilarity(long atA, long atB);
 }

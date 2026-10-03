@@ -45,6 +45,10 @@ class ChatRoundHarnessTest(unittest.TestCase):
         "round_the_faceless_opener_asks_the_name_and_never_their_face",
         "round_a_calls_next_turn_may_ask_the_name_once_while_unknown",
         "round_the_turn_after_he_finds_out_who_they_are_says_so_once",
+        # Owner 2026-10-02: voice first; a weak match may ask the name, a far one the last name.
+        "round_a_voice_recognised_turn_says_their_name_once",
+        "round_a_weak_voice_turn_may_ask_the_name_while_unknown",
+        "round_a_far_voice_turn_asks_the_last_name",
         "round_first_request_offers_every_tool_with_auto_choice_and_no_json_format",
         "round_a_respond_reply_is_one_request_with_addressed_told_early",
         "round_a_look_says_the_preamble_waits_for_the_frame_and_forces_respond",

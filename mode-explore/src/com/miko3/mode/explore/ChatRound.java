@@ -149,11 +149,17 @@ final class ChatRound {
         if (request.called && request.heard != null && request.transcript.isEmpty()) {
             ask = ask + "\n\n" + ExplorePrompts.CALL_WORDS;
         }
-        if (request.called && request.name == null && request.heard != null && request.transcript.size() == 1) {
+        if (request.name == null && request.heard != null && (request.called && request.transcript.size() == 1
+                || request.cue == CuriosityPort.TurnRequest.IdCue.ASK_NAME)) {
             ask = ask + "\n\n" + ExplorePrompts.NAME_ASK;
         }
         if (request.recalled) {
-            ask = ask + "\n\n" + ExplorePrompts.recalled(request.name);
+            ask = ask + "\n\n" + (request.cue == CuriosityPort.TurnRequest.IdCue.BY_VOICE
+                    ? ExplorePrompts.recalledByVoice(request.name) : ExplorePrompts.recalled(request.name));
+        }
+        // Owner 2026-10-02: the name they gave found someone whose voice is far from theirs.
+        if (request.cue == CuriosityPort.TurnRequest.IdCue.ASK_LAST_NAME && request.heard != null) {
+            ask = ask + "\n\n" + ExplorePrompts.LAST_NAME_ASK;
         }
         messages.add(userMessage(saidBefore, face, ask));
         return new Body(system, messages, system + "\u0000" + Json.write(messages));

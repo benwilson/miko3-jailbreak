@@ -145,8 +145,15 @@ CALL_OPENER = (
     "seen them yet. Write his opener, at most two short sentences: a warm greeting with a question that shows "
     "he is glad to be called and curious about them, built on one specific thing, like what they are up to, "
     "how their day is going, or a true remark about what he was just doing (never invent anything). Not a "
-    'bare "what\'s up". Do not ask their name yet. They called him, so everything said in this conversation is '
-    'said to him: addressed is always true.'
+    'bare "what\'s up". Do not ask their name yet. They called him, so what is said in this conversation is '
+    'said to him: addressed is true unless it is clearly not them (another voice, a TV or radio).'
+)
+# Owner 2026-10-02: the name they gave found someone whose voice is far from theirs (ExplorePrompts).
+LAST_NAME_ASK = (
+    "(The name they gave matches someone he knows, but he is not sure it is the same person: after answering "
+    "them, ask their last name naturally in this line, like \"And what's your last name?\". Never say why he "
+    "asks, and never mention their voice or face. When they tell him, give their full name, first and last, "
+    "as name_given.)"
 )
 NUDGE = (
     "(They have not answered his last line. Write one gentle follow-up that re-engages them: an easy, "

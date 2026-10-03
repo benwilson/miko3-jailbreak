@@ -1052,7 +1052,7 @@ class ConversationWiringTest(unittest.TestCase):
         for k in act_order + ["PLAN"]:
             self.assertEqual(self.java_string(actions, k + "_DESCRIPTION"), getattr(bench, k + "_DESCRIPTION"), k)
         for name in ("OWNER_NOTE_HEADING", "OWNER_NOTE_GUARD", "TASK_SYSTEM", "CALL_OPENER", "FACELESS_OPENER",
-                     "NAME_ASK", "NUDGE"):
+                     "NAME_ASK", "NUDGE", "LAST_NAME_ASK"):
             self.assertEqual(self.java_string(prompts, name), getattr(bench, name), name)
         recall = re.search(r'RECALL_SCHEMA = ExplorePrompts\.object\("name", ExplorePrompts\.described\(\s*'
                            r'ExplorePrompts\.type\("string"\), "(.*?)"\)\);', tools, re.S)
@@ -1064,6 +1064,20 @@ class ConversationWiringTest(unittest.TestCase):
                      ("NOTES_HEADING", "SCHEMA_PREAMBLE")):
             self.assertLess(prefix.index(a), prefix.index(b), (a, b))
         self.assertIn('"\\n\\"\\"\\"\\n"', prefix)
+
+    def test_the_adapter_binds_the_voice_port_methods_and_logs_no_ids(self):
+        """Owner 2026-10-02: whose voice reaches the conversation through the ears session, and
+        the people store enrols, counts and scores voices; ids never reach a log."""
+        a = code_only(src("ClaudeCuriosity.java"))
+        for method in ("voice", "recallPerson", "enrolVoice", "voiceScore", "voiceScored", "cancelVoiceScore"):
+            self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
+        self.assertIn("public void recallName(final String name, final long[] voiceAts, final long timeoutMs)", a)
+        self.assertIn("return s == null ? null : s.pollVoice();", a)
+        for line in re.findall(r"Log\.\w\(TAG, (.*?)\);", a):
+            if "voice" in line:
+                self.assertNotIn("personId", line)
+        ears = code_only(src("EarsAdapter.java"))
+        self.assertIn("public void onVoice(long at, String person, float score, int band)", ears)
 
     def test_the_adapter_binds_every_new_port_method(self):
         a = code_only(src("ClaudeCuriosity.java"))
@@ -1216,7 +1230,9 @@ class FacelessOpenerTest(unittest.TestCase):
         self.assertIn("request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name)", turn)
         self.assertIn("e.heard == null ? first : e.heard", turn)
         self.assertIn("request.heard == null ? first : request.heard", turn)
-        self.assertRegex(turn, r"if \(request\.recalled\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.recalled\(request\.name\);")
+        self.assertRegex(turn, r"if \(request\.recalled\) \{\s*ask = ask \+ \"\\n\\n\" \+ \(request\.cue == "
+                               r"CuriosityPort\.TurnRequest\.IdCue\.BY_VOICE\s*\? ExplorePrompts\.recalledByVoice\(request\.name\)"
+                               r" : ExplorePrompts\.recalled\(request\.name\)\);")
         recalled = src("ExplorePrompts.java")
         recalled = recalled[recalled.index("static String recalled("):]
         recalled = recalled[:recalled.index("\n    }\n")]
@@ -1227,7 +1243,7 @@ class FacelessOpenerTest(unittest.TestCase):
             self.assertIn(sig, port)
         session = code_only(src("ChatSession.java"))
         self.assertIn(".face(openedFaceless).call(called).withFacts(host.toolFacts()).noteBy(noteName)\n"
-                      "                .recalledNow(recalledDue);", session)
+                      "                .recalledNow(recalledDue).cue(idCue(heardText));", session)
 
     def test_the_face_checks_run_all_conversation_every_8_s(self):
         tuning = code_only(src("ExploreTuning.java"))
@@ -1282,9 +1298,32 @@ class CallConversationTest(unittest.TestCase):
         self.assertRegex(turn, r"if \(request\.called && request\.heard != null && request\.transcript\.isEmpty\(\)\) \{\s*"
                                r"ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CALL_WORDS;")
         # Owner 2026-10-02: the turn after a call's opener may ask the name while he doesn't know it.
-        self.assertRegex(turn, r"if \(request\.called && request\.name == null && request\.heard != null\s*"
-                               r"&& request\.transcript\.size\(\) == 1\) \{\s*"
+        # Owner 2026-10-02: and so may the turn after a weak voice match (IdCue.ASK_NAME).
+        self.assertRegex(turn, r"if \(request\.name == null && request\.heard != null && \(request\.called\s*"
+                               r"&& request\.transcript\.size\(\) == 1\s*"
+                               r"\|\| request\.cue == CuriosityPort\.TurnRequest\.IdCue\.ASK_NAME\)\) \{\s*"
                                r"ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.NAME_ASK;")
+
+    def test_the_call_opener_lets_a_tv_or_another_voice_be_not_addressed(self):
+        """Owner 2026-10-02: a TV in the background was answered because the call opener said
+        addressed is always true; it is true unless it is clearly not them."""
+        text = self.constant("CALL_OPENER")
+        self.assertNotIn("addressed is always true", text)
+        self.assertIn("addressed is true unless it is clearly not them (another voice, a TV or radio)", text)
+
+    def test_voice_cues_ask_the_last_name_or_say_the_name_recognised_by_voice(self):
+        last = self.constant("LAST_NAME_ASK")
+        for words in ("ask their last name naturally", "Never say why he asks", "full name, first and last",
+                      "name_given"):
+            self.assertIn(words, last)
+        prompts = src("ExplorePrompts.java")
+        by_voice = re.search(r"static String recalledByVoice\(String name\) \{(.*?)\n    \}", prompts, re.S).group(1)
+        for words in ("by their voice", "using their name", "naturally once", "wrong person"):
+            self.assertIn(words, by_voice)
+        turn = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
+        self.assertIn("ExplorePrompts.recalledByVoice(request.name)", turn)
+        self.assertRegex(turn, r"request\.cue == CuriosityPort\.TurnRequest\.IdCue\.ASK_LAST_NAME && request\.heard "
+                               r"!= null\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.LAST_NAME_ASK;")
 
     def test_a_run_of_unanswered_listens_gets_one_gentle_follow_up_before_the_end(self):
         """Owner 2026-10-02 ("oh hi and then he doesn't really talk to us"): instead of the

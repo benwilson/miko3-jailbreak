@@ -5,7 +5,7 @@ Reads the brain's `turn:` records (one per conversation turn, since 2026-10-03):
 
   turn: c=<conversation> t=<turn> open=<y|n> addr=<y|n|?> req=<ms> line=<ms> sound=<ms> done=<ms>
         spec=<y|n|?> tools=<a+b|-|?> tries=<1|2> retry=<why|-> fail=<why|-> unans=<n> nowords=<n>
-        reask=<y|n> end=<reason|-> meet=<call|cue|roaming|claude-pick|other> faceless=<y|n>
+        reask=<y|n> voice=<strong|weak|none|-> end=<reason|-> meet=<call|cue|roaming|claude-pick|other> faceless=<y|n>
         faceseen=<y|n> replies=<n>
 
 The ms are from t0, when the answer's words reached the brain (the request itself for the

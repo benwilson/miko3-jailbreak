@@ -18,6 +18,9 @@ public class RobotEarsClient {
 
         void onProvisional(long at, String text);
 
+        default void onVoice(long at, String person, float score, int band) {
+        }
+
         void onLost(String reason);
     }
 

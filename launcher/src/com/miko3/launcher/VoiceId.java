@@ -249,6 +249,17 @@ final class VoiceId implements VoicePrints {
         return store.count(personId);
     }
 
+    @Override
+    public float voiceScore(String personId, long at) {
+        float[] e = lastEmbeddingFor(at);
+        return e == null || personId == null ? Float.NaN : store.score(personId, e);
+    }
+
+    @Override
+    public float voiceSimilarity(long atA, long atB) {
+        return VoiceStore.similarity(lastEmbeddingFor(atA), lastEmbeddingFor(atB));
+    }
+
     // ---- the debug bench (VoiceTuning.BENCH_PROP) ----
 
     /**

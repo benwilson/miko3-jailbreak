@@ -69,6 +69,8 @@ class EarsAdapterHarnessTest(unittest.TestCase):
         "a_partial_answer_with_words_still_answers_the_armed_reply",
         # Robot 2026-10-02: the launcher's provisional answer (code 4) for a conversation listen.
         "a_provisional_answer_goes_to_the_armed_reply_only_and_queues_nothing",
+        # Owner 2026-10-02: whose voice said each conversation answer (code 5), for the conversation.
+        "voice_identifications_wait_in_order_for_the_brain_and_queue_no_cue",
     )
 
     @classmethod

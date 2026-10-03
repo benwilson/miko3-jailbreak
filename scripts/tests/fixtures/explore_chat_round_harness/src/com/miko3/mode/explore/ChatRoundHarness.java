@@ -218,6 +218,29 @@ public final class ChatRoundHarness {
                 recalled.equals("I'm Priya.\n\n" + ExplorePrompts.recalled("Priya")) && recalled.contains("Priya")
                         && after.equals("Yes.") && nameless.equals("Yes."),
                 recalled + " | " + after + " | " + nameless);
+        voiceCues(t);
+    }
+
+    /** Owner 2026-10-02: what a turn is told about who they are, from their voice. */
+    private static void voiceCues(List<CuriosityPort.Exchange> t) {
+        CuriosityPort.TurnRequest base = new CuriosityPort.TurnRequest("", "Priya", "{\"interests\":[\"tea\"]}", t,
+                "Not bad.").face(true);
+        String byVoice = lastText(base.recalledNow(true).cue(CuriosityPort.TurnRequest.IdCue.BY_VOICE));
+        String byName = lastText(base.recalledNow(true));
+        check("round_a_voice_recognised_turn_says_their_name_once",
+                byVoice.equals("Not bad.\n\n" + ExplorePrompts.recalledByVoice("Priya")) && byVoice.contains("Priya")
+                        && byVoice.contains("by their voice")
+                        && byName.equals("Not bad.\n\n" + ExplorePrompts.recalled("Priya")),
+                byVoice + " | " + byName);
+        String weak = lastText(new CuriosityPort.TurnRequest("", null, null, t, "Pasta.").face(true)
+                .cue(CuriosityPort.TurnRequest.IdCue.ASK_NAME));
+        String weakNamed = lastText(base.cue(CuriosityPort.TurnRequest.IdCue.ASK_NAME));
+        check("round_a_weak_voice_turn_may_ask_the_name_while_unknown",
+                weak.equals("Pasta.\n\n" + ExplorePrompts.NAME_ASK) && weakNamed.equals("Not bad."),
+                weak + " | " + weakNamed);
+        String last = lastText(base.cue(CuriosityPort.TurnRequest.IdCue.ASK_LAST_NAME));
+        check("round_a_far_voice_turn_asks_the_last_name",
+                last.equals("Not bad.\n\n" + ExplorePrompts.LAST_NAME_ASK) && last.contains("last name"), last);
     }
 
     private static void history() {
