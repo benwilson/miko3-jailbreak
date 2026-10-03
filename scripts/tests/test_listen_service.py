@@ -359,8 +359,13 @@ class EngineWiringTest(unittest.TestCase):
 
     def test_records_16k_mono_on_voice_modes_source(self):
         for needle in ("new AudioRecord(", "AudioFormat.CHANNEL_IN_MONO", "AudioFormat.ENCODING_PCM_16BIT",
-                       "MediaRecorder.AudioSource.VOICE_COMMUNICATION", "AudioRecord.getMinBufferSize("):
+                       "MicGain.source(", "AudioRecord.getMinBufferSize("):
             self.assertIn(needle, self.src)
+        # The source defaults to VOICE_COMMUNICATION; persist.miko3.ears.source picks another (owner 2026-10-02).
+        gain = _read(SESSION.parent / "MicGain.java")
+        for needle in ('"persist.miko3.ears.source"', "AudioSource.VOICE_COMMUNICATION",
+                       "AudioSource.VOICE_RECOGNITION", "AudioSource.UNPROCESSED", 'default:\n                return "VOICE_COMMUNICATION"'):
+            self.assertIn(needle, gain)
         self.assertRegex(_read(SESSION), r"SAMPLE_RATE\s*=\s*16000")
 
     def test_streaming_zipformer_with_endpointing(self):

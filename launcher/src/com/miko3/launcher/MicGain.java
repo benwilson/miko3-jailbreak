@@ -27,4 +27,36 @@ final class MicGain {
         db = Math.max(0, Math.min(MAX_DB, db));
         return (float) Math.pow(10, db / 20.0);
     }
+
+    /** persist.miko3.ears.source: recognition, communication (the default), unprocessed or mic. */
+    static final String SOURCE_PROP = "persist.miko3.ears.source";
+
+    /** The source's log name for the property's value; anything else is the default. */
+    static String sourceName(String value) {
+        String v = value == null ? "" : value.trim().toLowerCase(java.util.Locale.ROOT);
+        switch (v) {
+            case "recognition":
+                return "VOICE_RECOGNITION";
+            case "unprocessed":
+                return "UNPROCESSED";
+            case "mic":
+                return "MIC";
+            default:
+                return "VOICE_COMMUNICATION";
+        }
+    }
+
+    /** The MediaRecorder.AudioSource value for a sourceName(). */
+    static int source(String name) {
+        switch (name) {
+            case "VOICE_RECOGNITION":
+                return android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION;
+            case "UNPROCESSED":
+                return android.media.MediaRecorder.AudioSource.UNPROCESSED;
+            case "MIC":
+                return android.media.MediaRecorder.AudioSource.MIC;
+            default:
+                return android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION;
+        }
+    }
 }

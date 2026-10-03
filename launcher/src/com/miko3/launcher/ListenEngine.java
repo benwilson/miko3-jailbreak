@@ -493,16 +493,22 @@ final class ListenEngine implements ListenSession.Ears {
         return true;
     }
 
-    /** One AudioRecord on VOICE_COMMUNICATION, started, or IOException with why not. */
+    /** One AudioRecord on the chosen source (VOICE_COMMUNICATION unless set), started, or IOException with why not. */
     private AudioRecord openRecord() throws IOException {
         int minBuf = AudioRecord.getMinBufferSize(ListenSession.SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) {
             throw new IOException("unsupported microphone configuration (" + minBuf + ")");
         }
+        // Owner 2026-10-02 at home: "his microphone has a hard time hearing things". The vendor
+        // recorded on VOICE_RECOGNITION (no noise suppression or AGC by Android's rules), while
+        // VOICE_COMMUNICATION adds call-tuned processing known to hurt recognition.
+        // persist.miko3.ears.source picks it when the microphone opens; unset: as before.
+        String sourceName = MicGain.sourceName(SpeechEngine.systemProperty(MicGain.SOURCE_PROP));
+        int source = MicGain.source(sourceName);
         final AudioRecord record;
         try {
-            record = new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, ListenSession.SAMPLE_RATE,
+            record = new AudioRecord(source, ListenSession.SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
                     Math.max(minBuf, ListenSession.CHUNK_SAMPLES * 2 * 4));
         } catch (RuntimeException e) {
@@ -517,7 +523,7 @@ final class ListenEngine implements ListenSession.Ears {
             record.release();
             throw new IOException("microphone did not start recording");
         }
-        Log.i(TAG, "microphone open (VOICE_COMMUNICATION, 16 kHz mono, buffer " + minBuf + ")");
+        Log.i(TAG, "microphone open (" + sourceName + ", 16 kHz mono, buffer " + minBuf + ")");
         return record;
     }
 
