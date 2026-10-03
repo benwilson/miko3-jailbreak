@@ -18,9 +18,11 @@ import java.util.concurrent.TimeUnit;
  * the buffer holds at most VoiceTuning.MAX_BUFFER_MS, the start of the utterance. When a
  * conversation listen's answer has been delivered, clean (words, a tier, not clipped by
  * the robot's own speech), with at least VoiceTuning.MIN_SPEECH_MS up to its last speech,
- * answered() copies that span and returns; the embedding is computed on one low-priority
- * background thread, matched against the VoiceStore, and reported to the Listener with the
- * answer's at. The buffer is always cleared. Audio never leaves memory and is never kept
+ * answered() copies that span and returns (a call, "Hey Miko ...", needs only
+ * VoiceTuning.MIN_CALL_SPEECH_MS: called()); the embedding of its VoiceTuning.EMBED_MS with the
+ * most speech energy is computed on one background thread at normal priority (robot 2026-10-03:
+ * the result is wanted within the same turn), matched against the VoiceStore, and reported to
+ * the Listener with the utterance's at. The buffer is always cleared. Audio never leaves memory and is never kept
  * past the copy; the embedding is kept briefly (the last VoiceTuning.RECENT answers) so
  * the people layer can enrol it (VoicePrints). Plain Java: the extractor is an Embedder.
  */
@@ -37,6 +39,17 @@ final class VoiceId implements VoicePrints {
 
     private static final int CAP = (int) (VoiceTuning.SAMPLE_RATE * VoiceTuning.MAX_BUFFER_MS / 1000);
     private static final int MIN_SAMPLES = (int) (VoiceTuning.SAMPLE_RATE * VoiceTuning.MIN_SPEECH_MS / 1000);
+    private static final int MIN_CALL_SAMPLES =
+            (int) (VoiceTuning.SAMPLE_RATE * VoiceTuning.MIN_CALL_SPEECH_MS / 1000);
+    private static final int EMBED_SAMPLES = (int) (VoiceTuning.SAMPLE_RATE * VoiceTuning.EMBED_MS / 1000);
+    /** The energy window's step: 10 ms. */
+    private static final int FRAME = VoiceTuning.SAMPLE_RATE / 100;
+    /**
+     * The voice thread's priority: normal (Android maps Thread.NORM_PRIORITY to nice 0,
+     * Process.THREAD_PRIORITY_DEFAULT). Robot 2026-10-03: at the lowest priority an embedding took
+     * up to 8 s and came a turn late; the extractor keeps to one ONNX thread.
+     */
+    static final int THREAD_PRIORITY = Thread.NORM_PRIORITY;
 
     private final VoiceStore store;
     private final VoiceTuning tuning;
@@ -53,14 +66,14 @@ final class VoiceId implements VoicePrints {
     /** at -> embedding, the most recent last. */
     private final LinkedHashMap<Long, float[]> recent = new LinkedHashMap<Long, float[]>();
 
-    /** One thread, lowest priority, and at most two answers waiting: a backlog is dropped, never queued up. */
+    /** One thread, normal priority, and at most two answers waiting: a backlog is dropped, never queued up. */
     private final ThreadPoolExecutor thread = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue<Runnable>(2), new ThreadFactory() {
                 @Override
                 public Thread newThread(Runnable r) {
                     Thread t = new Thread(r, "voice-id");
                     t.setDaemon(true);
-                    t.setPriority(Thread.MIN_PRIORITY);
+                    t.setPriority(THREAD_PRIORITY);
                     return t;
                 }
             });
@@ -135,12 +148,25 @@ final class VoiceId implements VoicePrints {
      * its embedding when it is long enough and the model is loaded; always clears the buffer.
      * Returns at once: true when an embedding was queued.
      */
-    boolean answered(final long at, boolean clean) {
+    boolean answered(long at, boolean clean) {
+        return deliver(at, clean, MIN_SAMPLES);
+    }
+
+    /**
+     * Robot 2026-10-03: a call ("Hey Miko ...", clean when strong and not clipped) was
+     * delivered: as answered(), with only VoiceTuning.MIN_CALL_SPEECH_MS of speech needed, so
+     * the caller's own voice can be the conversation's first reference.
+     */
+    boolean called(long at, boolean clean) {
+        return deliver(at, clean, MIN_CALL_SAMPLES);
+    }
+
+    private boolean deliver(final long at, boolean clean, int minSamples) {
         final float[] snap;
         final int n;
         synchronized (buf) {
             n = speechLen;
-            if (!clean || n < MIN_SAMPLES || embedder == null) {
+            if (!clean || n < minSamples || embedder == null) {
                 len = 0;
                 speechLen = 0;
                 return false;
@@ -168,21 +194,29 @@ final class VoiceId implements VoicePrints {
         if (e == null) {
             return;
         }
+        int from = loudestStart(samples, n, EMBED_SAMPLES);
+        int take = Math.min(n, EMBED_SAMPLES);
+        float[] clip = samples;
+        if (from != 0 || take != n) {
+            clip = new float[take];
+            System.arraycopy(samples, from, clip, 0, take);
+        }
         long t0 = System.nanoTime();
         float[] embedding;
         try {
-            embedding = e.embed(samples, n);
+            embedding = e.embed(clip, take);
         } catch (Exception | LinkageError ex) {
             diag.log("voice: embedding failed: " + ex.getClass().getSimpleName());
             return;
         }
         long ms = (System.nanoTime() - t0) / 1000000;
-        long durMs = n * 1000L / VoiceTuning.SAMPLE_RATE;
+        long durMs = take * 1000L / VoiceTuning.SAMPLE_RATE;
+        long ofMs = n * 1000L / VoiceTuning.SAMPLE_RATE;
         if (embedding == null || embedding.length == 0) {
-            diag.log("voice: no embedding (dur " + durMs + " ms)");
+            diag.log("voice: no embedding (dur " + durMs + " ms of " + ofMs + " ms)");
             return;
         }
-        diag.log("voice: embedding in " + ms + " ms (dur " + durMs + " ms)");
+        diag.log("voice: embedding in " + ms + " ms (dur " + durMs + " ms of " + ofMs + " ms)");
         remember(at, embedding);
         VoiceStore.Match m = store.match(embedding, tuning);
         diag.log(String.format(Locale.US, "voice: match band=%s score=%.2f", VoiceTuning.bandName(m.band), m.score));
@@ -194,6 +228,41 @@ final class VoiceId implements VoicePrints {
                 diag.log("voice: delivery failed: " + ex.getClass().getSimpleName());
             }
         }
+    }
+
+    /**
+     * Where the want samples with the most energy begin among the first n (10 ms steps): the
+     * loudest stretch of the speech, the earliest on a tie, so a quiet clip gives its start.
+     * 0 when n is no longer than want.
+     */
+    static int loudestStart(float[] s, int n, int want) {
+        if (n <= want) {
+            return 0;
+        }
+        int frames = n / FRAME;
+        int span = Math.max(1, want / FRAME);
+        double[] energy = new double[frames];
+        for (int f = 0; f < frames; f++) {
+            double sum = 0;
+            for (int i = f * FRAME, end = i + FRAME; i < end; i++) {
+                sum += s[i] * s[i];
+            }
+            energy[f] = sum;
+        }
+        double window = 0;
+        for (int f = 0; f < Math.min(span, frames); f++) {
+            window += energy[f];
+        }
+        double best = window;
+        int bestFrame = 0;
+        for (int f = span; f < frames; f++) {
+            window += energy[f] - energy[f - span];
+            if (window > best * (1 + 1e-9) + 1e-12) {
+                best = window;
+                bestFrame = f - span + 1;
+            }
+        }
+        return Math.min(bestFrame * FRAME, n - want);
     }
 
     /** Keeps the embedding for at, dropping the oldest beyond VoiceTuning.RECENT. */

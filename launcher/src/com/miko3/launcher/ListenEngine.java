@@ -613,6 +613,9 @@ final class ListenEngine implements ListenSession.Ears {
         return record;
     }
 
+    /** Robot 2026-10-03: the minute level window, shared by every Mic so a reopen does not reset it. */
+    private static final MicLevel MIC_LEVEL = new MicLevel();
+
     @Override
     public ListenSession.Mic openMic() throws IOException {
         final AudioRecord record = openRecord();
@@ -624,14 +627,10 @@ final class ListenEngine implements ListenSession.Ears {
             private int peak;
             // Owner 2026-10-02 at home: "his microphone has a hard time hearing things". A software
             // gain (persist.miko3.ears.gain_db, 0..18 dB, re-read every ~3 s so it can be tuned live)
-            // before the wake word, the speech detector and the recogniser; a level line each minute.
+            // before the wake word, the speech detector and the recogniser; a level line each minute
+            // (robot 2026-10-03: from MIC_LEVEL, shared by every Mic, so reopening one keeps the window).
             private float gain = MicGain.factor(SpeechEngine.systemProperty(MicGain.PROP));
             private long gainCheckedAt;
-            private long windowStart = System.currentTimeMillis();
-            private double windowSq;
-            private long windowN;
-            private int windowPeak;
-            private long windowClipped;
 
             @Override
             public int read(float[] buf) {
@@ -649,30 +648,26 @@ final class ListenEngine implements ListenSession.Ears {
                         gain = g;
                     }
                 }
+                double chunkSq = 0;
+                int chunkPeak = 0;
+                long chunkClipped = 0;
                 for (int i = 0; i < n; i++) {
                     int s = pcm[i];
-                    sumSquares += (double) s * s;
-                    peak = Math.max(peak, Math.abs(s));
-                    windowSq += (double) s * s;
-                    windowPeak = Math.max(windowPeak, Math.abs(s));
+                    chunkSq += (double) s * s;
+                    chunkPeak = Math.max(chunkPeak, Math.abs(s));
                     float v = s * gain;
                     if (v > 32767f || v < -32768f) {
-                        windowClipped++;
+                        chunkClipped++;
                         v = v > 0 ? 32767f : -32768f;
                     }
                     buf[i] = v / 32768f;
                 }
+                sumSquares += chunkSq;
+                peak = Math.max(peak, chunkPeak);
                 count += n;
-                windowN += n;
-                if (now - windowStart >= 60000) {
-                    long rms = windowN == 0 ? 0 : Math.round(Math.sqrt(windowSq / windowN));
-                    Log.i(TAG, "ears: mic level: RMS " + rms + ", peak " + windowPeak + " (raw), gain x" + gain
-                            + ", clipped " + windowClipped + " of " + windowN + " samples");
-                    windowStart = now;
-                    windowSq = 0;
-                    windowN = 0;
-                    windowPeak = 0;
-                    windowClipped = 0;
+                String level = MIC_LEVEL.add(now, chunkSq, n, chunkPeak, chunkClipped, gain);
+                if (level != null) {
+                    Log.i(TAG, level);
                 }
                 return n;
             }

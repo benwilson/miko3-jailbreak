@@ -87,6 +87,10 @@ class ListenServiceHarnessTest(unittest.TestCase):
         # Owner 2026-10-02: the ears feed the voice identification; only clean answers are embedded.
         "ears_voice_a_clean_answer_is_identified_after_its_words",
         "ears_voice_cues_short_answers_and_clipped_answers_are_not_identified",
+        # Robot 2026-10-03: a call of 1.2 s or more is embedded too (the TV gate's reference).
+        "ears_voice_a_call_of_1_2_s_is_identified_and_a_shorter_one_is_not",
+        # Robot 2026-10-03: the minute mic level line's window survives Mic reopens.
+        "mic_level_window_spans_reopened_mics_and_reports_once_a_minute",
         # ListenSession stops at the endpoint, at the cap, and hears silence as "no speech".
         "stops_at_endpoint",
         "stops_at_cap",
@@ -370,6 +374,15 @@ class EngineWiringTest(unittest.TestCase):
                        "AudioSource.VOICE_RECOGNITION", "AudioSource.UNPROCESSED", 'default:\n                return "VOICE_COMMUNICATION"'):
             self.assertIn(needle, gain)
         self.assertRegex(_read(SESSION), r"SAMPLE_RATE\s*=\s*16000")
+
+    def test_mic_level_window_is_shared_by_every_mic(self):
+        """Robot 2026-10-03: the per-Mic window reset on every reopen, so the minute line never
+        printed; one static MicLevel collects every Mic's reads."""
+        self.assertRegex(self.src, r"private static final MicLevel MIC_LEVEL = new MicLevel\(\);")
+        body = _method_body(self.src, "public ListenSession.Mic openMic()") or ""
+        self.assertIn("MIC_LEVEL.add(now, chunkSq, n, chunkPeak, chunkClipped, gain)", body)
+        self.assertNotIn("windowStart", body)
+        self.assertIn("WINDOW_MS = 60000;", _read(SESSION.parent / "MicLevel.java"))
 
     def test_streaming_zipformer_with_endpointing(self):
         for needle in ("new OnlineRecognizer(", "OnlineTransducerModelConfig", "setEnableEndpoint(true)",

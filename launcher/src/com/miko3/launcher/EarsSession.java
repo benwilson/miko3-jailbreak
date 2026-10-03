@@ -1119,7 +1119,15 @@ final class EarsSession {
         deliver(new Utterance(text, side, angle, tier, at, partial, kind, wasWake, message));
         // Owner 2026-10-02: after the words went out, so they never wait on it. Only a listen's
         // answer with words that the robot's own speech did not clip says whose voice it was.
-        voiceAnswered(at, answer && !partial && !text.isEmpty());
+        // Robot 2026-10-03: so does a strong call ("Hey Miko ...") not clipped, from 1.2 s of
+        // speech, so the conversation's first voice (the TV gate's reference) is the caller's.
+        boolean call = tier == CueClassifier.TIER_STRONG
+                && (kind == CueClassifier.KIND_WAKE_WORD || kind == CueClassifier.KIND_NAME);
+        if (call && !answer) {
+            voiceCalled(at, !partial);
+        } else {
+            voiceAnswered(at, answer && !partial && !text.isEmpty());
+        }
         flushAnswerOver();
     }
 
@@ -1193,6 +1201,14 @@ final class EarsSession {
         VoiceId v = voice;
         if (v != null) {
             v.answered(at, clean);
+        }
+    }
+
+    /** Caller holds feedLock. A call was delivered; returns at once (the embedding runs elsewhere). */
+    private void voiceCalled(long at, boolean clean) {
+        VoiceId v = voice;
+        if (v != null) {
+            v.called(at, clean);
         }
     }
 

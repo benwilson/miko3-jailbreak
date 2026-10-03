@@ -506,6 +506,14 @@ class ActionToolsAndOwnerNotesTest(unittest.TestCase):
             self.assertIn(bench.NUDGE, bench.SCRIPTS[name])
         self.assertIn("call", bench.build_parser().parse_args(["--script", "call"]).script)
 
+    def test_the_call_words_script_sends_their_words_with_the_call_note(self):
+        """Robot 2026-10-03: --script call-words is turn 1 of a call with words, as ChatRound
+        builds it (their words, a blank line, CALL_WORDS)."""
+        first = bench.SCRIPTS["call-words"][0]
+        self.assertTrue(first.endswith("\n\n" + bench.CALL_WORDS), first)
+        self.assertFalse(first.startswith("("))
+        self.assertIn("call-words", bench.build_parser().parse_args(["--script", "call-words"]).script)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,8 +23,20 @@ final class VoiceTuning {
     static final int SAMPLE_RATE = 16000;
     /** Less speech than this says too little about a voice to be worth an embedding. */
     static final long MIN_SPEECH_MS = 1500;
-    /** The utterance buffer's cap; an answer's first 8 s are plenty for an embedding. */
+    /**
+     * Robot 2026-10-03: a call ("Hey Miko ...") this long is embedded too, as the conversation's
+     * first voice (the voice gate's reference is then the caller, not whatever answers first).
+     */
+    static final long MIN_CALL_SPEECH_MS = 1200;
+    /** The utterance buffer's cap: the span the embedded clip is picked from. */
     static final long MAX_BUFFER_MS = 8000;
+    /**
+     * Robot 2026-10-03: CAM++ took 1.8-8 s for 3-8 s of speech under Explore's load, slower than
+     * real time, so the answer's voice came a turn late. Only the EMBED_MS with the most speech
+     * energy is embedded; CAM++ is reliable at 2-3 s, and the strong/weak thresholds stay as they
+     * are (enrolled prints are made from the same 3 s clips, so scores stay comparable).
+     */
+    static final long EMBED_MS = 3000;
     /** Embeddings kept per person, the oldest dropped first. */
     static final int MAX_PER_PERSON = 10;
     /** Recent utterances whose embeddings stay in memory for the people layer to enrol. */

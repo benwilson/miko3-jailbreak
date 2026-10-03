@@ -80,13 +80,16 @@ class VoiceIdHarnessTest(unittest.TestCase):
         "store_unreadable_file_starts_empty",
         "store_ignores_embeddings_of_another_size",
         "store_file_holds_no_ids_in_its_logs",
-        "buffer_caps_at_eight_seconds_keeping_the_start",
+        "buffer_caps_at_eight_seconds_and_embeds_its_loudest_three",
+        "clip_is_the_three_seconds_with_the_most_speech_energy",
+        "loudest_start_is_the_start_for_short_or_even_clips_and_follows_the_energy",
+        "a_call_needs_only_1_2_seconds_of_speech",
         "buffer_trims_the_silence_after_the_last_speech",
         "buffer_short_speech_is_not_embedded_and_is_cleared",
         "buffer_unclean_answer_is_not_embedded_and_is_cleared",
         "buffer_start_and_reset_drop_the_previous_utterance",
         "no_embedder_yet_skips_quietly",
-        "embedding_runs_on_one_low_priority_background_thread",
+        "embedding_runs_on_one_normal_priority_background_thread",
         "a_known_voice_is_reported_with_its_band",
         "enrol_by_utterance_time_then_match_then_forget",
         "score_an_answer_against_a_person_or_another_answer",
@@ -202,15 +205,34 @@ class WiringTest(unittest.TestCase):
         dropped = end.split("if (tier == CueClassifier.TIER_NONE", 1)[1].split("return;", 1)[0]
         self.assertIn("voiceReset();", dropped)
 
-    def test_embedder_is_single_threaded_low_priority_and_loaded_off_the_recogniser(self):
+    def test_a_strong_call_is_embedded_after_its_delivery(self):
+        """Robot 2026-10-03: the call ("Hey Miko ...") is the conversation's first voice
+        reference; embedded through called() (1.2 s minimum) after deliver(), never when clipped."""
+        end = _method_body(_read(EARS), "private void endUtterance(")
+        tail = end.split("deliver(new Utterance(text, side, angle, tier, at, partial, kind, wasWake, message));", 1)
+        self.assertNotIn("voiceCalled(", tail[0])
+        self.assertRegex(tail[1], r"boolean call = tier == CueClassifier\.TIER_STRONG\s*&& \(kind == CueClassifier"
+                                  r"\.KIND_WAKE_WORD \|\| kind == CueClassifier\.KIND_NAME\);")
+        self.assertIn("voiceCalled(at, !partial);", tail[1])
+        self.assertIn("v.called(at, clean);", _method_body(_read(EARS), "private void voiceCalled("))
+        self.assertRegex(_read(VOICE_TUNING), r"MIN_CALL_SPEECH_MS = 1200;")
+        self.assertRegex(_read(VOICE_TUNING), r"EMBED_MS = 3000;")
+
+    def test_embedder_is_single_threaded_normal_priority_and_loaded_off_the_recogniser(self):
+        """Robot 2026-10-03: at background priority an embedding took up to 8 s and came a turn
+        late; the voice thread runs at the default priority, still with one ONNX thread."""
         emb = _read(EMBEDDER)
         self.assertIn(".setNumThreads(1)", emb)
-        self.assertIn("Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)", emb)
+        self.assertIn("Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)", emb)
+        self.assertNotIn("THREAD_PRIORITY_BACKGROUND", emb)
+        self.assertNotIn("THREAD_PRIORITY_LOWEST", emb)
         for needle in ("createStream()", "acceptWaveform(", "inputFinished()", "isReady(", "compute(", "release()"):
             self.assertIn(needle, emb)
         vid = _read(VOICE_ID)
         self.assertIn('"voice-id"', vid)
-        self.assertIn("Thread.MIN_PRIORITY", vid)
+        self.assertIn("THREAD_PRIORITY = Thread.NORM_PRIORITY;", vid)
+        self.assertIn("t.setPriority(THREAD_PRIORITY);", vid)
+        self.assertNotIn("MIN_PRIORITY", vid)
         engine = _read(ENGINE)
         self.assertIn('installAssets(context, VOICE_ASSETS)', engine)
         self.assertRegex(engine, r'VOICE_ASSETS = "voiceid";')

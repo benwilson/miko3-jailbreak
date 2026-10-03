@@ -150,6 +150,16 @@ public final class VoiceIdHarness {
         }
     }
 
+    /** Feeds ms of speech in 80 ms chunks, every sample at level. */
+    static void feedLevel(VoiceId v, long ms, float level) {
+        float[] buf = new float[CHUNK];
+        java.util.Arrays.fill(buf, level);
+        for (long t = 0; t < ms; t += 80) {
+            v.append(buf, CHUNK);
+            v.speech();
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         // ---- VoiceTuning ----
         scenario("tuning_defaults_and_bands", new Scenario() {
@@ -309,10 +319,13 @@ public final class VoiceIdHarness {
         });
 
         // ---- VoiceId: the utterance buffer ----
-        scenario("buffer_caps_at_eight_seconds_keeping_the_start", new Scenario() {
+        scenario("buffer_caps_at_eight_seconds_and_embeds_its_loudest_three", new Scenario() {
+            // Robot 2026-10-03: the buffer keeps the utterance's first 8 s; only the 3 s with the
+            // most energy among them is embedded (here the levels rise, so its last 3 s).
             public void run(String n) throws Exception {
                 FakeEmbedder e = new FakeEmbedder();
-                VoiceId v = new VoiceId(new VoiceStore(tempFile(), 10, new Lines()), tuning(), new Lines());
+                Lines lines = new Lines();
+                VoiceId v = new VoiceId(new VoiceStore(tempFile(), 10, new Lines()), tuning(), lines);
                 v.setEmbedder(e);
                 v.start();
                 int[] c = {0};
@@ -320,8 +333,73 @@ public final class VoiceIdHarness {
                 boolean sent = v.answered(5000, true);
                 e.done.await(5, TimeUnit.SECONDS);
                 v.shutdown();
-                check(n, sent && e.samples == 8 * RATE && Math.abs(e.firstSample - 1 / 10000f) < 1e-6
-                        && v.buffered() == 0, "samples=" + e.samples + " first=" + e.firstSample);
+                v.awaitIdle(2000);
+                check(n, sent && e.samples == 3 * RATE && Math.abs(e.firstSample - 63 / 10000f) < 1e-6
+                                && Math.abs(e.lastSample - 100 / 10000f) < 1e-6 && v.buffered() == 0
+                                && lines.has("(dur 3000 ms of 8000 ms)"),
+                        "samples=" + e.samples + " first=" + e.firstSample + " last=" + e.lastSample + " lines="
+                                + lines.all());
+            }
+        });
+        scenario("clip_is_the_three_seconds_with_the_most_speech_energy", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeEmbedder e = new FakeEmbedder();
+                VoiceId v = new VoiceId(new VoiceStore(tempFile(), 10, new Lines()), tuning(), new Lines());
+                v.setEmbedder(e);
+                v.start();
+                feedLevel(v, 1600, 0.05f);
+                feedLevel(v, 3200, 0.5f);
+                feedLevel(v, 2000, 0.05f);
+                v.answered(5000, true);
+                e.done.await(5, TimeUnit.SECONDS);
+                v.shutdown();
+                v.awaitIdle(2000);
+                check(n, e.samples == 3 * RATE && e.firstSample == 0.5f && e.lastSample == 0.5f,
+                        "samples=" + e.samples + " first=" + e.firstSample + " last=" + e.lastSample);
+            }
+        });
+        scenario("loudest_start_is_the_start_for_short_or_even_clips_and_follows_the_energy", new Scenario() {
+            public void run(String n) {
+                int want = 3 * RATE;
+                float[] flat = new float[5 * RATE];
+                java.util.Arrays.fill(flat, 0.2f);
+                float[] late = new float[5 * RATE];
+                java.util.Arrays.fill(late, 0.01f);
+                java.util.Arrays.fill(late, 4 * RATE, 5 * RATE, 0.9f);
+                int shortStart = VoiceId.loudestStart(new float[2 * RATE], 2 * RATE, want);
+                int flatStart = VoiceId.loudestStart(flat, flat.length, want);
+                int silentStart = VoiceId.loudestStart(new float[5 * RATE], 5 * RATE, want);
+                int lateStart = VoiceId.loudestStart(late, late.length, want);
+                check(n, shortStart == 0 && flatStart == 0 && silentStart == 0 && lateStart == 2 * RATE,
+                        "short=" + shortStart + " flat=" + flatStart + " silent=" + silentStart + " late=" + lateStart);
+            }
+        });
+        scenario("a_call_needs_only_1_2_seconds_of_speech", new Scenario() {
+            // Robot 2026-10-03: "Hey Miko ..." is the conversation's first voice reference.
+            public void run(String n) throws Exception {
+                FakeEmbedder e = new FakeEmbedder();
+                VoiceId v = new VoiceId(new VoiceStore(tempFile(), 10, new Lines()), tuning(), new Lines());
+                v.setEmbedder(e);
+                int[] c = {0};
+                v.start();
+                feed(v, 1360, true, c);
+                boolean asAnswer = v.answered(1, true);
+                v.start();
+                feed(v, 1040, true, c);
+                boolean tooShort = v.called(2, true);
+                v.start();
+                feed(v, 1360, true, c);
+                boolean clipped = v.called(3, false);
+                v.start();
+                feed(v, 1360, true, c);
+                boolean call = v.called(4, true);
+                e.done.await(5, TimeUnit.SECONDS);
+                v.shutdown();
+                v.awaitIdle(2000);
+                check(n, !asAnswer && !tooShort && !clipped && call && e.calls.size() == 1
+                                && e.calls.get(0) == 17 * CHUNK && v.buffered() == 0,
+                        "asAnswer=" + asAnswer + " tooShort=" + tooShort + " clipped=" + clipped + " call=" + call
+                                + " calls=" + e.calls);
             }
         });
         scenario("buffer_trims_the_silence_after_the_last_speech", new Scenario() {
@@ -398,7 +476,7 @@ public final class VoiceIdHarness {
         });
 
         // ---- VoiceId: the background thread ----
-        scenario("embedding_runs_on_one_low_priority_background_thread", new Scenario() {
+        scenario("embedding_runs_on_one_normal_priority_background_thread", new Scenario() {
             public void run(String n) throws Exception {
                 FakeEmbedder e = new FakeEmbedder();
                 e.gate = new CountDownLatch(1);
@@ -418,7 +496,7 @@ public final class VoiceIdHarness {
                 h.one.await(5, TimeUnit.SECONDS);
                 v.shutdown();
                 check(n, sent && returnedFirst && tookMs < 200 && "voice-id".equals(e.thread)
-                                && e.priority == Thread.MIN_PRIORITY && h.results.size() == 1
+                                && e.priority == Thread.NORM_PRIORITY && h.results.size() == 1
                                 && h.results.get(0).startsWith("4242:null:" + VoiceStore.BAND_NONE),
                         "sent=" + sent + " returnedFirst=" + returnedFirst + " took=" + tookMs + " thread=" + e.thread
                                 + " prio=" + e.priority + " results=" + h.results);
@@ -442,7 +520,7 @@ public final class VoiceIdHarness {
                 h.one.await(5, TimeUnit.SECONDS);
                 v.shutdown();
                 check(n, h.results.size() == 1 && h.results.get(0).equals("77:pid-9:" + VoiceStore.BAND_STRONG + ":89")
-                                && lines.has("voice: embedding in ") && lines.has("(dur 2000 ms)")
+                                && lines.has("voice: embedding in ") && lines.has("(dur 2000 ms of 2000 ms)")
                                 && lines.has("voice: match band=strong score=0.89") && !lines.all().contains("pid-9"),
                         "results=" + h.results + " lines=" + lines.all());
             }

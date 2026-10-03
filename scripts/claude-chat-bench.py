@@ -148,6 +148,14 @@ CALL_OPENER = (
     'bare "what\'s up". Do not ask their name yet. They called him, so what is said in this conversation is '
     'said to him: addressed is true unless it is clearly not them (another voice, a TV or radio).'
 )
+# Robot 2026-10-03: appended to turn 1 of a call with words (ExplorePrompts.CALL_WORDS).
+CALL_WORDS = (
+    "(He was just called by name with the words above; he is turning to find them and has not seen them yet. "
+    "Answer what they said warmly, at most two short sentences: glad to be called, with one specific, curious "
+    "follow-up question about what they said (never invent anything). Not a bare \"what's up\". Do not ask "
+    "their name yet. They called him, so this is said to him: addressed is true unless it is clearly not them "
+    "(another voice, a TV or radio).)"
+)
 # Owner 2026-10-02: the name they gave found someone whose voice is far from theirs (ExplorePrompts).
 LAST_NAME_ASK = (
     "(The name they gave matches someone he knows, but he is not sure it is the same person: after answering "
@@ -371,6 +379,12 @@ CALL = (
     "Sorry, I was stirring the pot. It's pasta night.",
     "Bye Miko.",
 )
+# Robot 2026-10-03: a call with words ("Hey Miko, guess what I made"), turn 1 as ChatRound builds it.
+CALL_WORDS_SCRIPT = (
+    "guess what I made for dinner\n\n" + CALL_WORDS,
+    "Pasta, from scratch.",
+    "Bye Miko.",
+)
 FACELESS = (
     FACELESS_OPENER,
     "Oh, hello! I'm Priya.",
@@ -378,7 +392,7 @@ FACELESS = (
     NUDGE,
     "Bye Miko.",
 )
-SCRIPTS = {"chat": SCRIPT, "commands": COMMANDS, "call": CALL, "faceless": FACELESS}
+SCRIPTS = {"chat": SCRIPT, "commands": COMMANDS, "call": CALL, "call-words": CALL_WORDS_SCRIPT, "faceless": FACELESS}
 
 
 def owner_note_line(name, note):

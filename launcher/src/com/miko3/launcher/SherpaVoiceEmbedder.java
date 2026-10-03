@@ -8,16 +8,18 @@ import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig;
 
 /**
  * Owner 2026-10-02: VoiceId's embedder, sherpa-onnx's speaker embedding extractor over
- * the bundled 3D-Speaker CAM++ model (assets/voiceid/model.onnx). One ONNX thread, and
- * the calling thread (VoiceId's own) dropped to background priority, so an embedding
- * never competes with the ears' recogniser. Made and used only on the voice thread.
+ * the bundled 3D-Speaker CAM++ model (assets/voiceid/model.onnx). One ONNX thread, so an
+ * embedding takes at most one core from the ears' recogniser. Robot 2026-10-03: the calling
+ * thread (VoiceId's own) runs at Process.THREAD_PRIORITY_DEFAULT, not background: at the
+ * lowest priority an embedding took 1.8-8 s under Explore's load and came a turn late, and
+ * the result is wanted within the same turn. Made and used only on the voice thread.
  */
 final class SherpaVoiceEmbedder implements VoiceId.Embedder {
     private final SpeakerEmbeddingExtractor extractor;
-    private boolean lowered;
+    private boolean prioritised;
 
     SherpaVoiceEmbedder(String modelPath) {
-        lower();
+        prioritise();
         extractor = new SpeakerEmbeddingExtractor(SpeakerEmbeddingExtractorConfig.builder()
                 .setModel(modelPath)
                 .setNumThreads(1)
@@ -30,16 +32,16 @@ final class SherpaVoiceEmbedder implements VoiceId.Embedder {
         return extractor.getDim();
     }
 
-    private void lower() {
-        if (!lowered) {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
-            lowered = true;
+    private void prioritise() {
+        if (!prioritised) {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+            prioritised = true;
         }
     }
 
     @Override
     public float[] embed(float[] samples, int n) {
-        lower();
+        prioritise();
         float[] audio = samples;
         if (n != samples.length) {
             audio = new float[n];

@@ -10601,12 +10601,15 @@ final class ExploreBrain {
         }
         note("the meeting becomes a conversation" + (faceless ? " with nobody in view" : "") + " (" + a.status + ")");
         String kind = meetKind();
+        // Robot 2026-10-03: the call's speech start keys its own voice, the conversation's reference.
+        long callAt = callChatCue != null ? callChatCue.at : callTaken && call != null ? call.at : NEVER;
         if (callTaken) {
             // KTD1: the call is kept until the conversation opens.
             gauges.stamp(Gauges.Stage.CALL_ARRIVED, now);
             clearCall();
         }
         chat = new ChatSession(tuning, port, chatHost);
+        chat.expectCallVoice(callAt);
         chat.learnNumber(++chatCount);
         chat.learnMeeting(kind, faceless);
         state = State.CHAT_THINK;

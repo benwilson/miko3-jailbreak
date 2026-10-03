@@ -858,6 +858,8 @@ public final class ExploreBrainHarness {
         final List<String> voiceRecalls = new ArrayList<String>();
         final List<String> enrolled = new ArrayList<String>();
         final List<Long> voiceScoreAsks = new ArrayList<Long>();
+        /** Robot 2026-10-03: the reference answer (refAt) of each gate score asked. */
+        final List<Long> voiceScoreRefs = new ArrayList<Long>();
         Float pendingVoiceScore;
         long pendingVoiceScoreAt;
         CuriosityPort.Resolved pendingResolved;
@@ -1125,6 +1127,17 @@ public final class ExploreBrainHarness {
             return at(t, () -> {
                 cues.add(Ears.Cue.of(kind, side, angleDeg, at));
                 log.add(new Event(t, "cue " + kind + " " + kind.tier + " " + side + " from " + at));
+            });
+        }
+
+        /**
+         * Robot 2026-10-03: the launcher's voice identification of the utterance that began at
+         * `at` (a call's own, "Hey Miko ..."), arriving at t.
+         */
+        Rig voiceOf(long t, long at, String person, float score, int band) {
+            return at(t, () -> {
+                voiceQueue.add(new Object[] {t, new Ears.Voice(at, person, score, band)});
+                log.add(new Event(t, "voice of " + at));
             });
         }
 
@@ -2146,6 +2159,7 @@ public final class ExploreBrainHarness {
         @Override
         public void voiceScore(String personId, long refAt, long at, long timeoutMs) {
             voiceScoreAsks.add(at);
+            voiceScoreRefs.add(refAt);
             Float score = gateScores.get(at);
             pendingVoiceScore = score == null ? Float.NaN : score;
             pendingVoiceScoreAt = now + 20;
@@ -15528,6 +15542,31 @@ public final class ExploreBrainHarness {
                             + " turns=" + turns.size() + " chatTurns=" + rig.chatTurns + " first turn=" + (turns.isEmpty() ? null : turns.get(0)[1])
                             + " searchedBefore=" + searchedBeforeTheConversation(rig, 400) + " v=" + rig.violations);
         });
+        scenario("callchat_the_callers_own_voice_is_the_voice_gates_reference", n -> {
+            // Robot 2026-10-03: "Hey Miko, guess what" is embedded; its voice, not the TV's, is the reference.
+            String tv = "AND NOW THE WEATHER FOR THE WEEKEND";
+            Rig rig = callChatRig(EMPTY_ROOM, hearWords(tv).voice(null, 0.1f, NO_VOICE).gate(0.05f),
+                    hearWords("so anyway").voice(null, 0.2f, NO_VOICE).gate(0.7f),
+                    hearWords("bye").voice(null, 0.2f, NO_VOICE).gate(0.7f));
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.RIGHT, 1600, "guess what");
+            rig.voiceOf(2400, 400, null, 0.2f, NO_VOICE);
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            boolean tvAsked = false;
+            for (TurnAsk a : rig.turnAsks) {
+                tvAsked |= tv.equals(a.request.heard);
+            }
+            check(n, open > 0 && over > 0 && !tvAsked && !rig.voiceScoreRefs.isEmpty()
+                            && rig.voiceScoreRefs.get(0) == 400
+                            && noted(notes, "voice: the caller's own voice is the conversation's reference")
+                            && noted(notes, "voice: not the partner (likely someone else or the TV)")
+                            && rig.violations.isEmpty(),
+                    "open@" + open + " refs=" + rig.voiceScoreRefs + " notes=" + records(notes, "voice") + " "
+                            + rig.tail());
+        });
         scenario("callchat_the_caller_found_at_look_3_gets_the_face_path_and_the_conversation_goes_on", n -> {
             // The side-first plan to his right: 90, 135, then 45 deg, where Priya stands.
             Rig rig = callChatRig(personAt(bearingOf(45f), 20), replies(7));
@@ -15903,10 +15942,14 @@ public final class ExploreBrainHarness {
                     "scoreAsks=" + rig.voiceScoreAsks + " asks=" + rig.turnAsks.size() + " turns=" + turns + " "
                             + rig.tail());
         });
+        scenario("voice_gate_the_callers_own_voice_before_the_conversation_is_the_reference",
+                n -> callVoiceIsTheReference(n, 400));
+        scenario("voice_gate_the_callers_own_voice_during_the_conversation_is_the_reference",
+                n -> callVoiceIsTheReference(n, 2500));
         scenario("voice_gate_with_no_voice_in_time_the_turn_goes_as_before", n -> {
             Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
                     hearWords("hello there").voice(null, 0.2f, NO_VOICE),
-                    hearWords("quick one").voice(null, 0.1f, NO_VOICE).voiceAfter(900).gate(0.05f),
+                    hearWords("quick one").voice(null, 0.1f, NO_VOICE).voiceAfter(1500).gate(0.05f),
                     hearWords("short"), hearWords("bye"));
             List<String> notes = traced(rig);
             rig.started();
@@ -15923,9 +15966,41 @@ public final class ExploreBrainHarness {
                 shortAsked |= "short".equals(t.request.heard);
             }
             check(n, open > 0 && over > 0 && askedQuick > 0 && shortAsked && rig.voiceScoreAsks.isEmpty()
-                            && !noted(notes, "voice: not the partner") && rig.violations.isEmpty(),
+                            && !noted(notes, "voice: not the partner")
+                            && noted(notes, "voice gate: no voice within 1000 ms, the turn goes as before")
+                            && rig.violations.isEmpty(),
                     "askedQuick=" + askedQuick + " scoreAsks=" + rig.voiceScoreAsks + " " + rig.tail());
         });
+    }
+
+    /** Robot 2026-10-03: a call whose own voice (at 400, the call's speech start) arrives at t, then a TV answer. */
+    private static void callVoiceIsTheReference(String n, long t) {
+        String tv = "AND NOW THE WEATHER FOR THE WEEKEND";
+        Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                hearWords(tv).voice(null, 0.1f, NO_VOICE).gate(0.05f),
+                hearWords("so anyway").voice(null, 0.2f, NO_VOICE).gate(0.7f),
+                hearWords("bye").voice(null, 0.2f, NO_VOICE).gate(0.7f));
+        rig.voiceOf(t, 400, null, 0.2f, NO_VOICE);
+        List<String> notes = traced(rig);
+        rig.started();
+        long open = openChat(rig);
+        long over = chatOver(rig, open);
+        boolean tvAsked = false;
+        boolean anywayAsked = false;
+        for (TurnAsk a : rig.turnAsks) {
+            tvAsked |= tv.equals(a.request.heard);
+            anywayAsked |= "so anyway".equals(a.request.heard);
+        }
+        boolean refsAreTheCall = !rig.voiceScoreRefs.isEmpty();
+        for (long ref : rig.voiceScoreRefs) {
+            refsAreTheCall &= ref == 400;
+        }
+        check(n, open > 0 && over > 0 && !tvAsked && anywayAsked && rig.voiceScoreAsks.size() == 3 && refsAreTheCall
+                        && noted(notes, "voice: the caller's own voice is the conversation's reference")
+                        && noted(notes, "voice: not the partner (likely someone else or the TV)")
+                        && rig.violations.isEmpty(),
+                "open=" + open + " notes=" + records(notes, "voice") + " scoreAsks=" + rig.voiceScoreAsks + " refs="
+                        + rig.voiceScoreRefs + " asks=" + rig.turnAsks.size() + " " + rig.tail());
     }
 
     private static void facelessCallScenarios() {

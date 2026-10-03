@@ -463,9 +463,17 @@ final class ExplorePrompts {
             + "them: an easy, different question or a light remark that invites them to keep talking. Never "
             + "complain that they went quiet. This is said to them: addressed is true.)";
 
-    /** Appended to turn 1 when the caller said words with the wake word: those words are what he answers. */
-    static final String CALL_WORDS = "(He was just called by name with the words above and has not seen them yet: "
-            + "answer them naturally, in a short line. Do not ask their name yet.)";
+    /**
+     * Appended to turn 1 when the caller said words with the wake word: those words are what he
+     * answers. Robot 2026-10-03: "Hey Miko he..." got a flat "Hey, what's up?"; like CALL_OPENER,
+     * it answers warmly with one specific, curious question, and a TV or another voice may be
+     * not addressed.
+     */
+    static final String CALL_WORDS = "(He was just called by name with the words above; he is turning to find them "
+            + "and has not seen them yet. Answer what they said warmly, at most two short sentences: glad to be "
+            + "called, with one specific, curious follow-up question about what they said (never invent anything). "
+            + "Not a bare \"what's up\". Do not ask their name yet. They called him, so this is said to him: "
+            + "addressed is true unless it is clearly not them (another voice, a TV or radio).)";
 
     /**
      * Owner 2026-10-02 ("he can ask a question and just say 'What's your name?'"): appended to

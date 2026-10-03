@@ -697,8 +697,12 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "voice_a_face_that_disagrees_keeps_the_voice_identity_and_stores_no_face",
         "voice_gate_an_answer_in_another_voice_is_not_said_to_him",
         "voice_gate_with_no_voice_in_time_the_turn_goes_as_before",
+        # Robot 2026-10-03: the call's own voice is the gate's reference, whenever it comes.
+        "voice_gate_the_callers_own_voice_before_the_conversation_is_the_reference",
+        "voice_gate_the_callers_own_voice_during_the_conversation_is_the_reference",
         # Conversation first, the caller found during it (owner 2026-10-02)
         "callchat_wake_with_words_opens_with_their_words_as_the_first_message_within_2_s",
+        "callchat_the_callers_own_voice_is_the_voice_gates_reference",
         "callchat_bare_wake_opens_at_once_with_a_greeting_question_and_searches_during_it",
         "callchat_the_caller_found_at_look_3_gets_the_face_path_and_the_conversation_goes_on",
         "callchat_never_found_goes_on_while_they_answer_and_ends_after_3_unanswered",

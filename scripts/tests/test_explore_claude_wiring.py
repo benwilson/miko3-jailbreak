@@ -1051,8 +1051,8 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertEqual(act_names, bench.ACTION_NAMES)
         for k in act_order + ["PLAN"]:
             self.assertEqual(self.java_string(actions, k + "_DESCRIPTION"), getattr(bench, k + "_DESCRIPTION"), k)
-        for name in ("OWNER_NOTE_HEADING", "OWNER_NOTE_GUARD", "TASK_SYSTEM", "CALL_OPENER", "FACELESS_OPENER",
-                     "NAME_ASK", "NUDGE", "LAST_NAME_ASK"):
+        for name in ("OWNER_NOTE_HEADING", "OWNER_NOTE_GUARD", "TASK_SYSTEM", "CALL_OPENER", "CALL_WORDS",
+                     "FACELESS_OPENER", "NAME_ASK", "NUDGE", "LAST_NAME_ASK"):
             self.assertEqual(self.java_string(prompts, name), getattr(bench, name), name)
         recall = re.search(r'RECALL_SCHEMA = ExplorePrompts\.object\("name", ExplorePrompts\.described\(\s*'
                            r'ExplorePrompts\.type\("string"\), "(.*?)"\)\);', tools, re.S)
@@ -1290,6 +1290,18 @@ class CallConversationTest(unittest.TestCase):
         ask = self.constant("NAME_ASK")
         for words in ("may ask their name", "What's your name, by the way?", "Never mention their face"):
             self.assertIn(words, ask)
+
+    def test_a_call_with_words_is_answered_warmly_with_one_curious_question(self):
+        """Robot 2026-10-03: "Hey Miko he..." got a flat "Hey, what's up?": the call-with-words
+        note answers what they said warmly, like CALL_OPENER, and lets a TV be not addressed."""
+        text = self.constant("CALL_WORDS")
+        for words in ("has not seen them yet", "Answer what they said warmly", "at most two short sentences",
+                      "one specific, curious follow-up question", "never invent anything",
+                      'Not a bare "what\'s up"', "Do not ask their name yet",
+                      "addressed is true unless it is clearly not them (another voice, a TV or radio)"):
+            self.assertIn(words, text)
+        self.assertNotIn("answer them naturally, in a short line", text)
+        self.assertTrue(text.startswith("(") and text.endswith(")"), text)
 
     def test_the_turn_picks_the_call_opener_first_and_appends_the_call_notes(self):
         turn = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)

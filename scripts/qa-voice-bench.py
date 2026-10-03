@@ -7,7 +7,7 @@ restarts (am force-stop, then am start; the HOME key does not bring it back), wa
 the voice model to load and the bench to run on the voice thread (synthetic audio of
 1.5, 3, 5 and 8 s, three runs each, "voice: bench dur M ms: embedding in N ms"), then
 prints each length's runs, median and max, and clears the property. The bench audio is
-synthetic; nothing is recorded. Real answers log "voice: embedding in N ms (dur M ms)"
+synthetic; nothing is recorded. Real answers log "voice: embedding in N ms (dur M ms of T ms)"
 as they happen, so `adb logcat -s ListenEngine | grep voice:` shows live timings too.
 
 Usage:

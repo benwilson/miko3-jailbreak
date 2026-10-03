@@ -546,7 +546,9 @@ final class ExploreTuning {
      * this conversation's answers gets the last-name question; at most voiceEnrolMax answers of
      * a conversation are enrolled to the person it settles on. The voice gate (a TV in the
      * background): an answer's words wait up to chatVoiceGateMs for its voice, then up to
-     * chatVoiceScoreMs for its score against the partner; past either, the turn goes as before.
+     * chatVoiceScoreMs for its score against the partner; past either, the turn goes as before,
+     * so a turn is never held more than their sum (1.2 s). The partner's voice is the call's own
+     * ("Hey Miko ...") when the launcher embedded it, else the conversation's first answer's.
      */
     final float voiceFarScore;
     final int voiceFarPrints;
@@ -1583,11 +1585,12 @@ final class ExploreTuning {
         // Owner 2026-10-02: one silent face check about every 8 s for the whole conversation.
         private long chatFaceDelayMs = 1000;
         private long chatFaceGapMs = 8000;
-        // Owner 2026-10-02: voice first; far off is well under the weak band (0.45); the gate waits ~300 ms.
+        // Owner 2026-10-02: voice first; far off is well under the weak band (0.45). Robot 2026-10-03:
+        // embeddings of at most 3 s at normal priority, so the gate waits up to 1000 + 200 ms (was 300 + 200).
         private float voiceFarScore = 0.30f;
         private int voiceFarPrints = 3;
         private int voiceEnrolMax = 3;
-        private long chatVoiceGateMs = 300;
+        private long chatVoiceGateMs = 1000;
         private long chatVoiceScoreMs = 200;
         // Owner 2026-10-02: conversation first; the answer waits for the wake utterance's end
         // (a worded "Hey Miko, ..." runs about 1.5-2 s past the wake); three unanswered listens.

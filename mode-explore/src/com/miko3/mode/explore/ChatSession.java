@@ -367,8 +367,15 @@ final class ChatSession {
     private boolean nameCorrection;
     /** The name under recall is the full name given after the last-name question. */
     private boolean lastNameRecall;
-    /** The conversation's first voice (the voice gate's reference), or null before one came. */
+    /**
+     * The conversation's first voice (the voice gate's reference), or null before one came.
+     * Robot 2026-10-03: the call's own voice ("Hey Miko ...") when it comes, whenever it comes.
+     */
     private Ears.Voice partnerVoice;
+    /** The call's speech start (the launcher's key for its voice), or NEVER for a conversation no call opened. */
+    private long callAt = ExploreBrain.NEVER;
+    /** The call's voice, kept through open()'s drain when it came before the conversation. */
+    private Ears.Voice earlyCallVoice;
     /** The identified person's voice print count (identity by voice). */
     private int partnerPrints;
     // The voice gate (owner 2026-10-02, a TV in the background): words held for their voice.
@@ -505,6 +512,15 @@ final class ChatSession {
     // ---- entry points from the brain ----
 
     /**
+     * Robot 2026-10-03: before start() or startCall(), the speech start of the call behind this
+     * conversation. The launcher embeds the call's own utterance ("Hey Miko ...") when it is long
+     * enough, and that voice, whenever it comes, is the conversation's voice reference.
+     */
+    void expectCallVoice(long at) {
+        callAt = at;
+    }
+
+    /**
      * The conversation opens on the match answer (KTD9): the persona snapshot,
      * the person's name, id, notes and questions asked, and turn 1 goes out at
      * once. faceless: no face was cut out, so nothing can ever be stored.
@@ -556,9 +572,12 @@ final class ChatSession {
         while (port.lateTurn() != null) {
             // dropped
         }
-        // Owner 2026-10-02: and a voice identification of another conversation's answer.
-        while (port.voice() != null) {
-            // dropped
+        // Owner 2026-10-02: and a voice identification of another conversation's answer;
+        // robot 2026-10-03: but the call's own voice is this conversation's, and is kept.
+        for (Ears.Voice v = port.voice(); v != null; v = port.voice()) {
+            if (callAt != ExploreBrain.NEVER && v.at == callAt) {
+                earlyCallVoice = v;
+            }
         }
         this.checkOpen = checkOpen;
         this.settledName = settled;
@@ -2025,12 +2044,16 @@ final class ChatSession {
             }
             if (score == null) {
                 port.cancelVoiceScore();
+                host.note("voice gate: no score within " + tuning.chatVoiceScoreMs + " ms, the turn goes as before");
             }
             gateScoring = false;
             gateVerdict = score != null && !score.isNaN() && score < tuning.voiceFarScore ? 2 : 1;
         }
         if (gateVerdict == 0 && (gateVoice != null || now < gateDeadline)) {
             return;
+        }
+        if (gateVerdict == 0) {
+            host.note("voice gate: no voice within " + tuning.chatVoiceGateMs + " ms, the turn goes as before");
         }
         String text = gateText;
         Ears.Voice v = gateVoice;
@@ -2062,7 +2085,16 @@ final class ChatSession {
         if (finished) {
             return;
         }
+        if (earlyCallVoice != null) {
+            Ears.Voice v = earlyCallVoice;
+            earlyCallVoice = null;
+            callVoice(now, v);
+        }
         for (Ears.Voice v = port.voice(); v != null; v = port.voice()) {
+            if (callAt != ExploreBrain.NEVER && v.at == callAt) {
+                callVoice(now, v);
+                continue;
+            }
             if (phase == Phase.VOICE_GATE && gateText != null && gateVoice == null) {
                 gateVoice = v;
                 gateArrived(now);
@@ -2073,12 +2105,28 @@ final class ChatSession {
     }
 
     /**
+     * Robot 2026-10-03: the call's own voice ("Hey Miko ..."): the caller's, so it is the voice
+     * gate's reference even when an answer's voice came first, and it counts as a partner voice.
+     */
+    private void callVoice(long now, Ears.Voice v) {
+        callAt = ExploreBrain.NEVER;
+        partnerVoice = v;
+        host.note("voice: the caller's own voice is the conversation's reference");
+        partnerVoiceCame(now, v);
+    }
+
+    /**
      * One partner answer's voice: kept for the name's check and enrolment, and (owner 2026-10-02)
      * a strong match with nobody known yet looks the person up to go on as them; a weak one with
      * no name yet lets the next turn ask the name. Never logs the id or the score.
      */
     private void handleVoice(long now, Ears.Voice v) {
         learnVoice(v);
+        partnerVoiceCame(now, v);
+    }
+
+    /** handleVoice() less the learning log's turn record (the call's voice opened no answer's turn). */
+    private void partnerVoiceCame(long now, Ears.Voice v) {
         voices.add(v);
         voiceAts.add(v.at);
         while (voiceAts.size() > VOICE_ATS) {

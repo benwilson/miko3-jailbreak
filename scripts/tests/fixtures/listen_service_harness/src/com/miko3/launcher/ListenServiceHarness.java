@@ -1755,16 +1755,72 @@ public final class ListenServiceHarness {
                         "got=" + got + " heard=" + r.heard() + " voice=" + r.client.voice + " samples=" + v.samples);
             }
         });
+        scenario("mic_level_window_spans_reopened_mics_and_reports_once_a_minute", new Scenario() {
+            // Robot 2026-10-03: the Mic is reopened more often than once a minute; the window is shared.
+            public void run(String n) {
+                MicLevel level = new MicLevel();
+                java.util.List<String> lines = new java.util.ArrayList<String>();
+                long t = 1000;
+                // Seven mics of 20 s each, a read every 80 ms of 1280 samples at raw level 100, two clipped.
+                for (int mic = 0; mic < 7; mic++) {
+                    for (int k = 0; k < 250; k++) {
+                        String line = level.add(t, 100.0 * 100.0 * 1280, 1280, k == 7 && mic == 2 ? 9000 : 100, 2,
+                                2.0f);
+                        if (line != null) {
+                            lines.add(line);
+                        }
+                        t += 80;
+                    }
+                }
+                boolean first = !lines.isEmpty() && lines.get(0).startsWith("ears: mic level: RMS 100, peak 9000 (raw),"
+                        + " gain x2.0, clipped ");
+                boolean second = lines.size() == 2 && lines.get(1).contains("peak 100 (raw)");
+                check(n, lines.size() == 2 && first && second, "lines=" + lines);
+            }
+        });
+        scenario("ears_voice_a_call_of_1_2_s_is_identified_and_a_shorter_one_is_not", new Scenario() {
+            // Robot 2026-10-03: the call's own utterance is the conversation's first voice reference.
+            public void run(String n) throws Exception {
+                Rig r = new Rig();
+                VoiceRig v = new VoiceRig(r);
+                r.open(false);
+                // A bare-ish call, under 1.2 s of speech: delivered, not embedded.
+                r.steps(false, 400);
+                for (int i = 0; i < 10; i++) {
+                    r.step(true);
+                    r.rec.text = "MIKO HI";
+                }
+                r.rec.endpoint = true;
+                r.steps(false, 400);
+                int shortCalls = v.calls;
+                // A call with words, 1.6 s of speech: embedded under the call's own at.
+                long start = r.clock.now + 80;
+                for (int i = 0; i < 20; i++) {
+                    r.step(true);
+                    r.rec.text = "MIKO WHAT ARE YOU UP TO";
+                }
+                r.rec.endpoint = true;
+                r.steps(false, 400);
+                boolean got = r.client.voiced.await(5, TimeUnit.SECONDS);
+                v.id.shutdown();
+                v.id.awaitIdle(2000);
+                check(n, shortCalls == 0 && got && v.calls == 1 && r.client.voice.size() == 1
+                                && r.client.voice.get(0).startsWith(start + ":") && v.samples >= 20 * CHUNK
+                                && v.id.buffered() == 0,
+                        "short=" + shortCalls + " calls=" + v.calls + " voice=" + r.client.voice + " start=" + start
+                                + " heard=" + r.heard());
+            }
+        });
         scenario("ears_voice_cues_short_answers_and_clipped_answers_are_not_identified", new Scenario() {
             public void run(String n) throws Exception {
                 Rig r = new Rig();
                 VoiceRig v = new VoiceRig(r);
                 r.open(false);
-                // A strong cue outside any listen: delivered, never embedded.
+                // A strong cue outside any listen that is not a call: delivered, never embedded.
                 r.steps(false, 400);
                 for (int i = 0; i < 30; i++) {
                     r.step(true);
-                    r.rec.text = "GOOD MORNING MIKO";
+                    r.rec.text = "GOOD MORNING";
                 }
                 r.rec.endpoint = true;
                 r.steps(false, 400);
