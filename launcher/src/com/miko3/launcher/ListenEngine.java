@@ -530,6 +530,16 @@ final class ListenEngine implements ListenSession.Ears {
             private double sumSquares;
             private long count;
             private int peak;
+            // Owner 2026-10-02 at home: "his microphone has a hard time hearing things". A software
+            // gain (persist.miko3.ears.gain_db, 0..18 dB, re-read every ~3 s so it can be tuned live)
+            // before the wake word, the speech detector and the recogniser; a level line each minute.
+            private float gain = MicGain.factor(SpeechEngine.systemProperty(MicGain.PROP));
+            private long gainCheckedAt;
+            private long windowStart = System.currentTimeMillis();
+            private double windowSq;
+            private long windowN;
+            private int windowPeak;
+            private long windowClipped;
 
             @Override
             public int read(float[] buf) {
@@ -538,13 +548,40 @@ final class ListenEngine implements ListenSession.Ears {
                     Log.w(TAG, "microphone read failed: " + n);
                     return -1;
                 }
+                long now = System.currentTimeMillis();
+                if (now - gainCheckedAt >= 3000) {
+                    gainCheckedAt = now;
+                    float g = MicGain.factor(SpeechEngine.systemProperty(MicGain.PROP));
+                    if (g != gain) {
+                        Log.i(TAG, "ears: mic gain now x" + g);
+                        gain = g;
+                    }
+                }
                 for (int i = 0; i < n; i++) {
                     int s = pcm[i];
-                    buf[i] = s / 32768f;
                     sumSquares += (double) s * s;
                     peak = Math.max(peak, Math.abs(s));
+                    windowSq += (double) s * s;
+                    windowPeak = Math.max(windowPeak, Math.abs(s));
+                    float v = s * gain;
+                    if (v > 32767f || v < -32768f) {
+                        windowClipped++;
+                        v = v > 0 ? 32767f : -32768f;
+                    }
+                    buf[i] = v / 32768f;
                 }
                 count += n;
+                windowN += n;
+                if (now - windowStart >= 60000) {
+                    long rms = windowN == 0 ? 0 : Math.round(Math.sqrt(windowSq / windowN));
+                    Log.i(TAG, "ears: mic level: RMS " + rms + ", peak " + windowPeak + " (raw), gain x" + gain
+                            + ", clipped " + windowClipped + " of " + windowN + " samples");
+                    windowStart = now;
+                    windowSq = 0;
+                    windowN = 0;
+                    windowPeak = 0;
+                    windowClipped = 0;
+                }
                 return n;
             }
 
