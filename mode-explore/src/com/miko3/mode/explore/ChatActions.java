@@ -72,13 +72,14 @@ final class ChatActions {
     static final String STAY_DESCRIPTION = "Stay here and don't roam for some minutes (at most 30); a call still "
             + "gets an answer. Use it when they ask him to stay or wait here.";
     static final String COME_HERE_DESCRIPTION = "Come over to the person he is talking to. Use it when they ask him "
-            + "to come here or come over.";
+            + "to come here, come over, come to them or come find them (\"come find me\", \"over here\").";
     static final String GO_AWAY_DESCRIPTION = "Turn away and leave the person alone for ten minutes. Use it when they "
             + "ask him to go away or leave them alone.";
     static final String BE_QUIET_DESCRIPTION = "Do not disturb for some minutes (0: ten, at most 30): no remarks, "
             + "and a call only gets a glance. Use it when they ask him to be quiet.";
-    static final String FIND_PERSON_DESCRIPTION = "Go and look for someone: by name, or anyone new when the name is "
-            + "empty, for up to five minutes. Use it when they ask him to go and find someone.";
+    static final String FIND_PERSON_DESCRIPTION = "Go and look for someone else: by name, or anyone new when the name is "
+            + "empty, for up to five minutes. Use it when they ask him to go and find someone else; never for the "
+            + "person talking to him (\"come find me\" is come_here).";
     static final String FIND_THING_DESCRIPTION = "Search for a thing his detector can name, like a printer or a "
             + "chair, and go over to it when he sees it, for up to five minutes. label is the plain name of the thing "
             + "in English, singular.";

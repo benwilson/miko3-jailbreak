@@ -219,7 +219,8 @@ STAY_DESCRIPTION = (
     'they ask him to stay or wait here.'
 )
 COME_HERE_DESCRIPTION = (
-    'Come over to the person he is talking to. Use it when they ask him to come here or come over.'
+    'Come over to the person he is talking to. Use it when they ask him to come here, come over, come to '
+    'them or come find them ("come find me", "over here").'
 )
 GO_AWAY_DESCRIPTION = (
     'Turn away and leave the person alone for ten minutes. Use it when they ask him to go away or leave '
@@ -230,8 +231,9 @@ BE_QUIET_DESCRIPTION = (
     'Use it when they ask him to be quiet.'
 )
 FIND_PERSON_DESCRIPTION = (
-    'Go and look for someone: by name, or anyone new when the name is empty, for up to five minutes. Use '
-    'it when they ask him to go and find someone.'
+    'Go and look for someone else: by name, or anyone new when the name is empty, for up to five minutes. '
+    'Use it when they ask him to go and find someone else; never for the person talking to him ("come find '
+    'me" is come_here).'
 )
 FIND_THING_DESCRIPTION = (
     'Search for a thing his detector can name, like a printer or a chair, and go over to it when he sees '
