@@ -127,20 +127,26 @@ SCHEMA_PREAMBLE = (
 )
 # Owner 2026-10-02 ("make him chattier"): the openers and the follow-up after silence (ExplorePrompts).
 FACELESS_OPENER = (
-    "Miko has just rolled up to someone, but from down on the floor he cannot see their face, so he cannot "
-    "remember them yet. Write his opener, at most two short sentences: greet them warmly with one specific, "
-    "curious thing, like a light question about them or their day, or a true remark about what he was just "
-    "doing (never invent anything), then say he can't see their face from down here and ask them to crouch "
-    "down to his level so he can get a good look at them. Do not ask their name. Later in the conversation, "
-    "do not ask their name either; if they tell him their name before he can see their face, he thanks them "
-    "and asks them to crouch down to his level so he'll remember them."
+    "Miko has just rolled up to someone he can't see well from down on the floor, so he doesn't know who they "
+    "are yet. Write his opener, at most two short sentences: greet them warmly with one specific, curious thing, "
+    "like a light question about them or their day, or a true remark about what he was just doing (never invent "
+    "anything), and ask their name naturally, like \"What's your name?\". Never mention their face, and never "
+    "ask them to crouch, come closer or move so he can see them. Once they tell him their name, use it now and "
+    "then for the rest of the conversation."
+)
+# Owner 2026-10-02: appended to the turn after a call's opener while he doesn't know who they are.
+NAME_ASK = (
+    "(He doesn't know who they are yet: after answering them, he may ask their name naturally in this line, "
+    "like \"What's your name, by the way?\". Never mention their face, and never ask them to crouch, come "
+    "closer or move so he can see them.)"
 )
 CALL_OPENER = (
     "Someone just called Miko by name and he answered right away; he is turning to find them and has not "
     "seen them yet. Write his opener, at most two short sentences: a warm greeting with a question that shows "
     "he is glad to be called and curious about them, built on one specific thing, like what they are up to, "
     "how their day is going, or a true remark about what he was just doing (never invent anything). Not a "
-    'bare "what\'s up". Do not ask their name yet.'
+    'bare "what\'s up". Do not ask their name yet. They called him, so everything said in this conversation is '
+    'said to him: addressed is always true.'
 )
 NUDGE = (
     "(They have not answered his last line. Write one gentle follow-up that re-engages them: an easy, "
@@ -360,7 +366,7 @@ CALL = (
 )
 FACELESS = (
     FACELESS_OPENER,
-    "Oh, hello! Like this?",
+    "Oh, hello! I'm Priya.",
     "We're just hanging out in the living room.",
     NUDGE,
     "Bye Miko.",

@@ -628,7 +628,7 @@ class SayDebugLogIsGatedTest(unittest.TestCase):
         starts = [m.start() for m in re.finditer(r"Log\.[diwe]\(\s*SAY_DEBUG_TAG\s*,", body)]
         self.assertTrue(starts, "no SAY_DEBUG_TAG log found")
         for at in starts:
-            before = body[max(0, at - 700):at]
+            before = body[max(0, at - 1500):at]
             self.assertIn("Log.isLoggable(SAY_DEBUG_TAG, Log.DEBUG)", before)
 
     def test_robot_say_sets_and_clears_the_tag(self):
@@ -1052,7 +1052,7 @@ class ConversationWiringTest(unittest.TestCase):
         for k in act_order + ["PLAN"]:
             self.assertEqual(self.java_string(actions, k + "_DESCRIPTION"), getattr(bench, k + "_DESCRIPTION"), k)
         for name in ("OWNER_NOTE_HEADING", "OWNER_NOTE_GUARD", "TASK_SYSTEM", "CALL_OPENER", "FACELESS_OPENER",
-                     "NUDGE"):
+                     "NAME_ASK", "NUDGE"):
             self.assertEqual(self.java_string(prompts, name), getattr(bench, name), name)
         recall = re.search(r'RECALL_SCHEMA = ExplorePrompts\.object\("name", ExplorePrompts\.described\(\s*'
                            r'ExplorePrompts\.type\("string"\), "(.*?)"\)\);', tools, re.S)
@@ -1134,7 +1134,7 @@ class ConversationWiringTest(unittest.TestCase):
             self.assertRegex(a, r"public [\w<>.]+ " + method + r"\(", method)
         resolve = re.search(r"private Resolved resolveNow\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn("RobotPeopleClient.idsNamed(app, name)", resolve)
-        self.assertIn("NameResolver.resolve(name, probe, ids, entries, close)", resolve)
+        self.assertIn("NameResolver.resolve(name, probe, ids, entries, close, nameOnly)", resolve)
         self.assertNotIn("claude.", resolve)
         last = re.search(r"private Resolved resolveLastNow\((.*?)\n    \}", a, re.S).group(1)
         self.assertIn("NameResolver.afterLastName(first, lastName, stored)", last)
@@ -1168,20 +1168,33 @@ class ConversationWiringTest(unittest.TestCase):
 
 
 class FacelessOpenerTest(unittest.TestCase):
-    """Robot 2026-10-01: from the floor the face was out of frame or too small, so he asked
-    people names he could never keep (R19). A conversation that opens with no usable face
-    invites them down to his level instead; the name is asked only once a face retry found a
-    usable face. A face-in-hand stranger's opener still asks the name."""
+    """Owner 2026-10-02 (at home): "less interruptions as he tries to find your face ... he can
+    just say 'What's your name?' and then base his conversation off the name." A conversation
+    that opens with no usable face greets them and asks their name; he never asks to see their
+    face (the crouch invitation is gone), and the face is checked silently in the background.
+    A face-in-hand stranger's opener still asks the name."""
 
     @staticmethod
     def constant(name):
         return ConversationWiringTest.java_string(src("ExplorePrompts.java"), name)
 
-    def test_the_faceless_opener_invites_them_down_and_never_asks_the_name(self):
+    def test_the_faceless_opener_asks_the_name_and_never_asks_to_see_their_face(self):
         text = self.constant("FACELESS_OPENER")
-        for words in ("can't see their face from down here", "crouch down to his level", "Do not ask their name",
-                      "do not ask their name either"):
+        for words in ("ask their name naturally", "What's your name?", "Never mention their face",
+                      "use it now and then for the rest of the conversation"):
             self.assertIn(words, text)
+        for gone in ("crouch down to his level", "Do not ask their name", "can't see their face from down here",
+                     "get a good look"):
+            self.assertNotIn(gone, text)
+
+    def test_the_crouch_invitation_and_face_seen_are_gone(self):
+        p = code_only(src("ExplorePrompts.java"))
+        for gone in ("CANT_SEE", "FACE_SEEN", "down to his level", "crouch down"):
+            self.assertNotIn(gone, p)
+        for f in ("ChatRound.java", "ChatSession.java", "CuriosityPort.java"):
+            code = code_only(src(f))
+            for gone in ("cantSee", "CANT_SEE", "FACE_SEEN", "faceSeen && name"):
+                self.assertNotIn(gone, code, f)
 
     def test_the_faceless_opener_is_warm_curious_and_fits_a_roaming_meeting(self):
         """Owner 2026-10-02: flat openers; a roaming or cue pick may now be met faceless, so the
@@ -1198,33 +1211,57 @@ class FacelessOpenerTest(unittest.TestCase):
         body = body[:body.index("\n    }\n")]
         self.assertIn("ask \"\n                    + \"their name", body)
 
-    def test_a_face_seen_on_a_retry_lets_him_ask_the_name(self):
-        self.assertIn("ask their name if he does not know it yet", self.constant("FACE_SEEN"))
-
-    def test_the_turn_picks_the_opener_by_the_request_and_appends_face_seen(self):
+    def test_the_turn_picks_the_opener_by_the_request_and_says_once_who_they_turned_out_to_be(self):
         turn = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
         self.assertIn("request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name)", turn)
         self.assertIn("e.heard == null ? first : e.heard", turn)
         self.assertIn("request.heard == null ? first : request.heard", turn)
-        self.assertRegex(turn, r"if \(request\.faceSeen\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.FACE_SEEN;")
+        self.assertRegex(turn, r"if \(request\.recalled\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.recalled\(request\.name\);")
+        recalled = src("ExplorePrompts.java")
+        recalled = recalled[recalled.index("static String recalled("):]
+        recalled = recalled[:recalled.index("\n    }\n")]
+        for words in ("someone he remembers", "Answer what they said first", "Never mention their face"):
+            self.assertIn(words, recalled)
         port = code_only(src("CuriosityPort.java"))
-        for sig in ("final boolean faceless;", "final boolean faceSeen;"):
+        for sig in ("final boolean faceless;", "final boolean recalled;"):
             self.assertIn(sig, port)
         session = code_only(src("ChatSession.java"))
-        self.assertIn(".face(openedFaceless, faceSeen && name == null)", session)
+        self.assertIn(".face(openedFaceless).call(called).withFacts(host.toolFacts()).noteBy(noteName)\n"
+                      "                .recalledNow(recalledDue);", session)
+
+    def test_the_face_checks_run_all_conversation_every_8_s(self):
+        tuning = code_only(src("ExploreTuning.java"))
+        self.assertNotIn("chatFaceTries", tuning)
+        self.assertIn("private long chatFaceGapMs = 8000;", tuning)
+        session = code_only(src("ChatSession.java"))
+        self.assertNotIn("chatFaceTries", session)
+
+    def test_the_adapter_looks_a_name_up_by_name_alone_and_never_logs_it(self):
+        a = code_only(src("ClaudeCuriosity.java"))
+        body = re.search(r"private CuriosityPort\.Recalled recallNow\((.*?)\n    \}", a, re.S).group(1)
+        for needle in ("RobotPeopleClient.idsNamed(app, name)", "NameResolver.byName(name, stored)",
+                       "RobotPeopleClient.addNamed(app, d.name)", "RobotPeopleClient.hasFace(app, d.personId)",
+                       "RobotPeopleClient.notesOf(app, d.personId)"):
+            self.assertIn(needle, body)
+        # Logs carry fixed text, ids and counts only: never the name variable or a stored name.
+        for log in re.findall(r"Log\.\w\(TAG, (.*?)\);", body, re.S):
+            for leak in ("+ name", "d.name +", "stored.get(", "+ n "):
+                self.assertNotIn(leak, log, log)
+        resolve = re.search(r"private Resolved resolveNow\((.*?)\n    \}", a, re.S).group(1)
+        self.assertIn("NameResolver.resolve(name, probe, ids, entries, close, nameOnly)", resolve)
 
 
 class CallConversationTest(unittest.TestCase):
     """Owner 2026-10-02: conversation first. A call's conversation opens before he has seen
-    them: its opener is a short greeting-question (never the crouch invitation, never the
-    name), the words said with the wake word are turn 1's message, the crouch invitation comes
-    once he knows he can't see them, and opening it costs no Claude request."""
+    them: its opener is a short greeting-question (never the name), the words said with the
+    wake word are turn 1's message, the next turn may ask the name (never to see their face),
+    and opening it costs no Claude request."""
 
     @staticmethod
     def constant(name):
         return ConversationWiringTest.java_string(src("ExplorePrompts.java"), name)
 
-    def test_the_call_opener_greets_with_a_question_and_asks_no_name_or_crouch(self):
+    def test_the_call_opener_greets_with_a_question_and_the_next_turn_may_ask_the_name(self):
         text = self.constant("CALL_OPENER")
         for words in ("greeting with a question", "has not seen them yet", "Do not ask their name yet",
                       # Owner 2026-10-02: "Hey! What's up?" every time; one curious thing, nothing invented.
@@ -1234,9 +1271,9 @@ class CallConversationTest(unittest.TestCase):
         self.assertNotIn("crouch", text)
         self.assertNotIn("Hey! What's up?", text)
         self.assertIn("Do not ask their name yet", self.constant("CALL_WORDS"))
-        cant = self.constant("CANT_SEE")
-        for words in ("can't see their face from down here", "crouch down to his level", "Do not ask their name"):
-            self.assertIn(words, cant)
+        ask = self.constant("NAME_ASK")
+        for words in ("may ask their name", "What's your name, by the way?", "Never mention their face"):
+            self.assertIn(words, ask)
 
     def test_the_turn_picks_the_call_opener_first_and_appends_the_call_notes(self):
         turn = re.search(r"static Body body\((.*?)\n    \}", code_only(src("ChatRound.java")), re.S).group(1)
@@ -1244,9 +1281,10 @@ class CallConversationTest(unittest.TestCase):
                                r": request\.faceless \? ExplorePrompts\.FACELESS_OPENER")
         self.assertRegex(turn, r"if \(request\.called && request\.heard != null && request\.transcript\.isEmpty\(\)\) \{\s*"
                                r"ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CALL_WORDS;")
-        self.assertRegex(turn, r"if \(request\.cantSee\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CANT_SEE;")
-        session = code_only(src("ChatSession.java"))
-        self.assertIn(".call(called, cantSeeDue).withFacts(host.toolFacts())\n                .noteBy(noteName);", session)
+        # Owner 2026-10-02: the turn after a call's opener may ask the name while he doesn't know it.
+        self.assertRegex(turn, r"if \(request\.called && request\.name == null && request\.heard != null\s*"
+                               r"&& request\.transcript\.size\(\) == 1\) \{\s*"
+                               r"ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.NAME_ASK;")
 
     def test_a_run_of_unanswered_listens_gets_one_gentle_follow_up_before_the_end(self):
         """Owner 2026-10-02 ("oh hi and then he doesn't really talk to us"): instead of the

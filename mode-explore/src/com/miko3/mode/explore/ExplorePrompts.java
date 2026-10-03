@@ -424,35 +424,34 @@ final class ExplorePrompts {
 
     /**
      * The opener when the conversation opened with no usable face (robot 2026-10-01: from
-     * the floor the face was out of frame or too small, and he asked people names he could
-     * never keep, R19): a call's, or a roaming or cue meeting met faceless (owner 2026-10-02).
-     * No photo goes with it. He invites them down to his level instead of asking the name; it
-     * is replayed as the conversation's first message, so it holds for every turn until
-     * FACE_SEEN says otherwise. Owner 2026-10-02 ("oh hi and then he doesn't really talk to
-     * us"): a warm greeting with one curious thing, not a flat hello.
+     * the floor the face was out of frame or too small): a roaming or cue meeting met
+     * faceless (owner 2026-10-02). No photo goes with it. Owner 2026-10-02 (at home: "less
+     * interruptions as he tries to find your face ... he can just say 'What's your name?'
+     * and then base his conversation off the name"): he never asks anyone to show him their
+     * face; he greets them and asks their name, and keeps looking for their face silently in
+     * the background. It is replayed as the conversation's first message. Owner 2026-10-02
+     * ("oh hi and then he doesn't really talk to us"): a warm greeting with one curious thing.
      */
-    static final String FACELESS_OPENER = "Miko has just rolled up to someone, but from down on the floor he cannot "
-            + "see their face, so he cannot remember them yet. Write his opener, at most two short sentences: greet "
-            + "them warmly with one specific, curious thing, like a light question about them or their day, or a "
-            + "true remark about what he was just doing (never invent anything), then say he can't see their face "
-            + "from down here and ask them to crouch down to his level so he can get a good look at them. Do not "
-            + "ask their name. Later in the conversation, do not ask their name either; if they tell him their "
-            + "name before he can see their face, he thanks them and asks them to crouch down to his level so "
-            + "he'll remember them.";
+    static final String FACELESS_OPENER = "Miko has just rolled up to someone he can't see well from down on the "
+            + "floor, so he doesn't know who they are yet. Write his opener, at most two short sentences: greet them "
+            + "warmly with one specific, curious thing, like a light question about them or their day, or a true "
+            + "remark about what he was just doing (never invent anything), and ask their name naturally, like "
+            + "\"What's your name?\". Never mention their face, and never ask them to crouch, come closer or move so "
+            + "he can see them. Once they tell him their name, use it now and then for the rest of the conversation.";
 
     /**
      * The opener of a conversation a call opened (owner 2026-10-02): he answered at once, before
      * turning to find them, so no photo goes with it and he has not seen them yet. A greeting
-     * with a question, never the crouch invitation (CANT_SEE comes later, once he knows he
-     * can't see them) and never the name (nothing could be kept without a face, R19). It is
-     * replayed as the conversation's first message. Owner 2026-10-02: "Hey! What's up?" every
+     * with a question, not the name yet (NAME_ASK may ask it on the next turn, owner
+     * 2026-10-02). It is replayed as the conversation's first message. Owner 2026-10-02: "Hey! What's up?" every
      * time was flat; it greets with one specific, curious thing instead, and no example to copy.
      */
     static final String CALL_OPENER = "Someone just called Miko by name and he answered right away; he is turning to "
             + "find them and has not seen them yet. Write his opener, at most two short sentences: a warm greeting "
             + "with a question that shows he is glad to be called and curious about them, built on one specific "
             + "thing, like what they are up to, how their day is going, or a true remark about what he was just "
-            + "doing (never invent anything). Not a bare \"what's up\". Do not ask their name yet.";
+            + "doing (never invent anything). Not a bare \"what's up\". Do not ask their name yet. They called him, "
+            + "so everything said in this conversation is said to him: addressed is always true.";
 
     /**
      * Owner 2026-10-02 ("he doesn't really talk to us"): the turn asked once a run of
@@ -468,21 +467,24 @@ final class ExplorePrompts {
             + "answer them naturally, in a short line. Do not ask their name yet.)";
 
     /**
-     * Appended once he knows he can't see them (owner 2026-10-02: the search found nobody, or
-     * found them with no usable face): FACELESS_OPENER's invitation, mid-conversation.
+     * Owner 2026-10-02 ("he can ask a question and just say 'What's your name?'"): appended to
+     * the turn right after a call's opener (or its answer to the words said with the wake word)
+     * while he still doesn't know who they are. Never about their face.
      */
-    // Robot 2026-10-02 15:27 (robot-say.py): "go to the kitchen and see if anyone's there" got only "Can't see
-    // your face from down here, mind crouching down": the invitation must never replace their request.
-    static final String CANT_SEE = "First answer what they just said: if they asked him to do something, do it "
-            + "with his tools as usual and skip the rest of this. Otherwise, in this line, also say he can't see their "
-            + "face from down here and ask them to "
-            + "crouch down to his level so he can get a good look at them. Do not ask their name; if they tell him "
-            + "their name before he can see their face, he thanks them and asks them to crouch down so he'll "
-            + "remember them.";
+    static final String NAME_ASK = "(He doesn't know who they are yet: after answering them, he may ask their name "
+            + "naturally in this line, like \"What's your name, by the way?\". Never mention their face, and never "
+            + "ask them to crouch, come closer or move so he can see them.)";
 
-    /** Appended to a turn's message once a face retry found a usable face for someone still unnamed. */
-    static final String FACE_SEEN = "He can see their face now, so he will be able to remember them: in this line, "
-            + "ask their name if he does not know it yet.";
+    /**
+     * Owner 2026-10-02: appended once, to the turn right after he found out who they are
+     * mid-conversation: the name they gave found someone he remembers, or a background face
+     * check matched them. The notes in the system prefix are theirs from this turn on.
+     */
+    static String recalled(String name) {
+        return "(He has just realised this is " + (name == null ? "" : name.trim()) + ", someone he remembers: "
+                + "the notes above are what he knows of them. Answer what they said first; if it fits, pick up one "
+                + "thing from the notes naturally. Never mention their face or how he recognised them.)";
+    }
 
     /** The re-request reminder for this question, appended to the last user message. */
     static String avoidQuestion(String question) {

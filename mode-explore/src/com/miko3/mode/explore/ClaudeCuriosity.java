@@ -206,6 +206,8 @@ final class ClaudeCuriosity implements CuriosityPort {
     /** Confirming and resolving names (face plan U7): one resolve and one added photo at a time. */
     private final Slot<Resolved> resolves = new Slot<Resolved>();
     private final Slot<MatchAnswer> photoAdds = new Slot<MatchAnswer>();
+    /** Owner 2026-10-02: a name given with no usable face, looked up by name alone. */
+    private final Slot<CuriosityPort.Recalled> recalls = new Slot<CuriosityPort.Recalled>();
     /** The recommended effort for a turn (KTD9); the client's gate drops it where a model refuses it. */
     private static final String TURN_EFFORT = "low";
     /**
@@ -815,6 +817,17 @@ final class ClaudeCuriosity implements CuriosityPort {
                     calls.append(calls.length() == 0 ? "" : "; ").append(u.name).append(' ').append(u.input);
                 }
             }
+            // Owner 2026-10-02 (home training run): what he heard, to tell recogniser garble from Claude's
+            // judgement. Only under this debug tag, which is off unless set for a supervised run.
+            String heard = "";
+            if (!body.messages.isEmpty()) {
+                Object last = body.messages.get(body.messages.size() - 1);
+                heard = String.valueOf(last);
+                if (heard.length() > 300) {
+                    heard = heard.substring(heard.length() - 300);
+                }
+            }
+            Log.d(SAY_DEBUG_TAG, "heard: " + heard);
             Log.d(SAY_DEBUG_TAG, "line: " + t.line + " | tool round: " + o.tools + " | final calls: " + calls);
         }
     }
@@ -1660,7 +1673,17 @@ final class ClaudeCuriosity implements CuriosityPort {
             List<String> ids = found == null ? Collections.<String>emptyList() : Arrays.asList(found);
             List<FaceMatcher.Entry> entries = mf.entries;
             float close = mf.close;
-            NameResolver.Decision d = NameResolver.resolve(name, probe, ids, entries, close);
+            // Owner 2026-10-02: someone kept by name alone (no photo) gets the face given with their exact name.
+            Map<String, String> nameOnly = new LinkedHashMap<String, String>();
+            for (String id : ids) {
+                if (!RobotPeopleClient.hasFace(app, id)) {
+                    String n = RobotPeopleClient.nameOf(app, id);
+                    if (n != null) {
+                        nameOnly.put(id, n);
+                    }
+                }
+            }
+            NameResolver.Decision d = NameResolver.resolve(name, probe, ids, entries, close, nameOnly);
             Log.i(TAG, "name resolved over " + ids.size() + " stored id(s): " + d);
             switch (d.kind) {
                 case JOIN: {
@@ -1728,6 +1751,71 @@ final class ClaudeCuriosity implements CuriosityPort {
     @Override
     public Resolved resolved() {
         return resolves.poll();
+    }
+
+    /**
+     * Owner 2026-10-02: a name given with no usable face, looked up by name alone
+     * (NameResolver.byName over the store's ids for it): someone stored lends their id,
+     * stored name, notes and questions; nobody means a new record under the name alone.
+     * Logs ids and counts only, never the name.
+     */
+    @Override
+    public void recallName(final String name, final long timeoutMs) {
+        final int g = recalls.start();
+        run(new Runnable() {
+            @Override
+            public void run() {
+                recalls.finish(g, recallNow(name));
+            }
+        }, recalls, g, CuriosityPort.Recalled.FAILED);
+    }
+
+    private CuriosityPort.Recalled recallNow(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            return CuriosityPort.Recalled.FAILED;
+        }
+        try {
+            String[] found = RobotPeopleClient.idsNamed(app, name);
+            Map<String, String> stored = new LinkedHashMap<String, String>();
+            if (found != null) {
+                for (String id : found) {
+                    String n = RobotPeopleClient.nameOf(app, id);
+                    if (n != null && !n.trim().isEmpty()) {
+                        stored.put(id, n);
+                    }
+                }
+            }
+            NameResolver.Decision d = NameResolver.byName(name, stored);
+            Log.i(TAG, "name looked up with no face over " + stored.size() + " stored id(s): " + d);
+            switch (d.kind) {
+                case JOIN: {
+                    PersonNotes n = RobotPeopleClient.notesOf(app, d.personId);
+                    boolean faced = RobotPeopleClient.hasFace(app, d.personId);
+                    return CuriosityPort.Recalled.found(d.personId, stored.get(d.personId), n.toJson(),
+                            n.questionsAsked, faced);
+                }
+                case NEW: {
+                    String id = RobotPeopleClient.addNamed(app, d.name);
+                    Log.i(TAG, "kept a new record by name alone, id " + id);
+                    return CuriosityPort.Recalled.created(id, d.name);
+                }
+                default:
+                    return CuriosityPort.Recalled.SHARED;
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "name look-up: the people store refused or is unavailable: " + e.getMessage());
+            return CuriosityPort.Recalled.FAILED;
+        }
+    }
+
+    @Override
+    public CuriosityPort.Recalled recalledName() {
+        return recalls.poll();
+    }
+
+    @Override
+    public void cancelRecallName() {
+        recalls.cancel();
     }
 
     @Override
