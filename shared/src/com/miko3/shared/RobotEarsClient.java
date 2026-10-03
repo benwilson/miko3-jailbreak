@@ -57,6 +57,14 @@ public final class RobotEarsClient {
          */
         void onProvisional(long at, String text);
 
+        /**
+         * Owner 2026-10-02: whose voice said the answer whose speech began at at (the at of its
+         * onHeard): person is the launcher's opaque person id or null, band RobotEars.VOICE_*;
+         * see RobotEars.Callback.voice. After that answer's onHeard. A no-op unless overridden.
+         */
+        default void onVoice(long at, String person, float score, int band) {
+        }
+
         /** The session is gone; reason is fixed text. Called at most once per open(). */
         void onLost(String reason);
     }
@@ -423,6 +431,22 @@ public final class RobotEarsClient {
                 public void run() {
                     if (!ended) {
                         listener.onProvisional(at, text);
+                    }
+                }
+            });
+        }
+
+        /** On the worker, in order with heard(): always after the answer it names. */
+        @Override
+        public void voice(final long at, final String person, final float score, final int band) {
+            if (ended) {
+                return;
+            }
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!ended) {
+                        listener.onVoice(at, person, score, band);
                     }
                 }
             });

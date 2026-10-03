@@ -496,6 +496,18 @@ public final class ListenServiceHarness {
             heardBeforeProvisional.add(heard.size());
         }
 
+        /** Owner 2026-10-02: each voice result as "at:person:band", with the deliveries it followed. */
+        final List<String> voice = Collections.synchronizedList(new ArrayList<String>());
+        final List<Integer> heardBeforeVoice = Collections.synchronizedList(new ArrayList<Integer>());
+        final CountDownLatch voiced = new CountDownLatch(1);
+
+        @Override
+        public void voice(long at, String person, float score, int band) {
+            heardBeforeVoice.add(heard.size());
+            voice.add(at + ":" + person + ":" + band);
+            voiced.countDown();
+        }
+
         @Override
         public void answerOver(long at) {
             answerOver.add(at);
@@ -691,6 +703,41 @@ public final class ListenServiceHarness {
                 }
             }
             return b.toString();
+        }
+    }
+
+    /** Owner 2026-10-02: a VoiceId with a fake embedder, fed by the rig's ears session. */
+    static final class VoiceRig {
+        final VoiceId id;
+        volatile int samples = -1;
+        volatile int calls;
+
+        VoiceRig(Rig r) throws IOException {
+            java.io.File dir = java.nio.file.Files.createTempDirectory("ears_voice").toFile();
+            dir.deleteOnExit();
+            VoiceStore.Diag quiet = new VoiceStore.Diag() {
+                @Override
+                public void log(String line) {
+                }
+            };
+            id = new VoiceId(new VoiceStore(new java.io.File(dir, "voiceprints.bin"), 10, quiet),
+                    new VoiceTuning(0.65f, 0.45f), quiet);
+            id.setEmbedder(new VoiceId.Embedder() {
+                @Override
+                public float[] embed(float[] s, int k) {
+                    calls++;
+                    samples = k;
+                    return new float[] {1f, 0f, 0f};
+                }
+            });
+            final EarsSession session = r.session;
+            id.setListener(new VoiceId.Listener() {
+                @Override
+                public void voice(long at, String person, float score, int band) {
+                    session.voiceHeard(at, person, score, band);
+                }
+            });
+            session.setVoice(id);
         }
     }
 
@@ -1674,6 +1721,80 @@ public final class ListenServiceHarness {
                                 && u != null && want.get(1).equals(u.text) && r.client.heard.size() == 1,
                         "provisional=" + r.client.provisional + " when=" + r.client.provisionalWhen + " endpoints="
                                 + endpointAt[0] + "," + endpointAt[1] + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_voice_a_clean_answer_is_identified_after_its_words", new Scenario() {
+            // Owner 2026-10-02: 2.4 s of answer in a listen, then the answer's silence: the words
+            // go out first, then the voice result for the same at, from the speech span only.
+            public void run(String n) throws Exception {
+                Rig r = new Rig();
+                r.sw.on = false;
+                VoiceRig v = new VoiceRig(r);
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                long start = r.clock.now + 80;
+                for (int i = 0; i < 30; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH WITH MY SISTER";
+                }
+                for (int i = 0; i < 60 && r.client.heard.isEmpty(); i++) {
+                    r.step(false);
+                }
+                boolean got = r.client.voiced.await(5, TimeUnit.SECONDS);
+                v.id.shutdown();
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, got && u != null && u.at == start && r.client.voice.size() == 1
+                                && r.client.voice.get(0).equals(start + ":null:" + VoiceStore.BAND_NONE)
+                                && r.client.heardBeforeVoice.get(0) == 1
+                                // The speech span, plus at most the pre-roll head (the capture thread's own
+                                // silent chunks can land in it); never the answer's trailing 2 s of silence.
+                                && v.samples >= 30 * CHUNK
+                                && v.samples <= 30 * CHUNK + EarsSession.DEFAULT_PREROLL_MS * 16
+                                && v.id.buffered() == 0,
+                        "got=" + got + " heard=" + r.heard() + " voice=" + r.client.voice + " samples=" + v.samples);
+            }
+        });
+        scenario("ears_voice_cues_short_answers_and_clipped_answers_are_not_identified", new Scenario() {
+            public void run(String n) throws Exception {
+                Rig r = new Rig();
+                VoiceRig v = new VoiceRig(r);
+                r.open(false);
+                // A strong cue outside any listen: delivered, never embedded.
+                r.steps(false, 400);
+                for (int i = 0; i < 30; i++) {
+                    r.step(true);
+                    r.rec.text = "GOOD MORNING MIKO";
+                }
+                r.rec.endpoint = true;
+                r.steps(false, 400);
+                int cues = r.client.heard.size();
+                int afterCue = v.id.buffered();
+                // A 1 s answer: too short.
+                r.sw.on = false;
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                for (int i = 0; i < 12; i++) {
+                    r.step(true);
+                    r.rec.text = "YES";
+                }
+                r.steps(false, 2400);
+                // A long answer the robot's own line clips: partial, never embedded.
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                for (int i = 0; i < 30; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH";
+                }
+                r.session.lineStarted();
+                r.step(true);
+                r.session.playbackIdle();
+                r.steps(false, 2400);
+                v.id.shutdown();
+                v.id.awaitIdle(2000);
+                check(n, cues >= 1 && afterCue == 0 && v.calls == 0 && r.client.voice.isEmpty()
+                                && v.id.buffered() == 0 && r.client.heard.size() >= 3,
+                        "cues=" + cues + " afterCue=" + afterCue + " calls=" + v.calls + " heard=" + r.heard());
             }
         });
         scenario("ears_speech_outside_a_listens_answer_sends_no_provisional", new Scenario() {

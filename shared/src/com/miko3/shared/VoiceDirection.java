@@ -8,13 +8,16 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The direction a voice comes from, read in our own process (meeting plan U1,
@@ -61,8 +64,16 @@ import java.util.concurrent.TimeUnit;
  *
  * The angle is meant to be sampled at a caller-set cadence on its own thread
  * (sample()), never from the capture thread, and reduced to a median over an
- * utterance rather than read once at its endpoint. Nothing here sets DSP modes
- * or gains.
+ * utterance rather than read once at its endpoint.
+ *
+ * The NC DSP's settings (vendor libconexant_dsp_lib.so, disassembled 2026-10-02):
+ * checkNcLater(), at each ears open, reads gain, digital gain, AEC, left AEC, NS, left
+ * NS, channel and VOIP on its own thread, NC_PACE_MS apart, and logs them in one "nc:"
+ * line; the replies are parsed out of the same stream as the direction frames. Only
+ * with NC_APPLY_PROPERTY set does it then send what NcFrames.plan() picks (a gain set
+ * only when it differs, a switch toggled only when it was read as a differing 0 or 1;
+ * never left AEC, never factory mode), re-read and log "nc: after". Every write goes
+ * through ncWrite() under this instance's lock, so the port has one writer at a time.
  *
  * Plain Java with no android.* imports. On a host JVM the stubs' static
  * initialisers fail to load the library; open() catches that and reports
@@ -83,6 +94,17 @@ public final class VoiceDirection {
     /** Side mode's raw thresholds (integers): at or above LEFT is left, at or below RIGHT is right. */
     public static final String LEFT_PROPERTY = "persist.miko3.voice_dir.left";
     public static final String RIGHT_PROPERTY = "persist.miko3.voice_dir.right";
+    /** The NC DSP's settings: log them at each ears open (default on). */
+    public static final String NC_STATUS_PROPERTY = "persist.miko3.ears.nc_status";
+    /** Apply the vendor's targets at each ears open (default off). */
+    public static final String NC_APPLY_PROPERTY = "persist.miko3.ears.nc_apply";
+    /** The gain the apply sets (default 30, 0 to 60) and the digital gain (default 0, 0 to 30). */
+    public static final String NC_GAIN_PROPERTY = "persist.miko3.ears.nc_gain";
+    public static final String NC_DGAIN_PROPERTY = "persist.miko3.ears.nc_dgain";
+    /** The gap between one NC request and the next. */
+    static final long NC_PACE_MS = 100;
+    /** How long a read request waits for its reply. */
+    static final long NC_REPLY_MS = 300;
     /** How long each stty run may take. */
     static final long STTY_TIMEOUT_MS = 2000;
     /** How long open() waits for the first direction frame (the chip sends one a second). */
@@ -191,6 +213,9 @@ public final class VoiceDirection {
     private long rawLoggedAt;
     /** The newest status frame's answer since open() last cleared it: -1 none, 0 off, 1 on. */
     private int status = -1;
+    /** The newest read reply per DSP setting since ncRead() last cleared it. */
+    private final Map<NcFrames.Setting, Integer> replies =
+            new EnumMap<NcFrames.Setting, Integer>(NcFrames.Setting.class);
     private final NcFrames.Sink frames = new NcFrames.Sink() {
         @Override
         public void direction(byte[] b, int at, int raw) {
@@ -200,6 +225,11 @@ public final class VoiceDirection {
         @Override
         public void status(boolean on) {
             status = on ? 1 : 0;
+        }
+
+        @Override
+        public void reply(NcFrames.Setting setting, int value) {
+            replies.put(setting, value);
         }
     };
 
@@ -479,6 +509,136 @@ public final class VoiceDirection {
             rawLoggedAt = now;
             log.log("voice direction: nc raw " + raw + (sides != null ? " (side)" : " (uncalibrated)"));
         }
+    }
+
+    // ---- the NC DSP's settings ----
+
+    /** The NC checks' own thread, so sampling never waits behind their pacing. */
+    private static final ScheduledExecutorService NC_THREAD = Executors.newSingleThreadScheduledExecutor(
+            new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "voice-direction-nc");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+    /** Whether a check is queued or running; an ears open meanwhile adds none. */
+    private static final AtomicBoolean NC_BUSY = new AtomicBoolean();
+
+    /**
+     * At an ears open: from the four NC property values ("" when unset), reads (and with apply
+     * on, sets) the DSP's settings on their own thread, opening the direction chip there if
+     * it is not open yet. Does nothing with both off, with no NC port configured, or while a
+     * check is under way; never blocks and never throws.
+     */
+    public static void checkNcLater(String status, String apply, String gain, String dgain) {
+        final NcFrames.Control c = NcFrames.Control.of(status, apply, gain, dgain);
+        final Logger log;
+        synchronized (VoiceDirection.class) {
+            if (!c.any() || config.port.isEmpty()) {
+                return;
+            }
+            log = logger;
+        }
+        if (!NC_BUSY.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            NC_THREAD.execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        VoiceDirection d = open();
+                        if (d.backend() != Backend.NC) {
+                            log.log("nc: skipped, backend " + d.backend());
+                            return;
+                        }
+                        d.ncCheck(c, NC_PACE_MS, NC_REPLY_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (Throwable t) {
+                        log.log("nc: check failed (" + t.getClass().getSimpleName() + ")");
+                    } finally {
+                        NC_BUSY.set(false);
+                    }
+                }
+            });
+        } catch (RuntimeException e) {
+            NC_BUSY.set(false);
+        }
+    }
+
+    /** Reads every setting and logs "nc: ..."; with c.apply sends NcFrames.plan()'s requests,
+     * re-reads and logs "nc: after ...". The host tests' entry. Returns the last values read. */
+    Map<NcFrames.Setting, Integer> ncCheck(NcFrames.Control c, long paceMs, long replyMs)
+            throws IOException, InterruptedException {
+        Map<NcFrames.Setting, Integer> read = ncReadAll(paceMs, replyMs);
+        log.log("nc: " + NcFrames.describe(read));
+        if (!c.apply || backend != Backend.NC) {
+            return read;
+        }
+        List<byte[]> plan = NcFrames.plan(read, c.gain, c.dgain);
+        if (plan.isEmpty()) {
+            log.log("nc: apply: nothing to change");
+            return read;
+        }
+        StringBuilder what = new StringBuilder();
+        for (byte[] f : plan) {
+            NcFrames.Setting s = NcFrames.Setting.of(f[4] & 0xff);
+            what.append(what.length() == 0 ? "" : ", ").append(s.label)
+                    .append(s.settable ? " " + read.get(s) + "->" + (f[14] & 0xff) : " toggle");
+        }
+        log.log("nc: apply " + what);
+        for (byte[] f : plan) {
+            ncWrite(f);
+            Thread.sleep(paceMs);
+        }
+        read = ncReadAll(paceMs, replyMs);
+        log.log("nc: after " + NcFrames.describe(read));
+        return read;
+    }
+
+    /** One read request per setting, paceMs apart, each waiting up to replyMs for its reply. */
+    private Map<NcFrames.Setting, Integer> ncReadAll(long paceMs, long replyMs)
+            throws IOException, InterruptedException {
+        Map<NcFrames.Setting, Integer> out = new EnumMap<NcFrames.Setting, Integer>(NcFrames.Setting.class);
+        for (NcFrames.Setting s : NcFrames.Setting.values()) {
+            if (backend != Backend.NC) {
+                break;
+            }
+            long sent = System.nanoTime();
+            synchronized (this) {
+                replies.remove(s);
+            }
+            ncWrite(s.read());
+            long deadline = sent + replyMs * 1000000L;
+            while (true) {
+                synchronized (this) {
+                    drain();
+                    Integer v = replies.get(s);
+                    if (v != null) {
+                        out.put(s, v);
+                        break;
+                    }
+                }
+                if (System.nanoTime() >= deadline) {
+                    break;
+                }
+                Thread.sleep(POLL_MS);
+            }
+            long left = paceMs - (System.nanoTime() - sent) / 1000000L;
+            if (left > 0) {
+                Thread.sleep(left);
+            }
+        }
+        return out;
+    }
+
+    /** The NC checks' one write, under the lock that open's writes and every drain hold. Only
+     * NcFrames.Setting's read, set and toggle requests come here. */
+    private synchronized void ncWrite(byte[] frame) throws IOException {
+        port.write(frame);
     }
 
     /** stty step 1: 115200 8N1, no modem control, no output processing, echo and line

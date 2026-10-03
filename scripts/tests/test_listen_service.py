@@ -84,6 +84,9 @@ def _method_body(src, name):
 
 class ListenServiceHarnessTest(unittest.TestCase):
     SCENARIOS = (
+        # Owner 2026-10-02: the ears feed the voice identification; only clean answers are embedded.
+        "ears_voice_a_clean_answer_is_identified_after_its_words",
+        "ears_voice_cues_short_answers_and_clipped_answers_are_not_identified",
         # ListenSession stops at the endpoint, at the cap, and hears silence as "no speech".
         "stops_at_endpoint",
         "stops_at_cap",
@@ -667,9 +670,10 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertEqual([n for n, _ in codes], ["open", "renew", "close", "listen", "clipWindow", "shoved"])
         self.assertEqual([c for _, c in codes], list(range(1, 7)))
         # The callback's codes are appended too: heard stays 1, answering (robot 2026-10-01) is 2,
-        # answerOver (review 2026-10-01, P2-2) is 3.
+        # answerOver (review 2026-10-01, P2-2) is 3, voice (owner 2026-10-02) is 5.
         callback_codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", callback)]
-        self.assertEqual(callback_codes, [("heard", 1), ("answering", 2), ("answerOver", 3), ("provisional", 4)])
+        self.assertEqual(callback_codes, [("heard", 1), ("answering", 2), ("answerOver", 3), ("provisional", 4),
+                                          ("voice", 5)])
 
     def test_no_per_utterance_cap_is_shorter_than_the_answer_cap(self):
         """Owner 2026-10-02: a 40 s run-on answer is not cut at 20 s. The Silero VAD's
@@ -979,9 +983,18 @@ class BuildScriptTest(unittest.TestCase):
         self.assertGreater(files_at, 0, "the real node implementation moved")
         nc_path = src[:files_at] + src[files_end:]
         writes = re.findall(r"\.write\(([^;]*)\);", nc_path)
-        self.assertEqual(sorted(writes), ["NcFrames.reportingToggle()", "NcFrames.statusQuery()"],
-                         "the NC path writes something other than the status query and the toggle")
-        self.assertEqual(nc_path.count(".write("), 2)
+        self.assertEqual(sorted(writes), ["NcFrames.reportingToggle()", "NcFrames.statusQuery()", "frame"],
+                         "the NC path writes something other than the status query, the toggle and ncWrite")
+        self.assertEqual(nc_path.count(".write("), 3)
+        # 2026-10-02: the DSP settings check writes only through ncWrite, under the instance lock,
+        # and only NcFrames.Setting's read requests and NcFrames.plan()'s sets and toggles.
+        self.assertIn("private synchronized void ncWrite(byte[] frame)", src)
+        callers = re.findall(r"\bncWrite\(([^;{]*)\);", nc_path)
+        self.assertEqual(sorted(callers), ["f", "s.read()"], callers)
+        self.assertIn("List<byte[]> plan = NcFrames.plan(", src)
+        for sampling in ("private synchronized int freshRaw", "private void drain", "private void sampleOnce"):
+            body_s = _method_body(src, sampling) or ""
+            self.assertNotIn("write(", body_s, sampling)
         self.assertEqual(body.count(".write(NcFrames.statusQuery())"), 1, "the status query is not written in openNc")
         self.assertEqual(body.count(".write(NcFrames.reportingToggle())"), 1, "the toggle is not written in openNc")
         self.assertGreater(body.find(".write(NcFrames.statusQuery())"), setup,
@@ -997,6 +1010,15 @@ class BuildScriptTest(unittest.TestCase):
                      "RIGHT_PROPERTY"):
             self.assertIn(f"SpeechEngine.systemProperty(VoiceDirection.{prop})", engine)
         self.assertIn("VoiceDirection.configure(", engine)
+        # 2026-10-02: the DSP settings are read (and, opted in, applied) at each ears open.
+        open_at, check_at = engine.find("ears.open(String.valueOf(uid)"), engine.find("VoiceDirection.checkNcLater(")
+        self.assertGreater(open_at, 0)
+        self.assertGreater(check_at, open_at, "the NC check is not made after the ears open")
+        self.assertEqual(engine.count("VoiceDirection.checkNcLater("), 1)
+        for prop in ("NC_STATUS_PROPERTY", "NC_APPLY_PROPERTY", "NC_GAIN_PROPERTY", "NC_DGAIN_PROPERTY"):
+            self.assertIn(f"SpeechEngine.systemProperty(VoiceDirection.{prop})", engine)
+        for prop in ("nc_status", "nc_apply", "nc_gain", "nc_dgain"):
+            self.assertIn(f'"persist.miko3.ears.{prop}"', src)
         # Side mode (robot, 2026-09-29): the ears are told the chip's angle is a side only.
         self.assertIn("VoiceDirection.sideOnlyConfigured()", engine)
         self.assertIn('LEFT_PROPERTY = "persist.miko3.voice_dir.left"', src)

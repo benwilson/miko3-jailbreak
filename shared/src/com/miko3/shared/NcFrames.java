@@ -1,5 +1,8 @@
 package com.miko3.shared;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.zip.CRC32;
 
 /**
@@ -24,6 +27,12 @@ import java.util.zip.CRC32;
  * with a bad CRC, bytes between frames and a frame torn off at the end of a
  * read all occur; the parse skips them without error.
  *
+ * The same chip is the mic-array DSP (vendor libconexant_dsp_lib.so, disassembled
+ * 2026-10-02, not yet sent on the robot): Setting builds the vendor's read, set and toggle
+ * requests, a read's 19-byte reply (op 02, value at byte 14 with its own CRC32) reaches
+ * Sink.reply(), and plan() picks the vendor-style changes. Nothing builds factory mode or
+ * left AEC's (malformed) toggle.
+ *
  * Plain Java with no android.* imports and no I/O: VoiceDirection does the
  * reading, and the host tests run this directly.
  */
@@ -37,6 +46,15 @@ public final class NcFrames {
     static final int OP_DIRECTION = 0x03;
     static final int MODULE_STATUS = 0x03;
     static final int OP_STATUS = 0x02;
+    /** A request's op: read a setting. The chip answers with one 19-byte frame. */
+    static final int OP_READ = 0x01;
+    /** The op of a read's answer, as module 03's status frame shows (robot, 2026-09-30); a
+     * 19-byte op 01 frame for a setting's module is taken as its answer too. */
+    static final int OP_REPLY = 0x02;
+    /** A request's op: set a value, or flip a switch. The vendor reads no reply. */
+    static final int OP_SET = 0x03;
+    /** Factory mode's module. Nothing here builds a frame for it, ever. */
+    static final int MODULE_FACTORY = 0x09;
 
     /** The vendor's status query (robot, 2026-09-30): answered by one status frame. Never
      * mutated; statusQuery() hands out a copy. */
@@ -70,6 +88,10 @@ public final class NcFrames {
         /** A status frame (module 03 / op 02): whether direction reporting is on. */
         default void status(boolean on) {
         }
+
+        /** A read reply for one DSP setting: its value, payload byte 0 (frame byte 14). */
+        default void reply(Setting setting, int value) {
+        }
     }
 
     /**
@@ -88,6 +110,9 @@ public final class NcFrames {
                     sink.direction(buf, i, buf[i + RAW_INDEX] & 0xff);
                 } else if (module == MODULE_STATUS && op == OP_STATUS) {
                     sink.status(buf[i + RAW_INDEX] != 0);
+                } else if ((op == OP_READ || op == OP_REPLY) && Setting.of(module) != null
+                        && payloadCrcOk(buf, i)) {
+                    sink.reply(Setting.of(module), buf[i + RAW_INDEX] & 0xff);
                 }
                 i += FRAME_LENGTH;
             } else {
@@ -96,6 +121,21 @@ public final class NcFrames {
             }
         }
         return i;
+    }
+
+    /** The frame at `at` carries CRC32 LE of payload byte 0 at bytes 15 to 18, as every
+     * status and direction frame captured on the robot does. Required of read replies only:
+     * a misread value could make the apply send a toggle it should not. */
+    private static boolean payloadCrcOk(byte[] b, int at) {
+        CRC32 crc = new CRC32();
+        crc.update(b, at + RAW_INDEX, 1);
+        long c = crc.getValue();
+        for (int i = 0; i < 4; i++) {
+            if (b[at + RAW_INDEX + 1 + i] != (byte) (c >>> (8 * i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static boolean prefixed(byte[] b, int at) {
@@ -160,6 +200,212 @@ public final class NcFrames {
             sb.append(Character.forDigit((buf[i] >> 4) & 0xf, 16)).append(Character.forDigit(buf[i] & 0xf, 16));
         }
         return sb.toString();
+    }
+
+    // ---- the DSP's settings (vendor libconexant_dsp_lib.so, disassembled 2026-10-02) ----
+
+    /**
+     * The mic-array DSP settings the vendor reads at start: each has a read request (14 bytes,
+     * op 01, the vendor's own sequence byte), and gain and digital gain have a set request
+     * (op 03 with a one-byte payload and its CRC); the switches have a toggle (op 03, no
+     * payload, no reply) that flips them. Left AEC's vendor toggle frame is malformed, so it
+     * has none here; factory mode (module 09) is not a setting here at all.
+     */
+    public enum Setting {
+        GAIN(0x04, "gain", 0x0c, -1, true),
+        DGAIN(0x12, "dgain", 0x0c, -1, true),
+        AEC(0x06, "aec", 0x15, 0x13, false),
+        LAEC(0x16, "laec", 0x01, -1, false),
+        NS(0x08, "ns", 0x01, 0x01, false),
+        LNS(0x18, "lns", 0x05, 0x04, false),
+        CH(0x11, "ch", 0x01, 0x01, false),
+        VOIP(0x05, "voip", 0x05, 0x04, false);
+
+        public final int module;
+        /** The name in the "nc:" log lines. */
+        public final String label;
+        private final int readSeq;
+        private final int toggleSeq;
+        /** Whether the value is set (gain, digital gain) rather than toggled. */
+        public final boolean settable;
+
+        Setting(int module, String label, int readSeq, int toggleSeq, boolean settable) {
+            this.module = module;
+            this.label = label;
+            this.readSeq = readSeq;
+            this.toggleSeq = toggleSeq;
+            this.settable = settable;
+        }
+
+        /** The setting on that module, or null. */
+        public static Setting of(int module) {
+            for (Setting s : values()) {
+                if (s.module == module) {
+                    return s;
+                }
+            }
+            return null;
+        }
+
+        /** The vendor's read request for this setting. */
+        public byte[] read() {
+            return request(module, OP_READ, readSeq, 0, null);
+        }
+
+        /** Whether this setting has a safe toggle (not gains, not left AEC). */
+        public boolean toggleable() {
+            return toggleSeq >= 0;
+        }
+
+        /** The vendor's toggle; IllegalStateException for a setting with none. */
+        public byte[] toggle() {
+            if (!toggleable()) {
+                throw new IllegalStateException("no toggle for " + label);
+            }
+            return request(module, OP_SET, toggleSeq, 0, null);
+        }
+
+        /** The vendor's set request with value (0 to 255); IllegalStateException unless settable. */
+        public byte[] set(int value) {
+            if (!settable) {
+                throw new IllegalStateException("no set for " + label);
+            }
+            return request(module, OP_SET, 0x01, 0x01, new byte[] {(byte) value});
+        }
+    }
+
+    /** XXUB, module, op, seq, flag, the payload's length with its CRC (LE, 2 bytes), the CRC32
+     * LE of those 10 bytes, then the payload and its CRC32 LE when there is one. */
+    private static byte[] request(int module, int op, int seq, int flag, byte[] payload) {
+        int len = payload == null ? 0 : payload.length + 4;
+        byte[] f = new byte[14 + len];
+        System.arraycopy(PREFIX, 0, f, 0, 4);
+        f[4] = (byte) module;
+        f[5] = (byte) op;
+        f[6] = (byte) seq;
+        f[7] = (byte) flag;
+        f[8] = (byte) len;
+        f[9] = (byte) (len >>> 8);
+        putCrc(f, 0, 10, 10);
+        if (payload != null) {
+            System.arraycopy(payload, 0, f, 14, payload.length);
+            putCrc(f, 14, payload.length, 14 + payload.length);
+        }
+        return f;
+    }
+
+    private static void putCrc(byte[] f, int from, int length, int to) {
+        CRC32 crc = new CRC32();
+        crc.update(f, from, length);
+        long c = crc.getValue();
+        for (int i = 0; i < 4; i++) {
+            f[to + i] = (byte) (c >>> (8 * i));
+        }
+    }
+
+    /** The vendor's targets: gain 30 (listening, speaking and idle alike), digital gain 0,
+     * AEC, left AEC, NS and left NS on, channel 0, VOIP off. */
+    public static int vendorTarget(Setting s) {
+        switch (s) {
+            case GAIN:
+                return 30;
+            case DGAIN:
+            case CH:
+            case VOIP:
+                return 0;
+            default:
+                return 1;
+        }
+    }
+
+    /**
+     * The requests that bring the read values (setting -> value, absent when the chip did not
+     * answer) to the targets, the vendor's way: a gain is set only when it was read and
+     * differs; a switch is toggled only when it was read as 0 or 1 and differs. An unread
+     * setting, a switch read as anything else, left AEC and factory mode are never sent.
+     * In Setting order.
+     */
+    public static List<byte[]> plan(Map<Setting, Integer> read, int gain, int dgain) {
+        List<byte[]> out = new ArrayList<byte[]>();
+        for (Setting s : Setting.values()) {
+            Integer v = read.get(s);
+            if (v == null) {
+                continue;
+            }
+            if (s.settable) {
+                int want = s == Setting.GAIN ? gain : dgain;
+                if (v != want) {
+                    out.add(s.set(want));
+                }
+            } else if (s.toggleable() && (v == 0 || v == 1) && v != vendorTarget(s)) {
+                out.add(s.toggle());
+            }
+        }
+        return out;
+    }
+
+    /** "gain=30 dgain=0 aec=1 ..." in Setting order, '?' for a setting not read. */
+    public static String describe(Map<Setting, Integer> read) {
+        StringBuilder sb = new StringBuilder();
+        for (Setting s : Setting.values()) {
+            Integer v = read.get(s);
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(s.label).append('=').append(v == null ? "?" : String.valueOf(v));
+        }
+        return sb.toString();
+    }
+
+    /** The launcher's NC DSP settings from their properties ("" or null when unset). */
+    public static final class Control {
+        /** Log the settings at each ears open; default on (reads are vendor-normal). */
+        public final boolean status;
+        /** Apply the targets at each ears open; default off. */
+        public final boolean apply;
+        public final int gain;
+        public final int dgain;
+
+        private Control(boolean status, boolean apply, int gain, int dgain) {
+            this.status = status;
+            this.apply = apply;
+            this.gain = gain;
+            this.dgain = dgain;
+        }
+
+        /** status: on unless "0"/"false"; apply: off unless "1"/"true"; gain default 30
+         * clamped to 0..60; dgain default 0 clamped to 0..30. */
+        public static Control of(String status, String apply, String gain, String dgain) {
+            return new Control(!isFalse(status), isTrue(apply), number(gain, 30, 0, 60), number(dgain, 0, 0, 30));
+        }
+
+        /** Whether anything is to be done at ears open. */
+        public boolean any() {
+            return status || apply;
+        }
+
+        private static boolean isTrue(String v) {
+            v = v == null ? "" : v.trim();
+            return v.equals("1") || v.equalsIgnoreCase("true");
+        }
+
+        private static boolean isFalse(String v) {
+            v = v == null ? "" : v.trim();
+            return v.equals("0") || v.equalsIgnoreCase("false");
+        }
+
+        private static int number(String v, int dflt, int min, int max) {
+            try {
+                return Math.max(min, Math.min(max, Integer.parseInt(v.trim())));
+            } catch (RuntimeException e) {
+                return dflt;
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "status " + status + " apply " + apply + " gain " + gain + " dgain " + dgain;
+        }
     }
 
     /** The calibration (KTD12): the raw value that is straight ahead, the

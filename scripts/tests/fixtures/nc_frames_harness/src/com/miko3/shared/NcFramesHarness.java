@@ -280,7 +280,366 @@ public final class NcFramesHarness {
         return Math.abs(a - b) < 1e-3f;
     }
 
+
+    // ---- the NC DSP's settings (vendor libconexant_dsp_lib.so, 2026-10-02) ----
+
+    /** A read reply as the status frame is (robot): op 02, value at byte 14, its CRC32 LE after. */
+    static byte[] reply(int module, int value) {
+        byte[] f = frame(module, 2, 0, 1, 5, 0, value);
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(f, 14, 1);
+        long c = crc.getValue();
+        for (int i = 0; i < 4; i++) {
+            f[15 + i] = (byte) (c >>> (8 * i));
+        }
+        return f;
+    }
+
+    /** The DSP: answers each read 15 ms later from its state (unless the module is mute), takes
+     * a set's payload as the new value and flips a 0/1 switch on a toggle; streams a direction
+     * frame every 50 ms from 0 so open() succeeds at once and frames interleave with replies. */
+    static final class FakeDsp extends FakePort {
+        final java.util.Map<Integer, Integer> state = new java.util.HashMap<Integer, Integer>();
+        final Set<Integer> mute = new HashSet<Integer>();
+
+        FakeDsp(int gain, int dgain, int aec, int laec, int ns, int lns, int ch, int voip) {
+            state.put(0x04, gain);
+            state.put(0x12, dgain);
+            state.put(0x06, aec);
+            state.put(0x16, laec);
+            state.put(0x08, ns);
+            state.put(0x18, lns);
+            state.put(0x11, ch);
+            state.put(0x05, voip);
+            for (int i = 0; i < 200; i++) {
+                feedAt(50L * i, direction(i & 0xff, 55 + (i % 8) * 5));
+            }
+        }
+
+        static FakeDsp vendor() {
+            return new FakeDsp(30, 0, 1, 1, 1, 1, 0, 0);
+        }
+
+        @Override
+        public synchronized void write(byte[] f) throws IOException {
+            super.write(f);
+            long now = (System.nanoTime() - t0) / 1000000L;
+            int module = f[4] & 0xff;
+            int op = f[5] & 0xff;
+            if (op == 1 && state.containsKey(module) && !mute.contains(module)) {
+                insertAt(now + 15, reply(module, state.get(module)));
+            } else if (op == 3 && f.length == 19) {
+                state.put(module, f[14] & 0xff);
+            } else if (op == 3) {
+                int v = state.get(module);
+                state.put(module, v == 0 ? 1 : v == 1 ? 0 : v);
+            }
+        }
+
+        /** Bytes readable at atMs, slotted in between the direction frames already queued. */
+        synchronized void insertAt(long atMs, byte[] bytes) {
+            long at = t0 + atMs * 1000000L;
+            int i = 0;
+            while (i < due.size() && due.get(i) <= at) {
+                i++;
+            }
+            // Never split a queued frame: move to the next frame boundary.
+            while (i < due.size() && i > 0 && due.get(i).equals(due.get(i - 1))) {
+                i++;
+            }
+            for (int k = 0; k < bytes.length; k++) {
+                pending.add(i + k, bytes[k]);
+                due.add(i + k, at);
+            }
+        }
+
+        synchronized List<String> written() {
+            List<String> out = new ArrayList<String>();
+            for (byte[] w : writes) {
+                out.add(NcFrames.hex(w, w.length));
+            }
+            return out;
+        }
+    }
+
+    static List<String> readsHex() {
+        List<String> out = new ArrayList<String>();
+        for (NcFrames.Setting s : NcFrames.Setting.values()) {
+            byte[] f = s.read();
+            out.add(NcFrames.hex(f, f.length));
+        }
+        return out;
+    }
+
+    static String hexOf(byte[] f) {
+        return NcFrames.hex(f, f.length);
+    }
+
+    static java.util.Map<NcFrames.Setting, Integer> values(Object... kv) {
+        java.util.Map<NcFrames.Setting, Integer> m =
+                new java.util.EnumMap<NcFrames.Setting, Integer>(NcFrames.Setting.class);
+        for (int i = 0; i < kv.length; i += 2) {
+            m.put((NcFrames.Setting) kv[i], (Integer) kv[i + 1]);
+        }
+        return m;
+    }
+
+    static java.util.Map<NcFrames.Setting, Integer> vendorValues() {
+        java.util.Map<NcFrames.Setting, Integer> m =
+                new java.util.EnumMap<NcFrames.Setting, Integer>(NcFrames.Setting.class);
+        for (NcFrames.Setting s : NcFrames.Setting.values()) {
+            m.put(s, NcFrames.vendorTarget(s));
+        }
+        return m;
+    }
+
+    static final long PACE = 5;
+    static final long REPLY = 150;
+
+    /** Every request the NC frames can build, for the Python test to check byte for byte. */
+    static void dumpFrames() {
+        for (NcFrames.Setting s : NcFrames.Setting.values()) {
+            System.out.println("FRAME " + s.label + ".read " + hexOf(s.read()));
+            if (s.toggleable()) {
+                System.out.println("FRAME " + s.label + ".toggle " + hexOf(s.toggle()));
+            }
+        }
+        System.out.println("FRAME gain.set30 " + hexOf(NcFrames.Setting.GAIN.set(30)));
+        System.out.println("FRAME gain.set0 " + hexOf(NcFrames.Setting.GAIN.set(0)));
+        System.out.println("FRAME dgain.set0 " + hexOf(NcFrames.Setting.DGAIN.set(0)));
+        System.out.println("FRAME dgain.set30 " + hexOf(NcFrames.Setting.DGAIN.set(30)));
+    }
+
+    static void ncScenarios() {
+        scenario("nc_replies_parse_between_direction_frames", new Scenario() {
+            public void run(String n) {
+                final List<String> seen = new ArrayList<String>();
+                NcFrames.Sink sink = new NcFrames.Sink() {
+                    public void direction(byte[] b, int at, int raw) {
+                        seen.add("dir " + raw);
+                    }
+
+                    public void status(boolean on) {
+                        seen.add("status " + on);
+                    }
+
+                    public void reply(NcFrames.Setting s, int v) {
+                        seen.add(s.label + " " + v);
+                    }
+                };
+                byte[] badPayload = reply(0x08, 1);
+                badPayload[16] ^= 1;
+                byte[] badHeader = reply(0x05, 0);
+                badHeader[11] ^= 1;
+                byte[] op01 = reply(0x11, 0);
+                op01[5] = 1;
+                byte[] fixed = frame(0x11, 1, 0, 1, 5, 0, 0);
+                System.arraycopy(op01, 14, fixed, 14, 5);
+                byte[] set = frame(0x04, 3, 1, 1, 5, 0, 30); // an op 03 frame is no reply
+                byte[] factory = frame(0x09, 2, 0, 1, 5, 0, 1);
+                byte[] buf = concat(hex(RAW_85), reply(0x04, 30), hex("0011"), hex(STATUS_ON), reply(0x12, 0),
+                        badPayload, direction(3, 70), badHeader, reply(0x06, 1), fixed, set, factory,
+                        reply(0x16, 1), hex(RAW_50), reply(0x18, 0), reply(0x05, 0));
+                int used = NcFrames.parseStream(buf, buf.length, sink);
+                check(n, seen.equals(java.util.Arrays.asList("dir 85", "gain 30", "status true", "dgain 0", "dir 70",
+                                "aec 1", "ch 0", "laec 1", "dir 50", "lns 0", "voip 0")) && used == buf.length,
+                        "seen=" + seen + " used=" + used + "/" + buf.length);
+            }
+        });
+        scenario("nc_request_frames_are_built_with_their_crcs", new Scenario() {
+            public void run(String n) {
+                boolean ok = hexOf(NcFrames.Setting.GAIN.read()).equals("5858554204010c0000004800b6a2")
+                        && hexOf(NcFrames.Setting.GAIN.set(30)).equals("585855420403010105008715a9561eeed20d28");
+                boolean threw = false;
+                try {
+                    NcFrames.Setting.LAEC.toggle();
+                } catch (IllegalStateException e) {
+                    threw = true;
+                }
+                boolean gainNoToggle = !NcFrames.Setting.GAIN.toggleable() && !NcFrames.Setting.DGAIN.toggleable();
+                boolean noSet = false;
+                try {
+                    NcFrames.Setting.AEC.set(1);
+                } catch (IllegalStateException e) {
+                    noSet = true;
+                }
+                check(n, ok && threw && gainNoToggle && noSet && NcFrames.Setting.of(0x09) == null,
+                        "gain read " + hexOf(NcFrames.Setting.GAIN.read()) + " set30 "
+                                + hexOf(NcFrames.Setting.GAIN.set(30)) + " laecThrew=" + threw + " noSet=" + noSet);
+            }
+        });
+        scenario("nc_plan_sends_only_what_differs", new Scenario() {
+            public void run(String n) {
+                List<byte[]> none = NcFrames.plan(vendorValues(), 30, 0);
+                java.util.Map<NcFrames.Setting, Integer> m = vendorValues();
+                m.put(NcFrames.Setting.GAIN, 20);
+                m.put(NcFrames.Setting.AEC, 0);
+                m.put(NcFrames.Setting.VOIP, 1);
+                List<String> got = new ArrayList<String>();
+                for (byte[] f : NcFrames.plan(m, 30, 0)) {
+                    got.add(hexOf(f));
+                }
+                List<String> want = java.util.Arrays.asList(hexOf(NcFrames.Setting.GAIN.set(30)),
+                        hexOf(NcFrames.Setting.AEC.toggle()), hexOf(NcFrames.Setting.VOIP.toggle()));
+                // Custom targets from the properties: gain 40, digital gain 6.
+                List<byte[]> custom = NcFrames.plan(vendorValues(), 40, 6);
+                check(n, none.isEmpty() && got.equals(want) && custom.size() == 2
+                                && hexOf(custom.get(0)).equals(hexOf(NcFrames.Setting.GAIN.set(40)))
+                                && hexOf(custom.get(1)).equals(hexOf(NcFrames.Setting.DGAIN.set(6))),
+                        "none=" + none.size() + " got=" + got + " custom=" + custom.size());
+            }
+        });
+        scenario("nc_plan_never_toggles_unknown_values", new Scenario() {
+            public void run(String n) {
+                // Unread: nothing. Read as 2 (not a 0/1 switch): nothing. Unread gains: no set.
+                List<byte[]> empty = NcFrames.plan(values(), 30, 0);
+                List<byte[]> odd = NcFrames.plan(values(NcFrames.Setting.AEC, 2, NcFrames.Setting.NS, 7,
+                        NcFrames.Setting.CH, 255, NcFrames.Setting.VOIP, 3), 30, 0);
+                check(n, empty.isEmpty() && odd.isEmpty(), "empty=" + empty.size() + " odd=" + odd.size());
+            }
+        });
+        scenario("nc_plan_never_sends_factory_or_left_aec", new Scenario() {
+            public void run(String n) {
+                int[] choices = {-1, 0, 1, 2, 30};
+                NcFrames.Setting[] all = NcFrames.Setting.values();
+                Set<String> allowed = new HashSet<String>();
+                for (NcFrames.Setting s : all) {
+                    if (s.toggleable()) {
+                        allowed.add(hexOf(s.toggle()));
+                    }
+                }
+                for (int g = 0; g <= 60; g++) {
+                    allowed.add(hexOf(NcFrames.Setting.GAIN.set(g)));
+                }
+                for (int g = 0; g <= 30; g++) {
+                    allowed.add(hexOf(NcFrames.Setting.DGAIN.set(g)));
+                }
+                String bad = null;
+                int combos = 1;
+                for (int i = 0; i < all.length; i++) {
+                    combos *= choices.length;
+                }
+                for (int c = 0; c < combos && bad == null; c++) {
+                    java.util.Map<NcFrames.Setting, Integer> m = values();
+                    int x = c;
+                    for (NcFrames.Setting s : all) {
+                        int v = choices[x % choices.length];
+                        x /= choices.length;
+                        if (v >= 0) {
+                            m.put(s, v);
+                        }
+                    }
+                    for (byte[] f : NcFrames.plan(m, c % 61, c % 31)) {
+                        int module = f[4] & 0xff;
+                        if (module == 0x09 || module == 0x16 || !allowed.contains(hexOf(f))) {
+                            bad = hexOf(f) + " for " + m;
+                        }
+                    }
+                }
+                // The source has no factory frame or left-AEC toggle bytes at all.
+                check(n, bad == null, "sent " + bad);
+            }
+        });
+        scenario("nc_control_parses_properties", new Scenario() {
+            public void run(String n) {
+                NcFrames.Control dflt = NcFrames.Control.of("", "", "", "");
+                NcFrames.Control nulls = NcFrames.Control.of(null, null, null, null);
+                NcFrames.Control on = NcFrames.Control.of("0", "1", "45", "12");
+                NcFrames.Control clamp = NcFrames.Control.of("1", "true", "99", "-4");
+                NcFrames.Control junk = NcFrames.Control.of("false", "yes", "x", "3.5");
+                NcFrames.Control off = NcFrames.Control.of("0", "0", "", "");
+                check(n, dflt.status && !dflt.apply && dflt.gain == 30 && dflt.dgain == 0 && dflt.any()
+                                && nulls.status && !nulls.apply && nulls.gain == 30
+                                && !on.status && on.apply && on.gain == 45 && on.dgain == 12 && on.any()
+                                && clamp.status && clamp.apply && clamp.gain == 60 && clamp.dgain == 0
+                                && !junk.status && !junk.apply && junk.gain == 30 && junk.dgain == 0
+                                && !off.any(),
+                        "dflt=" + dflt + " on=" + on + " clamp=" + clamp + " junk=" + junk + " off=" + off);
+            }
+        });
+        scenario("nc_status_logs_every_setting_and_writes_only_reads", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeDsp dsp = FakeDsp.vendor();
+                Lines log = new Lines();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(dsp, PORT), log);
+                int before = dsp.writes.size();
+                java.util.Map<NcFrames.Setting, Integer> got =
+                        d.ncCheck(NcFrames.Control.of("1", "", "", ""), PACE, REPLY);
+                List<String> w = dsp.written();
+                Thread.sleep(120);
+                int raw = d.lastRaw();
+                check(n, d.backend() == VoiceDirection.Backend.NC && before == 0
+                                && w.equals(readsHex()) && got.equals(vendorValues())
+                                && log.count("nc: gain=30 dgain=0 aec=1 laec=1 ns=1 lns=1 ch=0 voip=0") == 1
+                                && log.count("nc: after") == 0 && log.count("nc: apply") == 0
+                                && raw >= 55 && d.degrees() != d.degrees(),
+                        "writes=" + w + " got=" + got + " raw=" + raw + " log=" + log.lines);
+            }
+        });
+        scenario("nc_unanswered_settings_log_question_marks_and_are_not_applied", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeDsp dsp = new FakeDsp(30, 0, 0, 1, 0, 1, 0, 0);
+                dsp.mute.add(0x08); // NS never answers (and is off): no toggle
+                dsp.mute.add(0x04); // gain never answers: no set
+                Lines log = new Lines();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(dsp, PORT), log);
+                d.ncCheck(NcFrames.Control.of("", "1", "", ""), PACE, REPLY);
+                List<String> want = new ArrayList<String>(readsHex());
+                want.add(hexOf(NcFrames.Setting.AEC.toggle()));
+                want.addAll(readsHex());
+                check(n, dsp.written().equals(want)
+                                && log.count("nc: gain=? dgain=0 aec=0 laec=1 ns=? lns=1 ch=0 voip=0") == 1
+                                && log.count("nc: apply aec toggle") == 1
+                                && log.count("nc: after gain=? dgain=0 aec=1 laec=1 ns=? lns=1 ch=0 voip=0") == 1,
+                        "writes=" + dsp.written() + " log=" + log.lines);
+            }
+        });
+        scenario("nc_apply_sets_and_toggles_only_differences_then_rereads", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeDsp dsp = new FakeDsp(20, 5, 0, 0, 1, 0, 1, 1);
+                Lines log = new Lines();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(dsp, PORT), log);
+                java.util.Map<NcFrames.Setting, Integer> after =
+                        d.ncCheck(NcFrames.Control.of("", "1", "", ""), PACE, REPLY);
+                List<String> want = new ArrayList<String>(readsHex());
+                want.addAll(java.util.Arrays.asList(hexOf(NcFrames.Setting.GAIN.set(30)),
+                        hexOf(NcFrames.Setting.DGAIN.set(0)), hexOf(NcFrames.Setting.AEC.toggle()),
+                        hexOf(NcFrames.Setting.LNS.toggle()), hexOf(NcFrames.Setting.CH.toggle()),
+                        hexOf(NcFrames.Setting.VOIP.toggle())));
+                want.addAll(readsHex());
+                java.util.Map<NcFrames.Setting, Integer> expect = vendorValues();
+                expect.put(NcFrames.Setting.LAEC, 0); // left AEC is never toggled
+                check(n, dsp.written().equals(want) && after.equals(expect)
+                                && log.count("nc: gain=20 dgain=5 aec=0 laec=0 ns=1 lns=0 ch=1 voip=1") == 1
+                                && log.count("nc: apply gain 20->30, dgain 5->0, aec toggle, lns toggle, ch toggle, "
+                                + "voip toggle") == 1
+                                && log.count("nc: after gain=30 dgain=0 aec=1 laec=0 ns=1 lns=1 ch=0 voip=0") == 1
+                                && d.backend() == VoiceDirection.Backend.NC,
+                        "writes=" + dsp.written() + " after=" + after + " log=" + log.lines);
+            }
+        });
+        scenario("nc_apply_with_custom_gains_and_nothing_else_to_change", new Scenario() {
+            public void run(String n) throws Exception {
+                FakeDsp dsp = FakeDsp.vendor();
+                Lines log = new Lines();
+                VoiceDirection d = open(uncalibrated(), new FakeNative(), new FakeNodes(dsp, PORT), log);
+                d.ncCheck(NcFrames.Control.of("", "1", "", ""), PACE, REPLY);
+                int first = dsp.writes.size();
+                d.ncCheck(NcFrames.Control.of("", "1", "42", "3"), PACE, REPLY);
+                check(n, first == 8 && log.count("nc: apply: nothing to change") == 1
+                                && log.count("nc: apply gain 30->42, dgain 0->3") == 1
+                                && log.count("nc: after gain=42 dgain=3 aec=1") == 1 && dsp.writes.size() == 8 + 8 + 2 + 8,
+                        "first=" + first + " writes=" + dsp.writes.size() + " log=" + log.lines);
+            }
+        });
+    }
+
     public static void main(String[] args) {
+        if (args.length > 0 && args[0].equals("frames")) {
+            dumpFrames();
+            return;
+        }
+        ncScenarios();
         scenario("robot_frames_parse_to_85_and_50_and_the_03_02_frame_is_ignored", new Scenario() {
             public void run(String n) {
                 List<Integer> a = raws(hex(RAW_85), null);

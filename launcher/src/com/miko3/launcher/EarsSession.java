@@ -206,6 +206,14 @@ final class EarsSession {
          * at is when the answer's speech began. Called on the capture thread; must not block.
          */
         void provisional(long at, String text);
+
+        /**
+         * Owner 2026-10-02: who said the answer whose speech began at at, by voice: the best
+         * stored person id (or null), the cosine score and VoiceStore.BAND_*. Sent after that
+         * answer's heard(), from the voice thread, only for a clean answer long enough to embed.
+         */
+        default void voice(long at, String person, float score, int band) {
+        }
     }
 
     /** Where counters and refusals go. Never given words. */
@@ -329,6 +337,9 @@ final class EarsSession {
     private long uttCapAt = Long.MAX_VALUE;
     /** The words of the segments the recogniser already endpointed in this utterance (an answer's), joined. */
     private final StringBuilder segmentWords = new StringBuilder();
+    /** Owner 2026-10-02: the voice identification fed with the recogniser's audio, or null (none loaded). */
+    private volatile VoiceId voice;
+
     /** Robot 2026-10-02: how much of segmentWords already went out as the provisional answer. */
     private int provisionalSent;
 
@@ -813,6 +824,7 @@ final class EarsSession {
                     wake = false;
                     angles.clear();
                     speechStartMs = now;
+                    voiceStart();
                     partialHead = now - hearingSince < PARTIAL_HEAD_MS;
                     sampling = direction.start();
                     recognising = !gateWake || wordsMatter();
@@ -874,6 +886,9 @@ final class EarsSession {
                     decode(samples, n);
                 } else {
                     hold(samples, n);
+                }
+                if (speech) {
+                    voiceSpeech();
                 }
                 boolean endpoint = recognising && recognizer.isEndpoint();
                 if (uttCapAt != Long.MAX_VALUE) {
@@ -995,6 +1010,10 @@ final class EarsSession {
         long t0 = clock.nanoTime();
         recognizer.accept(buf, n);
         long dt = clock.nanoTime() - t0;
+        VoiceId v = voice;
+        if (v != null) {
+            v.append(buf, n);
+        }
         int chunksIn = Math.max(1, (n + CHUNK_SAMPLES - 1) / CHUNK_SAMPLES);
         uttDecodeNs += dt;
         uttFed += chunksIn;
@@ -1039,6 +1058,7 @@ final class EarsSession {
 
     /** Caller holds feedLock. Closes the utterance in progress and delivers it if it earns a tier. */
     private void endUtterance(long now, boolean cutShort) {
+        boolean answer = uttCapAt != Long.MAX_VALUE;
         if (!recognising && heldLen > 0 && (wake || wordsMatter())) {
             recognising = true; // a listen opened in this very chunk
             decode(held, heldLen);
@@ -1084,6 +1104,7 @@ final class EarsSession {
             angle = null;
         }
         if (tier == CueClassifier.TIER_NONE || (text.isEmpty() && !wasWake && side == CueClassifier.SIDE_NONE)) {
+            voiceReset();
             flushAnswerOver();
             return;
         }
@@ -1096,6 +1117,9 @@ final class EarsSession {
                 && (kind == CueClassifier.KIND_WAKE_WORD || kind == CueClassifier.KIND_NAME) ? CueWords.message(text) : "";
         // wasWake: the early cue for this at already went out (every in-speech hit sends one).
         deliver(new Utterance(text, side, angle, tier, at, partial, kind, wasWake, message));
+        // Owner 2026-10-02: after the words went out, so they never wait on it. Only a listen's
+        // answer with words that the robot's own speech did not clip says whose voice it was.
+        voiceAnswered(at, answer && !partial && !text.isEmpty());
         flushAnswerOver();
     }
 
@@ -1121,6 +1145,7 @@ final class EarsSession {
         segmentWords.setLength(0);
         provisionalSent = 0;
         preLen = 0;
+        voiceReset();
         if (uttCapAt != Long.MAX_VALUE) {
             uttCapAt = Long.MAX_VALUE;
             answerEnded(clock.nowMs(), false, "the capture closed mid-answer");
@@ -1130,6 +1155,61 @@ final class EarsSession {
 
     private void deliver(Utterance u) {
         deliver(u, true);
+    }
+
+    // ---- voice identification (owner 2026-10-02) ----
+
+    /** The voice identification the ears feed, or null for none. Set once at start. */
+    void setVoice(VoiceId v) {
+        voice = v;
+    }
+
+    /** Caller holds feedLock. An utterance began. */
+    private void voiceStart() {
+        VoiceId v = voice;
+        if (v != null) {
+            v.start();
+        }
+    }
+
+    /** Caller holds feedLock. Speech was heard in the chunk just fed. */
+    private void voiceSpeech() {
+        VoiceId v = voice;
+        if (v != null) {
+            v.speech();
+        }
+    }
+
+    /** Caller holds feedLock. The utterance was dropped. */
+    private void voiceReset() {
+        VoiceId v = voice;
+        if (v != null) {
+            v.reset();
+        }
+    }
+
+    /** Caller holds feedLock. The utterance was delivered; returns at once (the embedding runs elsewhere). */
+    private void voiceAnswered(long at, boolean clean) {
+        VoiceId v = voice;
+        if (v != null) {
+            v.answered(at, clean);
+        }
+    }
+
+    /** VoiceId's result, from the voice thread, to the session's current client. */
+    void voiceHeard(long at, String person, float score, int band) {
+        Client c;
+        synchronized (this) {
+            c = client;
+        }
+        if (c == null) {
+            return;
+        }
+        try {
+            c.voice(at, person, score, band);
+        } catch (RuntimeException e) {
+            diag.log("voice delivery failed: " + e.getClass().getSimpleName());
+        }
     }
 
     /** endsListen: false only for the early wake cue, which must not take a conversation listen's reply. */

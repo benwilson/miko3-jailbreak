@@ -53,6 +53,12 @@ public interface RobotEars extends IInterface {
     int KIND_VOICE = 4;
     /** Never sent: what Callback.Stub reports when an older launcher's parcel ends before the kind. */
     int KIND_MISSING = -1;
+    /** Callback.voice's band (owner 2026-10-02): nobody stored is close enough; the speaker is unknown. */
+    int VOICE_NONE = 0;
+    /** Maybe the named person (a close call, or a middling score): ask before assuming. */
+    int VOICE_WEAK = 1;
+    /** Confidently the named person. */
+    int VOICE_STRONG = 2;
 
     void open(Callback callback, boolean chargerLatched) throws RemoteException;
 
@@ -127,12 +133,25 @@ public interface RobotEars extends IInterface {
          */
         void provisional(long at, String text) throws RemoteException;
 
+        /**
+         * Owner 2026-10-02: whose voice said the conversation answer whose speech began at at
+         * (the at of that answer's heard()): person is the launcher's opaque person id of the
+         * closest stored voice, or null when band is VOICE_NONE; score is its cosine score;
+         * band is VOICE_*. Sent after that answer's heard(), once, one-way, only for a clean
+         * answer of at least 1.5 s of speech, and only once the embedding is computed (a
+         * few hundred ms later). Appended as its own code (5), handled exactly like codes 2-4:
+         * an older mode's Stub has no case for it (onTransact returns false, which a one-way
+         * sender never sees); a newer mode under an older launcher never receives one.
+         */
+        void voice(long at, String person, float score, int band) throws RemoteException;
+
         abstract class Stub extends Binder implements Callback {
             private static final String DESCRIPTOR = "com.miko3.shared.RobotEars.Callback";
             static final int TRANSACTION_heard = 1;
             static final int TRANSACTION_answering = 2;
             static final int TRANSACTION_answerOver = 3;
             static final int TRANSACTION_provisional = 4;
+            static final int TRANSACTION_voice = 5;
 
             public Stub() {
                 attachInterface(this, DESCRIPTOR);
@@ -185,6 +204,14 @@ public interface RobotEars extends IInterface {
                         data.enforceInterface(DESCRIPTOR);
                         long at = data.readLong();
                         provisional(at, data.readString());
+                        return true;
+                    }
+                    case TRANSACTION_voice: {
+                        data.enforceInterface(DESCRIPTOR);
+                        long at = data.readLong();
+                        String person = data.readString();
+                        float score = data.readFloat();
+                        voice(at, person, score, data.readInt());
                         return true;
                     }
                     case IBinder.INTERFACE_TRANSACTION:
@@ -264,6 +291,22 @@ public interface RobotEars extends IInterface {
                         data.writeLong(at);
                         data.writeString(text);
                         remote.transact(TRANSACTION_provisional, data, null, IBinder.FLAG_ONEWAY);
+                    } finally {
+                        data.recycle();
+                    }
+                }
+
+                /** One-way, like answering(). */
+                @Override
+                public void voice(long at, String person, float score, int band) throws RemoteException {
+                    Parcel data = Parcel.obtain();
+                    try {
+                        data.writeInterfaceToken(DESCRIPTOR);
+                        data.writeLong(at);
+                        data.writeString(person);
+                        data.writeFloat(score);
+                        data.writeInt(band);
+                        remote.transact(TRANSACTION_voice, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();
                     }

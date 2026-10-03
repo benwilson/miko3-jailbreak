@@ -82,6 +82,9 @@ final class ListenEngine implements ListenSession.Ears {
     /** KTD2: at the asset root, outside the staged model directory. */
     private static final String HOTWORDS_ASSET = "hotwords.txt";
     private static final String WAKE_MODEL_ASSET = "miko_wakeword_model.tflite";
+    /** Owner 2026-10-02: the speaker-embedding model (3D-Speaker CAM++), stamped like the listen model. */
+    private static final String VOICE_ASSETS = "voiceid";
+    private static final String VOICE_MODEL = "model.onnx";
     /** How long a listen waits for the robot to finish speaking. */
     static final long IDLE_TIMEOUT_MS = 20000;
     private static final float HOTWORDS_SCORE = 2.0f;
@@ -114,6 +117,8 @@ final class ListenEngine implements ListenSession.Ears {
     private final EarsSession ears;
     /** robot-say.py's debug-only heard-text injection, wrapped around the ears' engine, gate and recogniser. */
     private final EarsInject inject;
+    /** Owner 2026-10-02: who is speaking, by voice; fed by the ears, its model loaded on its own thread. */
+    private final VoiceId voiceId;
     private final SpeechTuning tuning;
     /** KTD2's threads, active paths and decoding unless a property switches them. */
     private final EarsTuning earsTuning;
@@ -187,6 +192,28 @@ final class ListenEngine implements ListenSession.Ears {
         this.ears = new EarsSession(earsClock, earsCapture, inject.spotter(earsSpotter), inject.gate(earsGate),
                 inject.recognizer(earsRecognizer), earsDirection, new CueClassifier(earsSwitch),
                 tuning.deafTailMs, earsDiag, earsTuning.gateWake, EarsSession.prerollMs(props.get(EarsSession.PREROLL_PROP)));
+        VoiceStore.Diag voiceDiag = new VoiceStore.Diag() {
+            @Override
+            public void log(String note) {
+                Log.i(TAG, note);
+            }
+        };
+        VoiceTuning voiceTuning = VoiceTuning.from(new VoiceTuning.Props() {
+            @Override
+            public String get(String key) {
+                return SpeechEngine.systemProperty(key);
+            }
+        });
+        this.voiceId = new VoiceId(new VoiceStore(new File(context.getFilesDir(), "voiceprints.bin"),
+                VoiceTuning.MAX_PER_PERSON, voiceDiag), voiceTuning, voiceDiag);
+        voiceId.setListener(new VoiceId.Listener() {
+            @Override
+            public void voice(long at, String person, float score, int band) {
+                ears.voiceHeard(at, person, score, band);
+            }
+        });
+        ears.setVoice(voiceId);
+        Log.i(TAG, "voice: " + voiceTuning);
         // KTD1: the deaf window follows the speech queue's line start and idle.
         speech.setSpeaking(new SpeechQueue.Speaking() {
             @Override
@@ -207,6 +234,11 @@ final class ListenEngine implements ListenSession.Ears {
 
     EarsSession ears() {
         return ears;
+    }
+
+    /** Owner 2026-10-02: the people layer's way to enrol and forget voices. */
+    VoicePrints voicePrints() {
+        return voiceId;
     }
 
     /** For EarsInjectReceiver. */
@@ -332,8 +364,32 @@ final class ListenEngine implements ListenSession.Ears {
                     // Shutting down.
                 }
             }
+
+            /** Owner 2026-10-02: on the same delivery thread, so it always follows the answer's heard(). */
+            @Override
+            public void voice(final long at, final String person, final float score, final int band) {
+                try {
+                    deliver.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                callback.voice(at, person, score, band);
+                            } catch (RemoteException | RuntimeException e) {
+                                // The client is gone; its death releases the session.
+                            }
+                        }
+                    });
+                } catch (RejectedExecutionException ignored) {
+                    // Shutting down.
+                }
+            }
         };
         ears.open(String.valueOf(uid), token, client, chargerLatched);
+        // The NC DSP's settings at each ears open, on their own thread (logged; applied only when set).
+        VoiceDirection.checkNcLater(SpeechEngine.systemProperty(VoiceDirection.NC_STATUS_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.NC_APPLY_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.NC_GAIN_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.NC_DGAIN_PROPERTY));
     }
 
     /**
@@ -393,6 +449,36 @@ final class ListenEngine implements ListenSession.Ears {
             Log.e(TAG, "recognizer failed to load; the robot cannot listen", t);
         }
         loadWakeWord();
+        loadVoiceId();
+    }
+
+    /**
+     * Owner 2026-10-02: the speaker-embedding model, copied out and loaded on the voice
+     * thread itself, so the recogniser never waits on it. Without it the ears still hear;
+     * nobody is identified by voice. With VoiceTuning.BENCH_PROP at 1 it then times
+     * compute() on 1.5-8 s of audio (qa-voice-bench.py).
+     */
+    private void loadVoiceId() {
+        final boolean bench = "1".equals(SpeechEngine.systemProperty(VoiceTuning.BENCH_PROP));
+        voiceId.runOnVoiceThread(new Runnable() {
+            @Override
+            public void run() {
+                long t0 = SystemClock.elapsedRealtime();
+                try {
+                    File dir = installAssets(context, VOICE_ASSETS);
+                    SherpaVoiceEmbedder e = new SherpaVoiceEmbedder(new File(dir, VOICE_MODEL).getAbsolutePath());
+                    voiceId.setEmbedder(e);
+                    Log.i(TAG, "voice: model ready in " + (SystemClock.elapsedRealtime() - t0) + " ms (dim "
+                            + e.dim() + ")");
+                } catch (Throwable t) {
+                    Log.e(TAG, "voice: model failed to load; nobody is identified by voice", t);
+                    return;
+                }
+                if (bench) {
+                    voiceId.bench(new long[] {1500, 3000, 5000, 8000}, 3);
+                }
+            }
+        });
     }
 
     /** The vendor engine, as VoiceEngine loads it; without it the session still
