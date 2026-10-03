@@ -10780,6 +10780,20 @@ public final class ExploreBrainHarness {
     }
 
     private static void peopleScenarios() {
+        scenario("muted_a_person_in_view_starts_no_person_stop_at_all", n -> {
+            // Home 2026-10-02 21:40: muted, he noticed the same person every 0.5 s ("a person while
+            // roaming: going over to meet them" then "muted: the stop ends quietly"), over and over.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = peopleRig(peopleTuning(), personWhen(t -> true));
+            rig.brain.setTrace(x -> notes.add(rig.now + " " + x));
+            rig.brain.setMuted(true);
+            rig.started();
+            rig.runUntil(15000);
+            check(n, notesWith(notes, "a person while roaming") == 0 && notesWith(notes, "the stop ends quietly") == 0
+                            && rig.count("match") == 0 && rig.violations.isEmpty(),
+                    "roaming=" + notesWith(notes, "a person while roaming") + " quietEnds="
+                            + notesWith(notes, "the stop ends quietly") + " " + lastNotes(notes, 8));
+        });
         scenario("people_roaming_person_is_approached_to_the_polite_distance_and_greeted_by_name", n -> {
             Rig rig = peopleRig(peopleTuning(), personWhen(t -> true));
             rig.started();

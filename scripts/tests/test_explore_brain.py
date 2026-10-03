@@ -412,6 +412,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "roam_steer_doorway_weights_open_bands_and_turns_to_face_one_out_of_view",
         "replies_doorway_reads_x_and_rejects_bad_answers",
         # People while roaming, with a per-person leave-alone (explore nav plan U7, R9, R10, AE4)
+        "muted_a_person_in_view_starts_no_person_stop_at_all",
         "people_roaming_person_is_approached_to_the_polite_distance_and_greeted_by_name",
         "people_ae4_same_person_5_min_later_is_checked_and_left_alone",
         "people_different_person_5_min_later_is_approached",

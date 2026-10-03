@@ -8654,7 +8654,9 @@ final class ExploreBrain {
             }
             return false;
         }
-        if (p == null || !canAsk() || now < phantomsIgnoredUntil) {
+        if (p == null || !canAsk() || hushed() || now < phantomsIgnoredUntil) {
+            // Hushed (muted or quiet): no person stop at all. Home 2026-10-02 21:40: muted, he
+            // started one on the same person every 0.5 s and the hush ended each at once.
             return false;
         }
         if (anyoneMet(now) && now >= metClearedUntil) {
