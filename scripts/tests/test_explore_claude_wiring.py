@@ -1051,7 +1051,8 @@ class ConversationWiringTest(unittest.TestCase):
         self.assertEqual(act_names, bench.ACTION_NAMES)
         for k in act_order + ["PLAN"]:
             self.assertEqual(self.java_string(actions, k + "_DESCRIPTION"), getattr(bench, k + "_DESCRIPTION"), k)
-        for name in ("OWNER_NOTE_HEADING", "OWNER_NOTE_GUARD", "TASK_SYSTEM"):
+        for name in ("OWNER_NOTE_HEADING", "OWNER_NOTE_GUARD", "TASK_SYSTEM", "CALL_OPENER", "FACELESS_OPENER",
+                     "NUDGE"):
             self.assertEqual(self.java_string(prompts, name), getattr(bench, name), name)
         recall = re.search(r'RECALL_SCHEMA = ExplorePrompts\.object\("name", ExplorePrompts\.described\(\s*'
                            r'ExplorePrompts\.type\("string"\), "(.*?)"\)\);', tools, re.S)
@@ -1182,6 +1183,15 @@ class FacelessOpenerTest(unittest.TestCase):
                       "do not ask their name either"):
             self.assertIn(words, text)
 
+    def test_the_faceless_opener_is_warm_curious_and_fits_a_roaming_meeting(self):
+        """Owner 2026-10-02: flat openers; a roaming or cue pick may now be met faceless, so the
+        opener no longer says they asked for him."""
+        text = self.constant("FACELESS_OPENER")
+        for words in ("at most two short sentences", "greet them warmly with one specific, curious thing",
+                      "never invent anything"):
+            self.assertIn(words, text)
+        self.assertNotIn("asked for him", text)
+
     def test_a_face_in_hand_strangers_opener_still_asks_the_name(self):
         p = src("ExplorePrompts.java")
         body = p[p.index("static String openerAsk("):]
@@ -1216,9 +1226,13 @@ class CallConversationTest(unittest.TestCase):
 
     def test_the_call_opener_greets_with_a_question_and_asks_no_name_or_crouch(self):
         text = self.constant("CALL_OPENER")
-        for words in ("greeting with a question", "has not seen them yet", "Do not ask their name yet"):
+        for words in ("greeting with a question", "has not seen them yet", "Do not ask their name yet",
+                      # Owner 2026-10-02: "Hey! What's up?" every time; one curious thing, nothing invented.
+                      "at most two short sentences", "one specific", "never invent anything",
+                      'Not a bare "what\'s up"'):
             self.assertIn(words, text)
         self.assertNotIn("crouch", text)
+        self.assertNotIn("Hey! What's up?", text)
         self.assertIn("Do not ask their name yet", self.constant("CALL_WORDS"))
         cant = self.constant("CANT_SEE")
         for words in ("can't see their face from down here", "crouch down to his level", "Do not ask their name"):
@@ -1233,6 +1247,36 @@ class CallConversationTest(unittest.TestCase):
         self.assertRegex(turn, r"if \(request\.cantSee\) \{\s*ask = ask \+ \"\\n\\n\" \+ ExplorePrompts\.CANT_SEE;")
         session = code_only(src("ChatSession.java"))
         self.assertIn(".call(called, cantSeeDue).withFacts(host.toolFacts())\n                .noteBy(noteName);", session)
+
+    def test_a_run_of_unanswered_listens_gets_one_gentle_follow_up_before_the_end(self):
+        """Owner 2026-10-02 ("oh hi and then he doesn't really talk to us"): instead of the
+        sign-off he re-engages once with a gentle follow-up; words from them reset it."""
+        nudge = self.constant("NUDGE")
+        for words in ("gentle follow-up", "invites them to keep talking", "Never complain", "addressed is true"):
+            self.assertIn(words, nudge)
+        session = code_only(src("ChatSession.java"))
+        self.assertIn("requestTurn(now, ExplorePrompts.NUDGE);", session)
+        heard = re.search(r"private void onHeard\(long now, String text\) \{(.*?)\n    \}", session, re.S).group(1)
+        self.assertIn("nudged = false;", heard)
+        unanswered = re.search(r"private void onUnanswered\(long now, boolean wordless\) \{(.*?)\n    \}",
+                               session, re.S).group(1)
+        self.assertLess(unanswered.index("nudge(now);"), unanswered.index("signOff(now);"))
+        # A reply judged not said to him ends any conversation only after a call's count.
+        self.assertIn("int max = tuning.callChatUnansweredMax;", session)
+
+    def test_chattier_tuning(self):
+        """Owner 2026-10-02: a longer no-reply cap, faceless meetings for strong or spoken-to
+        picks, and curiosity stops (and so remarks) about twice as often."""
+        t = src("ExploreTuning.java")
+        for decl in ("private long chatNoReplyMs = 60000;", "private float facelessMeetMinScore = 0.65f;",
+                     "private long facelessMeetVoiceMs = 5000;", "private long curiosityMinMs = 9000;",
+                     "private long curiosityMaxMs = 14000;",
+                     # Coordinator 2026-10-02 (home 20:51-20:55): people pause longer; the recogniser
+                     # sometimes gets no words, so two re-asks that ask them nearer or louder.
+                     "private long unansweredListenMs = 7000;", "private int chatReasksMax = 2;"):
+            self.assertIn(decl, t)
+        self.assertIn('DIDNT_CATCH = "Sorry, I didn\'t catch that. Could you come a bit closer or speak up?";',
+                      src("ChatSession.java"))
 
     def test_opening_a_call_conversation_reads_the_persona_and_sends_nothing_to_claude(self):
         c = code_only(src("ClaudeCuriosity.java"))
@@ -1338,6 +1382,22 @@ class InstructionsAndAddressedTest(unittest.TestCase):
                                "ends_conversation", "deflected", "notes_update", "feedback"])
         self.assertIn('"addressed", type("boolean")', body)
         self.assertNotIn('"action"', body)
+
+    def test_addressed_leans_true_when_unsure_and_after_he_spoke(self):
+        """Owner 2026-10-02 (home log 20:42:53): the reply to his "Hey! What's up?" was judged
+        not said to him and got silence."""
+        pre = ConversationWiringTest.java_string(self.prompts(), "SCHEMA_PREAMBLE")
+        for phrase in ("false only when it is clearly people talking to each other nearby", "when unsure, true",
+                       "a reply right after Miko spoke to them is addressed unless it is clearly people talking "
+                       "to each other"):
+            self.assertIn(phrase, pre, phrase)
+
+    def test_the_guard_makes_him_chatty_within_two_short_sentences(self):
+        guard = ConversationWiringTest.java_string(self.prompts(), "GUARD")
+        self.assertIn("at most two short sentences", guard)
+        self.assertIn("most lines end with a question or an invitation to keep talking, unless the conversation "
+                      "is wrapping up", guard)
+        self.assertIn("never say anything a coworker would be fired for saying", guard)
 
     def test_the_preamble_says_when_to_set_the_action_and_addressed(self):
         pre = ConversationWiringTest.java_string(self.prompts(), "SCHEMA_PREAMBLE")

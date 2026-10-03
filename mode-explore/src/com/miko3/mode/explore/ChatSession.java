@@ -162,8 +162,12 @@ final class ChatSession {
     static final String FORGOTTEN = "Done. I've forgotten you.";
     static final String KEPT = "Okay, keeping you.";
     static final String FORGET_FAILED = "That didn't work; I still remember you.";
-    /** Owner 2026-10-02: a call's conversation, after an answer that ended without words: once, through the on-device voice. */
-    static final String DIDNT_CATCH = "Sorry, I didn't catch that?";
+    /**
+     * Owner 2026-10-02: after an answer that ended without words, through the on-device voice, up
+     * to chatReasksMax times in a row. Robot 20:5x at home: 4 s of speech gave the recogniser no
+     * words; from the floor his microphones need them nearer or louder, so he asks for that.
+     */
+    static final String DIDNT_CATCH = "Sorry, I didn't catch that. Could you come a bit closer or speak up?";
     /**
      * Owner 2026-10-02: the polite end of a conversation nobody is having with him (turns not
      * said to him, or no message said to him for chatNoReplyMs), through the on-device voice.
@@ -338,8 +342,14 @@ final class ChatSession {
     private Detection seekFound;
     /** He knows he can't see them: the next turn invites them down to his level, once. */
     private boolean cantSeeDue;
-    /** This run of unanswered listens has had its "didn't catch that". */
-    private boolean reasked;
+    /**
+     * Owner 2026-10-02 ("he doesn't really talk to us"): this run of unanswered listens has had
+     * its one gentle follow-up (ExplorePrompts.NUDGE), asked at the second unanswered listen in
+     * a row, or when nothing was said to him in a call's for chatNoReplyMs. Words clear it.
+     */
+    private boolean nudged;
+    /** The "didn't catch that"s this run of unanswered listens has had (chatReasksMax at most). */
+    private int reasked;
 
     // ---- turns not said to him, and instructions (owner 2026-10-02) ----
     /** The run of unanswered listens before the message being answered: a reply not said to him adds to it. */
@@ -1704,7 +1714,8 @@ final class ChatSession {
         unansweredBefore = unanswered;
         heardAt = now;
         unanswered = 0;
-        reasked = false;
+        reasked = 0;
+        nudged = false;
         glanceIfNewcomer(now);
         if (askingLastName) {
             askingLastName = false;
@@ -1760,7 +1771,8 @@ final class ChatSession {
     private void notAddressed(long now) {
         learnTurnOver();
         unanswered = unansweredBefore + 1;
-        int max = called ? tuning.callChatUnansweredMax : 2;
+        // Owner 2026-10-02: a reply judged not said to him ends a conversation only after as many as a call's.
+        int max = tuning.callChatUnansweredMax;
         if (unanswered >= max) {
             host.note("not said to him: " + unanswered + " unanswered in a row: he leaves them to it");
             learnEnd("notaddr");
@@ -1799,15 +1811,29 @@ final class ChatSession {
         endAfterLine = true;
     }
 
+    /**
+     * Owner 2026-10-02: the second unanswered listen in a row; instead of going quiet he re-engages
+     * once with a gentle follow-up (a turn whose message is ExplorePrompts.NUDGE). The run keeps its
+     * count, so a non-call's next unanswered listen ends it, a call's third, as before.
+     */
+    private void nudge(long now) {
+        nudged = true;
+        unansweredBefore = unanswered;
+        host.note(unanswered + " unanswered listen(s): one gentle follow-up before the sign-off");
+        requestTurn(now, ExplorePrompts.NUDGE);
+    }
+
     private void onUnanswered(long now, boolean wordless) {
         learnUnanswered++;
         if (wordless) {
             learnNoWords++;
         }
-        if (called && wordless && !reasked && !confirmingForget && !askingLastName) {
-            // Owner 2026-10-02: an answer that ended without words gets one re-ask, which does not count.
-            reasked = true;
-            host.note("the answer ended without words: one \"didn't catch that\", not counted");
+        if (wordless && reasked < tuning.chatReasksMax && !confirmingForget && !askingLastName) {
+            // Owner 2026-10-02: an answer that ended without words gets a re-ask (up to chatReasksMax
+            // in a row, in any conversation), which does not count.
+            reasked++;
+            host.note("the answer ended without words: \"didn't catch that\" " + reasked + " of "
+                    + tuning.chatReasksMax + ", not counted");
             learnReask = true;
             speak(now, DIDNT_CATCH, false);
             return;
@@ -1819,6 +1845,13 @@ final class ChatSession {
             declineLastName(now);
         }
         glanceIfNewcomer(now);
+        // Owner 2026-10-02: the second unanswered listen in a row (or a call's no-reply cap) gets
+        // the gentle follow-up; the next one ends the conversation as before.
+        if (!nudged && !ending && (unanswered >= 2 || called && tuning.chatNoReplyMs > 0
+                && now - lastAddressedAt >= tuning.chatNoReplyMs)) {
+            nudge(now);
+            return;
+        }
         if (called) {
             // Owner 2026-10-02: not seeing them never ends a call's conversation; only silence does.
             if (unanswered >= tuning.callChatUnansweredMax) {
@@ -2123,7 +2156,7 @@ final class ChatSession {
         learnEmit(learnDone, null);
         learnDone = null;
         learnEmit(learnCur, null);
-        boolean afterWords = heardText != null && heardAt != ExploreBrain.NEVER;
+        boolean afterWords = heardText != null && !nudged && heardAt != ExploreBrain.NEVER;
         TurnRecord r = new TurnRecord(learnNo, ++learnTurns, afterWords ? heardAt : now, opener);
         r.words = afterWords;
         if (afterWords && speculated != null && speculated.equals(heardText.trim())

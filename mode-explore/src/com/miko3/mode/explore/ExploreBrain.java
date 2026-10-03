@@ -836,6 +836,10 @@ final class ExploreBrain {
     private boolean cuePick;
     /** Roaming person picks are ignored until then after a phantom (phantomPersonCooldownMs). */
     private long phantomsIgnoredUntil;
+    /** The meeting's person box score (enterMeet): a faceless roaming or cue pick this strong is met. */
+    private float meetScore;
+    /** When a voice from a known side, the person's, last landed for this stop's person (NEVER: none). */
+    private long personVoiceAt = NEVER;
     /** Robot 2026-10-01: when the meeting's listen (LISTEN, or the confirm ladder's) started. */
     private long meetListenAt;
     /** That listen's deadline was moved to the answer hold once already. */
@@ -4492,6 +4496,7 @@ final class ExploreBrain {
         target = null;
         roamingPick = false;
         cuePick = false;
+        personVoiceAt = NEVER;
         claudeStop = canAsk();
         if (!claudeStop && port.claudePausedMs() > 0) {
             note("Claude is paused for " + port.claudePausedMs() + " ms: a detector-only stop");
@@ -4952,6 +4957,7 @@ final class ExploreBrain {
         wheellessMeeting = false;
         roamingPick = false;
         cuePick = false;
+        personVoiceAt = NEVER;
         if (chat != null) {
             chat.learnCut(muted ? "muted" : "cut");
         }
@@ -5668,6 +5674,7 @@ final class ExploreBrain {
         meetLines = false;
         syncPark();
         show(EyeState.THINKING, null);
+        meetScore = personBox == null ? 0f : personBox.score;
         meetDeadline = now + tuning.meetTimeoutMs;
         note("a person: checking whether we've met");
         port.match(frameJpeg, personBox, tuning.meetTimeoutMs);
@@ -5704,8 +5711,13 @@ final class ExploreBrain {
      */
     private void matchAnswered(long now, CuriosityPort.MatchAnswer a) {
         if ((roamingPick || cuePick) && !callsOwn() && !usableFace(a)) {
-            phantomPerson(now, a);
-            return;
+            String why = facelessMeetable(now, a);
+            if (why == null) {
+                phantomPerson(now, a);
+                return;
+            }
+            note("no usable face in the " + (cuePick ? "cue's person box" : "roaming person pick's box") + ", but "
+                    + why + ": meeting them faceless");
         }
         if (intent == CuriosityPort.Action.FIND_PERSON && !callsOwn()) {
             if (!soughtPerson(a)) {
@@ -5723,6 +5735,26 @@ final class ExploreBrain {
             return;
         }
         startAs(now, a);
+    }
+
+    /**
+     * Owner 2026-10-02 (at home, "he doesn't really talk to us"): a roaming or cue pick with no
+     * usable face is still met, facelessly (no name asked; the crouch invitation), when its box
+     * scored at least facelessMeetMinScore or a voice from the person's known side landed within
+     * facelessMeetVoiceMs. Only a faceless NEW answer with a conversation qualifies: a failed
+     * check, or no conversation possible, stays a phantom. Null: a phantom; else why it is met.
+     */
+    private String facelessMeetable(long now, CuriosityPort.MatchAnswer a) {
+        if (a.status != CuriosityPort.MatchAnswer.Status.NEW || !chatPossible(a)) {
+            return null;
+        }
+        if (meetScore >= tuning.facelessMeetMinScore) {
+            return String.format(java.util.Locale.US, "the person box scored %.2f", meetScore);
+        }
+        if (personVoiceAt != NEVER && now - personVoiceAt <= tuning.facelessMeetVoiceMs) {
+            return "a voice from their side " + (now - personVoiceAt) + " ms ago";
+        }
+        return null;
     }
 
     /**
@@ -8659,6 +8691,7 @@ final class ExploreBrain {
         claudeStop = true;
         roamingPick = false;
         cuePick = false;
+        personVoiceAt = NEVER;
         heldPick = null;
         scanned.clear();
         scanHeadings.clear();
@@ -8988,6 +9021,9 @@ final class ExploreBrain {
                 break;
             case CONFIRM:
                 note("a voice from the person's side: carrying on toward them");
+                if (fromKnownSide(c)) {
+                    personVoiceAt = c.at;
+                }
                 break;
             default:
                 dropCue("cue " + c.tier + " " + c.side + " dropped in " + state);
@@ -9899,6 +9935,14 @@ final class ExploreBrain {
      * of where their box puts them; with only a side, a box near the centre counts as
      * either side and a voice with no side as theirs.
      */
+    /**
+     * A cue with a direction: a voice the ears placed. A shove's cue has none (robot 2026-10-02 at
+     * home: "shoved: ~3700 counts" every 0.5 s read as "a voice from the person's side").
+     */
+    private static boolean fromKnownSide(Ears.Cue c) {
+        return c != null && (c.side != Ears.Side.UNKNOWN || c.hasAngle());
+    }
+
     private boolean sameSideAsPerson(Ears.Cue c) {
         Detection box = headedBox();
         if (box == null) {
@@ -10261,6 +10305,9 @@ final class ExploreBrain {
         searchPlan = null;
         beginPersonStop(now, look, face);
         cuePick = true;
+        if (fromKnownSide(c)) {
+            personVoiceAt = c.at;
+        }
         target = face;
         remember(face.label, CuriosityPort.Kind.PERSON, now);
         if (!canAsk()) {
@@ -11206,6 +11253,7 @@ final class ExploreBrain {
         wheellessMeeting = false;
         roamingPick = false;
         cuePick = false;
+        personVoiceAt = NEVER;
         if (chat != null) {
             chat.learnCut("eyes");
         }

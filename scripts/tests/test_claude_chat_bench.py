@@ -497,6 +497,15 @@ class ActionToolsAndOwnerNotesTest(unittest.TestCase):
         self.assertIn("commands", bench.SCRIPTS)
         self.assertEqual(bench.PLAN_TOOL["name"], "revise_plan")
 
+    def test_the_opener_scripts_start_with_his_own_openers_and_follow_up(self):
+        """Owner 2026-10-02: --script call / faceless send the robot's openers as turn 1 and its
+        NUDGE after a silence (the wording is the robot's, held by test_explore_claude_wiring)."""
+        self.assertEqual(bench.SCRIPTS["call"][0], bench.CALL_OPENER)
+        self.assertEqual(bench.SCRIPTS["faceless"][0], bench.FACELESS_OPENER)
+        for name in ("call", "faceless"):
+            self.assertIn(bench.NUDGE, bench.SCRIPTS[name])
+        self.assertIn("call", bench.build_parser().parse_args(["--script", "call"]).script)
+
 
 if __name__ == "__main__":
     unittest.main()

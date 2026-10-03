@@ -196,6 +196,15 @@ final class ExploreTuning {
      */
     final long phantomPersonCooldownMs;
     /**
+     * Owner 2026-10-02 (at home: "he never really talks to us"): from the floor a face is almost
+     * never usable, so a roaming or cue pick with no usable face is still met, facelessly, when
+     * its person box scored at least facelessMeetMinScore (people 0.55-0.80, furniture and
+     * shadows about 0.53) or a voice from a known side, the person's, landed within
+     * facelessMeetVoiceMs of the face check's answer. Weaker picks with no voice stay phantoms.
+     */
+    final float facelessMeetMinScore;
+    final long facelessMeetVoiceMs;
+    /**
      * Asking Claude (explore on Claude KTD6): askAttempts tries of askTimeoutMs
      * each before falling back to the detector (R7, R8). A spoken line is given
      * up on after sayTimeoutMs if the finished callback never comes (KTD8). The
@@ -537,11 +546,14 @@ final class ExploreTuning {
      * answer clip waits up to this long for the utterance's end, so its deaf window never cuts
      * off the words said with the wake word (they are the first message); 0 answers at once.
      * callChatUnansweredMax: a call's conversation ends after this many unanswered listens in a
-     * row (not seeing them never ends it); a wordless answer gets one "didn't catch that" first.
+     * row (not seeing them never ends it); a wordless answer gets a "didn't catch that" first
+     * (up to chatReasksMax in a row), and the second unanswered listen a gentle follow-up turn.
      */
     final boolean callChatFirst;
     final long callUtteranceWaitMs;
     final int callChatUnansweredMax;
+    /** Owner 2026-10-02: wordless answers in a row that get a "didn't catch that" before one counts. */
+    final int chatReasksMax;
     /**
      * Owner 2026-10-02: a conversation with no message said to him (Claude's "addressed")
      * for this long ends politely, however the unanswered count stands: office chatter
@@ -1024,6 +1036,8 @@ final class ExploreTuning {
         puzzledMs = b.puzzledMs;
         peopleCooldownMs = b.peopleCooldownMs;
         phantomPersonCooldownMs = Math.max(0, b.phantomPersonCooldownMs);
+        facelessMeetMinScore = b.facelessMeetMinScore;
+        facelessMeetVoiceMs = Math.max(0, b.facelessMeetVoiceMs);
         askAttempts = Math.max(1, b.askAttempts);
         claudeLooksPerMinute = Math.max(0, b.claudeLooksPerMinute);
         askTimeoutMs = b.askTimeoutMs;
@@ -1110,6 +1124,7 @@ final class ExploreTuning {
         callChatFirst = b.callChatFirst;
         callUtteranceWaitMs = Math.max(0, b.callUtteranceWaitMs);
         callChatUnansweredMax = Math.max(1, b.callChatUnansweredMax);
+        chatReasksMax = Math.max(0, b.chatReasksMax);
         chatNoReplyMs = Math.max(0, b.chatNoReplyMs);
         chatStallGraceMs = Math.max(0, b.chatStallGraceMs);
         turnBudgetMs = Math.max(1, b.turnBudgetMs);
@@ -1381,8 +1396,10 @@ final class ExploreTuning {
         // about 8-15 s): the owner wants a remark about every 30 s when nobody is
         // talking to him (robot 2026-10-01: 45-90 s, with the losses below, gave one
         // every 5-15 min).
-        private long curiosityMinMs = 18000;
-        private long curiosityMaxMs = 28000;
+        // Owner 2026-10-02 ("make him chattier"): halved to 9-14 s, about twice the stops and so
+        // the remarks (nearly every stop that ends cleanly has one); docked looks are unchanged.
+        private long curiosityMinMs = 9000;
+        private long curiosityMaxMs = 14000;
         private int scanLooks = 3;
         private long scanTurnMs = 700;
         private long lookSettleMs = 400;
@@ -1412,6 +1429,9 @@ final class ExploreTuning {
         private long peopleCooldownMs = 120000;
         // Robot 2026-09-30: four phantom meetings in four minutes; 20 s lets him roam off the blur.
         private long phantomPersonCooldownMs = 20000;
+        // Owner 2026-10-02: home log 20:44, people at 0.76 and 0.80 dropped for no usable face.
+        private float facelessMeetMinScore = 0.65f;
+        private long facelessMeetVoiceMs = 5000;
         // Two tries of about 10 s (R7): a stop with Claude unreachable falls back
         // within ~20 s (AE4). Owner's call after live tests: a look usually takes ~3 s,
         // and a slow one is retried rather than waited on longer.
@@ -1538,7 +1558,8 @@ final class ExploreTuning {
         private long headingSampleMs = 100;
         // Meeting plan Assumptions: an unanswered listen is 4 s; the chat sensor-stall grace 5 s;
         // a turn has 5 s plus a 3 s retry; two sentences; a window of 30 exchanges; a 500 ms deaf tail.
-        private long unansweredListenMs = 4000;
+        // Owner 2026-10-02 (at home): people pause longer before answering; 4 s ended listens early.
+        private long unansweredListenMs = 7000;
         // Robot 2026-10-01: LauncherProtocol.EARS_ANSWER_HOLD_MS (the answer cap, 60 s since 2026-10-02, plus 3 s).
         private long answerHoldMs = 63000;
         // Robot 2026-10-01: about three tries, a few seconds apart, after the crouch invitation.
@@ -1550,7 +1571,9 @@ final class ExploreTuning {
         private boolean callChatFirst = true;
         private long callUtteranceWaitMs = 2500;
         private int callChatUnansweredMax = 3;
-        private long chatNoReplyMs = 45000;
+        private int chatReasksMax = 2;
+        // Owner 2026-10-02 ("make him chattier"): 45 s ended conversations a pause would not.
+        private long chatNoReplyMs = 60000;
         private long chatStallGraceMs = 5000;
         private long turnBudgetMs = 5000;
         private long turnRetryMs = 3000;
@@ -1863,6 +1886,11 @@ final class ExploreTuning {
         }
         Builder peopleCooldownMs(long v) { peopleCooldownMs = v; return this; }
         Builder phantomPersonCooldownMs(long v) { phantomPersonCooldownMs = v; return this; }
+        Builder facelessMeet(float minScore, long voiceMs) {
+            facelessMeetMinScore = minScore;
+            facelessMeetVoiceMs = voiceMs;
+            return this;
+        }
         Builder leanInCooldown(long cooldownMs, long minGapMs) {
             leanInCooldownMs = cooldownMs;
             leanInMinGapMs = minGapMs;
@@ -1925,6 +1953,7 @@ final class ExploreTuning {
         Builder stallRecoverWindowMs(long v) { stallRecoverWindowMs = v; return this; }
         Builder recoverMaxPerSpell(int v) { recoverMaxPerSpell = v; return this; }
         Builder chatNoReplyMs(long v) { chatNoReplyMs = v; return this; }
+        Builder chatReasksMax(int n) { chatReasksMax = n; return this; }
         Builder recoverSpellReset(long ms, long counts) {
             recoverSpellResetMs = ms;
             recoverSpellResetCounts = counts;

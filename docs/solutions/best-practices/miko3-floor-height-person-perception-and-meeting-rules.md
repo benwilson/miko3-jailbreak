@@ -68,6 +68,8 @@ The rules on PR #29 (branch `feat/explore-hey-miko-always-answers`, not yet merg
 
 This happens at most `callSeenRetargetsMax` = 2 times per call (ExploreTuning.java:1004, enforced at ExploreBrain.java:5771), so a series of blurred boxes cannot swing him back and forth.
 
+**Update 2026-10-02 (owner, at home: "he doesn't really talk to us").** Rule 1 was too strict: from the floor a face is almost never usable, so he met nobody unless called (home log 20:44: people at score 0.76 and 0.80 dropped). A roaming or cue pick with no usable face is now met as a faceless conversation (crouch invitation, no name asked) when its person box scored at least `facelessMeetMinScore` = 0.65 or a voice from the person's known side landed within `facelessMeetVoiceMs` = 5000 ms (`ExploreBrain.facelessMeetable`). Weaker picks with no voice stay phantoms; furniture scores about 0.53. A shove's cue has no side and never counts: at home, a stopped robot logged `shoved: ~3700 counts` every 0.5 s, and each one was noted as "a voice from the person's side".
+
 ## Why This Matters
 
 Without the face rule, every chair edge or desk shadow at 0.53 is a meeting. He drives up to furniture and talks to it, and the people in the office see it. Even with real people, asking a name he cannot store makes him look forgetful: the regulars told him their names and he greeted them as strangers the next time.

@@ -3086,7 +3086,8 @@ public final class ExploreBrainHarness {
             long over = chatOver(rig, open);
             long second = nthListenAt(rig, open, 2);
             long held = noteAt(notes, "an answer has started");
-            long first = noteAt(notes, "first unanswered listen");
+            // Owner 2026-10-02: a wordless answer now gets a "didn't catch that" (up to 2) before one counts.
+            long first = noteAt(notes, "\"didn't catch that\" 1 of 2, not counted");
             check(n, open > 0 && over > 0 && second > 0 && held - second >= 4000 && held - second <= 4150
                             && first - second >= 5000 && first - second <= 5150 && rig.violations.isEmpty(),
                     "second@" + second + " held@" + held + " first unanswered@" + first + " notes=" + notes);
@@ -5416,7 +5417,7 @@ public final class ExploreBrainHarness {
             Rig rig = new Rig(curious().scan(3, 500).sayTimeoutMs(6000).build(), CLEAR, (r, tt) -> list(), true,
                     (r, req, nth) -> null).started();
             rig.runUntil(9000);
-            check(n, t.curiosityMinMs == 18000 && t.curiosityMaxMs == 28000 && t.curiosityRetryMs == 3000
+            check(n, t.curiosityMinMs == 9000 && t.curiosityMaxMs == 14000 && t.curiosityRetryMs == 3000
                             && t.curiosityBackoffMs == 30000 && t.cameraBackoffMs == 120000 && t.askAttempts == 2
                             && t.askTimeoutMs == 10000 && t.pickMatchIou == 0.3f
                             && !rig.askTimeouts.isEmpty() && rig.askTimeouts.get(0) == 10000,
@@ -11235,7 +11236,7 @@ public final class ExploreBrainHarness {
             check(n, t.cueHoldMs == 10000 && t.leanInMs == 4000 && t.newcomerAngleDeg == 45f && t.cueStopBandDeg == 10f
                             && t.strongCueLooks == 3 && t.weakCueLooks == 2
                             && t.facingFaceMinRatio == 0.65f && t.facingFaceMinHeight == 0.12f
-                            && t.unansweredListenMs == 4000 && t.chatStallGraceMs == 5000
+                            && t.unansweredListenMs == 7000 && t.chatReasksMax == 2 && t.chatStallGraceMs == 5000
                             && t.turnBudgetMs == 5000 && t.turnRetryMs == 3000 && t.sentenceCap == 2
                             && t.transcriptWindow == 30 && t.deafTailMs == 500 && t.answerClipMs == 600
                             // Hey-miko plan U6: the placeholders and the heading history.
@@ -13570,8 +13571,26 @@ public final class ExploreBrainHarness {
         return roamRig(personWhen(visible), face);
     }
 
+    /**
+     * Owner 2026-10-02: a faceless pick scoring at least facelessMeetMinScore (0.65) is met
+     * faceless, so the phantom scenarios see person boxes at furniture strength (robot
+     * 2026-10-01: a chair's edge and a desk's shadow scored 0.53-0.54).
+     */
+    static final float PHANTOM_SCORE = 0.55f;
+
+    /** This vision with every person box at PHANTOM_SCORE. */
+    private static Vision weakPeople(Vision v) {
+        return (r, t) -> {
+            List<Detection> out = new ArrayList<Detection>();
+            for (Detection d : v.see(r, t)) {
+                out.add(d.label.equals("person") ? new Detection(d.label, PHANTOM_SCORE, d.x0, d.y0, d.x1, d.y1) : d);
+            }
+            return out;
+        };
+    }
+
     private static Rig roamRig(Vision v, boolean face) {
-        Rig rig = cueRig(cueTuning(), CLEAR, v);
+        Rig rig = cueRig(cueTuning(), CLEAR, face ? v : weakPeople(v));
         rig.people.persona = PERSONA;
         rig.people.match = face
                 ? (r, k) -> STRANGER.withMatch(FaceMatcher.Band.WEAK, null, 0.2f, 3L)
@@ -13635,10 +13654,12 @@ public final class ExploreBrainHarness {
         });
         // ---- Robot 2026-10-01: only a call may open a faceless meeting; a cue's needs a usable face ----
         scenario("cue_weak_then_a_person_box_with_no_face_is_not_met_and_nothing_is_said", n -> {
+            // Owner 2026-10-02: a weak box, and the voice's side no longer counts once it is older
+            // than facelessMeetVoiceMs (0 here), so only the face could make it a meeting.
             String[] detail = {""};
             boolean ok = true;
             for (Ears.Kind kind : new Ears.Kind[] {null, Ears.Kind.GREETING}) {
-                Rig rig = cueRig(personAt(90, 25));
+                Rig rig = cueRig(cueTuning().facelessMeet(0.65f, 0), CLEAR, weakPeople(personAt(90, 25)));
                 rig.people.persona = PERSONA;
                 rig.people.match = (r, k) -> noFace(r);
                 List<String> notes = traced(rig);
@@ -13690,7 +13711,109 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     "chat@" + chat + " asks=" + rig.turnAsks + " " + rig.tail());
         });
+        facelessMeetScenarios();
         callerTalksScenarios();
+    }
+
+    // ---- owner 2026-10-02: a faceless pick that is strong, or spoken from, is still met ----
+    //
+    // At home, "I keep saying hey Miko and he's like oh hi and then he doesn't really talk to
+    // us": people scoring 0.76 and 0.80 were dropped for no usable face (from the floor a face
+    // is almost never usable). A roaming or cue pick with no usable face now becomes a faceless
+    // conversation when its box scored at least facelessMeetMinScore (0.65) or a voice from the
+    // person's known side landed within facelessMeetVoiceMs (5 s); weaker picks with no voice,
+    // and those with only a shove's cue (no side), stay phantoms.
+
+    /** Runs until the brain is on its way to, or meeting, the person; the time, or -1. */
+    private static long towardPerson(Rig rig, long limit) {
+        while (rig.now < limit) {
+            ExploreBrain.State st = rig.brain.state();
+            if (st == ExploreBrain.State.FACE || st == ExploreBrain.State.APPROACH || st == ExploreBrain.State.MEET_LOOK
+                    || st == ExploreBrain.State.MEET) {
+                return rig.now;
+            }
+            rig.runUntil(rig.now + 10);
+        }
+        return -1;
+    }
+
+    private static void facelessMeetScenarios() {
+        scenario("roaming_faceless_pick_scoring_0_76_is_met_faceless_and_asks_no_name", n -> {
+            // Home log 20:44:04: score=0.76, dropped for no usable face.
+            Rig rig = roamRig(oncePaused(box("person", 0.76f, 0.5f, 0.5f, 0.3f, 0.3f)), true);
+            rig.people.match = (r, k) -> noFace(r);
+            List<String> notes = traced(rig);
+            rig.started();
+            long match = runUntilEvent(rig, "match", 0, 12000);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, match, match + 10000);
+            runUntil(rig, chat + 5000, r -> !r.turnAsks.isEmpty());
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, match > 0 && chat > 0 && first != null && first.request.faceless && !first.request.called
+                            && first.request.heard == null && rig.tuning.facelessMeetMinScore == 0.65f
+                            && noted(notes, "but the person box scored 0.76: meeting them faceless")
+                            && !noted(notes, "not meeting them") && rig.violations.isEmpty(),
+                    "match@" + match + " chat@" + chat + " asks=" + rig.turnAsks + " " + rig.tail());
+        });
+        scenario("roaming_weak_faceless_pick_with_a_voice_from_its_side_is_met_faceless", n -> {
+            Rig rig = roamRig(t -> true, false);
+            List<String> notes = traced(rig);
+            rig.started();
+            long toward = towardPerson(rig, 12000);
+            rig.cue(toward + 10, Ears.Tier.WEAK, Ears.Side.LEFT, 0f);
+            long match = runUntilEvent(rig, "match", toward, toward + 12000);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, match, match + 10000);
+            runUntil(rig, chat + 5000, r -> !r.turnAsks.isEmpty());
+            TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
+            check(n, toward > 0 && match > 0 && chat > 0 && first != null && first.request.faceless
+                            && noted(notes, "a voice from the person's side: carrying on toward them")
+                            && noted(notes, "but a voice from their side") && !noted(notes, "not meeting them")
+                            && rig.violations.isEmpty(),
+                    "toward@" + toward + " match@" + match + " chat@" + chat + " notes=" + notes + " " + rig.tail());
+        });
+        scenario("roaming_weak_faceless_pick_with_only_a_shove_is_still_a_phantom", n -> {
+            // Robot 2026-10-02 at home: a shove's cue (no side) read as "a voice from the person's side".
+            Rig rig = roamRig(t -> true, false);
+            List<String> notes = traced(rig);
+            rig.started();
+            long toward = towardPerson(rig, 12000);
+            rig.cue(toward + 10, Ears.Tier.WEAK, Ears.Side.UNKNOWN, Float.NaN);
+            long match = runUntilEvent(rig, "match", toward, toward + 12000);
+            rig.runUntil(match + 8000);
+            check(n, toward > 0 && match > 0 && entered(rig, ExploreBrain.State.CHAT_THINK, 0) < 0
+                            && spokenAfter(rig, match) == 0
+                            && noted(notes, "no usable face in the roaming person pick's box") && rig.violations.isEmpty(),
+                    "toward@" + toward + " match@" + match + " notes=" + notes + " " + rig.tail());
+        });
+        scenario("roaming_weak_faceless_pick_with_an_old_voice_is_still_a_phantom", n -> {
+            Rig rig = cueRig(cueTuning().facelessMeet(0.65f, 0), CLEAR, weakPeople(personWhen(t -> true)));
+            rig.people.persona = PERSONA;
+            rig.people.match = (r, k) -> noFace(r);
+            List<String> notes = traced(rig);
+            rig.started();
+            long toward = towardPerson(rig, 12000);
+            rig.cue(toward + 10, Ears.Tier.WEAK, Ears.Side.LEFT, 0f);
+            long match = runUntilEvent(rig, "match", toward, toward + 12000);
+            rig.runUntil(match + 8000);
+            check(n, toward > 0 && match > 0 && entered(rig, ExploreBrain.State.CHAT_THINK, 0) < 0
+                            && noted(notes, "no usable face in the roaming person pick's box") && rig.violations.isEmpty(),
+                    "toward@" + toward + " match@" + match + " notes=" + notes + " " + rig.tail());
+        });
+        scenario("cue_voice_then_a_weak_faceless_box_is_met_faceless_with_no_name_asked", n -> {
+            Rig rig = cueRig(weakPeople(personAt(90, 25)));
+            rig.people.persona = PERSONA;
+            rig.people.match = (r, k) -> noFace(r);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.cue(400, Ears.Tier.WEAK, Ears.Side.LEFT, -90f);
+            rig.runUntil(400);
+            long chat = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 30000);
+            runUntil(rig, chat + 5000, r -> !r.turnAsks.isEmpty());
+            TurnAsk first = firstAsk(rig, chat);
+            check(n, chat > 0 && first != null && first.request.faceless && !first.request.called
+                            && noted(notes, "no usable face in the cue's person box, but a voice from their side")
+                            && rig.violations.isEmpty(),
+                    "chat@" + chat + " notes=" + notes + " " + rig.tail());
+        });
     }
 
     // ---- the caller talks while he looks for them (owner, 2026-09-30) ----
@@ -14801,7 +14924,8 @@ public final class ExploreBrainHarness {
                     + "{\"tool\":\"wait\",\"args\":{\"seconds\":60},\"check\":false}]}"), null);
             long over = chatOver(rig, open);
             long stopped = notedAt(notes, "end=stopped", open);
-            check(n, open > 0 && stopped > open && over > stopped && rig.turnAsks.size() == 3
+            // Owner 2026-10-02: the two silences after line 3 get one follow-up turn before the end.
+            check(n, open > 0 && stopped > open && over > stopped && rig.turnAsks.size() == 4
                             && noted(notes, "an instruction (stop): done at once; the conversation goes on")
                             && rig.brain.task() == null && rig.violations.isEmpty(),
                     "stopped@" + stopped + " over@" + over + " asks=" + rig.turnAsks.size() + " notes=" + actNotes(notes));
@@ -15044,7 +15168,7 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     "asks=" + rig.turnAsks.size() + " notes=" + notesAfter(notes, open));
         });
-        scenario("chat_no_reply_said_to_him_for_45_s_ends_it_politely", n -> {
+        scenario("chat_no_reply_said_to_him_for_60_s_ends_it_politely", n -> {
             // The cap shortened to 9 s so two slow not-addressed turns (under the three) reach it.
             Rig rig = callChatRig(chatFirstTuning().chatNoReplyMs(9000), CLEAR, EMPTY_ROOM,
                     hearWords("so the quarterly numbers").after(3500), hearWords("yeah totally").after(3500),
@@ -15057,7 +15181,7 @@ public final class ExploreBrainHarness {
             long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
             long over = chatOver(rig, open);
             ExploreTuning plain = new ExploreTuning.Builder().build();
-            check(n, plain.chatNoReplyMs == 45000 && over > 0 && notesWith(notes, "not said to him (") >= 1
+            check(n, plain.chatNoReplyMs == 60000 && over > 0 && notesWith(notes, "not said to him (") >= 1
                             && notesWith(notes, "unanswered in a row") == 0
                             && noted(notes, "no message said to him for 9 s") && rig.count("say " + ChatSession.LEAVE_THEM) == 1
                             && rig.violations.isEmpty(),
@@ -15208,7 +15332,9 @@ public final class ExploreBrainHarness {
             for (TurnAsk a : rig.turnAsks) {
                 cantSee |= a.request.cantSee;
             }
-            check(n, open > 0 && over > 0 && rig.tuning.callChatUnansweredMax == 3 && rig.turnAsks.size() == 6
+            // Owner 2026-10-02: the second unanswered listen gets one follow-up turn; the third ends it.
+            check(n, open > 0 && over > 0 && rig.tuning.callChatUnansweredMax == 3 && rig.turnAsks.size() == 7
+                            && noted(notes, "2 unanswered listen(s): one gentle follow-up before the sign-off")
                             && noted(notes, "3 unanswered listens in a row") && !noted(notes, "walked off")
                             && !noted(notes, "one look for them") && noted(notes, "nobody found in the search")
                             && cantSee && rig.violations.isEmpty(),
@@ -15230,6 +15356,29 @@ public final class ExploreBrainHarness {
             }
             check(n, open > 0 && over > 0 && rig.count("say " + ChatSession.DIDNT_CATCH) == 1 && heardAgain
                             && noted(notes, "they said goodbye") && !noted(notes, "unanswered listens in a row")
+                            && rig.violations.isEmpty(),
+                    "reasks=" + rig.count("say " + ChatSession.DIDNT_CATCH) + " notes=" + notes + " " + rig.tail());
+        });
+        scenario("callchat_two_wordless_answers_get_two_didnt_catch_thats_and_the_third_counts", n -> {
+            // Owner 2026-10-02 (home, 4 s of speech gave no words): up to two re-asks, which ask them
+            // to come closer or speak up; the third wordless answer is an unanswered listen.
+            Rig rig = callChatRig(EMPTY_ROOM, hearSilence().after(5000).answeringAfter(1000),
+                    hearSilence().after(5000).answeringAfter(1000), hearSilence().after(5000).answeringAfter(1000),
+                    hearWords("hello again"), hearWords("bye"));
+            List<String> notes = traced(rig);
+            rig.started();
+            heyMiko(rig, 400, Ears.Side.LEFT, 800, "");
+            rig.runUntil(400);
+            long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
+            long over = chatOver(rig, open);
+            boolean heardAgain = false;
+            for (TurnAsk a : rig.turnAsks) {
+                heardAgain |= "hello again".equals(a.request.heard);
+            }
+            check(n, open > 0 && over > 0 && rig.count("say " + ChatSession.DIDNT_CATCH) == 2 && heardAgain
+                            && ChatSession.DIDNT_CATCH.contains("come a bit closer or speak up")
+                            && noted(notes, "\"didn't catch that\" 2 of 2, not counted")
+                            && noted(notes, "unanswered listen 1 of 3") && noted(notes, "they said goodbye")
                             && rig.violations.isEmpty(),
                     "reasks=" + rig.count("say " + ChatSession.DIDNT_CATCH) + " notes=" + notes + " " + rig.tail());
         });
@@ -15579,17 +15728,20 @@ public final class ExploreBrainHarness {
                             && rig.violations.isEmpty(),
                     "open@" + open + " say2@" + say2 + " over@" + over + " unpark=" + unpark + " " + rig.tail());
         });
-        scenario("chat_silence_twice_with_the_face_still_there_signs_off_once", n -> {
+        scenario("chat_silence_twice_with_the_face_still_there_gets_one_follow_up_then_signs_off_once", n -> {
+            // Owner 2026-10-02 ("he doesn't really talk to us"): the second silence gets one gentle
+            // follow-up (the NUDGE turn) instead of the sign-off; the silence after it signs off.
             Rig rig = sarahRig(true);
-            rig.people.listen = ListenScript.turns(hearWords("hi"), hearSilence(), hearSilence());
+            rig.people.listen = ListenScript.turns(hearWords("hi"), hearSilence(), hearSilence(), hearSilence());
             long open = openChat(rig);
             long say2 = runUntilEvent(rig, "say Line 2.", open, open + 30000);
             long over = chatOver(rig, say2);
             int unpark = rig.firstAfter("unpark", say2);
             long secondListen = rig.timeOf(rig.firstAfter("listen", rig.timeOf(unpark)));
             check(n, open > 0 && say2 > 0 && over > 0 && rig.count("react sign-off") == 1 && unpark >= 0
-                            && rig.countPrefix("unpark", open, over) == 1 && rig.countPrefix("listen", open, over) == 3
-                            && secondListen > rig.timeOf(unpark) && rig.turnAsks.size() == 2
+                            && rig.countPrefix("unpark", open, over) == 1 && rig.countPrefix("listen", open, over) == 4
+                            && secondListen > rig.timeOf(unpark) && rig.turnAsks.size() == 3
+                            && ExplorePrompts.NUDGE.equals(rig.turnAsks.get(2).request.heard)
                             && rig.brain.state() == ExploreBrain.State.PAUSE && rig.violations.isEmpty(),
                     "open@" + open + " over@" + over + " unparks=" + rig.countPrefix("unpark", open, over) + " " + rig.tail());
         });
@@ -15862,7 +16014,8 @@ public final class ExploreBrainHarness {
             long second = nthListenAt(rig, open, 2);
             long held = noteAt(notes, "an answer has started");
             long gaveUp = noteAt(notes, "the answer's words never came");
-            long first = noteAt(notes, "first unanswered listen");
+            // Owner 2026-10-02: a wordless answer now gets a "didn't catch that" (up to 2) before one counts.
+            long first = noteAt(notes, "\"didn't catch that\" 1 of 2, not counted");
             long hold = rig.tuning.answerHoldMs;
             check(n, open > 0 && over > 0 && second > 0 && hold == 63000
                             && held - second >= 4000 && held - second <= 4150
@@ -16194,7 +16347,7 @@ public final class ExploreBrainHarness {
             rig.runUntil(over + 15000);
             List<String> notes = rig.traceNotes;
             check(n, open > 0 && say2 > 0 && say3 > say2 && say4 > say3 && over > say4 && docked >= over
-                            && rig.turnAsks.size() == 4 && rig.count("react sign-off") == 1
+                            && rig.turnAsks.size() == 5 && rig.count("react sign-off") == 1
                             && rig.countPrefix("turn RIGHT", over, over + 6000) == 0
                             && rig.countPrefix("turn LEFT", over, over + 6000) == 0
                             && rig.countPrefix("hop", over, over + 6000) == 0
@@ -16359,7 +16512,7 @@ public final class ExploreBrainHarness {
         });
         scenario("chat_lease_lost_mid_conversation_continues_without_the_look_and_a_6_s_sensor_stall_ends_it", n -> {
             Rig lost = sarahRig(true);
-            lost.people.listen = ListenScript.turns(hearWords("hi"), hearSilence(), hearSilence());
+            lost.people.listen = ListenScript.turns(hearWords("hi"), hearSilence(), hearSilence(), hearSilence());
             long open = openChat(lost);
             long say2 = runUntilEvent(lost, "say Line 2.", open, open + 30000);
             lost.at(say2 + 100, () -> lost.brain.onLeaseChanged(false));
@@ -16377,7 +16530,7 @@ public final class ExploreBrainHarness {
             long eyesOnly2 = runUntilState(stalled, ExploreBrain.State.EYES_ONLY, over2 - 1, over2 + 2000);
             check(n, open > 0 && say2 > 0 && over > 0 && lost.countPrefix("unpark", say2, over) == 0
                             && lost.count("react sign-off") == 1
-                            && lost.countPrefix("listen", say2, over) == 2 && lost.notesDeltas.size() == 2 && eyesOnly > 0
+                            && lost.countPrefix("listen", say2, over) == 3 && lost.notesDeltas.size() == 3 && eyesOnly > 0
                             && open2 > 0 && say1 > 0 && over2 > 0 && signOff2 >= 0
                             && stalled.timeOf(signOff2) >= stall[0] + 5000 && stalled.timeOf(signOff2) < stall[0] + 7000
                             && eyesOnly2 > 0

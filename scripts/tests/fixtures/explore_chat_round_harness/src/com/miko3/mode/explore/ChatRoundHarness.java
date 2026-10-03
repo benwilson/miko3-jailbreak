@@ -826,7 +826,9 @@ public final class ChatRoundHarness {
                 .reply(respondUse("toolu_2", "Okay, coming forward."),
                         new String[]{"toolu_M", "move", "{\"kind\":\"forward\",\"amount\":1}"})
                 .reply(respondUse("toolu_3", "Actually, I can't drive off my charger."))
-                .reply(respondUse("toolu_4", "Bye then."));
+                .reply(respondUse("toolu_4", "Bye then."))
+                // Owner 2026-10-02: the second silence after it gets one gentle follow-up (NUDGE).
+                .reply(respondUse("toolu_5", "Still with me?"));
         Flight f = new Flight(t, facts("he is on his charger")).run("Come forward a bit.", "Okay.");
         int okay = f.said.indexOf("Okay, coming forward.");
         int sorry = f.said.indexOf("Actually, I can't drive off my charger.");
