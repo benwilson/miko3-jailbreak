@@ -23,6 +23,7 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig;
 import com.k2fsa.sherpa.onnx.Vad;
 import com.k2fsa.sherpa.onnx.VadModelConfig;
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotEars;
 import com.miko3.shared.VoiceDirection;
 
@@ -63,7 +64,9 @@ import java.util.concurrent.TimeUnit;
  * thread; listens are refused until then. The one recogniser decodes with
  * modified_beam_search, the hotwords file, bpe modelling with its vocabulary,
  * 2 threads and 2 active paths, and ends an utterance 0.8 s after its last
- * word or after about 2 s of nothing decoded.
+ * word or after about 2 s of nothing decoded. EarsTuning's properties (all off
+ * by default) switch the decoding, paths and threads, and the ears' wake gate,
+ * for the CPU measurements in scripts/qa-ears-cpu.py.
  *
  * The one-shot listen runs on the "listen" thread as before. The ears
  * session runs its capture on its own "ears" thread, samples the direction
@@ -79,11 +82,11 @@ final class ListenEngine implements ListenSession.Ears {
     /** KTD2: at the asset root, outside the staged model directory. */
     private static final String HOTWORDS_ASSET = "hotwords.txt";
     private static final String WAKE_MODEL_ASSET = "miko_wakeword_model.tflite";
+    /** Owner 2026-10-02: the speaker-embedding model (3D-Speaker CAM++), stamped like the listen model. */
+    private static final String VOICE_ASSETS = "voiceid";
+    private static final String VOICE_MODEL = "model.onnx";
     /** How long a listen waits for the robot to finish speaking. */
     static final long IDLE_TIMEOUT_MS = 20000;
-    /** KTD2: threads and active paths for the one recogniser. */
-    private static final int THREADS = 2;
-    private static final int MAX_ACTIVE_PATHS = 2;
     private static final float HOTWORDS_SCORE = 2.0f;
     /** The wake-word thresholds voice mode measured (VoiceEngine). */
     private static final float HEY_THRESHOLD = 0.65f;
@@ -94,7 +97,12 @@ final class ListenEngine implements ListenSession.Ears {
     private static final float VAD_MIN_SILENCE_S = 0.25f;
     private static final float VAD_MIN_SPEECH_S = 0.1f;
     private static final int VAD_WINDOW = 512;
-    private static final float VAD_MAX_SPEECH_S = 20f;
+    /**
+     * Owner 2026-10-02: the longest single utterance, for the Silero VAD's max-speech split and
+     * the recogniser's rule 3. Both were 20 s, so a run-on answer was split at about 20 s; they
+     * now follow a conversation listen's hard cap, which cuts any answer anyway.
+     */
+    private static final float LONGEST_UTTERANCE_S = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS / 1000f;
     private static final long TICK_MS = 500;
     /** Silence handed to the model after a capped listen, so its last words come out. */
     private static final int TAIL_SAMPLES = ListenSession.SAMPLE_RATE * 3 / 10;
@@ -107,7 +115,13 @@ final class ListenEngine implements ListenSession.Ears {
     private final Context context;
     private final ListenSession session;
     private final EarsSession ears;
+    /** robot-say.py's debug-only heard-text injection, wrapped around the ears' engine, gate and recogniser. */
+    private final EarsInject inject;
+    /** Owner 2026-10-02: who is speaking, by voice; fed by the ears, its model loaded on its own thread. */
+    private final VoiceId voiceId;
     private final SpeechTuning tuning;
+    /** KTD2's threads, active paths and decoding unless a property switches them. */
+    private final EarsTuning earsTuning;
     private volatile OnlineRecognizer recognizer;
     private volatile Vad vad;
     private volatile WakeWord wakeWord;
@@ -139,12 +153,15 @@ final class ListenEngine implements ListenSession.Ears {
                 return speech.awaitIdle(timeoutMs);
             }
         }, this, IDLE_TIMEOUT_MS);
-        this.tuning = SpeechTuning.from(new SpeechTuning.Props() {
+        SpeechTuning.Props props = new SpeechTuning.Props() {
             @Override
             public String get(String key) {
                 return SpeechEngine.systemProperty(key);
             }
-        });
+        };
+        this.tuning = SpeechTuning.from(props);
+        this.earsTuning = EarsTuning.from(props);
+        configureDirection();
         // KTD11: the Settings page's "answers when spoken to" switch, read through
         // the launcher's settings (its one parser of the stored value) at classify time.
         CueClassifier.Switch earsSwitch = new CueClassifier.Switch() {
@@ -153,18 +170,50 @@ final class ListenEngine implements ListenSession.Ears {
                 return settings.conversation().answersWhenSpokenTo;
             }
         };
-        this.ears = new EarsSession(new EarsSession.Clock() {
+        EarsSession.Clock earsClock = new EarsSession.Clock() {
             @Override
             public long nowMs() {
                 return SystemClock.elapsedRealtime();
             }
-        }, earsCapture, earsSpotter, earsGate, earsRecognizer, earsDirection, new CueClassifier(earsSwitch),
-                tuning.deafTailMs, new EarsSession.Diag() {
-                    @Override
-                    public void log(String note) {
-                        Log.i(TAG, "ears: " + note);
-                    }
-                });
+        };
+        EarsSession.Diag earsDiag = new EarsSession.Diag() {
+            @Override
+            public void log(String note) {
+                Log.i(TAG, "ears: " + note);
+            }
+        };
+        // Debug only (robot-say.py): inert unless debug.miko3.ears_inject is 1 when an utterance is offered.
+        this.inject = new EarsInject(earsClock, new EarsInject.Props() {
+            @Override
+            public String get(String key) {
+                return SpeechEngine.systemProperty(key);
+            }
+        }, earsDiag);
+        this.ears = new EarsSession(earsClock, earsCapture, inject.spotter(earsSpotter), inject.gate(earsGate),
+                inject.recognizer(earsRecognizer), earsDirection, new CueClassifier(earsSwitch),
+                tuning.deafTailMs, earsDiag, earsTuning.gateWake, EarsSession.prerollMs(props.get(EarsSession.PREROLL_PROP)));
+        VoiceStore.Diag voiceDiag = new VoiceStore.Diag() {
+            @Override
+            public void log(String note) {
+                Log.i(TAG, note);
+            }
+        };
+        VoiceTuning voiceTuning = VoiceTuning.from(new VoiceTuning.Props() {
+            @Override
+            public String get(String key) {
+                return SpeechEngine.systemProperty(key);
+            }
+        });
+        this.voiceId = new VoiceId(new VoiceStore(new File(context.getFilesDir(), "voiceprints.bin"),
+                VoiceTuning.MAX_PER_PERSON, voiceDiag), voiceTuning, voiceDiag);
+        voiceId.setListener(new VoiceId.Listener() {
+            @Override
+            public void voice(long at, String person, float score, int band) {
+                ears.voiceHeard(at, person, score, band);
+            }
+        });
+        ears.setVoice(voiceId);
+        Log.i(TAG, "voice: " + voiceTuning);
         // KTD1: the deaf window follows the speech queue's line start and idle.
         speech.setSpeaking(new SpeechQueue.Speaking() {
             @Override
@@ -185,6 +234,16 @@ final class ListenEngine implements ListenSession.Ears {
 
     EarsSession ears() {
         return ears;
+    }
+
+    /** Owner 2026-10-02: the people layer's way to enrol and forget voices. */
+    VoicePrints voicePrints() {
+        return voiceId;
+    }
+
+    /** For EarsInjectReceiver. */
+    EarsInject inject() {
+        return inject;
     }
 
     /** Loads the models on the listen thread (so a listen queued behind it waits),
@@ -238,7 +297,83 @@ final class ListenEngine implements ListenSession.Ears {
                         public void run() {
                             try {
                                 callback.heard(u.text, u.side, u.angle == null ? Float.NaN : u.angle, u.tier, u.at,
-                                        u.partial, u.kind);
+                                        u.partial, u.kind, u.called, u.message);
+                            } catch (RemoteException | RuntimeException e) {
+                                // The client is gone; its death releases the session.
+                            }
+                        }
+                    });
+                } catch (RejectedExecutionException ignored) {
+                    // Shutting down.
+                }
+            }
+
+            /** On the same delivery thread as heard(), so the mode gets it before the answer's words. */
+            @Override
+            public void answering(final long at) {
+                try {
+                    deliver.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                callback.answering(at);
+                            } catch (RemoteException | RuntimeException e) {
+                                // The client is gone; its death releases the session.
+                            }
+                        }
+                    });
+                } catch (RejectedExecutionException ignored) {
+                    // Shutting down.
+                }
+            }
+
+            /** Robot 2026-10-02: on the same delivery thread, so it follows answering() and precedes the words. */
+            @Override
+            public void provisional(final long at, final String text) {
+                try {
+                    deliver.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                callback.provisional(at, text);
+                            } catch (RemoteException | RuntimeException e) {
+                                // The client is gone; its death releases the session.
+                            }
+                        }
+                    });
+                } catch (RejectedExecutionException ignored) {
+                    // Shutting down.
+                }
+            }
+
+            /** Review P2-2: on the same delivery thread too, so it follows the answer's answering(). */
+            @Override
+            public void answerOver(final long at) {
+                try {
+                    deliver.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                callback.answerOver(at);
+                            } catch (RemoteException | RuntimeException e) {
+                                // The client is gone; its death releases the session.
+                            }
+                        }
+                    });
+                } catch (RejectedExecutionException ignored) {
+                    // Shutting down.
+                }
+            }
+
+            /** Owner 2026-10-02: on the same delivery thread, so it always follows the answer's heard(). */
+            @Override
+            public void voice(final long at, final String person, final float score, final int band) {
+                try {
+                    deliver.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                callback.voice(at, person, score, band);
                             } catch (RemoteException | RuntimeException e) {
                                 // The client is gone; its death releases the session.
                             }
@@ -250,6 +385,11 @@ final class ListenEngine implements ListenSession.Ears {
             }
         };
         ears.open(String.valueOf(uid), token, client, chargerLatched);
+        // The NC DSP's settings at each ears open, on their own thread (logged; applied only when set).
+        VoiceDirection.checkNcLater(SpeechEngine.systemProperty(VoiceDirection.NC_STATUS_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.NC_APPLY_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.NC_GAIN_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.NC_DGAIN_PROPERTY));
     }
 
     /**
@@ -289,7 +429,7 @@ final class ListenEngine implements ListenSession.Ears {
             File dir = installAssets(context, MODEL_ASSETS);
             hotwordsPath = copyAsset(context, HOTWORDS_ASSET).getAbsolutePath();
             long copied = SystemClock.elapsedRealtime();
-            OnlineRecognizer r = new OnlineRecognizer(config(dir, hotwordsPath));
+            OnlineRecognizer r = new OnlineRecognizer(config(dir, hotwordsPath, earsTuning));
             long loaded = SystemClock.elapsedRealtime();
             // One short decode first, so the first real listen doesn't pay ONNX
             // Runtime's first-run allocations while someone is answering.
@@ -304,11 +444,41 @@ final class ListenEngine implements ListenSession.Ears {
             recognizer = r;
             Log.i(TAG, "recognizer ready in " + (SystemClock.elapsedRealtime() - t0) + " ms (files "
                     + (copied - t0) + " ms, load " + (loaded - copied) + " ms, warm-up and VAD "
-                    + (SystemClock.elapsedRealtime() - loaded) + " ms)");
+                    + (SystemClock.elapsedRealtime() - loaded) + " ms; " + earsTuning + ")");
         } catch (Throwable t) {
             Log.e(TAG, "recognizer failed to load; the robot cannot listen", t);
         }
         loadWakeWord();
+        loadVoiceId();
+    }
+
+    /**
+     * Owner 2026-10-02: the speaker-embedding model, copied out and loaded on the voice
+     * thread itself, so the recogniser never waits on it. Without it the ears still hear;
+     * nobody is identified by voice. With VoiceTuning.BENCH_PROP at 1 it then times
+     * compute() on 1.5-8 s of audio (qa-voice-bench.py).
+     */
+    private void loadVoiceId() {
+        final boolean bench = "1".equals(SpeechEngine.systemProperty(VoiceTuning.BENCH_PROP));
+        voiceId.runOnVoiceThread(new Runnable() {
+            @Override
+            public void run() {
+                long t0 = SystemClock.elapsedRealtime();
+                try {
+                    File dir = installAssets(context, VOICE_ASSETS);
+                    SherpaVoiceEmbedder e = new SherpaVoiceEmbedder(new File(dir, VOICE_MODEL).getAbsolutePath());
+                    voiceId.setEmbedder(e);
+                    Log.i(TAG, "voice: model ready in " + (SystemClock.elapsedRealtime() - t0) + " ms (dim "
+                            + e.dim() + ")");
+                } catch (Throwable t) {
+                    Log.e(TAG, "voice: model failed to load; nobody is identified by voice", t);
+                    return;
+                }
+                if (bench) {
+                    voiceId.bench(new long[] {1500, 3000, 5000, 8000}, 3);
+                }
+            }
+        });
     }
 
     /** The vendor engine, as VoiceEngine loads it; without it the session still
@@ -333,8 +503,9 @@ final class ListenEngine implements ListenSession.Ears {
         }
     }
 
-    /** KTD2: the one configuration that serves roaming and the conversation. */
-    private static OnlineRecognizerConfig config(File dir, String hotwords) {
+    /** KTD2: the one configuration that serves roaming and the conversation; t's
+     * switches, unset, leave it exactly as KTD2 chose. */
+    private static OnlineRecognizerConfig config(File dir, String hotwords, EarsTuning t) {
         OnlineTransducerModelConfig transducer = OnlineTransducerModelConfig.builder()
                 .setEncoder(new File(dir, "encoder.onnx").getAbsolutePath())
                 .setDecoder(new File(dir, "decoder.onnx").getAbsolutePath())
@@ -345,33 +516,36 @@ final class ListenEngine implements ListenSession.Ears {
                 .setTokens(new File(dir, "tokens.txt").getAbsolutePath())
                 .setModelingUnit("bpe")
                 .setBpeVocab(new File(dir, BPE_VOCAB).getAbsolutePath())
-                .setNumThreads(THREADS)
+                .setNumThreads(t.threads)
                 .setDebug(false)
                 .setProvider("cpu")
                 .build();
         // KTD2: an utterance ends 0.8 s after its last word (rule 2) or after about
         // 2 s of nothing decoded (rule 1); the brain keeps the unanswered-listen
         // clock, and the one-shot's cap stops anything longer, so rule 3 is only a
-        // far backstop.
+        // far backstop. A conversation listen's answer runs past rule 2's endpoint
+        // (EarsSession.ANSWER_SILENCE_MS): there it only closes a segment.
         EndpointConfig endpoint = EndpointConfig.builder()
                 .setRule1(EndpointRule.builder().setMustContainNonSilence(false)
                         .setMinTrailingSilence(2.0f).setMinUtteranceLength(0f).build())
                 .setRule2(EndpointRule.builder().setMustContainNonSilence(true)
                         .setMinTrailingSilence(0.8f).setMinUtteranceLength(0f).build())
                 .setRule3(EndpointRule.builder().setMustContainNonSilence(false)
-                        .setMinTrailingSilence(0f).setMinUtteranceLength(20f).build())
+                        .setMinTrailingSilence(0f).setMinUtteranceLength(LONGEST_UTTERANCE_S).build())
                 .build();
-        return OnlineRecognizerConfig.builder()
+        OnlineRecognizerConfig.Builder b = OnlineRecognizerConfig.builder()
                 .setFeatureConfig(FeatureConfig.builder().setSampleRate(ListenSession.SAMPLE_RATE)
                         .setFeatureDim(80).build())
                 .setOnlineModelConfig(model)
                 .setEndpointConfig(endpoint)
                 .setEnableEndpoint(true)
-                .setDecodingMethod("modified_beam_search")
-                .setMaxActivePaths(MAX_ACTIVE_PATHS)
-                .setHotwordsFile(hotwords)
-                .setHotwordsScore(HOTWORDS_SCORE)
-                .build();
+                .setDecodingMethod(t.decoding)
+                .setMaxActivePaths(t.paths);
+        // sherpa-onnx's config check refuses a hotwords file without modified_beam_search.
+        if (t.hotwords()) {
+            b.setHotwordsFile(hotwords).setHotwordsScore(HOTWORDS_SCORE);
+        }
+        return b.build();
     }
 
     private static VadModelConfig vadConfig(File dir) {
@@ -382,7 +556,7 @@ final class ListenEngine implements ListenSession.Ears {
                         .setMinSilenceDuration(VAD_MIN_SILENCE_S)
                         .setMinSpeechDuration(VAD_MIN_SPEECH_S)
                         .setWindowSize(VAD_WINDOW)
-                        .setMaxSpeechDuration(VAD_MAX_SPEECH_S)
+                        .setMaxSpeechDuration(LONGEST_UTTERANCE_S)
                         .build())
                 .setSampleRate(ListenSession.SAMPLE_RATE)
                 .setNumThreads(1)
@@ -405,16 +579,22 @@ final class ListenEngine implements ListenSession.Ears {
         return true;
     }
 
-    /** One AudioRecord on VOICE_COMMUNICATION, started, or IOException with why not. */
+    /** One AudioRecord on the chosen source (VOICE_COMMUNICATION unless set), started, or IOException with why not. */
     private AudioRecord openRecord() throws IOException {
         int minBuf = AudioRecord.getMinBufferSize(ListenSession.SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) {
             throw new IOException("unsupported microphone configuration (" + minBuf + ")");
         }
+        // Owner 2026-10-02 at home: "his microphone has a hard time hearing things". The vendor
+        // recorded on VOICE_RECOGNITION (no noise suppression or AGC by Android's rules), while
+        // VOICE_COMMUNICATION adds call-tuned processing known to hurt recognition.
+        // persist.miko3.ears.source picks it when the microphone opens; unset: as before.
+        String sourceName = MicGain.sourceName(SpeechEngine.systemProperty(MicGain.SOURCE_PROP));
+        int source = MicGain.source(sourceName);
         final AudioRecord record;
         try {
-            record = new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, ListenSession.SAMPLE_RATE,
+            record = new AudioRecord(source, ListenSession.SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
                     Math.max(minBuf, ListenSession.CHUNK_SAMPLES * 2 * 4));
         } catch (RuntimeException e) {
@@ -429,7 +609,7 @@ final class ListenEngine implements ListenSession.Ears {
             record.release();
             throw new IOException("microphone did not start recording");
         }
-        Log.i(TAG, "microphone open (VOICE_COMMUNICATION, 16 kHz mono, buffer " + minBuf + ")");
+        Log.i(TAG, "microphone open (" + sourceName + ", 16 kHz mono, buffer " + minBuf + ")");
         return record;
     }
 
@@ -442,6 +622,16 @@ final class ListenEngine implements ListenSession.Ears {
             private double sumSquares;
             private long count;
             private int peak;
+            // Owner 2026-10-02 at home: "his microphone has a hard time hearing things". A software
+            // gain (persist.miko3.ears.gain_db, 0..18 dB, re-read every ~3 s so it can be tuned live)
+            // before the wake word, the speech detector and the recogniser; a level line each minute.
+            private float gain = MicGain.factor(SpeechEngine.systemProperty(MicGain.PROP));
+            private long gainCheckedAt;
+            private long windowStart = System.currentTimeMillis();
+            private double windowSq;
+            private long windowN;
+            private int windowPeak;
+            private long windowClipped;
 
             @Override
             public int read(float[] buf) {
@@ -450,13 +640,40 @@ final class ListenEngine implements ListenSession.Ears {
                     Log.w(TAG, "microphone read failed: " + n);
                     return -1;
                 }
+                long now = System.currentTimeMillis();
+                if (now - gainCheckedAt >= 3000) {
+                    gainCheckedAt = now;
+                    float g = MicGain.factor(SpeechEngine.systemProperty(MicGain.PROP));
+                    if (g != gain) {
+                        Log.i(TAG, "ears: mic gain now x" + g);
+                        gain = g;
+                    }
+                }
                 for (int i = 0; i < n; i++) {
                     int s = pcm[i];
-                    buf[i] = s / 32768f;
                     sumSquares += (double) s * s;
                     peak = Math.max(peak, Math.abs(s));
+                    windowSq += (double) s * s;
+                    windowPeak = Math.max(windowPeak, Math.abs(s));
+                    float v = s * gain;
+                    if (v > 32767f || v < -32768f) {
+                        windowClipped++;
+                        v = v > 0 ? 32767f : -32768f;
+                    }
+                    buf[i] = v / 32768f;
                 }
                 count += n;
+                windowN += n;
+                if (now - windowStart >= 60000) {
+                    long rms = windowN == 0 ? 0 : Math.round(Math.sqrt(windowSq / windowN));
+                    Log.i(TAG, "ears: mic level: RMS " + rms + ", peak " + windowPeak + " (raw), gain x" + gain
+                            + ", clipped " + windowClipped + " of " + windowN + " samples");
+                    windowStart = now;
+                    windowSq = 0;
+                    windowN = 0;
+                    windowPeak = 0;
+                    windowClipped = 0;
+                }
                 return n;
             }
 
@@ -677,11 +894,31 @@ final class ListenEngine implements ListenSession.Ears {
         }
     };
 
+    /** Explore plan U2 (KTD10, KTD12): the confirmed NC port and its calibration,
+     * read from their properties the way SpeechTuning reads its own, handed to
+     * VoiceDirection before its first open(). Unset, the chip is never tried. The
+     * left/right thresholds put the chip in side mode (robot, 2026-09-29: it cannot
+     * tell front from back) when no calibration is set. */
+    static void configureDirection() {
+        VoiceDirection.configure(VoiceDirection.Config.of(
+                SpeechEngine.systemProperty(VoiceDirection.PORT_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.ZERO_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.SIGN_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.SCALE_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.LEFT_PROPERTY),
+                SpeechEngine.systemProperty(VoiceDirection.RIGHT_PROPERTY)), new VoiceDirection.Logger() {
+                    @Override
+                    public void log(String msg) {
+                        Log.i(TAG, msg);
+                    }
+                });
+    }
+
     /** KTD4: sampled on VoiceDirection's own thread, never the capture thread. */
     private final EarsSession.Direction earsDirection = new EarsSession.Direction() {
         @Override
         public EarsSession.Sampling start() {
-            final VoiceDirection.Sampler sampler = VoiceDirection.open().sample(EarsSession.DIRECTION_PERIOD_MS);
+            final VoiceDirection.Sampler sampler = VoiceDirection.sampleLazily(EarsSession.DIRECTION_PERIOD_MS);
             return new EarsSession.Sampling() {
                 @Override
                 public List<Float> drain() {
@@ -693,6 +930,11 @@ final class ListenEngine implements ListenSession.Ears {
                     sampler.stop();
                 }
             };
+        }
+
+        @Override
+        public boolean sideOnly() {
+            return VoiceDirection.sideOnlyConfigured();
         }
     };
 

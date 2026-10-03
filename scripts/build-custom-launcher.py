@@ -30,6 +30,8 @@ ListenService runs sherpa-onnx's streaming zipformer-en-20M. The build
 downloads that model's pinned, checksummed release into tools/third_party/,
 and stages its int8 encoder, decoder and joiner plus tokens.txt into the APK's
 assets/listen/ under fixed names, with a stamp.txt like the voice's.
+The voice identification's speaker-embedding model (3D-Speaker CAM++) is fetched
+the same way and staged as assets/voiceid/model.onnx with its own stamp.txt.
 
 Usage:
   python3 scripts/build-custom-launcher.py
@@ -117,6 +119,15 @@ BPE_VOCAB = "bpe.vocab"
 VAD_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
 VAD_MODEL_SHA256 = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
 VAD_MODEL = "silero_vad.onnx"
+# Owner 2026-10-02: voice identification. sherpa-onnx's speaker embedding extractor runs
+# 3D-Speaker's CAM++ (English, VoxCeleb, 16 kHz, ~28 MB), staged as assets/voiceid/model.onnx
+# with a stamp.txt like the listen model's. The release tag really is spelled "recongition".
+VOICEID_MODEL = "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
+VOICEID_MODEL_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+                     + VOICEID_MODEL)
+VOICEID_MODEL_SHA256 = "357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b"
+VOICEID_ASSET = "voiceid/model.onnx"
+VOICEID_CACHE = REPO / "tools" / "third_party" / "voiceid"
 # The hotwords file lives at the APK asset root, outside the staged model directory.
 HOTWORDS = LAUNCHER_ASSETS / "hotwords.txt"
 STAMP = "stamp.txt"
@@ -322,6 +333,21 @@ def listen_model(cache=LISTEN_CACHE):
     return listen_extras(root)
 
 
+def voiceid_model(cache=VOICEID_CACHE, fetch=fetch):
+    """Asset root holding voiceid/model.onnx, the pinned speaker-embedding model, fetched
+    (checksummed) into cache once. Raises BuildError naming the model when it cannot be had."""
+    root = Path(cache)
+    staged = root / VOICEID_ASSET
+    if not staged.is_file():
+        try:
+            src = fetch(VOICEID_MODEL_URL, root / VOICEID_MODEL, VOICEID_MODEL_SHA256)
+        except BuildError as e:
+            raise BuildError(f"!! cannot stage {VOICEID_MODEL}: the voice-id model is unavailable\n   {e}")
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, staged)
+    return root
+
+
 def placeholder_voice(cache=SHERPA_CACHE):
     """Asset root holding voice/ for the stock placeholder voice."""
     root = Path(cache) / PLACEHOLDER_VOICE
@@ -401,6 +427,8 @@ def main():
           + (" (stock placeholder until the trained voice is committed)" if placeholder else "") + " ==")
     listen_root = listen_model()
     print(f"== listening model: {LISTEN_MODEL} (int8) ==")
+    voiceid_root = voiceid_model()
+    print(f"== voice-id model: {VOICEID_MODEL} ==")
     with tempfile.TemporaryDirectory(prefix="launcher-voice-stamp-") as td:
         # The stamp goes in its own asset root, merged into assets/voice/ by
         # stage_assets, so neither voice source is ever written to.
@@ -411,6 +439,8 @@ def main():
         (stamp_root / "voice" / LABEL).write_text(("stock lessac medium" if placeholder else "trained") + "\n")
         (stamp_root / "listen").mkdir()
         (stamp_root / "listen" / STAMP).write_text(voice_stamp(listen_root / "listen") + "\n")
+        (stamp_root / "voiceid").mkdir()
+        (stamp_root / "voiceid" / STAMP).write_text(voice_stamp(voiceid_root / "voiceid") + "\n")
         # The wake-word model at the asset root, where recognizer.WakeWord looks for it
         # (meeting plan U3): the same file mode-voice ships, never a second copy in git.
         shutil.copy(bc.WAKEWORD_MODEL, stamp_root / bc.WAKEWORD_MODEL.name)
@@ -424,7 +454,7 @@ def main():
             apk_out=APK,
             # stage_assets skips a source that does not exist.
             asset_sources=[LAUNCHER_ASSETS] + ([placeholder] if placeholder else [])
-            + [listen_root, stamp_root, SHARED_ASSETS],
+            + [listen_root, voiceid_root, stamp_root, SHARED_ASSETS],
             res_dir=RES,
             native_libs=native_libs,
             jars=[sherpa_jar],

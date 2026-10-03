@@ -20,7 +20,7 @@ HARNESS = TESTS / "fixtures" / "claude_api_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "shared" / "ClaudeApiHarness.java"
 CLIENT = SHARED / "ClaudeApi.java"
 TRANSPORT = SHARED / "ClaudeHttpsTransport.java"
-PLAIN_JAVA = [CLIENT, TRANSPORT, SHARED / "Json.java", SHARED / "ClaudeAccess.java"]
+PLAIN_JAVA = [CLIENT, TRANSPORT, SHARED / "Json.java", SHARED / "ClaudeAccess.java", SHARED / "JpegSlim.java"]
 
 
 class ClaudeClientIsPlainJavaTest(unittest.TestCase):
@@ -69,6 +69,14 @@ class HttpsTransportWiringTest(unittest.TestCase):
 
     def test_only_https_connections(self):
         self.assertIn("HttpsURLConnection", self.src)
+
+    def test_retry_after_header_is_passed_on(self):
+        self.assertRegex(self.src, r"new ClaudeApi\.Response\(\s*status\s*,\s*readBody\(in\)\s*,\s*conn\.getHeaderField\(\s*\"retry-after\"\s*\)\s*\)")
+
+    def test_streams_through_the_same_connection_rules(self):
+        # Robot 2026-10-02: the conversation streams so the line can be spoken before the tail.
+        self.assertRegex(self.src, r"implements\s+ClaudeApi\.StreamingTransport")
+        self.assertRegex(self.src, r"public\s+ClaudeApi\.Response\s+stream\(")
 
     def test_no_logging(self):
         # R14: nothing about a request (and so nothing near the key) reaches logcat.
@@ -149,7 +157,7 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "messages_not_set_up_makes_no_request",
         "jpeg_block_base64_has_no_newlines",
         "conversation_sends_the_message_list_in_order_with_its_roles",
-        "conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_1024",
+        "conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_400",
         "conversation_sends_effort_beside_the_json_schema_format",
         "conversation_effort_400_retries_once_without_effort_keeping_the_schema_format",
         "conversation_later_calls_send_no_effort_and_keep_the_format",
@@ -159,6 +167,41 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "conversation_without_effort_sends_only_the_format_and_the_retry_budget",
         "conversation_timeout_overload_rate_limit_and_refusal_map_to_their_reasons",
         "conversation_error_output_carries_no_transcript_prefix_or_key",
+        "conversation_streamed_asks_for_a_stream",
+        "conversation_streamed_reports_the_line_question_and_name_before_the_tail",
+        "conversation_streamed_result_is_the_whole_reply",
+        "conversation_streamed_fields_survive_escapes_split_across_deltas",
+        "conversation_streamed_400_gates_still_retry_once",
+        "conversation_streamed_error_event_and_refusal_map_to_their_reasons",
+        "conversation_without_a_streaming_transport_reports_the_fields_from_the_whole_reply",
+        "conversation_never_sends_effort_to_a_haiku_model",
+        "partial_json_scanner_reads_only_closed_top_level_strings",
+        "partial_json_scanner_reads_closed_top_level_booleans_as_words",
+        "keep_warm_is_one_tokenless_models_page_of_one",
+        "keep_warm_failures_are_false_and_never_throw_and_unset_sends_nothing",
+        "retry_after_seconds_reaches_both_results",
+        "retry_after_missing_or_unreadable_is_minus_one",
+        "rate_limited_and_overloaded_are_never_retried_by_the_client",
+        "backoff_honours_retry_after",
+        "backoff_without_retry_after_is_a_fixed_15_s_and_never_doubles",
+        "backoff_pauses_on_529_but_not_on_other_failures",
+        "backoff_a_429_inside_a_pause_starts_no_new_pause",
+        "a_paused_result_is_rate_limited_without_a_status_and_starts_no_pause",
+        "conversation_tools_request_carries_definitions_and_auto_choice",
+        "conversation_tools_ride_beside_the_schema_and_survive_the_output_config_gate",
+        "conversation_plain_reply_parses_text_and_tool_use",
+        "conversation_with_tools_accepts_a_tool_only_or_prose_reply",
+        "conversation_streamed_tool_use_parses_interleaved_text_and_split_input",
+        "conversation_streamed_text_before_a_tool_use_is_told_before_the_tool_streams",
+        "conversation_streamed_schema_line_before_a_tool_use_is_early",
+        "conversation_streamed_reply_tool_input_is_early_and_becomes_the_json",
+        "conversation_plain_reply_tool_reports_the_fields_from_the_whole_reply",
+        "conversation_reply_tool_beside_another_tool_is_never_told_early_when_known",
+        "conversation_reply_tool_tells_a_named_boolean_as_a_word_streamed_or_whole",
+        "conversation_streamed_truncated_tool_input_is_bad_reply",
+        "tool_result_text_and_image_blocks",
+        "tool_result_error_sets_is_error",
+        "conversation_tool_result_follow_up_sends_assistant_blocks_then_results",
     )
 
     @classmethod
@@ -170,7 +213,7 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         out = cls._td.name
         # Only the plain-Java classes are compiled; the rest of shared/ needs the Android SDK.
         # The real transport is compiled too, to prove it builds without Android.
-        sources = [HARNESS_MAIN, CLIENT, TRANSPORT, SHARED / "Json.java", SHARED / "ClaudeAccess.java"]
+        sources = [HARNESS_MAIN] + PLAIN_JAVA
         c = subprocess.run(jvm_harness.javac_cmd(jdk[0], out, sources, [HARNESS]),
                            capture_output=True, text=True)
         cls.compiled = c.returncode == 0

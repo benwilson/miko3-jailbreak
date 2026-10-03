@@ -13,7 +13,7 @@ Why this exists (Miko 3 context):
 Pipeline:
   0. ensure toolchain (Android SDK cmdline-tools + platform + build-tools, lld)
   1. compile native/neuterd with clang + ld.lld
-  2. copy src to a build dir and inject the base64 neuterd into RootOps.java
+  2. copy src to a build dir and inject the base64 neuterd and mute watcher into RootOps.java
   3. javac -> d8 -> classes.dex
   4. aapt2 link manifest -> unsigned.apk, add classes.dex
   5. zipalign -> apksigner sign (generating a debug keystore on first run)
@@ -201,19 +201,31 @@ def compile_neuterd():
     return binary
 
 
+MUTEWATCH = NATIVE / "miko3-mute-watch.sh"
+PLACEHOLDERS = ("@@NEUTERD_B64@@", "@@MUTEWATCH_B64@@")
+
+
+def inject_payloads(text, neuterd_bytes, mutewatch_bytes):
+    """RootOps.java's text with neuterd and the mute watcher embedded as base64."""
+    for placeholder in PLACEHOLDERS:
+        if placeholder not in text:
+            raise BuildError(f"!! RootOps.java placeholder {placeholder} not found")
+    return (text.replace("@@NEUTERD_B64@@", base64.b64encode(neuterd_bytes).decode("ascii"))
+            .replace("@@MUTEWATCH_B64@@", base64.b64encode(mutewatch_bytes).decode("ascii")))
+
+
 def stage_sources(neuterd_binary):
-    print("== 2/6 stage sources + inject neuterd ==")
+    print("== 2/6 stage sources + inject neuterd and the mute watcher ==")
     if BUILD.exists():
         shutil.rmtree(BUILD)
+    if not MUTEWATCH.exists():
+        raise BuildError(f"!! missing {MUTEWATCH}")
     src_out = BUILD / "src"
     shutil.copytree(SRC, src_out)
-    b64 = base64.b64encode(neuterd_binary.read_bytes()).decode("ascii")
     rootops = src_out / "com" / "miko3" / "bootagent" / "RootOps.java"
-    text = rootops.read_text()
-    if "@@NEUTERD_B64@@" not in text:
-        raise BuildError("!! RootOps.java placeholder @@NEUTERD_B64@@ not found")
-    rootops.write_text(text.replace("@@NEUTERD_B64@@", b64))
-    print(f"   embedded neuterd ({neuterd_binary.stat().st_size} bytes -> {len(b64)} b64 chars)")
+    rootops.write_text(inject_payloads(rootops.read_text(), neuterd_binary.read_bytes(), MUTEWATCH.read_bytes()))
+    print(f"   embedded neuterd ({neuterd_binary.stat().st_size} bytes) and "
+          f"{MUTEWATCH.name} ({MUTEWATCH.stat().st_size} bytes)")
     return src_out
 
 

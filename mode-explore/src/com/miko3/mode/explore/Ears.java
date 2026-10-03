@@ -12,9 +12,11 @@ import java.util.List;
  * only enqueues, and the harness rig fakes it.
  *
  * The brain drains it once per tick, as it polls Camera.latest(), and applies
- * the replacement rule (KTD3) itself; nothing here decides anything. No text
- * crosses this interface: an utterance's words reach the brain only through
- * CuriosityPort.listen()/heard() while he is deliberately listening (KTD1).
+ * the replacement rule (KTD3) itself; nothing here decides anything. An
+ * utterance's words reach the brain through CuriosityPort.listen()/heard()
+ * while he is deliberately listening (KTD1), with one exception (owner
+ * 2026-10-02): a call's own words besides the address ride its cue as its
+ * message, since a call opens the conversation and they are its first message.
  */
 interface Ears {
 
@@ -56,13 +58,35 @@ interface Ears {
         final Side side;
         final float angleDeg;
         final long at;
+        /**
+         * Hey Miko plan KTD4: the end-of-utterance delivery of a wake word the
+         * launcher already sent as an early cue for this at. The call was made
+         * then, so this cue makes no second one. False unless the launcher says so.
+         */
+        final boolean called;
+        /**
+         * Owner 2026-10-02: a call's words besides the address ("how's it going" from "Hey Miko,
+         * how's it going?"), the caller's first message; "" for a bare call, an early cue, any
+         * other cue, and everything from an older launcher.
+         */
+        final String message;
 
         Cue(Kind kind, Tier tier, Side side, float angleDeg, long at) {
+            this(kind, tier, side, angleDeg, at, false);
+        }
+
+        Cue(Kind kind, Tier tier, Side side, float angleDeg, long at, boolean called) {
+            this(kind, tier, side, angleDeg, at, called, "");
+        }
+
+        Cue(Kind kind, Tier tier, Side side, float angleDeg, long at, boolean called, String message) {
+            this.message = message == null ? "" : message.trim();
             this.kind = kind;
             this.tier = tier;
             this.side = side;
             this.angleDeg = angleDeg;
             this.at = at;
+            this.called = called;
         }
 
         /** A cue whose tier is its kind's. */
@@ -76,6 +100,16 @@ interface Ears {
 
         boolean hasAngle() {
             return !Float.isNaN(angleDeg);
+        }
+
+        /** Words of the caller's besides the address (owner 2026-10-02). */
+        boolean hasMessage() {
+            return !message.isEmpty();
+        }
+
+        /** The call for this at was already made by the early cue (KTD4). */
+        boolean alreadyCalled() {
+            return called;
         }
 
         @Override

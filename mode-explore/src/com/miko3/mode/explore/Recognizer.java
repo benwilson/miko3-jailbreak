@@ -12,5 +12,8 @@ import java.util.List;
 interface Recognizer {
     List<Detection> detect(Bitmap frame) throws Exception;
 
+    /** The last detect()'s stage times (detector speed plan), or null if not kept. */
+    DetectorStages stages();
+
     void close();
 }

@@ -244,6 +244,20 @@ public final class ListenServiceHarness {
         }
     }
 
+    /** Null when marks run first..last, each sample once and in order; else what went wrong. */
+    static String contiguous(List<Integer> marks, int first, int last) {
+        if (marks.size() != last - first + 1) {
+            return "fed " + marks.size() + " marks, want " + (last - first + 1) + " (" + first + ".." + last + ")"
+                    + (marks.isEmpty() ? "" : " from " + marks.get(0));
+        }
+        for (int i = 0; i < marks.size(); i++) {
+            if (marks.get(i) != first + i) {
+                return "mark " + i + " is " + marks.get(i) + ", want " + (first + i);
+            }
+        }
+        return null;
+    }
+
     static String describe(ListenSession.Result r) {
         return r.outcome + "/" + r.stop + " \"" + r.text + "\" " + r.audioMs + " ms " + r.reason;
     }
@@ -252,10 +266,16 @@ public final class ListenServiceHarness {
 
     static final class FakeClock implements EarsSession.Clock {
         long now = 1000;
+        long nanos;
 
         @Override
         public long nowMs() {
             return now;
+        }
+
+        @Override
+        public long nanoTime() {
+            return nanos;
         }
     }
 
@@ -326,6 +346,7 @@ public final class ListenServiceHarness {
         @Override
         public void reset() {
             resets++;
+            hitNext = false; // a reset engine forgets what it was about to report
         }
     }
 
@@ -351,10 +372,28 @@ public final class ListenServiceHarness {
         boolean endpoint;
         int resets;
         int accepted;
+        /** Every sample handed over, held catch-up included. */
+        long samples;
+        /** When set, each 80 ms of audio "costs" decodeNsPerChunk on this clock. */
+        FakeClock clock;
+        long decodeNsPerChunk;
+
+        /** Every non-silent sample handed over, in order, as the short it was captured as (the pre-roll scenarios). */
+        final List<Integer> marks = new ArrayList<Integer>();
 
         @Override
         public void accept(float[] samples, int n) {
             accepted++;
+            this.samples += n;
+            for (int i = 0; i < n; i++) {
+                int v = Math.round(samples[i] * 32768f);
+                if (v != 0) {
+                    marks.add(v);
+                }
+            }
+            if (clock != null) {
+                clock.nanos += decodeNsPerChunk * ((n + CHUNK - 1) / CHUNK);
+            }
         }
 
         @Override
@@ -375,8 +414,10 @@ public final class ListenServiceHarness {
         }
     }
 
+    /** Like VoiceDirection's sampler, drain() hands out only the readings since the last drain. */
     static final class FakeSampling implements EarsSession.Sampling {
         final List<Float> angles;
+        int drained;
         boolean stopped;
 
         FakeSampling(List<Float> angles) {
@@ -385,7 +426,9 @@ public final class ListenServiceHarness {
 
         @Override
         public List<Float> drain() {
-            return new ArrayList<Float>(angles);
+            List<Float> out = new ArrayList<Float>(angles.subList(drained, angles.size()));
+            drained = angles.size();
+            return out;
         }
 
         @Override
@@ -398,12 +441,19 @@ public final class ListenServiceHarness {
         List<Float> angles = new ArrayList<Float>();
         int starts;
         FakeSampling last;
+        /** Like the NC chip in side mode: its angle is a side, not a bearing. */
+        boolean sideOnly;
 
         @Override
         public EarsSession.Sampling start() {
             starts++;
             last = new FakeSampling(angles);
             return last;
+        }
+
+        @Override
+        public boolean sideOnly() {
+            return sideOnly;
         }
     }
 
@@ -413,6 +463,56 @@ public final class ListenServiceHarness {
         @Override
         public void heard(EarsSession.Utterance u) {
             heard.add(u);
+        }
+
+        /** Robot 2026-10-01: each "answering" as the start of the answer's speech, with the deliveries it preceded. */
+        final List<Long> answering = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Integer> heardBeforeAnswering = Collections.synchronizedList(new ArrayList<Integer>());
+
+        @Override
+        public void answering(long at) {
+            answering.add(at);
+            heardBeforeAnswering.add(heard.size());
+        }
+
+        /** Review P2-2: each "answer over" (the announced answer ended without words), with when it came. */
+        final List<Long> answerOver = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Integer> heardBeforeAnswerOver = Collections.synchronizedList(new ArrayList<Integer>());
+        FakeClock overClock;
+        final List<Long> answerOverWhen = Collections.synchronizedList(new ArrayList<Long>());
+
+        /** Robot 2026-10-02: each provisional answer (the words so far at an endpoint inside an answer), with when it came. */
+        final List<String> provisional = Collections.synchronizedList(new ArrayList<String>());
+        final List<Long> provisionalWhen = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Long> provisionalAt = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Integer> heardBeforeProvisional = Collections.synchronizedList(new ArrayList<Integer>());
+        FakeClock provisionalClock;
+
+        @Override
+        public void provisional(long at, String text) {
+            provisional.add(text);
+            provisionalAt.add(at);
+            provisionalWhen.add(provisionalClock == null ? -1 : provisionalClock.now);
+            heardBeforeProvisional.add(heard.size());
+        }
+
+        /** Owner 2026-10-02: each voice result as "at:person:band", with the deliveries it followed. */
+        final List<String> voice = Collections.synchronizedList(new ArrayList<String>());
+        final List<Integer> heardBeforeVoice = Collections.synchronizedList(new ArrayList<Integer>());
+        final CountDownLatch voiced = new CountDownLatch(1);
+
+        @Override
+        public void voice(long at, String person, float score, int band) {
+            heardBeforeVoice.add(heard.size());
+            voice.add(at + ":" + person + ":" + band);
+            voiced.countDown();
+        }
+
+        @Override
+        public void answerOver(long at) {
+            answerOver.add(at);
+            heardBeforeAnswerOver.add(heard.size());
+            answerOverWhen.add(overClock == null ? -1 : overClock.now);
         }
     }
 
@@ -494,8 +594,50 @@ public final class ListenServiceHarness {
             session = new EarsSession(clock, capture, spotter, gate, rec, direction, new CueClassifier(sw), TAIL, diag);
         }
 
+        /** With EarsTuning's wake gate on or off. */
+        Rig(boolean gateWake) {
+            session = new EarsSession(clock, capture, spotter, gate, rec, direction, new CueClassifier(sw), TAIL, diag,
+                    gateWake);
+        }
+
+        /** robot-say.py's injection (2026-10-02): the fakes wrapped by an EarsInject reading props. */
+        EarsInject inject;
+
+        Rig(FakeProps props) {
+            inject = new EarsInject(clock, props, diag);
+            session = new EarsSession(clock, capture, inject.spotter(spotter), inject.gate(gate), inject.recognizer(rec),
+                    direction, new CueClassifier(sw), TAIL, diag);
+        }
+
+        /** With an explicit pre-roll length. */
+        Rig(boolean gateWake, long prerollMs) {
+            session = new EarsSession(clock, capture, spotter, gate, rec, direction, new CueClassifier(sw), TAIL, diag,
+                    gateWake, prerollMs);
+        }
+
         void open(boolean charger) {
             session.open("10001", token, client, charger);
+        }
+
+        /** The next mark to capture: each marked sample is its own position in the audio, from 1. */
+        int mark = 1;
+
+        /** One chunk whose samples are numbered, so the recogniser's input shows what was fed, in what order. */
+        void marked(boolean speech) {
+            for (int i = 0; i < CHUNK; i++) {
+                pcm[i] = (short) mark++;
+            }
+            chunk(speech);
+            Arrays.fill(pcm, (short) 0);
+        }
+
+        /** n marked speech chunks, then a marked chunk carrying the endpoint. */
+        void markedUtter(int n) {
+            for (int i = 0; i < n; i++) {
+                marked(true);
+            }
+            rec.endpoint = true;
+            marked(true);
         }
 
         /** Advances the clock one 80 ms chunk and feeds it, with speech present or not. */
@@ -522,6 +664,20 @@ public final class ListenServiceHarness {
             }
         }
 
+        /** One chunk, the client's renew and the session's tick, as the engine's ticker would run it. */
+        void step(boolean speech) {
+            chunk(speech);
+            session.renew("10001", false);
+            session.tick();
+        }
+
+        /** step()s for ms of audio. */
+        void steps(boolean speech, long ms) {
+            for (long t = 0; t < ms; t += 80) {
+                step(speech);
+            }
+        }
+
         boolean awaitMic(boolean open) throws InterruptedException {
             for (int i = 0; i < 200; i++) {
                 if (session.capturing() == open) {
@@ -542,10 +698,67 @@ public final class ListenServiceHarness {
             StringBuilder b = new StringBuilder();
             synchronized (client.heard) {
                 for (EarsSession.Utterance u : client.heard) {
-                    b.append(u.tier).append(u.partial ? "p" : "").append('@').append(u.at).append(' ');
+                    b.append(u.tier).append(u.partial ? "p" : "").append(u.called ? "c" : "").append('k')
+                            .append(u.kind).append(u.text.isEmpty() ? "-" : "w").append('@').append(u.at).append(' ');
                 }
             }
             return b.toString();
+        }
+    }
+
+    /** Owner 2026-10-02: a VoiceId with a fake embedder, fed by the rig's ears session. */
+    static final class VoiceRig {
+        final VoiceId id;
+        volatile int samples = -1;
+        volatile int calls;
+
+        VoiceRig(Rig r) throws IOException {
+            java.io.File dir = java.nio.file.Files.createTempDirectory("ears_voice").toFile();
+            dir.deleteOnExit();
+            VoiceStore.Diag quiet = new VoiceStore.Diag() {
+                @Override
+                public void log(String line) {
+                }
+            };
+            id = new VoiceId(new VoiceStore(new java.io.File(dir, "voiceprints.bin"), 10, quiet),
+                    new VoiceTuning(0.65f, 0.45f), quiet);
+            id.setEmbedder(new VoiceId.Embedder() {
+                @Override
+                public float[] embed(float[] s, int k) {
+                    calls++;
+                    samples = k;
+                    return new float[] {1f, 0f, 0f};
+                }
+            });
+            final EarsSession session = r.session;
+            id.setListener(new VoiceId.Listener() {
+                @Override
+                public void voice(long at, String person, float score, int band) {
+                    session.voiceHeard(at, person, score, band);
+                }
+            });
+            session.setVoice(id);
+        }
+    }
+
+    /** The debug property robot-say.py sets, as the inject gate reads it. */
+    static final class FakeProps implements EarsInject.Props {
+        String value;
+
+        FakeProps(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String get(String key) {
+            return EarsInject.PROPERTY.equals(key) && value != null ? value : "";
+        }
+    }
+
+    /** Silent chunks until the client has heard want utterances or ms of audio pass. */
+    static void runUntilHeard(Rig r, int want, long ms) {
+        for (long t = 0; t < ms && r.client.heard.size() < want; t += 80) {
+            r.step(false);
         }
     }
 
@@ -984,38 +1197,46 @@ public final class ListenServiceHarness {
         });
 
         // ---- the charger flag (KTD6) ----
-        scenario("ears_charger_closes_idle_session_keeps_conversation_listen", new Scenario() {
+        scenario("ears_charger_keeps_capturing_and_delivers_the_wake_word", new Scenario() {
+            public void run(String n) throws Exception {
+                // Hey Miko plan KTD5: the ears stay open on the charger (this replaces the meeting plan's KTD6 close).
+                Rig r = new Rig();
+                r.open(true);
+                boolean opened = r.awaitMic(true);
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                int early = r.client.heard.size();
+                r.rec.text = "HEY MIKO";
+                r.rec.endpoint = true;
+                r.chunk(true);
+                boolean listenDocked = r.session.listen("10001", 6000);
+                r.session.renew("10001", true);
+                Thread.sleep(40);
+                boolean stillCapturing = r.session.capturing() && r.session.held() && r.capture.opens == 1;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, opened && early == 1 && u != null && u.kind == CueClassifier.KIND_WAKE_WORD
+                        && u.tier == CueClassifier.TIER_STRONG && listenDocked && stillCapturing
+                        && r.client.heard.size() == 2,
+                        "opened=" + opened + " early=" + early + " listenDocked=" + listenDocked
+                                + " stillCapturing=" + stillCapturing + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_charger_latch_changes_never_close_the_capture", new Scenario() {
             public void run(String n) throws Exception {
                 Rig r = new Rig();
                 r.open(false);
                 boolean opened = r.awaitMic(true);
-                boolean listening = r.session.listen("10001", 6000);
-                r.session.renew("10001", true); // docked mid-listen: the listen finishes first
+                r.session.renew("10001", true);
+                r.session.tick();
                 Thread.sleep(40);
-                boolean keptWhileListening = r.session.capturing() && r.session.held();
-                // The reply ends the listen; now the charger rule closes the capture.
-                r.utter("YEAH GOOD THANKS", 4);
-                boolean closedAfter = r.awaitMic(false) && r.session.held() && !r.session.listening();
-                boolean refusedDocked = !r.session.listen("10001", 6000);
-                // Off the charger again: the capture comes back.
-                r.log.events.clear();
+                boolean dockedOpen = r.session.capturing();
                 r.session.renew("10001", false);
-                boolean reopened = r.awaitMic(true);
-                check(n, opened && listening && keptWhileListening && closedAfter && refusedDocked && reopened
-                        && r.client.heard.size() == 1, "opened=" + opened + " kept=" + keptWhileListening
-                        + " closedAfter=" + closedAfter + " refusedDocked=" + refusedDocked + " reopened=" + reopened
-                        + " heard=" + r.heard());
-            }
-        });
-        scenario("ears_opens_closed_while_docked", new Scenario() {
-            public void run(String n) throws Exception {
-                Rig r = new Rig();
-                r.open(true);
+                r.session.tick();
                 Thread.sleep(40);
-                boolean stayedClosed = r.session.held() && !r.session.capturing() && r.capture.opens == 0;
-                r.session.renew("10001", false);
-                boolean opened = r.awaitMic(true);
-                check(n, stayedClosed && opened, "stayedClosed=" + stayedClosed + " opened=" + opened);
+                check(n, opened && dockedOpen && r.session.capturing() && r.capture.opens == 1
+                        && r.log.indexOf("mic-closed") < 0,
+                        "opened=" + opened + " dockedOpen=" + dockedOpen + " opens=" + r.capture.opens);
             }
         });
 
@@ -1033,9 +1254,190 @@ public final class ListenServiceHarness {
                 r.chunk(true);
                 r.rec.endpoint = true;
                 r.chunk(true);
+                // The early cue (Hey Miko plan KTD4), then the words, marked already called.
+                EarsSession.Utterance u = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, quiet == 0 && u != null && u.tier == CueClassifier.TIER_STRONG && !u.partial && u.called
+                        && r.client.heard.size() == 2, "quiet=" + quiet + " heard=" + r.heard());
+            }
+        });
+        // ---- Hey Miko plan U3 (KTD4): the wake word is delivered as soon as it is spotted ----
+        scenario("ears_wake_mid_speech_delivers_an_early_cue_at_once", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.direction.angles = new ArrayList<Float>(Arrays.asList(20f, 30f, 40f));
+                r.chunk(true);
+                long start = r.clock.now;
+                r.rec.text = "HEY MIKO";
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true); // the engine fires here, mid-speech
+                EarsSession.Utterance e = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                int atOnce = r.client.heard.size();
+                check(n, atOnce == 1 && e != null && "".equals(e.text) && e.kind == CueClassifier.KIND_WAKE_WORD
+                        && e.tier == CueClassifier.TIER_STRONG && e.at == start && !e.called && !e.partial
+                        && e.angle != null && e.angle == 30f && e.side == CueClassifier.SIDE_RIGHT,
+                        "atOnce=" + atOnce + " start=" + start + " heard=" + r.heard()
+                                + (e == null ? "" : " angle=" + e.angle));
+            }
+        });
+        scenario("ears_end_of_a_called_utterance_is_marked_already_called", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.direction.angles = new ArrayList<Float>(Arrays.asList(20f, 30f, 40f));
+                r.chunk(true);
+                long start = r.clock.now;
+                r.rec.text = "HEY MIKO";
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                // More readings after the early cue: the final median takes all of them.
+                r.direction.angles.add(80f);
+                r.direction.angles.add(90f);
+                r.utter("HEY MIKO WHAT'S UP", 2);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, r.client.heard.size() == 2 && f != null && f.called && f.at == start
+                        && "HEY MIKO WHAT'S UP".equals(f.text) && f.kind == CueClassifier.KIND_WAKE_WORD
+                        && f.angle != null && f.angle == 40f && !r.client.heard.get(0).called,
+                        "heard=" + r.heard() + (f == null ? "" : " angle=" + f.angle));
+            }
+        });
+        scenario("ears_a_called_utterance_carries_the_callers_message", new Scenario() {
+            public void run(String n) {
+                // Owner 2026-10-02: the words said with the wake word are the caller's first message.
+                // The early cue has none yet; the end-of-utterance delivery carries them.
+                Rig r = new Rig();
+                r.open(false);
+                r.chunk(true);
+                r.rec.text = "HEY MIKO";
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                r.utter("HEY MIKO HOW'S IT GOING", 3);
+                EarsSession.Utterance e = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                Rig b = new Rig();
+                b.open(false);
+                b.chunk(true);
+                b.rec.text = "HEY MIKO";
+                b.spotter.hitNext = true;
+                b.chunk(true);
+                b.utter("HEY MIKO", 1);
+                EarsSession.Utterance bare = b.client.heard.size() < 2 ? null : b.client.heard.get(1);
+                check(n, e != null && "".equals(e.message) && f != null && f.called
+                                && "how's it going".equals(f.message) && bare != null && bare.called
+                                && "".equals(bare.message) && !r.diag.mention("going"),
+                        "heard=" + r.heard() + " early=" + (e == null ? null : e.message) + " end="
+                                + (f == null ? null : f.message) + " bare=" + (bare == null ? null : bare.message));
+            }
+        });
+        scenario("ears_a_name_call_carries_its_message_and_other_utterances_none", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.utter("MIKO COME OVER HERE", 3);
+                r.silence(1200);
+                r.utter("HEY BUDDY", 2);
+                EarsSession.Utterance name = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                EarsSession.Utterance hello = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, name != null && name.kind == CueClassifier.KIND_NAME && "come over here".equals(name.message)
+                                && hello != null && hello.kind == CueClassifier.KIND_GREETING && "".equals(hello.message),
+                        "heard=" + r.heard() + " name=" + (name == null ? null : name.message) + " hello="
+                                + (hello == null ? null : hello.message));
+            }
+        });
+        scenario("ears_two_hits_in_one_utterance_send_one_early_cue", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                int early = r.client.heard.size();
+                r.utter("HEY MIKO HEY MIKO", 2);
+                int bare = 0;
+                int called = 0;
+                synchronized (r.client.heard) {
+                    for (EarsSession.Utterance u : r.client.heard) {
+                        bare += u.text.isEmpty() ? 1 : 0;
+                        called += u.called ? 1 : 0;
+                    }
+                }
+                check(n, early == 1 && r.client.heard.size() == 2 && bare == 1 && called == 1,
+                        "early=" + early + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_wake_inside_the_deaf_window_delivers_nothing", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.session.lineStarted();
+                r.chunk(true);
+                r.spotter.hitNext = true; // his own clip says the phrase: the window drops it unheard
+                r.chunk(true);
+                r.chunk(true);
+                r.session.playbackIdle();
+                r.silence(Rig.TAIL + 400);
+                check(n, r.client.heard.isEmpty(), "heard=" + r.heard());
+            }
+        });
+        scenario("ears_early_cue_keeps_the_conversation_listen_for_the_words", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                boolean listening = r.session.listen("10001", 6000);
+                r.chunk(true);
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                boolean stillListening = r.session.listening();
+                int early = r.client.heard.size();
+                r.utter("HEY MIKO I'M SAM", 2);
+                r.silence(EarsSession.ANSWER_SILENCE_MS + 80); // the listen's answer ends on silence
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, listening && early == 1 && stillListening && f != null && f.called
+                        && "HEY MIKO I'M SAM".equals(f.text) && !r.session.listening(),
+                        "early=" + early + " stillListening=" + stillListening + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_bare_wake_with_the_gate_closed_is_unchanged", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.spotter.hitNext = true;
+                r.chunk(false);
                 EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
-                check(n, quiet == 0 && u != null && u.tier == CueClassifier.TIER_STRONG && !u.partial
-                        && r.client.heard.size() == 1, "quiet=" + quiet + " heard=" + r.heard());
+                check(n, r.client.heard.size() == 1 && u != null && "".equals(u.text) && !u.called
+                        && u.at == r.clock.now && u.kind == CueClassifier.KIND_WAKE_WORD, "heard=" + r.heard());
+            }
+        });
+        scenario("ears_side_only_direction_sends_the_side_without_an_angle", new Scenario() {
+            // Robot (2026-09-29): the NC chip tells only left from right, so its -90/+90
+            // is a side, not a bearing. The brain's side search needs a side and no angle.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.direction.sideOnly = true;
+                r.direction.angles = new ArrayList<Float>(Arrays.asList(-90f, null, -90f));
+                r.chunk(true);
+                r.rec.text = "HEY MIKO";
+                r.spotter.hitNext = true;
+                r.chunk(true);
+                EarsSession.Utterance e = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                r.direction.angles.add(-90f);
+                r.utter("HEY MIKO WHAT'S UP", 2);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                // A plain word burst with a side and no words is still delivered on the side.
+                r.direction.angles = new ArrayList<Float>(Arrays.asList(90f, 90f));
+                r.utter("", 4);
+                EarsSession.Utterance b = r.client.heard.size() < 3 ? null : r.client.heard.get(2);
+                check(n, e != null && e.kind == CueClassifier.KIND_WAKE_WORD && e.side == CueClassifier.SIDE_LEFT
+                                && e.angle == null && f != null && f.called && f.side == CueClassifier.SIDE_LEFT
+                                && f.angle == null && b != null && b.side == CueClassifier.SIDE_RIGHT && b.angle == null,
+                        "heard=" + r.heard() + (e == null ? "" : " early=" + e.side + "/" + e.angle)
+                                + (f == null ? "" : " end=" + f.side + "/" + f.angle)
+                                + (b == null ? "" : " burst=" + b.side + "/" + b.angle));
             }
         });
         scenario("ears_direction_sampled_only_while_speech", new Scenario() {
@@ -1090,6 +1492,640 @@ public final class ListenServiceHarness {
                 check(n, started && stillOn && !r.session.listening(), started + " " + stillOn + " " + r.session.listening());
             }
         });
+        // ---- Robot 2026-10-01: a conversation listen's maxMs is the window to START answering ----
+        scenario("ears_answer_started_in_the_window_runs_past_max", new Scenario() {
+            // Speech from 2.5 s for 4 s into a 4 s listen: the whole answer at about 8.5 s
+            // (6.5 s plus ANSWER_SILENCE_MS of no speech; the recogniser's 0.8 s endpoint at
+            // 7.3 s only closes a segment), once, as the listen's.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false; // only a listen gives words a tier: a cue would be dropped
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 2480);
+                long start = r.clock.now + 80;
+                for (int i = 0; i < 50; i++) { // 4 s of speech
+                    r.step(true);
+                    r.rec.text = i < 25 ? "WE WENT" : "WE WENT TO THE BEACH WITH MY SISTER";
+                }
+                boolean pastMax = r.clock.now - t0 > 4000 && r.session.listening() && r.client.heard.isEmpty();
+                long lastWord = r.clock.now - t0;
+                r.steps(false, 720);
+                r.rec.endpoint = true;
+                r.step(false);
+                boolean notAtEndpoint = r.client.heard.isEmpty();
+                while (r.client.heard.isEmpty() && r.clock.now - t0 < lastWord + 4000) {
+                    r.step(false);
+                }
+                long doneAt = r.clock.now - t0;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                r.steps(false, 1000);
+                check(n, pastMax && notAtEndpoint && r.client.heard.size() == 1 && u != null
+                                && "WE WENT TO THE BEACH WITH MY SISTER".equals(u.text) && u.at == start && !u.partial
+                                && u.tier != CueClassifier.TIER_NONE && doneAt - lastWord >= 2000
+                                && doneAt - lastWord <= 2160 && !r.session.listening(),
+                        "pastMax=" + pastMax + " notAtEndpoint=" + notAtEndpoint + " doneAt=" + doneAt
+                                + " lastWord=" + lastWord + " start=" + start + " heard=" + r.heard()
+                                + " listening=" + r.session.listening());
+            }
+        });
+        scenario("ears_silent_listen_still_ends_at_max", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 3920);
+                boolean before = r.session.listening();
+                long at = r.clock.now - t0;
+                r.steps(false, 160);
+                check(n, before && at < 4000 && !r.session.listening() && r.client.heard.isEmpty(),
+                        "before=" + before + " at=" + at + " after=" + r.session.listening() + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_endless_answer_is_cut_at_the_hard_cap", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                r.step(true);
+                r.rec.text = "AND THEN AND THEN";
+                while (r.clock.now - t0 < EarsSession.LISTEN_HARD_CAP_MS - 80) {
+                    r.step(true);
+                }
+                boolean held = r.session.listening() && r.client.heard.isEmpty();
+                while (r.client.heard.isEmpty() && r.clock.now - t0 < EarsSession.LISTEN_HARD_CAP_MS + 1000) {
+                    r.step(true);
+                }
+                long cutAt = r.clock.now - t0;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, EarsSession.LISTEN_HARD_CAP_MS == 60000 && held && u != null
+                                && "AND THEN AND THEN".equals(u.text) && !u.partial && u.tier != CueClassifier.TIER_NONE
+                                && cutAt >= 60000 && cutAt <= 60160 && !r.session.listening(),
+                        "held=" + held + " cutAt=" + cutAt + " heard=" + r.heard() + " listening="
+                                + r.session.listening());
+            }
+        });
+        scenario("ears_answer_begun_just_before_the_listen_is_its_answer", new Scenario() {
+            // He finishes his question and they are already answering: speech that began
+            // within LISTEN_EARLY_START_MS of the listen opening is the listen's answer.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.step(true);
+                long start = r.clock.now;
+                r.rec.text = "YES I";
+                r.steps(true, 400);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(true, 4400);
+                r.rec.text = "YES I HAVE BEEN THERE TWICE";
+                boolean pastMax = r.clock.now - t0 > 4000 && r.session.listening();
+                r.rec.endpoint = true;
+                r.step(false);
+                r.steps(false, 2080);
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                // Speech begun well before the listen is not held open past maxMs.
+                Rig q = new Rig();
+                q.sw.on = false;
+                q.open(false);
+                q.steps(true, 1040);
+                long q0 = q.clock.now;
+                q.session.listen("10001", 4000);
+                q.steps(true, 4080);
+                boolean early = q.session.listening();
+                check(n, EarsSession.LISTEN_EARLY_START_MS == 500 && pastMax && r.client.heard.size() == 1
+                                && u != null && "YES I HAVE BEEN THERE TWICE".equals(u.text) && u.at == start
+                                && !r.session.listening() && !early && q.clock.now - q0 > 4000,
+                        "pastMax=" + pastMax + " heard=" + r.heard() + " stillOnForAnOldUtterance=" + early);
+            }
+        });
+        scenario("ears_wake_word_inside_a_long_answer_keeps_the_early_cue", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 2480);
+                r.step(true);
+                r.rec.text = "HEY MIKO";
+                r.spotter.hitNext = true;
+                r.step(true);
+                int early = r.client.heard.size();
+                r.rec.text = "HEY MIKO I SAW A WHALE";
+                r.steps(true, 3200);
+                boolean pastMax = r.clock.now - t0 > 4000 && r.session.listening() && r.client.heard.size() == 1;
+                r.rec.endpoint = true;
+                r.step(false);
+                r.steps(false, 2080);
+                EarsSession.Utterance e = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, early == 1 && e != null && e.kind == CueClassifier.KIND_WAKE_WORD && "".equals(e.text)
+                                && pastMax && r.client.heard.size() == 2 && f != null && f.called
+                                && "HEY MIKO I SAW A WHALE".equals(f.text) && f.at == e.at && !r.session.listening(),
+                        "early=" + early + " pastMax=" + pastMax + " heard=" + r.heard());
+            }
+        });
+        // ---- Owner 2026-10-02: a conversation listen's answer ends on ANSWER_SILENCE_MS of no speech ----
+        scenario("ears_answer_with_pauses_is_delivered_once_joined_after_the_silence", new Scenario() {
+            // Three segments over about 12 s, two 1.2 s pauses: the recogniser endpoints each
+            // segment, but the answer is delivered once, joined, about 2 s after the last word.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                long t0 = r.clock.now;
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                long start = r.clock.now + 80;
+                String[] parts = {"WE WENT TO THE BEACH", "AND THEN WE HAD ICE CREAM", "AND MY SISTER FELL ASLEEP"};
+                int resets0 = r.rec.resets;
+                boolean quietBetween = true;
+                long lastWord = 0;
+                for (int s = 0; s < 3; s++) {
+                    for (int i = 0; i < 35; i++) { // 2.8 s of speech
+                        r.step(true);
+                        r.rec.text = parts[s];
+                    }
+                    lastWord = r.clock.now;
+                    r.steps(false, 720);
+                    r.rec.endpoint = true; // the recogniser's 0.8 s trailing-silence rule
+                    r.step(false);
+                    if (s < 2) {
+                        r.steps(false, 400); // 1.2 s of pause in all
+                        quietBetween &= r.client.heard.isEmpty() && r.session.listening();
+                    }
+                }
+                while (r.client.heard.isEmpty() && r.clock.now - lastWord < 4000) {
+                    r.step(false);
+                }
+                long after = r.clock.now - lastWord;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                r.steps(false, 1000);
+                String want = "WE WENT TO THE BEACH AND THEN WE HAD ICE CREAM AND MY SISTER FELL ASLEEP";
+                check(n, EarsSession.ANSWER_SILENCE_MS == 2000 && quietBetween && r.client.heard.size() == 1
+                                && u != null && want.equals(u.text) && u.at == start && !u.partial
+                                && u.tier != CueClassifier.TIER_NONE && after >= 2000 && after <= 2160
+                                && lastWord - t0 > 11000 && r.client.answering.size() == 1
+                                && r.client.answerOver.isEmpty() && r.rec.resets - resets0 >= 3
+                                && !r.session.listening(),
+                        "quietBetween=" + quietBetween + " after=" + after + " span=" + (lastWord - t0) + " heard="
+                                + r.heard() + " text=" + (u == null ? null : u.text) + " over=" + r.client.answerOver
+                                + " resets=" + (r.rec.resets - resets0));
+            }
+        });
+        // ---- Robot 2026-10-02: each endpoint inside an answer sends the words so far as a provisional answer ----
+        scenario("ears_each_endpoint_inside_an_answer_sends_the_words_so_far_as_provisional", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.client.provisionalClock = r.clock;
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                long start = r.clock.now + 80;
+                String[] parts = {"WE WENT TO THE BEACH", "AND THEN WE HAD ICE CREAM"};
+                long[] endpointAt = new long[2];
+                for (int s = 0; s < 2; s++) {
+                    for (int i = 0; i < 35; i++) {
+                        r.step(true);
+                        r.rec.text = parts[s];
+                    }
+                    r.steps(false, 720);
+                    r.rec.endpoint = true;
+                    r.step(false);
+                    endpointAt[s] = r.clock.now;
+                    // The same endpoint seen again with no new words sends nothing more.
+                    r.rec.endpoint = true;
+                    r.step(false);
+                    if (s == 0) {
+                        r.steps(false, 400);
+                    }
+                }
+                while (r.client.heard.isEmpty() && r.clock.now - endpointAt[1] < 4000) {
+                    r.step(false);
+                }
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                java.util.List<String> want = java.util.Arrays.asList("WE WENT TO THE BEACH",
+                        "WE WENT TO THE BEACH AND THEN WE HAD ICE CREAM");
+                check(n, want.equals(r.client.provisional) && r.client.provisionalWhen.size() == 2
+                                && r.client.provisionalWhen.get(0) == endpointAt[0]
+                                && r.client.provisionalWhen.get(1) == endpointAt[1]
+                                && r.client.provisionalAt.get(0) == start
+                                && r.client.heardBeforeProvisional.equals(java.util.Arrays.asList(0, 0))
+                                && u != null && want.get(1).equals(u.text) && r.client.heard.size() == 1,
+                        "provisional=" + r.client.provisional + " when=" + r.client.provisionalWhen + " endpoints="
+                                + endpointAt[0] + "," + endpointAt[1] + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_voice_a_clean_answer_is_identified_after_its_words", new Scenario() {
+            // Owner 2026-10-02: 2.4 s of answer in a listen, then the answer's silence: the words
+            // go out first, then the voice result for the same at, from the speech span only.
+            public void run(String n) throws Exception {
+                Rig r = new Rig();
+                r.sw.on = false;
+                VoiceRig v = new VoiceRig(r);
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                long start = r.clock.now + 80;
+                for (int i = 0; i < 30; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH WITH MY SISTER";
+                }
+                for (int i = 0; i < 60 && r.client.heard.isEmpty(); i++) {
+                    r.step(false);
+                }
+                boolean got = r.client.voiced.await(5, TimeUnit.SECONDS);
+                v.id.shutdown();
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, got && u != null && u.at == start && r.client.voice.size() == 1
+                                && r.client.voice.get(0).equals(start + ":null:" + VoiceStore.BAND_NONE)
+                                && r.client.heardBeforeVoice.get(0) == 1
+                                // The speech span, plus at most the pre-roll head (the capture thread's own
+                                // silent chunks can land in it); never the answer's trailing 2 s of silence.
+                                && v.samples >= 30 * CHUNK
+                                && v.samples <= 30 * CHUNK + EarsSession.DEFAULT_PREROLL_MS * 16
+                                && v.id.buffered() == 0,
+                        "got=" + got + " heard=" + r.heard() + " voice=" + r.client.voice + " samples=" + v.samples);
+            }
+        });
+        scenario("ears_voice_cues_short_answers_and_clipped_answers_are_not_identified", new Scenario() {
+            public void run(String n) throws Exception {
+                Rig r = new Rig();
+                VoiceRig v = new VoiceRig(r);
+                r.open(false);
+                // A strong cue outside any listen: delivered, never embedded.
+                r.steps(false, 400);
+                for (int i = 0; i < 30; i++) {
+                    r.step(true);
+                    r.rec.text = "GOOD MORNING MIKO";
+                }
+                r.rec.endpoint = true;
+                r.steps(false, 400);
+                int cues = r.client.heard.size();
+                int afterCue = v.id.buffered();
+                // A 1 s answer: too short.
+                r.sw.on = false;
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                for (int i = 0; i < 12; i++) {
+                    r.step(true);
+                    r.rec.text = "YES";
+                }
+                r.steps(false, 2400);
+                // A long answer the robot's own line clips: partial, never embedded.
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                for (int i = 0; i < 30; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH";
+                }
+                r.session.lineStarted();
+                r.step(true);
+                r.session.playbackIdle();
+                r.steps(false, 2400);
+                v.id.shutdown();
+                v.id.awaitIdle(2000);
+                check(n, cues >= 1 && afterCue == 0 && v.calls == 0 && r.client.voice.isEmpty()
+                                && v.id.buffered() == 0 && r.client.heard.size() >= 3,
+                        "cues=" + cues + " afterCue=" + afterCue + " calls=" + v.calls + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_speech_outside_a_listens_answer_sends_no_provisional", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.steps(false, 100);
+                int resets0 = r.rec.resets;
+                for (int i = 0; i < 20; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH";
+                }
+                r.steps(false, 10);
+                r.rec.endpoint = true;
+                r.steps(false, 40);
+                check(n, r.client.provisional.isEmpty() && r.rec.resets > resets0,
+                        "provisional=" + r.client.provisional + " resets=" + (r.rec.resets - resets0));
+            }
+        });
+        scenario("ears_a_40_s_answer_is_delivered_whole_not_cut_at_20_s", new Scenario() {
+            // 40 s of continuous speech, with the recogniser closing a segment at 20 s (its
+            // longest-utterance rule) and the VAD dropping for a chunk there (its max-speech
+            // split): one answer, whole, after the silence that follows it.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                long start = r.clock.now + 80;
+                boolean split = false;
+                while (r.clock.now + 80 - start < 40000) {
+                    long in = r.clock.now + 80 - start;
+                    if (!split && in >= 20000) {
+                        split = true;
+                        r.rec.endpoint = true;
+                        r.step(false);
+                        continue;
+                    }
+                    r.step(true);
+                    r.rec.text = in < 20000 ? "FIRST WE SAILED" : "THEN WE ROWED HOME";
+                }
+                long lastWord = r.clock.now;
+                boolean whole = r.client.heard.isEmpty() && r.session.listening();
+                r.steps(false, 2400);
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                long when = u == null ? -1 : r.clock.now;
+                check(n, whole && r.client.heard.size() == 1 && u != null
+                                && "FIRST WE SAILED THEN WE ROWED HOME".equals(u.text) && u.at == start
+                                && !u.partial && lastWord - start >= 39900 && r.client.answerOver.isEmpty()
+                                && !r.session.listening(),
+                        "whole=" + whole + " heard=" + r.heard() + " text=" + (u == null ? null : u.text) + " span="
+                                + (lastWord - start) + " when=" + when);
+            }
+        });
+        scenario("ears_a_line_mid_answer_delivers_the_joined_words_as_partial", new Scenario() {
+            // The deaf window still cuts an answer: what was said so far, segments joined, at once.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                for (int i = 0; i < 10; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT";
+                }
+                r.steps(false, 720);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.steps(false, 400);
+                for (int i = 0; i < 10; i++) {
+                    r.step(true);
+                    r.rec.text = "TO THE BEACH";
+                }
+                boolean before = r.client.heard.isEmpty();
+                r.session.lineStarted();
+                r.step(true);
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, before && r.client.heard.size() == 1 && u != null && "WE WENT TO THE BEACH".equals(u.text)
+                                && u.partial && r.client.answerOver.isEmpty(),
+                        "before=" + before + " heard=" + r.heard() + " text=" + (u == null ? null : u.text));
+            }
+        });
+        scenario("ears_outside_a_listen_utterances_still_end_at_the_fast_endpoint", new Scenario() {
+            // The cue path keeps KTD2's endpointing: no listen, two calls 1.2 s apart are two
+            // utterances, each delivered at its own endpoint.
+            public void run(String n) {
+                Rig r = new Rig();
+                r.open(false);
+                r.utter("MIKO COME HERE", 4);
+                int first = r.client.heard.size();
+                r.silence(1200);
+                r.utter("MIKO LOOK", 4);
+                int second = r.client.heard.size();
+                r.silence(2400);
+                check(n, first == 1 && second == 2 && r.client.heard.size() == 2
+                                && "MIKO COME HERE".equals(r.client.heard.get(0).text)
+                                && "MIKO LOOK".equals(r.client.heard.get(1).text),
+                        "first=" + first + " second=" + second + " heard=" + r.heard());
+            }
+        });
+        // ---- Robot 2026-10-01: "answering" tells the mode once that a listen's answer has started ----
+        scenario("ears_answer_started_in_the_window_says_answering_once_before_the_words", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 2480);
+                long start = r.clock.now + 80;
+                for (int i = 0; i < 50; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH";
+                }
+                java.util.List<Long> during = new ArrayList<Long>(r.client.answering);
+                r.steps(false, 720);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.steps(false, 1400);
+                check(n, during.equals(Collections.singletonList(start)) && r.client.answering.size() == 1
+                                && r.client.heardBeforeAnswering.equals(Collections.singletonList(0))
+                                && r.client.heard.size() == 1,
+                        "during=" + during + " start=" + start + " answering=" + r.client.answering + " heard="
+                                + r.heard());
+            }
+        });
+        scenario("ears_answer_begun_just_before_the_listen_says_answering", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.step(true);
+                long start = r.clock.now;
+                r.rec.text = "YES I";
+                r.steps(true, 400);
+                boolean none = r.client.answering.isEmpty();
+                r.session.listen("10001", 4000);
+                r.steps(true, 400);
+                check(n, none && r.client.answering.equals(Collections.singletonList(start)),
+                        "none=" + none + " start=" + start + " answering=" + r.client.answering);
+            }
+        });
+        scenario("ears_silent_or_unlistened_speech_says_no_answering", new Scenario() {
+            public void run(String n) {
+                // A silent listen, then speech with no listen open, then speech begun too long before one.
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 4400);
+                r.steps(true, 1000);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.steps(false, 400);
+                Rig q = new Rig();
+                q.sw.on = false;
+                q.open(false);
+                q.steps(true, 1040);
+                q.session.listen("10001", 4000);
+                q.steps(true, 1000);
+                check(n, r.client.answering.isEmpty() && q.client.answering.isEmpty(),
+                        "silent/unlistened=" + r.client.answering + " old speech=" + q.client.answering);
+            }
+        });
+        scenario("ears_each_listen_says_answering_at_most_once", new Scenario() {
+            public void run(String n) {
+                // Two utterances inside one start window: the first is the answer, once; a new listen
+                // with a new answer says it again.
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                r.steps(true, 400); // a wordless burst: it ends without ending the listen
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                r.steps(false, 160);
+                boolean stillOpen = r.session.listening();
+                r.steps(true, 400); // a second utterance in the same start window
+                int afterTwo = r.client.answering.size();
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                r.steps(false, 4000);
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                r.steps(true, 400);
+                check(n, stillOpen && afterTwo == 1 && r.client.answering.size() == 2, "stillOpen=" + stillOpen
+                        + " afterTwo=" + afterTwo + " answering=" + r.client.answering + " heard=" + r.heard());
+            }
+        });
+        // ---- Review P2-2: an announced answer that ends without words says "answer over" ----
+        scenario("ears_wordless_answer_says_answer_over_once_when_the_listen_ends", new Scenario() {
+            public void run(String n) {
+                // A cough 1 s into a 4 s listen: answering, the recogniser hears "", no side. The
+                // launcher's listen ends at its window with no words: the mode hears "answer over".
+                Rig r = new Rig();
+                r.client.overClock = r.clock;
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                long opened = r.clock.now;
+                r.steps(false, 1000);
+                long start = r.clock.now + 80;
+                r.steps(true, 300);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                boolean noneYet = r.client.answerOver.isEmpty();
+                r.steps(false, 4000);
+                long when = r.client.answerOverWhen.isEmpty() ? -1 : r.client.answerOverWhen.get(0);
+                check(n, r.client.answering.equals(Collections.singletonList(start)) && noneYet
+                                && r.client.answerOver.equals(Collections.singletonList(start)) && r.client.heard.isEmpty()
+                                && when - opened >= 3600 && when - opened <= 4100 && !r.session.listening(),
+                        "answering=" + r.client.answering + " over=" + r.client.answerOver + " @" + (when - opened)
+                                + " noneYet=" + noneYet + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_answer_over_logs_why_the_answer_had_no_words", new Scenario() {
+            public void run(String n) {
+                // Robot 2026-10-02: "answer over: no words" said nothing about the answer. It now
+                // gives its length, the chunks fed to the recogniser, when it ended against the
+                // listen's window, whether the deaf window clipped it, how soon after the deaf
+                // window it began and the pre-roll fed, so the robot log can tell a cough from his
+                // own speech's tail.
+                Rig r = new Rig();
+                r.client.overClock = r.clock;
+                r.sw.on = false;
+                r.open(false);
+                r.session.lineStarted();
+                r.steps(false, 400);
+                r.session.playbackIdle();
+                r.steps(false, Rig.TAIL);
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                r.steps(true, 320);
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                r.steps(false, 4000);
+                String line = null;
+                synchronized (r.diag.lines) {
+                    for (String l : r.diag.lines) {
+                        if (l.contains("answer over: no words")) {
+                            line = l;
+                        }
+                    }
+                }
+                check(n, line != null && line.matches(".*answer \\d+ ms long.*") && line.contains("chunks fed")
+                                && line.contains("not deaf-clipped") && line.matches(".*began \\d+ ms after the deaf window.*")
+                                && line.matches(".*ended \\d+ ms before the listen's end.*") && line.contains("pre-roll"),
+                        "line=" + line + " all=" + r.diag.lines);
+            }
+        });
+        scenario("ears_wordless_answer_past_the_window_says_answer_over_as_it_ends", new Scenario() {
+            public void run(String n) {
+                // Speech begun at 3 s that runs to 5 s with no words: the listen ends with it, after
+                // ANSWER_SILENCE_MS of no speech, and so does the mode's hold.
+                Rig r = new Rig();
+                r.client.overClock = r.clock;
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                long opened = r.clock.now;
+                r.steps(false, 3000);
+                r.steps(true, 2000);
+                long ended = r.clock.now;
+                r.rec.endpoint = true;
+                r.step(false);
+                boolean notAtEndpoint = r.client.answerOver.isEmpty() && r.session.listening();
+                r.steps(false, 2400);
+                long when = r.client.answerOverWhen.isEmpty() ? -1 : r.client.answerOverWhen.get(0);
+                check(n, notAtEndpoint && r.client.answering.size() == 1 && r.client.answerOver.size() == 1
+                                && when - ended >= 2000 && when - ended <= 2160 && r.client.heard.isEmpty()
+                                && !r.session.listening(),
+                        "notAtEndpoint=" + notAtEndpoint + " answering=" + r.client.answering + " over="
+                                + r.client.answerOver + " @" + (when - opened) + " ended@" + (ended - opened));
+            }
+        });
+        scenario("ears_answer_with_words_or_no_answer_says_no_answer_over", new Scenario() {
+            public void run(String n) {
+                // An answer with words, a silent listen, and an older-style flow: never "answer over".
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 1000);
+                for (int i = 0; i < 10; i++) {
+                    r.step(true);
+                    r.rec.text = "WE WENT TO THE BEACH";
+                }
+                r.rec.endpoint = true;
+                r.step(false);
+                r.rec.endpoint = false;
+                r.steps(false, 5000);
+                Rig q = new Rig();
+                q.sw.on = false;
+                q.open(false);
+                q.session.listen("10001", 4000);
+                q.steps(false, 5000);
+                check(n, r.client.answering.size() == 1 && r.client.heard.size() == 1 && r.client.answerOver.isEmpty()
+                                && q.client.answering.isEmpty() && q.client.answerOver.isEmpty(),
+                        "words: answering=" + r.client.answering + " over=" + r.client.answerOver + " heard=" + r.heard()
+                                + " silent: over=" + q.client.answerOver);
+            }
+        });
+        scenario("ears_speech_in_the_last_300_ms_of_the_window_is_not_claimed", new Scenario() {
+            public void run(String n) {
+                // Review P3-10: the mode's timer starts before the launcher's window opens, so an
+                // answer claimed at the window's very end reached the mode after it had given up.
+                // The start window closes LISTEN_EDGE_MS early so "answering" always arrives in time.
+                Rig r = new Rig();
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.steps(false, 3760);
+                r.steps(true, 400);
+                Rig q = new Rig();
+                q.sw.on = false;
+                q.open(false);
+                q.session.listen("10001", 4000);
+                q.steps(false, 3520);
+                q.steps(true, 400);
+                check(n, r.client.answering.isEmpty() && q.client.answering.size() == 1
+                                && EarsSession.LISTEN_EDGE_MS == 300,
+                        "late=" + r.client.answering + " in time=" + q.client.answering);
+            }
+        });
         scenario("ears_logs_counters_not_words", new Scenario() {
             public void run(String n) {
                 Rig r = new Rig();
@@ -1099,6 +2135,408 @@ public final class ListenServiceHarness {
                 boolean summary = r.diag.mention("utterances");
                 check(n, summary && !r.diag.mention("SARAH") && !r.diag.mention("HELLO") && !r.diag.mention("sarah"),
                         String.valueOf(r.diag.lines));
+            }
+        });
+
+        // ---- Ears CPU switches (2026-09-30): EarsTuning, the wake gate, the decode timing ----
+        scenario("ears_tuning_unset_is_ktd2", new Scenario() {
+            public void run(String n) {
+                final java.util.Map<String, String> p = new java.util.HashMap<String, String>();
+                SpeechTuning.Props props = new SpeechTuning.Props() {
+                    public String get(String key) {
+                        return p.get(key);
+                    }
+                };
+                EarsTuning d = EarsTuning.from(props);
+                p.put(EarsTuning.DECODING_PROP, "nonsense");
+                p.put(EarsTuning.PATHS_PROP, "x");
+                p.put(EarsTuning.THREADS_PROP, "");
+                p.put(EarsTuning.GATE_PROP, "maybe");
+                EarsTuning junk = EarsTuning.from(props);
+                String want = "decoding=modified_beam_search paths=2 threads=2 hotwords=on gate=off";
+                check(n, want.equals(d.toString()) && want.equals(junk.toString())
+                        && want.equals(EarsTuning.defaults().toString()), d + " / " + junk);
+            }
+        });
+        scenario("ears_tuning_switches_and_clamps", new Scenario() {
+            public void run(String n) {
+                final java.util.Map<String, String> p = new java.util.HashMap<String, String>();
+                SpeechTuning.Props props = new SpeechTuning.Props() {
+                    public String get(String key) {
+                        return p.get(key);
+                    }
+                };
+                p.put(EarsTuning.DECODING_PROP, " greedy_search ");
+                p.put(EarsTuning.PATHS_PROP, "64");
+                p.put(EarsTuning.THREADS_PROP, "1");
+                p.put(EarsTuning.GATE_PROP, "WAKE");
+                EarsTuning a = EarsTuning.from(props);
+                p.put(EarsTuning.THREADS_PROP, "0");
+                p.put(EarsTuning.PATHS_PROP, "0");
+                EarsTuning b = EarsTuning.from(props);
+                check(n, "decoding=greedy_search paths=8 threads=1 hotwords=off gate=wake".equals(a.toString())
+                        && !a.hotwords() && a.gateWake && b.threads == 1 && b.paths == 1, a + " / " + b);
+            }
+        });
+        scenario("ears_gate_off_decodes_every_speech_chunk", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(false);
+                r.sw.on = false;
+                r.open(false);
+                r.utter("SO ANYWAY THE PRINTER", 4);
+                r.session.close("10001");
+                check(n, r.rec.samples == 5L * CHUNK && r.client.heard.isEmpty() && r.diag.mention("fed=5 gated=0"),
+                        "samples=" + r.rec.samples + " " + r.diag.lines);
+            }
+        });
+        scenario("ears_gate_holds_audio_while_the_words_cannot_matter", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true);
+                r.sw.on = false;
+                r.open(false);
+                r.utter("SO ANYWAY THE PRINTER", 4); // the endpoint is not heard while shut
+                r.silence(1200);                    // the hangover ends it
+                r.session.close("10001");
+                check(n, r.rec.samples == 0 && r.client.heard.isEmpty() && r.diag.mention("fed=0 gated=")
+                        && r.diag.mention("decoded=0") && !r.session.listening(),
+                        "samples=" + r.rec.samples + " heard=" + r.heard() + " " + r.diag.lines);
+            }
+        });
+        scenario("ears_gate_feeds_the_held_utterance_when_the_engine_fires", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true);
+                r.sw.on = false;
+                r.open(false);
+                r.chunk(true);
+                r.chunk(true);
+                long before = r.rec.samples;
+                r.spotter.hitNext = true;
+                r.chunk(true); // the early cue, then the two held chunks and this one
+                long caught = r.rec.samples;
+                r.rec.text = "HEY MIKO COME HERE";
+                r.rec.endpoint = true;
+                r.chunk(true);
+                EarsSession.Utterance end = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, before == 0 && caught == 3L * CHUNK && r.rec.samples == 4L * CHUNK && end != null && end.called
+                        && "HEY MIKO COME HERE".equals(end.text) && end.tier == CueClassifier.TIER_STRONG,
+                        "before=" + before + " caught=" + caught + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_gate_stays_open_with_the_switch_on", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true); // the switch defaults on, as in the launcher
+                r.open(false);
+                r.utter("MIKO COME HERE", 3);
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, r.rec.samples == 4L * CHUNK && u != null && u.tier == CueClassifier.TIER_STRONG
+                        && u.kind == CueClassifier.KIND_NAME && !u.called, "samples=" + r.rec.samples
+                        + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_gate_opens_for_a_conversation_listen", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true);
+                r.sw.on = false;
+                r.open(false);
+                r.chunk(true);
+                r.chunk(true); // held: no listen yet
+                long before = r.rec.samples;
+                r.session.listen("10001", 6000);
+                r.rec.text = "I'M SAM";
+                r.rec.endpoint = true;
+                r.chunk(true);
+                long fed = r.rec.samples;
+                r.silence(EarsSession.ANSWER_SILENCE_MS + 80); // the listen's answer ends on silence
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, before == 0 && fed == 3L * CHUNK && u != null && "I'M SAM".equals(u.text)
+                        && !r.session.listening(), "before=" + before + " samples=" + r.rec.samples
+                        + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_summary_reports_decode_ms_per_chunk", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig();
+                r.rec.clock = r.clock;
+                r.rec.decodeNsPerChunk = 12000000L; // 12 ms per 80 ms chunk
+                r.open(false);
+                r.utter("HELLO THERE", 3);
+                r.rec.decodeNsPerChunk = 40000000L;
+                r.utter("HELLO AGAIN", 3);
+                r.session.close("10001");
+                // Released: the summary (nearest-rank p50 of {12, 40} is 12), then cleared.
+                boolean first = r.diag.mention("decode_p50=12.0 decode_p95=40.0 decode_max=40.0 decoded=2 fed=8");
+                double[] five = {1, 2, 3, 4, 100};
+                check(n, first && EarsSession.percentile(five, 95) == 100 && EarsSession.percentile(five, 50) == 3
+                        && EarsSession.percentile(new double[] {7}, 95) == 7, String.valueOf(r.diag.lines));
+            }
+        });
+
+        // ---- the pre-roll: the audio just before the VAD's onset reaches the recogniser first ----
+
+        scenario("ears_preroll_feeds_the_head_before_the_onset_in_order", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(); // the default pre-roll, never opened: no capture thread feeds
+                int pre = (int) (EarsSession.DEFAULT_PREROLL_MS * EarsSession.SAMPLE_RATE / 1000);
+                for (int i = 0; i < 6; i++) {
+                    r.marked(false); // the word's first 150 ms and more sit here, before the gate opens
+                }
+                int onset = r.mark;
+                r.markedUtter(3);
+                String bad = contiguous(r.rec.marks, onset - pre, r.mark - 1);
+                check(n, bad == null && pre >= CHUNK * 15 / 8, "pre=" + pre + " " + bad);
+            }
+        });
+        scenario("ears_preroll_never_feeds_a_sample_twice", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(false, 300);
+                for (int i = 0; i < 5; i++) {
+                    r.marked(false);
+                }
+                int first = r.mark - 300 * 16;
+                r.markedUtter(3);
+                int gap = r.mark;
+                r.marked(false); // one chunk between the endpoint and the next onset
+                r.rec.endpoint = false;
+                r.markedUtter(2);
+                // The second utterance's pre-roll is the gap alone: nothing the first one fed comes back.
+                String bad = contiguous(r.rec.marks, first, r.mark - 1);
+                check(n, bad == null, "gap=" + gap + " " + bad);
+            }
+        });
+        scenario("ears_preroll_is_held_with_the_utterance_under_the_wake_gate", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(true, 300);
+                r.sw.on = false;
+                for (int i = 0; i < 4; i++) {
+                    r.marked(false);
+                }
+                int first = r.mark - 300 * 16;
+                r.marked(true);
+                r.marked(true); // held, pre-roll first
+                int before = r.rec.marks.size();
+                r.spotter.hitNext = true;
+                r.marked(true); // the engine fires: pre-roll, the held chunks, this one
+                r.rec.endpoint = true;
+                r.marked(true);
+                String bad = contiguous(r.rec.marks, first, r.mark - 1);
+                check(n, before == 0 && bad == null, "before=" + before + " " + bad);
+            }
+        });
+        scenario("ears_preroll_holds_nothing_from_before_the_deaf_window", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(false, 500);
+                for (int i = 0; i < 6; i++) {
+                    r.marked(false); // hearing, before the robot speaks
+                }
+                r.session.lineStarted();
+                for (int i = 0; i < 3; i++) {
+                    r.marked(false); // the robot's own line: deaf
+                }
+                r.session.playbackIdle();
+                while (r.clock.now + 80 < r.session.deafUntilMs()) {
+                    r.marked(false); // the tail: deaf
+                }
+                int heard = r.mark;
+                r.marked(false);
+                r.marked(false); // 160 ms heard, shorter than the pre-roll
+                r.markedUtter(2);
+                // The utterance leads with the heard audio alone: nothing from before or inside the window.
+                String bad = contiguous(r.rec.marks, heard, r.mark - 1);
+                check(n, bad == null, "heard=" + heard + " " + bad);
+            }
+        });
+        scenario("ears_preroll_holds_nothing_from_before_a_capture_restart", new Scenario() {
+            public void run(String n) throws Exception {
+                Rig r = new Rig(false, 500);
+                for (int i = 0; i < 6; i++) {
+                    r.marked(false); // fed before any capture runs: a previous capture's last audio
+                }
+                int restart = r.mark;
+                r.open(false);
+                boolean up = r.awaitMic(true);
+                r.markedUtter(2); // the fake mic's silent chunks may interleave; only marks count
+                r.session.close("10001");
+                int lowest = r.rec.marks.isEmpty() ? -1 : Collections.min(r.rec.marks);
+                check(n, up && lowest >= restart, "restart=" + restart + " lowest=" + lowest);
+            }
+        });
+        // robot-say.py (2026-10-02): debug-only heard-text injection through the real ears path.
+        scenario("ears_inject_refused_while_the_property_is_off", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps(""));
+                r.open(false);
+                boolean offered = r.inject.offer("hey miko turn around", true);
+                runUntilHeard(r, 1, 6000);
+                boolean quiet = r.client.heard.isEmpty() && !r.inject.active();
+                // Real speech still goes through the wrapped fakes untouched.
+                r.spotter.hitNext = true;
+                r.utter("HEY MIKO HELLO", 3);
+                r.silence(EarsSession.ENDPOINT_HANGOVER_MS + 80);
+                EarsSession.Utterance u = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, !offered && quiet && u != null && "HEY MIKO HELLO".equals(u.text)
+                                && r.diag.mention("inject refused: " + EarsInject.PROPERTY + " is off"),
+                        "offered=" + offered + " quiet=" + quiet + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_inject_wake_call_sends_the_early_cue_then_the_called_words", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.open(false);
+                boolean offered = r.inject.offer("Turn around, please!", true);
+                runUntilHeard(r, 2, 6000);
+                EarsSession.Utterance cue = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                EarsSession.Utterance f = r.client.heard.size() < 2 ? null : r.client.heard.get(1);
+                check(n, offered && cue != null && cue.text.isEmpty() && cue.kind == CueClassifier.KIND_WAKE_WORD
+                                && cue.tier == CueClassifier.TIER_STRONG
+                                && f != null && "HEY MIKO TURN AROUND PLEASE".equals(f.text) && f.called
+                                && "turn around please".equals(f.message) && f.at == cue.at && !f.partial
+                                && r.client.heard.size() == 2,
+                        "offered=" + offered + " heard=" + r.heard() + (f == null ? "" : " message=" + f.message));
+            }
+        });
+        scenario("ears_inject_answer_runs_the_listens_answer_path", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.sw.on = false;
+                r.open(false);
+                r.client.provisionalClock = r.clock;
+                r.session.listen("10001", 4000);
+                r.steps(false, 400);
+                boolean offered = r.inject.offer("yes, go find the printer", false);
+                runUntilHeard(r, 1, 8000);
+                long heardAt = r.clock.now;
+                EarsSession.Utterance u = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                long speak = EarsInject.speakMs("YES GO FIND THE PRINTER", false);
+                long provisionalAfter = r.client.provisionalWhen.isEmpty() ? -1
+                        : r.client.provisionalWhen.get(0) - (u == null ? 0 : u.at);
+                check(n, offered && r.client.answering.size() == 1 && u != null
+                                && "YES GO FIND THE PRINTER".equals(u.text) && !u.called
+                                && java.util.Arrays.asList("YES GO FIND THE PRINTER").equals(r.client.provisional)
+                                && r.client.heardBeforeProvisional.equals(java.util.Arrays.asList(0))
+                                && provisionalAfter >= speak + EarsInject.ENDPOINT_AFTER_MS - 80
+                                && heardAt - u.at >= speak + EarsSession.ANSWER_SILENCE_MS - 80
+                                && r.client.answerOver.isEmpty() && !r.session.listening()
+                                && r.client.heard.size() == 1,
+                        "offered=" + offered + " answering=" + r.client.answering + " provisional=" + r.client.provisional
+                                + " provisionalAfter=" + provisionalAfter + " heard=" + r.heard() + " at " + heardAt);
+            }
+        });
+        scenario("ears_inject_waits_out_the_deaf_window", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.open(false);
+                r.session.lineStarted();
+                r.inject.offer("hello there", true);
+                r.steps(false, 3000);
+                boolean nothingWhileSpeaking = r.client.heard.isEmpty() && !r.inject.active();
+                r.session.playbackIdle();
+                long idleAt = r.clock.now;
+                runUntilHeard(r, 2, 6000);
+                EarsSession.Utterance cue = r.client.heard.isEmpty() ? null : r.client.heard.get(0);
+                check(n, nothingWhileSpeaking && r.client.heard.size() == 2 && cue != null
+                                && cue.at > idleAt + Rig.TAIL && "HEY MIKO HELLO THERE".equals(r.client.heard.get(1).text),
+                        "nothingWhileSpeaking=" + nothingWhileSpeaking + " heard=" + r.heard() + " idleAt=" + idleAt);
+            }
+        });
+        scenario("ears_inject_ignores_real_audio_while_it_plays_then_passes_it_through", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.open(false);
+                r.inject.offer("what time is it", true);
+                // The microphone hears speech and a wake hit throughout: the injection's verdicts win.
+                for (int i = 0; i < 80 && r.inject.active() || i < 2; i++) {
+                    r.spotter.hitNext = true;
+                    r.rec.text = "SOMETHING ELSE";
+                    r.step(true);
+                }
+                int during = r.client.heard.size();
+                String words = during < 2 ? "" : r.client.heard.get(1).text;
+                long acceptedDuring = r.rec.accepted;
+                r.rec.text = "";
+                r.utter("HELLO MIKO", 3);
+                r.silence(EarsSession.ENDPOINT_HANGOVER_MS + 80);
+                EarsSession.Utterance after = r.client.heard.size() < 3 ? null : r.client.heard.get(r.client.heard.size() - 1);
+                check(n, during == 2 && "HEY MIKO WHAT TIME IS IT".equals(words) && acceptedDuring == 0
+                                && after != null && "HELLO MIKO".equals(after.text) && r.rec.accepted > 0,
+                        "during=" + during + " words=" + words + " accepted=" + acceptedDuring + " heard=" + r.heard());
+            }
+        });
+        scenario("ears_inject_next_offer_starts_once_the_words_are_spent", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.sw.on = false;
+                r.open(false);
+                r.inject.offer("", true);
+                runUntilHeard(r, 2, 6000);
+                boolean spent = r.diag.mention("inject spent");
+                // The mode answers the call at once and listens: the answer must not wait out the tail.
+                r.session.listen("10001", 4000);
+                long opened = r.clock.now;
+                r.inject.offer("my name is sam", false);
+                runUntilHeard(r, 3, 8000);
+                EarsSession.Utterance u = r.client.heard.size() < 3 ? null : r.client.heard.get(2);
+                check(n, spent && u != null && "MY NAME IS SAM".equals(u.text) && u.at - opened <= 160
+                                && r.client.answering.size() == 1,
+                        "spent=" + spent + " heard=" + r.heard() + " opened=" + opened + " answering=" + r.client.answering);
+            }
+        });
+        scenario("ears_inject_stale_offer_is_dropped", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.open(false);
+                r.session.lineStarted();
+                r.inject.offer("are you there", false);
+                r.clock.now += EarsInject.STALE_MS + 1000;
+                r.session.playbackIdle();
+                runUntilHeard(r, 1, 4000);
+                check(n, r.client.heard.isEmpty() && r.diag.mention("inject dropped"), "heard=" + r.heard());
+            }
+        });
+        scenario("ears_inject_normalises_like_the_models_tokens", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                boolean ok = "YES GO FIND THE PRINTER".equals(EarsInject.normalize("yes, go find the printer!"))
+                        && "GO SEE IF ANYONE'S THERE".equals(EarsInject.normalize("  go see if anyone's  there? "))
+                        && "".equals(EarsInject.normalize(" ,.! ")) && "".equals(EarsInject.normalize(null))
+                        && EarsInject.normalize(new String(new char[1000]).replace('\0', 'a')).length() == EarsInject.MAX_CHARS;
+                boolean emptyRefused = !r.inject.offer(" ... ", false);
+                boolean bareWake = r.inject.offer("", true);
+                boolean armedWithSpaces = new EarsInject(r.clock, new FakeProps(" 1 "), r.diag).armed();
+                boolean offWithZero = !new EarsInject(r.clock, new FakeProps("0"), r.diag).armed();
+                r.open(false);
+                r.inject.offer("Hey Miko, hi", true);
+                runUntilHeard(r, 2, 6000);
+                String words = r.client.heard.size() < 2 ? "" : r.client.heard.get(1).text;
+                check(n, ok && emptyRefused && bareWake && armedWithSpaces && offWithZero && "HEY MIKO HI".equals(words),
+                        ok + " " + emptyRefused + " " + bareWake + " " + armedWithSpaces + " " + offWithZero + " " + words);
+            }
+        });
+        scenario("ears_inject_logs_no_words", new Scenario() {
+            public void run(String n) {
+                Rig r = new Rig(new FakeProps("1"));
+                r.sw.on = false;
+                r.open(false);
+                r.session.listen("10001", 4000);
+                r.inject.offer("the purple elephant", false);
+                runUntilHeard(r, 1, 8000);
+                boolean leaked = false;
+                synchronized (r.diag.lines) {
+                    for (String l : r.diag.lines) {
+                        leaked |= l.toUpperCase().contains("PURPLE") || l.toUpperCase().contains("ELEPHANT");
+                    }
+                }
+                check(n, !leaked && r.client.heard.size() == 1 && r.diag.mention("inject queued: an utterance, 3 word(s)"),
+                        "leaked=" + leaked + " lines=" + r.diag.lines);
+            }
+        });
+        scenario("ears_preroll_tuning_parses_and_clamps", new Scenario() {
+            public void run(String n) {
+                long d = EarsSession.DEFAULT_PREROLL_MS;
+                check(n, EarsSession.prerollMs(null) == d && EarsSession.prerollMs(" ") == d
+                        && EarsSession.prerollMs("junk") == d && EarsSession.prerollMs(" 160 ") == 160
+                        && EarsSession.prerollMs("0") == 0 && EarsSession.prerollMs("-40") == 0
+                        && EarsSession.prerollMs("99999") == EarsSession.MAX_PREROLL_MS
+                        && d >= 160 && d <= 500, "default=" + d);
             }
         });
 

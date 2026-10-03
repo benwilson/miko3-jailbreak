@@ -142,6 +142,47 @@ lease logic, the camera, or system load (all of which were real, separately-
 fixed issues found along the way, but none of which were THE cause of the
 raw-serial-level stall specifically).
 
+### The POWER section's fields (measured 2026-10-01 / 2026-10-02)
+
+Every reply to the `POWER` keepalive starts with a `POWER=` section of ten
+comma-separated fields. Three captures:
+
+| When | Reply's POWER section |
+|---|---|
+| Off the charger, 2026-10-01 | `POWER=0,0,07589,-0357,07580,-0357,056,07,34,11` |
+| Off the charger, older sample (`docs/hardware/tof-sensor.md`) | `POWER=0,0,07884,-0234,07887,-0234,076,14,15,23` |
+| On the owner's dock, charging, 2026-10-02 | `POWER=2,0,08268,01002,08271,-0255,100,00,00,00` |
+
+What the fields appear to mean (from these three captures only):
+
+| Field | Off the dock | On the dock | Reading |
+|---|---|---|---|
+| 1st | `0` | `2` | charge state: 0 off the dock, 2 charging. Other values unmeasured; a fully charged dock may report 1 or 3. |
+| 2nd | `0` | `0` | unknown |
+| 3rd, 5th | `07589`/`07580`, `07884`/`07887` | `08268`/`08271` | look like battery millivolts (about 7.6-7.9 V draining, 8.27 V charging) |
+| 4th | `-0357`, `-0234` | `01002` | signed current: negative while draining, positive (+1002) while charging |
+| 6th | `-0357`, `-0234` | `-0255` | signed; matches the 4th off the dock, stays negative on it. Unknown. |
+| 7th | `056`, `076` | `100` | looks like the battery percentage |
+| 8th-10th | various | `00,00,00` | unknown |
+
+**Docked**, as `SensorReply.Power.docked()` reads it: the 1st field above 0,
+**or** a 4th-field current of at least `+200` (`SensorReply.DOCKED_CURRENT_MIN`).
+The current covers a dock whose state field is not 2; the state field covers
+a full battery whose charging current has fallen toward 0. +200 sits well
+above every draining value seen (-234 to -357) and well below a real charge
+(+1002), so noise around 0 does not read as docked. A section cut off before
+the 4th field's comma, or with a non-numeric state or current, reads as no
+POWER at all, never as off the dock.
+
+Why it matters: on the owner's dock the floor ToF reads its fault value 16383,
+so explore sits in EYES_ONLY and never sends a motion command. The CPL=3
+charger latch (below) only arrives in motion acknowledgements, so it never
+came, and Android's battery service did not see the dock either (AC/USB
+powered false, status 3). POWER arrives on every poll with no motion, so it
+is the dock signal explore now uses first (`ExploreBrain.trackPower`, with the
+CPL=3 latch kept as a second source). Leaving the dock takes
+`ExploreTuning.dockOffReadings` (2) off readings in a row.
+
 ---
 
 ## RESOLVED (truly final): ServiceExam was never actually required — the whole drive path is back on DirectMotorDriver, bypassing ServiceExam entirely (2026-09-15, same day as the section below)

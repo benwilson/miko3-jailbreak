@@ -1,0 +1,8 @@
+# On the charger: tools that work there, and honest refusals of driving.
+# python3 scripts/robot-say.py --script scripts/robot-say-scripts/dock.txt --tail 30
+@wake
+how's your battery doing?
+what can you see right now?
+can you come over here?
+okay, never mind. what have you been up to today?
+thanks, talk later

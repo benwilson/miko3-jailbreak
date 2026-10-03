@@ -1,6 +1,9 @@
 package com.miko3.mode.explore;
 
 import android.app.Application;
+import android.content.Context;
+import android.media.AudioManager;
+import android.os.SystemClock;
 import android.util.Log;
 
 import com.miko3.shared.HttpRequest;
@@ -9,6 +12,7 @@ import com.miko3.shared.HttpsSupport;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.ModeRegistry;
 import com.miko3.shared.RoutingHttpServer;
+import com.miko3.shared.VolumeKeys;
 
 import java.io.File;
 import java.io.IOException;
@@ -52,10 +56,18 @@ public class ModeApp extends Application {
     private ExploreLoop loop;
     private ClipPlayer clips;
     private ExploreCamera camera;
+    /** Set instead of the wander while the detector bench runs (debug.miko3.explore.bench). */
+    private DetectorBench bench;
     // Claude, the launcher's voice, ears and people store at curiosity stops (explore on Claude U6).
     private ClaudeCuriosity curiosity;
     // The launcher's continuous ears as the brain's step input (meeting plan U7, KTD1).
     private EarsAdapter ears;
+
+    // The speaker muted or turned all the way down (owner 2026-10-02): do not disturb.
+    // Set by SpeakerMute on the brain thread; the clip calls read it from any thread.
+    private volatile boolean speakerMuted;
+    /** How often SpeakerMute asks the audio service; a press is noticed within this. */
+    private static final long MUTE_POLL_MS = 250;
 
     /** How often the brain loop runs; well under a hop tick (ExploreBrain.onTick). */
     private static final long BRAIN_TICK_MS = 20;
@@ -146,6 +158,15 @@ public class ModeApp extends Application {
             }
             exploring = true;
             setExploreState(ExploreState.of(ExploreState.EYES_ONLY));
+            if (DetectorBench.requested()) {
+                // Detector speed plan: time the detector on bundled or pushed frames and
+                // nothing else. No camera (repeated opens wedged its HAL), no driver, no
+                // lease, no brain; scripts/qa-detector-bench.py clears the property after.
+                Log.i(TAG, "detector bench requested -- no camera, no driving this run");
+                bench = new DetectorBench(this);
+                bench.start();
+                return;
+            }
             ExploreTuning.Calibration calibration =
                     ExploreCalibration.read(new File(getFilesDir(), ExploreCalibration.FILE_NAME));
             Log.i(TAG, calibration == null
@@ -164,6 +185,12 @@ public class ModeApp extends Application {
                     ? ExploreTuning.Navigation.LOOK_THEN_GO : ExploreTuning.Navigation.CONTINUOUS;
             Log.i(TAG, "navigation: " + navigation);
             final ExploreTuning tuning = ExploreTuning.defaults(calibration, gyro, navigation);
+            // The learning log opens before the brain notes anything; its first line says which
+            // build and tuning this run is, so scripts/daily-diff.py can compare two days' code.
+            learnLog = new LearnLog(getFilesDir(), android.os.Process.myPid());
+            String stamp = LearnLog.startRecord(buildId(), tuning);
+            learnLog.record("ExploreModeApp", stamp);
+            Log.i(TAG, stamp);
             clips = new ClipPlayer(this);
             // Open whenever he roams, escapes or is curious, closed while he talks
             // (explore nav plan U4, KTD2); the recognizer loads on the camera's
@@ -189,6 +216,9 @@ public class ModeApp extends Application {
             loop = new ExploreLoop(tuning, ExploreDrive.CLOCK, drive, drive, drive, eyes, sound, camera, curiosity,
                     ears, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
             loop.setGauges(gauges);
+            loop.setMute(new SpeakerMute());
+            // Dark-floor mode (owner 2026-10-02): persist.miko3.explore.dark_floor=1, re-read every ~5 s.
+            loop.setDarkFloor(drive);
             loop.start();
             Log.i(TAG, "explore started");
         }
@@ -209,7 +239,20 @@ public class ModeApp extends Application {
                 return;
             }
             exploring = false;
+            if (bench != null) {
+                bench.cancel();
+                bench = null;
+                setExploreState(ExploreState.IDLE_STATE);
+                Log.i(TAG, "detector bench stopped");
+                return;
+            }
             loop.stop();
+            LearnLog l = learnLog;
+            learnLog = null;
+            if (l != null) {
+                l.record("ExploreModeApp", "learn: stop");
+                l.close();
+            }
             drive.setReadingListener(null);
             ears.release();
             curiosity.release();
@@ -233,10 +276,12 @@ public class ModeApp extends Application {
     private final ExploreBrain.Eyes eyes = new ExploreBrain.Eyes() {
         @Override
         public void show(ExploreBrain.EyeState state, ExploreBrain.Direction gaze) {
-            // He sings while parked: resting after being cornered, or eyes-only.
+            // He sings only while resting after being cornered. Never DOCKED or EYES_ONLY (owner
+            // 2026-10-02): on this charger the floor sensor reads a fault, so he sat in
+            // EYES_ONLY on the dock and babbled; quiet is the safer default for both.
             ClipPlayer c = clips;
             if (c != null) {
-                if (state == ExploreBrain.EyeState.RESTING || state == ExploreBrain.EyeState.EYES_ONLY) {
+                if (state == ExploreBrain.EyeState.RESTING) {
                     c.startSinging();
                 } else {
                     c.stopSinging();
@@ -268,6 +313,10 @@ public class ModeApp extends Application {
                     break;
                 case LISTENING:
                     setExploreState(ExploreState.of(ExploreState.LISTENING));
+                    break;
+                case DOCKED:
+                    // On the charger: the ordinary awake look, glancing about, and no song.
+                    setExploreState(ExploreState.IDLE_STATE);
                     break;
                 default:
                     setExploreState(ExploreState.IDLE_STATE);
@@ -303,7 +352,7 @@ public class ModeApp extends Application {
         @Override
         public void playStartle() {
             ClipPlayer c = clips;
-            if (c != null) {
+            if (c != null && !speakerMuted) {
                 c.playStartle();
             }
         }
@@ -311,7 +360,7 @@ public class ModeApp extends Application {
         @Override
         public void playReaction(String group) {
             ClipPlayer c = clips;
-            if (c != null) {
+            if (c != null && !speakerMuted) {
                 c.playReaction(group);
             }
         }
@@ -319,18 +368,64 @@ public class ModeApp extends Application {
         @Override
         public void playName(String label) {
             ClipPlayer c = clips;
-            if (c != null) {
+            if (c != null && !speakerMuted) {
                 c.playName(label);
             }
         }
     };
 
+    /**
+     * The brain's do-not-disturb (ExploreLoop.Mute): STREAM_MUSIC muted or at zero, which
+     * the volume keys on top set (shared VolumeKeys). Asked of the audio service at most
+     * every MUTE_POLL_MS from the brain thread. Going quiet also cuts off the clip now
+     * playing, so it does not carry on aloud when the speaker comes back.
+     */
+    private final class SpeakerMute implements ExploreLoop.Mute {
+        private final AudioManager audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        private long nextPollMs;
+        private boolean muted;
+
+        @Override
+        public boolean muted() {
+            long now = SystemClock.elapsedRealtime();
+            if (now >= nextPollMs) {
+                nextPollMs = now + MUTE_POLL_MS;
+                boolean m = VolumeKeys.silenced(audio);
+                speakerMuted = m;
+                if (m != muted) {
+                    muted = m;
+                    ClipPlayer c = clips;
+                    if (m && c != null) {
+                        c.hush();
+                    }
+                }
+            }
+            return muted;
+        }
+    }
+
+    /** The learning log (2026-10-03): the brain's records, appended for a developer to pull. Null while stopped. */
+    private volatile LearnLog learnLog;
+
     private final ExploreBrain.Trace trace = new ExploreBrain.Trace() {
         @Override
         public void note(String message) {
             Log.i("ExploreBrain", message);
+            LearnLog l = learnLog;
+            if (l != null) {
+                l.offer("ExploreBrain", message);
+            }
         }
     };
+
+    /** The build id the APK carries (its versionName, scripts/build_common.py build_id()), or null. */
+    private String buildId() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     /** Called when a MainActivity instance (re)establishes itself as the active
      * one: bumps and returns the new generation and marks the mode present. */

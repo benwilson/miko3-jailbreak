@@ -357,6 +357,78 @@ final class Heading {
         }
     }
 
+    /**
+     * A short history of his heading (hey-miko plan U6, KTD7), so a call's angle can be
+     * corrected for his own turning since the voice was sampled. Unwrapped degrees,
+     * positive left: from the gyro while it is usable, otherwise from the turn he
+     * commanded at its nominal rate. Samples older than keepMs are dropped, keeping one
+     * at or before the edge so a time inside the window can still be interpolated.
+     */
+    static final class History {
+        private final long keepMs;
+        private final long sampleMs;
+        /** {time, degrees}, oldest first. */
+        private final ArrayDeque<double[]> samples = new ArrayDeque<double[]>();
+        private double deg;
+        private double lastGyroDeg = Double.NaN;
+        private long lastMs = -1;
+
+        History(long keepMs, long sampleMs) {
+            this.keepMs = keepMs;
+            this.sampleMs = sampleMs;
+        }
+
+        /**
+         * One reading at nowMs: gyroDeg is the gyro heading (NaN when it is not usable);
+         * without it, commandedSign (LEFT, RIGHT or 0) turns at degPerMs since the last one.
+         */
+        void offer(long nowMs, double gyroDeg, int commandedSign, double degPerMs) {
+            if (lastMs >= 0 && nowMs > lastMs) {
+                if (!Double.isNaN(gyroDeg) && !Double.isNaN(lastGyroDeg)) {
+                    deg += delta(lastGyroDeg, gyroDeg);
+                } else if (commandedSign != 0) {
+                    deg += commandedSign * degPerMs * (nowMs - lastMs);
+                }
+            }
+            lastGyroDeg = gyroDeg;
+            lastMs = nowMs;
+            double[] newest = samples.peekLast();
+            if (newest == null || nowMs - (long) newest[0] >= sampleMs) {
+                samples.addLast(new double[]{nowMs, deg});
+            }
+            while (samples.size() > 2) {
+                double[] oldest = samples.pollFirst();
+                if (nowMs - (long) samples.peekFirst()[0] < keepMs) {
+                    samples.addFirst(oldest);
+                    break;
+                }
+            }
+        }
+
+        /** Degrees turned (positive left) from atMs to the newest reading; NaN when atMs is older than the history. */
+        double turnedSince(long atMs) {
+            if (samples.isEmpty() || atMs < (long) samples.peekFirst()[0]) {
+                return Double.NaN;
+            }
+            double[] before = null;
+            for (double[] s : samples) {
+                if ((long) s[0] > atMs) {
+                    double at = before == null ? s[1]
+                            : before[1] + (s[1] - before[1]) * (atMs - before[0]) / (s[0] - before[0]);
+                    return deg - at;
+                }
+                before = s;
+            }
+            // After the newest sample: between it and the newest reading.
+            double[] last = samples.peekLast();
+            if (lastMs <= (long) last[0] || atMs >= lastMs) {
+                return atMs >= lastMs ? 0 : deg - last[1];
+            }
+            double at = last[1] + (deg - last[1]) * (atMs - last[0]) / (lastMs - last[0]);
+            return deg - at;
+        }
+    }
+
     static double wrap(double d) {
         double w = d % 360;
         w = w < 0 ? w + 360 : w;

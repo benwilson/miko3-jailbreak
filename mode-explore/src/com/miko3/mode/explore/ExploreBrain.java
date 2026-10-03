@@ -31,7 +31,15 @@ import java.util.Set;
  *              hopTickMs apart (each resend keeps it rolling), then stop (R1)
  *   STARTLE    stopped, startle clip and flinch (R11)
  *   BACK_OFF   the only reversing: backTicks, time-bounded and blind (R4, R12)
- *   CORNERED   too many hazards too fast: resting eyes, no motion (KTD8)
+ *   CORNERED   too many hazards too fast: resting eyes, no motion (KTD8); also the
+ *              fully jammed rest (robot 2026-10-01): the help line, jammedRestMs, one short back-up.
+ *              Before it, the long wriggle runs in the escape's state: up to wriggleMs one
+ *              way, then the other, stopping a way at once when its wheels don't move
+ *   RECOVER    after a stall (robot 2026-10-01: the motor board refused all motion for 9-29 s):
+ *              still, one short probe at each of stallRecoverProbesMs after the stall: a
+ *              back-up (the way he came), a turn only after two still back-ups; the first
+ *              that moves backs straight out, then the normal escape; none is a real jam (the
+ *              wriggle). A turn probe whose wheels move but heading doesn't: that way is blocked
  *   STOPPED    after shutdown(); inert
  *
  * Camera curiosity (camera curiosity plan KTD5), entered from PAUSE when a
@@ -87,6 +95,8 @@ import java.util.Set;
  *                               no name: nothing kept, R19)
  *        -> failed: lines request -> ASK_NAME ..., or NAME_CLIP
  *   Every failure or missed deadline ends the stop and he carries on exploring.
+ *   A roaming person pick (the detector's, while roaming) meets only with a usable
+ *   face; anything else drops it quietly (owner 2026-10-01). A call's meeting never does.
  *   Names and lines never go into the trace.
  *
  *   SCAN -> ASK -> nothing interesting: PAUSE, silent
@@ -141,7 +151,9 @@ import java.util.Set;
  * is the one place it opens and closes, by rule (cameraWanted): open in every
  * roaming, escaping and curiosity state; closed while he meets, asks or talks, at
  * rest, without the lease or sensors, and for cameraBackoffMs after a camera that
- * gave no look in time (he roams on the floor sensor meanwhile, R5). Each leg is
+ * gave no look in time (he roams on the floor sensor meanwhile, R5); a curiosity
+ * stop's miss retries once and only a second in a row closes it, for
+ * curiosityBackoffMs. Each leg is
  * chosen from the newest fresh look's openness by RoamSteer (a bend toward the
  * most open columns, a length cut by blocked ones; a low-confidence profile
  * chooses as before), and a fresh look reading the way ahead blocked ends a leg
@@ -214,6 +226,43 @@ import java.util.Set;
  * The hazard's side, a blocked side, the floor sensor, stalls, CPL and escapes rule
  * as before; with no usable heading nothing changes. Notes carry counts only.
  *
+ * Somewhere he has not looked lately (owner 2026-10-01; PlaceMemory): a look whose
+ * camera made a place print is scored against the prints of the last 30 minutes
+ * from roughly the same heading (any, with the heading unusable) and kept. Its
+ * novelty stands for the bands in view, and for its heading for a while (a scan's
+ * looks score the headings it turned through); the steer takes the lower of that
+ * and the grid's, and a scan turns toward the less familiar side. A look that
+ * matches notes "place: seen before (sim X.XX, N min ago)", each memory once in a
+ * row. It only lowers novelty: blocked bands and every safety stop rule as before;
+ * looks without a print (or plain ones) change nothing.
+ *
+ * Seeking the unfamiliar (owner 2026-10-01: "if everything around him is familiar,
+ * he should find something that's unfamiliar and drive towards it"): a curiosity stop
+ * that ends with nothing new to react to, whose scored looks were all familiar
+ * (seekFamiliarNovelty), for the seekFamiliarScans-th stop in a row and at most once
+ * per seekGapMs, starts a seek. So does any roaming curiosity stop's end (after its
+ * remark, if it had one) once he has roamed seekEveryMs without a seek, or when the
+ * last seekAreaWindowMs of roaming stayed within a small area of the coverage grid's
+ * dead reckoning (seekAreaSpanM, seekAreaCells): owner, "if he's been somewhere in the
+ * last 30 minutes, he should try and find somewhere else to go". Live, Claude had a
+ * remark at almost every stop and the place memory read most views as new, so the
+ * familiar trigger alone never fired. Each trigger notes why: "seeking: surroundings
+ * familiar (...)", "seeking: stayed within a small area (N cells in 3 min)", "seeking:
+ * no seek for 5 min". Claude gets the stop's frames with their headings
+ * and how familiar each looked (labels and numbers only) and answers a frame and x,
+ * or none; offline, none, late or where the last seek went: the least familiar frame's
+ * most open band. Its heading is the frame's capture heading plus the exact bearing of
+ * x (RoamSteer.bearingOf). He stands thinking in PAUSE while Claude chooses, turns to
+ * it (measured), looks again, and drives roaming legs toward it (the steer pulls by
+ * seekWeight; no curiosity stops meanwhile), re-centring after each leg on the box
+ * Claude named or the most open band near where it should be. It ends on arrival (a
+ * look after a leg new enough, or through a remembered doorway), after seekMaxLegs or
+ * seekMaxCounts, on any hazard, stall or wedge (blocked), or when anything takes him
+ * out of roaming (a call, a person, the sensors or lease); the place is then marked in
+ * the place memory, so the next seek goes elsewhere. Notes start "seeking:" and carry
+ * numbers and detector labels only. It never moves him any way roaming would not: every
+ * stop rule above still holds.
+ *
  * People while roaming (explore nav plan U7, R9, R10, KTD4, KTD8): a detector person
  * box in a leg decision's look, with Claude set up, becomes a synthetic PERSON pick
  * (the look is its frame 0): FACE, APPROACH until the box is politeHeight of the
@@ -243,9 +292,15 @@ import java.util.Set;
  *              PAUSE with nothing sent
  *
  * Held cues wait for the escape or the line to end, expire after cueHoldMs (a
- * strong one becoming a lean-in); a shove arms a weak cue only while stopped; the
- * ears follow the charger latch; in EYES_ONLY only the wake word opens a meeting,
- * without a turn. The conversation the meeting becomes is U8's (CHAT states).
+ * strong one becoming a lean-in); a shove arms a weak cue only while stopped. A
+ * call (a strong wake word or name, hey-miko plan U5) has its own slot instead:
+ * never dropped, answered with a local clip the moment KTD2's order allows, and,
+ * on the charger or in EYES_ONLY, met without a turn. The ears stay open on the
+ * charger. The call's own search (hey-miko plan U6) runs in CUE_TURN and CUE_LOOK
+ * with its own plan (its bearing and the two neighbours, or eight looks round one
+ * circle), counts any person box tall enough as found, goes over to a far one
+ * through FACE and APPROACH, and when nobody is found says "Where'd you go?" and
+ * listens in CUE_WHERE. The conversation the meeting becomes is U8's (CHAT states).
  *
  * It keeps no stop timer of its own: the drive adapter (U5, KTD6) stops the
  * motors if the brain stops calling it.
@@ -253,6 +308,11 @@ import java.util.Set;
 final class ExploreBrain {
     interface Clock {
         long nowMs();
+
+        /** The wall clock (epoch ms), read once per leg line to name the leg's frame as the frame ring does. */
+        default long wallMs() {
+            return System.currentTimeMillis();
+        }
     }
 
     /** The drive adapter (U5). Commands go out only under the lease; stop() always goes out. */
@@ -281,7 +341,8 @@ final class ExploreBrain {
     interface Sound {
         void playStartle();
 
-        /** A reaction clip group: "curious", "thinking", "disappointed", "delighted" or "puzzled". */
+        /** A reaction clip group: "curious", "thinking", "disappointed", "delighted" or "puzzled";
+         * "privacy" is the bathroom beep (BATHROOM_BEEP). */
         void playReaction(String group);
 
         /** Say a vocabulary name ("ooh, a plant"). */
@@ -303,7 +364,6 @@ final class ExploreBrain {
 
         /** The newest recognized frame since open(), or null. */
         Look latest();
-
         /**
          * Closed and idle: close() has taken effect and no detector run is in
          * flight. close() is asynchronous, so speech waits for this (R6).
@@ -341,19 +401,29 @@ final class ExploreBrain {
          */
         default void park(boolean parked) {
         }
+
+        /**
+         * Bathroom privacy (owner 2026-10-02): from the moment the brain thinks he is in a
+         * bathroom until he is out, no frame is saved anywhere (the NavDebug last-nav, the
+         * calibration frame ring). The brain sets it on each change. No-op by default.
+         */
+        default void setPrivate(boolean on) {
+        }
     }
 
     /**
      * One recognized camera frame: when it was captured (brain clock), what was in
      * it, and the frame's JPEG (null when the camera didn't keep it), which the
      * look request sends to Claude (explore on Claude U4), and its openness profile
-     * (explore nav plan U3; null when the camera didn't score it).
+     * (explore nav plan U3; null when the camera didn't score it), and its place
+     * print (PlaceMemory; null when the camera didn't make one).
      */
     static final class Look {
         final long frameMs;
         final List<Detection> detections;
         final byte[] jpeg;
         final Openness.Profile openness;
+        final PlaceMemory.Print place;
 
         Look(long frameMs, List<Detection> detections) {
             this(frameMs, detections, null);
@@ -364,10 +434,16 @@ final class ExploreBrain {
         }
 
         Look(long frameMs, List<Detection> detections, byte[] jpeg, Openness.Profile openness) {
+            this(frameMs, detections, jpeg, openness, null);
+        }
+
+        Look(long frameMs, List<Detection> detections, byte[] jpeg, Openness.Profile openness,
+             PlaceMemory.Print place) {
             this.frameMs = frameMs;
             this.detections = detections;
             this.jpeg = jpeg;
             this.openness = openness;
+            this.place = place;
         }
     }
 
@@ -410,7 +486,7 @@ final class ExploreBrain {
     /** ...and THINKING: waiting for Claude's answer (explore on Claude R7). */
     /** ...and GLANCE: eyes sliding toward a voice (gaze is its side; meeting plan R3, KTD12),
      * and LISTENING: attentive, looking for a face turned toward him or hearing a reply. */
-    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING, GLANCE, LISTENING }
+    enum EyeState { IDLE, LOOK, FLINCH, RESTING, EYES_ONLY, STARE, THINKING, GLANCE, LISTENING, DOCKED }
 
     enum State {
         EYES_ONLY, PAUSE, LOOK, TURN, HOP, STARTLE, BACK_OFF, CORNERED, STOPPED,
@@ -419,8 +495,12 @@ final class ExploreBrain {
         ASK_NAME, LISTEN, NAME, REMEMBER, NAME_CLIP,
         CONFIRM, LAST_NAME,
         RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF,
-        CUE_TURN, CUE_LOOK,
-        CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES;
+        RECOVER,
+        /** Dark floor (robot 2026-10-02 18:28): a move tipped him; stopped, a gentle undo, flat again. */
+        TIP,
+        CUE_TURN, CUE_LOOK, CUE_WHERE,
+        CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES,
+        DOCKED;
 
         /** A curiosity stop's looking states: the camera is always open in these (R2, AE6). */
         boolean curious() {
@@ -435,7 +515,7 @@ final class ExploreBrain {
          */
         boolean roams() {
             return this == PAUSE || this == LOOK || this == TURN || this == HOP || this == STARTLE
-                    || this == BACK_OFF || escapes();
+                    || this == BACK_OFF || this == TIP || escapes();
         }
 
         /** A wedged escape's steps (explore nav plan U5): the camera stays open through them. */
@@ -448,7 +528,7 @@ final class ExploreBrain {
          * the camera is open in these, as in a curiosity stop's looking states.
          */
         boolean cueSearch() {
-            return this == CUE_TURN || this == CUE_LOOK;
+            return this == CUE_TURN || this == CUE_LOOK || this == CUE_WHERE;
         }
 
         /**
@@ -467,6 +547,20 @@ final class ExploreBrain {
          */
         boolean confirms() {
             return this == CONFIRM || this == LAST_NAME;
+        }
+
+        /** Heading for, or meeting, a person he found: FACE, APPROACH or MEET_LOOK. */
+        boolean approachesPerson() {
+            return this == FACE || this == APPROACH || this == MEET_LOOK;
+        }
+
+        /**
+         * A conversation with someone (hey-miko plan KTD2 step 2): the meeting and
+         * everything after it, up to the end of the CHAT states. A call waits these out.
+         */
+        boolean converses() {
+            return chats() || confirms() || this == MEET || this == ASK_NAME || this == LISTEN || this == NAME
+                    || this == REMEMBER || this == NAME_CLIP;
         }
 
         /** Part of a curiosity stop, from the scan until he is back to wandering. */
@@ -490,7 +584,9 @@ final class ExploreBrain {
             SEARCHES("searches"), FACES_FOUND("facesFound"), QUIET_RESUMES("quietResumes"),
             CUES_HELD("cuesHeld"), CUES_DROPPED("cuesDropped"), RETARGETS("retargets"), SHOVES("shoves"),
             /** A question the conversation model repeated after the re-request (U8, KTD9). */
-            REPEATS("repeats");
+            REPEATS("repeats"),
+            /** A curiosity stop's remark handed to the speech service (the remark rate, owner 2026-10-01). */
+            REMARKS("remarks");
 
             final String key;
 
@@ -501,7 +597,10 @@ final class ExploreBrain {
 
         enum Stage {
             CUE_AT("cueAt"), TURN_DONE("turnDone"), FACE_FOUND("faceFound"), MATCH_ANSWERED("matchAnswered"),
-            LINE_REQUESTED("lineRequested"), FIRST_SOUND("firstSound");
+            LINE_REQUESTED("lineRequested"), FIRST_SOUND("firstSound"),
+            /** A call's cue (hey-miko plan U6): heard (its at), answered, a person found in front, the conversation open. */
+            CALL_HEARD("callHeard"), CALL_ANSWERED("callAnswered"), CALL_FACING("callFacing"),
+            CALL_ARRIVED("callArrived");
 
             final String key;
 
@@ -544,12 +643,97 @@ final class ExploreBrain {
     /** Where he has been this session (explore nav plan U10), forgotten at shutdown. */
     private final Coverage coverage;
     private int coverageNoted = -1;
+    /** What he has looked at in the last 30 minutes (visual place memory). */
+    private final PlaceMemory places;
+    /** The newest look scored against it, and its novelty (NaN: plain, or no print). */
+    private Look placeLook;
+    private double placeLookNovelty = Double.NaN;
+    /** The print the last "seen before" note was about: each memory is noted once in a row. */
+    private Object placeNoted;
+    /** How long ago the newest scored look's best match was taken (-1: none). */
+    private long placeLookAgeMs = -1;
+
+    // ---- seeking the unfamiliar (owner 2026-10-01) ----
+    /** One look of a curiosity stop's scan: its heading at capture (NaN: unusable) and how familiar it looked. */
+    private static final class SeekView {
+        final Look look;
+        final double heading;
+        final double novelty;
+        final long seenAgoMs;
+
+        SeekView(Look look, double heading, double novelty, long seenAgoMs) {
+            this.look = look;
+            this.heading = heading;
+            this.novelty = novelty;
+            this.seenAgoMs = seenAgoMs;
+        }
+    }
+
+    /** The current (or last) curiosity stop's looks, in order. */
+    private final List<SeekView> seekScan = new ArrayList<SeekView>();
+    /** Stops in a row that ended with nothing new and looked familiar; whether the last one ended with nothing. */
+    private int familiarStops;
+    private boolean lastStopNothing = true;
+    /** The seek request is out (sent at seekAskAt, with these frames, in order). */
+    private boolean seekAsking;
+    private long seekAskAt;
+    private List<SeekView> seekFrames = new ArrayList<SeekView>();
+    /** The heading the seek drives toward (NaN: no seek under way), and what it is aiming at. */
+    private double seekTarget = Double.NaN;
+    private String seekLabel;
+    private PlaceMemory.Print seekPrint;
+    /** Legs driven toward it, the forward counts at its start, and whether the first turn to face it was made. */
+    private int seekLegs;
+    private long seekFromCounts;
+    private boolean seekTurned;
+    /** The seek heads for a doorway Claude reported (not a frame it picked). */
+    private boolean seekToDoor;
+    /** The last open doorway Claude reported and when, NaN once a seek has taken it (seekDoorwayMs). */
+    private double seekDoorway = Double.NaN;
+    private long seekDoorwayAt;
+    /** No seek starts before this (seekGapMs after the last one ended). */
+    private long seekNextAt;
+    /**
+     * The target is Claude's (its pick, or a doorway it reported), not the least familiar
+     * fallback: openness never vetoes it (robot 2026-10-01 16:35).
+     */
+    private boolean seekTrusted;
+    /** "a person while seeking" was noted for this seek. */
+    private boolean seekPersonNoted;
+    /** A hazard toward the trusted target has turned the seek seekBlockedAimDeg off it; the next one ends it. */
+    private boolean seekDetoured;
+    /** Short legs driven toward a target that read blocked (seekTrustedLegsMax). */
+    private int seekTrustLegs;
+    /** The leg under way (or about to start) is a trusted short leg: openness neither ends nor re-aims it. */
+    private boolean trustLeg;
+    /** That leg heads for a doorway Claude reported, outside a seek: a hazard on it drops the doorway. */
+    private boolean trustLegDoor;
+    /** The last open doorway Claude reported and when (NaN: none, or since passed or blocked by a hazard). */
+    private double doorwayReported = Double.NaN;
+    private long doorwayReportedAt;
+    /**
+     * A roaming curiosity stop is under way (begun in enterScan): as it ends, after its remark if
+     * it had one, a seek may start. Anything that clears the stop otherwise (a voice, a hazard)
+     * clears it too.
+     */
+    private boolean stopSeekable;
+    /** Roaming time since the last seek ended, or since he started (seekEveryMs). */
+    private long roamedSinceSeekMs;
+    /** Roaming time in all: the clock the area trail keeps. */
+    private long roamedMs;
+    private long roamClockAt = -1;
+    /** Where he was while roaming, about once a second: {roamedMs, x, y} (coverage's dead reckoning, metres). */
+    private final ArrayDeque<double[]> areaTrail = new ArrayDeque<double[]>();
     /** Times of the hazard reactions since the last successful hop, for the cornered cap. */
     private final ArrayDeque<Long> hazardTimes = new ArrayDeque<Long>();
 
     private Trace trace;
     private State state = State.EYES_ONLY;
     private boolean started;
+    /** When start() ran (brain clock), for robot_status's "exploring for". */
+    private long startedAtMs;
+    /** Owner 2026-10-03: POWER's last battery percentage, or -1 before any. */
+    private int batteryPercent = -1;
     private boolean leaseHeld;
     private boolean moving;
     private boolean stepping;
@@ -602,6 +786,14 @@ final class ExploreBrain {
     /** When the next curiosity stop is due, and when a camera failure's back-off ends. */
     private long curiosityAt = Long.MAX_VALUE;
     private long curiosityOffUntil;
+    /** The last stop's look never came: the next miss in a row turns curiosity off (curiosityBackoffMs). */
+    private boolean stopLookMissed;
+    /** A stop retried after its first missed look: when the retry is due, instead of a full gap (or -1). */
+    private long curiosityRetryAt = -1;
+    /** The line queued at SPEAK is a stop's remark (counted when it is handed to the speech service). */
+    private boolean remarkQueued;
+    /** When each remark of the last ten minutes was spoken, for the running rate in the log. */
+    private final ArrayDeque<Long> remarkTimes = new ArrayDeque<Long>();
     private Step step;
     /** A look counts only if its frame was captured at or after lookAfter; none by lookDeadline is a failure. */
     private long lookAfter;
@@ -623,11 +815,41 @@ final class ExploreBrain {
     private final ArrayDeque<Cue> cues = new ArrayDeque<Cue>();
     /** Names inspected this session (R9), and when the person/pet cool-down ends (R12). */
     private final Set<String> seen = new HashSet<String>();
+    /** The things in seen, most recent first, capped at reactedLabelsMax: labels only, never a person. */
+    private final ArrayDeque<String> reacted = new ArrayDeque<String>();
+    /** His remarks about things this session, most recent first, capped at saidLinesMax (for the look request). */
+    private final ArrayDeque<String> saidLines = new ArrayDeque<String>();
+    /** Every remark about a thing this session, normalised, so none is said twice (capped at SAID_EVER_MAX). */
+    private final Set<String> saidEver = new java.util.LinkedHashSet<String>();
+    private static final int SAID_EVER_MAX = 500;
     private long peopleIgnoredUntil;
+    /**
+     * This stop's person came from a roaming pick (approachPerson), not a call, a cue or
+     * Claude's pick at a stop: a match that finds no face in its box drops it (a phantom).
+     */
+    private boolean roamingPick;
+    /**
+     * This stop's person came from a voice cue that is not a call (a lean-in, or a strong cue
+     * without the wake word or his name), found by the person-box shape test (robot
+     * 2026-10-01): like a roaming pick, its meeting needs a usable face.
+     */
+    private boolean cuePick;
+    /** Roaming person picks are ignored until then after a phantom (phantomPersonCooldownMs). */
+    private long phantomsIgnoredUntil;
+    /** The meeting's person box score (enterMeet): a faceless roaming or cue pick this strong is met. */
+    private float meetScore;
+    /** When a voice from a known side, the person's, last landed for this stop's person (NEVER: none). */
+    private long personVoiceAt = NEVER;
+    /** Robot 2026-10-01: when the meeting's listen (LISTEN, or the confirm ladder's) started. */
+    private long meetListenAt;
+    /** That listen's deadline was moved to the answer hold once already. */
+    private boolean answerHeld;
 
     // ---- asking Claude (explore on Claude U4) ----
     /** This stop asks Claude: decided as the scan starts. */
     private boolean claudeStop;
+    /** When each Claude look request of the last minute went out (claudeLooksPerMinute), oldest first. */
+    private final ArrayDeque<Long> claudeLookTimes = new ArrayDeque<Long>();
     /** The scan's looks in order, and the first detector sighting among them (the fallback). */
     private final List<Look> scanned = new ArrayList<Look>();
     /** The heading each scan look was taken at (NaN: not measured), for ORIENT (explore nav plan U2, R4). */
@@ -697,6 +919,8 @@ final class ExploreBrain {
     /** Continuous mode, in PAUSE: a leg decision waiting for a look to steer by, until then (steerWaitMs). */
     private long steerWaitUntil = NO_WAIT;
     private static final long NO_WAIT = Long.MIN_VALUE;
+    /** The running remark count in the log covers this long. */
+    private static final long REMARK_WINDOW_MS = 600000;
     /** Frames awaiting the floor-teach distance (teachQueue); the oldest is dropped first. */
     private static final int TEACH_QUEUE_MAX = 8;
     /** A timed orient shorter than this is already facing it. */
@@ -747,7 +971,7 @@ final class ExploreBrain {
     private EscThen escThen;
     /** A short forward try (ExploreTuning.escapeProbeTicks) is under way, and what follows it if blocked. */
     private boolean probing;
-    private enum ProbeThen { STEP, REST, AFTER_REST }
+    private enum ProbeThen { STEP, REST, AFTER_REST, BACK_OUT }
     private ProbeThen probeThen;
     private long probeSince;
     /** Where a forward drive last hit a hazard or stalled (NaN: none since a clean drive). */
@@ -768,6 +992,59 @@ final class ExploreBrain {
     private boolean escBackedOut;
     /** Encoder counts (both wheels) moved in the current roaming leg. */
     private long hopMoved;
+
+    // ---- the navigation log (2026-10-02): one line per forward leg, for the coding agent ----
+
+    /** The top-level modes the "mode:" notes name, one note per change. */
+    private enum Mode { ROAM, EYES_ONLY, DOCKED, CHAT, ESCAPE, RECOVER, JAM }
+
+    private Mode mode;
+    /** The decision behind the next hop: its source, the bend before it, the look and plan it used. */
+    private String legDecSrc;
+    private char legDecSide = 'S';
+    private int legDecBend;
+    private float legDecOpen = Float.NaN;
+    private double legDecNov = Double.NaN;
+    private Look legDecLook;
+    /** The leg under way (legNo 0: none), what decided it and what it has met so far. */
+    private int legCount;
+    private int legNo;
+    private String legSrc;
+    private char legSide;
+    private int legBend;
+    private float legOpen;
+    private double legNov;
+    private Look legLook0;
+    private long legLookAge;
+    private int legPlan;
+    private int legSent;
+    private long legLogStartedAt;
+    private long legL0;
+    private long legR0;
+    private double legHdg0;
+    private int legTofMin;
+    private int legCpl;
+    private int legHiccups;
+    /** Dark-floor mode's per-leg floor record: readings, valid tofs, stalls and tilts in the leg. */
+    private int legReadings;
+    private int legTofValid;
+    private int legStalls;
+    private int legTilts;
+    /** Dark floor: the leg's largest tilt from flat and largest fast change, in degrees (NaN: no accel). */
+    private double legTiltMax = Double.NaN;
+    private double legFastMax = Double.NaN;
+    private boolean legPrivate;
+    /** Why the leg ended, set where it ends; null: read from the state it ended in. */
+    private String legEnd;
+    /** Why the measured turn under way was asked for, for its "measured turn:" note. */
+    private String turnWhy = "roam";
+    /** Escape and seek episodes: the open one's number (0: none) and when it began. */
+    private int escCount;
+    private int escNo;
+    private long escStartedAt;
+    private int seekCount;
+    private int seekNo;
+    private long seekStartedAt;
     /** This ladder has driven forward cleanly (a retrace move), not only backed out. */
     private boolean escDroveForward;
     /** Wedged by a blocked turn: back out before the retrace's first turn. */
@@ -783,6 +1060,142 @@ final class ExploreBrain {
     /** The measured turn that would not turn when he was wedged (null: another trigger), and its amount. */
     private Direction wedgeTurnDir;
     private double wedgeTurnDeg;
+    /** How far the measured turn that wedged him had turned when it was ruled blocked. */
+    private double wedgeTurnTurned = Double.NaN;
+
+    // ---- fully jammed (robot 2026-10-01: "he's constantly getting stuck under this chair") ----
+    /** The fixed help line, said on the launcher's speech service (no Claude call). */
+    static final String HELP_LINE = "I'm stuck under here. Could someone pull me out?";
+    /** This escape: a back-up went nowhere (under stallMinCounts). */
+    private boolean jamBackStalled;
+    /** This escape: the ways a measured turn turned under jamTurnDeg. */
+    private final EnumSet<Direction> jamBlockedWays = EnumSet.noneOf(Direction.class);
+    /** Fully jammed: no escapes, only the long rests and one short back-up after each. */
+    private boolean jammed;
+    /** How many times he has been fully jammed since start, for the log. */
+    private int jams;
+    /** The one short back-up after a jammed rest is under way, until jamProbeUntil. */
+    private boolean jamProbing;
+    private long jamProbeUntil;
+    /** The probe's ticks are done and its motors stopped at this time; it is judged on a later reading. */
+    private long jamJudgeAfter;
+    /** Wheel counts moved (average of both wheels) since the rest or the probe began, and from where. */
+    private long jamMoved;
+    private SensorReading jamFrom;
+    /** The heading when the rest began (NaN: unusable), to see him turned from outside. */
+    private double jamHeading = Double.NaN;
+    /** Why the rest ends early (moved from outside, shoved), or null. */
+    private String jamPoke;
+    /** The help line waits for the camera to close; when it was last said. */
+    private boolean jamHelpPending;
+    private long jamHelpAt = NEVER;
+
+    // ---- the long wriggle (robot 2026-10-01: an 11 s spin freed him where 1.5 s turns gave up) ----
+    /** A wriggle is under way, in the escape's state (escapeTick hands it every step). */
+    private boolean wriggling;
+    /** Why it began: the jam rule's reason (it fails into "fully jammed"), or two blocked escape turns. */
+    private String wriggleWhy;
+    /** The way it turns now, and whether this is the second way. */
+    private Direction wriggleDir;
+    private boolean wriggleSecond;
+    /** This way began at wriggleWayAt and ends by wriggleUntil. */
+    private long wriggleWayAt;
+    private long wriggleUntil;
+    /** The heading when this way began (NaN: unusable). */
+    private double wriggleHeading = Double.NaN;
+    /** Wheel counts this way, summed over both wheels, and from where they are counted. */
+    private long wriggleCounts;
+    private SensorReading wriggleFrom;
+    /** {time, wriggleCounts} since the way began or resumed: the wheels-not-moving window. */
+    private final ArrayDeque<long[]> wriggleWindow = new ArrayDeque<long[]>();
+    /** This way's one short back-up after wriggleFreeCounts: tried, under way, its end and its counts. */
+    private boolean wriggleBackTried;
+    private boolean wriggleBacking;
+    private long wriggleBackUntil;
+    private long wriggleJudgeAfter;
+    private long wriggleBackMoved;
+    /** When the last wriggle began: at most one per wriggleEveryMs. */
+    private long wriggleAt = NEVER;
+    /** Escape measured turns in a row that turned under jamTurnDeg. */
+    private int escBlockedRun;
+
+    // ---- the post-stall recovery wait (robot 2026-10-01: the motor board refused all motion for 9-29 s) ----
+    /** The last stall (forward, or a back-up that went nowhere) or collision stop: a cutout may run from here. */
+    private long stallStampAt = NEVER;
+    /** A wait ran to its verdict this stuck spell: no second one until he drives off cleanly or is freed. */
+    /** RECOVER waits entered this stuck spell (recoverMaxPerSpell); the cap once the jam path ran. */
+    private int recoverCount;
+    /** The last stall or zero-movement attempt (or RECOVER entered): the spell's quiet clock. */
+    private long spellEventAt = NEVER;
+    /** This STARTLE follows a drive stall: the wait comes before the escape. */
+    private boolean recoverAfterStartle;
+    /** The wait counts from recoverFrom (the stall); probes at each of recoverProbes, next recoverNext. */
+    private long recoverFrom;
+    private long[] recoverProbes = new long[0];
+    /** RECOVER waits so far; with an alternate schedule set, odd ones use it (schedule B). */
+    private int recoverWaits = 0;
+    private int recoverNext;
+    /** Once the board is back: the ladder (wedged, why recoverWhy), else the plain escape (back up, turn away). */
+    private boolean recoverWedged;
+    private String recoverWhy;
+    /** A probe (one short turn) is under way until recoverProbeUntil; it began at recoverProbeAt. */
+    private boolean recoverProbing;
+    private boolean recoverProbeScheduled;
+    private long recoverProbeAt;
+    private long recoverProbeUntil;
+    private long recoverJudgeAfter;
+    /** The probe's wheel counts (both wheels), from where, and the heading it began at. */
+    private long recoverMoved;
+    private SensorReading recoverFromReading;
+    private double recoverHeading = Double.NaN;
+    /** This probe backs up (robot 15:19: behind is the way he came) rather than turning. */
+    private boolean recoverProbeBack;
+    /** The turn probe's way; back-up probes in a row that moved nothing; a turn probe found a way blocked. */
+    private Direction recoverProbeDir;
+    private int recoverBackStill;
+    private Direction recoverBlockedWay;
+    /** Once the board is back: the first move is the full straight back-up (blockedTurnBackTicks). */
+    private boolean recoverBackFirst;
+    /** A blocked turn's short back-up is over: the retry waits until then (blockedTurnWaitMs). */
+    private boolean retryWaiting;
+    // ---- boxed in (robot 2026-10-01: minutes under a desk, forward refused, turning in place) ----
+    /** The controller's forward refusals (CPL hiccups and hazards) within boxedInWindowMs. */
+    private final ArrayDeque<Long> cplRefusals = new ArrayDeque<Long>();
+    /** A full look-around just found no heading open over boxedInOpen (boxedIn's second trigger). */
+    private boolean aroundFoundNothing;
+    // ---- look around (robot 2026-10-01 15:55: three closed looks only covered the half in front) ----
+    /** The look-around under way, null for none: per look {facing, most open, its heading}. */
+    private List<double[]> around;
+    private Direction aroundDir;
+    /** A remembered doorway one of its looks read open, NaN for none. */
+    private double aroundDoor = Double.NaN;
+    /** It has ended, turning to its most open heading: the next leg decision goes on as a normal leg. */
+    private boolean aroundFaced;
+    /** Review P2-5: when the last look-around ended, and forwardCounts then (the cooldown). */
+    private long aroundEndedAt = NEVER;
+    private long aroundEndedCounts;
+    /** His last clean forward leg: its heading (NaN: none) and length (counts, one wheel). */
+    private double inHeading = Double.NaN;
+    private long inCounts;
+    /** This ladder began boxed in, leaving along boxedExit (NaN: no way in logged); the view there. */
+    private boolean boxedLadder;
+    private double boxedExit = Double.NaN;
+    private PlaceMemory.Print boxedPrint;
+    /** Once out: the way back under is avoided by the novelty steer until boxedAvoidUntil. */
+    private double boxedAvoidHeading = Double.NaN;
+    private long boxedAvoidUntil = NEVER;
+    /** The escape's next turn starts no sooner than this (after a blocked turn's back-up). */
+    private long escTurnNotBefore;
+    /** Jammed rests since he was found jammed: the probe times (jamProbeAtMs) count from there. */
+    private int jamRests;
+    private long jammedAt;
+    private long jamRestStartedAt;
+    /** A shove while waiting: the next probe goes at once. */
+    private String recoverPoke;
+    /** Wheel counts (both wheels) in the current turn, from where (null: no encoders): a cutout reads none. */
+    private long turnCounts;
+    private SensorReading turnCountFrom;
+
     /** This ladder's: the blocked turn to try the free way after the first back-up (null: none). */
     private Direction escRetryDir;
     private double escRetryDeg;
@@ -848,7 +1261,7 @@ final class ExploreBrain {
     /** When the last motor command went out (TimedMotor): the shove cue's blanking window. */
     private long lastMotorCommandAt = NEVER;
     /**
-     * Whether the brain wants the launcher's ears session open (follows the charger latch, KTD6).
+     * Whether the brain wants the launcher's ears session open (always, until shutdown; hey-miko plan KTD5).
      * The session itself can die underneath (ears.listening() false while this is true): that
      * is a lost session, reopened on the drive lease's backoff below.
      */
@@ -859,6 +1272,85 @@ final class ExploreBrain {
     private long earsReopenDueAt = NEVER;
     /** The cue waiting for a state that can take it (KTD3's replacement rule), or null. */
     private Ears.Cue cueHeld;
+    /**
+     * The call (hey-miko plan KTD1): a strong WAKE_WORD or NAME cue, in its own slot apart
+     * from cueHeld. It never expires or degrades, repeated calls merge into it (the newest
+     * angle wins), and it is kept until the conversation it leads to opens.
+     */
+    private Ears.Cue call;
+    /** The call is being acted on (its search, the approach it carries on, its meeting). */
+    private boolean callTaken;
+    /**
+     * A second caller's call (KTD4), heard during the taken call's own meeting or
+     * conversation and not the partner's: it waits here, never merged into the taken
+     * call, and becomes the slot's fresh, unanswered call when that one clears.
+     */
+    private Ears.Cue nextCall;
+    /** The answer clip has played for this call: a call handed back is retaken without a second one. */
+    private boolean callAnswered;
+    /** The call's wait was counted (CUES_HELD once per call). */
+    private boolean callWaitCounted;
+    /** The utterance keys (Cue.at) of recent calls: an already-called delivery with one of them is absorbed (KTD4). */
+    private final ArrayDeque<Long> callAts = new ArrayDeque<Long>();
+    private static final int CALL_ATS_KEPT = 8;
+    /** The call's search (hey-miko plan KTD6): 45 deg steps, eight looks for one circle with no angle. */
+    private static final double CALL_STEP_DEG = 45;
+    private static final int CALL_CIRCLE_LOOKS = 8;
+    /** The bearing the call's search was planned round (searchRel's frame, right positive); NaN with no angle. */
+    private double callBearing = Double.NaN;
+    /**
+     * The caller spoke during the call's search (owner 2026-09-30): the call's meeting
+     * opened on their voice with nobody in view, so more of their voice in it is theirs.
+     */
+    private boolean callerHeard;
+
+    // ---- conversation first (owner 2026-10-02) ----
+    /** The call's conversation is opening in MEET: the persona is on its way, the answer may wait for the utterance's end. */
+    private boolean callChatOpening;
+    /** The call the opening conversation answers, its words besides the address, and whether he may look for them. */
+    private Ears.Cue callChatCue;
+    private String callChatMessage = "";
+    private boolean callChatSearch;
+    /** When an early wake cue's answer stops waiting for the utterance's end (NEVER: not waiting). */
+    private long callUtteranceUntil = NEVER;
+    /** The search during the conversation: bearings (right positive) from where it opened, the next one, where he faces. */
+    private double[] chatSeekPlan;
+    private int chatSeekIndex;
+    private double chatSeekRel;
+    private boolean chatSeekCentring;
+    private boolean chatSeekTurning;
+    private boolean chatSeekTurnLeft;
+    private int chatSeekBlocked;
+    /** A search bearing this close counts as reached: turns undershoot by a few degrees, and a tiny turn reads 0. */
+    private static final double CHAT_SEEK_CLOSE_DEG = 10;
+    /** This step's reading, for the conversation's turns: fresh, and whether it is a hazard. */
+    private boolean chatFresh;
+    private boolean chatHazard;
+    /**
+     * The caller spoke during the first turn of the call's search, or while he turned to or
+     * looked at a caller seen in a look: the conversation opens when that turn or look ends.
+     */
+    private Ears.Cue callerInTurn;
+    /** Turns this call toward a caller seen in a look (capped at callSeenRetargetsMax). */
+    private int seenRetargets;
+    /** This CUE_TURN or CUE_LOOK is the turn toward, or the confirming look at, a caller seen in a look. */
+    private boolean seenLook;
+    /** The planned look the search resumes after when nobody is where the caller was seen. */
+    private int seenResumeLook;
+    /** The capture time of the look that turned him to a seen caller: it and older looks cannot confirm them. */
+    private long seenFrame = NEVER;
+    /** The call's search turns that would not turn (robot 2026-10-01: the motor board latched). */
+    private int callBlockedTurns;
+    /** The frame time of the newest look when the call's stop began (it arrived before the stop). */
+    private long callStopFrame = NEVER;
+    /** The frame time of the last look checked during the call's stop, fresh or stale. */
+    private long callLookChecked = NEVER;
+    /** CUE_WHERE: when the listen after "Where'd you go?" ends. */
+    private long whereUntil;
+    /** The turn the wheels were last told to make (Heading.LEFT or RIGHT), 0 once stopped (KTD7's fallback). */
+    private int turnSign;
+    /** KTD7: his heading lately, to correct a call's angle for his own turning since it was heard. */
+    private final Heading.History headingHistory;
     /** The cue being searched for in CUE_TURN and CUE_LOOK, or null. */
     private Ears.Cue searchCue;
     /** A strong cue from the other side already retargeted this search (once only, KTD3). */
@@ -879,13 +1371,19 @@ final class ExploreBrain {
     /** The last shove while stopped and the last collision stop while driving (KTD5): "sorry" within 2 s is strong. */
     private long lastShoveAt = NEVER;
     private long bumpAt = NEVER;
-    /** A meeting entered from EYES_ONLY on the wake word (KTD8): the lease and sensor guards let it finish. */
+    /** A meeting entered without a turn on a call (KTD8; EYES_ONLY, no lease or camera, the charger): the lease and sensor guards let it finish. */
     private boolean wheellessMeeting;
+    /** The conversation has nobody in view (a faceless match or a meeting without a look). */
+    private boolean chatFaceless;
+    /** When the conversation partner last spoke outside a listen's words (a wake word, a call, a cue). */
+    private long partnerSpokeAt = NEVER;
     /** The port's stand-in box for a person he cannot see (the wheelless meeting): straight ahead. */
     private static final Detection UNSEEN_PERSON = new Detection("person", 1f, 0.35f, 0.2f, 0.65f, 0.8f);
     // ---- the conversation (meeting plan U8; KTD7, KTD8, KTD10, R16) ----
     /** The conversation running in the CHAT states, or null. */
     private ChatSession chat;
+    /** Conversations so far this run, for the turn: records' numbers. */
+    private int chatCount;
     // ---- confirming a close match and resolving names (face plan U7; KTD6, KTD9, KTD10, KTD12) ----
     private enum IdStep { NONE, ASKING, LISTENING, RESOLVING, ADDING, KEEPING }
     private IdStep idStep = IdStep.NONE;
@@ -905,6 +1403,22 @@ final class ExploreBrain {
     private String chatSettled;
     /** The acknowledgement clip's window (KTD14): the local question waits for it to end. */
     private long ackUntil = NEVER;
+    /**
+     * Docked (owner 2026-10-02): whether he has been on the charger since he last left it,
+     * when the next look is due, a look being waited for (the detector unparked) and its
+     * window, and a look out with Claude (asking holds the port's slot).
+     */
+    private boolean onDock;
+    private long dockLookAt = NEVER;
+    private boolean dockLooking;
+    /** POWER's dock verdict, debounced (2026-10-02): set by one reading saying docked,
+     * cleared by dockOffReadings in a row saying off; offStreak counts those. */
+    private boolean powerDocked;
+    private int powerOffStreak;
+    private long dockLookAfter;
+    private long dockLookDeadline;
+    private boolean dockAsking;
+    private Look dockLook;
     /** The side the voice that started this stop came from, or null: the resume leg turns away from it. */
     private Direction chatCueSide;
     private Direction chatSide;
@@ -948,8 +1462,10 @@ final class ExploreBrain {
         this.random = random;
         this.classifier = new HazardClassifier(tuning);
         this.compass = new Heading(tuning.gyro, tuning);
+        this.headingHistory = new Heading.History(tuning.headingHistoryMs, tuning.headingSampleMs);
         this.steer = new RoamSteer(tuning);
         this.coverage = new Coverage(tuning);
+        this.places = new PlaceMemory(tuning);
         this.planner = new EscapePlanner(tuning);
     }
 
@@ -958,14 +1474,34 @@ final class ExploreBrain {
         return coverage;
     }
 
+    /** What he has looked at lately (visual place memory), for tests. */
+    PlaceMemory places() {
+        return places;
+    }
+
     /** The heading tracker, for the navigation that builds on it (explore nav plan U2, U5). */
     Heading heading() {
         return compass;
     }
 
+    /** The heading a seek is driving toward, NaN for none (seeking the unfamiliar), for tests and logs. */
+    double seekHeading() {
+        return seekTarget;
+    }
+
+    /** A seek is under way: asking Claude where to go, or heading there. */
+    boolean seeking() {
+        return seekAsking || !Double.isNaN(seekTarget);
+    }
+
     /** The remembered open doorway's heading, NaN for none (explore nav plan U6), for tests and logs. */
     double doorwayHeading() {
         return doorway;
+    }
+
+    /** A trusted short leg (openness off) is set up for the next hop (review 2026-10-01), for tests. */
+    boolean trustLegPending() {
+        return trustLeg;
     }
 
     void setTrace(Trace trace) {
@@ -977,8 +1513,1656 @@ final class ExploreBrain {
         this.gauges = gauges == null ? Gauges.NONE : gauges;
     }
 
+    // ---- do not disturb (owner 2026-10-02) ----
+    //
+    // The speaker muted, or turned all the way down, with the volume keys on top: "I don't
+    // want him interrupting me." He roams on but starts nothing to say: no curiosity stop,
+    // no lean-in or turn toward a voice, no conversation, no help line, no docked look. A
+    // call gets a glance toward the voice and nothing more, and a stop or conversation under
+    // way ends at once with no sign-off. Unmuting gives him his voice back.
+
+    private static final long MUTED_GLANCE_MS = 1500;
+    private boolean muted;
+    /** When a muted call's glance gives way to the eyes it replaced, or NEVER. */
+    private long mutedGlanceUntil = NEVER;
+    private EyeState glanceBackState;
+    private Direction glanceBackGaze;
+
+    /**
+     * Dark-floor mode on or off (owner 2026-10-02; persist.miko3.explore.dark_floor, read
+     * by ExploreLoop's DarkFloor, which also switches the MCU's ToF check off and on). The
+     * classifier takes no floor reading as clear and guards nose dips with the
+     * accelerometer instead (HazardClassifier), and legs are capped at darkLegTicksMax,
+     * since only the camera and wheel stalls catch obstacles. Each leg also writes a
+     * "floor:" record. Brain thread only.
+     */
+    void setDarkFloor(boolean on) {
+        if (on == classifier.darkFloor() || state == State.STOPPED) {
+            return;
+        }
+        classifier.setDarkFloor(on);
+        step(false);
+    }
+
+    boolean darkFloor() {
+        return classifier.darkFloor();
+    }
+
+    /** The speaker was muted (or turned all the way down), or is audible again. */
+    void setMuted(boolean m) {
+        if (m == muted || state == State.STOPPED) {
+            return;
+        }
+        muted = m;
+        note(m ? "muted: do not disturb (no remarks, calls get a glance)" : "unmuted: talking again");
+        step(false);
+    }
+
+    boolean muted() {
+        return muted;
+    }
+
+    /** Once per step, before the call and the state's own step: the glance's end, then what muting ends. */
+    private void mutedStep(long now) {
+        if (mutedGlanceUntil != NEVER && now >= mutedGlanceUntil) {
+            mutedGlanceUntil = NEVER;
+            if (shownState == EyeState.GLANCE) {
+                show(glanceBackState, glanceBackGaze);
+            }
+        }
+        if (!hushed()) {
+            return;
+        }
+        String why = hushWhy();
+        if (call != null || nextCall != null) {
+            nextCall = null;
+            clearCall();
+            note(why + ": the call is dropped");
+        }
+        cueHeld = null;
+        if (muted) {
+            // Bathroom privacy keeps the jam's help line: it sends nothing anywhere.
+            jamHelpPending = false;
+        }
+        if (state == State.DOCKED && (dockAsking || dockLooking)) {
+            dropDockLook(why);
+        }
+        if (state.inStop()) {
+            note(state.chats() ? why + ": the conversation ends quietly" : why + ": the stop ends quietly");
+            endCuriosity(now);
+        }
+    }
+
+    /** A cue while muted: a call's glance toward the voice (no clip, no conversation), any other dropped. */
+    private void mutedCue(long now, Ears.Cue c) {
+        if (!isCall(c)) {
+            dropCue("cue " + c.tier + " " + c.side + " dropped: " + hushWhy());
+            return;
+        }
+        note(hushWhy() + ": a call gets a glance from " + c.side);
+        if (shownState != EyeState.GLANCE) {
+            boolean still = shownState == null || shownState == EyeState.STARE || shownState == EyeState.LOOK;
+            glanceBackState = still ? EyeState.IDLE : shownState;
+            glanceBackGaze = still ? null : shownGaze;
+        }
+        show(EyeState.GLANCE, sideOf(c));
+        mutedGlanceUntil = now + MUTED_GLANCE_MS;
+    }
+
+    // ---- following instructions (owner 2026-10-02) ----
+    //
+    // "When someone gives him an instruction, he tries to follow it. Generally, he can't do a
+    // task, but if they tell him to go away, or go to a different room, or go find a different
+    // person, he should try to do that. This however shouldn't take priority over being
+    // interrupted by someone else going 'Hey Miko', it should just integrate with his explore
+    // ability." A conversation that ends on an instruction (ChatSession.action, its line
+    // already said he will) sets an intent his roaming carries out:
+    // - go_away: the first leg turns about, away from them; their way and this spot are
+    //   avoided and they are left alone for 10 min;
+    // - go_elsewhere: a seek at once (after one scan for its frames), a doorway back toward
+    //   them not taken; this spot avoided for 15 min;
+    // - find_person: a seek at once, roaming person picks even while seeking, for up to 5 min;
+    //   a named target counts only when the face check matches that name, anyone new otherwise;
+    // - come_here: the call's search and approach, with no answer clip;
+    // - be_quiet: do not disturb for 10 min, as muted, while he roams on.
+    // A call drops any intent at once (be_quiet's do-not-disturb gives it a glance, as muted);
+    // hazards, RECOVER, the jam, bathroom privacy and do-not-disturb all come first. The trace
+    // says the action and whether a target was given, never the target.
+
+    static final long INTENT_LEAVE_ALONE_MS = 10L * 60 * 1000;
+    static final long INTENT_AWAY_AVOID_MS = 10L * 60 * 1000;
+    static final long INTENT_ELSEWHERE_AVOID_MS = 15L * 60 * 1000;
+    static final long INTENT_SEEK_MS = 5L * 60 * 1000;
+    static final long INTENT_QUIET_MS = 10L * 60 * 1000;
+    static final double INTENT_AVOID_RADIUS_M = 1.0;
+    static final double INTENT_AVOID_DEG = 45;
+    /** go_away turns about, not the usual chatAwayDeg. */
+    static final double INTENT_AWAY_DEG = 180;
+    /** The person's side as a bearing (left positive) when only the side is known. */
+    static final double INTENT_SIDE_DEG = 45;
+
+    private CuriosityPort.Action intent = CuriosityPort.Action.NONE;
+    /** The person or place named with it, or null. Never traced. */
+    private String intentTarget;
+    private long intentUntil = NEVER;
+    /** be_quiet: do not disturb, as muted, until its time is over. */
+    private boolean quiet;
+    /** A seek is due at the next stop's end (go_elsewhere, find_person). */
+    private boolean intentSeekDue;
+    /** The way back toward them (NaN: none) and this spot, avoided until then. */
+    private double intentAvoidHeading = Double.NaN;
+    private long intentAvoidUntil = NEVER;
+    /** The first leg's turn after the conversation, when not chatAwayDeg (NaN). */
+    private double awayLegDeg = Double.NaN;
+    /** The call in the slot is come_here's: its search and approach, no conversation first. */
+    private boolean comeHereCall;
+
+    /** The intent under way, for tests and the state page. */
+    CuriosityPort.Action intent() {
+        return intent;
+    }
+
+    /**
+     * Starts an intent now, as a conversation ending on this instruction does (side: the
+     * person's side, null for ahead or unknown). Package-private for the harness.
+     */
+    void startIntent(CuriosityPort.Action a, String target, Direction side) {
+        startIntent(clock.nowMs(), a, target, side);
+    }
+
+    /** Owner 2026-10-03: starts an action tool's act now (side as above). Package-private for the harness. */
+    void startAct(ChatActions.Act act, Direction side) {
+        startAct(clock.nowMs(), act, side);
+    }
+
+    private void startIntent(long now, CuriosityPort.Action a, String target, Direction side) {
+        startAct(now, a == null ? null : ChatActions.Act.of(a, target), side);
+    }
+
+    private void startAct(long now, ChatActions.Act act, Direction side) {
+        CuriosityPort.Action a = act == null ? CuriosityPort.Action.NONE : act.action;
+        String target = act == null ? null : act.target;
+        if (a == CuriosityPort.Action.NONE) {
+            return;
+        }
+        if (a == CuriosityPort.Action.RUN_TASK) {
+            startTask(now, act);
+            return;
+        }
+        if (intent != CuriosityPort.Action.NONE) {
+            dropIntent("a new instruction");
+        }
+        intentAct = act;
+        intentStartedAt = now;
+        intentEndOk = false;
+        intentEndWhy = null;
+        intentTarget = target == null || target.trim().isEmpty() ? null : target.trim();
+        note("intent: " + a.word() + (intentTarget == null ? " (no target)" : " (target given)"));
+        note("act: start " + act.describe() + (task != null ? " (task " + taskNo + " step " + (taskIdx + 1) + ")" : ""));
+        if (startNewAct(now, act)) {
+            return;
+        }
+        double toward = Double.NaN;
+        if (compass.usable(now)) {
+            toward = Heading.wrap(compass.degrees()
+                    + (side == Direction.LEFT ? INTENT_SIDE_DEG : side == Direction.RIGHT ? -INTENT_SIDE_DEG : 0));
+        }
+        switch (a) {
+            case GO_AWAY:
+                intentAvoid(now, toward, INTENT_AWAY_AVOID_MS);
+                note("intent: go_away: their way avoided for " + span(INTENT_AWAY_AVOID_MS));
+                if (onCharger()) {
+                    intentDone("on the charger: no leg to drive");
+                    return;
+                }
+                if (stillReason(now) != null) {
+                    // Review 2026-10-03: as on the charger: he leaves them alone, but no leg later.
+                    intentDone("he can't drive now: no leg to drive");
+                    return;
+                }
+                intent = a;
+                intentUntil = now + INTENT_SEEK_MS;
+                awayLeg = side == null ? randomDirection() : side.opposite();
+                awayLegDeg = INTENT_AWAY_DEG;
+                break;
+            case GO_ELSEWHERE:
+                intentAvoid(now, toward, INTENT_ELSEWHERE_AVOID_MS);
+                note("intent: go_elsewhere: this spot avoided for " + span(INTENT_ELSEWHERE_AVOID_MS));
+                intent = a;
+                intentUntil = now + INTENT_SEEK_MS;
+                intentSeekDue = true;
+                break;
+            case FIND_PERSON:
+                intent = a;
+                intentUntil = now + INTENT_SEEK_MS;
+                intentSeekDue = true;
+                break;
+            case COME_HERE:
+                // The call's search and approach toward them (the answer clip skipped: he just
+                // said he's coming), then the meeting, where the conversation goes on.
+                Ears.Side es = !chatFaceless || side == null ? Ears.Side.UNKNOWN
+                        : side == Direction.LEFT ? Ears.Side.LEFT : Ears.Side.RIGHT;
+                nextCall = null;
+                call = new Ears.Cue(Ears.Kind.NAME, Ears.Tier.STRONG, es, Float.NaN, now);
+                callAnswered = true;
+                comeHereCall = true;
+                awayLeg = null;
+                intentDone("coming over, as for a call");
+                break;
+            case BE_QUIET:
+                intent = a;
+                intentUntil = now + INTENT_QUIET_MS;
+                quiet = true;
+                long quietMs = act.ms > 0 ? act.ms : INTENT_QUIET_MS;
+                intentUntil = now + quietMs;
+                note("intent: be_quiet: do not disturb for " + span(quietMs)
+                        + " (no remarks, calls get a glance)");
+                break;
+            default:
+                break;
+        }
+    }
+
+    // ---- the action tools (owner 2026-10-03) ----
+    //
+    // "The AI response could control the robot damn near completely, or at least launch it on
+    // a workflow": Claude chooses (ChatActions, ChatRound), his own code drives. Each act runs
+    // as an intent, so a call drops it (be_quiet's and stay's calls are answered in place) and
+    // hazards, RECOVER, the jam, bathroom privacy and the charger always come first:
+    // - move: one turn (left, right, around, a spin) or a short straight drive forward or back,
+    //   through the usual LOOK/TURN, HOP and BACK_OFF steps and their floor-sensor, CPL and stall
+    //   rules; done when he is still again, failed when a hazard, a stall or RECOVER came first;
+    // - stay and wait: no legs or scans until the time is over; a call is answered where he stands;
+    // - find_thing: a seek at once; the first look whose labels name it ends the seek and he
+    //   turns to it and drives a short leg toward it (done when he stops);
+    // - go_to_place: a turn and a leg toward where he last saw one of its labels (place memory),
+    //   then a seek; done when a look shows one;
+    // - come_back (a task's step): a turn toward where the task started (dead reckoning) and one
+    //   leg of at most COME_BACK_MAX_M.
+    // Each act's start and end are records ("act: "), with its tool, kind and amount only.
+
+    /**
+     * Metres per forward or back tick at the fixed speed (~0.25 m/s, 250 ms ticks). Still a guess
+     * (review 2026-10-03): the 2026-10-02 robot log's 157 clean forward legs ("leg: ... end=done",
+     * 4+ ticks sent) moved a median 196 encoder counts per tick (mean of the wheels; 259 ms a
+     * tick), so the tick itself is steady, but counts only become metres through
+     * ExploreTuning.coverageCountsPerMetre (3000, which nav-report.py also uses), and that is
+     * the same unmeasured 0.25 m/s guess: 196 / 3000 = 0.065 m agrees with 0.0625 only because
+     * both rest on it. Tape-measure one leg of known ticks (docs/TODO.md) to set both.
+     */
+    static final double MOVE_M_PER_TICK = 0.0625;
+    static final long MOVE_MS = 60000;
+    /** find_thing's approach leg for a box at most FIND_FAR_HEIGHT of the frame high; shorter as it grows. */
+    static final double FIND_APPROACH_M = 0.6;
+    static final double FIND_APPROACH_MIN_M = 0.15;
+    static final float FIND_FAR_HEIGHT = 0.1f;
+    /** A box at least this share of the frame high is close already: no approach. */
+    static final float FIND_NEAR_HEIGHT = 0.5f;
+    static final double COME_BACK_MAX_M = 3.0;
+    static final double COME_BACK_NEAR_M = 0.3;
+
+    /** The act behind the intent under way, with its details. */
+    private ChatActions.Act intentAct;
+    private long intentStartedAt;
+    /** The last intent's end, for a task's step: done (true) or dropped, and the fixed words why. */
+    private boolean intentEndOk;
+    private String intentEndWhy;
+    /** stay, wait: no legs or scans until then, and a call is answered in place. */
+    private long stayUntil = NEVER;
+    /** move, come_back, find_thing's approach: the motion is due at the next decision (false: started). */
+    private boolean moveDue;
+    /** ... its motion has started; and has been seen moving. */
+    private boolean moveStarted;
+    private boolean moveSawMotion;
+    /** A back move: BACK_OFF ends in a pause, not the escape's turn. */
+    private boolean moveBack;
+    /** find_thing's approach, come_back's and go_to_place's way to turn to (absolute degrees; NaN: none). */
+    private double actHeading = Double.NaN;
+    /** ... and the metres to drive after it (0: none). */
+    private double actLegM;
+    /** The look the label check last read. */
+    private Look actLook;
+
+    /**
+     * Review 2026-10-03: find_thing's approach leg from the box's height (share of the frame):
+     * FIND_APPROACH_M up to FIND_FAR_HEIGHT, falling linearly to FIND_APPROACH_MIN_M near
+     * FIND_NEAR_HEIGHT, so a near thing gets a short nudge, not a fixed 0.6 m into it. The leg
+     * also ends early where something stops him (actStep).
+     */
+    static double findApproachM(float height) {
+        double f = (FIND_NEAR_HEIGHT - height) / (FIND_NEAR_HEIGHT - FIND_FAR_HEIGHT);
+        f = Math.max(0, Math.min(1, f));
+        return FIND_APPROACH_MIN_M + f * (FIND_APPROACH_M - FIND_APPROACH_MIN_M);
+    }
+
+    private static String fmt2(double v) {
+        return String.format(java.util.Locale.US, "%.2f", v);
+    }
+
+    /** The intent's act, for tests. */
+    ChatActions.Act intentAct() {
+        return intentAct;
+    }
+
+    /**
+     * What the conversation's tools answer from (owner 2026-10-03): robot_status's text, the
+     * places (bathroom ones left out), and why he can't drive now (ChatActions refuses motion
+     * then), as fixed words.
+     */
+    private CuriosityPort.ToolFacts toolFactsNow(long now, String doing) {
+        List<String> hidden = new ArrayList<String>(BATHROOM_STRONG);
+        hidden.addAll(BATHROOM_WEAK);
+        List<ChatTools.Place> recent = places.recent(now, tuning.placeMax);
+        List<ChatTools.Place> shown = new ArrayList<ChatTools.Place>();
+        for (ChatTools.Place p : recent) {
+            boolean hide = false;
+            for (String l : p.labels) {
+                hide |= hidden.contains(l);
+            }
+            if (!hide) {
+                shown.add(p);
+            }
+        }
+        return new CuriosityPort.ToolFacts(
+                ChatTools.statusText(batteryPercent, onCharger(), muted, quiet || muted,
+                        started ? now - startedAtMs : 0, doing),
+                ChatTools.placesText(recent, hidden), stillReason(now), null, shown);
+    }
+
+    // ---- the look tool's fast path (robot 2026-10-03, review 2026-10-03) ----
+    //
+    // The first live look tool call waited ~4.7 s for the detector to unpark and run on a fresh
+    // frame after the preamble, and the line came at 7.3 s. Now the newest detected frame goes to
+    // Claude at once, with its labels, when it is at most FAST_LOOK_FRAME_MS old. Privacy first:
+    // only a frame the detector itself checked ever goes (review 2026-10-03: a streamed frame
+    // trusted an older detection, and a turn or an approach since could have brought a bathroom
+    // into view), and only when that detection shows no bathroom label at any score. Otherwise
+    // the look takes the detector's slow path as before. The camera keeps no extra frame copies.
+
+    static final long FAST_LOOK_FRAME_MS = 1500;
+
+    private CuriosityPort.LookResult fastToolLook(long now) {
+        Look d = camera.latest();
+        if (d == null || d.jpeg == null || now - d.frameMs > FAST_LOOK_FRAME_MS || bathroom || muted || quiet) {
+            return null;
+        }
+        List<String> labels = new ArrayList<String>();
+        for (Detection x : d.detections) {
+            if (BATHROOM_STRONG.contains(x.label) || BATHROOM_WEAK.contains(x.label)) {
+                return null;
+            }
+            if (!labels.contains(x.label)) {
+                labels.add(x.label);
+            }
+        }
+        return CuriosityPort.LookResult.streamed(d.jpeg, labels, now - d.frameMs);
+    }
+
+    /** Why he can't drive now, or null when he can. */
+    private String stillReason(long now) {
+        if (onCharger()) {
+            return "he is on his charger and does not drive off it when asked";
+        }
+        if (bathroom) {
+            return "privacy: he thinks he is in a bathroom and is only leaving it";
+        }
+        if (!leaseHeld || chatNoWheels) {
+            return "his wheels are not his right now";
+        }
+        if (classifier.status(now) == HazardClassifier.Status.UNAVAILABLE) {
+            return "his floor sensor is not answering, so he can't drive safely";
+        }
+        if (jammed || state == State.RECOVER) {
+            return "he is stuck and waiting for his motors to come back";
+        }
+        return null;
+    }
+
+    // ---- review 2026-10-03: a re-plan never re-drives into what just stalled him ----
+
+    /** A move that failed is not run again the same way from (about) the same heading for this long. */
+    static final long FAILED_MOVE_MS = 120000;
+    /** The heading a move started from (NaN: unknown), and the last failed move: its kind, heading and when. */
+    private double moveFromHeading = Double.NaN;
+    private String failedMoveKind;
+    private double failedMoveHeading = Double.NaN;
+    private long failedMoveAt = NEVER;
+
+    /**
+     * Why this move can't start now, or null: he can't drive (stillReason, RECOVER and the jam
+     * included), forward where a hazard or stall just stopped him (blockedAheadAt), back with
+     * behind blocked lately (behindEvidence), or the same move that just failed from here.
+     */
+    private String moveRefusal(long now, ChatActions.Act act) {
+        String still = stillReason(now);
+        if (still != null) {
+            return still;
+        }
+        boolean facing = compass.usable(now);
+        if ("forward".equals(act.kind) && facing && !Double.isNaN(blockedAheadAt)
+                && Math.abs(Heading.delta(compass.degrees(), blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return "something stopped him that way just now";
+        }
+        if ("back".equals(act.kind) && behindEvidence(now)) {
+            return "behind him is blocked";
+        }
+        if (act.kind != null && act.kind.equals(failedMoveKind) && now - failedMoveAt < FAILED_MOVE_MS
+                && (Double.isNaN(failedMoveHeading) || !facing
+                || Math.abs(Heading.delta(compass.degrees(), failedMoveHeading)) <= tuning.escapeProbeClearDeg)) {
+            return "the same move failed from here just now";
+        }
+        return null;
+    }
+
+    /** A move that failed (a hazard, a stall, RECOVER came first): not run again the same way from here for a while. */
+    void recordFailedMove(String kind, double heading, long at) {
+        failedMoveKind = kind;
+        failedMoveHeading = heading;
+        failedMoveAt = at;
+    }
+
+    /** For tests: as if a hazard or stall had just stopped him driving this way. */
+    void markBlockedAhead() {
+        blockedAheadAt = compass.usable(clock.nowMs()) ? compass.degrees() : Double.NaN;
+    }
+
+    /** For tests: as if a turn or back-up had just stalled against something behind him. */
+    void markBehindBlocked() {
+        behindBlockedAt = clock.nowMs();
+    }
+
+    /** For tests: as if a turn that way had just been blocked. */
+    void markBlockedSide(Direction d) {
+        blockSide(d);
+    }
+
+    // ---- review 2026-10-03: aimed turns (find_thing's approach, come_back, go_to_place) ----
+
+    /** At most this many re-aims before an aimed drive gives up rather than drive the wrong way. */
+    static final int AIM_TRIES = 2;
+    /** The heading an aimed turn is for (absolute degrees; NaN: none), checked again before the hop. */
+    private double aimHeading = Double.NaN;
+    private int aimTries;
+
+    /**
+     * An aimed turn: delta degrees (left positive) to face aim. Unlike enterLook's unaimed turns
+     * it never flips to the other side when this side was blocked lately (that ended about twice
+     * delta off, then drove); a blocked turn's own retry may still, and reaim() catches it.
+     */
+    private void enterAimedLook(long now, double delta, double aim) {
+        aimHeading = aim;
+        enterLookAs(now, delta > 0 ? Direction.LEFT : Direction.RIGHT, false, timedMs(Math.abs(delta)),
+                Math.abs(delta));
+    }
+
+    /** Why an aimed drive toward aim can't go (that way just stopped him; he can't drive), or null. */
+    private String aimBlocked(long now, double aim) {
+        String still = stillReason(now);
+        if (still != null) {
+            return still;
+        }
+        if (!Double.isNaN(aim) && !Double.isNaN(blockedAheadAt)
+                && Math.abs(Heading.delta(aim, blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return "something stopped him that way just now";
+        }
+        return null;
+    }
+
+    /**
+     * Before an aimed drive's hop: facing aimHeading (within the turn tolerance) or no compass,
+     * the hop goes (false); off, another aimed turn (up to AIM_TRIES), else the act fails rather
+     * than drive the wrong way.
+     */
+    private boolean reaim(long now) {
+        double aim = aimHeading;
+        if (!compass.usable(now)) {
+            aimHeading = Double.NaN;
+            return false;
+        }
+        double off = Heading.delta(compass.degrees(), aim);
+        String blocked = aimBlocked(now, aim);
+        if (blocked == null && Math.abs(off) < tuning.turnToleranceDeg) {
+            aimHeading = Double.NaN;
+            return false;
+        }
+        hopNext = false;
+        if (blocked != null || aimTries >= AIM_TRIES) {
+            aimHeading = Double.NaN;
+            plannedTicks = -1;
+            moveStarted = false;
+            dropIntent(blocked != null ? blocked : "he could not face that way");
+            enterPause(now, pauseMs(), false);
+            return true;
+        }
+        aimTries++;
+        note("act: re-aiming " + Math.round(off) + " deg before driving (" + aimTries + " of " + AIM_TRIES + ")");
+        enterAimedLook(now, off, aim);
+        return true;
+    }
+
+    /** The newer acts' start (true when handled here); today's five fall through to the switch. */
+    private boolean startNewAct(long now, ChatActions.Act act) {
+        switch (act.action) {
+            case MOVE: {
+                if (onCharger()) {
+                    intentEnd(false, "on the charger: he does not drive off it");
+                    return true;
+                }
+                String refused = moveRefusal(now, act);
+                if (refused != null) {
+                    intentEnd(false, refused);
+                    return true;
+                }
+                intent = act.action;
+                intentUntil = now + MOVE_MS;
+                moveDue = true;
+                awayLeg = null;
+                moveFromHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
+                return true;
+            }
+            case COME_BACK:
+                if (stillReason(now) != null) {
+                    intentEnd(false, stillReason(now));
+                    return true;
+                }
+                intent = act.action;
+                intentUntil = now + MOVE_MS;
+                moveDue = true;
+                awayLeg = null;
+                return true;
+            case STAY:
+            case WAIT:
+                intent = act.action;
+                stayUntil = now + Math.max(1000, act.ms);
+                intentUntil = stayUntil;
+                awayLeg = null;
+                note("intent: " + act.action.word() + ": no legs for " + (act.ms / 1000) + " s (calls answered in place)");
+                return true;
+            case FIND_THING:
+                intent = act.action;
+                intentUntil = now + (task != null ? TASK_SEEK_MS : INTENT_SEEK_MS);
+                intentSeekDue = true;
+                actLook = camera.latest();
+                return true;
+            case GO_TO_PLACE:
+                intent = act.action;
+                intentUntil = now + (task != null ? TASK_SEEK_MS : INTENT_SEEK_MS);
+                intentSeekDue = true;
+                actLook = camera.latest();
+                double h = places.headingOf(act.labels, now);
+                if (!Double.isNaN(h) && compass.usable(now)) {
+                    actHeading = h;
+                    actLegM = 0;
+                    note("intent: go_to_place: heading for where he saw it (" + Math.round(h) + " deg)");
+                } else {
+                    note("intent: go_to_place: not seen lately; searching");
+                }
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Once per step, the newer acts: move's watcher (done when still again, failed when a
+     * hazard, a stall or RECOVER came first) and the label check of find_thing and go_to_place.
+     */
+    private void actStep(long now) {
+        if (intent == CuriosityPort.Action.NONE) {
+            return;
+        }
+        if (moveStarted) {
+            if (state == State.STARTLE || state == State.RECOVER || state.escapes() || jammed || wriggling
+                    || state == State.CORNERED) {
+                moveStarted = false;
+                moveBack = false;
+                aimHeading = Double.NaN;
+                if (intent == CuriosityPort.Action.FIND_THING) {
+                    // Review 2026-10-03: the approach ends where something stops him: that is the thing.
+                    intentDone("went over to it until something stopped him");
+                    return;
+                }
+                if (intent == CuriosityPort.Action.MOVE && intentAct != null) {
+                    recordFailedMove(intentAct.kind, moveFromHeading, now);
+                }
+                dropIntent("a hazard or a stall stopped it");
+                return;
+            }
+            if (state == State.LOOK || state == State.TURN || state == State.HOP || state == State.BACK_OFF) {
+                moveSawMotion = true;
+            } else if (moveSawMotion && state == State.PAUSE && !hopNext) {
+                moveStarted = false;
+                intentDone(intent == CuriosityPort.Action.FIND_THING ? "found it and went over"
+                        : intent == CuriosityPort.Action.COME_BACK ? "came back" : "moved");
+                return;
+            }
+        }
+        if ((intent == CuriosityPort.Action.FIND_THING || intent == CuriosityPort.Action.GO_TO_PLACE)
+                && intentAct != null && !moveStarted && !moveDue && !state.converses() && !state.chats()) {
+            Look look = camera.latest();
+            if (look == null || look == actLook) {
+                return;
+            }
+            actLook = look;
+            Detection seen = null;
+            for (Detection d : look.detections) {
+                if (d.label != null && intentAct.labels.contains(d.label.toLowerCase(java.util.Locale.US))) {
+                    seen = d;
+                    break;
+                }
+            }
+            if (seen == null) {
+                return;
+            }
+            if (seeking()) {
+                endSeek(now, true, "saw what he was asked to find");
+            }
+            intentSeekDue = false;
+            if (intent == CuriosityPort.Action.GO_TO_PLACE) {
+                intentDone("saw what marks the place");
+                return;
+            }
+            double off = -seen.centerX() * tuning.cameraHalfFovDeg;
+            float height = seen.y1 - seen.y0;
+            if (height >= FIND_NEAR_HEIGHT) {
+                // Review 2026-10-03: it already fills half the frame from the floor: he is there.
+                note("intent: find_thing: seen " + Math.round(off) + " deg off, close already");
+                intentDone("found it, close by");
+                return;
+            }
+            actHeading = compass.usable(now) ? Heading.wrap(compass.degrees() + off) : Double.NaN;
+            actLegM = findApproachM(height);
+            moveDue = true;
+            note("intent: find_thing: seen " + Math.round(off) + " deg off; going over (" + fmt2(actLegM) + " m)");
+        }
+    }
+
+    /**
+     * At a leg decision (decide()): the act's motion, when due. True when it took the decision
+     * (a turn or a drive started, or a stay held him still).
+     */
+    private boolean actDecide(long now) {
+        if (now < stayUntil) {
+            enterPause(now, pauseMs(), false);
+            return true;
+        }
+        if (task != null && taskWait != TaskWait.ACT || taskLine != null) {
+            // A task's step that does not drive (say, look, wait, a consult): he holds still.
+            enterPause(now, pauseMs(), false);
+            return true;
+        }
+        if (hopNext && !Double.isNaN(aimHeading)) {
+            // Review 2026-10-03: an aimed drive re-checks where he faces before it goes.
+            return reaim(now);
+        }
+        if (intent == CuriosityPort.Action.GO_TO_PLACE && !Double.isNaN(actHeading)) {
+            double delta = compass.usable(now) ? Heading.delta(compass.degrees(), actHeading) : 0;
+            double aim = actHeading;
+            actHeading = Double.NaN;
+            if (Math.abs(delta) >= tuning.turnToleranceDeg) {
+                plannedTicks = drawTicks();
+                aimTries = 0;
+                enterAimedLook(now, delta, aim);
+                return true;
+            }
+            return false;
+        }
+        if (!moveDue || intentAct == null) {
+            return false;
+        }
+        moveDue = false;
+        moveStarted = true;
+        moveSawMotion = false;
+        if (intent == CuriosityPort.Action.COME_BACK) {
+            if (!taskStartKnown || !coverage.tracking() || !compass.usable(now)) {
+                moveStarted = false;
+                dropIntent("he lost track of where it started");
+                return false;
+            }
+            double dx = taskStartX - coverage.x();
+            double dy = taskStartY - coverage.y();
+            double dist = Math.hypot(dx, dy);
+            if (dist < COME_BACK_NEAR_M) {
+                moveStarted = false;
+                intentDone("already back");
+                return false;
+            }
+            actHeading = Heading.wrap(Math.toDegrees(Math.atan2(dy, dx)));
+            actLegM = Math.min(dist, COME_BACK_MAX_M);
+        }
+        if (intent == CuriosityPort.Action.COME_BACK || intent == CuriosityPort.Action.FIND_THING) {
+            int ticks = Math.max(1, (int) Math.round(actLegM / MOVE_M_PER_TICK));
+            double delta = Double.isNaN(actHeading) || !compass.usable(now) ? 0
+                    : Heading.delta(compass.degrees(), actHeading);
+            double aim = actHeading;
+            actHeading = Double.NaN;
+            String blocked = aimBlocked(now, aim);
+            if (blocked != null) {
+                moveStarted = false;
+                dropIntent(blocked);
+                return false;
+            }
+            plannedTicks = ticks;
+            aimTries = 0;
+            if (Math.abs(delta) >= tuning.turnToleranceDeg) {
+                enterAimedLook(now, delta, aim);
+            } else {
+                startHop(now);
+            }
+            return true;
+        }
+        String kind = intentAct.kind == null ? "" : intentAct.kind;
+        double amount = intentAct.amount;
+        if ("forward".equals(kind)) {
+            plannedTicks = Math.max(1, (int) Math.round(amount / MOVE_M_PER_TICK));
+            startHop(now);
+        } else if ("back".equals(kind)) {
+            startMoveBack(now, Math.max(1, (int) Math.round(amount / MOVE_M_PER_TICK)));
+        } else {
+            Direction d = "turn_left".equals(kind) ? Direction.LEFT : "turn_right".equals(kind) ? Direction.RIGHT
+                    : randomDirection();
+            plannedTicks = 0;
+            enterLook(now, d, false, timedMs(amount), amount);
+            if (heading != d && ("turn_left".equals(kind) || "turn_right".equals(kind))) {
+                note("act: move: that way is blocked lately; turning " + heading + " instead");
+            }
+        }
+        return true;
+    }
+
+    /** A back move: straight back this many ticks, then a pause (no escape turn). */
+    private void startMoveBack(long now, int ticks) {
+        stopMotors();
+        moveBack = true;
+        state = State.BACK_OFF;
+        ticksLeft = ticks - 1;
+        nextTickAt = now + tuning.backTickMs;
+        phaseUntil = now + ticks * tuning.backTickMs;
+        // The stall watch from here, as the blocked turn's short back-up.
+        hopStartedAt = now;
+        lastWheels = null;
+        wheelMoves.clear();
+        moving = true;
+        backTick();
+        compass.startLeg(true, now);
+    }
+
+    /** An intent's end as a task's step reads it, with the act's record. */
+    private void intentEnd(boolean ok, String why) {
+        intentEndOk = ok;
+        intentEndWhy = why;
+        note("intent: " + (ok ? "done" : "dropped") + " (" + why + ")");
+        if (intentAct != null) {
+            note("act: end " + intentAct.describe() + " " + (ok ? "done" : "failed") + " ms="
+                    + (clock.nowMs() - intentStartedAt));
+        }
+        clearIntent();
+    }
+
+    // ---- tasks: run_task's workflow (owner 2026-10-03) ----
+    //
+    // Claude plans the steps; the robot runs them in order, deterministically: say, look and
+    // wait here, the rest as acts (above). On a failed step, after a look (so later lines can
+    // use what he saw) and at a step marked check, he consults Claude (CuriosityPort.taskPlan:
+    // the goal, the steps so far with their outcomes, his status and the latest labels; never a
+    // frame) for the rest of the plan or an abort. At most TASK_MAX_CONSULTS consults and
+    // TASK_MAX_MS per task, then it ends with a spoken line. Reflexes always win: hazards and
+    // stalls fail a step; bathroom privacy, the charger, lost wheels, a call and "stop" end the
+    // task. A conversation that opens on its own pauses it. Its record ("task: ") has the step
+    // tools, their outcomes as ok/fail, the consults, the end and the time; never the goal or
+    // anything said.
+
+    static final int TASK_MAX_CONSULTS = 10;
+    static final long TASK_MAX_MS = 5L * 60 * 1000;
+    static final long TASK_CONSULT_TIMEOUT_MS = 15000;
+    static final long TASK_LOOK_MS = 5000;
+    /** A task's search step (find_thing, go_to_place) gets this much of the task's five minutes. */
+    static final long TASK_SEEK_MS = 2L * 60 * 1000;
+    static final String TASK_ABORT_LINE = "Sorry, I couldn't finish that errand.";
+    static final String TASK_PRIVACY_LINE = "I'll stop that errand here.";
+
+    private enum TaskWait { NONE, ACT, SAY_READY, SAY, LOOK, WAIT, CONSULT }
+
+    /** A line the task's end says, once the camera is closed and quiet (KTD6, as every line off the conversation). */
+    private String taskLine;
+
+    private ChatActions.Act task;
+    private final List<ChatActions.Act> taskSteps = new ArrayList<ChatActions.Act>();
+    private final List<String> taskOutcomes = new ArrayList<String>();
+    private final List<Boolean> taskOk = new ArrayList<Boolean>();
+    private int taskIdx;
+    private int taskNo;
+    private int taskCount;
+    private int taskConsults;
+    private long taskStartedAt;
+    private long taskStepAt;
+    private long taskWaitUntil;
+    private TaskWait taskWait = TaskWait.NONE;
+    private boolean taskLooking;
+    private boolean taskStartKnown;
+    private double taskStartX;
+    private double taskStartY;
+
+    /** The task under way, or null; for tests and the state page. */
+    ChatActions.Act task() {
+        return task;
+    }
+
+    /** A task's line is due or being said (its camera stays closed), for tests. */
+    boolean speaksForTask() {
+        return taskLine != null || task != null && (taskWait == TaskWait.SAY_READY || taskWait == TaskWait.SAY);
+    }
+
+    /** Steps done so far in the task under way (or the last one), for tests. */
+    int taskStepsDone() {
+        return taskOutcomes.size();
+    }
+
+    private void startTask(long now, ChatActions.Act t) {
+        if (task != null) {
+            endTask(now, "a new instruction", null);
+        }
+        if (intent != CuriosityPort.Action.NONE) {
+            dropIntent("a new instruction");
+        }
+        task = t;
+        taskNo = ++taskCount;
+        taskSteps.clear();
+        taskSteps.addAll(t.steps);
+        taskOutcomes.clear();
+        taskOk.clear();
+        taskIdx = 0;
+        taskConsults = 0;
+        taskStartedAt = now;
+        taskWait = TaskWait.NONE;
+        taskLooking = false;
+        awayLeg = null;
+        taskStartKnown = coverage.tracking();
+        taskStartX = coverage.x();
+        taskStartY = coverage.y();
+        note("task: start n=" + taskNo + " steps=" + ChatActions.stepTools(taskSteps));
+    }
+
+    /** Once per step: the task's next move. */
+    private void taskStep(long now) {
+        if (taskLine != null) {
+            if (state.chats() || state.converses()) {
+                taskLine = null;
+            } else if (!cameraOpen && camera.quiet()) {
+                port.say(taskLine);
+                taskLine = null;
+            }
+        }
+        if (task == null) {
+            return;
+        }
+        if (bathroom) {
+            // Privacy first: no consult, no look, no frame; the task ends here.
+            endTask(now, "bathroom", TASK_PRIVACY_LINE);
+            return;
+        }
+        if (state == State.DOCKED || onCharger()) {
+            endTask(now, "docked", TASK_ABORT_LINE);
+            return;
+        }
+        if (state == State.EYES_ONLY) {
+            endTask(now, "no wheels or sensors", TASK_ABORT_LINE);
+            return;
+        }
+        if (now - taskStartedAt >= TASK_MAX_MS) {
+            endTask(now, "out of time", TASK_ABORT_LINE);
+            return;
+        }
+        if (state.converses() || state.chats() || call != null) {
+            // A conversation or a call's search comes first (a call itself ends the task in callStep).
+            return;
+        }
+        switch (taskWait) {
+            case ACT:
+                if (intent == CuriosityPort.Action.NONE) {
+                    stepOutcome(now, intentEndOk, intentEndWhy == null ? "ended" : intentEndWhy);
+                }
+                return;
+            case SAY_READY:
+                // Speech starts once the camera and the detector are closed (KTD6).
+                if (!cameraOpen && camera.quiet()) {
+                    port.say(taskSteps.get(taskIdx).text);
+                    taskWait = TaskWait.SAY;
+                }
+                return;
+            case SAY:
+                if (port.sayFinished()) {
+                    stepOutcome(now, true, "said it");
+                }
+                return;
+            case LOOK: {
+                Look l = camera.latest();
+                if (l != null && l.frameMs > taskStepAt) {
+                    taskLooking = false;
+                    List<String> labels = shownLabels(l);
+                    stepOutcome(now, true, labels.isEmpty() ? "saw nothing his detector could name"
+                            : "saw: " + joinLabels(labels));
+                } else if (now >= taskWaitUntil) {
+                    taskLooking = false;
+                    stepOutcome(now, false, "his camera gave no picture in time");
+                }
+                return;
+            }
+            case WAIT:
+                if (now >= taskWaitUntil) {
+                    stepOutcome(now, true, "waited");
+                }
+                return;
+            case CONSULT: {
+                CuriosityPort.TaskPlan p = port.taskPlanAnswer();
+                if (p != null) {
+                    applyPlan(now, p);
+                } else if (now >= taskWaitUntil) {
+                    port.cancelTaskPlan();
+                    endTask(now, "the consult timed out", TASK_ABORT_LINE);
+                }
+                return;
+            }
+            default:
+                startStep(now);
+        }
+    }
+
+    private void startStep(long now) {
+        if (taskIdx >= taskSteps.size()) {
+            endTask(now, "done", null);
+            return;
+        }
+        ChatActions.Act s = taskSteps.get(taskIdx);
+        taskStepAt = now;
+        switch (s.action) {
+            case SAY:
+                if (muted || quiet) {
+                    stepOutcome(now, false, "he is in do not disturb, so he said nothing");
+                    return;
+                }
+                taskWait = TaskWait.SAY_READY;
+                return;
+            case LOOK:
+                if (!camera.available() || !leaseHeld) {
+                    stepOutcome(now, false, "his camera is not available");
+                    return;
+                }
+                taskLooking = true;
+                taskWaitUntil = now + TASK_LOOK_MS;
+                taskWait = TaskWait.LOOK;
+                return;
+            case WAIT:
+                taskWaitUntil = now + Math.max(1000, s.ms);
+                taskWait = TaskWait.WAIT;
+                return;
+            default:
+                if (s.drives() && onCharger()) {
+                    stepOutcome(now, false, "on the charger");
+                    return;
+                }
+                if (s.drives() && stillReason(now) != null) {
+                    // Review 2026-10-03: never a driving step while he waits for the board, is jammed, etc.
+                    stepOutcome(now, false, stillReason(now));
+                    return;
+                }
+                taskWait = TaskWait.ACT;
+                startAct(now, s, null);
+                if (intent == CuriosityPort.Action.NONE && intentEndWhy == null) {
+                    intentEndOk = true;
+                    intentEndWhy = "started";
+                }
+        }
+    }
+
+    private void stepOutcome(long now, boolean ok, String why) {
+        ChatActions.Act s = taskSteps.get(taskIdx);
+        taskOutcomes.add(s.tool + ": " + (ok ? "" : "failed: ") + why);
+        taskOk.add(ok);
+        taskWait = TaskWait.NONE;
+        intentEndWhy = null;
+        note("task: step n=" + taskNo + " i=" + (taskIdx + 1) + " tool=" + s.tool + " " + (ok ? "ok" : "fail")
+                + " ms=" + (now - taskStepAt));
+        boolean consult = !ok || s.check || s.action == CuriosityPort.Action.LOOK;
+        if (consult && ok && s.action != CuriosityPort.Action.LOOK && taskIdx + 1 >= taskSteps.size()) {
+            // A check on the last step: nothing left to revise (a last look may still add a line about it).
+            consult = false;
+        }
+        if (!consult) {
+            taskIdx++;
+            return;
+        }
+        if (taskConsults >= TASK_MAX_CONSULTS) {
+            endTask(now, "out of consults", TASK_ABORT_LINE);
+            return;
+        }
+        taskConsults++;
+        List<String> rest = new ArrayList<String>();
+        for (int i = taskIdx + 1; i < taskSteps.size(); i++) {
+            rest.add(stepText(taskSteps.get(i)));
+        }
+        Look l = camera.latest();
+        List<String> labels = l != null && now - l.frameMs < 30000 ? shownLabels(l) : new ArrayList<String>();
+        CuriosityPort.ToolFacts f = toolFactsNow(now, "carrying out an errand");
+        port.taskPlan(new CuriosityPort.TaskConsult(task.goal, new ArrayList<String>(taskOutcomes), rest, f.status,
+                labels, ok ? "check" : "failed", TASK_MAX_CONSULTS - taskConsults,
+                TASK_MAX_MS - (now - taskStartedAt), f), TASK_CONSULT_TIMEOUT_MS);
+        taskWaitUntil = now + TASK_CONSULT_TIMEOUT_MS + 2000;
+        taskWait = TaskWait.CONSULT;
+        note("task: consult n=" + taskNo + " #" + taskConsults + " after=" + (ok ? "check" : "failure"));
+    }
+
+    private void applyPlan(long now, CuriosityPort.TaskPlan p) {
+        if (p.status == CuriosityPort.TaskPlan.Status.FAILED) {
+            endTask(now, "the consult failed", TASK_ABORT_LINE);
+            return;
+        }
+        if (p.status == CuriosityPort.TaskPlan.Status.ABORT) {
+            endTask(now, "abandoned", p.line == null ? TASK_ABORT_LINE : p.line);
+            return;
+        }
+        while (taskSteps.size() > taskIdx + 1) {
+            taskSteps.remove(taskSteps.size() - 1);
+        }
+        taskSteps.addAll(p.steps);
+        taskIdx++;
+        taskWait = TaskWait.NONE;
+        note("task: revised n=" + taskNo + " rest=" + ChatActions.stepTools(p.steps));
+    }
+
+    /** One step as the consult reads it: the tool and its arguments (to Claude only, never logged). */
+    private static String stepText(ChatActions.Act s) {
+        StringBuilder b = new StringBuilder(s.tool);
+        if (s.kind != null) {
+            b.append(' ').append(s.kind).append(' ').append(s.amount);
+        }
+        if (s.ms > 0) {
+            b.append(' ').append(s.ms / 1000).append(" s");
+        }
+        if (s.target != null) {
+            b.append(" \"").append(s.target).append('"');
+        }
+        if (s.text != null) {
+            b.append(" \"").append(s.text).append('"');
+        }
+        return b.toString();
+    }
+
+    /**
+     * A look's labels as a task step or a consult may tell Claude: each once, never a bathroom
+     * one at any score (review 2026-10-03, as toolFactsNow hides bathroom places).
+     */
+    private static List<String> shownLabels(Look l) {
+        List<String> labels = new ArrayList<String>();
+        for (Detection d : l.detections) {
+            if (d.label != null && !labels.contains(d.label) && !BATHROOM_STRONG.contains(d.label)
+                    && !BATHROOM_WEAK.contains(d.label)) {
+                labels.add(d.label);
+            }
+        }
+        return labels;
+    }
+
+    private static String joinLabels(List<String> labels) {
+        StringBuilder b = new StringBuilder();
+        for (String l : labels) {
+            b.append(b.length() == 0 ? "" : ", ").append(l);
+        }
+        return b.toString();
+    }
+
+    /** The task ends (why: fixed words), with this line said (null: none); its record. */
+    private void endTask(long now, String why, String line) {
+        if (task == null) {
+            return;
+        }
+        if (taskWait == TaskWait.CONSULT) {
+            port.cancelTaskPlan();
+        }
+        StringBuilder outs = new StringBuilder();
+        for (Boolean ok : taskOk) {
+            outs.append(outs.length() == 0 ? "" : ",").append(ok ? "ok" : "fail");
+        }
+        note("task: n=" + taskNo + " steps=" + ChatActions.stepTools(taskSteps) + " outcomes="
+                + (outs.length() == 0 ? "-" : outs.toString()) + " consults=" + taskConsults + " end=" + why
+                + " ms=" + (now - taskStartedAt));
+        ChatActions.Act ended = task;
+        task = null;
+        taskWait = TaskWait.NONE;
+        taskLooking = false;
+        if (intent != CuriosityPort.Action.NONE && ended != null && !"a call".equals(why)) {
+            dropIntent("the task ended");
+        }
+        if (line != null && !muted && !quiet && !state.chats() && state != State.STOPPED) {
+            taskLine = line;
+        }
+    }
+
+    private void intentAvoid(long now, double toward, long ms) {
+        intentAvoidHeading = toward;
+        intentAvoidUntil = now + ms;
+        coverage.avoid(INTENT_AVOID_RADIUS_M, intentAvoidUntil);
+    }
+
+    /** Once per step: an intent whose time is over ends (be_quiet's do-not-disturb with it). */
+    private void intentStep(long now) {
+        if (intent == CuriosityPort.Action.NONE || now < intentUntil) {
+            return;
+        }
+        if (intent == CuriosityPort.Action.BE_QUIET) {
+            intentDone("be_quiet: " + span(intentAct != null && intentAct.ms > 0 ? intentAct.ms : INTENT_QUIET_MS)
+                    + " over");
+        } else if (intent == CuriosityPort.Action.STAY || intent == CuriosityPort.Action.WAIT) {
+            intentDone("stayed");
+        } else {
+            dropIntent("timed out");
+        }
+    }
+
+    private void intentDone(String why) {
+        intentEnd(true, why);
+    }
+
+    private void dropIntent(String why) {
+        intentEnd(false, why);
+    }
+
+    private void clearIntent() {
+        intent = CuriosityPort.Action.NONE;
+        intentTarget = null;
+        intentUntil = NEVER;
+        intentSeekDue = false;
+        quiet = false;
+        intentAct = null;
+        stayUntil = NEVER;
+        moveDue = false;
+        moveStarted = false;
+        moveSawMotion = false;
+        actHeading = Double.NaN;
+        actLegM = 0;
+        aimHeading = Double.NaN;
+        if (moveBack && state == State.BACK_OFF) {
+            stopMotors();
+            enterPause(clock.nowMs(), pauseMs(), false);
+        }
+        moveBack = false;
+    }
+
+    /** Whether a heading leads back toward the spot or the person an intent avoids. */
+    private boolean intentAvoided(long now, double heading) {
+        if (Double.isNaN(heading) || now >= intentAvoidUntil) {
+            return false;
+        }
+        if (!Double.isNaN(intentAvoidHeading)
+                && Math.abs(Heading.delta(Heading.wrap(heading), intentAvoidHeading)) <= INTENT_AVOID_DEG) {
+            return true;
+        }
+        return coverage.avoided(heading, BATHROOM_AVOID_REACH_M, now);
+    }
+
+    /** A way avoided: back toward the bathroom he left, or toward what an intent avoids. */
+    private boolean avoidedWay(long now, double heading) {
+        return bathAvoided(now, heading) || intentAvoided(now, heading);
+    }
+
+    /** Some way is avoided now (the bathroom's, or an intent's). */
+    private boolean avoiding(long now) {
+        return now < bathAvoidUntil || now < intentAvoidUntil;
+    }
+
+    /** A person met while finding someone named: whether this face check is them (true when no name was given). */
+    private boolean soughtPerson(CuriosityPort.MatchAnswer a) {
+        if (intentTarget == null || intentTarget.equalsIgnoreCase("someone") || intentTarget.equalsIgnoreCase("anyone")
+                || intentTarget.equalsIgnoreCase("somebody")) {
+            return true;
+        }
+        String n = a.name == null ? "" : a.name.trim();
+        if (n.isEmpty() || a.status == CuriosityPort.MatchAnswer.Status.NEW) {
+            return false;
+        }
+        return AnswerParser.same(n, intentTarget) || NameResolver.firstWord(n).equalsIgnoreCase(
+                NameResolver.firstWord(intentTarget));
+    }
+
+    // ---- bathroom privacy (owner 2026-10-02) ----
+    //
+    // "If he thinks he's in a bathroom, he beeps every five seconds and tries to escape the
+    // bathroom as quickly as possible." He has a camera, so this is privacy first. Decided on
+    // the robot from the detector's labels alone: a strong label (BATHROOM_STRONG) in
+    // BATHROOM_STRONG_LOOKS of the last BATHROOM_WEAK_LOOKS looks within BATHROOM_WEAK_WINDOW_MS
+    // (robot 2026-10-02 14:51: one look of a close office chair read "toilet" 0.62), a strong box
+    // that a non-bathroom label also claims counting only as weak, or two different weak ones
+    // (BATHROOM_WEAK) within the last BATHROOM_WEAK_LOOKS looks and BATHROOM_WEAK_WINDOW_MS. From then until he is out: no frame goes to Claude
+    // (canAsk() is false, so every request takes its no-Claude path), the camera saves none
+    // (Camera.setPrivate), no place print is kept (and those of the looks that decided it are
+    // dropped), no curiosity stop, remark or conversation (a call gets a glance, as muted),
+    // and one beep every BATHROOM_BEEP_MS (silent while muted: the speaker is off anyway).
+    // He leaves the way he came (the boxed-in retrace), or turns about and drives with no
+    // way in logged; the hazard, CPL, stall, RECOVER and jam rules all still apply. He is out
+    // after BATHROOM_OUT_M driven since the trigger with no bathroom label in the last
+    // BATHROOM_OUT_LOOKS looks; then the way in and the coverage cells around the spot are
+    // avoided for BATHROOM_AVOID_MS (the steer, seeks, doorways and his legs).
+
+    /** One look of these at BATHROOM_STRONG_MIN or more means a bathroom. Toilet paper is only
+     *  weak: on the robot (2026-10-02) a small white thing on the office floor read "toilet paper"
+     *  0.35 and he beeped his way out of the office. */
+    static final Set<String> BATHROOM_STRONG = new HashSet<String>(java.util.Arrays.asList("toilet"));
+    /** 0.5, not 0.35: replaying 2026-10-02 found office looks with a full-frame "toilet" at 0.35-0.36. */
+    static final float BATHROOM_STRONG_MIN = 0.5f;
+    /** Two different ones of these at BATHROOM_WEAK_MIN or more, close together, mean a bathroom; one never does. */
+    static final Set<String> BATHROOM_WEAK = new HashSet<String>(java.util.Arrays.asList(
+            "toilet paper", "sink", "mirror", "soap", "paper towel", "towel", "bathtub"));
+    /** A box smaller than this share of the frame never counts: from the floor a real fixture is big. */
+    static final float BATHROOM_MIN_AREA = 0.006f;
+    /** 0.4, not 0.3: the same replay found office pairs like sink 0.31 + paper towel, mirror 0.30 + bathtub 0.38. */
+    static final float BATHROOM_WEAK_MIN = 0.4f;
+    static final int BATHROOM_WEAK_LOOKS = 3;
+    static final long BATHROOM_WEAK_WINDOW_MS = 10000;
+    /**
+     * Robot 2026-10-02 14:51: the detector gave one full-frame box "toilet" 0.62 and "office chair"
+     * 0.33. A strong box that a non-bathroom label at BATHROOM_RIVAL_MIN or more also claims (IoU at
+     * least BATHROOM_RIVAL_IOU) counts only as a weak label.
+     */
+    static final float BATHROOM_RIVAL_IOU = 0.8f;
+    static final float BATHROOM_RIVAL_MIN = 0.25f;
+    /** The strong rule needs its label in this many of the last BATHROOM_WEAK_LOOKS looks, not one. */
+    static final int BATHROOM_STRONG_LOOKS = 2;
+    static final long BATHROOM_BEEP_MS = 5000;
+    static final String BATHROOM_BEEP = "privacy";
+    static final double BATHROOM_OUT_M = 2.0;
+    static final int BATHROOM_OUT_LOOKS = 3;
+    static final long BATHROOM_AVOID_MS = 3L * 60 * 60 * 1000;
+    /** The way in is avoided this far either side; the spot's cells this far round, seen up to the reach ahead. */
+    static final double BATHROOM_AVOID_DEG = 45;
+    static final double BATHROOM_AVOID_RADIUS_M = 1.0;
+    static final double BATHROOM_AVOID_REACH_M = 3.0;
+
+    /** Privacy on: he thinks he is in a bathroom and is not out yet. */
+    private boolean bathroom;
+    /** The last look weighed, and the recent ones' weak labels {frameMs, labels} (before a trigger). */
+    private Look bathLook;
+    private final ArrayDeque<Object[]> bathLooks = new ArrayDeque<Object[]>();
+    private long bathBeepAt = NEVER;
+    /** Counts driven since the trigger (mean of the wheels, so a turn in place adds nothing). */
+    private long bathCounts;
+    private SensorReading bathWheels;
+    /** Looks in a row with no bathroom label, since the trigger. */
+    private int bathCleanLooks;
+    /** The escape is still to start, at the next leg decision. */
+    private boolean bathEscapePending;
+    /** The way in (NaN: none) and the spot's cells are avoided until then (NEVER: nothing avoided). */
+    private double bathAvoidHeading = Double.NaN;
+    private long bathAvoidUntil = NEVER;
+    /** A strong label in the newest look, not yet confirmed: frames are held until then (bathHeld). */
+    private long bathHoldUntil = NEVER;
+
+    /** Privacy is on (bathroom), for the state page and tests. */
+    boolean bathroomPrivate() {
+        return bathroom;
+    }
+
+    /** Do not disturb or bathroom privacy: nothing to say, a call gets a glance. */
+    private boolean hushed() {
+        return muted || bathroom || quiet;
+    }
+
+    /** Why he is hushed, for the trace. */
+    private String hushWhy() {
+        return muted ? "muted" : bathroom ? "bathroom" : "quiet";
+    }
+
+    /** Claude may be asked: never with a bathroom frame (privacy), else as the port says. */
+    private boolean canAsk() {
+        return !bathroom && !bathHeld(clock.nowMs()) && port.canAsk();
+    }
+
+    /**
+     * Review 2026-10-03: the newest look shows a strong bathroom label (no rival) that one look
+     * is no longer enough to call a bathroom: until the next look clears it or confirms it (at
+     * most BATHROOM_WEAK_WINDOW_MS), no frame leaves the robot, though he does not beep or leave.
+     */
+    private boolean bathHeld(long now) {
+        return bathHoldUntil != NEVER && now < bathHoldUntil;
+    }
+
+    /** {strong, weak} bathroom boxes in a look at their thresholds, each label once (its first box), in box order. */
+    private static List<List<Detection>> bathroomHits(Look look) {
+        List<Detection> strong = new ArrayList<Detection>();
+        List<Detection> weak = new ArrayList<Detection>();
+        if (look.detections != null) {
+            for (Detection d : look.detections) {
+                if ((d.x1 - d.x0) * (d.y1 - d.y0) < BATHROOM_MIN_AREA) {
+                    continue;
+                }
+                boolean strongLabel = BATHROOM_STRONG.contains(d.label) && d.score >= BATHROOM_STRONG_MIN;
+                if (strongLabel && !bathroomRival(d, look.detections)) {
+                    if (!hasLabel(strong, d.label)) {
+                        strong.add(d);
+                    }
+                } else if ((BATHROOM_WEAK.contains(d.label) || strongLabel) && d.score >= BATHROOM_WEAK_MIN
+                        && !hasLabel(weak, d.label)) {
+                    weak.add(d);
+                }
+            }
+        }
+        List<List<Detection>> out = new ArrayList<List<Detection>>();
+        out.add(strong);
+        out.add(weak);
+        return out;
+    }
+
+    /** A non-bathroom label at BATHROOM_RIVAL_MIN or more claims (about) the same box as d. */
+    private static boolean bathroomRival(Detection d, List<Detection> all) {
+        for (Detection o : all) {
+            if (o != d && o.label != null && !BATHROOM_STRONG.contains(o.label) && !BATHROOM_WEAK.contains(o.label)
+                    && o.score >= BATHROOM_RIVAL_MIN && iou(d, o) >= BATHROOM_RIVAL_IOU) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static float iou(Detection a, Detection b) {
+        float w = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+        float h = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+        float inter = w > 0 && h > 0 ? w * h : 0f;
+        float union = (a.x1 - a.x0) * (a.y1 - a.y0) + (b.x1 - b.x0) * (b.y1 - b.y0) - inter;
+        return union > 0 ? inter / union : 0f;
+    }
+
+    private static boolean hasLabel(List<Detection> ds, String label) {
+        for (Detection d : ds) {
+            if (d.label.equals(label)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<String> labelsOf(List<Detection> ds) {
+        List<String> out = new ArrayList<String>();
+        for (Detection d : ds) {
+            out.add(d.label);
+        }
+        return out;
+    }
+
+    /** Once per step, before anything else reads the look: each new look weighed for a bathroom. */
+    private void bathroomWatch(long now) {
+        if (!cameraOpen || state == State.DOCKED) {
+            return;
+        }
+        Look look = camera.latest();
+        if (look == null || look == bathLook) {
+            return;
+        }
+        bathLook = look;
+        List<List<Detection>> hits = bathroomHits(look);
+        List<Detection> strong = hits.get(0);
+        List<Detection> weak = hits.get(1);
+        if (bathroom) {
+            bathCleanLooks = strong.isEmpty() && weak.isEmpty() ? bathCleanLooks + 1 : 0;
+            return;
+        }
+        bathLooks.addLast(new Object[]{look.frameMs, weak, strong});
+        while (bathLooks.size() > BATHROOM_WEAK_LOOKS
+                || look.frameMs - (Long) bathLooks.peekFirst()[0] > BATHROOM_WEAK_WINDOW_MS) {
+            bathLooks.pollFirst();
+        }
+        int strongLooks = 0;
+        long strongSince = look.frameMs;
+        for (Object[] b : bathLooks) {
+            if (!((List<?>) b[2]).isEmpty()) {
+                strongLooks++;
+                strongSince = Math.min(strongSince, (Long) b[0]);
+            }
+        }
+        bathHoldUntil = strong.isEmpty() ? NEVER : now + BATHROOM_WEAK_WINDOW_MS;
+        if (!strong.isEmpty() && strongLooks >= BATHROOM_STRONG_LOOKS) {
+            bathHoldUntil = NEVER;
+            trig("bathroom", "strong", strong, strongLooks);
+            enterBathroom(now, labelsOf(strong), strongSince);
+            return;
+        }
+        List<Detection> seen = new ArrayList<Detection>();
+        long since = look.frameMs;
+        int looks = 0;
+        for (Object[] b : bathLooks) {
+            @SuppressWarnings("unchecked")
+            List<Detection> w = (List<Detection>) b[1];
+            boolean added = false;
+            for (Detection d : w) {
+                if (!hasLabel(seen, d.label)) {
+                    seen.add(d);
+                    added = true;
+                    since = Math.min(since, (Long) b[0]);
+                }
+            }
+            looks += added ? 1 : 0;
+        }
+        if (seen.size() >= 2) {
+            trig("bathroom", "weak2", seen, looks);
+            enterBathroom(now, labelsOf(seen), since);
+        }
+    }
+
+    // ---- the trig: records (2026-10-03, the learning log) ----
+
+    /**
+     * One record per decision a detection set off: its kind (bathroom, person-pick, meet,
+     * remark, curiosity), the rule branch that fired, the deciding boxes (label, score,
+     * box as frame fractions; several joined by "+") and how many looks agreed. Labels are
+     * the detector's class names (spaces as "_"); a living thing is only "person" or
+     * "animal", never a description or a name.
+     */
+    private void trig(String kind, String rule, List<Detection> boxes, int looks) {
+        StringBuilder label = new StringBuilder();
+        StringBuilder score = new StringBuilder();
+        StringBuilder box = new StringBuilder();
+        for (Detection d : boxes) {
+            String sep = label.length() == 0 ? "" : "+";
+            label.append(sep).append(trigLabel(d.label));
+            score.append(sep).append(two(d.score));
+            box.append(sep).append(two(d.x0)).append(',').append(two(d.y0)).append(',').append(two(d.x1))
+                    .append(',').append(two(d.y1));
+        }
+        note("trig: kind=" + kind + " rule=" + rule + " label=" + (label.length() == 0 ? "-" : label)
+                + " score=" + (score.length() == 0 ? "-" : score) + " box=" + (box.length() == 0 ? "-" : box)
+                + " looks=" + looks);
+    }
+
+    private void trig(String kind, String rule, Detection box, int looks) {
+        List<Detection> one = new ArrayList<Detection>();
+        if (box != null) {
+            one.add(box);
+        }
+        trig(kind, rule, one, looks);
+    }
+
+    /** A label as one token: whitespace and the record's separators become "_". */
+    static String trigLabel(String label) {
+        if (label == null || label.trim().isEmpty()) {
+            return "-";
+        }
+        return label.trim().replaceAll("[\\s+=,]+", "_");
+    }
+
+    /**
+     * What kind of meeting this is, for the learning log's records (2026-10-03): a call's (the
+     * wake word or his name, a come-here), a voice cue's, a roaming person pick's, Claude's
+     * person pick at a stop, or other.
+     */
+    private String meetKind() {
+        return callTaken || callChatCue != null ? "call" : cuePick ? "cue" : roamingPick ? "roaming"
+                : claudeStop ? "claude-pick" : "other";
+    }
+
+    /** The box as a record may show it: a living thing's label (Claude's description of them) is only its kind. */
+    private static Detection trigBox(Detection d, CuriosityPort.Kind kind) {
+        if (d == null || kind == null || !kind.isLiving()) {
+            return d;
+        }
+        return new Detection(kind == CuriosityPort.Kind.PERSON ? "person" : "animal", d.score, d.x0, d.y0, d.x1, d.y1);
+    }
+
+    /** Privacy on: everything that could see, keep or say anything ends here; the escape is due. */
+    private void enterBathroom(long now, List<String> labels, long sinceFrameMs) {
+        bathroom = true;
+        StringBuilder l = new StringBuilder();
+        for (String x : labels) {
+            l.append(l.length() == 0 ? "" : ", ").append(x);
+        }
+        note("bathroom: " + l + "; leaving and beeping (privacy)");
+        camera.setPrivate(true);
+        // The looks that decided it were taken inside: their prints go too.
+        places.forgetSince(sinceFrameMs);
+        placeLook = null;
+        bathLooks.clear();
+        bathCounts = 0;
+        bathWheels = null;
+        bathCleanLooks = 0;
+        bathBeepAt = now;
+        cancelAsk();
+        cancelDoorway(now, "bathroom privacy");
+        cancelMetCheck();
+        endSeek(now, false, "bathroom privacy");
+        if (state == State.HOP) {
+            // No further in: the leg ends here, logged like any other, so it is the way out.
+            legEnd = "bath";
+            legDriven(now);
+        }
+        boolean usable = compass.usable(now);
+        bathAvoidHeading = !Double.isNaN(inHeading) ? inHeading : usable ? compass.degrees() : Double.NaN;
+        bathAvoidUntil = now + BATHROOM_AVOID_MS;
+        coverage.avoid(BATHROOM_AVOID_RADIUS_M, bathAvoidUntil);
+        bathEscapePending = true;
+    }
+
+    /** Once per step while private: the beep, and whether he is out. */
+    private void bathroomStep(long now) {
+        if (!bathroom) {
+            return;
+        }
+        if (now >= bathBeepAt) {
+            if (!muted) {
+                sound.playReaction(BATHROOM_BEEP);
+            }
+            bathBeepAt = now + BATHROOM_BEEP_MS;
+        }
+        if (bathCounts >= BATHROOM_OUT_M * tuning.coverageCountsPerMetre && bathCleanLooks >= BATHROOM_OUT_LOOKS) {
+            bathroom = false;
+            bathEscapePending = false;
+            camera.setPrivate(false);
+            bathAvoidUntil = now + BATHROOM_AVOID_MS;
+            coverage.extendAvoid(bathAvoidUntil);
+            note("bathroom: out; avoiding that area for " + BATHROOM_AVOID_MS / 3600000 + " h");
+        }
+    }
+
+    /** Counts driven while private, from every reading (a reset or glitch jump is ignored). */
+    private void countBathWheels(SensorReading r) {
+        if (!bathroom || !r.hasWheels()) {
+            return;
+        }
+        if (bathWheels != null) {
+            long d = Math.abs((r.wheelLeft - bathWheels.wheelLeft) + (r.wheelRight - bathWheels.wheelRight)) / 2;
+            if (d < 5000) {
+                bathCounts += d;
+            }
+        }
+        bathWheels = r;
+    }
+
+    /**
+     * At a leg decision in PAUSE: the escape, leaving the way he came (the boxed-in retrace),
+     * or with no way in logged, turning about and driving. Not while an escape is under way
+     * or jammed (those carry on, and it waits); with the heading unusable he roams out on
+     * the steer. True when it has started.
+     */
+    private boolean bathroomEscape(long now) {
+        if (!bathEscapePending || state != State.PAUSE || jammed || planner.active()) {
+            return false;
+        }
+        bathEscapePending = false;
+        if (!compass.usable(now)) {
+            note("bathroom: no usable heading; roaming out");
+            return false;
+        }
+        boolean way = !Double.isNaN(inHeading);
+        double exit = Heading.wrap((way ? inHeading : compass.degrees()) + 180);
+        long counts = way ? inCounts : Math.round(BATHROOM_OUT_M * tuning.coverageCountsPerMetre);
+        note("bathroom: " + (way ? "leaving the way he came" : "no way in logged: turning about")
+                + " (facing " + Math.round(exit) + " deg); the way in (" + Math.round(Heading.wrap(exit + 180))
+                + " deg) avoided");
+        around = null;
+        leaveBy(now, exit, counts, false, null);
+        return true;
+    }
+
+    /**
+     * Whether a heading leads back toward the bathroom he left (or is leaving): within
+     * BATHROOM_AVOID_DEG of the way in, or toward the coverage cells round the spot.
+     */
+    private boolean bathAvoided(long now, double heading) {
+        if (Double.isNaN(heading) || now >= bathAvoidUntil) {
+            return false;
+        }
+        if (!Double.isNaN(bathAvoidHeading)
+                && Math.abs(Heading.delta(Heading.wrap(heading), bathAvoidHeading)) <= BATHROOM_AVOID_DEG) {
+            return true;
+        }
+        return coverage.avoided(heading, BATHROOM_AVOID_REACH_M, now);
+    }
+
+    /** A look's openness for the steer: the bearings back toward the bathroom read closed. */
+    private Openness.Profile open(long now, Look look) {
+        Openness.Profile p = look == null ? null : look.openness;
+        if (p == null || p.bins == null || !avoiding(now) || !compass.usable(now)) {
+            return p;
+        }
+        double facing = compass.degrees();
+        float[] bins = null;
+        int n = p.bins.length;
+        for (int i = 0; i < n; i++) {
+            double x = -1 + (2 * i + 1) / (double) n;
+            if (avoidedWay(now, Heading.wrap(facing - x * tuning.cameraHalfFovDeg))) {
+                if (bins == null) {
+                    bins = p.bins.clone();
+                }
+                bins[i] = 0f;
+            }
+        }
+        return bins == null ? p : new Openness.Profile(bins, p.confidence);
+    }
+
+    /**
+     * A leg about to start toward the bathroom he left: turned away instead (the planned
+     * leg follows the turn). True when it turned.
+     */
+    private boolean bathTurnAway(long now, int ticks) {
+        if (!compass.usable(now) || !bathAvoided(now, compass.degrees())) {
+            return false;
+        }
+        double away = Double.isNaN(bathAvoidHeading) ? 180
+                : Heading.delta(compass.degrees(), Heading.wrap(bathAvoidHeading + 180));
+        if (Math.abs(away) < tuning.turnToleranceDeg) {
+            away = 180;
+        }
+        Direction d = away > 0 ? Direction.LEFT : Direction.RIGHT;
+        note("bathroom: not driving back toward it; turning " + d + " " + Math.round(Math.abs(away)) + " deg");
+        plannedTicks = ticks;
+        lastHazardSide = null;
+        enterLook(now, d, false, timedMs(Math.abs(away)), Math.abs(away));
+        return true;
+    }
+
     State state() {
         return state;
+    }
+
+    /** Place-memory prints kept now, for tests. */
+    int placePrints() {
+        return places.size();
     }
 
     /** The camera is off after a failure (cameraBackoffMs), for tests and logs. */
@@ -992,6 +3176,7 @@ final class ExploreBrain {
             return;
         }
         started = true;
+        startedAtMs = clock.nowMs();
         faceHoldUntil = clock.nowMs() + tuning.faceHoldMs;
         enterEyesOnly(classifier.reason());
     }
@@ -1002,16 +3187,38 @@ final class ExploreBrain {
             return;
         }
         classifier.offer(reading);
+        if (!moving && classifier.learnFlat(reading)) {
+            note("tilt: flat accel " + classifier.flat());
+        }
+        trackPower(reading);
         trackWheels(reading);
         countEscapeWheels(reading);
+        countJamWheels(reading);
+        countWriggleWheels(reading);
+        countRecoverWheels(reading);
+        countBathWheels(reading);
         lastReading = reading;
+        if (legNo != 0 && state == State.HOP && reading.tof > 0 && reading.tof < 16383 && reading.tof < legTofMin) {
+            legTofMin = reading.tof;
+        }
+        if (legNo != 0 && state == State.HOP) {
+            legReadings++;
+            if (reading.tof > 0 && reading.tof != tuning.tofFault) {
+                legTofValid++;
+            }
+            legTiltMax = maxOf(legTiltMax, classifier.tiltDeg());
+            legFastMax = maxOf(legFastMax, classifier.fastDeg());
+        }
         compass.offer(reading, moving);
+        headingHistory.offer(reading.timestampMs,
+                compass.usable(reading.timestampMs) ? compass.degrees() : Double.NaN,
+                moving ? turnSign : 0, 360.0 / Math.max(1, tuning.escapeSweepMaxMs));
         coverage.offer(reading, compass.degrees(), compass.usable(reading.timestampMs));
         teachFloor(reading);
         double[] turn = compass.takeTurnResult();
         if (turn != null) {
             note("measured turn: asked " + Math.round(turn[0]) + " deg, turned " + Math.round(turn[1])
-                    + " deg, overshoot " + Math.round(turn[2]) + " deg");
+                    + " deg, overshoot " + Math.round(turn[2]) + " deg why=" + turnWhy);
         }
         step(true);
     }
@@ -1035,15 +3242,45 @@ final class ExploreBrain {
         if (state == State.STOPPED) {
             return;
         }
+        if (legNo != 0) {
+            legEnd = "stop";
+            legLog(clock.nowMs());
+        }
+        escapeEnd(clock.nowMs(), "stop");
         moving = false;
         motor.stop();
+        dropWriggle();
         cancelAsk();
         cancelWayOut();
         cancelDoorway(clock.nowMs(), null);
         cancelMetCheck();
         planner.reset();
         coverage.clear();
+        if (seekAsking) {
+            port.cancelSeek();
+        }
+        seekAsking = false;
+        seekTarget = Double.NaN;
+        seekPrint = null;
+        seekLabel = null;
+        seekTrusted = false;
+        seekPersonNoted = false;
+        trustLeg = false;
+        trustLegDoor = false;
+        doorwayReported = Double.NaN;
+        seekFrames.clear();
+        seekScan.clear();
+        familiarStops = 0;
+        stopSeekable = false;
+        areaTrail.clear();
+        places.clear();
+        placeLook = null;
+        placeNoted = null;
         probing = false;
+        if (bathroom) {
+            bathroom = false;
+            camera.setPrivate(false);
+        }
         state = State.STOPPED;
         syncCamera();
         syncMoving();
@@ -1075,7 +3312,9 @@ final class ExploreBrain {
             again = true;
             return;
         }
+        aroundStep();
         stepping = true;
+        roamClock(clock.nowMs());
         boolean wasInStop = state.inStop();
         try {
             boolean f = fresh;
@@ -1086,6 +3325,10 @@ final class ExploreBrain {
             } while (again && state != State.STOPPED);
             syncCamera();
             syncMoving();
+            if (legNo != 0 && state != State.HOP) {
+                legLog(clock.nowMs());
+            }
+            noteMode();
             // However a stop ends (a line, NOTHING, a skip, the fallback, a
             // failure, a hazard, the lease), the next one is a full gap of
             // wandering away. Live, stops began ~0.5 s apart and he never roamed.
@@ -1102,7 +3345,27 @@ final class ExploreBrain {
         HazardClassifier.Status s = classifier.status(now);
         // The one place cues are consumed (KTD1, KTD3): every state, EYES_ONLY included.
         drainEars(now);
+        // Bathroom privacy first: before anything else reads this step's look (a stop, the
+        // steer, the place memory), and before what privacy ends (as muting) is ended.
+        bathroomWatch(now);
+        bathroomStep(now);
+        intentStep(now);
+        actStep(now);
+        taskStep(now);
+        mutedStep(now);
+        spellStep(now);
+        // The call (hey-miko plan KTD1, KTD2): in every state, EYES_ONLY included, before
+        // the state's own step, so a take and its answer clip land in this very step.
+        callStep(now);
         if (state == State.EYES_ONLY) {
+            if (leaseHeld && dockable() && onCharger()) {
+                // On the dock with the ToF faulted (the owner's charger, 2026-10-02) he never
+                // drives, so only POWER can say docked; the look needs the camera, not the ToF.
+                enterDocked(now);
+                watchLooks(now);
+                dockStep(now);
+                return;
+            }
             if (leaseHeld && s != HazardClassifier.Status.UNAVAILABLE) {
                 if (!faceHoldReleased) {
                     // The first roam waits for the start-up face migration, with the
@@ -1119,7 +3382,11 @@ final class ExploreBrain {
                 if (curiosityAt == Long.MAX_VALUE) {
                     scheduleCuriosity(now);
                 }
-                enterPause(now, pauseMs(), false);
+                if (jammed) {
+                    resumeJam(now, "the lease or the sensors came back");
+                } else {
+                    enterPause(now, pauseMs(), false);
+                }
             }
             return;
         }
@@ -1135,7 +3402,23 @@ final class ExploreBrain {
                 note("lease lost during the conversation: no wheels and no look until it ends");
             }
         }
-        if (s == HazardClassifier.Status.UNAVAILABLE && !wheellessMeeting) {
+        // Docked (owner 2026-10-02): on the charger he sits still and quiet instead of roaming.
+        // Before the sensor check: DOCKED never drives, so a faulted ToF does not end it.
+        if (state != State.DOCKED && dockable() && onCharger()) {
+            enterDocked(now);
+        }
+        if (state == State.DOCKED) {
+            watchLooks(now);
+            dockStep(now);
+            return;
+        }
+        // A docked look's remark (SPEAK, from DOCKED) never drives: a faulted ToF on the dock
+        // must not cut it short, or finishPick never marks the thing seen and it is said again.
+        boolean dockRemark = onDock && onCharger() && state == State.SPEAK;
+        if (tipStep(now, fresh, s)) {
+            return;
+        }
+        if (s == HazardClassifier.Status.UNAVAILABLE && !wheellessMeeting && !dockRemark) {
             if (!state.chats()) {
                 enterEyesOnly("sensors unavailable: " + classifier.reason());
                 return;
@@ -1152,6 +3435,7 @@ final class ExploreBrain {
         boolean hazard = s == HazardClassifier.Status.HAZARD;
         watchLooks(now);
         doorwayStep(now);
+        seekStep(now);
         metCheckStep(now);
         takeHeldCue(now);
         switch (state) {
@@ -1208,32 +3492,44 @@ final class ExploreBrain {
                     // The sensor can't say when he is past it, so each stall in a row
                     // backs off further and turns a set, growing amount (escapeTurn()).
                     stallStreak++;
-                    note("wheels stalled while driving: blocked by something low (" + stallStreak + " in a row)");
+                    legStalls++;
+                    note("wheels stalled while driving: blocked by something low (" + stallStreak + " in a row)"
+                            + tiltTag());
                     compass.legStalled(now - tuning.stallWindowMs);
+                    stampStall(now);
                     hazardInMotion(now, null);
+                    // Robot 2026-10-01: the board may refuse all motion for a while after a stall.
+                    recoverAfterStartle = recoverDue(now);
                 } else if (now >= phaseUntil) {
                     if (doorwayLeg) {
                         note("through the doorway at " + Math.round(doorway) + " deg");
                         forgetDoorway();
+                        doorwayReported = Double.NaN;
+                        endSeek(now, true, "through the doorway");
                     }
                     legDriven(now);
-                } else if (blockedAheadInLeg()) {
+                } else if (!trustLeg && blockedAheadInLeg()) {
                     // He never stops for the camera alone (KTD9): the leg just ends here,
                     // like a short one, and the next decision bends away.
                     note("camera reads the way ahead blocked: ending the leg early");
                     doorwayLeg = false;
+                    legEnd = "camera";
                     legDriven(now);
-                } else if (reaimInLeg(now)) {
+                } else if (!trustLeg && reaimInLeg(now)) {
                     break;
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
                     nextTickAt += tuning.hopTickMs;
-                    motor.hopTick();
+                    legSent++;
+                    hopTick();
                 }
                 break;
             case STARTLE:
                 if (now >= phaseUntil) {
-                    if (corneredAfterStartle) {
+                    if (recoverAfterStartle) {
+                        recoverAfterStartle = false;
+                        enterRecover(now, corneredAfterStartle, "hazards in a row");
+                    } else if (corneredAfterStartle) {
                         wedged(now, "hazards in a row", false);
                     } else {
                         startBackOff(now);
@@ -1243,13 +3539,54 @@ final class ExploreBrain {
             case BACK_OFF:
                 // Blind (nothing watches behind him): bounded by time, hazards ignored; the
                 // short back-up before a retried turn also stops on a stall.
-                if (backForTurn && now < phaseUntil && wheelsStalled(now)) {
+                if (moveBack) {
+                    // Owner 2026-10-03: the move tool's back-up. A stall waits out the board (RECOVER).
+                    if (now < phaseUntil && wheelsStalled(now)) {
+                        note("wheels stalled backing up");
+                        stampStall(now);
+                        stopMotors();
+                        moveBack = false;
+                        if (recoverDue(now)) {
+                            enterRecover(now, false, "the back-up went nowhere");
+                        } else {
+                            dropIntent("the back-up stalled");
+                            enterPause(now, pauseMs(), false);
+                        }
+                    } else if (now >= phaseUntil) {
+                        stopMotors();
+                        moveBack = false;
+                        enterPause(now, pauseMs(), false);
+                    } else if (ticksLeft > 0 && now >= nextTickAt) {
+                        ticksLeft--;
+                        nextTickAt += tuning.backTickMs;
+                        backTick();
+                    }
+                    break;
+                }
+                if (backForTurn && !retryWaiting && now < phaseUntil && wheelsStalled(now)) {
                     note("wheels stalled backing up");
+                    stampStall(now);
+                    if (recoverDue(now)) {
+                        if (escapeDir == null) {
+                            escapeDir = retryDir;
+                        }
+                        enterRecover(now, false, "the back-up went nowhere");
+                        break;
+                    }
                     phaseUntil = now;
                 }
-                if (now >= phaseUntil && backForTurn) {
+                if (now >= phaseUntil && backForTurn && !retryWaiting && tuning.blockedTurnWaitMs > 0) {
+                    // Robot 15:19: the blocked turn re-armed the board's cutout; the other way
+                    // straight after it would read nothing. Still, then the retry.
+                    stopMotors();
+                    retryWaiting = true;
+                    ticksLeft = 0;
+                    phaseUntil = now + tuning.blockedTurnWaitMs;
+                    note("backed up: waiting " + tuning.blockedTurnWaitMs + " ms before turning " + retryDir);
+                } else if (now >= phaseUntil && backForTurn) {
                     stopMotors();
                     backForTurn = false;
+                    retryWaiting = false;
                     enterLook(now, retryDir, retryEscape, retryMs, retryDeg);
                     turnRetrying = true;
                 } else if (now >= phaseUntil) {
@@ -1258,7 +3595,7 @@ final class ExploreBrain {
                 } else if (ticksLeft > 0 && now >= nextTickAt) {
                     ticksLeft--;
                     nextTickAt += tuning.backTickMs;
-                    motor.backTick();
+                    backTick();
                 }
                 break;
             case SCAN:
@@ -1269,11 +3606,14 @@ final class ExploreBrain {
             case CUE_LOOK:
                 curiosityStep(now, fresh, hazard);
                 break;
+            case CUE_WHERE:
+                whereStep(now);
+                break;
             case CHAT_THINK:
             case CHAT_SPEAK:
             case CHAT_LISTEN:
             case CHAT_NOTES:
-                chatStep(now);
+                chatStep(now, fresh, hazard);
                 break;
             case INSPECT:
             case REACT_HERE:
@@ -1334,7 +3674,14 @@ final class ExploreBrain {
             case DRIVE_OFF:
                 escapeTick(now, fresh, hazard);
                 break;
+            case RECOVER:
+                recoverStep(now, fresh);
+                break;
             case CORNERED:
+                if (jammed) {
+                    jamStep(now, fresh);
+                    break;
+                }
                 if (now >= phaseUntil) {
                     if (!ladderAfterRest) {
                         restEndedAt = now;
@@ -1368,15 +3715,38 @@ final class ExploreBrain {
     /** A roaming leg ended without a hazard or stall (its time, or the camera saw the way blocked). */
     private void legDriven(long now) {
         stopMotors();
-        if (legWentNowhere(now)) {
+        boolean nowhere = legWentNowhere(now);
+        if (legNo != 0) {
+            legEnd = nowhere ? "nowhere" : legEnd != null ? legEnd : "retry".equals(legSrc) ? "cpl_retry_ok" : "done";
+        }
+        if (!Double.isNaN(seekTarget) && !nowhere) {
+            // Only a leg that drove counts toward seekMaxLegs (robot 16:00: turns only, "leg 0" three times);
+            // a trusted short leg counts toward seekTrustedLegsMax instead.
+            if (trustLeg) {
+                seekTrustLegs++;
+            } else {
+                seekLegs++;
+            }
+        }
+        trustLeg = false;
+        trustLegDoor = false;
+        if (nowhere) {
             // Too short for the stall watch to rule, but the encoders say he never moved:
             // not a drive-off, so the blocked ways stay avoided.
             aheadBlocked();
         } else {
+            if (compass.usable(now) && lastWheels != null && hopMoved / 2 >= tuning.escapeRetraceMinCounts) {
+                // The way he came, should he end up boxed in (robot 2026-10-01).
+                inHeading = compass.degrees();
+                inCounts = hopMoved / 2;
+            }
             blockedSides.clear();
             blockedAheadAt = Double.NaN;
+            // Driven away cleanly: whatever cornered him is behind him. Review P2-6: only a
+            // leg that moved; one that went nowhere keeps the jam and the stuck spell's count.
+            jammed = false;
+            recoverDone();
         }
-        // Driven away cleanly: whatever cornered him is behind him.
         compass.droveOffCleanly();
         hazardTimes.clear();
         stallStreak = 0;
@@ -1390,13 +3760,32 @@ final class ExploreBrain {
     private void decide(long now, boolean hazard) {
         if (hazard) {
             refuse(now);
+        } else if (bathroomEscape(now)) {
+            // Out of the bathroom the way he came (owner 2026-10-02): the retrace has started.
+            return;
+        } else if (boxedIn(now)) {
+            // Leaving the way he came (robot 2026-10-01): the retrace has started.
+            return;
+        } else if (actDecide(now)) {
+            // Owner 2026-10-03: an action tool's motion, a stay, or a task's still step.
+            return;
         } else if (awayLeg != null) {
             // The first leg after a conversation turns away from the person (R16).
             Direction d = awayLeg;
             awayLeg = null;
+            double deg = Double.isNaN(awayLegDeg) ? tuning.chatAwayDeg : awayLegDeg;
+            awayLegDeg = Double.NaN;
             note("first leg after the conversation: turning " + d + ", away from them");
-            enterLook(now, d, false, timedMs(tuning.chatAwayDeg), tuning.chatAwayDeg);
-        } else if (!hopNext && camera.available() && now >= curiosityAt && now >= curiosityOffUntil) {
+            if (intent == CuriosityPort.Action.GO_AWAY) {
+                intentDone("turned away");
+            }
+            enterLook(now, d, false, timedMs(deg), deg);
+        } else if (seekAsking) {
+            // Claude is choosing where to go (seekStep): he stands and thinks.
+            return;
+        } else if (!hopNext && !seeking() && around == null && camera.available()
+                && (now >= curiosityAt || intentSeekDue) && now >= curiosityOffUntil && !hushed()) {
+            // An intent's seek (owner 2026-10-02) scans first, for its frames, whatever the stop's timer.
             enterScan(now);
         } else if (hopNext) {
             startHop(now);
@@ -1454,6 +3843,9 @@ final class ExploreBrain {
         }
         if (hazard) {
             refuse(now);
+        } else if (bathroomEscape(now)) {
+            // Look-then-go: the look that decided he is in a bathroom starts the escape, not a leg.
+            return;
         } else if (!seePerson(now, arrived ? look : null)) {
             chooseLeg(now, arrived ? look : null);
         }
@@ -1464,21 +3856,83 @@ final class ExploreBrain {
      * is confident, else as before the camera roamed: a random turn or a hop.
      */
     private void chooseLeg(long now, Look look) {
-        double door = doorwayBearing(now);
-        if (look != null && steer.doorwayReadsBlocked(look.openness, door)) {
-            note("the doorway at " + Math.round(doorway) + " deg reads blocked now: forgotten");
-            forgetDoorway();
-            door = Double.NaN;
+        trustLeg = false;
+        trustLegDoor = false;
+        legDecClear();
+        legDecLook = look;
+        legDecSrc = around != null ? "around" : !Double.isNaN(seekTarget) ? "seek" : null;
+        if (around != null) {
+            aroundLook(now, look);
+            return;
         }
-        RoamSteer.Novelty novelty = novelty(now);
-        if (novelty != null && coverage.cells(now) != coverageNoted) {
+        if (!Double.isNaN(seekTarget) && seekLook(now, look)) {
+            return;
+        }
+        boolean seek = !Double.isNaN(seekTarget);
+        double door = seek ? seekBearing(now) : doorwayBearing(now);
+        if (!seek && look != null && !Double.isNaN(door) && Math.abs(door) <= tuning.cameraHalfFovDeg
+                && steer.confident(look.openness) && steer.openAt(look.openness, door) <= tuning.steerBlocked) {
+            if (hazardToward(now, doorway)) {
+                // Blocked by a hazard there, not just the camera: that still blocks.
+                note("the doorway at " + Math.round(doorway) + " deg reads blocked and a hazard was there just now: forgotten");
+                forgetBlockedDoorway();
+                door = Double.NaN;
+            } else {
+                // Robot 2026-10-01 16:35: openness read open hallway carpet 0.00. Claude's doorway
+                // is trusted over it; the floor sensor, CPL and stall rules guard the short leg.
+                note(String.format(java.util.Locale.US,
+                        "the doorway at %d deg reads blocked (open %.2f); trusting Claude: a short leg toward it",
+                        Math.round(doorway), steer.openAt(look.openness, door)));
+                trustedLeg(now, door, true);
+                return;
+            }
+        }
+        // Seeking, the target alone pulls: every way around him is familiar anyway.
+        RoamSteer.Novelty novelty = seek ? null : novelty(now, look);
+        if (novelty != null && coverage.tracking() && coverage.cells(now) != coverageNoted) {
             coverageNoted = coverage.cells(now);
             note("coverage: " + coverageNoted + " cells");
         }
-        RoamSteer.Plan plan = look == null ? null : steer.plan(look.openness, door, novelty);
+        RoamSteer.Plan plan = look == null ? null
+                : steer.plan(open(now, look), door, novelty, seek ? tuning.seekWeight : tuning.doorwayWeight);
+        if (plan == null && seek && !Double.isNaN(door)) {
+            // No look to steer by: straight on toward it, after a turn if it is off to a side.
+            if (Math.abs(door) >= tuning.turnToleranceDeg) {
+                plannedTicks = drawTicks();
+                turnToward(now, door);
+            } else {
+                startHop(now);
+            }
+            return;
+        }
         doorwayLeg = false;
         if (plan != null) {
-            note("steer: " + plan);
+            String said = plan.toString();
+            note("steer: " + (seek && !seekToDoor ? said.replace(", toward the doorway", ", toward the seek target") : said));
+            boolean faced = aroundFaced;
+            aroundFaced = false;
+            legDecSrc = seek ? "seek" : plan.towardDoorway ? "door" : faced ? "around" : "steer";
+            legDecOpen = plan.open;
+            legDecNov = plan.novelty;
+            boolean closed = steer.mostOpen(open(now, look)) <= tuning.steerBlocked;
+            boolean cooling = closed && !faced && !plan.towardDoorway && !aroundAllowed(now);
+            if (cooling) {
+                note("everything ahead closed, but looked around " + (now - aroundEndedAt) / 1000
+                        + " s ago: the steer's own plan");
+            }
+            if (closed && !faced && !plan.towardDoorway && tuning.lookAroundLooks > 1 && compass.usable(now)
+                    && !cooling) {
+                // Nothing in view open: look all the way round before choosing, rather
+                // than a blind 60 deg guess (robot 2026-10-01 15:55).
+                startAround(now, look, plan.side == RoamSteer.RIGHT ? Direction.RIGHT : Direction.LEFT);
+                return;
+            }
+            if (closed && faced && plan.turnOnly && !plan.towardDoorway) {
+                // Facing the look-around's best, still under steerBlocked: a short leg there,
+                // guarded by the floor sensor, not another blind turn.
+                plan = new RoamSteer.Plan(RoamSteer.STRAIGHT, 0, plan.open, false, true, 0f);
+                note("facing the look-around's best: a short leg");
+            }
             if (plan.towardDoorway && !plan.turnOnly && !plan.shortLeg && plan.open >= tuning.steerOpen) {
                 double after = compass.degrees() + (plan.side == RoamSteer.LEFT ? plan.bendDeg
                         : plan.side == RoamSteer.RIGHT ? -plan.bendDeg : 0);
@@ -1545,22 +3999,89 @@ final class ExploreBrain {
     }
 
     /**
-     * How new the ground is along each bearing off his facing (explore nav plan U10),
-     * or null (as before U10) with the heading not usable, no position kept yet, or
-     * coverageWeight 0.
+     * How new each bearing off his facing is: the lower of the grid's novelty
+     * (explore nav plan U10; none with the heading not usable or no position kept
+     * yet) and the place memory's (in view, look's; out of view, the newest look at
+     * that heading). Null (as before U10) with coverageWeight 0, or when neither
+     * knows anything.
      */
-    private RoamSteer.Novelty novelty(final long now) {
-        if (tuning.coverageWeight <= 0 || !compass.usable(now) || !coverage.tracking()) {
+    private RoamSteer.Novelty novelty(final long now, Look look) {
+        if (tuning.coverageWeight <= 0) {
             return null;
         }
+        boolean usable = compass.usable(now);
         final double facing = compass.degrees();
-        // An anonymous class, not a lambda: the Android build's bootclasspath has no LambdaMetafactory.
+        RoamSteer.Novelty grid = null;
+        if (usable && coverage.tracking()) {
+            // An anonymous class, not a lambda: the Android build's bootclasspath has no LambdaMetafactory.
+            grid = new RoamSteer.Novelty() {
+                @Override
+                public double at(double bearing) {
+                    return coverage.novelty(Heading.wrap(facing + bearing), now);
+                }
+            };
+        }
+        final RoamSteer.Novelty base = places.steer(grid, facing, usable, placeNovelty(now, look), now);
+        final boolean boxed = now < boxedAvoidUntil && !Double.isNaN(boxedAvoidHeading);
+        final boolean bath = avoiding(now);
+        if (!usable || (!boxed && !bath)) {
+            return base;
+        }
+        // Just out of a boxed-in spot: the way back under reads as already seen; so does the
+        // way back to a bathroom he left (owner 2026-10-02).
+        final double avoid = boxedAvoidHeading;
         return new RoamSteer.Novelty() {
             @Override
             public double at(double bearing) {
-                return coverage.novelty(Heading.wrap(facing + bearing), now);
+                double h = Heading.wrap(facing + bearing);
+                if ((boxed && Math.abs(Heading.delta(h, avoid)) <= tuning.boxedAvoidDeg) || (bath && avoidedWay(now, h))) {
+                    return 0;
+                }
+                return base == null ? Double.NaN : base.at(bearing);
             }
         };
+    }
+
+    /**
+     * Scores a look against the place memory once, and keeps its print (visual place
+     * memory): its heading at capture is the compass less what he has turned since
+     * (NaN when not usable). Notes a match placeSeenSim or better, each memory once
+     * in a row. The look's novelty, NaN for none (no look, no print, a plain view).
+     */
+    private double placeNovelty(long now, Look look) {
+        if (look == null || look.place == null || bathroom) {
+            // Bathroom privacy: nothing from inside is kept or scored.
+            return Double.NaN;
+        }
+        if (look != placeLook) {
+            double heading = Double.NaN;
+            if (compass.usable(now)) {
+                double turned = headingHistory.turnedSince(look.frameMs);
+                heading = Double.isNaN(turned) ? Double.NaN : Heading.wrap(compass.degrees() - turned);
+            }
+            PlaceMemory.Match m = places.look(look.place, labels(look), heading, look.frameMs);
+            placeLook = look;
+            placeLookNovelty = m.novelty;
+            placeLookAgeMs = m.ageMs;
+            if (m.seen() && m.print != placeNoted) {
+                placeNoted = m.print;
+                note(m.note());
+            }
+        }
+        return placeLookNovelty;
+    }
+
+    /** The detector's labels in a look (its boxes are already above the detector's floor). */
+    private static List<String> labels(Look look) {
+        List<String> out = new ArrayList<String>();
+        if (look.detections != null) {
+            for (Detection d : look.detections) {
+                if (!out.contains(d.label)) {
+                    out.add(d.label);
+                }
+            }
+        }
+        return out;
     }
 
     /** turnChance, cut by coverageTurnScale while the way ahead is new ground (U10). */
@@ -1574,6 +4095,13 @@ final class ExploreBrain {
     private void refuse(long now) {
         HazardClassifier.Hazard h = classifier.hazard();
         note("hazard at start: " + h);
+        if (h != null && h.kind == HazardClassifier.Kind.CPL) {
+            recordRefusal(now, true);
+        }
+        trustLegHazard();
+        if (seeking()) {
+            seekDetour(now, "blocked: " + h, escapeSide(h));
+        }
         aheadBlocked();
         leaveStopForHazard();
         hopNext = false;
@@ -1603,10 +4131,14 @@ final class ExploreBrain {
             return false;
         }
         int left = ticksRemaining(now);
+        recordRefusal(now, false);
         note("controller refused forward (CPL) on plain floor: a hiccup; " + left
                 + " ticks to go, trying once more in " + tuning.cplRetryPauseMs + " ms");
         stopMotors();
         cplRetryUntil = now + tuning.cplRetryPauseMs + tuning.cplRetryWindowMs;
+        legEnd = "cpl";
+        legHiccups++;
+        legDecSrc = "retry";
         plannedTicks = left;
         hopNext = true;
         enterPause(now, tuning.cplRetryPauseMs, true);
@@ -1641,7 +4173,9 @@ final class ExploreBrain {
         if (left < tuning.reaimMinTicks) {
             return false;
         }
-        double deg = steer.reaimDeg(look.openness, doorwayBearing(now), novelty(now));
+        boolean seek = !Double.isNaN(seekTarget);
+        double deg = seek ? steer.reaimDeg(open(now, look), seekBearing(now), null, tuning.seekWeight)
+                : steer.reaimDeg(open(now, look), doorwayBearing(now), novelty(now, look));
         if (Math.abs(deg) < tuning.reaimMinDeg) {
             return false;
         }
@@ -1656,6 +4190,9 @@ final class ExploreBrain {
         reaimedAt = now;
         stopMotors();
         plannedTicks = left;
+        legEnd = "reaim";
+        legDecSrc = legSrc;
+        legDecLook = look;
         enterLook(now, d, false, timedMs(bend), bend);
         return true;
     }
@@ -1669,11 +4206,37 @@ final class ExploreBrain {
 
     /** As above, for a hazard the classifier did not see (h null: side unknown). */
     private void hazardInMotion(long now, HazardClassifier.Hazard h) {
+        recoverAfterStartle = false;
+        if (state == State.HOP && h != null) {
+            // Robot 2026-10-03: a hazard driving forward blocks this heading ahead (frontClear).
+            aheadBlocked();
+        }
+        if (h != null && h.kind == HazardClassifier.Kind.CPL) {
+            recordRefusal(now, true);
+        }
+        if (h != null && h.kind == HazardClassifier.Kind.TILT) {
+            SensorReading r = lastReading;
+            note("dark floor: tilt (accel z " + (r != null && r.hasAccel ? String.valueOf(r.accelZ) : "-")
+                    + ", flat " + tuning.darkFlatAccelZ + "): stopping and backing off");
+            if (legNo != 0) {
+                legTilts++;
+            }
+        }
+        trustLegHazard();
+        if (h == null) {
+            endSeek(now, false, "blocked: wheels stalled");
+        } else if (seeking()) {
+            seekDetour(now, "blocked: " + h, escapeSide(h));
+        }
         if (drivingForward() && (h == null || h.kind == HazardClassifier.Kind.OBSTACLE)) {
             stampBump(now);
         }
         if (state == State.HOP) {
             aheadBlocked();
+            legEnd = h == null ? "stall" : h.kind == HazardClassifier.Kind.CPL ? "cpl"
+                    : h.kind == HazardClassifier.Kind.EDGE ? "edge"
+                    : h.kind == HazardClassifier.Kind.TILT ? "tilt" : "obstacle";
+            legCpl += h != null && h.kind == HazardClassifier.Kind.CPL ? 1 : 0;
         }
         stopMotors();
         leaveStopForHazard();
@@ -1685,8 +4248,11 @@ final class ExploreBrain {
         escapeDir = escapeSide(h);
         corneredAfterStartle = recordHazard(now);
         corneredAfterStartle |= wedgedNow(now);
-        // One "whoa" per stall streak: repeat stalls flinch quietly.
-        if (!stalledNow || stallStreak == 1) {
+        // One "whoa" per stall streak: repeat stalls flinch quietly. On the charger (the
+        // latch refuses the leg he drove onto it with) he settles without a sound.
+        if (onCharger()) {
+            note("on the charger: no startle");
+        } else if (!stalledNow || stallStreak == 1) {
             sound.playStartle();
         }
         show(EyeState.FLINCH, null);
@@ -1705,10 +4271,19 @@ final class ExploreBrain {
         if (!state.inStop()) {
             return;
         }
+        if (callsOwn() && (state.cueSearch() || state.approachesPerson())) {
+            // KTD1: the escape comes first; the call is retaken from where it leaves him.
+            handBackCall("a hazard");
+            clearStop();
+            return;
+        }
         if (state.cueSearch() && searchCue != null) {
             // R9: the escape comes first; the voice is looked for again from where it leaves him.
             note("hazard during the turn to a voice: the cue waits for the escape");
             holdCue(clock.nowMs(), searchCue);
+            // Not over: the same voice is looked for again after the escape, not held off.
+            leanInOpen = false;
+            leanInExempt = searchCue;
             clearStop();
             return;
         }
@@ -1737,7 +4312,7 @@ final class ExploreBrain {
         note("escape over: saying Claude's line from here");
         pick = p;
         target = null;
-        speak(now, p.line);
+        speakRemark(now, p.line);
         return true;
     }
 
@@ -1826,8 +4401,13 @@ final class ExploreBrain {
         turnProgressDeg = 0;
         turnProgressAt = now;
         if (measured) {
+            turnWhy = bathroom ? "bathroom"
+                    : (escape && state == State.TURN) || state.escapes() || state == State.RECOVER || jammed ? "escape"
+                    : state.cueSearch() ? "cue" : state.chats() ? "call" : state.curious() ? "scan"
+                    : seeking() ? "seek" : "roam";
             compass.startTurn(heading == Direction.LEFT ? Heading.LEFT : Heading.RIGHT,
                     escape && state == State.TURN ? Math.min(deg, tuning.escapeSweepDeg) : deg, now);
+            note("turn start: heading " + Math.round(compass.degrees()) + " deg, asking " + Math.round(deg) + " deg " + heading);
         }
     }
 
@@ -1836,13 +4416,19 @@ final class ExploreBrain {
      * while hopping: turns and back-offs move the wheels differently.
      */
     private void trackWheels(SensorReading r) {
-        if (!(state == State.HOP || escapeDriving() || (state == State.BACK_OFF && backForTurn)) || !r.hasWheels()) {
+        if (!(state == State.HOP || escapeDriving() || (state == State.BACK_OFF && (backForTurn || moveBack)))
+                || !r.hasWheels()) {
             return;
         }
         if (lastWheels != null) {
             long moved = Math.abs(r.wheelLeft - lastWheels.wheelLeft) + Math.abs(r.wheelRight - lastWheels.wheelRight);
             if (state == State.HOP) {
                 hopMoved += moved;
+                if (recoverCount > 0 && tuning.recoverSpellResetCounts > 0
+                        && hopMoved / 2 >= tuning.recoverSpellResetCounts) {
+                    // Robot 2026-10-02: a forward leg driving cleanly ends the stuck spell.
+                    spellOver("a forward leg drove " + hopMoved / 2 + " counts cleanly");
+                }
             }
             wheelMoves.addLast(new long[]{r.timestampMs, moved});
         } else {
@@ -1885,18 +4471,39 @@ final class ExploreBrain {
     // ---- curiosity ----
 
     private void scheduleCuriosity(long now) {
+        if (curiosityRetryAt >= 0) {
+            curiosityAt = curiosityRetryAt;
+            curiosityRetryAt = -1;
+            return;
+        }
         curiosityAt = now + between(tuning.curiosityMinMs, tuning.curiosityMaxMs);
     }
 
     private void enterScan(long now) {
         note("curiosity stop: scanning");
+        if (!lastStopNothing) {
+            // The last stop found something to react to: not all familiar.
+            familiarStops = 0;
+        }
+        lastStopNothing = false;
+        seekScan.clear();
+        stopSeekable = true;
         // The next stop is scheduled now, so one cut short by a hazard is not retried at once.
         scheduleCuriosity(now);
         state = State.SCAN;
         scanLooksLeft = tuning.scanLooks;
-        scanDir = unblocked(randomDirection());
+        scanDir = unblocked(scanSide(now, randomDirection()));
         target = null;
-        claudeStop = port.canAsk();
+        roamingPick = false;
+        cuePick = false;
+        personVoiceAt = NEVER;
+        claudeStop = canAsk();
+        if (!claudeStop && port.claudePausedMs() > 0) {
+            note("Claude is paused for " + port.claudePausedMs() + " ms: a detector-only stop");
+        } else if (claudeStop && !lookBudgetLeft(now)) {
+            claudeStop = false;
+            note("Claude look budget spent (" + tuning.claudeLooksPerMinute + " a minute): a detector-only stop");
+        }
         heldPick = null;
         scanned.clear();
         scanHeadings.clear();
@@ -1906,6 +4513,34 @@ final class ExploreBrain {
         firstLook = true;
         show(EyeState.IDLE, null);
         waitForLook(now);
+    }
+
+    /**
+     * The way to scan: toward the side whose recent looks were less familiar (visual
+     * place memory), by at least coverageMinGain over the headings the scan would
+     * face; else the given (random) way.
+     */
+    private Direction scanSide(long now, Direction random) {
+        if (tuning.coverageWeight <= 0 || !compass.usable(now)) {
+            return random;
+        }
+        double left = 0;
+        double right = 0;
+        int n = 0;
+        for (int i = 1; i < tuning.scanLooks; i++) {
+            double l = places.noveltyAt(compass.degrees() + i * tuning.scanTurnDeg, now);
+            double r = places.noveltyAt(compass.degrees() - i * tuning.scanTurnDeg, now);
+            if (Double.isNaN(l) || Double.isNaN(r)) {
+                continue;
+            }
+            left += l;
+            right += r;
+            n++;
+        }
+        if (n == 0 || Math.abs(left - right) / n < tuning.coverageMinGain) {
+            return random;
+        }
+        return left > right ? Direction.LEFT : Direction.RIGHT;
     }
 
     /** Stand still until a look taken after now + settle arrives. */
@@ -1919,6 +4554,32 @@ final class ExploreBrain {
         firstLook = false;
     }
 
+    /**
+     * A stop's look did not come in time (the remark rate, owner 2026-10-01). The
+     * stop ends (saying its pick, if it has one). The first miss is retried
+     * curiosityRetryMs later; a second in a row with no look at all turns curiosity
+     * off for curiosityBackoffMs, and one where looks came, just none new enough (a
+     * slow detector, not a broken camera), only ends the stop.
+     */
+    private void stopLookMissed(long now, boolean noLookAtAll) {
+        boolean again = stopLookMissed;
+        stopLookMissed = !again;
+        if (!noLookAtAll) {
+            note("no new look in time; ending this curiosity stop");
+        } else if (again) {
+            note("camera gave no look in time again; curiosity off for " + tuning.curiosityBackoffMs + " ms");
+            curiosityOffUntil = now + tuning.curiosityBackoffMs;
+        } else {
+            note("camera gave no look in time");
+        }
+        if (!again && pick == null) {
+            // Taken by scheduleCuriosity as the stop ends, in place of a full gap of wandering.
+            note("trying the curiosity stop again in " + tuning.curiosityRetryMs + " ms");
+            curiosityRetryAt = now + tuning.curiosityRetryMs;
+        }
+        giveUp(now);
+    }
+
     /** SCAN, FACE and APPROACH: waiting for a look, leading with the eyes, turning, or driving a leg. */
     private void curiosityStep(long now, boolean fresh, boolean hazard) {
         switch (step) {
@@ -1929,20 +4590,15 @@ final class ExploreBrain {
                     if (fresh) {
                         onLook(now, look);
                     }
+                } else if (fresh && state == State.CUE_LOOK && callsOwn() && look != null
+                        && look.frameMs != callLookChecked && staleCallLook(now, look)) {
+                    break;
                 } else if (now >= lookDeadline) {
                     if (state == State.CUE_LOOK) {
                         cueLookOver(now, look == null);
                         break;
                     }
-                    if (look != null) {
-                        // Looks are coming, just not a new enough one: a slow detector,
-                        // not a broken camera, so only this stop ends.
-                        note("no new look in time; ending this curiosity stop");
-                    } else {
-                        note("camera gave no look in time; curiosity off for " + tuning.cameraBackoffMs + " ms");
-                        curiosityOffUntil = now + tuning.cameraBackoffMs;
-                    }
-                    giveUp(now);
+                    stopLookMissed(now, look == null);
                 }
                 break;
             }
@@ -1957,6 +4613,9 @@ final class ExploreBrain {
                     turnWouldNotTurn(now);
                 } else if (hazard) {
                     hazardInMotion(now);
+                } else if (state == State.CUE_TURN && fresh && callsOwn() && seenInTurn(now)) {
+                    // Turning to face a caller seen in a look taken on the way (turnToSeenCaller).
+                    break;
                 } else if (state == State.CUE_TURN && trendSaysStop(now)) {
                     double turned = turnedSoFar(now);
                     stopMotors();
@@ -1995,20 +4654,23 @@ final class ExploreBrain {
             cueLook(now, look);
             return;
         }
+        stopLookMissed = false;
         // Someone met in the last 10 minutes: the detector's fallback never approaches a person (KTD8).
-        boolean ignorePeople = now < peopleIgnoredUntil || anyoneMet(now) || leftAlone(now, look);
+        // Only SCAN asks: a call's FACE and APPROACH never pass the leave-alone checks (hey-miko KTD8).
+        boolean ignorePeople = state == State.SCAN
+                && (now < peopleIgnoredUntil || anyoneMet(now) || leftAlone(now, look));
         if (state == State.SCAN && claudeStop) {
             scanLook(now, look, ignorePeople);
             return;
         }
         if (state == State.SCAN) {
+            seekRecord(now, look);
             Sighting sighting = Sighting.choose(look.detections, tuning, ignorePeople);
             if (sighting.kind == Sighting.Kind.NOTHING) {
                 if (--scanLooksLeft > 0) {
                     startCuriosityTurn(now, scanDir, tuning.scanTurnMs, tuning.scanTurnDeg, false);
                 } else {
-                    note("nothing interesting here");
-                    endCuriosity(now);
+                    nothing(now, "nothing interesting here");
                 }
                 return;
             }
@@ -2041,6 +4703,11 @@ final class ExploreBrain {
         lostLooks = 0;
         target = found;
         stare(target);
+        if (callsOwn() && CuriosityPort.Kind.of(target.label) == CuriosityPort.Kind.PERSON
+                && (polite(target) || Sighting.fillsFrame(target, tuning))) {
+            callArrive(now, look);
+            return;
+        }
         if (state == State.FACE) {
             face(now);
         } else if (Sighting.fillsFrame(target, tuning)) {
@@ -2113,7 +4780,7 @@ final class ExploreBrain {
             return;
         }
         moving = true;
-        motor.turn(heading);
+        turnWheels(heading);
         step = Step.TURNING;
         turnStartedAt = now;
         phaseUntil = now + turnMs;
@@ -2139,7 +4806,7 @@ final class ExploreBrain {
         nextTickAt = now + tuning.hopTickMs;
         phaseUntil = now + tuning.approachTicks * tuning.hopTickMs;
         moving = true;
-        motor.hopTick();
+        hopTick();
         compass.startLeg(false, now);
     }
 
@@ -2163,12 +4830,16 @@ final class ExploreBrain {
         } else if (ticksLeft > 0 && now >= nextTickAt) {
             ticksLeft--;
             nextTickAt += tuning.hopTickMs;
-            motor.hopTick();
+            hopTick();
         }
     }
 
     /** Arrived (not a hazard, R6): inspect it. */
     private void arrive(long now) {
+        if (callsOwn() && target != null && CuriosityPort.Kind.of(target.label) == CuriosityPort.Kind.PERSON) {
+            callArrive(now, null);
+            return;
+        }
         stopMotors();
         hazardTimes.clear();
         if (pick != null) {
@@ -2199,7 +4870,7 @@ final class ExploreBrain {
                 if (Sighting.isPersonOrPet(target.label)) {
                     peopleIgnoredUntil = now + tuning.peopleCooldownMs;
                 } else {
-                    seen.add(target.label);
+                    markSeen(target.label);
                 }
                 remember(target.label, CuriosityPort.Kind.of(target.label), now);
             }
@@ -2234,13 +4905,32 @@ final class ExploreBrain {
 
     /** Back to wandering; the camera closes as the state leaves curiosity. */
     private void endCuriosity(long now) {
+        // A roaming stop's end (not a meeting's): after its remark, if any, it may become a seek.
+        boolean seekable = stopSeekable && !meetingHeld;
         stopMotors();
         clearStop();
+        if (jammed) {
+            // Review P2-6: a call met where he stood (IN_PLACE) while jammed: still jammed.
+            resumeJam(now, "the stop");
+            return;
+        }
         enterPause(now, pauseMs(), false);
+        if (seekable || intentSeekDue) {
+            maybeSeek(now);
+        }
     }
 
     /** Forgets everything about the current stop (the camera closes as the state leaves curiosity). */
     private void clearStop() {
+        stopSeekable = false;
+        trustLeg = false;
+        trustLegDoor = false;
+        if (leanInOpen) {
+            leanInOpen = false;
+            if (!leanInMet) {
+                leanInOver(clock.nowMs());
+            }
+        }
         closeMeeting();
         cancelAsk();
         // A check the stop was waiting on runs on; its answer then only clears a roaming person.
@@ -2253,6 +4943,7 @@ final class ExploreBrain {
         stranger = null;
         helloOnly = false;
         pendingLine = null;
+        remarkQueued = false;
         afterOrient = null;
         scanned.clear();
         scanHeadings.clear();
@@ -2261,13 +4952,21 @@ final class ExploreBrain {
         searchCue = null;
         searchPlan = null;
         searchFirstTurn = false;
+        callerInTurn = null;
         latestTrend = null;
         wheellessMeeting = false;
+        roamingPick = false;
+        cuePick = false;
+        personVoiceAt = NEVER;
+        if (chat != null) {
+            chat.learnCut(muted ? "muted" : "cut");
+        }
         chat = null;
         chatCueSide = null;
         chatNoWheels = false;
         chatStallSince = NEVER;
         chatLookWanted = false;
+        clearCallChat();
         syncPark();
     }
 
@@ -2282,8 +4981,20 @@ final class ExploreBrain {
      * except at a leg decision.
      */
     private boolean cameraWanted(long now) {
-        if (!camera.available() || !leaseHeld || now < curiosityOffUntil) {
+        if (!cameraUsable(now)) {
             return false;
+        }
+        if (!state.chats() && (taskLine != null
+                || task != null && (taskWait == TaskWait.SAY_READY || taskWait == TaskWait.SAY))) {
+            // Owner 2026-10-03: a task's line is said with the camera closed, as any line off the conversation.
+            return false;
+        }
+        if (state == State.DOCKED) {
+            // Docked (robot 2026-10-02): open only for each look, closed between them, as the
+            // HAL's streaming cost ~68% of a core for one look a minute. dockStep starts a look
+            // only once the reopen gap since the last close has passed. With dockCameraCloses
+            // off: opened once and kept open, the detector parked between looks (syncPark).
+            return !tuning.dockCameraCloses || dockLooking;
         }
         if (state.curious() || state.cueSearch() || state.chats()) {
             return true;
@@ -2296,9 +5007,14 @@ final class ExploreBrain {
             return false;
         }
         if (tuning.navigation == ExploreTuning.Navigation.LOOK_THEN_GO) {
-            return state == State.PAUSE && lookForLeg;
+            return state == State.PAUSE && (lookForLeg || taskLooking);
         }
         return true;
+    }
+
+    /** The camera could open now: it exists, he holds the lease, and no failure's back-off is running (R5). */
+    private boolean cameraUsable(long now) {
+        return camera.available() && leaseHeld && now >= curiosityOffUntil;
     }
 
     private void syncCamera() {
@@ -2355,6 +5071,7 @@ final class ExploreBrain {
         Look look = camera.latest();
         if (look != null && look != lastLook) {
             lastLook = look;
+            placeNovelty(now, look);
             roamLookDeadline = now + tuning.lookTimeoutMs;
             teachQueue.addLast(new long[]{look.frameMs, forwardCounts});
             while (teachQueue.size() > TEACH_QUEUE_MAX) {
@@ -2431,6 +5148,7 @@ final class ExploreBrain {
 
     /** A Claude stop's scan look: keep it (and the detector's first sighting), and take them all (R1). */
     private void scanLook(long now, Look look, boolean ignorePeople) {
+        seekRecord(now, look);
         scanned.add(look);
         scanHeadings.add(compass.usable(now) ? compass.degrees() : Double.NaN);
         if (detectorPick == null) {
@@ -2469,13 +5187,14 @@ final class ExploreBrain {
     }
 
     private void startAsk(long now) {
+        spendLook(now);
         askTries++;
         asking = true;
         askDeadline = now + tuning.askTimeoutMs;
         boolean cooling = now < peopleIgnoredUntil;
         note("asking Claude (try " + askTries + " of " + tuning.askAttempts + ", " + askedFrames.size() + " frames)");
-        port.ask(new CuriosityPort.LookRequest(new ArrayList<CuriosityPort.Frame>(askedFrames), recent(now), cooling),
-                tuning.askTimeoutMs);
+        port.ask(new CuriosityPort.LookRequest(new ArrayList<CuriosityPort.Frame>(askedFrames), recent(now), cooling,
+                new ArrayList<String>(reacted), new ArrayList<String>(saidLines)), tuning.askTimeoutMs);
     }
 
     /** ASK, each tick: poll the answer; a failure or a missed deadline is another try, then the fallback (R7). */
@@ -2504,17 +5223,44 @@ final class ExploreBrain {
         }
     }
 
+    /** A line is needed, except for a familiar thing: that one is as good as nothing without a fresh line (onPick). */
     private boolean validPick(CuriosityPort.Answer a) {
         return a.frame >= 0 && a.frame < askedFrames.size() && a.box != null && a.kind != null
-                && usable(a.line);
+                && (usable(a.line) || (!a.kind.isLiving() && seenLoosely(a.box.label)));
     }
 
+    /**
+     * Another try, unless the tries are spent or (robot 2026-10-01) Claude has since paused
+     * after a 429 or 529, or the look budget is spent: never a request straight into a rate limit.
+     */
     private void retryOrFallback(long now) {
-        if (askTries < tuning.askAttempts) {
-            startAsk(now);
-        } else {
+        if (askTries >= tuning.askAttempts) {
             fallback(now);
+        } else if (!canAsk()) {
+            note(port.claudePausedMs() > 0 ? "Claude is paused: no second try" : "Claude unreachable: no second try");
+            fallback(now);
+        } else if (!lookBudgetLeft(now)) {
+            note("Claude look budget spent: no second try");
+            fallback(now);
+        } else {
+            startAsk(now);
         }
+    }
+
+    /** Robot 2026-10-01: another Claude look request fits in the last minute's claudeLooksPerMinute (0: no cap). */
+    private boolean lookBudgetLeft(long now) {
+        if (tuning.claudeLooksPerMinute <= 0) {
+            return true;
+        }
+        while (!claudeLookTimes.isEmpty() && now - claudeLookTimes.peekFirst() >= 60000) {
+            claudeLookTimes.pollFirst();
+        }
+        return claudeLookTimes.size() < tuning.claudeLooksPerMinute;
+    }
+
+    /** One Claude look request goes out now: it counts against claudeLooksPerMinute. */
+    private void spendLook(long now) {
+        claudeLookTimes.addLast(now);
     }
 
     /** Claude picked something: face it, approaching only if the detector boxed it too (KTD7). */
@@ -2539,9 +5285,21 @@ final class ExploreBrain {
             nothing(now, "greeted people and animals recently: as good as nothing, carrying on");
             return;
         }
-        if (!a.kind.isLiving() && seenLoosely(a.box.label)) {
-            nothing(now, "reacted to that already: as good as nothing, carrying on");
-            return;
+        if (!a.kind.isLiving()) {
+            // Robot 2026-10-01: in a familiar office nearly every pick was something he had reacted
+            // to, and those stops ended silently. A fresh line about it is said; no line, or one he
+            // has said before, is as good as nothing.
+            boolean fresh = usable(a.line) && !saidBefore(a.line);
+            if (seenLoosely(a.box.label)) {
+                if (!fresh) {
+                    nothing(now, "reacted to that already: as good as nothing, carrying on");
+                    return;
+                }
+                note("reacted to that already, but with a fresh line: saying it");
+            } else if (!fresh) {
+                nothing(now, "a line he has said already: as good as nothing, carrying on");
+                return;
+            }
         }
         takePick(now, a, false);
     }
@@ -2560,6 +5318,9 @@ final class ExploreBrain {
         float cx = a.box.centerX();
         pickRecentred = Math.abs(cx) > tuning.centreTolerance;
         Detection agree = remark ? null : detectorAgrees(scanned.get(look).detections, a);
+        trig(remark ? "remark" : a.kind == CuriosityPort.Kind.PERSON ? "person-pick" : "curiosity",
+                remark ? "met_recently" : agree != null ? "claude_detector" : "claude",
+                trigBox(agree != null ? agree : a.box, a.kind), scanned.size());
         if (agree != null) {
             note("the detector sees it too, as a " + agree.label + ": approaching");
             target = agree;
@@ -2599,7 +5360,42 @@ final class ExploreBrain {
     /** A stop that ends with nothing to react to: no line, back to wandering (R4). */
     private void nothing(long now, String why) {
         note(why);
+        lastStopNothing = true;
         endCuriosity(now);
+    }
+
+    /** A thing he reacted to: into seen, and to the front of the request's reacted list. */
+    private void markSeen(String label) {
+        seen.add(label);
+        reacted.remove(label);
+        reacted.addFirst(label);
+        while (reacted.size() > tuning.reactedLabelsMax) {
+            reacted.pollLast();
+        }
+    }
+
+    /** A remark about a thing: to the front of the request's said list, and never to be said again. */
+    private void rememberSaid(String line) {
+        saidLines.remove(line);
+        saidLines.addFirst(line);
+        while (saidLines.size() > tuning.saidLinesMax) {
+            saidLines.pollLast();
+        }
+        saidEver.add(normalisedLine(line));
+        if (saidEver.size() > SAID_EVER_MAX) {
+            java.util.Iterator<String> it = saidEver.iterator();
+            it.next();
+            it.remove();
+        }
+    }
+
+    private boolean saidBefore(String line) {
+        return saidEver.contains(normalisedLine(line));
+    }
+
+    /** Lower case, letters and digits only, single spaces: "What a plant!" and "what a plant" are one line. */
+    private static String normalisedLine(String line) {
+        return line.toLowerCase(java.util.Locale.US).replaceAll("[^a-z0-9]+", " ").trim();
     }
 
     /** Whether a thing he reacted to this session (seen) loosely matches this label. */
@@ -2688,8 +5484,7 @@ final class ExploreBrain {
     private void fallback(long now) {
         pick = null;
         if (detectorPick == null) {
-            note("no answer from Claude and the detector saw nothing; carrying on");
-            endCuriosity(now);
+            nothing(now, "no answer from Claude and the detector saw nothing; carrying on");
             return;
         }
         note("no answer from Claude; falling back to the detector's " + detectorPick);
@@ -2787,7 +5582,7 @@ final class ExploreBrain {
             enterMeetLook(now);
             return;
         }
-        speak(now, pick.line);
+        speakRemark(now, pick.line);
     }
 
     // ---- meeting a person (explore on Claude U5; R9-R14, KTD3, KTD4) ----
@@ -2869,6 +5664,7 @@ final class ExploreBrain {
 
     /** MEET: thinking eyes while Claude compares the face in this frame's person box with the stored ones. */
     private void enterMeet(long now, byte[] frameJpeg, Detection personBox) {
+        trig("meet", meetKind(), trigBox(personBox, CuriosityPort.Kind.PERSON), 1);
         stopMotors();
         state = State.MEET;
         meetingHeld = true;
@@ -2878,12 +5674,17 @@ final class ExploreBrain {
         meetLines = false;
         syncPark();
         show(EyeState.THINKING, null);
+        meetScore = personBox == null ? 0f : personBox.score;
         meetDeadline = now + tuning.meetTimeoutMs;
         note("a person: checking whether we've met");
         port.match(frameJpeg, personBox, tuning.meetTimeoutMs);
     }
 
     private void meetStep(long now) {
+        if (callChatOpening) {
+            callChatOpeningStep(now);
+            return;
+        }
         CuriosityPort.MatchAnswer a = meetLines ? port.linesAnswer() : port.matchAnswer();
         if (a == null) {
             if (now < meetDeadline) {
@@ -2909,11 +5710,80 @@ final class ExploreBrain {
      * the lines it speaks with port.lines().
      */
     private void matchAnswered(long now, CuriosityPort.MatchAnswer a) {
+        if ((roamingPick || cuePick) && !callsOwn() && !usableFace(a)) {
+            String why = facelessMeetable(now, a);
+            if (why == null) {
+                phantomPerson(now, a);
+                return;
+            }
+            note("no usable face in the " + (cuePick ? "cue's person box" : "roaming person pick's box") + ", but "
+                    + why + ": meeting them faceless");
+        }
+        if (intent == CuriosityPort.Action.FIND_PERSON && !callsOwn()) {
+            if (!soughtPerson(a)) {
+                // Owner 2026-10-02: someone else, while finding the one asked for: left alone, the search goes on.
+                note("intent: find_person: not the one asked for; carrying on");
+                met.addLast(new Met(port.metId(), now));
+                endCuriosity(now);
+                return;
+            }
+            intentDone(intentTarget == null ? "found someone" : "found the one asked for");
+        }
+        leanInMet |= leanInOpen;
         if (confirmable(a)) {
             enterConfirm(now, a);
             return;
         }
         startAs(now, a);
+    }
+
+    /**
+     * Owner 2026-10-02 (at home, "he doesn't really talk to us"): a roaming or cue pick with no
+     * usable face is still met, facelessly (he asks the name; the face is checked again quietly),
+     * when its box scored at least facelessMeetMinScore or a voice from the person's known side
+     * landed within facelessMeetVoiceMs. Only a faceless NEW answer with a conversation qualifies: a failed
+     * check, or no conversation possible, stays a phantom. Null: a phantom; else why it is met.
+     */
+    private String facelessMeetable(long now, CuriosityPort.MatchAnswer a) {
+        if (a.status != CuriosityPort.MatchAnswer.Status.NEW || !chatPossible(a)) {
+            return null;
+        }
+        if (meetScore >= tuning.facelessMeetMinScore) {
+            return String.format(java.util.Locale.US, "the person box scored %.2f", meetScore);
+        }
+        if (personVoiceAt != NEVER && now - personVoiceAt <= tuning.facelessMeetVoiceMs) {
+            return "a voice from their side " + (now - personVoiceAt) + " ms ago";
+        }
+        return null;
+    }
+
+    /**
+     * The face check gave a usable face (owner 2026-10-01): a match, or a new face that passed
+     * the quality gate. Not one: no face in the person box, a crop rejected as too small, dark
+     * or blurry, one that could not be straightened, the face models not ready (NOT_READY), the
+     * face settings or people store unavailable, or a failed or timed-out check.
+     */
+    private static boolean usableFace(CuriosityPort.MatchAnswer a) {
+        return a.status == CuriosityPort.MatchAnswer.Status.KNOWN
+                || a.status == CuriosityPort.MatchAnswer.Status.NEW && !a.faceless;
+    }
+
+    /**
+     * A roaming person pick with no usable face (robot 2026-09-30: motion blur scored person
+     * about 0.5 while roaming; 2026-10-01: a chair's edge and the shadow under a desk scored
+     * 0.53-0.54, and a box that stays is no proof, since furniture stays too). Owner: "If he's
+     * not positive that it's a person, why is he acting like it is a person?" The meeting is
+     * dropped with nothing said, roaming person picks are ignored for phantomPersonCooldownMs,
+     * and he roams on. A call's meeting is never dropped: someone asked for him.
+     */
+    private void phantomPerson(long now, CuriosityPort.MatchAnswer a) {
+        phantomsIgnoredUntil = now + tuning.phantomPersonCooldownMs;
+        String why = a.status == CuriosityPort.MatchAnswer.Status.FAILED ? "the face check failed"
+                : a.band == FaceMatcher.Band.NOT_READY ? "the face models are not ready" : "no face, or one rejected";
+        note("no usable face in the " + (cuePick ? "cue's person box" : "roaming person pick's box") + " (" + why
+                + "): not meeting them; roaming on, roaming people ignored for " + tuning.phantomPersonCooldownMs
+                + " ms");
+        endCuriosity(now);
     }
 
     /**
@@ -3015,14 +5885,35 @@ final class ExploreBrain {
         stopMotors();
         state = State.LISTEN;
         meetDeadline = now + tuning.listenMs + tuning.listenMarginMs;
+        meetListenAt = now;
+        answerHeld = false;
         note("listening for a reply");
         port.listen(tuning.listenMs);
+    }
+
+    /**
+     * A meeting listen's deadline passed with nothing heard (robot 2026-10-01): true, once
+     * per listen, when the answer has started (the launcher's "answering"), so the caller
+     * moves the deadline to tuning.answerHoldMs from the listen's start; the words come at
+     * the answer's end. False for a silent listen and under an older launcher: as before.
+     */
+    private boolean holdForAnswer() {
+        if (answerHeld || !port.answering()) {
+            return false;
+        }
+        answerHeld = true;
+        note("an answer has started: the listen holds for it up to " + tuning.answerHoldMs + " ms from its start");
+        return true;
     }
 
     /** LISTEN: nothing heard stores nothing (R12); words go on to the name. */
     private void listenStep(long now) {
         CuriosityPort.Heard h = port.heard();
         if (h == null) {
+            if (now >= meetDeadline && holdForAnswer()) {
+                meetDeadline = meetListenAt + tuning.answerHoldMs + tuning.listenMarginMs;
+                return;
+            }
             if (now >= meetDeadline) {
                 note("no answer from listening in time; carrying on");
                 finishPick(now);
@@ -3168,6 +6059,8 @@ final class ExploreBrain {
         if (port.sayFinished() || now >= sayUntil) {
             idStep = IdStep.LISTENING;
             idDeadline = now + tuning.listenMs + tuning.listenMarginMs;
+            meetListenAt = now;
+            answerHeld = false;
             show(EyeState.LISTENING, null);
             port.listen(tuning.listenMs);
         }
@@ -3176,6 +6069,9 @@ final class ExploreBrain {
     /** The one listen: silence counts as no (R21); words go to AnswerParser (KTD9). */
     private void answerStep(long now) {
         CuriosityPort.Heard h = port.heard();
+        if (h == null && now >= idDeadline && holdForAnswer()) {
+            idDeadline = meetListenAt + tuning.answerHoldMs + tuning.listenMarginMs;
+        }
         if (h == null && now < idDeadline) {
             return;
         }
@@ -3416,6 +6312,16 @@ final class ExploreBrain {
         say(now, line, State.SPEAK);
     }
 
+    /** SPEAK, for a stop's remark: counted once it is handed to the speech service (countRemark). */
+    private void speakRemark(long now, String line) {
+        if (pick != null && pick.kind != null && !pick.kind.isLiving()) {
+            rememberSaid(line);
+        }
+        queueLine(now, line, State.SPEAK);
+        remarkQueued = true;
+        lineStarted(now);
+    }
+
     private void say(long now, String line, State s) {
         queueLine(now, line, s);
         lineStarted(now);
@@ -3431,6 +6337,7 @@ final class ExploreBrain {
         syncCamera();
         stareAtPick();
         pendingLine = line;
+        remarkQueued = false;
         quietUntil = now + tuning.quietWaitMs;
     }
 
@@ -3440,6 +6347,20 @@ final class ExploreBrain {
         String line = pendingLine;
         pendingLine = null;
         port.say(line);
+        if (remarkQueued) {
+            remarkQueued = false;
+            countRemark(now);
+        }
+    }
+
+    /** A stop's remark handed to the speech service: counted, with the running rate logged. */
+    private void countRemark(long now) {
+        gauges.count(Gauges.Counter.REMARKS);
+        remarkTimes.addLast(now);
+        while (now - remarkTimes.peekFirst() > REMARK_WINDOW_MS) {
+            remarkTimes.pollFirst();
+        }
+        note("remarks in the last 10 min: " + remarkTimes.size());
     }
 
     /**
@@ -3470,7 +6391,7 @@ final class ExploreBrain {
                         + met.size() + " met recently)");
             }
         } else {
-            seen.add(pick.box.label);
+            markSeen(pick.box.label);
         }
         endCuriosity(now);
     }
@@ -3556,9 +6477,37 @@ final class ExploreBrain {
 
     /** A roaming, escape or curiosity turn that would not turn: stop at once, and he is wedged. */
     private void turnWouldNotTurn(long now) {
+        if (state == State.CUE_TURN && callsOwn() && Math.abs(compass.turned()) < tuning.callBlockedTurnDeg) {
+            callBlockedTurns++;
+            note("the call's search turn would not turn (" + callBlockedTurns + " of " + tuning.callBlockedTurnsMax
+                    + (callBlockedTurns >= tuning.callBlockedTurnsMax ? "): meeting the caller where he is" : ")"));
+        }
         stopMotors();
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(turnDeg)
                 + " deg in " + (now - turnStartedAt) + " ms");
+        if (state == State.TURN && zeroTurn() && recoverCount < recoverCap()) {
+            // Robot 16:42:39: within a stuck spell, a turn reading 0 deg and no counts is a fresh
+            // cutout, even after a recovery: it waits again (up to recoverMaxPerSpell). Robot
+            // 2026-10-02 09:21:58: so is the first one, with no stall before it; it went to the
+            // escape ladder, whose moves all read zero inside the cutout, and he rested jammed.
+            stampStall(now);
+        }
+        if (state == State.TURN && zeroTurn() && recoverDue(now)) {
+            // Review P3: the zero turn is fresh evidence the board is latched now: the wait
+            // runs from it, not from an older stall or bump stamp whose early probes are past.
+            stampStall(now);
+            if (recoverCount > 0) {
+                // After the board came back: a cutout or a side blocked for real; either way try
+                // the other side next (cleared on a clean drive-off).
+                blockSide(heading);
+            }
+            turnRetrying = false;
+            if (escapeDir == null) {
+                escapeDir = heading;
+            }
+            enterRecover(now, false, "a turn that would not turn");
+            return;
+        }
         blockSide(heading);
         if (state == State.TURN && !turnRetrying && tuning.blockedTurnBackTicks > 0
                 && !planner.hasLegToBackAlong(compass.legs(), compass.degrees())) {
@@ -3577,6 +6526,7 @@ final class ExploreBrain {
         leaveStopForHazard();
         wedgeTurnDir = heading;
         wedgeTurnDeg = turnDeg;
+        wedgeTurnTurned = measured ? Math.abs(compass.turned()) : Double.NaN;
         wedged(now, "a turn that would not turn", true);
     }
 
@@ -3586,6 +6536,9 @@ final class ExploreBrain {
         int ticks = tuning.blockedTurnBackTicks;
         state = State.BACK_OFF;
         backForTurn = true;
+        // Review P2-1: a wait left over from an earlier back-up (a lease drop inside it)
+        // would skip this one's stall check and its wait.
+        retryWaiting = false;
         ticksLeft = ticks - 1;
         nextTickAt = now + tuning.backTickMs;
         phaseUntil = now + ticks * tuning.backTickMs;
@@ -3593,7 +6546,7 @@ final class ExploreBrain {
         lastWheels = null;
         wheelMoves.clear();
         moving = true;
-        motor.backTick();
+        backTick();
         // Not logged as a leg: a retrace of it would only drive him back into the spot
         // it freed him from (and call that a clean escape).
     }
@@ -3612,12 +6565,18 @@ final class ExploreBrain {
         if (!Double.isNaN(doorway)) {
             note("wedged: the doorway at " + Math.round(doorway) + " deg is forgotten");
             forgetDoorway();
+            seekDoorway = Double.NaN; // review P2-4: no later seek trusts it
         }
         hopNext = false;
         plannedTicks = -1;
         lookForLeg = false;
         if (!compass.usable(now)) {
             enterCornered(now);
+            return;
+        }
+        if (jammed) {
+            note("still jammed: " + why + "; no escape, resting");
+            jamRest(now);
             return;
         }
         if (failedLadders > 0 && now - restEndedAt <= tuning.pinnedWindowMs) {
@@ -3651,8 +6610,27 @@ final class ExploreBrain {
     private void startLadder(long now, String why, boolean turnBlocked) {
         note("wedged: " + why + " (" + hazardTimes.size() + " hazards, " + stallStreak + " stalls, "
                 + failedLadders + " failed escapes in a row); escaping");
+        escapeStart(now, "wedged");
+        beginLadder(now, turnBlocked);
+        escapePhase(now);
+    }
+
+    /** The ladder's state for a new escape, at its first step (RETRACE), not yet entered. */
+    private void beginLadder(long now, boolean turnBlocked) {
+        escForwardFirstTried = false;
+        jamForwardTried = false;
+        endSeek(now, false, "an escape");
+        boxedLadder = false;
         hazardTimes.clear();
         escapeFailures.clear();
+        jamBackStalled = false;
+        jamBlockedWays.clear();
+        escBlockedRun = 0;
+        if (turnBlocked && wedgeTurnDir != null && wedgeTurnTurned < tuning.jamTurnDeg) {
+            jamBlockedWays.add(wedgeTurnDir);
+        }
+        wedgeTurnTurned = Double.NaN;
+        escTurnNotBefore = 0;
         planner.begin(now, compass.degrees());
         escDroveForward = false;
         escBackOutFirst = turnBlocked;
@@ -3662,7 +6640,272 @@ final class ExploreBrain {
         escRetryDeg = wedgeTurnDeg;
         escShortBack = false;
         circleDir = unblocked(escapeSide != null ? escapeSide : Direction.LEFT);
-        escapePhase(now);
+    }
+
+    // ---- look around (robot 2026-10-01 15:55) ----
+
+    /** Everything in view reads closed: the look-around begins with this look, turning d first. */
+    private void startAround(long now, Look look, Direction d) {
+        around = new ArrayList<double[]>();
+        aroundDir = d;
+        aroundDoor = Double.NaN;
+        note("everything ahead closed: looking around (" + tuning.lookAroundLooks + " looks)");
+        aroundLook(now, look);
+    }
+
+    /** One look of the look-around (null: none came in time): read it, then step on, or end. */
+    private void aroundLook(long now, Look look) {
+        int k = around.size() + 1;
+        float open = -1f;
+        Openness.Profile profile = open(now, look);
+        if (look != null && steer.confident(profile) && compass.usable(now)) {
+            double at = compass.degrees();
+            open = steer.mostOpen(profile);
+            around.add(new double[]{at, open, Heading.wrap(at + steer.mostOpenBearing(profile))});
+            if (!Double.isNaN(doorway) && Double.isNaN(aroundDoor)) {
+                double b = steer.openBandNear(look.openness, Heading.delta(at, doorway), tuning.doorwayFacingDeg);
+                if (!Double.isNaN(b)) {
+                    aroundDoor = Heading.wrap(at + b);
+                }
+            }
+            note("look-around look " + k + " of " + tuning.lookAroundLooks + " at " + Math.round(at) + " deg: open "
+                    + String.format(java.util.Locale.US, "%.2f", open));
+        } else {
+            around.add(new double[]{Double.NaN, -1, Double.NaN});
+            note("look-around look " + k + " of " + tuning.lookAroundLooks + ": no usable look");
+        }
+        boolean stale = false;
+        if (open >= tuning.lookAroundOpen) {
+            // Open, but ground he has just covered (the steer's own staleness): look on for newer.
+            RoamSteer.Novelty nov = novelty(now, look);
+            double v = nov == null ? Double.NaN : nov.at(steer.mostOpenBearing(profile));
+            stale = !Double.isNaN(v) && v <= tuning.coverageStaleNovelty;
+        }
+        if ((open >= tuning.lookAroundOpen && !stale) || around.size() >= tuning.lookAroundLooks) {
+            endAround(now, look);
+            return;
+        }
+        // The next step, the same way round (the unblocked way, if that side is blocked).
+        aroundDir = unblocked(aroundDir);
+        plannedTicks = 0;
+        lastHazardSide = null;
+        double deg = tuning.lookAroundStepDeg;
+        enterLook(now, aroundDir, false, timedMs(deg), compass.usable(now) ? deg : 0);
+    }
+
+    /**
+     * Review P2-5: a new look-around only lookAroundCooldownMs after the last one ended,
+     * or once he has driven lookAroundCooldownCounts since (a new place, a new view).
+     */
+    private boolean aroundAllowed(long now) {
+        return aroundEndedAt == NEVER || now - aroundEndedAt >= tuning.lookAroundCooldownMs
+                || forwardCounts - aroundEndedCounts >= tuning.lookAroundCooldownCounts;
+    }
+
+    /** The look-around is over: boxed in when it found nothing open all round, else face its most open heading. */
+    private void endAround(long now, Look look) {
+        List<double[]> looks = around;
+        around = null;
+        aroundEndedAt = now;
+        aroundEndedCounts = forwardCounts;
+        double[] best = null;
+        for (double[] l : looks) {
+            if (!Double.isNaN(l[2]) && (best == null || l[1] > best[1])) {
+                best = l;
+            }
+        }
+        RoamSteer.Novelty nov = best == null || best[1] <= tuning.steerBlocked ? null : novelty(now, null);
+        if (nov != null) {
+            // Of the looks reading open, the one facing the newest ground by the steer's own
+            // weighting (coverageWeight), so the look-around still favours somewhere new.
+            double facing = compass.degrees();
+            double bestScore = Double.NEGATIVE_INFINITY;
+            for (double[] l : looks) {
+                if (Double.isNaN(l[2]) || l[1] <= tuning.steerBlocked) {
+                    continue;
+                }
+                double v = nov.at(Heading.delta(facing, l[2]));
+                double score = l[1] + (Double.isNaN(v) ? 0 : tuning.coverageWeight * v);
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = l;
+                }
+            }
+        }
+        double door = aroundDoor;
+        aroundDoor = Double.NaN;
+        String of = looks.size() + " of " + tuning.lookAroundLooks + " looks";
+        if (best == null) {
+            note("looked around: no usable look (" + of + ")");
+            return;
+        }
+        float mostOpen = -1f;
+        for (double[] l : looks) {
+            mostOpen = Math.max(mostOpen, (float) l[1]);
+        }
+        if (Double.isNaN(door) && mostOpen < tuning.lookAroundOpen && reportedDoorwayRecent(now)
+                && !hazardToward(now, doorwayReported) && compass.usable(now)) {
+            // Robot 2026-10-01 16:35: every look read 0.38 or less on open carpet. Claude's
+            // doorway is trusted over the camera: face it and take a short leg, not boxed in.
+            note(String.format(java.util.Locale.US, "looked around: nothing open (best open %.2f, %d of %d looks); "
+                            + "Claude reported a doorway at %d deg %d s ago: facing it for a short leg",
+                    mostOpen, looks.size(), tuning.lookAroundLooks, Math.round(doorwayReported),
+                    (now - doorwayReportedAt) / 1000));
+            aroundFaced = false;
+            trustedLeg(now, Heading.delta(compass.degrees(), doorwayReported), true);
+            return;
+        }
+        if (Double.isNaN(door) && best[1] <= tuning.boxedInOpen && looks.size() >= tuning.lookAroundLooks) {
+            aroundFoundNothing = true;
+            boolean boxed = boxedIn(now);
+            aroundFoundNothing = false;
+            if (boxed) {
+                return;
+            }
+        }
+        double face = Double.isNaN(door) ? best[2] : door;
+        note("looked around: " + (Double.isNaN(door) ? "most open at " + Math.round(face) + " deg"
+                : "the doorway at " + Math.round(face) + " deg reads open; most open at " + Math.round(best[2]) + " deg")
+                + " (open " + String.format(java.util.Locale.US, "%.2f", best[1]) + "); " + of);
+        aroundFaced = true;
+        lastHazardSide = null;
+        double bearing = compass.usable(now) ? Heading.delta(compass.degrees(), face) : 0;
+        if (Math.abs(bearing) < tuning.turnToleranceDeg) {
+            // Facing it already: a normal leg from this look.
+            chooseLeg(now, look);
+            return;
+        }
+        // Face it, then look again from there: that look plans the normal leg.
+        plannedTicks = 0;
+        Direction d = bearing > 0 ? Direction.LEFT : Direction.RIGHT;
+        double deg = Math.abs(bearing);
+        if (unblocked(d) != d) {
+            d = d.opposite();
+            deg = 360 - deg;
+        }
+        enterLook(now, d, false, timedMs(deg), deg);
+    }
+
+    /** A look-around (or its facing turn) cut short by anything but its own turns and pauses. */
+    private void aroundStep() {
+        if (around == null && !aroundFaced) {
+            return;
+        }
+        boolean roaming = state == State.PAUSE || state == State.LOOK || state == State.TURN;
+        if (roaming && !escape) {
+            return;
+        }
+        if (around != null) {
+            note("look-around dropped: " + state + (escape ? " (an escape turn)" : ""));
+        }
+        around = null;
+        aroundDoor = Double.NaN;
+        aroundFaced = false;
+    }
+
+    /**
+     * A forward refusal by the controller (a CPL hiccup or hazard): boxedInRefusals in
+     * boxedInWindowMs is boxed in. Review P2-3: a hiccup and CPL again on its retry (at
+     * its start or within cplRetryWindowMs, before cplRetryUntil) are one episode and count
+     * once: hazard is true for a CPL hazard, which inside that episode adds nothing.
+     */
+    private void recordRefusal(long now, boolean hazard) {
+        if (hazard && now < cplRetryUntil) {
+            return;
+        }
+        cplRefusals.addLast(now);
+        while (!cplRefusals.isEmpty() && now - cplRefusals.peekFirst() > tuning.boxedInWindowMs) {
+            cplRefusals.pollFirst();
+        }
+    }
+
+    /**
+     * Boxed in (robot 2026-10-01: under a desk for minutes, turns working, forward refused,
+     * the steer reading "open 0.00"): at a leg decision in PAUSE, boxedInRefusals forward
+     * refusals within boxedInWindowMs, or a full look-around that found no heading open
+     * over boxedInOpen (robot 15:55: closed looks one way only are not enough). He leaves the way he came: the ladder's retrace move, facing the
+     * reverse of his last clean forward leg and driving its length back. Refused, the
+     * ladder goes on (circle, way out, drive off). Never with the heading unusable, while
+     * jammed, or with an escape under way. True when the retrace has started.
+     */
+    private boolean boxedIn(long now) {
+        while (!cplRefusals.isEmpty() && now - cplRefusals.peekFirst() > tuning.boxedInWindowMs) {
+            cplRefusals.pollFirst();
+        }
+        boolean refused = tuning.boxedInRefusals > 0 && cplRefusals.size() >= tuning.boxedInRefusals;
+        boolean closed = tuning.boxedInLookAround && aroundFoundNothing;
+        if (hopNext && now < cplRetryUntil) {
+            // Review P2-3: a CPL hiccup's retry is due: it drives first (a hiccup is not a hazard).
+            return false;
+        }
+        if (!(refused || closed) || state != State.PAUSE || !compass.usable(now) || jammed || planner.active()) {
+            return false;
+        }
+        String why = refused
+                ? cplRefusals.size() + " forward refusals in " + Math.round((now - cplRefusals.peekFirst()) / 1000.0) + " s"
+                : "a full look-around found no heading with open over " + tuning.boxedInOpen;
+        cplRefusals.clear();
+        aroundFoundNothing = false;
+        boolean way = !Double.isNaN(inHeading);
+        double exit = way ? Heading.wrap(inHeading + 180) : Double.NaN;
+        note("boxed in: " + why + (way ? "; leaving the way he came (facing " + Math.round(exit) + " deg)"
+                : "; no way in logged: escaping"));
+        endSeek(now, false, "boxed in");
+        if (!Double.isNaN(doorway)) {
+            forgetDoorway();
+            seekDoorway = Double.NaN; // review P2-4: no later seek trusts it
+        }
+        Look look = camera.latest();
+        leaveBy(now, exit, inCounts, true, look == null ? null : look.place);
+        return true;
+    }
+
+    /**
+     * Leaving along exit (NaN: the escape ladder from its first step instead): straight to
+     * the ladder's retrace move, facing exit and driving up to counts (at most the retrace
+     * distance), with no blind back-up or back-out first. Boxed in, that one move frees him
+     * and the view there (print) is marked sought; else (the bathroom) the retrace goes on
+     * along the leg log. Refused, the ladder goes on (circle, way out, drive off).
+     */
+    private void leaveBy(long now, double exit, long counts, boolean boxed, PlaceMemory.Print print) {
+        stopMotors();
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        doorwayLeg = false;
+        steerWaitUntil = NO_WAIT;
+        escapeStart(now, boxed ? "boxed" : bathroom ? "bathroom" : "leave");
+        beginLadder(now, false);
+        boxedLadder = boxed;
+        boxedPrint = boxed ? print : null;
+        boxedExit = boxed ? exit : Double.NaN;
+        if (Double.isNaN(exit)) {
+            escapePhase(now);
+            return;
+        }
+        escBackUpFirst = false;
+        escBackOutFirst = false;
+        state = State.RETRACE;
+        show(EyeState.IDLE, null);
+        EscapePlanner.Move m = new EscapePlanner.Move(exit, Math.min(counts, tuning.escapeRetraceCounts));
+        note("retrace: facing " + m);
+        planner.tried(m.heading);
+        escGoal = m.counts;
+        escTurnTo(now, m.heading, EscThen.DRIVE);
+    }
+
+    /** Out of a boxed-in spot: the view there is where a seek went, and the way back under is avoided a while. */
+    private void leftBox(long now) {
+        boxedLadder = false;
+        places.markSought(boxedPrint, now);
+        boxedPrint = null;
+        if (Double.isNaN(boxedExit) || tuning.boxedAvoidMs <= 0) {
+            return;
+        }
+        boxedAvoidHeading = Heading.wrap(boxedExit + 180);
+        boxedAvoidUntil = now + tuning.boxedAvoidMs;
+        note("boxed in: out; the way back under (" + Math.round(boxedAvoidHeading) + " deg) avoided for "
+                + tuning.boxedAvoidMs / 1000 + " s");
     }
 
     /** Enters the planner's current step. */
@@ -3671,6 +6914,15 @@ final class ExploreBrain {
             case RETRACE:
                 state = State.RETRACE;
                 show(EyeState.IDLE, null);
+                if (escBackUpFirst && !escForwardFirstTried && preferForward(now)) {
+                    // Robot 2026-10-03: behind is blocked (the wall he backed into): forward first;
+                    // blocked, the step restarts and backs up as before.
+                    escForwardFirstTried = true;
+                    if (tryForwardFirst(now, "behind is blocked (" + behindWhy + "), so forward before backing up",
+                            false, ProbeThen.STEP)) {
+                        return;
+                    }
+                }
                 if (escBackUpFirst) {
                     // Straight back first, blind and bounded like a blocked turn's back-up
                     // (its time, the stall watch), not logged as a leg.
@@ -3714,8 +6966,9 @@ final class ExploreBrain {
                 break;
             case SECOND_ASK:
                 state = State.WAY_OUT;
-                if (!port.canAsk() || !cameraWanted(now)) {
-                    note("no second way-out ask: " + (port.canAsk() ? "no camera" : "Claude unreachable"));
+                if (!canAsk() || !cameraWanted(now) || !lookBudgetLeft(now)) {
+                    note("no second way-out ask: " + (!canAsk() ? "Claude unreachable or paused"
+                            : !cameraWanted(now) ? "no camera" : "Claude look budget spent"));
                     planner.next(now);
                     escapePhase(now);
                     return;
@@ -3753,6 +7006,11 @@ final class ExploreBrain {
 
     /** Each tick of an escape step: its budget, then what it is doing. */
     private void escapeTick(long now, boolean fresh, boolean hazard) {
+        if (wriggling) {
+            // Turning in place, blind to hazards like the escape's own turns.
+            wriggleStep(now, fresh);
+            return;
+        }
         if (probing) {
             probeStep(now, fresh, hazard);
             return;
@@ -3798,11 +7056,12 @@ final class ExploreBrain {
                 break;
             case TURN_READY:
                 // Turning in place is how he gets out: a hazard in view doesn't stop it.
-                if (fresh) {
+                if (fresh && now >= escTurnNotBefore) {
+                    escTurnNotBefore = 0;
                     heading = escDir;
                     turnDeg = escTurnAmount;
                     moving = true;
-                    motor.turn(escDir);
+                    turnWheels(escDir);
                     turnStartedAt = now;
                     phaseUntil = now + timedMs(escTurnAmount);
                     measureTurn(now, escTurnAmount);
@@ -3839,7 +7098,7 @@ final class ExploreBrain {
                 escTicks = 1;
                 nextTickAt = now + tuning.hopTickMs;
                 esc = Esc.DRIVING;
-                motor.hopTick();
+                hopTick();
                 compass.startLeg(false, now);
                 break;
             case DRIVING:
@@ -3852,7 +7111,7 @@ final class ExploreBrain {
                             : escGoal > 0 ? tuning.backOutMaxMs : tuning.backTicks * tuning.backTickMs);
                     nextTickAt = now + tuning.backTickMs;
                     esc = Esc.BACKING;
-                    motor.backTick();
+                    backTick();
                     if (!escShortBack) {
                         // The short back-up is not a leg (see startShortBack).
                         compass.startLeg(true, now);
@@ -3957,6 +7216,9 @@ final class ExploreBrain {
             if (escFirstRetry) {
                 escFirstRetry = false;
                 escapeFreed(now, "backed up, turned and drove off");
+            } else if (planner.phase() == EscapePlanner.Phase.RETRACE && boxedLadder) {
+                planner.addRetraced(escMoved);
+                escapeFreed(now, "left the way he came: " + escMoved + " counts", true);
             } else if (planner.phase() == EscapePlanner.Phase.RETRACE) {
                 planner.addRetraced(escMoved);
                 escWait(now, EscThen.RETRACE_NEXT);
@@ -3966,7 +7228,7 @@ final class ExploreBrain {
         } else if (now >= nextTickAt) {
             escTicks++;
             nextTickAt += tuning.hopTickMs;
-            motor.hopTick();
+            hopTick();
         }
     }
 
@@ -3985,6 +7247,18 @@ final class ExploreBrain {
         boolean stalled = (escGoal > 0 || escShortBack) && wheelsStalled(now);
         if (reached || stalled || now >= escUntil) {
             stopMotors();
+            if (!reached && escFrom != null && escMoved < BACK_FREE_COUNTS) {
+                behindBlocked(now, "a back-up moved " + escMoved + " counts");
+            }
+            if (!reached && escFrom != null && escMoved < tuning.stallMinCounts) {
+                stampStall(now);
+                if (recoverDue(now)) {
+                    note("back-up went nowhere (" + escMoved + " counts)");
+                    enterRecover(now, true, "the back-up went nowhere");
+                    return;
+                }
+                jamBackStalled = true;
+            }
             if (escShortBack) {
                 escShortBack = false;
                 escGoal = escGoalAfterRetry;
@@ -3998,11 +7272,15 @@ final class ExploreBrain {
                     note("backed out " + escMoved + " counts");
                 }
             }
+            if (jamCheck(now)) {
+                return;
+            }
             if (escThen == EscThen.FIRST_BACK) {
                 afterFirstBack(now, escMoved >= tuning.stallMinCounts);
             } else if (escThen == EscThen.RETRY_TURN) {
                 escThen = escThenAfterRetry;
                 flipEscTurn(now);
+                escWaitBeforeTurn(now);
                 if (planner.phase() == EscapePlanner.Phase.RETRACE && !Double.isNaN(escTarget)
                         && escTurnAmount > tuning.retraceLongWayMaxDeg) {
                     escFailed(now, "the other way round is " + Math.round(escTurnAmount) + " deg");
@@ -4016,7 +7294,7 @@ final class ExploreBrain {
             }
         } else if (now >= nextTickAt) {
             nextTickAt += tuning.backTickMs;
-            motor.backTick();
+            backTick();
         }
     }
 
@@ -4044,6 +7322,7 @@ final class ExploreBrain {
             escFirstRetry = true;
             escGoal = 0;
             escTurnBy(d, deg, EscThen.DRIVE);
+            escWaitBeforeTurn(now);
             return;
         }
         if (tryForwardFirst(now, "after backing up", false, ProbeThen.STEP)) {
@@ -4138,6 +7417,7 @@ final class ExploreBrain {
     }
 
     private void escAfterTurn(long now) {
+        escBlockedRun = 0;
         if (escThen == EscThen.LOOK) {
             escLook(now);
         } else {
@@ -4149,7 +7429,34 @@ final class ExploreBrain {
     private void escTurnBlocked(long now) {
         note("measured turn blocked: turned " + Math.round(compass.turned()) + " of " + Math.round(escTurnAmount)
                 + " deg in " + (now - turnStartedAt) + " ms (" + escDir + ")");
+        boolean nowhere = measured && Math.abs(compass.turned()) < tuning.jamTurnDeg;
+        if (nowhere && zeroTurn() && recoverCount > 0 && recoverCount < recoverCap()) {
+            stampStall(now);
+        }
+        if (nowhere && zeroTurn() && recoverDue(now)) {
+            stampStall(now); // review P3: the wait runs from this zero turn, as above
+            if (recoverCount > 0) {
+                blockSide(escDir);
+            }
+            stopMotors();
+            enterRecover(now, true, "an escape turn that would not turn");
+            return;
+        }
         blockSide(escDir);
+        if (nowhere) {
+            jamBlockedWays.add(escDir);
+        }
+        if (jamCheck(now)) {
+            return;
+        }
+        escBlockedRun = nowhere ? escBlockedRun + 1 : 0;
+        if (escBlockedRun >= 2 && wriggleAllowed(now)) {
+            // Robot 2026-10-01: short turns that read "turned 0" give up before a wedged
+            // robot works loose; one long wriggle before the ladder grinds on.
+            endEscapeForJam();
+            startWriggle(now, "escape turns blocked twice in a row");
+            return;
+        }
         if (escFirstRetry) {
             firstRetryFailed(now, "a turn that would not turn");
             return;
@@ -4178,6 +7485,18 @@ final class ExploreBrain {
             }
         }
         escFailed(now, "a turn that would not turn");
+    }
+
+    /**
+     * A blocked turn's back-up is over: the other way waits blockedTurnWaitMs (robot 15:19:
+     * the blocked turn re-armed the cutout); the step's budget waits with him (budgetWaits).
+     */
+    private void escWaitBeforeTurn(long now) {
+        if (tuning.blockedTurnWaitMs <= 0) {
+            return;
+        }
+        escTurnNotBefore = now + tuning.blockedTurnWaitMs;
+        note("backed up: waiting " + tuning.blockedTurnWaitMs + " ms before the turn");
     }
 
     /** What follows a turn retried after a back-out. */
@@ -4279,7 +7598,7 @@ final class ExploreBrain {
         }
         double at = compass.degrees();
         if (planner.phase() == EscapePlanner.Phase.CIRCLE) {
-            planner.addLook(at, look.openness, look.jpeg);
+            planner.addLook(at, open(now, look), look.jpeg);
             note("circle look " + planner.looks() + " of " + tuning.escapeCircleSteps + " at " + Math.round(at) + " deg");
             if (planner.circleDone()) {
                 planner.next(now);
@@ -4302,14 +7621,15 @@ final class ExploreBrain {
     /** Claude's way out from escAsked (the circle's frames, or the second ask's one), within the step's budget. */
     private void askWayOut(long now) {
         boolean second = planner.phase() == EscapePlanner.Phase.SECOND_ASK;
-        if (escAsked.isEmpty() || !port.canAsk()) {
-            note("no way-out ask (" + escAsked.size() + " frames, Claude " + (port.canAsk() ? "set up" : "unreachable")
-                    + ")");
+        if (escAsked.isEmpty() || !canAsk() || !lookBudgetLeft(now)) {
+            note("no way-out ask (" + escAsked.size() + " frames, Claude " + (!canAsk() ? "unreachable or paused"
+                    : lookBudgetLeft(now) ? "set up" : "look budget spent") + ")");
             wayOutFailed(now);
             return;
         }
         show(EyeState.THINKING, null);
         note("asking Claude the way out (" + escAsked.size() + " frames" + (second ? ", second ask" : "") + ")");
+        spendLook(now);
         port.wayOut(new CuriosityPort.WayOutRequest(new ArrayList<CuriosityPort.Frame>(escAsked), second),
                 Math.max(1, planner.stepUntil() - now));
         wayOutAsking = true;
@@ -4394,6 +7714,10 @@ final class ExploreBrain {
         if (esc == Esc.TURNING && measured && compass.usable(now)) {
             return true;
         }
+        if (esc == Esc.TURN_READY && escTurnNotBefore > 0) {
+            // Waiting after a blocked turn's back-up (blockedTurnWaitMs), until that turn starts.
+            return true;
+        }
         EscapePlanner.Phase p = planner.phase();
         return (p == EscapePlanner.Phase.DRIVE_OFF || p == EscapePlanner.Phase.SECOND_DRIVE_OFF)
                 && (esc == Esc.DRIVE_READY || esc == Esc.DRIVING);
@@ -4404,6 +7728,7 @@ final class ExploreBrain {
     /** A forward drive hit a hazard or stalled facing this way. */
     private void aheadBlocked() {
         blockedAheadAt = compass.usable(clock.nowMs()) ? compass.degrees() : Double.NaN;
+        frontBlocked(clock.nowMs());
     }
 
     /**
@@ -4453,7 +7778,7 @@ final class ExploreBrain {
                 escTicks = 1;
                 nextTickAt = now + tuning.hopTickMs;
                 esc = Esc.DRIVING;
-                motor.hopTick();
+                hopTick();
                 compass.startLeg(false, now);
                 break;
             case DRIVING: {
@@ -4476,7 +7801,7 @@ final class ExploreBrain {
                 } else if (now >= nextTickAt) {
                     escTicks++;
                     nextTickAt += tuning.hopTickMs;
-                    motor.hopTick();
+                    hopTick();
                 }
                 break;
             }
@@ -4486,7 +7811,7 @@ final class ExploreBrain {
                     escUntil = now + tuning.backTicks * tuning.backTickMs;
                     nextTickAt = now + tuning.backTickMs;
                     esc = Esc.BACKING;
-                    motor.backTick();
+                    backTick();
                     compass.startLeg(true, now);
                 }
                 break;
@@ -4496,7 +7821,7 @@ final class ExploreBrain {
                     probeDone(now);
                 } else if (now >= nextTickAt) {
                     nextTickAt += tuning.backTickMs;
-                    motor.backTick();
+                    backTick();
                 }
                 break;
             default:
@@ -4523,7 +7848,11 @@ final class ExploreBrain {
         probing = false;
         probeThen = null;
         esc = null;
-        if (then == ProbeThen.STEP) {
+        if (then == ProbeThen.BACK_OUT) {
+            // Robot 2026-10-03: forward was blocked too; the straight back-out, as before.
+            state = State.PAUSE;
+            startBackOff(now);
+        } else if (then == ProbeThen.STEP) {
             planner.restartStep(now);
             escapePhase(now);
         } else if (then == ProbeThen.REST) {
@@ -4545,7 +7874,14 @@ final class ExploreBrain {
      */
     private void escapeFreed(long now, String how, boolean droveForward) {
         stopMotors();
+        blockedWaysForgotten();
         note("free after " + (now - (planner.active() ? planner.startedAt() : probeSince)) + " ms: " + how);
+        escapeEnd(now, "freed");
+        if (boxedLadder) {
+            leftBox(now);
+        }
+        jammed = false;
+        recoverDone();
         if (droveForward) {
             blockedSides.clear();
         }
@@ -4611,7 +7947,7 @@ final class ExploreBrain {
      */
     private void askDoorway(long now) {
         if (!(state == State.PAUSE || state == State.HOP) || lookForLeg || escape || !cameraOpen
-                || !compass.usable(now) || !port.canAsk()) {
+                || !compass.usable(now) || !canAsk() || !lookBudgetLeft(now)) {
             return;
         }
         Look look = roamLook(now);
@@ -4622,6 +7958,7 @@ final class ExploreBrain {
         doorwayAskAt = now;
         doorwayAsking = true;
         note("asking Claude for an open doorway (facing " + Math.round(doorwayAskFacing) + " deg)");
+        spendLook(now);
         port.doorway(look.jpeg, tuning.doorwayAskTimeoutMs);
     }
 
@@ -4633,6 +7970,14 @@ final class ExploreBrain {
             doorwaySetCounts = forwardCounts;
             doorwayLeg = false;
             note("Claude sees an " + a + ": remembered at " + Math.round(doorway) + " deg");
+            doorwayReported = doorway;
+            doorwayReportedAt = now;
+            seekDoorway = doorway;
+            seekDoorwayAt = now;
+            if (seeking() && !seekToDoor) {
+                // Robot 16:00:24: reported just after Claude's pick; the doorway wins.
+                headForDoorway(now);
+            }
         } else if (a.status == CuriosityPort.Doorway.Status.NONE) {
             note("Claude sees no open doorway");
         } else {
@@ -4658,12 +8003,631 @@ final class ExploreBrain {
         if (Double.isNaN(doorway) || !compass.usable(now)) {
             return Double.NaN;
         }
+        if (bathAvoided(now, doorway)) {
+            note("bathroom: the doorway at " + Math.round(doorway) + " deg leads back toward it: forgotten");
+            forgetBlockedDoorway();
+            return Double.NaN;
+        }
+        if (intentAvoided(now, doorway)) {
+            // An intent's avoided way (owner 2026-10-02): not taken now, still remembered.
+            return Double.NaN;
+        }
         return Heading.delta(compass.degrees(), doorway);
     }
 
     private void forgetDoorway() {
         doorway = Double.NaN;
         doorwayLeg = false;
+    }
+
+    /**
+     * A hazard proved the doorway blocked: forgotten for steering, as reported, and
+     * (review P2-4) for the next seek, which would otherwise trust it and drive back at it.
+     */
+    private void forgetBlockedDoorway() {
+        forgetDoorway();
+        doorwayReported = Double.NaN;
+        seekDoorway = Double.NaN;
+    }
+
+    // ---- seeking the unfamiliar (owner 2026-10-01) ----
+
+    /** A scan's look, for a seek: its heading at capture and how familiar it looked (scored once). */
+    private void seekRecord(long now, Look look) {
+        double novelty = placeNovelty(now, look);
+        seekScan.add(new SeekView(look, captureHeading(now, look), novelty, Double.isNaN(novelty) ? -1 : placeLookAgeMs));
+    }
+
+    /** The heading a look was captured at: the compass less what he has turned since; NaN when not usable. */
+    private double captureHeading(long now, Look look) {
+        if (!compass.usable(now)) {
+            return Double.NaN;
+        }
+        double turned = headingHistory.turnedSince(look.frameMs);
+        return Double.isNaN(turned) ? Double.NaN : Heading.wrap(compass.degrees() - turned);
+    }
+
+    /**
+     * A roaming curiosity stop ended (in PAUSE now, after its remark if it had one): he
+     * seeks, at most once per seekGapMs, when
+     * - the stop found nothing new and its looks were familiar (at least seekMinLooks
+     *   scored, every one seekFamiliarNovelty or less) for the seekFamiliarScans-th stop
+     *   in a row;
+     * - the last seekAreaWindowMs of roaming stayed within a small area (areaTrapped); or
+     * - he has roamed seekEveryMs without a seek.
+     * Live (2026-10-01) the first alone never fired: Claude had a remark at almost every
+     * stop, and the place memory read most views as new.
+     */
+    private void maybeSeek(long now) {
+        if (seeking() || state != State.PAUSE || bathroom) {
+            return;
+        }
+        if (intentSeekDue && compass.usable(now)) {
+            // Owner 2026-10-02: asked to go elsewhere, or to find someone: a seek now, whatever the gap.
+            intentSeekDue = false;
+            seekNo = ++seekCount;
+            seekStartedAt = now;
+            note("seeking: " + intent.word() + " asked for");
+            note("seek#" + seekNo + " start trigger=intent");
+            familiarStops = 0;
+            startSeek(now);
+            return;
+        }
+        String why = null;
+        if (tuning.seekFamiliarScans > 0 && lastStopNothing) {
+            int scored = 0;
+            double most = 0;
+            for (SeekView v : seekScan) {
+                if (!Double.isNaN(v.novelty)) {
+                    scored++;
+                    most = Math.max(most, v.novelty);
+                }
+            }
+            familiarStops = scored >= tuning.seekMinLooks && most <= tuning.seekFamiliarNovelty ? familiarStops + 1 : 0;
+            if (familiarStops >= tuning.seekFamiliarScans) {
+                why = String.format(java.util.Locale.US,
+                        "seeking: surroundings familiar (%d stops in a row, every look's novelty %.2f or less)",
+                        familiarStops, most);
+            }
+        }
+        if (why == null) {
+            int cells = areaTrapped();
+            if (cells >= 0) {
+                why = "seeking: stayed within a small area (" + cells + " cells in " + span(tuning.seekAreaWindowMs) + ")";
+            }
+        }
+        if (why == null && tuning.seekEveryMs > 0 && roamedSinceSeekMs >= tuning.seekEveryMs) {
+            why = "seeking: no seek for " + span(tuning.seekEveryMs);
+        }
+        if (why == null || now < seekNextAt || !compass.usable(now)) {
+            return;
+        }
+        note(why);
+        seekNo = ++seekCount;
+        seekStartedAt = now;
+        note("seek#" + seekNo + " start trigger="
+                + (why.contains("familiar") ? "familiar" : why.contains("small area") ? "area" : "timer"));
+        familiarStops = 0;
+        startSeek(now);
+    }
+
+    /** A duration as whole minutes ("5 min"), or seconds when it is not whole minutes. */
+    private static String span(long ms) {
+        return ms % 60000 == 0 ? (ms / 60000) + " min" : (ms / 1000) + " s";
+    }
+
+    /**
+     * Roaming time since the last step. For seekEveryMs: wandering, pauses, escapes and
+     * roaming curiosity stops (with their remarks), never a meeting, a conversation or a
+     * voice's turn. For the area trail, only the moving part (state.roams()): with coverage
+     * tracking, his dead-reckoned position joins it about once a second.
+     */
+    private void roamClock(long now) {
+        if (roamClockAt >= 0 && now > roamClockAt && leaseHeld
+                && (state.roams() || stopSeekable && !meetingHeld && !state.chats())) {
+            long dt = Math.min(now - roamClockAt, 1000);
+            roamedSinceSeekMs += dt;
+        }
+        if (roamClockAt >= 0 && now > roamClockAt && leaseHeld && state.roams()) {
+            roamedMs += Math.min(now - roamClockAt, 1000);
+            if (coverage.tracking() && (areaTrail.isEmpty() || roamedMs - areaTrail.peekLast()[0] >= 1000)) {
+                areaTrail.addLast(new double[]{roamedMs, coverage.x(), coverage.y()});
+                while (roamedMs - areaTrail.peekFirst()[0] > tuning.seekAreaWindowMs) {
+                    areaTrail.pollFirst();
+                }
+            }
+        }
+        roamClockAt = now;
+    }
+
+    /**
+     * The coverageCellM cells the last seekAreaWindowMs of roaming passed through, when
+     * they span less than seekAreaSpanM along both axes or number seekAreaCells or fewer;
+     * -1 when he got further, the area trigger is off, or the trail does not cover the
+     * whole window yet (dead reckoning not tracking for long enough).
+     */
+    private int areaTrapped() {
+        if (tuning.seekAreaWindowMs <= 0 || areaTrail.isEmpty()
+                || roamedMs - areaTrail.peekFirst()[0] < tuning.seekAreaWindowMs - 2000) {
+            return -1;
+        }
+        double minX = Double.MAX_VALUE, maxX = -Double.MAX_VALUE, minY = Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+        Set<Long> cells = new HashSet<Long>();
+        for (double[] p : areaTrail) {
+            minX = Math.min(minX, p[1]);
+            maxX = Math.max(maxX, p[1]);
+            minY = Math.min(minY, p[2]);
+            maxY = Math.max(maxY, p[2]);
+            long cx = (long) Math.floor(p[1] / tuning.coverageCellM);
+            long cy = (long) Math.floor(p[2] / tuning.coverageCellM);
+            cells.add((cx << 32) ^ (cy & 0xffffffffL));
+        }
+        boolean small = maxX - minX < tuning.seekAreaSpanM && maxY - minY < tuning.seekAreaSpanM;
+        return small || cells.size() <= tuning.seekAreaCells ? cells.size() : -1;
+    }
+
+    /** Ask Claude which of the stop's frames to go to; without Claude, the least familiar one. */
+    private void startSeek(long now) {
+        if (doorwayRecent(now) && hazardToward(now, seekDoorway)) {
+            // Review P2-4: a hazard lies that way now; the seek chooses afresh.
+            note("seeking: the reported doorway at " + Math.round(seekDoorway) + " deg is blocked: not trusted");
+            seekDoorway = Double.NaN;
+        }
+        if (doorwayRecent(now) && intentAvoided(now, seekDoorway)) {
+            // Owner 2026-10-02: a doorway back toward where he was asked to leave is not taken.
+            note("seeking: the reported doorway at " + Math.round(seekDoorway) + " deg leads back that way: not taken");
+            seekDoorway = Double.NaN;
+        }
+        if (doorwayRecent(now)) {
+            headForDoorway(now);
+            return;
+        }
+        seekFrames.clear();
+        List<CuriosityPort.SeekFrame> frames = new ArrayList<CuriosityPort.SeekFrame>();
+        for (SeekView v : seekScan) {
+            if (Double.isNaN(v.heading) || v.look.jpeg == null) {
+                continue;
+            }
+            double from = seekFrames.isEmpty() ? v.heading : seekFrames.get(0).heading;
+            frames.add(new CuriosityPort.SeekFrame(new CuriosityPort.Frame(frames.size(), v.look.jpeg),
+                    Heading.delta(from, v.heading), v.novelty, v.seenAgoMs, places.soughtBefore(v.look.place, now),
+                    labels(v.look)));
+            seekFrames.add(v);
+        }
+        if (!canAsk() || frames.isEmpty()) {
+            seekFallback(now, port.claudePausedMs() > 0 ? "Claude paused" : "no Claude");
+            return;
+        }
+        if (!lookBudgetLeft(now)) {
+            seekFallback(now, "Claude look budget spent");
+            return;
+        }
+        seekAsking = true;
+        seekAskAt = now;
+        show(EyeState.THINKING, null);
+        note("seeking: asking Claude where to go (" + frames.size() + " frames)");
+        spendLook(now);
+        port.seek(new CuriosityPort.SeekRequest(frames), tuning.seekAskTimeoutMs);
+    }
+
+    /**
+     * Each step: the answer to take or give up on, and a seek that something took him
+     * away from (a call, a person, a stop, an escape) ends.
+     */
+    private void seekStep(long now) {
+        if (!seeking()) {
+            return;
+        }
+        if (!state.roams()) {
+            endSeek(now, false, state.cueSearch() ? (callsOwn() ? "a call" : "a voice")
+                    : "interrupted: " + state.name().toLowerCase(java.util.Locale.US));
+            return;
+        }
+        if (!seekAsking) {
+            return;
+        }
+        CuriosityPort.WayOut a = port.seekAnswer();
+        if (a != null) {
+            seekAsking = false;
+            seekAnswered(now, a);
+        } else if (now - seekAskAt >= tuning.seekAskTimeoutMs) {
+            seekAsking = false;
+            port.cancelSeek();
+            seekFallback(now, "no answer from Claude in " + tuning.seekAskTimeoutMs + " ms");
+        }
+    }
+
+    /** Claude's frame and x become the target; none, a failure or where he went last time: the fallback. */
+    private void seekAnswered(long now, CuriosityPort.WayOut a) {
+        if (a.status != CuriosityPort.WayOut.Status.WAY || a.frame < 0 || a.frame >= seekFrames.size()
+                || !(a.x >= -1f && a.x <= 1f)) {
+            seekFallback(now, a.status == CuriosityPort.WayOut.Status.NONE ? "Claude sees nowhere new"
+                    : "Claude's answer failed");
+            return;
+        }
+        SeekView v = seekFrames.get(a.frame);
+        if (places.soughtBefore(v.look.place, now)) {
+            seekFallback(now, "Claude picked where he went last time");
+            return;
+        }
+        aimSeek(now, v, a.x, true, String.format(java.util.Locale.US, "seeking: Claude picked frame %d x %.2f",
+                a.frame + 1, a.x));
+    }
+
+    /**
+     * Without a pick: the stop's least familiar look (by place novelty; plain views and
+     * where his last seek went don't count), aimed at its most open band (straight
+     * ahead when its openness isn't trusted; a look with nothing open is skipped).
+     */
+    private void seekFallback(long now, String why) {
+        SeekView best = null;
+        int bestAt = -1;
+        double bestX = 0;
+        for (int i = 0; i < seekScan.size(); i++) {
+            SeekView v = seekScan.get(i);
+            if (Double.isNaN(v.heading) || Double.isNaN(v.novelty) || places.soughtBefore(v.look.place, now)
+                    || (best != null && v.novelty <= best.novelty)) {
+                continue;
+            }
+            double x = steer.confident(v.look.openness) ? steer.mostOpenX(v.look.openness) : 0;
+            if (Double.isNaN(x)) {
+                continue;
+            }
+            best = v;
+            bestAt = i;
+            bestX = x;
+        }
+        if (best == null) {
+            String over = why + "; no least familiar frame with anything open (" + seekScan.size()
+                    + " looks): nowhere he hasn't been lately";
+            if (seeking()) {
+                endSeek(now, false, over);
+            } else {
+                // The seek ended before it began (robot 15:59:40: NONE, nothing logged, re-asked
+                // 42 s later): still the gap and the seek clock restart.
+                note("seeking: " + over + "; no seek for " + span(tuning.seekGapMs));
+                seekEnd(now, "gave_up");
+                seekClockRestart(now);
+            }
+            return;
+        }
+        aimSeek(now, best, bestX, false, String.format(java.util.Locale.US, "seeking: %s: least familiar frame %d x %.2f",
+                why, bestAt + 1, bestX));
+    }
+
+    /**
+     * The target: the look's heading at capture plus the exact bearing of x in it
+     * (RoamSteer.bearingOf, with the camera's measured pitch); the detector's box
+     * there, if any, is what a re-look re-centres on.
+     */
+    private void aimSeek(long now, SeekView v, double x, boolean trusted, String what) {
+        double bearing = RoamSteer.bearingOf(x, tuning.cameraHalfFovDeg, tuning.cameraPitchDeg);
+        seekTarget = Heading.wrap(v.heading + bearing);
+        seekLabel = boxAt(v.look, x);
+        seekPrint = v.look.place;
+        seekLegs = 0;
+        seekTrustLegs = 0;
+        seekTrusted = trusted;
+        seekDetoured = false;
+        seekFromCounts = forwardCounts;
+        seekTurned = false;
+        seekFrames.clear();
+        note(what + ": heading " + degrees(seekTarget) + " deg (bearing " + Math.round(bearing) + ")"
+                + (seekLabel == null ? "" : ", at a " + seekLabel));
+    }
+
+    /** The label of the detector's box (not a person) spanning x in the look, else null. */
+    private String boxAt(Look look, double x) {
+        if (look.detections == null) {
+            return null;
+        }
+        for (Detection d : look.detections) {
+            if (d.score >= tuning.confidenceFloor && CuriosityPort.Kind.of(d.label) != CuriosityPort.Kind.PERSON
+                    && x >= 2 * d.x0 - 1 && x <= 2 * d.x1 - 1) {
+                return d.label;
+            }
+        }
+        return null;
+    }
+
+    /** A heading as whole degrees, 0..359. */
+    private static long degrees(double heading) {
+        return Math.floorMod(Math.round(heading), 360L);
+    }
+
+    /** The seek target's bearing from his facing (left positive), NaN for none or no usable heading. */
+    private double seekBearing(long now) {
+        if (Double.isNaN(seekTarget) || !compass.usable(now)) {
+            return Double.NaN;
+        }
+        return Heading.delta(compass.degrees(), seekTarget);
+    }
+
+    /**
+     * A leg decision while seeking: arrived (a look after a leg that is new enough),
+     * out of legs or distance, the first turn to face it (true: started), or a re-centre
+     * on what the look shows there (the box Claude named, else the most open band
+     * within seekRecentreDeg of where the target should be).
+     */
+    private boolean seekLook(long now, Look look) {
+        if (seekLegs + seekTrustLegs > 0 && look != null) {
+            double nov = placeNovelty(now, look);
+            if (!Double.isNaN(nov) && nov >= tuning.seekArriveNovelty) {
+                endSeek(now, true, String.format(java.util.Locale.US, "the place looks new, novelty %.2f", nov));
+                return false;
+            }
+        }
+        long driven = forwardCounts - seekFromCounts;
+        if (seekLegs >= tuning.seekMaxLegs || seekTrustLegs >= tuning.seekTrustedLegsMax
+                || driven >= tuning.seekMaxCounts) {
+            endSeek(now, false, seekLegs + " legs" + (seekTrustLegs > 0 ? " and " + seekTrustLegs + " short trusted legs" : "")
+                    + ", " + driven + " counts, nowhere new yet");
+            return false;
+        }
+        double expected = seekBearing(now);
+        if (Double.isNaN(expected)) {
+            endSeek(now, false, "heading not usable");
+            return false;
+        }
+        if (!seekTurned) {
+            seekTurned = true;
+            if (Math.abs(expected) >= tuning.turnToleranceDeg) {
+                // Turn only, then look again from there (the confirming look).
+                plannedTicks = 0;
+                turnToward(now, expected);
+                return true;
+            }
+        }
+        if (look == null) {
+            return false;
+        }
+        double found = seekFind(look, expected);
+        int leg = seekLegs + seekTrustLegs + 1;
+        if (seekTrusted && Math.abs(expected) <= tuning.cameraHalfFovDeg && steer.confident(look.openness)) {
+            double aim = Double.isNaN(found) ? expected : found;
+            float open = steer.openAt(look.openness, aim);
+            if (open <= tuning.steerBlocked) {
+                // Robot 2026-10-01 16:35: the scorer read open hallway carpet 0.00 and gave up on
+                // Claude's doorway. Openness never vetoes Claude's target; hazards still do.
+                if (!Double.isNaN(found)) {
+                    seekTarget = Heading.wrap(compass.degrees() + found);
+                    note("seeking: leg " + leg + ", re-centred by " + Math.round(found - expected) + " deg");
+                }
+                if (hazardToward(now, seekTarget)) {
+                    if (!seekDetour(now, "a hazard toward it just now", unblocked(escapeSide != null ? escapeSide
+                            : Direction.LEFT))) {
+                        return false;
+                    }
+                    seekTurned = true;
+                    plannedTicks = 0;
+                    turnToward(now, seekBearing(now));
+                    return true;
+                }
+                note(String.format(java.util.Locale.US,
+                        "seeking: openness reads the target blocked (open %.2f); trusting Claude's pick and driving", open));
+                trustedLeg(now, Heading.delta(compass.degrees(), seekTarget), false);
+                return true;
+            }
+        }
+        if (Double.isNaN(found) && Math.abs(expected) <= tuning.cameraHalfFovDeg && steer.confident(look.openness)) {
+            // Facing the target and it reads blocked (robot 16:00:30, open 0.21): the most open
+            // band within seekBlockedAimDeg of it instead; nothing open there ends the seek.
+            double alt = steer.openBandNear(look.openness, expected, tuning.seekBlockedAimDeg);
+            if (Double.isNaN(alt)) {
+                endSeek(now, false, "the target reads blocked, nothing open within "
+                        + Math.round(tuning.seekBlockedAimDeg) + " deg of it");
+                return false;
+            }
+            seekTarget = Heading.wrap(compass.degrees() + alt);
+            note("seeking: leg " + leg + ", the target reads blocked: aiming at the open band "
+                    + Math.round(alt - expected) + " deg off it (heading " + degrees(seekTarget) + " deg)");
+        } else if (Double.isNaN(found)) {
+            note("seeking: leg " + leg + ", nothing to re-centre on: keeping heading " + degrees(seekTarget) + " deg");
+        } else {
+            seekTarget = Heading.wrap(compass.degrees() + found);
+            note("seeking: leg " + leg + ", re-centred by " + Math.round(found - expected) + " deg");
+        }
+        return false;
+    }
+
+    /** Where the target is in this look, as a bearing off his facing; NaN: not in view or not recognisable. */
+    private double seekFind(Look look, double expected) {
+        if (Math.abs(expected) > tuning.cameraHalfFovDeg) {
+            return Double.NaN;
+        }
+        if (seekLabel != null && look.detections != null) {
+            double best = Double.NaN;
+            for (Detection d : look.detections) {
+                if (d.score < tuning.confidenceFloor || !seekLabel.equals(d.label)) {
+                    continue;
+                }
+                double deg = RoamSteer.bearingOf(d.centerX(), tuning.cameraHalfFovDeg, tuning.cameraPitchDeg);
+                if (Math.abs(deg - expected) <= tuning.seekRecentreDeg
+                        && (Double.isNaN(best) || Math.abs(deg - expected) < Math.abs(best - expected))) {
+                    best = deg;
+                }
+            }
+            if (!Double.isNaN(best)) {
+                return best;
+            }
+        }
+        return steer.openBandNear(look.openness, expected, tuning.seekRecentreDeg);
+    }
+
+    /** A measured (or timed) turn toward a bearing, the long way round when that side is blocked. */
+    private void turnToward(long now, double bearing) {
+        Direction d = bearing > 0 ? Direction.LEFT : Direction.RIGHT;
+        double deg = Math.abs(bearing);
+        if (unblocked(d) != d) {
+            note("the " + d + " side is blocked: turning the long way round");
+            d = d.opposite();
+            deg = 360 - deg;
+        }
+        note("seeking: turning " + d + " " + Math.round(deg) + " deg to face it");
+        lastHazardSide = null;
+        enterLook(now, d, false, timedMs(deg), compass.usable(now) ? deg : 0);
+    }
+
+    /**
+     * Something real (a hazard, a CPL refusal, or one there just now) blocks the way to
+     * the seek target. Claude's target, the first time: the target moves seekBlockedAimDeg
+     * off it toward side (away from the hazard; chosen by the hazard, not the camera) and
+     * the seek goes on. Otherwise the seek ends. True when it goes on.
+     */
+    private boolean seekDetour(long now, String why, Direction side) {
+        if (Double.isNaN(seekTarget)) {
+            endSeek(now, false, why);
+            return false;
+        }
+        if (!seekTrusted || seekDetoured || tuning.seekBlockedAimDeg <= 0 || !compass.usable(now)) {
+            endSeek(now, false, why);
+            return false;
+        }
+        seekDetoured = true;
+        double off = side == Direction.RIGHT ? -tuning.seekBlockedAimDeg : tuning.seekBlockedAimDeg;
+        seekTarget = Heading.wrap(seekTarget + off);
+        seekTurned = false;
+        seekLabel = null;
+        note("seeking: blocked toward the target (" + why + "): trying " + Math.round(Math.abs(off)) + " deg "
+                + (off < 0 ? "right" : "left") + " of it (heading " + degrees(seekTarget) + " deg), by the hazard, not the camera");
+        return true;
+    }
+
+    /**
+     * A hazard (or one there just now) within escapeProbeClearDeg of heading, or the way
+     * back under a box he got out of: real evidence, which openness never overrides.
+     */
+    private boolean hazardToward(long now, double heading) {
+        if (Double.isNaN(heading)) {
+            return false;
+        }
+        if (!Double.isNaN(blockedAheadAt) && Math.abs(Heading.delta(heading, blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return true;
+        }
+        if (bathAvoided(now, heading)) {
+            // The way back to a bathroom he left: never a seek's or a doorway's way.
+            return true;
+        }
+        return now < boxedAvoidUntil && !Double.isNaN(boxedAvoidHeading)
+                && Math.abs(Heading.delta(heading, boxedAvoidHeading)) <= tuning.boxedAvoidDeg;
+    }
+
+    /** Claude reported an open doorway within seekDoorwayMs (taken by a seek or not). */
+    private boolean reportedDoorwayRecent(long now) {
+        return !Double.isNaN(doorwayReported) && now - doorwayReportedAt <= tuning.seekDoorwayMs;
+    }
+
+    /**
+     * A short leg (steerShortTicks at most) toward bearing (off his facing, left positive),
+     * after a turn to face it if it is off to a side: a target Claude chose that the camera
+     * reads blocked. The camera neither ends nor re-aims it; the floor sensor, CPL, stall
+     * and RECOVER rules stop it as on any leg.
+     */
+    private void trustedLeg(long now, double bearing, boolean toDoor) {
+        legDecSrc = toDoor ? "door" : "seek";
+        trustLeg = true;
+        trustLegDoor = toDoor;
+        doorwayLeg = false;
+        lastHazardSide = null;
+        plannedTicks = Math.max(1, Math.min(tuning.steerShortTicks, drawTicks()));
+        if (Double.isNaN(bearing) || Math.abs(bearing) < tuning.turnToleranceDeg || !compass.usable(now)) {
+            startHop(now);
+            return;
+        }
+        if (seeking()) {
+            turnToward(now, bearing);
+            return;
+        }
+        Direction d = bearing > 0 ? Direction.LEFT : Direction.RIGHT;
+        double deg = Math.abs(bearing);
+        if (unblocked(d) != d) {
+            d = d.opposite();
+            deg = 360 - deg;
+        }
+        note("turning " + d + " " + Math.round(deg) + " deg to face the doorway");
+        enterLook(now, d, false, timedMs(deg), deg);
+    }
+
+    /** A hazard or CPL refusal on a trusted leg toward a doorway: it is blocked for real, so forgotten. */
+    private void trustLegHazard() {
+        boolean door = trustLeg && trustLegDoor;
+        trustLeg = false;
+        trustLegDoor = false;
+        if (!door) {
+            return;
+        }
+        note("the doorway at " + Math.round(Double.isNaN(doorway) ? doorwayReported : doorway)
+                + " deg: a hazard on the leg toward it: forgotten");
+        forgetBlockedDoorway();
+    }
+
+    /**
+     * The seek is over (why: numbers and reasons only): the place it went to is marked
+     * in the place memory (the target's view, and on arrival the view now), so the next
+     * seek goes elsewhere; the grid marked the ground he drove. No seek for seekGapMs.
+     */
+    private void endSeek(long now, boolean arrived, String why) {
+        if (intent == CuriosityPort.Action.GO_ELSEWHERE && seeking()) {
+            intentDone(arrived ? "the seek arrived somewhere new" : "the seek is over");
+        }
+        if (!seeking()) {
+            return;
+        }
+        if (seekAsking) {
+            seekAsking = false;
+            port.cancelSeek();
+        }
+        note("seeking: " + (arrived ? "arrived" : "gave up") + " (" + why + ")");
+        seekEnd(now, arrived ? "arrived" : "gave_up");
+        places.markSought(seekPrint, now);
+        Look look = camera.latest();
+        if (arrived && look != null) {
+            places.markSought(look.place, now);
+        }
+        seekTarget = Double.NaN;
+        seekLabel = null;
+        seekPrint = null;
+        seekFrames.clear();
+        seekLegs = 0;
+        seekTrustLegs = 0;
+        seekTrusted = false;
+        seekDetoured = false;
+        seekPersonNoted = false;
+        seekToDoor = false;
+        seekClockRestart(now);
+    }
+
+    /** No seek for seekGapMs, and seekEveryMs counts from now. */
+    private void seekClockRestart(long now) {
+        familiarStops = 0;
+        seekNextAt = now + tuning.seekGapMs;
+        roamedSinceSeekMs = 0;
+    }
+
+    /** Claude reported an open doorway within seekDoorwayMs that no seek has taken yet. */
+    private boolean doorwayRecent(long now) {
+        return !Double.isNaN(seekDoorway) && now - seekDoorwayAt <= tuning.seekDoorwayMs;
+    }
+
+    /** The seek's target becomes the reported doorway (robot 16:00: "there's a door in his view"). */
+    private void headForDoorway(long now) {
+        if (seekAsking) {
+            seekAsking = false;
+            port.cancelSeek();
+        }
+        seekTarget = seekDoorway;
+        seekDoorway = Double.NaN;
+        seekToDoor = true;
+        seekLabel = null;
+        seekPrint = null;
+        seekLegs = 0;
+        seekTrustLegs = 0;
+        seekTrusted = true;
+        seekDetoured = false;
+        seekFromCounts = forwardCounts;
+        seekTurned = false;
+        seekFrames.clear();
+        note("seeking: heading for the doorway at " + degrees(seekTarget) + " deg");
     }
 
     // ---- people while roaming (explore nav plan U7, R9, R10, KTD4, KTD8) ----
@@ -4680,7 +8644,19 @@ final class ExploreBrain {
             return false;
         }
         Detection p = personBox(look.detections);
-        if (p == null || !port.canAsk()) {
+        if (p != null && seeking() && intent != CuriosityPort.Action.FIND_PERSON) {
+            // Robot 16:46:30: a roaming person pick ended a seek 0.7 s in; in a busy office that
+            // cut nearly every seek, and most such meetings dropped for lack of a usable face.
+            // Calls still interrupt a seek; Claude's picks at a stop don't arise (no stops while seeking).
+            if (!seekPersonNoted) {
+                seekPersonNoted = true;
+                note("a person while seeking: carrying on to the target");
+            }
+            return false;
+        }
+        if (p == null || !canAsk() || hushed() || now < phantomsIgnoredUntil) {
+            // Hushed (muted or quiet): no person stop at all. Home 2026-10-02 21:40: muted, he
+            // started one on the same person every 0.5 s and the hush ended each at once.
             return false;
         }
         if (anyoneMet(now) && now >= metClearedUntil) {
@@ -4715,6 +8691,9 @@ final class ExploreBrain {
      */
     private void beginPersonStop(long now, Look lookOrNull, Detection person) {
         claudeStop = true;
+        roamingPick = false;
+        cuePick = false;
+        personVoiceAt = NEVER;
         heldPick = null;
         scanned.clear();
         scanHeadings.clear();
@@ -4732,11 +8711,13 @@ final class ExploreBrain {
 
     private void approachPerson(long now, Look look, Detection p) {
         note("a person while roaming: going over to meet them");
+        trig("person-pick", "roaming", p, 1);
         lookForLeg = false;
         hopNext = false;
         plannedTicks = -1;
         doorwayLeg = false;
         beginPersonStop(now, look, p);
+        roamingPick = true;
         remember(p.label, CuriosityPort.Kind.PERSON, now);
         target = p;
         state = State.FACE;
@@ -4765,7 +8746,7 @@ final class ExploreBrain {
      * compare against. False: none went, so the person counts as just met.
      */
     private boolean startMetCheck(long now, byte[] jpeg, Detection box) {
-        if (metChecking || now < metNextCheckAt || jpeg == null || box == null || !port.canAsk()) {
+        if (metChecking || now < metNextCheckAt || jpeg == null || box == null || !canAsk()) {
             return false;
         }
         List<String> ids = new ArrayList<String>();
@@ -4780,6 +8761,7 @@ final class ExploreBrain {
         metCheckAt = now;
         metNextCheckAt = now + tuning.metCheckIntervalMs;
         note("asking Claude whether this person was just met (" + ids.size() + " met recently)");
+        trig("person-pick", "met_check", trigBox(box, CuriosityPort.Kind.PERSON), 1);
         port.recentlyMet(new CuriosityPort.RecentlyMetRequest(jpeg, box, ids), tuning.metCheckTimeoutMs);
         return true;
     }
@@ -4843,22 +8825,36 @@ final class ExploreBrain {
     // next look of the plan (strong: that side, behind, the other side; weak: that
     // side, the opposite) and, after the last, resumes quietly with nothing sent. A
     // facing face plays the acknowledgement in a clip window (KTD14) and enters the
-    // MEET path. In EYES_ONLY, or with no camera to decide, only the wake word
-    // opens a meeting: no turn, the stranger's lines, the lease guard held off
-    // until it ends (KTD8). The ears session follows the charger latch (KTD6).
+    // MEET path. In EYES_ONLY, or with no camera to decide, only a call opens a
+    // meeting: no turn, the stranger's lines, the lease guard held off until it
+    // ends (KTD8). Calls (strong wake words and names) skip this table: see the
+    // call section below. The ears stay open on the charger (hey-miko plan KTD5).
 
     private enum CueVerdict { TAKE, HOLD, DROP, CONFIRM }
 
+    // The lean-in cooldown (robot 2026-10-01 15:12-15:17: 15 lean-ins in 5 minutes under a desk).
+    /** A lean-in (not a call's search) is under way, and whether it has met someone. */
+    private boolean leanInOpen;
+    private boolean leanInMet;
+    /** When the last lean-in started (leanInMinGapMs) and until when one that met nobody holds off voices. */
+    private long leanInAt = NEVER;
+    private long leanInCooldownUntil = NEVER;
+    /** The hold-off already noted (one note per cooldown). */
+    private long leanInIgnoreNoted = NEVER;
+    /** A cue exempt from the hold-off: a lean-in's own, held through an escape, or a conversation's newcomer. */
+    private Ears.Cue leanInExempt;
+
     /**
-     * Opens and closes the launcher's ears with the charger latch (KTD6) and at shutdown, and
+     * Opens the launcher's ears and closes them at shutdown (they stay open on the charger,
+     * hey-miko plan KTD5), and
      * reopens a session that died while wanted (a launcher restart is a lease loss and an
      * ears-session loss at once, meeting plan: "re-opens the ears with the same backoff the
      * drive lease uses"). The backoff mirrors ExploreDrive.scheduleLeaseRetry: the loss is
      * noticed, the first reopen fires 2 s later, then 4, 8, 16 and 30 s apart until one holds.
      */
     private void syncEars(long now) {
-        // A conversation already open finishes on the charger (KTD6): the ears stay with it.
-        boolean want = ears.present() && state != State.STOPPED && (!classifier.charger() || state.chats());
+        // The ears stay open on the charger (hey-miko plan KTD5): a call there opens a meeting that does not move.
+        boolean want = ears.present() && state != State.STOPPED;
         if (want != earsOpen) {
             earsOpen = want;
             earsReopenAttempt = 0;
@@ -4867,7 +8863,7 @@ final class ExploreBrain {
                 note("ears open");
                 port.earsOpen();
             } else {
-                note("ears closed: " + (state == State.STOPPED ? "stopping" : "on the charger"));
+                note("ears closed: stopping");
                 port.earsClose();
             }
             return;
@@ -4949,6 +8945,12 @@ final class ExploreBrain {
         }
         note("shoved: " + shove.counts + " counts while stopped");
         gauges.count(Gauges.Counter.SHOVES);
+        if (jammed && state == State.CORNERED && !jamProbing && jamPoke == null) {
+            jamPoke = "shoved (" + shove.counts + " counts)";
+        }
+        if (state == State.RECOVER && !recoverProbing && !wriggling && recoverPoke == null) {
+            recoverPoke = "shoved (" + shove.counts + " counts)";
+        }
         lastShoveAt = shove.at;
         port.earsShoved(shove.at);
         offerCue(now, new Ears.Cue(Ears.Kind.VOICE, Ears.Tier.WEAK, Ears.Side.UNKNOWN, Float.NaN, shove.at));
@@ -4957,6 +8959,7 @@ final class ExploreBrain {
     /** A collision stop while driving (a stall, an obstacle): "sorry" within bumpApologyMs is strong (KTD5). */
     private void stampBump(long now) {
         bumpAt = now;
+        stampStall(now);
         note("collision stop: a bump");
         port.earsShoved(now);
     }
@@ -4978,11 +8981,40 @@ final class ExploreBrain {
     private void offerCue(long now, Ears.Cue c) {
         gauges.count(Gauges.Counter.CUES);
         gauges.count(c.strong() ? Gauges.Counter.STRONG_CUES : Gauges.Counter.WEAK_CUES);
+        if (hushed()) {
+            mutedCue(now, c);
+            return;
+        }
+        if (isCall(c)) {
+            offerCall(now, c);
+            return;
+        }
+        if (state == State.CUE_WHERE && callsOwn()) {
+            whereReply(now, c);
+            return;
+        }
+        if (callsOwn() && state.approachesPerson()) {
+            // The call's own approach (KTD8): only another call can turn him from it.
+            dropCue("cue " + c.tier + " " + c.side + " during the call's approach: ignored");
+            return;
+        }
         if (state.cueSearch()) {
             offerCueDuringSearch(now, c);
             return;
         }
-        switch (cueVerdict(now, c)) {
+        if (callsOwn() && callerHeard && state == State.MEET && callersVoice(c)) {
+            note("cue " + c.tier + " " + c.side + " from the caller during their meeting: theirs");
+            return;
+        }
+        CueVerdict verdict = cueVerdict(now, c);
+        if (state.chats() && chat != null && verdict == CueVerdict.DROP) {
+            // Not a newcomer: the conversation partner's voice (their words reach the listen).
+            partnerSpokeAt = now;
+        }
+        if ((verdict == CueVerdict.TAKE || verdict == CueVerdict.HOLD) && !state.chats() && leanInHeldOff(now, c)) {
+            return;
+        }
+        switch (verdict) {
             case TAKE:
                 takeCue(now, c);
                 break;
@@ -4991,6 +9023,9 @@ final class ExploreBrain {
                 break;
             case CONFIRM:
                 note("a voice from the person's side: carrying on toward them");
+                if (fromKnownSide(c)) {
+                    personVoiceAt = c.at;
+                }
                 break;
             default:
                 dropCue("cue " + c.tier + " " + c.side + " dropped in " + state);
@@ -4998,14 +9033,812 @@ final class ExploreBrain {
         }
     }
 
+    // ---- the call (hey-miko plan U5; R1-R4, R11; KTD1-KTD5) ----
+    //
+    // A strong WAKE_WORD or NAME cue is a call. It goes to its own slot, never expires
+    // and is never dropped: callVerdict (KTD2's order) says whether it waits for a
+    // moment to finish or is taken now. A take stops the wheels and plays the answer
+    // clip in the same step (KTD3), then searches (the hand-off U6 replaces), carries
+    // on toward the person he was already going to, or, on the charger, in EYES_ONLY,
+    // without the lease or without a camera, meets without moving. A hazard or a lost
+    // lease during the call's search or approach hands it back to the slot, answered,
+    // to be retaken without a second clip. The slot clears when the conversation
+    // opens, when the call's stop ends without one, or at once when no conversation
+    // can open (no Claude): then the answer clip is the whole response. Logs carry
+    // sides and counts only.
+
+    private enum CallVerdict { WAIT, IN_PLACE, CARRY_ON, SEARCH }
+
+    /** A call (KTD1): a strong wake word or name cue. Other cues keep the held-cue rules. */
+    private static boolean isCall(Ears.Cue c) {
+        return c.strong() && (c.kind == Ears.Kind.WAKE_WORD || c.kind == Ears.Kind.NAME);
+    }
+
+    /**
+     * A call from the session: absorbed when its utterance already called (KTD4), no call
+     * when it is the conversation partner's own (inside newcomerAngleDeg), else it fills
+     * the slot or merges into the call there, the newest angle winning.
+     */
+    private void offerCall(long now, Ears.Cue c) {
+        if (c.alreadyCalled() && callAts.contains(c.at)) {
+            if (callChatOpening && callChatCue != null && c.at == callChatCue.at) {
+                // Owner 2026-10-02: what they said with the wake word is the conversation's first message.
+                if (c.hasMessage()) {
+                    callChatMessage = c.message;
+                }
+                note("the end of the call's utterance: " + (c.hasMessage() ? "their words are the first message"
+                        : "no other words"));
+                if (callUtteranceUntil != NEVER) {
+                    callUtteranceUntil = NEVER;
+                    if (!callAnswered) {
+                        answerCall(now);
+                    }
+                }
+                return;
+            }
+            if (call != null && !callTaken && c.at == call.at) {
+                // The call still waits (a back-off, a line): its utterance has ended, so its answer
+                // will not wait for that end, and its words wait with it for the conversation.
+                call = new Ears.Cue(call.kind, call.tier, call.side, call.angleDeg, call.at, true,
+                        c.hasMessage() ? c.message : call.message);
+                note("the end of the waiting call's utterance" + (c.hasMessage() ? ", with words" : ""));
+                return;
+            }
+            note("the end of a call's utterance: already called");
+            return;
+        }
+        callAts.remove(c.at);
+        callAts.addLast(c.at);
+        while (callAts.size() > CALL_ATS_KEPT) {
+            callAts.removeFirst();
+        }
+        if (state.chats() && chat != null && !newcomersCall(c)) {
+            // Owner 2026-09-30: in a conversation a call that is not clearly someone else's is the
+            // partner speaking ("Hey Miko, ..."): no new call, and they are still here.
+            partnerSpokeAt = now;
+            if (partnersCall(c)) {
+                dropCue("a call from the partner's side during the conversation: theirs, no call");
+            } else {
+                note("a call in " + state + " from " + c.side
+                        + ": the conversation partner speaking, the conversation goes on");
+            }
+            return;
+        }
+        if (partnersCall(c)) {
+            dropCue("a call from the partner's side during the conversation: theirs, no call");
+            return;
+        }
+        if (callsOwn() && callerHeard && state == State.MEET && callersVoice(c)) {
+            note("a call from the caller during their meeting: theirs, no call");
+            return;
+        }
+        if (call == null) {
+            clearCall();
+            call = c;
+            gauges.stamp(Gauges.Stage.CALL_HEARD, c.at);
+            note("a call from " + c.side + " in " + state);
+            if (state.chats() && chat != null && c.hasAngle()) {
+                // Outside the partner's angle: the newcomer's glance and "one sec" (R15).
+                chat.newcomer(sideOf(c));
+            }
+            return;
+        }
+        if (callTaken && state != State.CUE_WHERE && !state.cueSearch() && !state.approachesPerson()) {
+            // KTD4: the taken call's own meeting or conversation. Someone else's call waits
+            // for it to end; merged into the taken call, it would clear with it (R1).
+            if (nextCall == null) {
+                nextCall = c;
+                note("a call from " + c.side + " during the call's own meeting: it waits for the next turn");
+            } else {
+                nextCall = mergeCalls(c.kind, nextCall, c);
+                note("a repeat of the waiting call merged into it, now from " + nextCall.side);
+            }
+            return;
+        }
+        Ears.Cue merged = mergeCalls(c.kind, call, c);
+        call = merged;
+        if (callTaken && state == State.CUE_WHERE) {
+            // KTD9: a new call after "Where'd you go?" looks again, every time, with no second answer.
+            note("a new call after nobody was found: looking again");
+            startCallSearch(now, merged, false);
+            return;
+        }
+        if (callTaken && state.cueSearch()) {
+            // Owner 2026-09-30: the caller calling again from their side (or from nowhere to be
+            // told) is the caller talking: the conversation opens now. KTD6: a call with an
+            // angle from the other side retargets the search.
+            if (!searchCallersVoice(c)) {
+                note("a new call from the other side during its search: retargeting");
+                stopMotors();
+                startCallSearch(now, merged, true);
+            } else {
+                callerVoiceInSearch(now, merged, "a new call from " + c.side + " during its search");
+            }
+            return;
+        }
+        if (callTaken && state.approachesPerson()) {
+            // KTD8: merged into the call's own approach unless its angle is away from that person.
+            if (c.hasAngle() && !sameSideAsPerson(c)) {
+                note("a new call from away from the person during the call's approach: retargeting");
+                stopMotors();
+                clearStop();
+                startCallSearch(now, merged, true);
+            } else {
+                note("a new call from the person's side during the call's approach: merged into it");
+            }
+            return;
+        }
+        note("a second call merged into the first, now from " + merged.side);
+    }
+
+    /** Two calls are one (KTD1), of the given kind: the newer one's angle, or side, wins when it has one. */
+    private static Ears.Cue mergeCalls(Ears.Kind kind, Ears.Cue older, Ears.Cue newer) {
+        boolean newerPlaces = newer.hasAngle() || (!older.hasAngle() && newer.side != Ears.Side.UNKNOWN);
+        Ears.Cue where = newerPlaces ? newer : older;
+        // The angle keeps the time it was sampled at: KTD7 corrects it for his turning since then.
+        return new Ears.Cue(kind, Ears.Tier.STRONG, where.side, where.angleDeg, where.at);
+    }
+
+    /**
+     * In a conversation, a call whose angle is within newcomerAngleDeg of the partner is
+     * the partner's own and makes no call (KTD4). With no angle nobody can be told apart,
+     * so it waits as a call. A meeting without a look has nobody placed in front of him.
+     */
+    private boolean partnersCall(Ears.Cue c) {
+        if (!state.converses() || !c.hasAngle() || (wheellessMeeting && !state.chats())) {
+            return false;
+        }
+        return Math.abs(c.angleDeg) <= tuning.newcomerAngleDeg;
+    }
+
+    /**
+     * In a conversation (owner 2026-09-30), a call is someone else's only when the partner
+     * is in view and its angle is clearly away from them (beyond newcomerAngleDeg); with
+     * nobody in view, or no angle (the direction chip's side alone), it is the partner's.
+     */
+    private boolean newcomersCall(Ears.Cue c) {
+        return !chatFaceless && c.hasAngle() && Math.abs(c.angleDeg) > tuning.newcomerAngleDeg;
+    }
+
+    /** Each step: the call in the slot, waited out or taken by KTD2's order. */
+    private void callStep(long now) {
+        if (call == null || state == State.STOPPED) {
+            return;
+        }
+        if (task != null && !comeHereCall) {
+            // Owner 2026-10-03: a call ends a task at once (its come_here step's own call aside).
+            endTask(now, "a call", null);
+        }
+        if (intent != CuriosityPort.Action.NONE && intent != CuriosityPort.Action.BE_QUIET
+                && intent != CuriosityPort.Action.STAY && intent != CuriosityPort.Action.WAIT) {
+            // Owner 2026-10-02: a call from anyone comes before any instruction.
+            dropIntent("a call");
+        }
+        if (callTaken) {
+            if (state.inStop()) {
+                return;
+            }
+            // Its search found nobody, or its meeting ended before a conversation opened.
+            note("the call's stop is over without a conversation: the call is done");
+            clearCall();
+            if (call == null) {
+                return;
+            }
+            // A caller who waited through that meeting (KTD4) is taken in this same step.
+        }
+        CallVerdict v = callVerdict(now, call);
+        if (v == CallVerdict.WAIT) {
+            if (!callWaitCounted) {
+                callWaitCounted = true;
+                gauges.count(Gauges.Counter.CUES_HELD);
+                note("the call waits for " + state + " to finish");
+            }
+            return;
+        }
+        takeCall(now, v);
+    }
+
+    /**
+     * KTD2's order: a line playing, then a conversation, then the charger (checked before
+     * the back-off wait, since a docked robot keeps cycling through STARTLE and BACK_OFF),
+     * then this back-off, then no wheels or no camera, then the person he was going to.
+     */
+    private CallVerdict callVerdict(long now, Ears.Cue c) {
+        if (state == State.SPEAK && pendingLine == null) {
+            return CallVerdict.WAIT;
+        }
+        if (state.converses()) {
+            return CallVerdict.WAIT;
+        }
+        if (onCharger()) {
+            return CallVerdict.IN_PLACE;
+        }
+        if (now < stayUntil) {
+            // Owner 2026-10-03: asked to stay, he answers where he stands.
+            return CallVerdict.IN_PLACE;
+        }
+        if (state == State.STARTLE || state == State.BACK_OFF) {
+            return CallVerdict.WAIT;
+        }
+        if (wriggling) {
+            // The wriggle is bounded (two ways of up to wriggleMs): the call waits for its verdict.
+            return CallVerdict.WAIT;
+        }
+        if (state == State.RECOVER) {
+            // Waiting out a motor cutout (robot 2026-10-01): a search turn would read nothing.
+            return CallVerdict.IN_PLACE;
+        }
+        if (jammed) {
+            // Fully jammed (robot 2026-10-01): a search turn would only push against the jam.
+            return CallVerdict.IN_PLACE;
+        }
+        if (callBlockedTurns >= tuning.callBlockedTurnsMax) {
+            // Robot 2026-10-01 (the motor board latched): his turns do nothing, so no search.
+            return CallVerdict.IN_PLACE;
+        }
+        if (state.escapes() && callAnswered) {
+            // A call handed back by a hazard waits out the escape it caused (robot 2026-10-01: its
+            // search restarted 40 ms into each wedge escape, so none ever ran). A new call is answered at once.
+            return CallVerdict.WAIT;
+        }
+        if (state == State.EYES_ONLY || !leaseHeld || !camera.available() || now < curiosityOffUntil) {
+            return CallVerdict.IN_PLACE;
+        }
+        if (state.approachesPerson()
+                && headingForAPerson() && (!c.hasAngle() || sameSideAsPerson(c))) {
+            return CallVerdict.CARRY_ON;
+        }
+        return CallVerdict.SEARCH;
+    }
+
+    /** Takes the call: the wheels stop and the answer plays in this step (KTD3), then what the verdict says. */
+    private void takeCall(long now, CallVerdict v) {
+        Ears.Cue c = call;
+        if (cueHeld != null) {
+            dropCue("the held cue gives way to the call");
+            cueHeld = null;
+        }
+        if (v != CallVerdict.CARRY_ON) {
+            if (state.escapes()) {
+                // An escape cut short is a failed one (robot 2026-10-01: the count stayed at 0 through 11).
+                failedLadders++;
+                note("the escape gives way to the call (" + failedLadders + " failed escapes in a row)");
+            }
+            leaveForCue();
+            backForTurn = false;
+            retryWaiting = false;
+            turnRetrying = false;
+        }
+        // Owner 2026-10-02: conversation first; its answer may wait for the end of what they are saying.
+        boolean chatFirst = tuning.callChatFirst && canAsk() && !comeHereCall;
+        if (!callAnswered && !chatFirst) {
+            answerCall(now);
+        }
+        if (!canAsk()) {
+            // KTD1: no conversation can open, so the answer is the whole response.
+            note("no Claude to talk with: the answer is the whole response");
+            clearCall();
+            if (v == CallVerdict.CARRY_ON) {
+                // R4: he still stops for the answer, then carries on the same approach.
+                carryOnAfterAnswer(now);
+            } else if (state != State.EYES_ONLY) {
+                enterPause(now, pauseMs(), false);
+            }
+            return;
+        }
+        callTaken = true;
+        if (chatFirst) {
+            openCallChat(now, c, v);
+            return;
+        }
+        switch (v) {
+            case IN_PLACE:
+                // On the charger (KTD5), in EYES_ONLY, without the lease or a camera, or with turns that
+                // do nothing (callBlockedTurns): no turn, no drive.
+                meetWithoutLooking(now, c, "a call while he cannot turn to it: meeting without a look");
+                break;
+            case CARRY_ON:
+                note("a call from the person's side: answering and carrying on toward them");
+                carryOnAfterAnswer(now);
+                break;
+            default:
+                startCallSearch(now, c, false);
+                break;
+        }
+    }
+
+    /** The answer (KTD3): the prepared clip from the answer group, inside a clip window. */
+    private void answerCall(long now) {
+        callAnswered = true;
+        gauges.stamp(Gauges.Stage.CALL_ANSWERED, now);
+        note("answering the call");
+        port.clipWindow(tuning.answerClipMs);
+        sound.playReaction("answer");
+        ackUntil = now + tuning.answerClipMs + tuning.deafTailMs;
+    }
+
+
+    /**
+     * R4 wins over KTD2 step 6's wording: a call from the person he was going to stops
+     * the wheels for the answer, then the same approach goes on from a look taken after
+     * the clip (re-facing them if the stop left them off-centre).
+     */
+    private void carryOnAfterAnswer(long now) {
+        if (state != State.FACE && state != State.APPROACH) {
+            return;
+        }
+        stopMotors();
+        waitForLook(now);
+        lookAfter = Math.max(lookAfter, now + tuning.answerClipMs);
+        lookDeadline = Math.max(lookDeadline, lookAfter + tuning.lookTimeoutMs);
+    }
+
+    // ---- finding and reaching the caller (hey-miko plan U6; R5-R7, R9, R10; KTD6-KTD9) ----
+    //
+    // The call's search runs in CUE_TURN and CUE_LOOK with its own plan. With an angle:
+    // the bearing, corrected for his own turning since the voice was sampled (KTD7), then
+    // its two 45 deg neighbours. With a side and no angle (R7): 90 deg to that side, then 45
+    // and 135 on it, then ahead, the other side and behind. With neither: eight 45 deg looks
+    // over one circle from straight ahead. Each look takes frames captured once the turn stopped
+    // (no settle) and has callLookMs; the first fresh frame with nobody in it ends that look at
+    // once, and a stale one with the caller in it counts within callStaleLookDeg (staleCallLook). Any person
+    // box at least callPersonMinHeight tall and scoring callPersonMinScore is the caller (no
+    // facing-face gate), the one nearest the bearing when there is one. A far one (under callNearHeight) is faced and approached
+    // to politeHeight through FACE and APPROACH, a near one is met where it stands; either
+    // way the meeting opens with no leave-alone check. Nobody: "Where'd you go?" and a
+    // listen (CUE_WHERE); a new call looks again every time, a reply opens the meeting, silence
+    // roams. The caller's voice during the search opens the meeting at once (callerSpoke).
+
+    /** Whether this search or stop is the taken call's own. */
+    private boolean callsOwn() {
+        return callTaken && call != null;
+    }
+
+    /** The call's search from here (KTD6): the plan, then the first turn or look. A retarget counts as one. */
+    private void startCallSearch(long now, Ears.Cue c, boolean retarget) {
+        callerInTurn = null;
+        seenLook = false;
+        if (!retarget) {
+            seenRetargets = 0;
+        }
+        state = State.CUE_TURN;
+        searchCue = c;
+        searchRetargeted = retarget;
+        if (retarget) {
+            gauges.count(Gauges.Counter.RETARGETS);
+        } else {
+            gauges.count(Gauges.Counter.SEARCHES);
+            gauges.stamp(Gauges.Stage.CUE_AT, c.at);
+        }
+        double since = c.hasAngle() ? headingHistory.turnedSince(c.at) : Double.NaN;
+        double[] plan;
+        if (!Double.isNaN(since)) {
+            // KTD7: the angle is right positive and a turn left since the sample moves the voice right.
+            double bearing = Heading.delta(0, c.angleDeg + since);
+            plan = new double[]{bearing, bearing - CALL_STEP_DEG, bearing + CALL_STEP_DEG};
+            callBearing = bearing;
+        } else if (c.side == Ears.Side.LEFT || c.side == Ears.Side.RIGHT) {
+            // R7: a side and no angle (the direction chip's usual cue): that side first, at 90 deg,
+            // then its 45 deg neighbours (45 and 135), then the rest of one circle in one sweep:
+            // ahead, the other side, behind. Right positive, as the plan's bearings are.
+            double s = c.side == Ears.Side.LEFT ? -1 : 1;
+            plan = new double[]{s * 2 * CALL_STEP_DEG, s * 3 * CALL_STEP_DEG, s * CALL_STEP_DEG, 0,
+                    -s * CALL_STEP_DEG, -s * 2 * CALL_STEP_DEG, -s * 3 * CALL_STEP_DEG, -s * 4 * CALL_STEP_DEG};
+            callBearing = Double.NaN;
+        } else {
+            // R9: no side and no usable angle (none, or one older than the heading history): one
+            // circle of looks from straight ahead.
+            plan = new double[CALL_CIRCLE_LOOKS];
+            for (int i = 0; i < plan.length; i++) {
+                plan[i] = CALL_STEP_DEG * i;
+            }
+            callBearing = Double.NaN;
+        }
+        searchPlan = plan;
+        searchLook = 0;
+        searchRel = 0;
+        searchTurnDoneStamped = false;
+        searchFirstTurn = true;
+        searchRemainingDeg = Math.abs(plan[0]);
+        searchTurnLeft = plan[0] < 0;
+        latestTrend = null;
+        trendSeenInStep = false;
+        show(EyeState.GLANCE, sideOf(c));
+        note("looking for the caller" + (!Double.isNaN(callBearing) ? " to the " + (callBearing < 0 ? "left" : "right")
+                : c.side == Ears.Side.UNKNOWN ? " with no angle"
+                : c.side == Ears.Side.LEFT ? " with no angle, left side first" : " with no angle, right side first")
+                + ": " + plan.length + " looks");
+        if (searchRemainingDeg < 1) {
+            enterCueLook(now);
+            return;
+        }
+        // The camera may still be in its reopen gap: the turn starts now, the look waits for it.
+        startCueTurnStep(now, tuning.lookLeadMs);
+    }
+
+    /**
+     * A fresh look (captured once the turn stopped) during the call's search: a person box ends it
+     * (callFound); no caller in it ends this stop at once and the plan moves on, so an empty stop
+     * costs one camera interval rather than all of callLookMs (which stays the cap when no fresh
+     * frame comes). A person box with no picture waits for the next look.
+     */
+    private void callLook(long now, Look look) {
+        Detection p = callPerson(look.detections);
+        if (p == null) {
+            callLookOver(now, false);
+            return;
+        }
+        if (look.jpeg == null) {
+            lookAfter = look.frameMs + 1;
+            return;
+        }
+        callFound(now, look, p);
+    }
+
+    /**
+     * A look captured before the call's stop began, seen during it (robot 2026-09-30: he
+     * turned past a caller who was in the frames he threw away). A caller in it counts
+     * when the heading it was captured at (the heading history) is within
+     * callStaleLookDeg of where he faces now: found, and the meeting or the approach
+     * follows as for a fresh look. Farther off (robot 2026-10-01: the owner seen 37 and 61 deg
+     * away and the search went on blind) it is a bearing to turn to (turnToSeenCaller). A stale look that arrived
+     * during the stop means the detector has been working since on a frame captured after
+     * the stop began (it takes one frame at a time), due about one detection time later,
+     * so the stop waits for it past callLookMs if need be. True when the caller was found.
+     */
+    private boolean staleCallLook(long now, Look look) {
+        callLookChecked = look.frameMs;
+        // The confirming look needs a look captured after the one that turned him there.
+        Detection p = look.jpeg == null || (seenLook && look.frameMs <= seenFrame) ? null : callPerson(look.detections);
+        if (p != null) {
+            double turned = headingHistory.turnedSince(look.frameMs);
+            if (!Double.isNaN(turned) && Math.abs(turned) <= tuning.callStaleLookDeg) {
+                note("a caller in a look captured " + Math.round(Math.abs(turned))
+                        + " deg from here before the stop: found");
+                callFound(now, look, p);
+                return true;
+            }
+            if (Double.isNaN(turned)) {
+                note("a caller in a look captured at an unknown heading: not where he faces now");
+            } else if (turnToSeenCaller(now, look, p, turned, false)) {
+                return true;
+            }
+        }
+        if (look.frameMs != callStopFrame) {
+            long detecting = Math.min(tuning.callLookMs, Math.max(0, now - look.frameMs));
+            long due = now + detecting + STALE_LOOK_SLACK_MS;
+            if (due > lookDeadline) {
+                lookDeadline = due;
+                note("a look captured before the stop arrived: the frame captured since is due in about "
+                        + detecting + " ms, waiting for it");
+            }
+        }
+        return false;
+    }
+
+    /** Slack on a frame's due time (the readings that notice looks come every 100 ms). */
+    private static final long STALE_LOOK_SLACK_MS = 200;
+
+    /**
+     * A new look during one of the call search's turns: a caller in it whose bearing the turn
+     * will not bring into view (passed already, or well beyond where the turn stops) is turned
+     * to now (turnToSeenCaller). One the turn's stop will face is left to that stop's look.
+     */
+    private boolean seenInTurn(long now) {
+        Look look = camera.latest();
+        if (look == null || look.jpeg == null || look.frameMs == callLookChecked) {
+            return false;
+        }
+        callLookChecked = look.frameMs;
+        Detection p = callPerson(look.detections);
+        double turned = p == null ? Double.NaN : headingHistory.turnedSince(look.frameMs);
+        if (Double.isNaN(turned)) {
+            return false;
+        }
+        // In the turn's own direction: where the caller is, and how far the turn still goes.
+        double way = searchTurnLeft ? -1 : 1;
+        double at = way * seenBearing(p, turned);
+        double ahead = Math.max(0, searchRemainingDeg - turnedSoFar(now));
+        if (at >= -tuning.callStaleLookDeg && at <= ahead + tuning.callStaleLookDeg) {
+            return false;
+        }
+        return turnToSeenCaller(now, look, p, turned, true);
+    }
+
+    /**
+     * Where a caller in a look is from here (right positive): the heading the look was
+     * captured at (turned is how far he has turned left since) plus where the box sits in
+     * the frame, half the frame's width being cameraHalfFovDeg.
+     */
+    private double seenBearing(Detection p, double turned) {
+        return Heading.delta(0, p.centerX() * tuning.cameraHalfFovDeg + turned);
+    }
+
+    /**
+     * A caller in a look captured at a known heading away from here (robot 2026-10-01: the
+     * owner was seen 37 and 61 deg off and the search went on blind): the planned looks wait
+     * while he turns to face them and takes one confirming look, by the call's fresh-frame
+     * rules. Someone there is found (callFound); nobody resumes the planned looks
+     * (callLookOver). At most callSeenRetargetsMax a call, so blurred boxes cannot swing him
+     * to and fro. True when he turned (or looks at once, the bearing being ahead).
+     */
+    private boolean turnToSeenCaller(long now, Look look, Detection p, double turned, boolean inTurn) {
+        double rel = seenBearing(p, turned);
+        String where = "a caller in a look captured " + Math.round(Math.abs(turned)) + " deg from here, "
+                + Math.round(Math.abs(rel)) + " deg to the " + (rel < 0 ? "left" : "right");
+        if (seenRetargets >= tuning.callSeenRetargetsMax) {
+            note(where + ": already turned to a seen caller " + seenRetargets + " times this call, left to the plan");
+            return false;
+        }
+        seenRetargets++;
+        if (inTurn) {
+            double t = turnedSoFar(now);
+            stopMotors();
+            searchRel += searchTurnLeft ? -t : t;
+        }
+        if (!seenLook) {
+            // The look the search was turning to is still to come; the one it stopped at is done.
+            seenResumeLook = inTurn ? searchLook - 1 : searchLook;
+        }
+        seenLook = true;
+        seenFrame = look.frameMs;
+        callBearing = searchRel + rel;
+        note(where + ": turning to face them (" + seenRetargets + " of " + tuning.callSeenRetargetsMax + ")");
+        state = State.CUE_TURN;
+        searchFirstTurn = false;
+        searchRemainingDeg = Math.abs(rel);
+        searchTurnLeft = rel < 0;
+        if (searchRemainingDeg < 1) {
+            enterCueLook(now);
+            return true;
+        }
+        startCueTurn(now, searchRemainingDeg, searchTurnLeft, 0);
+        return true;
+    }
+
+    /** KTD6's "found": a person box tall enough, with no aspect-ratio gate; nearest the bearing, else the tallest. */
+    private Detection callPerson(List<Detection> found) {
+        Detection best = null;
+        double bestOff = Double.MAX_VALUE;
+        for (Detection d : found) {
+            // The call's own floor (robot QA: a floor-level caller scored 0.27-0.32); curiosity keeps confidenceFloor.
+            if (d.score < tuning.callPersonMinScore || CuriosityPort.Kind.of(d.label) != CuriosityPort.Kind.PERSON
+                    || d.height() <= 0 || d.height() < tuning.callPersonMinHeight) {
+                continue;
+            }
+            double off = Double.isNaN(callBearing) ? -d.height()
+                    : Math.abs(Heading.delta(callBearing, searchRel + d.centerX() * tuning.cameraHalfFovDeg));
+            if (best == null || off < bestOff) {
+                best = d;
+                bestOff = off;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * The caller in front of him (KTD8): far, the call's FACE and APPROACH to politeHeight;
+     * near, the meeting here. The answer already played, so no acknowledgement.
+     */
+    private void callFound(long now, Look look, Detection p) {
+        seenLook = false;
+        if (callerInTurn != null) {
+            // The caller spoke while he turned to them: the meeting opens facing them, and is theirs.
+            note("the caller is talking and in view: the meeting opens facing them");
+            call = callerInTurn;
+            callerInTurn = null;
+            callerHeard = true;
+        }
+        gauges.stamp(Gauges.Stage.FACE_FOUND, now);
+        gauges.stamp(Gauges.Stage.CALL_FACING, now);
+        gauges.count(Gauges.Counter.FACES_FOUND);
+        Ears.Cue c = searchCue;
+        chatCueSide = c == null ? null : sideOf(c);
+        searchCue = null;
+        searchPlan = null;
+        beginPersonStop(now, look, p);
+        target = p;
+        remember(p.label, CuriosityPort.Kind.PERSON, now);
+        if (p.height() < tuning.callNearHeight) {
+            note("the caller is far: going over to them");
+            state = State.FACE;
+            faceTurns = 0;
+            lostLooks = 0;
+            firstLook = false;
+            face(now);
+            return;
+        }
+        note("the caller is near: meeting them here");
+        if (!canAsk()) {
+            nameClip(now);
+            return;
+        }
+        enterMeet(now, look.jpeg, p);
+    }
+
+    /** The call's look budget passed: the next look of its plan, or "Where'd you go?" once the plan is done. */
+    private void callLookOver(long now, boolean noLookAtAll) {
+        if (noLookAtAll) {
+            // No camera to find them with: the call is met where he is (KTD2), with no second answer.
+            note("camera gave no look in time during the call's search; curiosity off for "
+                    + tuning.cameraBackoffMs + " ms");
+            curiosityOffUntil = now + tuning.cameraBackoffMs;
+            callTaken = false;
+            takeCall(now, CallVerdict.IN_PLACE);
+            return;
+        }
+        if (seenLook) {
+            seenLook = false;
+            if (callerInTurn != null) {
+                callerSpoke(now, callerInTurn, "nobody where the caller was seen, and the caller is talking");
+                return;
+            }
+            note("nobody where the caller was seen: back to the planned looks");
+            searchLook = seenResumeLook;
+        }
+        if (searchLook + 1 >= searchPlan.length) {
+            enterWhere(now);
+            return;
+        }
+        nextSearchLook(now);
+    }
+
+    /** KTD9: nobody found. "Where'd you go?" in a clip window, then a listen of callListenMs after it. */
+    private void enterWhere(long now) {
+        stopMotors();
+        seenLook = false;
+        state = State.CUE_WHERE;
+        searchPlan = null;
+        searchCue = null;
+        show(EyeState.LISTENING, null);
+        note("nobody found for the call: asking where they went");
+        port.clipWindow(tuning.whereClipMs);
+        sound.playReaction("where");
+        ackUntil = now + tuning.whereClipMs + tuning.deafTailMs;
+        whereUntil = now + tuning.whereClipMs + tuning.callListenMs;
+    }
+
+    /** CUE_WHERE's step: silence for the whole listen resumes roaming, and the call is over. */
+    private void whereStep(long now) {
+        if (now < whereUntil) {
+            return;
+        }
+        note("no answer after asking where they went: carrying on");
+        clearCall();
+        quietResume(now);
+    }
+
+    /** A voice that is not a call after "Where'd you go?" (owner 2026-09-30): the caller answering, so the conversation opens. */
+    private void whereReply(long now, Ears.Cue c) {
+        callerSpoke(now, mergeCalls(call.kind, call, c), "a reply after asking where they went");
+    }
+
+    /**
+     * Whether a voice during the call's search is the caller's (owner 2026-09-30): from the
+     * call's side, or from a side that cannot be told (no side, or a call with none).
+     */
+    private boolean callersVoice(Ears.Cue c) {
+        Direction side = sideOf(c);
+        Direction callSide = call == null ? null : sideOf(call);
+        return side == null || callSide == null || side == callSide;
+    }
+
+    /** callersVoice, against the side the search is looking for (the call's, once retargeted). */
+    private boolean searchCallersVoice(Ears.Cue c) {
+        Direction side = sideOf(c);
+        Direction searching = searchCue != null ? sideOf(searchCue) : call == null ? null : sideOf(call);
+        return side == null || searching == null || side == searching;
+    }
+
+    /**
+     * The caller spoke during the call's search or after "Where'd you go?" (owner
+     * 2026-09-30: "he needs to start talking to people even when he's looking for them"):
+     * the search stops and the call's meeting opens here with nobody in view, the
+     * meeting-without-a-look path, which becomes the conversation: Claude's opener, then
+     * a listen. No turn: the side-first search already faces the call's side on its first
+     * looks. The cue carries no words (Ears passes none), so the opener starts it.
+     */
+    /**
+     * The caller's voice during the search: the conversation opens now, or, during the first
+     * turn (the one toward the call's side), once that turn is done, so he faces their side.
+     */
+    private void callerVoiceInSearch(long now, Ears.Cue c, String why) {
+        if (seenLook) {
+            // Facing the person he saw beats opening with nobody in view: the confirming look decides.
+            if (callerInTurn == null) {
+                note(why + ": the caller is talking; the conversation opens once he has looked where they were seen");
+            }
+            callerInTurn = c;
+            return;
+        }
+        if (state == State.CUE_TURN && searchFirstTurn) {
+            if (callerInTurn == null) {
+                note(why + ": the caller is talking; the conversation opens once he faces their side");
+            }
+            callerInTurn = c;
+            return;
+        }
+        callerSpoke(now, c, why);
+    }
+
+    private void callerSpoke(long now, Ears.Cue c, String why) {
+        callerInTurn = null;
+        seenLook = false;
+        note(why + ": the caller is talking to him, the conversation opens now");
+        call = c;
+        meetWithoutLooking(now, c, "the call's meeting opens on the caller's voice, nobody in view");
+        callerHeard = true;
+    }
+
+    /** The call's approach arrived (KTD8): the meeting opens on this look, not the curiosity line. */
+    private void callArrive(long now, Look look) {
+        stopMotors();
+        hazardTimes.clear();
+        note("arrived: a polite distance from the caller");
+        if (look != null && look.jpeg != null) {
+            enterMeet(now, look.jpeg, target);
+        } else {
+            enterMeetLook(now);
+        }
+    }
+
+    /**
+     * A hazard or a lost lease interrupts the call's stop (KTD1): during its search or its
+     * approach the call goes back to the slot, answered, to be retaken when the escape (or
+     * EYES_ONLY) allows; anywhere else (its meeting) the call is over.
+     */
+    private void handBackCall(String why) {
+        if (!callsOwn()) {
+            return;
+        }
+        if (state.cueSearch() || state.approachesPerson()) {
+            callTaken = false;
+            callWaitCounted = false;
+            note(why + " during the call's search or approach: the call waits in its slot");
+        } else {
+            note(why + " during the call's meeting: the call is done");
+            clearCall();
+        }
+    }
+
+    private void clearCall() {
+        call = null;
+        comeHereCall = false;
+        callBlockedTurns = 0;
+        callTaken = false;
+        callAnswered = false;
+        callWaitCounted = false;
+        callerHeard = false;
+        callBearing = Double.NaN;
+        if (nextCall != null) {
+            // The waiting caller's turn: a fresh, untaken, unanswered call that callStep's verdict takes.
+            call = nextCall;
+            nextCall = null;
+            gauges.stamp(Gauges.Stage.CALL_HEARD, call.at);
+            note("the waiting call from " + call.side + " takes the slot");
+        }
+    }
+
     /** During a search (KTD3): a strong cue from the other side retargets once; everything else is ignored. */
     private void offerCueDuringSearch(long now, Ears.Cue c) {
+        if (callsOwn() && state != State.CUE_WHERE && searchCallersVoice(c)) {
+            // Owner 2026-09-30: the caller's voice during the call's search opens the conversation.
+            callerVoiceInSearch(now, c.strong() ? c : mergeCalls(call.kind, call, c),
+                    "cue " + c.tier + " " + c.side + " during the call's search");
+            return;
+        }
         Direction side = sideOf(c);
         Direction searching = searchCue == null ? null : sideOf(searchCue);
         if (c.strong() && side != null && searching != null && side != searching && !searchRetargeted) {
             note("strong cue from the other side during the search: retargeting once");
-            gauges.count(Gauges.Counter.RETARGETS);
             stopMotors();
+            if (callsOwn()) {
+                // The call's own search stays the call's, looking where this voice came from.
+                call = new Ears.Cue(call.kind, Ears.Tier.STRONG, c.side, c.angleDeg, c.at);
+                startCallSearch(now, call, true);
+                return;
+            }
+            gauges.count(Gauges.Counter.RETARGETS);
             enterCueSearch(now, c, true);
             return;
         }
@@ -5017,21 +9850,35 @@ final class ExploreBrain {
         if (state.chats()) {
             return chatVerdict(c);
         }
-        if (state == State.EYES_ONLY || !camera.available() || now < curiosityOffUntil) {
-            // He cannot move, or has no camera to decide with: only the wake word opens a meeting.
-            return c.kind == Ears.Kind.WAKE_WORD ? CueVerdict.TAKE : CueVerdict.DROP;
+        if (state == State.EYES_ONLY || state == State.DOCKED || !camera.available() || now < curiosityOffUntil) {
+            // He cannot move (eyes-only, or docked: a shove or a voice there is not a reason to
+            // turn), or has no camera to decide with: only a call opens a meeting (callVerdict).
+            return CueVerdict.DROP;
+        }
+        if (remarkUnderway()) {
+            // The remark rate (owner 2026-10-01): a voice that is not a call waits for the remark.
+            return CueVerdict.HOLD;
+        }
+        if (jammed && state == State.CORNERED) {
+            // A turn to a voice would only push against the jam; a call is met where he is.
+            return CueVerdict.DROP;
+        }
+        if (seeking() && state.roams()) {
+            // Robot 2026-10-01: a voice is no reason to drop a seek; it waits for the seek's end.
+            return CueVerdict.HOLD;
         }
         switch (state) {
-            case PAUSE: case HOP: case SCAN: case INSPECT: case REACT_HERE: case CORNERED: case ASK: case ORIENT:
+            case PAUSE: case HOP: case SCAN: case INSPECT: case REACT_HERE: case ASK: case ORIENT:
                 return CueVerdict.TAKE;
+            case CORNERED:
+                // A cornered rest is part of an escape (robot 2026-10-01): a voice waits for its end.
+                return CueVerdict.HOLD;
             case LOOK: case TURN:
                 return escape ? CueVerdict.HOLD : CueVerdict.TAKE;
-            case SPEAK:
-                // Before the line starts the remark is dropped; while it plays the deaf window is open (KTD1).
-                return pendingLine != null ? CueVerdict.TAKE : CueVerdict.HOLD;
             case FACE: case APPROACH: case MEET_LOOK: case MEET:
                 return sameSideAsPerson(c) ? CueVerdict.CONFIRM : CueVerdict.TAKE;
-            case STARTLE: case BACK_OFF: case RETRACE: case CIRCLE: case WAY_OUT: case DRIVE_OFF:
+            case STARTLE: case BACK_OFF: case RETRACE: case CIRCLE: case WAY_OUT: case DRIVE_OFF: case RECOVER:
+            case TIP:
             case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP: case CONFIRM: case LAST_NAME:
                 return CueVerdict.HOLD;
             default:
@@ -5040,18 +9887,48 @@ final class ExploreBrain {
     }
 
     /**
-     * The CHAT states (KTD8): a strong utterance whose latched angle magnitude exceeds
-     * newcomerAngleDeg is held as a newcomer cue (kept until the conversation ends,
-     * however long it runs); one inside it, the wake word included, is the speaker's
-     * reply (the listen hears it) or dropped, since the listening look tells them
-     * when he hears; weak cues are ignored. Without an angle nobody can be told
-     * apart, so the voice is the speaker's.
+     * A stop with a remark to make (the remark rate, owner 2026-10-01): a line at
+     * SPEAK, or a pick with a line that is not a person to meet, on its way to it.
+     * Office voices that are not calls used to drop nearly every one.
+     */
+    private boolean remarkUnderway() {
+        if (state == State.SPEAK) {
+            return true;
+        }
+        if (state != State.ORIENT && state != State.FACE && state != State.APPROACH && state != State.INSPECT
+                && state != State.REACT_HERE) {
+            return false;
+        }
+        return pick != null && (pick.kind != CuriosityPort.Kind.PERSON || remarkOnly) && usable(pick.line);
+    }
+
+    /**
+     * The CHAT states (KTD8), for cues that are not calls (a call waits the
+     * conversation out, callVerdict): a strong utterance whose latched angle magnitude
+     * exceeds newcomerAngleDeg is held as a newcomer cue (kept until the conversation
+     * ends, however long it runs); one inside it is the speaker's reply (the listen
+     * hears it) or dropped, since the listening look tells them when he hears; weak
+     * cues are ignored. Without an angle nobody can be told apart, so the voice is the
+     * speaker's.
      */
     private CueVerdict chatVerdict(Ears.Cue c) {
-        if (!c.strong()) {
+        if (!c.strong() || chatFaceless) {
+            // With nobody in view nobody can be told apart from the partner.
             return CueVerdict.DROP;
         }
         return c.hasAngle() && Math.abs(c.angleDeg) > tuning.newcomerAngleDeg ? CueVerdict.HOLD : CueVerdict.DROP;
+    }
+
+    /** The box the stop is heading for: the target, else the meeting's expected box, else the pick's. */
+    private Detection headedBox() {
+        return target != null ? target : meetExpect != null ? meetExpect : pick != null ? pick.box : null;
+    }
+
+    /** Whether the stop is heading for a person (KTD2 step 6: only a person can be the caller
+     * he carries on toward; a call made while he approaches a thing still searches, R1). */
+    private boolean headingForAPerson() {
+        Detection box = headedBox();
+        return box != null && CuriosityPort.Kind.of(box.label) == CuriosityPort.Kind.PERSON;
     }
 
     /**
@@ -5060,8 +9937,16 @@ final class ExploreBrain {
      * of where their box puts them; with only a side, a box near the centre counts as
      * either side and a voice with no side as theirs.
      */
+    /**
+     * A cue with a direction: a voice the ears placed. A shove's cue has none (robot 2026-10-02 at
+     * home: "shoved: ~3700 counts" every 0.5 s read as "a voice from the person's side").
+     */
+    private static boolean fromKnownSide(Ears.Cue c) {
+        return c != null && (c.side != Ears.Side.UNKNOWN || c.hasAngle());
+    }
+
     private boolean sameSideAsPerson(Ears.Cue c) {
-        Detection box = target != null ? target : meetExpect != null ? meetExpect : pick != null ? pick.box : null;
+        Detection box = headedBox();
         if (box == null) {
             return false;
         }
@@ -5100,6 +9985,34 @@ final class ExploreBrain {
         gauges.count(Gauges.Counter.CUES_DROPPED);
     }
 
+    /** A lean-in ended with no meeting (nobody facing him, no usable face, a dropped meeting): the cooldown. */
+    private void leanInOver(long now) {
+        if (tuning.leanInCooldownMs > 0) {
+            leanInCooldownUntil = now + tuning.leanInCooldownMs;
+        }
+    }
+
+    /**
+     * A voice that is not a call, inside the lean-in hold-off (leanInCooldownMs after one
+     * that met nobody, leanInMinGapMs after any): ignored, with one note per hold-off.
+     */
+    private boolean leanInHeldOff(long now, Ears.Cue c) {
+        if (c == leanInExempt) {
+            return false;
+        }
+        long until = Math.max(leanInCooldownUntil, leanInAt == NEVER || tuning.leanInMinGapMs <= 0 ? NEVER
+                : leanInAt + tuning.leanInMinGapMs);
+        if (until == NEVER || now >= until) {
+            return false;
+        }
+        gauges.count(Gauges.Counter.CUES_DROPPED);
+        if (until != leanInIgnoreNoted) {
+            leanInIgnoreNoted = until;
+            note("cue ignored: lean-in cooldown (" + (until - now + 999) / 1000 + " s left)");
+        }
+        return true;
+    }
+
     /** A held cue lasts cueHoldMs; past that a strong one becomes a lean-in and a weak one is dropped (KTD3). */
     private void expireHeldCue(long now) {
         // A newcomer held during a conversation keeps however long it runs (KTD3, R15).
@@ -5124,6 +10037,9 @@ final class ExploreBrain {
         switch (cueVerdict(now, c)) {
             case TAKE:
                 cueHeld = null;
+                if (leanInHeldOff(now, c)) {
+                    break;
+                }
                 note("taking the held cue");
                 takeCue(now, c);
                 break;
@@ -5139,12 +10055,8 @@ final class ExploreBrain {
         }
     }
 
-    /** Takes a cue: the search, or, when he cannot move or see, the wake word's meeting without a turn. */
+    /** Takes a cue that is not a call: the search (cueVerdict never takes one he cannot turn to). */
     private void takeCue(long now, Ears.Cue c) {
-        if (state == State.EYES_ONLY || !camera.available() || now < curiosityOffUntil) {
-            meetWithoutLooking(now, c);
-            return;
-        }
         leaveForCue();
         enterCueSearch(now, c, false);
     }
@@ -5152,6 +10064,9 @@ final class ExploreBrain {
     /** Stops whatever the state was doing so the search can start: the wheels, a stop's pick or line, a leg plan. */
     private void leaveForCue() {
         stopMotors();
+        if (state == State.DOCKED) {
+            dropDockLook("a call");
+        }
         if (state.inStop()) {
             if (pendingLine != null) {
                 note("a voice before the line started: dropping the remark");
@@ -5163,6 +10078,9 @@ final class ExploreBrain {
         hopNext = false;
         plannedTicks = -1;
         doorwayLeg = false;
+        // Review P3: a trusted short leg cut off here leaves no trust for a later leg.
+        trustLeg = false;
+        trustLegDoor = false;
         lookForLeg = false;
         steerWaitUntil = NO_WAIT;
         escape = false;
@@ -5170,6 +10088,7 @@ final class ExploreBrain {
 
     /** CUE_TURN: the eyes glance to the side, then the first turn toward the voice (KTD4). */
     private void enterCueSearch(long now, Ears.Cue c, boolean retarget) {
+        seenLook = false;
         state = State.CUE_TURN;
         searchCue = c;
         searchRetargeted = retarget;
@@ -5179,6 +10098,12 @@ final class ExploreBrain {
             if (!c.strong()) {
                 gauges.count(Gauges.Counter.LEAN_INS);
             }
+            if (c != leanInExempt) {
+                leanInAt = now;
+            }
+            leanInExempt = null;
+            leanInOpen = true;
+            leanInMet = false;
         }
         double first = firstTurnDeg(c);
         searchPlan = lookPlan(first, c.strong());
@@ -5302,6 +10227,10 @@ final class ExploreBrain {
 
     /** CUE_LOOK: attentive eyes, the camera deciding within leanInMs of being ready (KTD4). */
     private void enterCueLook(long now) {
+        if (callerInTurn != null && callsOwn() && !seenLook) {
+            callerSpoke(now, callerInTurn, "the turn toward the caller's side is done");
+            return;
+        }
         searchFirstTurn = false;
         if (!searchTurnDoneStamped) {
             searchTurnDoneStamped = true;
@@ -5312,12 +10241,31 @@ final class ExploreBrain {
         step = Step.WAIT_LOOK;
         lookAfter = now + tuning.lookSettleMs;
         long ready = Math.max(now, cameraClosedAt + tuning.reopenGapMs);
+        if (callsOwn()) {
+            // Robot 2026-09-30: detection takes 1.8-4.7 s a frame, so no settle wait. The wheels
+            // were stopped in this same step (the turn's end, or no turn at all), so any frame
+            // captured from now on is fresh; stale ones are still checked (staleCallLook).
+            lookAfter = now;
+            Look before = camera.latest();
+            callStopFrame = before == null ? NEVER : before.frameMs;
+            callLookChecked = NEVER;
+            // KTD6: a budget; a camera just (re)opened has no look yet and gets the first-look time.
+            long budget = camera.latest() == null ? tuning.firstLookTimeoutMs : tuning.callLookMs;
+            lookDeadline = Math.max(lookAfter, ready) + budget;
+            note(seenLook ? "looking where the caller was seen"
+                    : "looking for the caller (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
+            return;
+        }
         lookDeadline = ready + tuning.leanInMs;
-        note("looking for a face turned toward him (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
+        note("looking for a person toward him (look " + (searchLook + 1) + " of " + searchPlan.length + ")");
     }
 
     /** A look during CUE_LOOK: a facing face ends the search in the meeting; anything else waits for the next look. */
     private void cueLook(long now, Look look) {
+        if (callsOwn()) {
+            callLook(now, look);
+            return;
+        }
         Detection face = facingFace(look.detections);
         if (face == null || look.jpeg == null) {
             lookAfter = look.frameMs + 1;
@@ -5348,7 +10296,8 @@ final class ExploreBrain {
     private void foundFace(long now, Look look, Detection face) {
         gauges.stamp(Gauges.Stage.FACE_FOUND, now);
         gauges.count(Gauges.Counter.FACES_FOUND);
-        note("a face turned toward him after the cue");
+        // The shape test sees a person box only: the face check in the meeting decides (robot 2026-10-01).
+        note("a person toward him after the cue (a person box; the face check decides)");
         port.clipWindow(tuning.ackClipMs);
         sound.playReaction("acknowledge");
         ackUntil = now + tuning.ackClipMs + tuning.deafTailMs;
@@ -5357,10 +10306,15 @@ final class ExploreBrain {
         searchCue = null;
         searchPlan = null;
         beginPersonStop(now, look, face);
+        cuePick = true;
+        if (fromKnownSide(c)) {
+            personVoiceAt = c.at;
+        }
         target = face;
         remember(face.label, CuriosityPort.Kind.PERSON, now);
-        if (!port.canAsk()) {
+        if (!canAsk()) {
             note("no Claude to meet them with: the name clip");
+            leanInMet = true;
             nameClip(now);
             return;
         }
@@ -5369,17 +10323,26 @@ final class ExploreBrain {
 
     /** The look's budget passed with no facing face: the next look of the plan, or a quiet resume. */
     private void cueLookOver(long now, boolean noLookAtAll) {
+        if (callsOwn()) {
+            callLookOver(now, noLookAtAll);
+            return;
+        }
         if (noLookAtAll) {
             note("camera gave no look in time; curiosity off for " + tuning.cameraBackoffMs + " ms");
             curiosityOffUntil = now + tuning.cameraBackoffMs;
             quietResume(now);
             return;
         }
-        searchLook++;
-        if (searchLook >= searchPlan.length) {
+        if (searchLook + 1 >= searchPlan.length) {
             quietResume(now);
             return;
         }
+        nextSearchLook(now);
+    }
+
+    /** Turns to the plan's next look (or looks at once when it is where he already faces). */
+    private void nextSearchLook(long now) {
+        searchLook++;
         double delta = Heading.wrap(searchPlan[searchLook] - searchRel + 180) - 180;
         if (Math.abs(delta) < 1) {
             enterCueLook(now);
@@ -5402,16 +10365,191 @@ final class ExploreBrain {
     }
 
     /**
-     * The wake word while he cannot move or cannot look (KTD8): no turn and no face,
-     * so the meeting takes the stranger's text-only lines and the guards that would
-     * send him to EYES_ONLY hold off until it ends.
+     * Conversation first (owner 2026-10-02: "he needs to be able to carry on a conversation even
+     * before he's managed to turn and recognize the person"). The taken call opens the
+     * conversation here, with nobody in view and no search before it: the persona comes from the
+     * port (no Claude), and turn 1 goes out as soon as it is in. An early wake cue's answer clip
+     * waits for the utterance's end (at most callUtteranceWaitMs), since its deaf window would
+     * cut off the words said with the wake word, which are the first message. He looks for the
+     * caller during the conversation (ChatSession's search) unless he cannot turn (IN_PLACE).
      */
-    private void meetWithoutLooking(long now, Ears.Cue c) {
-        if (!port.canAsk()) {
-            dropCue("wake word, but no Claude to meet anyone with");
+    private void openCallChat(long now, Ears.Cue c, CallVerdict v) {
+        stopMotors();
+        if (state.inStop()) {
+            clearStop();
+        }
+        gauges.stamp(Gauges.Stage.CUE_AT, c.at);
+        boolean inPlace = v == CallVerdict.IN_PLACE;
+        chatCueSide = sideOf(c);
+        wheellessMeeting = inPlace;
+        beginPersonStop(now, null, UNSEEN_PERSON);
+        target = null;
+        state = State.MEET;
+        meetingHeld = true;
+        stranger = null;
+        matched = null;
+        helloOnly = false;
+        meetLines = false;
+        callChatOpening = true;
+        callChatCue = c;
+        callChatMessage = c.message;
+        callChatSearch = !inPlace;
+        callUtteranceUntil = !callAnswered && c.kind == Ears.Kind.WAKE_WORD && !c.alreadyCalled() && !c.hasMessage()
+                && tuning.callUtteranceWaitMs > 0 ? now + tuning.callUtteranceWaitMs : NEVER;
+        show(EyeState.GLANCE, chatCueSide);
+        meetDeadline = now + tuning.meetTimeoutMs;
+        note("the call opens the conversation now" + (inPlace ? ", where he is (no turning)"
+                : "; he looks for the caller during it")
+                + (callUtteranceUntil != NEVER ? "; the answer waits for the end of what they are saying" : ""));
+        port.callChat(tuning.meetTimeoutMs);
+        if (callUtteranceUntil == NEVER && !callAnswered) {
+            answerCall(now);
+        }
+    }
+
+    /** The opening call conversation in MEET: the answer once the utterance ended, then the persona, then CHAT. */
+    private void callChatOpeningStep(long now) {
+        if (callUtteranceUntil != NEVER) {
+            if (now < callUtteranceUntil) {
+                return;
+            }
+            callUtteranceUntil = NEVER;
+            note("no end of the call's utterance in " + tuning.callUtteranceWaitMs + " ms: answering now");
+        }
+        if (!callAnswered) {
+            answerCall(now);
+        }
+        CuriosityPort.MatchAnswer a = port.callChatAnswer();
+        if (a == null) {
+            if (now < meetDeadline) {
+                return;
+            }
+            note("no conversation settings in " + tuning.meetTimeoutMs + " ms");
+            a = CuriosityPort.MatchAnswer.FAILED;
+        }
+        callChatOpening = false;
+        if (a.persona != null && chatLikely()) {
+            enterChat(now, a);
             return;
         }
-        note("wake word while he cannot turn to it: meeting without a look");
+        // An older launcher, or no ears: the meeting without a look, as before conversation first.
+        note("the call's conversation cannot open here: the meeting without a look");
+        callChatCue = null;
+        meetLines = true;
+        meetDeadline = now + tuning.meetTimeoutMs;
+        port.lines(tuning.meetTimeoutMs);
+    }
+
+    /** Forgets the call conversation's opening and its search; a search turn under way stops. */
+    private void clearCallChat() {
+        if (chatSeekTurning) {
+            chatSeekTurning = false;
+            stopMotors();
+        }
+        callChatOpening = false;
+        callChatCue = null;
+        callChatMessage = "";
+        callChatSearch = false;
+        callUtteranceUntil = NEVER;
+        chatSeekPlan = null;
+        chatSeekIndex = 0;
+        chatSeekRel = 0;
+        chatSeekCentring = false;
+        chatSeekBlocked = 0;
+    }
+
+    /**
+     * The search plan for the call conversation (bearings right positive from where it opened),
+     * as the call's search plans it: an angle, then its 45 deg neighbours; a side (the chip's
+     * usual cue), that side at 90 deg, then 135 and 45 on it, then ahead, the other side and
+     * behind; neither, one circle of 45 deg looks from straight ahead.
+     */
+    private void planChatSeek(Ears.Cue c, boolean search) {
+        chatSeekPlan = null;
+        chatSeekIndex = 0;
+        chatSeekRel = 0;
+        chatSeekCentring = false;
+        chatSeekTurning = false;
+        chatSeekBlocked = 0;
+        if (!search) {
+            return;
+        }
+        double since = c.hasAngle() ? headingHistory.turnedSince(c.at) : Double.NaN;
+        if (!Double.isNaN(since)) {
+            double bearing = Heading.delta(0, c.angleDeg + since);
+            chatSeekPlan = new double[]{bearing, bearing - CALL_STEP_DEG, bearing + CALL_STEP_DEG};
+        } else if (c.side == Ears.Side.LEFT || c.side == Ears.Side.RIGHT) {
+            double s = c.side == Ears.Side.LEFT ? -1 : 1;
+            chatSeekPlan = new double[]{s * 2 * CALL_STEP_DEG, s * 3 * CALL_STEP_DEG, s * CALL_STEP_DEG, 0,
+                    -s * CALL_STEP_DEG, -s * 2 * CALL_STEP_DEG, -s * 3 * CALL_STEP_DEG, -s * 4 * CALL_STEP_DEG};
+        } else {
+            chatSeekPlan = new double[CALL_CIRCLE_LOOKS];
+            for (int i = 0; i < chatSeekPlan.length; i++) {
+                chatSeekPlan[i] = CALL_STEP_DEG * i;
+            }
+        }
+    }
+
+    /** Whether a search turn may start now: a fresh, clear reading, the wheels, off the charger, turns that turn. */
+    private boolean chatMayTurn() {
+        return chatFresh && !chatHazard && leaseHeld && !chatNoWheels && !wheellessMeeting && !onCharger()
+                && !jammed && chatSeekBlocked < tuning.callBlockedTurnsMax && state.chats();
+    }
+
+    /** One short search turn, timed or measured like a curiosity turn. */
+    private void startChatTurn(long now, double deg, boolean left) {
+        heading = left ? Direction.LEFT : Direction.RIGHT;
+        turnDeg = deg;
+        turnMs = timedMs(deg);
+        moving = true;
+        turnWheels(heading);
+        turnStartedAt = now;
+        phaseUntil = now + turnMs;
+        measureTurn(now, deg);
+        chatSeekTurning = true;
+        chatSeekTurnLeft = left;
+    }
+
+    /** The search turn ends (done, held or blocked): where he faces now moves by what it turned. */
+    private void endChatTurn(long now, String why) {
+        double turned;
+        if (measured && compass.usable(now)) {
+            turned = Math.abs(compass.turned());
+        } else {
+            turned = turnDeg * Math.min(1.0, (now - turnStartedAt) / (double) Math.max(1, turnMs));
+        }
+        stopMotors();
+        chatSeekTurning = false;
+        chatSeekRel += chatSeekTurnLeft ? -turned : turned;
+        if (why != null) {
+            note(why);
+        }
+    }
+
+    /** Each conversation step: the search turn under way, if any, ends when done, blocked or on a hazard. */
+    private void chatTurnStep(long now) {
+        if (!chatSeekTurning) {
+            return;
+        }
+        if (turnBlocked(now)) {
+            chatSeekBlocked++;
+            endChatTurn(now, "the search turn would not turn (" + chatSeekBlocked + " of " + tuning.callBlockedTurnsMax
+                    + (chatSeekBlocked >= tuning.callBlockedTurnsMax ? "): no more turning in this conversation" : ")"));
+        } else if (chatHazard) {
+            endChatTurn(now, "a hazard reading: the search turn stops");
+        } else if (turnDone(now)) {
+            endChatTurn(now, null);
+        }
+    }
+
+    /**
+     * A call while he cannot move or cannot look (KTD8; hey-miko plan KTD5: on the
+     * charger too): no turn and no face, so the meeting takes the stranger's text-only
+     * lines and the guards that would send him to EYES_ONLY hold off until it ends.
+     * takeCall has already checked that Claude is there to meet with.
+     */
+    private void meetWithoutLooking(long now, Ears.Cue c, String why) {
+        note(why);
         gauges.stamp(Gauges.Stage.CUE_AT, c.at);
         stopMotors();
         if (state.inStop()) {
@@ -5445,7 +10583,7 @@ final class ExploreBrain {
 
     /** The ears session is listening and Claude is set up: a meeting will most likely become a conversation. */
     private boolean chatLikely() {
-        return earsOpen && ears.listening() && port.canAsk();
+        return earsOpen && ears.listening() && canAsk();
     }
 
     /** MEET becomes the conversation (KTD8): turn 1 goes out the moment the match answered. */
@@ -5453,6 +10591,8 @@ final class ExploreBrain {
         stopMotors();
         meetingHeld = true;
         boolean faceless = wheellessMeeting || a.faceless;
+        chatFaceless = faceless;
+        partnerSpokeAt = NEVER;
         chatSide = chatCueSide != null ? chatCueSide : sideOfPick();
         chatNoWheels = !leaseHeld;
         chatStallSince = NEVER;
@@ -5460,18 +10600,40 @@ final class ExploreBrain {
             port.touch();
         }
         note("the meeting becomes a conversation" + (faceless ? " with nobody in view" : "") + " (" + a.status + ")");
+        String kind = meetKind();
+        if (callTaken) {
+            // KTD1: the call is kept until the conversation opens.
+            gauges.stamp(Gauges.Stage.CALL_ARRIVED, now);
+            clearCall();
+        }
         chat = new ChatSession(tuning, port, chatHost);
+        chat.learnNumber(++chatCount);
+        chat.learnMeeting(kind, faceless);
         state = State.CHAT_THINK;
         syncPark();
-        chat.start(now, a, faceless, chatCheckOpen, chatSettled);
+        if (callChatCue != null) {
+            // Owner 2026-10-02: the call's conversation, opened before he has seen them.
+            Ears.Cue c = callChatCue;
+            boolean search = callChatSearch && !onCharger() && leaseHeld;
+            planChatSeek(c, search);
+            String message = callChatMessage;
+            callChatCue = null;
+            callChatMessage = "";
+            chat.startCall(now, a, message, search, ackUntil);
+        } else {
+            chat.start(now, a, faceless, chatCheckOpen, chatSettled);
+        }
         state = chatState(chat.state());
     }
 
-    private void chatStep(long now) {
+    private void chatStep(long now, boolean fresh, boolean hazard) {
         if (chat == null) {
             endCuriosity(now);
             return;
         }
+        chatFresh = fresh;
+        chatHazard = hazard;
+        chatTurnStep(now);
         chat.step(now);
         state = chatState(chat.state());
         syncPark();
@@ -5492,21 +10654,32 @@ final class ExploreBrain {
      */
     private void finishChat(long now) {
         boolean named = chat.named();
-        boolean docked = classifier.charger();
+        boolean docked = onCharger();
+        // Owner 2026-10-02: the instruction it ended on, carried out once it is over.
+        CuriosityPort.Action asked = chat.action();
+        String askedTarget = chat.actionTarget();
+        ChatActions.Act askedAct = chat.act();
+        Direction askedSide = chatSide;
         peopleIgnoredUntil = now + tuning.peopleCooldownMs;
         if (named) {
             met.addLast(new Met(port.metId(), now));
             note("conversation with someone named over: left alone for " + (tuning.metLeaveAloneMs / 1000) + " s ("
                     + met.size() + " met recently)");
         } else {
+            long alone = asked == CuriosityPort.Action.GO_AWAY
+                    ? Math.max(tuning.unnamedLeaveAloneMs, INTENT_LEAVE_ALONE_MS) : tuning.unnamedLeaveAloneMs;
             leaveAloneSide = chatSide;
-            leaveAloneUntil = now + tuning.unnamedLeaveAloneMs;
+            leaveAloneUntil = now + alone;
             note("conversation with someone unnamed over: their side (" + chatSide + ") left alone for "
-                    + (tuning.unnamedLeaveAloneMs / 1000) + " s");
+                    + (alone / 1000) + " s");
         }
-        if (cueHeld != null) {
+        if (call != null) {
+            note("a call waited for the conversation: it is answered now");
+            awayLeg = null;
+        } else if (cueHeld != null) {
             note("the newcomer's held cue is taken now");
             cueHeld = new Ears.Cue(cueHeld.kind, cueHeld.tier, cueHeld.side, cueHeld.angleDeg, now);
+            leanInExempt = cueHeld;
             awayLeg = null;
         } else if (docked) {
             note("on the charger: no resume leg");
@@ -5515,6 +10688,14 @@ final class ExploreBrain {
             awayLeg = chatSide == null ? null : chatSide.opposite();
         }
         endCuriosity(now);
+        if (asked != CuriosityPort.Action.NONE && call == null) {
+            if (task != null) {
+                endTask(now, "a new instruction", null);
+            }
+            startAct(now, askedAct != null ? askedAct : ChatActions.Act.of(asked, askedTarget), askedSide);
+        } else if (asked != CuriosityPort.Action.NONE) {
+            note("intent: " + asked.word() + " dropped (a call waited for the conversation)");
+        }
         // The guards the conversation held off (KTD7) apply again at once.
         if (!leaseHeld) {
             enterEyesOnly("lease lost");
@@ -5534,7 +10715,8 @@ final class ExploreBrain {
 
     /** The detector is parked through the CHAT states except for the one look the conversation asks for (KTD7). */
     private void syncPark() {
-        boolean want = (state.chats() || (state == State.MEET || state.confirms()) && chatLikely()) && !chatLookWanted;
+        boolean want = (state.chats() || (state == State.MEET || state.confirms()) && chatLikely()) && !chatLookWanted
+                || state == State.DOCKED && !dockLooking;
         if (want != parked) {
             parked = want;
             if (!parked && cameraOpen) {
@@ -5597,7 +10779,19 @@ final class ExploreBrain {
 
         @Override
         public boolean looksAllowed() {
+            long now = clock.nowMs();
+            if (partnerSpokeAt != NEVER && now - partnerSpokeAt <= tuning.unansweredListenMs) {
+                // Owner 2026-09-30: they spoke during that listen (a wake word the listen did not
+                // get as words): still here, so no walked-off look; the chat listens again.
+                note("the partner spoke during the listen: still here, no walked-off look");
+                return false;
+            }
             // The camera rule keeps its lease requirement (KTD7): without it the look is skipped.
+            return leaseHeld && !chatNoWheels && cameraOpen && camera.available() && clock.nowMs() >= curiosityOffUntil;
+        }
+
+        @Override
+        public boolean faceLooksAllowed() {
             return leaseHeld && !chatNoWheels && cameraOpen && camera.available() && clock.nowMs() >= curiosityOffUntil;
         }
 
@@ -5619,7 +10813,114 @@ final class ExploreBrain {
 
         @Override
         public boolean charger() {
-            return classifier.charger();
+            return onCharger();
+        }
+
+        // Owner 2026-10-03: the look tool. Privacy first: in a bathroom no frame goes to Claude,
+        // and do not disturb (muted, be_quiet) takes no look either; then the camera rule (KTD7).
+        @Override
+        public String lookBlocked() {
+            if (bathroom || bathHeld(clock.nowMs())) {
+                return "privacy: he thinks he is in a bathroom, so his camera shares nothing";
+            }
+            if (muted || quiet) {
+                return "he is in do not disturb";
+            }
+            if (!leaseHeld || chatNoWheels || !cameraOpen || !camera.available()) {
+                return "his camera is not available right now";
+            }
+            return null;
+        }
+
+        @Override
+        public CuriosityPort.ToolFacts toolFacts() {
+            return toolFactsNow(clock.nowMs(), "talking with someone");
+        }
+
+        @Override
+        public CuriosityPort.LookResult fastLook(long now) {
+            return fastToolLook(now);
+        }
+
+        @Override
+        public void stopActs() {
+            // Owner 2026-10-03: "stop" ends any errand or task at once; he stays put.
+            long now = clock.nowMs();
+            if (task != null) {
+                endTask(now, "stopped", null);
+            }
+            if (intent != CuriosityPort.Action.NONE) {
+                dropIntent("told to stop");
+            }
+            awayLeg = null;
+        }
+
+        @Override
+        public ChatSession.Seek seek(long now) {
+            if (chatSeekPlan == null || chatSeekIndex >= chatSeekPlan.length) {
+                chatSeekPlan = null;
+                chatSeekCentring = false;
+                return ChatSession.Seek.DONE;
+            }
+            double delta = Heading.wrap(chatSeekPlan[chatSeekIndex] - chatSeekRel + 180) - 180;
+            // A turn lands within a few degrees of what it asked: closer than CHAT_SEEK_CLOSE_DEG is there.
+            double close = chatSeekCentring ? Math.max(CHAT_SEEK_CLOSE_DEG, tuning.centreTolerance * tuning.cameraHalfFovDeg)
+                    : CHAT_SEEK_CLOSE_DEG;
+            if (Math.abs(delta) < close) {
+                if (chatSeekCentring) {
+                    chatSeekPlan = null;
+                    chatSeekCentring = false;
+                    return ChatSession.Seek.DONE;
+                }
+                return ChatSession.Seek.LOOK;
+            }
+            if (!chatMayTurn()) {
+                if (chatSeekBlocked >= tuning.callBlockedTurnsMax || !leaseHeld || chatNoWheels) {
+                    // Turns that do nothing, or no wheels: the search ends; looks here still run.
+                    chatSeekPlan = null;
+                    chatSeekCentring = false;
+                    return ChatSession.Seek.DONE;
+                }
+                return ChatSession.Seek.HELD;
+            }
+            double deg = Math.min(Math.abs(delta), tuning.cueTurnStepDeg);
+            note((chatSeekCentring ? "turning to face the caller: " : "looking for the caller: turning ")
+                    + (delta < 0 ? "left " : "right ") + Math.round(deg) + " deg");
+            startChatTurn(now, deg, delta < 0);
+            return ChatSession.Seek.TURNING;
+        }
+
+        @Override
+        public void seekLooked() {
+            if (chatSeekPlan != null && !chatSeekCentring) {
+                chatSeekIndex++;
+            }
+        }
+
+        @Override
+        public boolean seekTurning() {
+            return chatSeekTurning;
+        }
+
+        @Override
+        public void holdStill() {
+            if (chatSeekTurning) {
+                endChatTurn(clock.nowMs(), "the search turn stops: he speaks, or an answer started");
+            }
+        }
+
+        @Override
+        public Detection callerIn(Look look) {
+            return look == null ? null : callPerson(look.detections);
+        }
+
+        @Override
+        public void faceCaller(Detection box) {
+            gauges.stamp(Gauges.Stage.CALL_FACING, clock.nowMs());
+            chatSide = box.centerX() < 0 ? Direction.LEFT : box.centerX() > 0 ? Direction.RIGHT : chatSide;
+            chatSeekPlan = new double[]{chatSeekRel + box.centerX() * tuning.cameraHalfFovDeg};
+            chatSeekIndex = 0;
+            chatSeekCentring = true;
         }
     };
 
@@ -5640,8 +10941,64 @@ final class ExploreBrain {
 
     // ---- entering states ----
 
-    private void enterEyesOnly(String why) {
+    // ---- docked (owner 2026-10-02) ----
+    //
+    // On the charger the latch refuses every leg, so roaming there was refusals,
+    // escape turns that whirred, startles and the resting song. Now any roaming,
+    // escaping or resting state becomes DOCKED the moment the latch is seen: no wheels,
+    // eyes DOCKED (no song), the camera closed (dockCameraCloses; else open with the
+    // detector parked). Every dockLookMs, while nothing else is going on, he opens it
+    // (or unparks) for one look and closes it again; Claude
+    // (else the detector) decides, and he speaks only for a thing he has not reacted
+    // to this session, with a line he has not said. Anything else is silence. Calls
+    // still take him out of DOCKED (callStep runs first) and come back to it after.
+
+    /** States DOCKED may replace: roaming, escaping, resting and eyes-only (a faulted ToF on the dock),
+     * never a stop, a call or a conversation. */
+    private boolean dockable() {
+        return (state.roams() || state == State.CORNERED || state == State.RECOVER || state == State.EYES_ONLY)
+                && call == null && !callChatOpening && chat == null;
+    }
+
+    /** On the charger: POWER says so (debounced, trackPower), or the CPL=3 latch is set. */
+    private boolean onCharger() {
+        return powerDocked || classifier.charger();
+    }
+
+    /**
+     * POWER's dock verdict (2026-10-02, SensorReply.Power.docked()). The CPL=3 latch needs a
+     * motion command, and on the owner's dock the ToF reads 16383 so he never sends one;
+     * POWER rides on every poll. One reading saying docked docks him; leaving takes
+     * dockOffReadings in a row saying off. A reading without a readable POWER counts neither way.
+     */
+    private void trackPower(SensorReading r) {
+        if (r.batteryPercent >= 0) {
+            batteryPercent = r.batteryPercent;
+        }
+        if (r.docked == null) {
+            return;
+        }
+        if (r.docked) {
+            powerOffStreak = 0;
+            if (!powerDocked) {
+                powerDocked = true;
+                note("power: on the charger (POWER says docked)");
+            }
+        } else if (powerDocked && ++powerOffStreak >= tuning.dockOffReadings) {
+            powerDocked = false;
+            powerOffStreak = 0;
+            note("power: off the charger for " + tuning.dockOffReadings + " readings");
+        }
+    }
+
+    private void enterDocked(long now) {
+        note(onDock ? "docked: sitting still again" : "docked: on the charger; sitting still and quiet, a look every "
+                + tuning.dockLookMs + " ms");
+        escapeEnd(now, "docked");
+        onDock = true;
         stopMotors();
+        dropWriggle();
+        recoverProbing = false;
         cancelAsk();
         cancelWayOut();
         planner.reset();
@@ -5650,8 +11007,234 @@ final class ExploreBrain {
         probeThen = null;
         escShortBack = false;
         backForTurn = false;
+        retryWaiting = false;
         turnRetrying = false;
+        trustLeg = false;
+        trustLegDoor = false;
+        escape = false;
+        jammed = false;
+        cancelDoorway(now, "docked");
+        endSeek(now, false, "docked");
+        cancelMetCheck();
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        steerWaitUntil = NO_WAIT;
+        target = null;
+        pick = null;
+        heldPick = null;
+        afterOrient = null;
+        cues.clear();
+        if (cueHeld != null) {
+            dropCue("docked: the held cue is dropped");
+            cueHeld = null;
+        }
+        awayLeg = null;
+        dockLooking = false;
+        dockAsking = false;
+        dockLook = null;
+        dockLookAt = now + tuning.dockLookMs;
+        state = State.DOCKED;
+        show(EyeState.DOCKED, null);
+    }
+
+    /** DOCKED, each step: off the charger roams again; else the next look, or the one being waited for or asked about. */
+    private void dockStep(long now) {
+        if (!onCharger()) {
+            onDock = false;
+            dropDockLook(null);
+            note("docked: off the charger; roaming again");
+            scheduleCuriosity(now);
+            enterPause(now, pauseMs(), false);
+            return;
+        }
+        if (now >= mutedGlanceUntil) {
+            show(EyeState.DOCKED, null);
+        }
+        if (hushed()) {
+            return;
+        }
+        if (dockAsking) {
+            dockAnswerStep(now);
+            return;
+        }
+        if (!dockLooking) {
+            if (now < dockLookAt || !dockQuiet(now)) {
+                return;
+            }
+            if (tuning.dockCameraCloses ? !cameraUsable(now) : !cameraOpen) {
+                note("docked look: no camera now; the next in " + tuning.dockLookMs + " ms");
+                dockLookAt = now + tuning.dockLookMs;
+                return;
+            }
+            if (!cameraOpen && now < cameraClosedAt + tuning.reopenGapMs) {
+                // Closed between looks: never reopened inside the gap (a reopen within ~50 ms of a
+                // close hangs the HAL, err -110). ExploreCamera waits for onClosed() too.
+                return;
+            }
+            // The detector unparks at the end of this step (and the camera opens, when it was
+            // closed between looks); the look must be taken after it settles.
+            dockLooking = true;
+            dockLookAfter = now + tuning.lookSettleMs;
+            dockLookDeadline = Math.max(now, cameraClosedAt + tuning.reopenGapMs) + tuning.firstLookTimeoutMs;
+            return;
+        }
+        Look look = camera.latest();
+        if (look != null && look.frameMs >= dockLookAfter) {
+            dockLooking = false;
+            dockLookAt = now + tuning.dockLookMs;
+            onDockLook(now, look);
+        } else if (now >= dockLookDeadline) {
+            dockLooking = false;
+            dockLookAt = now + tuning.dockLookMs;
+            note("docked look: no look in time; the next in " + tuning.dockLookMs + " ms");
+        }
+    }
+
+    /** Nothing else going on: no call or its conversation opening, no answer clip, nothing being said. */
+    private boolean dockQuiet(long now) {
+        // Not port.sayFinished(): on the robot that is a one-shot "a line just finished" event, never
+        // true before the first line, so a fresh start on the charger never looked (robot 2026-10-02
+        // 16:30-16:41). Lines are said in their own states, which return to DOCKED when done.
+        return call == null && !callChatOpening && now >= ackUntil && pendingLine == null;
+    }
+
+    /** One look: to Claude when it can be asked, else (or when Claude fails) the detector decides. */
+    private void onDockLook(long now, Look look) {
+        if (look.jpeg != null && canAsk() && lookBudgetLeft(now)) {
+            spendLook(now);
+            asking = true;
+            dockAsking = true;
+            dockLook = look;
+            askDeadline = now + tuning.askTimeoutMs;
+            List<CuriosityPort.Frame> frames = new ArrayList<CuriosityPort.Frame>();
+            frames.add(new CuriosityPort.Frame(0, look.jpeg));
+            note("docked look: asking Claude for anything new");
+            port.ask(new CuriosityPort.LookRequest(frames, recent(now), now < peopleIgnoredUntil,
+                    new ArrayList<String>(reacted), new ArrayList<String>(saidLines)), tuning.askTimeoutMs);
+            return;
+        }
+        dockDetectorLook(now, look);
+    }
+
+    /** Claude's answer to a docked look: a remark only for a new thing with a fresh line; anything else is silence. */
+    private void dockAnswerStep(long now) {
+        CuriosityPort.Answer a = port.answer();
+        if (a == null) {
+            if (now >= askDeadline) {
+                note("docked look: no answer from Claude in " + tuning.askTimeoutMs + " ms; the detector decides");
+                cancelAsk();
+                dockAsking = false;
+                dockDetectorLook(now, dockLook);
+                dockLook = null;
+            }
+            return;
+        }
+        asking = false;
+        dockAsking = false;
+        Look look = dockLook;
+        dockLook = null;
+        if (a.status == CuriosityPort.Answer.Status.NOTHING) {
+            note("docked look: nothing new (Claude); quiet");
+            return;
+        }
+        if (a.status != CuriosityPort.Answer.Status.PICK || a.frame != 0 || a.box == null || a.kind == null) {
+            note("docked look: Claude's answer failed or was unusable; the detector decides");
+            dockDetectorLook(now, look);
+            return;
+        }
+        if (a.kind.isLiving()) {
+            // A person or a pet: a call is how they reach him here, and the ears are open.
+            note("docked look: Claude picked a person or an animal; quiet");
+            return;
+        }
+        // A thing's label (never a person's description: they returned above) may be noted.
+        String thing = a.box.label;
+        if (seenLoosely(thing)) {
+            note("docked look: Claude picked something he reacted to already (" + thing + "); quiet");
+            return;
+        }
+        if (!usable(a.line) || saidBefore(a.line)) {
+            note("docked look: no fresh line about the " + thing + "; quiet");
+            return;
+        }
+        note("docked look: something new, the " + thing + ": saying it");
+        trig("remark", "docked", a.box, 1);
+        pick = a;
+        pickAt = now;
+        pickRecentred = false;
+        remarkOnly = false;
+        target = null;
+        remember(a.box.label, a.kind, now);
+        // SPEAK closes the camera for the line; finishPick marks it seen, and the step after is DOCKED again.
+        speakRemark(now, a.line);
+    }
+
+    /** The detector's verdict on a docked look: says the name of the biggest thing he has not reacted to, else nothing. */
+    private void dockDetectorLook(long now, Look look) {
+        Detection best = null;
+        if (look != null) {
+            for (Detection d : look.detections) {
+                if (d.score < tuning.confidenceFloor || Sighting.BACKGROUND.contains(d.label)
+                        || Sighting.isPersonOrPet(d.label) || seenLoosely(d.label)) {
+                    continue;
+                }
+                if (best == null || d.area() > best.area()) {
+                    best = d;
+                }
+            }
+        }
+        if (best == null) {
+            note("docked look: nothing new (detector); quiet");
+            return;
+        }
+        note("docked look: something new, a " + best.label + " (detector): saying its name");
+        markSeen(best.label);
+        remember(best.label, CuriosityPort.Kind.of(best.label), now);
+        sound.playName(best.label);
+    }
+
+    /** Leaves a docked look half-done: the look or Claude's answer to it is dropped (why: a note, or null for none). */
+    private void dropDockLook(String why) {
+        if (dockAsking) {
+            cancelAsk();
+            if (why != null) {
+                note("docked look: Claude's answer dropped for " + why);
+            }
+        }
+        dockAsking = false;
+        dockLooking = false;
+        dockLook = null;
+    }
+
+    private void enterEyesOnly(String why) {
+        escapeEnd(clock.nowMs(), "eyes");
+        handBackCall("the lease or the sensors lost");
+        stopMotors();
+        dropWriggle();
+        recoverProbing = false;
+        cancelAsk();
+        cancelWayOut();
+        planner.reset();
+        esc = null;
+        probing = false;
+        probeThen = null;
+        escShortBack = false;
+        backForTurn = false;
+        retryWaiting = false;
+        turnRetrying = false;
+        trustLeg = false;
+        trustLegDoor = false;
+        if (leanInOpen) {
+            // Review P3: the lean-in ends here, so its cooldown (if it met nobody) runs from
+            // now, not from whatever later stop's clearStop would have found the flag still set.
+            leanInOpen = false;
+            if (!leanInMet) {
+                leanInOver(clock.nowMs());
+            }
+        }
         cancelDoorway(clock.nowMs(), "lease or sensors lost");
+        endSeek(clock.nowMs(), false, "lease or sensors lost");
         cancelMetCheck();
         closeMeeting();
         gatedPick = null;
@@ -5668,12 +11251,20 @@ final class ExploreBrain {
         searchCue = null;
         searchPlan = null;
         searchFirstTurn = false;
+        callerInTurn = null;
         wheellessMeeting = false;
+        roamingPick = false;
+        cuePick = false;
+        personVoiceAt = NEVER;
+        if (chat != null) {
+            chat.learnCut("eyes");
+        }
         chat = null;
         chatCueSide = null;
         chatNoWheels = false;
         chatStallSince = NEVER;
         chatLookWanted = false;
+        clearCallChat();
         awayLeg = null;
         if (state != State.EYES_ONLY || shownState == null) {
             note("eyes only: " + why);
@@ -5696,11 +11287,17 @@ final class ExploreBrain {
     /** Eyes toward d, then a turn of ms, or deg once measured (0: timed only). */
     private void enterLook(long now, Direction d, boolean escapeTurn, long ms, double deg) {
         // Every turn through here is unaimed (its way doesn't matter, only its amount):
-        // it goes the unblocked way. Aimed ones (the steer's bend) come round already.
-        d = unblocked(d);
+        // it goes the unblocked way. Aimed ones (the steer's bend, enterAimedLook) come round already.
+        enterLookAs(now, unblocked(d), escapeTurn, ms, deg);
+    }
+
+    /** Eyes toward d, then a turn of ms, or deg once measured, exactly that way. */
+    private void enterLookAs(long now, Direction d, boolean escapeTurn, long ms, double deg) {
         state = State.LOOK;
         turnRetrying = false;
         heading = d;
+        legDecSide = d == Direction.LEFT ? 'L' : 'R';
+        legDecBend = (int) Math.round(deg);
         escape = escapeTurn;
         turnMs = ms;
         turnDeg = deg;
@@ -5715,16 +11312,24 @@ final class ExploreBrain {
         turnStartedAt = now;
         phaseUntil = now + turnMs;
         moving = true;
-        motor.turn(heading);
+        turnWheels(heading);
         measureTurn(now, turnDeg);
     }
 
     private void startHop(long now) {
         hopNext = false;
-        show(EyeState.IDLE, null);
-        state = State.HOP;
+        aimHeading = Double.NaN;
         int ticks = plannedTicks > 0 ? plannedTicks : drawTicks();
         plannedTicks = -1;
+        if (classifier.darkFloor() && ticks > tuning.darkLegTicksMax) {
+            // Dark floor: only the camera and stalls see obstacles, so legs stay short.
+            ticks = tuning.darkLegTicksMax;
+        }
+        if (bathTurnAway(now, ticks)) {
+            return;
+        }
+        show(EyeState.IDLE, null);
+        state = State.HOP;
         legLook = camera.latest();
         ticksLeft = ticks - 1;
         nextTickAt = now + tuning.hopTickMs;
@@ -5734,7 +11339,8 @@ final class ExploreBrain {
         wheelMoves.clear();
         hopMoved = 0;
         moving = true;
-        motor.hopTick();
+        legStart(now, ticks);
+        hopTick();
         compass.startLeg(false, now);
     }
 
@@ -5742,6 +11348,173 @@ final class ExploreBrain {
     private boolean legWentNowhere(long now) {
         long ms = Math.max(1, now - hopStartedAt);
         return lastWheels != null && hopMoved * tuning.stallWindowMs < tuning.stallMinCounts * ms;
+    }
+
+    // ---- the navigation log (2026-10-02) ----
+
+    /** No decision for the next hop yet: straight, no plan, no look. */
+    private void legDecClear() {
+        legDecSrc = null;
+        legDecSide = 'S';
+        legDecBend = 0;
+        legDecOpen = Float.NaN;
+        legDecNov = Double.NaN;
+        legDecLook = null;
+    }
+
+    /** A forward leg starts (its first tick goes out next): what decided it, and where it starts from. */
+    private void legStart(long now, int ticks) {
+        if (legNo != 0) {
+            legLog(now);
+        }
+        if (escNo != 0 && !planner.active()) {
+            escapeEnd(now, "resumed");
+        }
+        legNo = ++legCount;
+        legSrc = legDecSrc != null ? legDecSrc : "blind";
+        legSide = legDecSide;
+        legBend = legDecBend;
+        legOpen = legDecOpen;
+        legNov = legDecNov;
+        legLook0 = legDecLook;
+        legLookAge = legLook0 == null ? -1 : now - legLook0.frameMs;
+        legPlan = ticks;
+        legSent = 1;
+        legLogStartedAt = now;
+        SensorReading r = lastReading;
+        boolean w = r != null && r.hasWheels();
+        legL0 = w ? r.wheelLeft : Long.MIN_VALUE;
+        legR0 = w ? r.wheelRight : Long.MIN_VALUE;
+        legHdg0 = compass.usable(now) ? compass.degrees() : Double.NaN;
+        legTofMin = Integer.MAX_VALUE;
+        legCpl = 0;
+        legHiccups = 0;
+        legReadings = 0;
+        legTofValid = 0;
+        legStalls = 0;
+        legTilts = 0;
+        legTiltMax = Double.NaN;
+        legFastMax = Double.NaN;
+        legPrivate = bathroom;
+        legEnd = null;
+        legDecClear();
+    }
+
+    /**
+     * The leg's one line, at its end: numbers and fixed words only (no labels, no names).
+     * look is the deciding frame's wall ms, as the frame ring names it; none while private.
+     */
+    private void legLog(long now) {
+        String end = legEnd != null ? legEnd : legEndFromState();
+        SensorReading r = lastReading;
+        boolean w = legL0 != Long.MIN_VALUE && r != null && r.hasWheels();
+        Look look = legPrivate || bathroom ? null : legLook0;
+        Openness.Profile p = legLook0 == null ? null : legLook0.openness;
+        float best = p == null ? Float.NaN : steer.mostOpen(p);
+        boolean hdg = !Double.isNaN(legHdg0) && compass.usable(now);
+        note("leg: id=" + legNo + " src=" + legSrc + " side=" + legSide + " bend=" + legBend
+                + " open=" + two(legOpen) + " best=" + two(best) + " conf=" + two(p == null ? Float.NaN : p.confidence)
+                + " nov=" + two(legNov)
+                + " look=" + (look == null ? "-" : String.valueOf(look.frameMs + clock.wallMs() - clock.nowMs()))
+                + " lookAge=" + (look == null ? "-" : String.valueOf(legLookAge))
+                + " plan=" + legPlan + "t sent=" + legSent + "t"
+                + " L=" + (w ? String.valueOf(r.wheelLeft - legL0) : "-")
+                + " R=" + (w ? String.valueOf(r.wheelRight - legR0) : "-")
+                + " ms=" + (now - legLogStartedAt)
+                + " hdg=" + (hdg ? Math.round(legHdg0) % 360 + ">" + Math.round(compass.degrees()) % 360 : "-")
+                + " end=" + end + " tofMin=" + (legTofMin == Integer.MAX_VALUE ? "-" : String.valueOf(legTofMin))
+                + " cpl=" + legCpl + " hiccups=" + legHiccups);
+        if (classifier.darkFloor()) {
+            note("floor: id=" + legNo + " dark=1 tofValid=" + legTofValid + "/" + legReadings
+                    + " stalls=" + legStalls + " tilts=" + legTilts + " tiltMax=" + deg(legTiltMax)
+                    + " fastMax=" + deg(legFastMax) + " tiltEnd=" + deg(classifier.tiltDeg()) + " end=" + end);
+        }
+        legNo = 0;
+        legLook0 = null;
+        legEnd = null;
+    }
+
+    /** A leg that ended without saying why: what took him out of it. */
+    private String legEndFromState() {
+        if (state == State.EYES_ONLY) {
+            return "eyes";
+        } else if (state == State.STOPPED) {
+            return "stop";
+        } else if (state == State.DOCKED) {
+            return "dock";
+        } else if (state == State.RECOVER) {
+            return "stall";
+        } else if (state.cueSearch() || state.converses()) {
+            return "cue";
+        } else if (state.approachesPerson()) {
+            return "person";
+        }
+        return "other";
+    }
+
+    /** 0..1 to two places ("0.54"); "-" for none (NaN or negative). */
+    private static String two(double v) {
+        if (Double.isNaN(v) || v < 0) {
+            return "-";
+        }
+        long c = Math.round(v * 100);
+        return c / 100 + (c % 100 < 10 ? ".0" : ".") + c % 100;
+    }
+
+    /** One note per change of the top-level mode. */
+    private void noteMode() {
+        Mode m = topMode();
+        if (m != null && m != mode) {
+            mode = m;
+            note("mode: " + m);
+        }
+    }
+
+    private Mode topMode() {
+        if (state == State.STOPPED) {
+            return null;
+        } else if (state == State.EYES_ONLY) {
+            return Mode.EYES_ONLY;
+        } else if (state == State.DOCKED) {
+            return Mode.DOCKED;
+        } else if (state == State.RECOVER) {
+            return Mode.RECOVER;
+        } else if (jammed) {
+            return Mode.JAM;
+        } else if (state.cueSearch() || state.converses()) {
+            return Mode.CHAT;
+        } else if (state.escapes() || planner.active()) {
+            return Mode.ESCAPE;
+        }
+        return Mode.ROAM;
+    }
+
+    /** An escape episode begins (none open): its number and trigger. */
+    private void escapeStart(long now, String trigger) {
+        if (escNo != 0) {
+            return;
+        }
+        escNo = ++escCount;
+        escStartedAt = now;
+        note("escape#" + escNo + " start trigger=" + trigger + tiltTag());
+    }
+
+    /** The open escape episode ends: how, and how long it took. */
+    private void escapeEnd(long now, String outcome) {
+        if (escNo == 0) {
+            return;
+        }
+        note("escape#" + escNo + " end outcome=" + outcome + " ms=" + (now - escStartedAt) + tiltTag());
+        escNo = 0;
+    }
+
+    /** The open seek ends: how, and how long it took. */
+    private void seekEnd(long now, String outcome) {
+        if (seekNo == 0) {
+            return;
+        }
+        note("seek#" + seekNo + " end outcome=" + outcome + " ms=" + (now - seekStartedAt));
+        seekNo = 0;
     }
 
     /** A leg's length as before the steer: random in hopTicks..hopTicksMax. */
@@ -5769,6 +11542,12 @@ final class ExploreBrain {
 
     private void startBackOff(long now) {
         int ticks = stalledNow ? Math.max(tuning.backTicks, tuning.stallBackTicks) : tuning.backTicks;
+        if (recoverBackFirst) {
+            // The board is back (robot 15:19): straight back the full escape length before any turn.
+            recoverBackFirst = false;
+            ticks = Math.max(ticks, tuning.blockedTurnBackTicks);
+            note("the board is back: backing straight out " + ticks + " back ticks before turning" + tiltTag());
+        }
         if (ticks <= 0) {
             enterLook(now, escapeDir, true, escapeTurnMs(), escapeTurnDeg());
             return;
@@ -5778,8 +11557,766 @@ final class ExploreBrain {
         nextTickAt = now + tuning.backTickMs;
         phaseUntil = now + ticks * tuning.backTickMs;
         moving = true;
-        motor.backTick();
+        backTick();
         compass.startLeg(true, now);
+    }
+
+    // ---- fully jammed (robot 2026-10-01) ----
+
+    /**
+     * Fully jammed: in this escape a back-up went nowhere and measured turns both ways
+     * turned under jamTurnDeg. Live under a chair, forward, reverse and both turns all
+     * moved nothing at once; the ladder and its 30 s rests kept pushing, which risks the
+     * motor board's stall latch. Stops the escape now and rests; true when it did.
+     */
+    private boolean jamCheck(long now) {
+        if (tuning.jamTurnDeg <= 0 || !jamBackStalled || jamBlockedWays.size() < 2) {
+            return false;
+        }
+        if (!jamForwardTried && planner.active() && frontClear(now)) {
+            // Robot 2026-10-03: never a jam before forward was tried while the front reads clear.
+            jamForwardTried = true;
+            if (tryForwardFirst(now, "behind and both turns are blocked; forward before calling it a jam", false,
+                    ProbeThen.STEP)) {
+                return true;
+            }
+        }
+        endEscapeForJam();
+        String why = "the back-up went nowhere and turns both ways turned under " + Math.round(tuning.jamTurnDeg)
+                + " deg";
+        if (wriggleAllowed(now)) {
+            startWriggle(now, why);
+        } else {
+            if (tuning.wriggleMs > 0 && wriggleAt != NEVER) {
+                note("no wriggle: the last was " + (now - wriggleAt) / 1000 + " s ago");
+            }
+            enterJammed(now, why);
+        }
+        return true;
+    }
+
+    /** The escape ends where it stands: no more ladder steps, asks or probes. */
+    private void endEscapeForJam() {
+        escapeEnd(clock.nowMs(), "jam");
+        stopMotors();
+        cancelWayOut();
+        planner.reset();
+        esc = null;
+        probing = false;
+        escFirstRetry = false;
+        escShortBack = false;
+        jamBackStalled = false;
+        jamBlockedWays.clear();
+        escBlockedRun = 0;
+    }
+
+    /** Fully jammed: no more pushing, the help line when due, the long rests and their probes. */
+    private void enterJammed(long now, String why) {
+        escapeEnd(now, "jam");
+        // Robot 2026-10-03: behind was blocked last: the jam's probes alternate, forward first.
+        jamAlternate = behindEvidence(now);
+        jamProbeFwd = false;
+        jams++;
+        jammed = true;
+        note("fully jammed: " + why + "; no more pushing (jam " + jams + " since start)");
+        jamRests = 0;
+        jammedAt = now;
+        jamRest(now);
+    }
+
+    /**
+     * Review P2-6: still jammed after a lease or sensor drop, or after a meeting held where
+     * he stood: back to the jammed rest (never a roaming leg into the jam). The rest that
+     * was cut short is taken again, keeping its probe time on the jam's schedule.
+     */
+    private void resumeJam(long now, String after) {
+        note("still jammed after " + after + ": back to the jammed rest");
+        awayLeg = null;
+        jamRests = Math.max(0, jamRests - 1);
+        jamRest(now);
+    }
+
+    /** The jammed rest: no motion for jammedRestMs, the help line when due, then one short back-up. */
+    private void jamRest(long now) {
+        long restMs = jamRestMs(now);
+        jamRests++;
+        jamRestStartedAt = now;
+        rest(now, restMs);
+        jamProbing = false;
+        jamPoke = null;
+        jamMoved = 0;
+        jamFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        jamHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
+        if (jamHelpAt == NEVER || now - jamHelpAt >= tuning.jamHelpEveryMs) {
+            jamHelpPending = true;
+        }
+        note("jammed: resting " + restMs + " ms, then one short back-up");
+    }
+
+    /**
+     * The next jammed rest: up to the next of jamProbeAtMs (30, 60, 120 s after he was found
+     * jammed), then jammedRestMs each (robot 15:19: one probe at 120 s left him stuck for
+     * minutes after the cutout had cleared).
+     */
+    private long jamRestMs(long now) {
+        long[] at = tuning.jamProbeAtMs;
+        while (jamRests < at.length && jammedAt + at[jamRests] <= now) {
+            // A probe time already past (a poke probed early, or the last probe ran long).
+            jamRests++;
+        }
+        if (jamRests < at.length) {
+            return jammedAt + at[jamRests] - now;
+        }
+        return tuning.jammedRestMs;
+    }
+
+    /** Wheel counts while jammed: someone pulling him out during the rest, or the probe moving. */
+    private void countJamWheels(SensorReading r) {
+        if (!jammed || state != State.CORNERED || !r.hasWheels()) {
+            return;
+        }
+        if (jamFrom != null) {
+            jamMoved += (Math.abs(r.wheelLeft - jamFrom.wheelLeft) + Math.abs(r.wheelRight - jamFrom.wheelRight)) / 2;
+        }
+        jamFrom = r;
+    }
+
+    /** CORNERED while jammed: the help line, the rest, the probe and its verdict. */
+    private void jamStep(long now, boolean fresh) {
+        if (jamHelpPending && !jamProbing
+                && (camera.quiet() || now - jamRestStartedAt >= tuning.quietWaitMs)) {
+            // Said once the camera and detector are closed (R6), with no motion under way.
+            jamHelpPending = false;
+            jamHelpAt = now;
+            note("asking for help: \"" + HELP_LINE + "\"");
+            port.say(HELP_LINE);
+        }
+        if (jamProbing) {
+            if (jamProbeFwd && now < jamProbeUntil && classifier.status(now) == HazardClassifier.Status.HAZARD) {
+                stopMotors();
+                jamProbeUntil = now;
+                frontBlocked(now);
+            }
+            if (now < jamProbeUntil) {
+                if (now >= nextTickAt) {
+                    nextTickAt += jamProbeFwd ? tuning.hopTickMs : tuning.backTickMs;
+                    if (jamProbeFwd) {
+                        hopTick();
+                    } else {
+                        backTick();
+                    }
+                }
+                return;
+            }
+            if (moving) {
+                stopMotors();
+                jamJudgeAfter = now;
+            }
+            if (!fresh || now <= jamJudgeAfter) {
+                return;
+            }
+            jamProbing = false;
+            if (jamFrom != null && jamMoved >= tuning.stallMinCounts) {
+                jamFreed(now);
+            } else {
+                // Robot 2026-10-03: nothing moved says nothing about either side (the cutout reads
+                // zero every way); with behind blocked the next probe tries the other way.
+                note("jam probe went nowhere (" + (jamFrom == null ? "no encoders" : jamMoved + " counts")
+                        + "): resting again");
+                jamRest(now);
+            }
+            return;
+        }
+        if (jamPoke == null && jamFrom != null && jamMoved >= tuning.jamMovedCounts) {
+            jamPoke = "moved from outside (" + jamMoved + " counts)";
+        }
+        if (jamPoke == null && !Double.isNaN(jamHeading) && compass.usable(now)
+                && Math.abs(Heading.delta(jamHeading, compass.degrees())) >= tuning.jamMovedDeg) {
+            jamPoke = "moved from outside (turned " + Math.round(Heading.delta(jamHeading, compass.degrees()))
+                    + " deg)";
+        }
+        if (jamPoke != null) {
+            startJamProbe(now, jamPoke);
+        } else if (now >= phaseUntil) {
+            startJamProbe(now, "the rest is over");
+        }
+    }
+
+    /** The one gentle probe: jamProbeTicks back ticks, blind and bounded by their time. */
+    private void startJamProbe(long now, String why) {
+        // Robot 2026-10-03: forward when behind was blocked last and the front reads clear;
+        // the probes alternate rather than repeat the way that failed.
+        jamProbeFwd = jamAlternate && !jamProbeFwd && frontClear(now);
+        note("jam probe: " + why + (jamProbeFwd ? "; behind is blocked (" + behindWhy + "): driving forward "
+                : "; backing up ") + tuning.jamProbeTicks + " ticks");
+        jamPoke = null;
+        jamProbing = true;
+        jamMoved = 0;
+        jamFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        long tickMs = jamProbeFwd ? tuning.hopTickMs : tuning.backTickMs;
+        jamProbeUntil = now + tuning.jamProbeTicks * tickMs;
+        nextTickAt = now + tickMs;
+        moving = true;
+        if (jamProbeFwd) {
+            hopTick();
+        } else {
+            backTick();
+        }
+    }
+
+    /** The probe moved: he is free, and roams again with today's escape state cleared. */
+    private void jamFreed(long now) {
+        note("jam probe moved " + jamMoved + " counts: free, roaming again");
+        freedFromJam(now);
+    }
+
+    /** Out of a jam (the probe or the wriggle moved): roams again with today's escape state cleared. */
+    private void freedFromJam(long now) {
+        jammed = false;
+        blockedWaysForgotten();
+        recoverDone();
+        jamHelpPending = false;
+        blockedSides.clear();
+        blockedAheadAt = Double.NaN;
+        ladderAfterRest = false;
+        restEndedAt = NEVER;
+        hazardTimes.clear();
+        stallStreak = 0;
+        failedLadders = 0;
+        escapeFailures.clear();
+        escapeSide = null;
+        lastHazardSide = null;
+        enterPause(now, pauseMs(), false);
+    }
+
+    // ---- the long wriggle (robot 2026-10-01) ----
+
+    private boolean wriggleAllowed(long now) {
+        return tuning.wriggleMs > 0 && tuning.jamTurnDeg > 0 && (state.escapes() || state == State.RECOVER)
+                && (wriggleAt == NEVER || now - wriggleAt >= tuning.wriggleEveryMs);
+    }
+
+    /**
+     * One long wriggle: a continuous turn LEFT for up to wriggleMs, then RIGHT. Live under a
+     * chair, the escape's ~1.5 s turns read "turned 0" while one 11 s spin worked him loose.
+     * It stays bounded: a way stops at once when its wheels don't move (the motor board
+     * latches after repeated stalled pushing), and at most one runs per wriggleEveryMs.
+     */
+    private void startWriggle(long now, String why) {
+        note(why + ": one long wriggle first");
+        wriggling = true;
+        wriggleWhy = why;
+        wriggleAt = now;
+        wriggleSecond = false;
+        measured = false;
+        startWriggleWay(now, Direction.LEFT);
+    }
+
+    private void startWriggleWay(long now, Direction d) {
+        wriggleDir = d;
+        wriggleWayAt = now;
+        wriggleUntil = now + tuning.wriggleMs;
+        wriggleCounts = 0;
+        wriggleBackTried = false;
+        wriggleBacking = false;
+        wriggleHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
+        note("wriggle " + d + ": up to " + tuning.wriggleMs + " ms");
+        show(EyeState.LOOK, d);
+        wriggleTurn(now);
+    }
+
+    /** The turn (re)starts: the not-moving window counts from here. */
+    private void wriggleTurn(long now) {
+        wriggleFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        wriggleWindow.clear();
+        wriggleWindow.addLast(new long[]{now, wriggleCounts});
+        moving = true;
+        turnWheels(wriggleDir);
+    }
+
+    /** Wheel counts during the wriggle: summed over both wheels while turning, averaged while backing up. */
+    private void countWriggleWheels(SensorReading r) {
+        if (!wriggling || !r.hasWheels()) {
+            return;
+        }
+        if (wriggleFrom != null) {
+            long d = Math.abs(r.wheelLeft - wriggleFrom.wheelLeft) + Math.abs(r.wheelRight - wriggleFrom.wheelRight);
+            if (wriggleBacking) {
+                wriggleBackMoved += d / 2;
+            } else if (moving) {
+                wriggleCounts += d;
+                wriggleWindow.addLast(new long[]{clock.nowMs(), wriggleCounts});
+            }
+        }
+        wriggleFrom = r;
+    }
+
+    /** Fewer than wriggleMinCounts in the last wriggleStillMs: the wheels are not moving at all. */
+    private boolean wriggleWheelsStill(long now) {
+        long since = now - tuning.wriggleStillMs;
+        while (wriggleWindow.size() > 1) {
+            long[] first = wriggleWindow.pollFirst();
+            long[] next = wriggleWindow.peekFirst();
+            if (next[0] > since) {
+                wriggleWindow.addFirst(first);
+                break;
+            }
+        }
+        long[] base = wriggleWindow.peekFirst();
+        return base != null && base[0] <= since && wriggleCounts - base[1] < tuning.wriggleMinCounts;
+    }
+
+    private double wriggleTurned(long now) {
+        return Double.isNaN(wriggleHeading) || !compass.usable(now) ? 0
+                : Math.abs(Heading.delta(wriggleHeading, compass.degrees()));
+    }
+
+    private String wriggleSoFar(long now) {
+        return "turned " + Math.round(wriggleTurned(now)) + " deg, " + wriggleCounts + " counts";
+    }
+
+    private void wriggleStep(long now, boolean fresh) {
+        if (wriggleBacking) {
+            if (now < wriggleBackUntil) {
+                if (now >= nextTickAt) {
+                    nextTickAt += tuning.backTickMs;
+                    backTick();
+                }
+                return;
+            }
+            if (moving) {
+                stopMotors();
+                wriggleJudgeAfter = now;
+            }
+            if (!fresh || now <= wriggleJudgeAfter) {
+                return;
+            }
+            wriggleBacking = false;
+            if (wriggleBackMoved >= tuning.stallMinCounts) {
+                note("wriggle " + wriggleDir + ": free after " + (now - wriggleWayAt) + " ms (" + wriggleSoFar(now)
+                        + "; the back-up moved " + wriggleBackMoved + " counts)");
+                wriggleFreed(now);
+                return;
+            }
+            if (now >= wriggleUntil) {
+                note("wriggle " + wriggleDir + ": not free after " + tuning.wriggleMs + " ms (" + wriggleSoFar(now)
+                        + ")");
+                wriggleWayOver(now);
+                return;
+            }
+            note("wriggle " + wriggleDir + ": the back-up went nowhere (" + wriggleBackMoved + " counts); turning on");
+            wriggleTurn(now);
+            return;
+        }
+        if (wriggleTurned(now) >= tuning.wriggleFreeDeg) {
+            stopMotors();
+            note("wriggle " + wriggleDir + ": free after " + (now - wriggleWayAt) + " ms (" + wriggleSoFar(now) + ")");
+            wriggleFreed(now);
+            return;
+        }
+        if (!wriggleBackTried && wriggleCounts >= tuning.wriggleFreeCounts) {
+            // The wheels turn a lot but he doesn't: free to back away, or spinning in place?
+            stopMotors();
+            wriggleBackTried = true;
+            note("wriggle " + wriggleDir + ": " + wriggleSoFar(now) + "; backing up to see");
+            wriggleBacking = true;
+            wriggleBackMoved = 0;
+            wriggleFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+            wriggleBackUntil = now + tuning.jamProbeTicks * tuning.backTickMs;
+            nextTickAt = now + tuning.backTickMs;
+            moving = true;
+            backTick();
+            return;
+        }
+        if (wriggleWheelsStill(now)) {
+            stopMotors();
+            note("wriggle " + wriggleDir + ": wheels not moving; stopping");
+            wriggleWayOver(now);
+            return;
+        }
+        if (now >= wriggleUntil) {
+            stopMotors();
+            note("wriggle " + wriggleDir + ": not free after " + tuning.wriggleMs + " ms (" + wriggleSoFar(now) + ")");
+            wriggleWayOver(now);
+        }
+    }
+
+    private void wriggleWayOver(long now) {
+        if (!wriggleSecond) {
+            wriggleSecond = true;
+            startWriggleWay(now, wriggleDir.opposite());
+            return;
+        }
+        wriggling = false;
+        boolean due = jamHelpAt == NEVER || now - jamHelpAt >= tuning.jamHelpEveryMs;
+        note(due ? "wriggle failed both ways: asking for help"
+                : "wriggle failed both ways: resting (the help line was said " + (now - jamHelpAt) / 1000 + " s ago)");
+        enterJammed(now, wriggleWhy.startsWith("the back-up") ? wriggleWhy : "a wriggle both ways went nowhere");
+    }
+
+    private void wriggleFreed(long now) {
+        wriggling = false;
+        wriggleBacking = false;
+        note("wriggled free: roaming again");
+        freedFromJam(now);
+    }
+
+    /** Leaving the wriggle unfinished (eyes only, shutdown): no motion of its own goes on. */
+    private void dropWriggle() {
+        wriggling = false;
+        wriggleBacking = false;
+    }
+
+    // ---- the post-stall recovery wait (robot 2026-10-01) ----
+
+    private void stampStall(long now) {
+        stallStampAt = now;
+        spellEventAt = now;
+        // Robot 2026-10-03: what stalled says which way is blocked. A turn on the spot stalls when
+        // his tail swings into something; a back-up when something is behind; a forward leg ahead.
+        if (lastPush == Push.TURN || lastPush == Push.BACK) {
+            behindBlocked(now, lastPush == Push.TURN ? "a turn stalled" : "a back-up stalled");
+        } else if (lastPush == Push.FORWARD) {
+            // This heading is blocked ahead (tryForwardFirst and frontClear read it).
+            aheadBlocked();
+        }
+    }
+
+    /**
+     * Robot 2026-10-02 11:57-12:00: the stuck spell ends after recoverSpellResetMs with no
+     * stall and no zero-movement attempt (each stamps the stall clock), so a stall a minute
+     * later waits for the board again. The clock stands still while he is still stuck: in
+     * RECOVER, a cornered rest, an escape (the planner's ladder included) or the jam path.
+     */
+    private void spellStep(long now) {
+        if (recoverCount == 0 || tuning.recoverSpellResetMs <= 0 || spellEventAt == NEVER) {
+            return;
+        }
+        if (state == State.RECOVER || state == State.CORNERED || state.escapes() || planner.active() || jammed
+                || wriggling) {
+            spellEventAt = now;
+            return;
+        }
+        if (now - spellEventAt >= tuning.recoverSpellResetMs) {
+            spellOver("no stall or zero move for " + span(tuning.recoverSpellResetMs));
+        }
+    }
+
+    /** The stuck spell is over: its recovery count back to 0, so the next stall waits again. */
+    private void spellOver(String why) {
+        note("stuck spell over (" + why + "): recoveries reset after " + recoverCount);
+        recoverDone();
+    }
+
+    /**
+     * A wait is due: recovery on, none run to its verdict this stuck spell, and within
+     * stallRecoverWindowMs of the last stall or collision stop (the cutout lasted 9-29 s live).
+     */
+    private boolean recoverDue(long now) {
+        return tuning.stallRecoverProbesMs.length > 0 && recoverCount < recoverCap()
+                && stallStampAt != NEVER && now - stallStampAt <= tuning.stallRecoverWindowMs;
+    }
+
+    /**
+     * RECOVER waits a stuck spell: recoverMaxPerSpell, before the jam path runs; one with
+     * jam detection off (no jam path to hold back: the escape as before the wait).
+     */
+    private int recoverCap() {
+        return tuning.jamTurnDeg > 0 ? tuning.recoverMaxPerSpell : 1;
+    }
+
+    /** Out of the stuck spell (drove off cleanly, freed): the next stall waits again. */
+    private void recoverDone() {
+        recoverCount = 0;
+        tipsInSpell = 0;
+        stallStampAt = NEVER;
+    }
+
+    /**
+     * Robot 2026-10-01, 14:08 and 14:33: after a stall the motor board refused all motion
+     * for ~9-29 s, then came back by itself. The escape run inside that window read 0 counts
+     * and 0 deg everywhere and called a jam. Now he stops, stays still, and probes with one
+     * short back-up at each of stallRecoverProbesMs after the stall; nothing he tried inside
+     * the window counts toward the jam rule, the wriggle or "turns blocked twice".
+     */
+    private void enterRecover(long now, boolean wedgedAfter, String why) {
+        escapeStart(now, "stall");
+        stopMotors();
+        cancelWayOut();
+        planner.reset();
+        esc = null;
+        probing = false;
+        escFirstRetry = false;
+        escShortBack = false;
+        backForTurn = false;
+        turnRetrying = false;
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        jamBackStalled = false;
+        jamBlockedWays.clear();
+        escBlockedRun = 0;
+        recoverWedged = wedgedAfter;
+        recoverWhy = why;
+        recoverCount++;
+        spellEventAt = now;
+        recoverBackStill = 0;
+        recoverBlockedWay = null;
+        recoverLastFwd = false;
+        retryWaiting = false;
+        recoverFrom = stallStampAt == NEVER ? now : stallStampAt;
+        long since = now - recoverFrom;
+        boolean alt = tuning.stallRecoverProbesAltMs.length > 0 && recoverWaits % 2 == 1;
+        recoverWaits++;
+        long[] all = alt ? tuning.stallRecoverProbesAltMs : tuning.stallRecoverProbesMs;
+        int first = 0;
+        while (first < all.length && all[first] < since) {
+            first++;
+        }
+        // Every probe time already past (a late trigger in the window): one probe now.
+        recoverProbes = first < all.length ? java.util.Arrays.copyOfRange(all, first, all.length) : new long[]{since};
+        recoverNext = 0;
+        recoverProbing = false;
+        recoverPoke = null;
+        state = State.RECOVER;
+        show(EyeState.RESTING, null);
+        StringBuilder at = new StringBuilder();
+        for (long ms : recoverProbes) {
+            at.append(at.length() == 0 ? "" : ", ").append(Math.round(ms / 1000.0));
+        }
+        note("stall: waiting for the motor board to recover (probes at " + at + " s)"
+                + (tuning.stallRecoverProbesAltMs.length > 0 ? (alt ? " (schedule B)" : " (schedule A)") : "")
+                + (recoverCap() > 1 ? " (recovery " + recoverCount + " of " + recoverCap() + ")" : ""));
+    }
+
+    /** RECOVER: still until the next probe (or a shove), each probe's verdict, or the wriggle after none moved. */
+    private void recoverStep(long now, boolean fresh) {
+        if (wriggling) {
+            wriggleStep(now, fresh);
+            return;
+        }
+        if (recoverProbing) {
+            if (recoverProbeFwd && now < recoverProbeUntil
+                    && classifier.status(now) == HazardClassifier.Status.HAZARD) {
+                // The forward probe keeps the forward safety: a hazard stops it at once.
+                stopMotors();
+                recoverProbeUntil = now;
+                frontBlocked(now);
+            }
+            if (now < recoverProbeUntil) {
+                if (recoverProbeBack && now >= nextTickAt) {
+                    nextTickAt += tuning.backTickMs;
+                    backTick();
+                } else if (recoverProbeFwd && now >= nextTickAt) {
+                    nextTickAt += tuning.hopTickMs;
+                    hopTick();
+                }
+                return;
+            }
+            if (moving) {
+                stopMotors();
+                recoverJudgeAfter = now;
+            }
+            if (!fresh || now <= recoverJudgeAfter) {
+                return;
+            }
+            recoverProbing = false;
+            recoverVerdict(now);
+            return;
+        }
+        // Motion only starts on a fresh reading.
+        if (fresh && (recoverPoke != null || now >= recoverFrom + recoverProbes[recoverNext])) {
+            startRecoverProbe(now);
+        }
+    }
+
+    private void startRecoverProbe(long now) {
+        recoverProbeScheduled = now >= recoverFrom + recoverProbes[recoverNext];
+        if (recoverProbeScheduled) {
+            recoverNext++;
+        }
+        if (recoverPoke != null) {
+            note("recover probe now: " + recoverPoke);
+            recoverPoke = null;
+        }
+        recoverProbing = true;
+        recoverProbeAt = now;
+        recoverMoved = 0;
+        recoverFromReading = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        recoverHeading = compass.usable(now) ? compass.degrees() : Double.NaN;
+        measured = false;
+        moving = true;
+        // Robot 2026-10-03: behind is blocked (the move that stalled was a turn or a back-up, or a
+        // back-up barely moved) and the front reads clear: the probe drives forward instead.
+        recoverProbeFwd = tuning.stallRecoverProbeBackTicks > 0 && recoverFromReading != null
+                && probeForward(now, recoverLastFwd);
+        recoverLastFwd = recoverProbeFwd;
+        if (recoverProbeFwd) {
+            recoverProbeBack = false;
+            note("recover probe: behind is blocked (" + behindWhy + "): probing forward");
+            recoverProbeUntil = now + tuning.stallRecoverProbeBackTicks * tuning.hopTickMs;
+            nextTickAt = now + tuning.hopTickMs;
+            hopTick();
+            return;
+        }
+        // Back the way he came first (robot 15:19); a turn only after two back-ups moved nothing,
+        // or with no encoders to judge a back-up by. On a dark floor never a turn (robot 2026-10-02
+        // 18:28: a 52 deg turn probe out of a stall against a furniture base, then he tipped over).
+        recoverProbeBack = tuning.stallRecoverProbeBackTicks > 0 && recoverFromReading != null
+                && (classifier.darkFloor() || recoverBlockedWay != null || recoverBackStill < 2);
+        if (recoverProbeBack) {
+            recoverProbeUntil = now + tuning.stallRecoverProbeBackTicks * tuning.backTickMs;
+            nextTickAt = now + tuning.backTickMs;
+            backTick();
+            return;
+        }
+        recoverProbeUntil = now + tuning.stallRecoverProbeMs;
+        recoverProbeDir = unblocked(escapeSide != null ? escapeSide : escapeDir != null ? escapeDir : Direction.LEFT);
+        turnWheels(recoverProbeDir);
+    }
+
+    /** The probe's counts (both wheels), and every turn's: a turn whose wheels read none is a cutout's sign. */
+    private void countRecoverWheels(SensorReading r) {
+        if (!r.hasWheels()) {
+            return;
+        }
+        if (turnSign != 0 && turnCountFrom != null) {
+            turnCounts += Math.abs(r.wheelLeft - turnCountFrom.wheelLeft) + Math.abs(r.wheelRight - turnCountFrom.wheelRight);
+        }
+        turnCountFrom = turnCountFrom == null ? null : r;
+        if (state != State.RECOVER || !recoverProbing) {
+            return;
+        }
+        if (recoverFromReading != null) {
+            recoverMoved += Math.abs(r.wheelLeft - recoverFromReading.wheelLeft)
+                    + Math.abs(r.wheelRight - recoverFromReading.wheelRight);
+        }
+        recoverFromReading = r;
+    }
+
+    /**
+     * A zero attempt (robot 16:42): this turn turned under stallRecoverProbeDeg with its
+     * wheels still. One that turned that much, or moved its wheels, is not.
+     */
+    private boolean zeroTurn() {
+        return Math.abs(compass.turned()) < tuning.stallRecoverProbeDeg && turnWheelsStill();
+    }
+
+    /** This turn's wheels moved under stallMinCounts (both wheels): no power, not just no heading. */
+    private boolean turnWheelsStill() {
+        return turnCountFrom != null && turnCounts < tuning.stallMinCounts;
+    }
+
+    private void recoverVerdict(long now) {
+        long at = Math.round((recoverProbeAt - recoverFrom) / 1000.0);
+        boolean counts = recoverFromReading != null;
+        boolean heading = !Double.isNaN(recoverHeading) && compass.usable(now);
+        double turned = heading ? Math.abs(Heading.delta(recoverHeading, compass.degrees())) : 0;
+        if (!counts && !heading) {
+            // No encoders and no gyro: nothing can tell a cutout from a block. On as before.
+            note("recover probe at " + at + " s: no encoders or heading to judge by; escaping as before");
+            recovered(now);
+            return;
+        }
+        boolean wheels = counts && recoverMoved >= tuning.stallMinCounts;
+        if (recoverProbeFwd) {
+            if (wheels) {
+                note("recover probe at " + at + " s: moved " + recoverMoved + " counts driving forward: the board is back"
+                        + tiltTag());
+                recovered(now);
+                return;
+            }
+        } else if (recoverProbeBack) {
+            if (wheels && recoverMoved < BACK_FREE_COUNTS) {
+                // It moved, but barely: something is behind him (nothing moved at all is the cutout).
+                behindBlocked(now, "a back-up probe moved only " + recoverMoved + " counts");
+            }
+            if (wheels) {
+                note("recover probe at " + at + " s: moved " + recoverMoved + " counts backing up: the board is back"
+                        + tiltTag());
+                recovered(now);
+                return;
+            }
+            recoverBackStill++;
+        } else if (turned >= tuning.stallRecoverProbeDeg || (wheels && !heading)) {
+            note("recover probe at " + at + " s: moved " + recoverMoved + " counts"
+                    + (turned >= tuning.stallRecoverProbeDeg ? " (turned " + Math.round(turned) + " deg)" : "")
+                    + ": the board is back" + tiltTag());
+            recovered(now);
+            return;
+        } else if (wheels) {
+            // The board is alive, but the turn hit something (robot 15:19: a desk leg; 109
+            // counts, 0 deg): that way is blocked, and the probes left back up again.
+            note("recover probe at " + at + " s: wheels moved " + recoverMoved + " counts but he did not turn: that"
+                    + " way is blocked");
+            recoverBlockedWay = recoverProbeDir;
+            blockSide(recoverProbeDir);
+        }
+        if (!wheels) {
+            note("recover probe at " + at + " s: nothing" + tiltTag());
+        }
+        if (recoverProbeScheduled && recoverNext >= recoverProbes.length) {
+            if (recoverBlockedWay == null && recoverCount < recoverCap()) {
+                // Robot 16:42: the cutout re-arms on each attempt that reads zero. Nothing moved, but
+                // the board may yet come back: the escape again, and its next zero attempt waits again.
+                note("no recovery after " + at + " s (recovery " + recoverCount + " of " + recoverCap()
+                        + "): trying the escape again");
+                resumeEscape(now);
+                return;
+            }
+            note("no recovery after " + at + " s: a real jam");
+            realJam(now, "no recovery after " + at + " s");
+        }
+    }
+
+    /** The wait's verdict is a real jam: the wriggle, then the jam path. */
+    private void realJam(long now, String why) {
+        recoverCount = Math.max(recoverCount, recoverCap());
+        if (tuning.jamTurnDeg <= 0) {
+            // Jam detection off: the escape as it ran before the wait.
+            resumeEscape(now);
+        } else if (wriggleAllowed(now)) {
+            startWriggle(now, why);
+        } else {
+            if (tuning.wriggleMs > 0 && wriggleAt != NEVER) {
+                note("no wriggle: the last was " + (now - wriggleAt) / 1000 + " s ago");
+            }
+            enterJammed(now, why);
+        }
+    }
+
+    /** The board is back: the normal escape, judged only on what it does from now. */
+    private void recovered(long now) {
+        recoverBackFirst = true;
+        if (recoverBlockedWay != null) {
+            // Turn away from the way a probe found blocked, once he has backed up.
+            escapeDir = recoverBlockedWay.opposite();
+            escapeSide = escapeDir;
+        }
+        resumeEscape(now);
+    }
+
+    private void resumeEscape(long now) {
+        jamBackStalled = false;
+        jamBlockedWays.clear();
+        escBlockedRun = 0;
+        lastWheels = null;
+        wheelMoves.clear();
+        hopStartedAt = now;
+        if (recoverWedged) {
+            // The ladder starts with its own straight back-up (backing up first).
+            recoverBackFirst = false;
+            wedged(now, recoverWhy, false);
+            return;
+        }
+        if (escapeDir == null) {
+            escapeDir = unblocked(escapeSide != null ? escapeSide : randomDirection());
+        }
+        if (recoverBackFirst && preferForward(now) && tryForwardFirst(now, "the board is back, and behind is blocked ("
+                + behindWhy + "), so forward instead of backing out", false, ProbeThen.BACK_OUT)) {
+            return;
+        }
+        startBackOff(now);
     }
 
     private void enterCornered(long now) {
@@ -5834,7 +12371,343 @@ final class ExploreBrain {
         }
     }
 
+    /** Starts the wheels turning d, noting the sign for KTD7's heading history. */
+    // ---- which way he last pushed, and which ways are blocked (robot 2026-10-03) ----
+    //
+    // Owner, 14:10: "He thinks he's stuck... He's backed up against the wall. He's definitely
+    // not stuck. All he has to do is drive forward." A turn on the spot by a wall stalled; the
+    // board-back move, the recover probes, the ladder's first move and the jam probes all
+    // backed up, into the wall, and he called a jam three times. They assumed behind is clear
+    // because he drove in, which is false when the move that stalled was a turn (his tail
+    // swings into the wall) or a back-up, or when a back-up barely moves. Now the stalled move
+    // and every back-up under BACK_FREE_COUNTS mark behind as blocked, and every forward stall
+    // or block marks the front; while behind was blocked last and the front reads clear (the
+    // floor sensor, no hazard driving this way just now, the camera's openness), those moves go
+    // forward instead, through the usual forward safety, and a failed forward sends the next
+    // one back: they alternate rather than repeat the way that failed.
+
+    private enum Push { NONE, FORWARD, BACK, TURN }
+
+    /** A back-up that moved fewer counts than this (both wheels) says behind is blocked. */
+    static final long BACK_FREE_COUNTS = 50;
+    /** Evidence that behind is blocked counts for this long. */
+    static final long BEHIND_BLOCKED_MS = 120000;
+
+    private Push lastPush = Push.NONE;
+    /** This ladder tried forward before its back-up, and before calling a jam. */
+    private boolean escForwardFirstTried;
+    /** The recover probe under way drives forward; and the last one did. */
+    private boolean recoverProbeFwd;
+    private boolean recoverLastFwd;
+    /** The jam probe under way drives forward; and the jam's probes alternate (behind was blocked last). */
+    private boolean jamProbeFwd;
+    private boolean jamAlternate;
+    private boolean jamForwardTried;
+    private long behindBlockedAt = NEVER;
+    private String behindWhy;
+    private long frontBlockedAt = NEVER;
+
+    // ---- dark floor: tipping (robot 2026-10-02 18:28) ----
+
+    /** A tilt this much worse than where a move began (or the undo began) counts as getting worse. */
+    static final double TIP_WORSE_DEG = 3;
+    /** Still tilted this long after the undo: no more pushing (the jam path). */
+    static final long TIP_SETTLE_MAX_MS = 5000;
+
+    /** The move that tipped him, the turn's way if a turn, and how many tips this stuck spell. */
+    private Push tipPush = Push.NONE;
+    private Direction tipTurn;
+    private int tipsInSpell;
+    /** The undo: not begun (NEVER), or under way until tipUndoUntil; its starting tilt; when it stopped. */
+    private long tipUndoUntil = NEVER;
+    private double tipUndoFrom = Double.NaN;
+    private long tipSettleFrom = NEVER;
+    /** The tilt while he last stood still: a move that begins tilted only stops when it gets worse. */
+    private double tiltAtRest = Double.NaN;
+
+    /**
+     * Robot 2026-10-02 18:28: wedged on a furniture base after a stall, a 52 deg turn probe and
+     * the straight back-out after it tipped him onto his side; BACK_OFF never looked at the tilt.
+     * On a dark floor every move but a forward leg (whose TILT hazard covers it) now stops at the
+     * first sign of a tip (HazardClassifier.tipping(): darkEscapeTiltDeg from flat, or a fast
+     * change away from flat), then goes a couple of ticks the opposite way and waits until he is
+     * flat again. A move that began tilted stops only when it gets worse. True when it took the step.
+     */
+    private boolean tipStep(long now, boolean fresh, HazardClassifier.Status s) {
+        if (state == State.TIP) {
+            if (s == HazardClassifier.Status.UNAVAILABLE || !leaseHeld) {
+                // Lifted or tipped over, or no lease: the usual eyes-only path from here.
+                stopMotors();
+                return false;
+            }
+            tipUndoStep(now, fresh);
+            return true;
+        }
+        if (!moving) {
+            tiltAtRest = classifier.tiltDeg();
+            return false;
+        }
+        if (!classifier.darkFloor() || !leaseHeld || state == State.HOP
+                || (state == State.APPROACH && step == Step.LEG) || !classifier.tipping()) {
+            return false;
+        }
+        double d = classifier.tiltDeg();
+        boolean worse = Double.isNaN(tiltAtRest) || !(tiltAtRest >= tuning.darkEscapeTiltDeg)
+                || d > tiltAtRest + TIP_WORSE_DEG;
+        if (!classifier.fastTipped() && !worse) {
+            return false;
+        }
+        tipped(now);
+        return true;
+    }
+
+    private void tipped(long now) {
+        Push p = lastPush;
+        Direction turned = turnSign == Heading.LEFT ? Direction.LEFT : turnSign != 0 ? Direction.RIGHT : null;
+        String what = p == Push.BACK ? "backing up" : p == Push.FORWARD ? "driving forward"
+                : p == Push.TURN ? "turning" + (turned == null ? "" : " " + turned) : "moving";
+        note("dark floor: tipping while " + what + " in " + state + " (tilt " + deg(classifier.tiltDeg())
+                + " deg, fast " + deg(classifier.fastDeg()) + " deg): stopping");
+        stopMotors();
+        leaveStopForHazard();
+        if (seeking()) {
+            endSeek(now, false, "tipping");
+        }
+        dropWriggle();
+        recoverProbing = false;
+        jamProbing = false;
+        cancelWayOut();
+        planner.reset();
+        esc = null;
+        probing = false;
+        probeThen = null;
+        escFirstRetry = false;
+        escShortBack = false;
+        backForTurn = false;
+        turnRetrying = false;
+        retryWaiting = false;
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        doorwayLeg = false;
+        // That way tips him: the escape's evidence for which way is blocked.
+        if (p == Push.BACK) {
+            behindBlocked(now, "backing up tipped him");
+        } else if (p == Push.FORWARD) {
+            aheadBlocked();
+        } else if (p == Push.TURN && turned != null) {
+            blockSide(turned);
+        }
+        tipPush = p;
+        tipTurn = turned;
+        tipsInSpell++;
+        spellEventAt = now;
+        escapeStart(now, "tip");
+        if (tipsInSpell > tuning.darkTipMaxPerSpell) {
+            note("dark floor: tipped " + tipsInSpell + " times getting out: no more pushing");
+            if (jammed) {
+                jamRest(now);
+            } else {
+                endEscapeForJam();
+                enterJammed(now, "every way out tips him");
+            }
+            return;
+        }
+        state = State.TIP;
+        tipUndoUntil = NEVER;
+        tipSettleFrom = NEVER;
+        tipUndoFrom = classifier.tiltDeg();
+        sound.playStartle();
+        show(EyeState.FLINCH, null);
+    }
+
+    /** TIP: the gentle undo (the opposite way, darkTipUndoTicks ticks), then still until flat again. */
+    private void tipUndoStep(long now, boolean fresh) {
+        int ticks = tuning.darkTipUndoTicks;
+        if (tipUndoUntil == NEVER) {
+            // Motion only starts on a fresh reading.
+            if (!fresh) {
+                return;
+            }
+            tipUndoFrom = classifier.tiltDeg();
+            tipSettleFrom = now;
+            if (ticks <= 0 || tipPush == Push.NONE || (tipPush == Push.TURN && tipTurn == null)) {
+                tipUndoUntil = now;
+                return;
+            }
+            moving = true;
+            if (tipPush == Push.BACK) {
+                note("dark floor: undoing it: forward " + ticks + " ticks");
+                tipUndoUntil = now + ticks * tuning.hopTickMs;
+                nextTickAt = now + tuning.hopTickMs;
+                hopTick();
+            } else if (tipPush == Push.FORWARD) {
+                note("dark floor: undoing it: back " + ticks + " ticks");
+                tipUndoUntil = now + ticks * tuning.backTickMs;
+                nextTickAt = now + tuning.backTickMs;
+                backTick();
+            } else {
+                note("dark floor: undoing it: turning " + tipTurn.opposite() + " " + ticks + " ticks");
+                tipUndoUntil = now + ticks * tuning.backTickMs;
+                turnWheels(tipTurn.opposite());
+            }
+            return;
+        }
+        if (moving) {
+            double d = classifier.tiltDeg();
+            if (now < tipUndoUntil && d > tipUndoFrom + TIP_WORSE_DEG) {
+                note("dark floor: the undo tips him more (tilt " + deg(d) + " deg): stopping");
+            }
+            if (now >= tipUndoUntil || d > tipUndoFrom + TIP_WORSE_DEG) {
+                stopMotors();
+                tipSettleFrom = now;
+                return;
+            }
+            if (now >= nextTickAt && tipPush != Push.TURN) {
+                if (tipPush == Push.BACK) {
+                    nextTickAt += tuning.hopTickMs;
+                    hopTick();
+                } else {
+                    nextTickAt += tuning.backTickMs;
+                    backTick();
+                }
+            }
+            return;
+        }
+        if (!fresh) {
+            return;
+        }
+        double d = classifier.tiltDeg();
+        if (d >= tuning.darkEscapeTiltDeg) {
+            if (now - tipSettleFrom >= TIP_SETTLE_MAX_MS) {
+                note("dark floor: still tilted " + deg(d) + " deg after " + TIP_SETTLE_MAX_MS + " ms: no more pushing");
+                tipsInSpell = Math.max(tipsInSpell, tuning.darkTipMaxPerSpell + 1);
+                if (jammed) {
+                    jamRest(now);
+                } else {
+                    endEscapeForJam();
+                    enterJammed(now, "stuck tilted");
+                }
+            }
+            return;
+        }
+        note("dark floor: flat again (tilt " + deg(d) + " deg)");
+        tipCarryOn(now);
+    }
+
+    /** Flat again after a tip: on with the escape, away from the way that tipped him. */
+    private void tipCarryOn(long now) {
+        Push p = tipPush;
+        tipPush = Push.NONE;
+        tipUndoUntil = NEVER;
+        if (jammed) {
+            jamRest(now);
+            return;
+        }
+        state = State.PAUSE;
+        if (p == Push.FORWARD) {
+            // Like any hazard ahead: back off, then the escape turn.
+            stalledNow = false;
+            startBackOff(now);
+            return;
+        }
+        Direction d = p == Push.TURN && tipTurn != null ? tipTurn.opposite()
+                : escapeDir != null ? escapeDir : randomDirection();
+        escapeDir = d;
+        enterLook(now, d, true, escapeTurnMs(), escapeTurnDeg());
+    }
+
+    /** Dark floor: " (tilt N deg)", the accel's angle to flat, for a stall or escape note; "" otherwise. */
+    private String tiltTag() {
+        return classifier.darkFloor() ? " (tilt " + deg(classifier.tiltDeg()) + " deg)" : "";
+    }
+
+    /** Whole degrees for the log, "-" for none. */
+    private static String deg(double d) {
+        return Double.isNaN(d) ? "-" : String.valueOf(Math.round(d));
+    }
+
+    private static double maxOf(double a, double b) {
+        return Double.isNaN(a) ? b : Double.isNaN(b) ? a : Math.max(a, b);
+    }
+
+    private void hopTick() {
+        lastPush = Push.FORWARD;
+        motor.hopTick();
+    }
+
+    private void backTick() {
+        lastPush = Push.BACK;
+        motor.backTick();
+    }
+
+    /** Behind him is blocked: this says why (fixed words, counts). */
+    private void behindBlocked(long now, String why) {
+        behindBlockedAt = now;
+        behindWhy = why;
+    }
+
+    /** Ahead of him is blocked (a forward stall, a hazard driving forward, a forward try blocked). */
+    private void frontBlocked(long now) {
+        frontBlockedAt = now;
+    }
+
+    /** Free again (a clean drive-off, out of a jam): what blocked him is behind him. */
+    private void blockedWaysForgotten() {
+        tipsInSpell = 0;
+        behindBlockedAt = NEVER;
+        frontBlockedAt = NEVER;
+        behindWhy = null;
+    }
+
+    /**
+     * The front reads clear: the floor sensor and CPL (no hazard now), no hazard or stall
+     * driving this way just now, and the camera's openness (when it has a look since he last
+     * turned) not a hard block. tryForwardFirst's tests.
+     */
+    private boolean frontClear(long now) {
+        if (classifier.status(now) != HazardClassifier.Status.CLEAR) {
+            return false;
+        }
+        if (compass.usable(now) && !Double.isNaN(blockedAheadAt)
+                && Math.abs(Heading.delta(compass.degrees(), blockedAheadAt)) <= tuning.escapeProbeClearDeg) {
+            return false;
+        }
+        Look look = camera.latest();
+        return look == null || look.openness == null || look.frameMs < headingSettledAt
+                || !steer.blockedAhead(look.openness);
+    }
+
+    /** Behind was blocked last, and lately. */
+    private boolean behindEvidence(long now) {
+        return behindBlockedAt != NEVER && now - behindBlockedAt <= BEHIND_BLOCKED_MS
+                && (frontBlockedAt == NEVER || behindBlockedAt >= frontBlockedAt);
+    }
+
+    /** The next move out goes forward: behind was blocked last (and lately), and the front reads clear. */
+    private boolean preferForward(long now) {
+        return behindEvidence(now) && frontClear(now);
+    }
+
+    /**
+     * A probe's way (RECOVER's, the jam's): a probe that moved nothing says nothing about either
+     * side (the board's cutout reads zero every way), so with behind blocked they alternate,
+     * forward first while the front reads clear; with no sign behind is blocked, back as before.
+     */
+    private boolean probeForward(long now, boolean lastWasForward) {
+        return !lastWasForward && behindEvidence(now) && frontClear(now);
+    }
+
+    private void turnWheels(Direction d) {
+        lastPush = Push.TURN;
+        turnSign = d == Direction.LEFT ? Heading.LEFT : Heading.RIGHT;
+        turnCounts = 0;
+        turnCountFrom = lastReading != null && lastReading.hasWheels() ? lastReading : null;
+        motor.turn(d);
+    }
+
     private void stopMotors() {
+        turnSign = 0;
         if (moving) {
             if (measured && heading != null && compass.turnReached()) {
                 // A turn that got there: that way turns again.
@@ -5860,6 +12733,11 @@ final class ExploreBrain {
     }
 
     private void show(EyeState s, Direction gaze) {
+        if ((s == EyeState.RESTING || s == EyeState.EYES_ONLY) && onCharger()) {
+            // On the charger every still look is the docked one: ModeApp sings only for these two.
+            s = EyeState.DOCKED;
+            gaze = null;
+        }
         if (s == shownState && gaze == shownGaze) {
             return;
         }

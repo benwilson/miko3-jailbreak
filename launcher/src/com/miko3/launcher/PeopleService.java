@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.os.IBinder;
 
 import com.miko3.shared.FaceCheck;
+import com.miko3.shared.Feedback;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotPeople;
 
@@ -127,6 +128,19 @@ public class PeopleService extends Service {
         }
 
         @Override
+        public String addNamed(String name) {
+            enforceCaller();
+            // Owner 2026-10-02: someone remembered by name alone; the name is never logged.
+            return people().addNamed(name);
+        }
+
+        @Override
+        public boolean hasFace(String id) {
+            enforceCaller();
+            return people().hasFace(id);
+        }
+
+        @Override
         public boolean setEmbedding(String id, int slot, long addedAtMillis, String modelId, float[] embedding) {
             enforceCaller();
             return people().setEmbedding(id, slot, addedAtMillis, modelId, embedding);
@@ -151,6 +165,21 @@ public class PeopleService extends Service {
                 return checks().closeAsEnded(handle);
             }
             return checks().updateOutcome(handle, outcome, joinedId);
+        }
+
+        @Override
+        public boolean recordFeedback(String id, String kind, String summary, String quote, String context) {
+            enforceCaller();
+            // Re-checked here with the same rules Explore applied: a bad entry is refused, never stored.
+            Feedback f = Feedback.of(kind, summary, quote);
+            return f != null && people().recordFeedback(id, f, context);
+        }
+
+        @Override
+        public String ownerNoteFor(String name) {
+            enforceCaller();
+            // Owner 2026-10-03: never logged; only the matched note goes back.
+            return people().ownerNotes().noteFor(name);
         }
     };
 
