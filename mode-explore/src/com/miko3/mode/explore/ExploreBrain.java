@@ -496,6 +496,8 @@ final class ExploreBrain {
         CONFIRM, LAST_NAME,
         RETRACE, CIRCLE, WAY_OUT, DRIVE_OFF,
         RECOVER,
+        /** Dark floor (robot 2026-10-02 18:28): a move tipped him; stopped, a gentle undo, flat again. */
+        TIP,
         CUE_TURN, CUE_LOOK, CUE_WHERE,
         CHAT_THINK, CHAT_SPEAK, CHAT_LISTEN, CHAT_NOTES,
         DOCKED;
@@ -513,7 +515,7 @@ final class ExploreBrain {
          */
         boolean roams() {
             return this == PAUSE || this == LOOK || this == TURN || this == HOP || this == STARTLE
-                    || this == BACK_OFF || escapes();
+                    || this == BACK_OFF || this == TIP || escapes();
         }
 
         /** A wedged escape's steps (explore nav plan U5): the camera stays open through them. */
@@ -1024,6 +1026,9 @@ final class ExploreBrain {
     private int legTofValid;
     private int legStalls;
     private int legTilts;
+    /** Dark floor: the leg's largest tilt from flat and largest fast change, in degrees (NaN: no accel). */
+    private double legTiltMax = Double.NaN;
+    private double legFastMax = Double.NaN;
     private boolean legPrivate;
     /** Why the leg ended, set where it ends; null: read from the state it ended in. */
     private String legEnd;
@@ -3178,6 +3183,9 @@ final class ExploreBrain {
             return;
         }
         classifier.offer(reading);
+        if (!moving && classifier.learnFlat(reading)) {
+            note("tilt: flat accel " + classifier.flat());
+        }
         trackPower(reading);
         trackWheels(reading);
         countEscapeWheels(reading);
@@ -3194,6 +3202,8 @@ final class ExploreBrain {
             if (reading.tof > 0 && reading.tof != tuning.tofFault) {
                 legTofValid++;
             }
+            legTiltMax = maxOf(legTiltMax, classifier.tiltDeg());
+            legFastMax = maxOf(legFastMax, classifier.fastDeg());
         }
         compass.offer(reading, moving);
         headingHistory.offer(reading.timestampMs,
@@ -3401,6 +3411,9 @@ final class ExploreBrain {
         // A docked look's remark (SPEAK, from DOCKED) never drives: a faulted ToF on the dock
         // must not cut it short, or finishPick never marks the thing seen and it is said again.
         boolean dockRemark = onDock && onCharger() && state == State.SPEAK;
+        if (tipStep(now, fresh, s)) {
+            return;
+        }
         if (s == HazardClassifier.Status.UNAVAILABLE && !wheellessMeeting && !dockRemark) {
             if (!state.chats()) {
                 enterEyesOnly("sensors unavailable: " + classifier.reason());
@@ -3476,7 +3489,8 @@ final class ExploreBrain {
                     // backs off further and turns a set, growing amount (escapeTurn()).
                     stallStreak++;
                     legStalls++;
-                    note("wheels stalled while driving: blocked by something low (" + stallStreak + " in a row)");
+                    note("wheels stalled while driving: blocked by something low (" + stallStreak + " in a row)"
+                            + tiltTag());
                     compass.legStalled(now - tuning.stallWindowMs);
                     stampStall(now);
                     hazardInMotion(now, null);
@@ -9826,6 +9840,7 @@ final class ExploreBrain {
             case FACE: case APPROACH: case MEET_LOOK: case MEET:
                 return sameSideAsPerson(c) ? CueVerdict.CONFIRM : CueVerdict.TAKE;
             case STARTLE: case BACK_OFF: case RETRACE: case CIRCLE: case WAY_OUT: case DRIVE_OFF: case RECOVER:
+            case TIP:
             case ASK_NAME: case LISTEN: case NAME: case REMEMBER: case NAME_CLIP: case CONFIRM: case LAST_NAME:
                 return CueVerdict.HOLD;
             default:
@@ -11328,6 +11343,8 @@ final class ExploreBrain {
         legTofValid = 0;
         legStalls = 0;
         legTilts = 0;
+        legTiltMax = Double.NaN;
+        legFastMax = Double.NaN;
         legPrivate = bathroom;
         legEnd = null;
         legDecClear();
@@ -11359,7 +11376,8 @@ final class ExploreBrain {
                 + " cpl=" + legCpl + " hiccups=" + legHiccups);
         if (classifier.darkFloor()) {
             note("floor: id=" + legNo + " dark=1 tofValid=" + legTofValid + "/" + legReadings
-                    + " stalls=" + legStalls + " tilts=" + legTilts + " end=" + end);
+                    + " stalls=" + legStalls + " tilts=" + legTilts + " tiltMax=" + deg(legTiltMax)
+                    + " fastMax=" + deg(legFastMax) + " tiltEnd=" + deg(classifier.tiltDeg()) + " end=" + end);
         }
         legNo = 0;
         legLook0 = null;
@@ -11428,7 +11446,7 @@ final class ExploreBrain {
         }
         escNo = ++escCount;
         escStartedAt = now;
-        note("escape#" + escNo + " start trigger=" + trigger);
+        note("escape#" + escNo + " start trigger=" + trigger + tiltTag());
     }
 
     /** The open escape episode ends: how, and how long it took. */
@@ -11436,7 +11454,7 @@ final class ExploreBrain {
         if (escNo == 0) {
             return;
         }
-        note("escape#" + escNo + " end outcome=" + outcome + " ms=" + (now - escStartedAt));
+        note("escape#" + escNo + " end outcome=" + outcome + " ms=" + (now - escStartedAt) + tiltTag());
         escNo = 0;
     }
 
@@ -11478,7 +11496,7 @@ final class ExploreBrain {
             // The board is back (robot 15:19): straight back the full escape length before any turn.
             recoverBackFirst = false;
             ticks = Math.max(ticks, tuning.blockedTurnBackTicks);
-            note("the board is back: backing straight out " + ticks + " back ticks before turning");
+            note("the board is back: backing straight out " + ticks + " back ticks before turning" + tiltTag());
         }
         if (ticks <= 0) {
             enterLook(now, escapeDir, true, escapeTurnMs(), escapeTurnDeg());
@@ -11960,6 +11978,7 @@ final class ExploreBrain {
     /** Out of the stuck spell (drove off cleanly, freed): the next stall waits again. */
     private void recoverDone() {
         recoverCount = 0;
+        tipsInSpell = 0;
         stallStampAt = NEVER;
     }
 
@@ -12091,9 +12110,10 @@ final class ExploreBrain {
             return;
         }
         // Back the way he came first (robot 15:19); a turn only after two back-ups moved nothing,
-        // or with no encoders to judge a back-up by.
+        // or with no encoders to judge a back-up by. On a dark floor never a turn (robot 2026-10-02
+        // 18:28: a 52 deg turn probe out of a stall against a furniture base, then he tipped over).
         recoverProbeBack = tuning.stallRecoverProbeBackTicks > 0 && recoverFromReading != null
-                && (recoverBlockedWay != null || recoverBackStill < 2);
+                && (classifier.darkFloor() || recoverBlockedWay != null || recoverBackStill < 2);
         if (recoverProbeBack) {
             recoverProbeUntil = now + tuning.stallRecoverProbeBackTicks * tuning.backTickMs;
             nextTickAt = now + tuning.backTickMs;
@@ -12151,7 +12171,8 @@ final class ExploreBrain {
         boolean wheels = counts && recoverMoved >= tuning.stallMinCounts;
         if (recoverProbeFwd) {
             if (wheels) {
-                note("recover probe at " + at + " s: moved " + recoverMoved + " counts driving forward: the board is back");
+                note("recover probe at " + at + " s: moved " + recoverMoved + " counts driving forward: the board is back"
+                        + tiltTag());
                 recovered(now);
                 return;
             }
@@ -12161,7 +12182,8 @@ final class ExploreBrain {
                 behindBlocked(now, "a back-up probe moved only " + recoverMoved + " counts");
             }
             if (wheels) {
-                note("recover probe at " + at + " s: moved " + recoverMoved + " counts backing up: the board is back");
+                note("recover probe at " + at + " s: moved " + recoverMoved + " counts backing up: the board is back"
+                        + tiltTag());
                 recovered(now);
                 return;
             }
@@ -12169,7 +12191,7 @@ final class ExploreBrain {
         } else if (turned >= tuning.stallRecoverProbeDeg || (wheels && !heading)) {
             note("recover probe at " + at + " s: moved " + recoverMoved + " counts"
                     + (turned >= tuning.stallRecoverProbeDeg ? " (turned " + Math.round(turned) + " deg)" : "")
-                    + ": the board is back");
+                    + ": the board is back" + tiltTag());
             recovered(now);
             return;
         } else if (wheels) {
@@ -12181,7 +12203,7 @@ final class ExploreBrain {
             blockSide(recoverProbeDir);
         }
         if (!wheels) {
-            note("recover probe at " + at + " s: nothing");
+            note("recover probe at " + at + " s: nothing" + tiltTag());
         }
         if (recoverProbeScheduled && recoverNext >= recoverProbes.length) {
             if (recoverBlockedWay == null && recoverCount < recoverCap()) {
@@ -12335,6 +12357,230 @@ final class ExploreBrain {
     private String behindWhy;
     private long frontBlockedAt = NEVER;
 
+    // ---- dark floor: tipping (robot 2026-10-02 18:28) ----
+
+    /** A tilt this much worse than where a move began (or the undo began) counts as getting worse. */
+    static final double TIP_WORSE_DEG = 3;
+    /** Still tilted this long after the undo: no more pushing (the jam path). */
+    static final long TIP_SETTLE_MAX_MS = 5000;
+
+    /** The move that tipped him, the turn's way if a turn, and how many tips this stuck spell. */
+    private Push tipPush = Push.NONE;
+    private Direction tipTurn;
+    private int tipsInSpell;
+    /** The undo: not begun (NEVER), or under way until tipUndoUntil; its starting tilt; when it stopped. */
+    private long tipUndoUntil = NEVER;
+    private double tipUndoFrom = Double.NaN;
+    private long tipSettleFrom = NEVER;
+    /** The tilt while he last stood still: a move that begins tilted only stops when it gets worse. */
+    private double tiltAtRest = Double.NaN;
+
+    /**
+     * Robot 2026-10-02 18:28: wedged on a furniture base after a stall, a 52 deg turn probe and
+     * the straight back-out after it tipped him onto his side; BACK_OFF never looked at the tilt.
+     * On a dark floor every move but a forward leg (whose TILT hazard covers it) now stops at the
+     * first sign of a tip (HazardClassifier.tipping(): darkEscapeTiltDeg from flat, or a fast
+     * change away from flat), then goes a couple of ticks the opposite way and waits until he is
+     * flat again. A move that began tilted stops only when it gets worse. True when it took the step.
+     */
+    private boolean tipStep(long now, boolean fresh, HazardClassifier.Status s) {
+        if (state == State.TIP) {
+            if (s == HazardClassifier.Status.UNAVAILABLE || !leaseHeld) {
+                // Lifted or tipped over, or no lease: the usual eyes-only path from here.
+                stopMotors();
+                return false;
+            }
+            tipUndoStep(now, fresh);
+            return true;
+        }
+        if (!moving) {
+            tiltAtRest = classifier.tiltDeg();
+            return false;
+        }
+        if (!classifier.darkFloor() || !leaseHeld || state == State.HOP
+                || (state == State.APPROACH && step == Step.LEG) || !classifier.tipping()) {
+            return false;
+        }
+        double d = classifier.tiltDeg();
+        boolean worse = Double.isNaN(tiltAtRest) || !(tiltAtRest >= tuning.darkEscapeTiltDeg)
+                || d > tiltAtRest + TIP_WORSE_DEG;
+        if (!classifier.fastTipped() && !worse) {
+            return false;
+        }
+        tipped(now);
+        return true;
+    }
+
+    private void tipped(long now) {
+        Push p = lastPush;
+        Direction turned = turnSign == Heading.LEFT ? Direction.LEFT : turnSign != 0 ? Direction.RIGHT : null;
+        String what = p == Push.BACK ? "backing up" : p == Push.FORWARD ? "driving forward"
+                : p == Push.TURN ? "turning" + (turned == null ? "" : " " + turned) : "moving";
+        note("dark floor: tipping while " + what + " in " + state + " (tilt " + deg(classifier.tiltDeg())
+                + " deg, fast " + deg(classifier.fastDeg()) + " deg): stopping");
+        stopMotors();
+        leaveStopForHazard();
+        if (seeking()) {
+            endSeek(now, false, "tipping");
+        }
+        dropWriggle();
+        recoverProbing = false;
+        jamProbing = false;
+        cancelWayOut();
+        planner.reset();
+        esc = null;
+        probing = false;
+        probeThen = null;
+        escFirstRetry = false;
+        escShortBack = false;
+        backForTurn = false;
+        turnRetrying = false;
+        retryWaiting = false;
+        hopNext = false;
+        plannedTicks = -1;
+        lookForLeg = false;
+        doorwayLeg = false;
+        // That way tips him: the escape's evidence for which way is blocked.
+        if (p == Push.BACK) {
+            behindBlocked(now, "backing up tipped him");
+        } else if (p == Push.FORWARD) {
+            aheadBlocked();
+        } else if (p == Push.TURN && turned != null) {
+            blockSide(turned);
+        }
+        tipPush = p;
+        tipTurn = turned;
+        tipsInSpell++;
+        spellEventAt = now;
+        escapeStart(now, "tip");
+        if (tipsInSpell > tuning.darkTipMaxPerSpell) {
+            note("dark floor: tipped " + tipsInSpell + " times getting out: no more pushing");
+            if (jammed) {
+                jamRest(now);
+            } else {
+                endEscapeForJam();
+                enterJammed(now, "every way out tips him");
+            }
+            return;
+        }
+        state = State.TIP;
+        tipUndoUntil = NEVER;
+        tipSettleFrom = NEVER;
+        tipUndoFrom = classifier.tiltDeg();
+        sound.playStartle();
+        show(EyeState.FLINCH, null);
+    }
+
+    /** TIP: the gentle undo (the opposite way, darkTipUndoTicks ticks), then still until flat again. */
+    private void tipUndoStep(long now, boolean fresh) {
+        int ticks = tuning.darkTipUndoTicks;
+        if (tipUndoUntil == NEVER) {
+            // Motion only starts on a fresh reading.
+            if (!fresh) {
+                return;
+            }
+            tipUndoFrom = classifier.tiltDeg();
+            tipSettleFrom = now;
+            if (ticks <= 0 || tipPush == Push.NONE || (tipPush == Push.TURN && tipTurn == null)) {
+                tipUndoUntil = now;
+                return;
+            }
+            moving = true;
+            if (tipPush == Push.BACK) {
+                note("dark floor: undoing it: forward " + ticks + " ticks");
+                tipUndoUntil = now + ticks * tuning.hopTickMs;
+                nextTickAt = now + tuning.hopTickMs;
+                hopTick();
+            } else if (tipPush == Push.FORWARD) {
+                note("dark floor: undoing it: back " + ticks + " ticks");
+                tipUndoUntil = now + ticks * tuning.backTickMs;
+                nextTickAt = now + tuning.backTickMs;
+                backTick();
+            } else {
+                note("dark floor: undoing it: turning " + tipTurn.opposite() + " " + ticks + " ticks");
+                tipUndoUntil = now + ticks * tuning.backTickMs;
+                turnWheels(tipTurn.opposite());
+            }
+            return;
+        }
+        if (moving) {
+            double d = classifier.tiltDeg();
+            if (now < tipUndoUntil && d > tipUndoFrom + TIP_WORSE_DEG) {
+                note("dark floor: the undo tips him more (tilt " + deg(d) + " deg): stopping");
+            }
+            if (now >= tipUndoUntil || d > tipUndoFrom + TIP_WORSE_DEG) {
+                stopMotors();
+                tipSettleFrom = now;
+                return;
+            }
+            if (now >= nextTickAt && tipPush != Push.TURN) {
+                if (tipPush == Push.BACK) {
+                    nextTickAt += tuning.hopTickMs;
+                    hopTick();
+                } else {
+                    nextTickAt += tuning.backTickMs;
+                    backTick();
+                }
+            }
+            return;
+        }
+        if (!fresh) {
+            return;
+        }
+        double d = classifier.tiltDeg();
+        if (d >= tuning.darkEscapeTiltDeg) {
+            if (now - tipSettleFrom >= TIP_SETTLE_MAX_MS) {
+                note("dark floor: still tilted " + deg(d) + " deg after " + TIP_SETTLE_MAX_MS + " ms: no more pushing");
+                tipsInSpell = Math.max(tipsInSpell, tuning.darkTipMaxPerSpell + 1);
+                if (jammed) {
+                    jamRest(now);
+                } else {
+                    endEscapeForJam();
+                    enterJammed(now, "stuck tilted");
+                }
+            }
+            return;
+        }
+        note("dark floor: flat again (tilt " + deg(d) + " deg)");
+        tipCarryOn(now);
+    }
+
+    /** Flat again after a tip: on with the escape, away from the way that tipped him. */
+    private void tipCarryOn(long now) {
+        Push p = tipPush;
+        tipPush = Push.NONE;
+        tipUndoUntil = NEVER;
+        if (jammed) {
+            jamRest(now);
+            return;
+        }
+        state = State.PAUSE;
+        if (p == Push.FORWARD) {
+            // Like any hazard ahead: back off, then the escape turn.
+            stalledNow = false;
+            startBackOff(now);
+            return;
+        }
+        Direction d = p == Push.TURN && tipTurn != null ? tipTurn.opposite()
+                : escapeDir != null ? escapeDir : randomDirection();
+        escapeDir = d;
+        enterLook(now, d, true, escapeTurnMs(), escapeTurnDeg());
+    }
+
+    /** Dark floor: " (tilt N deg)", the accel's angle to flat, for a stall or escape note; "" otherwise. */
+    private String tiltTag() {
+        return classifier.darkFloor() ? " (tilt " + deg(classifier.tiltDeg()) + " deg)" : "";
+    }
+
+    /** Whole degrees for the log, "-" for none. */
+    private static String deg(double d) {
+        return Double.isNaN(d) ? "-" : String.valueOf(Math.round(d));
+    }
+
+    private static double maxOf(double a, double b) {
+        return Double.isNaN(a) ? b : Double.isNaN(b) ? a : Math.max(a, b);
+    }
+
     private void hopTick() {
         lastPush = Push.FORWARD;
         motor.hopTick();
@@ -12358,6 +12604,7 @@ final class ExploreBrain {
 
     /** Free again (a clean drive-off, out of a jam): what blocked him is behind him. */
     private void blockedWaysForgotten() {
+        tipsInSpell = 0;
         behindBlockedAt = NEVER;
         frontBlockedAt = NEVER;
         behindWhy = null;

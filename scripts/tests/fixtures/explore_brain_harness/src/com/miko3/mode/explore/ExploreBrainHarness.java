@@ -17116,6 +17116,53 @@ public final class ExploreBrainHarness {
                 false, true, -2120, 310, accelZ);
     }
 
+    static SensorReading darkAt(long t, int tof, int ir2, int ax, int ay, int az) {
+        return new SensorReading(t, tof, SensorReadingAbsent.ABSENT, ir2, null, false, false, 0, 0, false, 0, 0, 0,
+                false, true, ax, ay, az);
+    }
+
+    /** The robot's flat accel (-2200, 600, 23100) turned deg about y (positive: toward +x). */
+    static int[] tiltedBy(double deg) {
+        double r = Math.toRadians(deg);
+        double x = -2200;
+        double z = 23100;
+        return new int[]{(int) Math.round(x * Math.cos(r) + z * Math.sin(r)), 600,
+                (int) Math.round(-x * Math.sin(r) + z * Math.cos(r))};
+    }
+
+    /** A post-stall rig on a black floor (cutoutRig): dark readings; tilt may override one (null: flat). */
+    interface DarkTilt {
+        SensorReading at(Rig r, long t);
+    }
+
+    private static Rig darkCutoutRig(List<String> notes, ExploreTuning.Builder b, long cutoutMs, DarkTilt tilt) {
+        Rig[] h = new Rig[1];
+        long[] stallAt = {-1};
+        Rig rig = escRig(b, h, t -> {
+            Rig r = h[0];
+            if (r == null) {
+                return darkFlat(t);
+            }
+            if (stallAt[0] < 0 && r.brain.state() == ExploreBrain.State.HOP && r.moving && t - r.legStartT >= 700
+                    && r.blockedFrom == Long.MAX_VALUE) {
+                r.blockedFrom = t;
+            }
+            if (stallAt[0] < 0 && r.brain.state() == ExploreBrain.State.STARTLE) {
+                stallAt[0] = t;
+                pin(r, true);
+            }
+            if (stallAt[0] >= 0 && t >= stallAt[0] + cutoutMs && r.yaw.stuck) {
+                pin(r, false);
+            }
+            SensorReading over = tilt == null ? null : tilt.at(r, t);
+            return over != null ? over : darkFlat(t);
+        }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+        rig.creepPer100 = 0;
+        rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+        rig.brain.setDarkFloor(true);
+        return rig;
+    }
+
     /** SensorSnapshot's absent-field value, without pulling in the shared parser. */
     static final class SensorReadingAbsent {
         static final int ABSENT = -1;
@@ -17235,6 +17282,213 @@ public final class ExploreBrainHarness {
                     "on=" + on + " off=" + off);
         });
 
+        scenario("dark_classifier_full_vector_tilt_is_a_tilt_without_the_z_rule", n -> {
+            // Robot 2026-10-02 18:28: z alone missed the tip. 30 deg toward +x from the robot's flat
+            // (-2200, 600, 23100) keeps z at ~21100, above 23100 * cos 28 deg, but the vector says 30 deg.
+            HazardClassifier c = new HazardClassifier(tuning().darkTiltFast(0, 300).build());
+            c.setDarkFloor(true);
+            feedClassifier(c, t -> darkFlat(t), 100, 1000);
+            int[] v = tiltedBy(30);
+            c.offer(darkAt(1100, 16383, 0, v[0], v[1], v[2]));
+            HazardClassifier.Status one = c.status(1100);
+            c.offer(darkAt(1200, 16383, 0, v[0], v[1], v[2]));
+            HazardClassifier.Status two = c.status(1200);
+            HazardClassifier.Hazard h = c.hazard();
+            check(n, v[2] > 20396 && one == HazardClassifier.Status.CLEAR && two == HazardClassifier.Status.HAZARD
+                            && h != null && h.kind == HazardClassifier.Kind.TILT && Math.abs(c.tiltDeg() - 30) < 1.5,
+                    "z=" + v[2] + " one=" + one + " two=" + two + " hazard=" + h + " tilt=" + c.tiltDeg());
+        });
+        scenario("dark_classifier_learns_flat_from_still_readings_once", n -> {
+            HazardClassifier c = new HazardClassifier(tuning().build());
+            // Readings 30 deg off the default are not flat and never learned from.
+            int[] off = tiltedBy(30);
+            boolean learnedOff = false;
+            for (int i = 0; i < 20; i++) {
+                learnedOff |= c.learnFlat(darkAt(100 + i * 100, 16383, 0, off[0], off[1], off[2]));
+            }
+            // A slight slope, 8 deg off the default: 16 still readings learn it.
+            int[] slope = tiltedBy(8);
+            int learnedAt = -1;
+            for (int i = 0; i < 20; i++) {
+                if (c.learnFlat(darkAt(3000 + i * 100, 16383, 0, slope[0], slope[1], slope[2]))) {
+                    learnedAt = i + 1;
+                }
+            }
+            c.offer(darkAt(6000, 16383, 0, slope[0], slope[1], slope[2]));
+            double onSlope = c.tiltDeg();
+            check(n, !learnedOff && learnedAt == 16 && onSlope < 0.5 && c.flat().contains("16 still readings"),
+                    "learnedOff=" + learnedOff + " learnedAt=" + learnedAt + " onSlope=" + onSlope + " flat=" + c.flat());
+        });
+        scenario("dark_classifier_fast_tip_is_a_tilt_at_once_but_setting_down_is_not", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, t -> darkFlat(t), 100, 1000);
+            int[] v = tiltedBy(12);
+            c.offer(darkAt(1100, 16383, 0, v[0], v[1], v[2]));
+            boolean one = c.tilted();
+            c.offer(darkAt(1200, 16383, 0, v[0], v[1], v[2]));
+            boolean two = c.tilted() && c.fastTipped() && c.status(1200) == HazardClassifier.Status.HAZARD;
+            // Held there, the change is old news: under 28 deg it is no longer a tilt.
+            c.offer(darkAt(1600, 16383, 0, v[0], v[1], v[2]));
+            c.offer(darkAt(1700, 16383, 0, v[0], v[1], v[2]));
+            boolean held = c.tilted();
+            // Set down flat again: a change toward flat is no tip.
+            c.offer(darkFlat(1800));
+            c.offer(darkFlat(1900));
+            boolean down = c.tilted() || c.fastTipped();
+            check(n, !one && two && !held && !down, "one=" + one + " two=" + two + " held=" + held + " down=" + down);
+        });
+        scenario("dark_classifier_tipping_guard_is_stricter_than_the_tilt", n -> {
+            HazardClassifier c = new HazardClassifier(tuning().darkTiltFast(0, 300).build());
+            c.setDarkFloor(true);
+            feedClassifier(c, t -> darkFlat(t), 100, 1000);
+            int[] nine = tiltedBy(8);
+            c.offer(darkAt(1100, 16383, 0, nine[0], nine[1], nine[2]));
+            c.offer(darkAt(1200, 16383, 0, nine[0], nine[1], nine[2]));
+            boolean at8 = c.tipping();
+            int[] v = tiltedBy(12);
+            c.offer(darkAt(1300, 16383, 0, v[0], v[1], v[2]));
+            boolean once = c.tipping();
+            c.offer(darkAt(1400, 16383, 0, v[0], v[1], v[2]));
+            boolean twice = c.tipping();
+            boolean tilt = c.tilted();
+            HazardClassifier off = new HazardClassifier(tuning().build());
+            feedClassifier(off, CLEAR, 100, 1000);
+            off.offer(new SensorReading(1100, 303, 100, 100, null, false, false, 0, 0, false, 0, 0, 0,
+                    false, true, v[0], v[1], v[2]));
+            off.offer(new SensorReading(1200, 304, 100, 100, null, false, false, 0, 0, false, 0, 0, 0,
+                    false, true, v[0], v[1], v[2]));
+            check(n, !at8 && !once && twice && !tilt && !off.tipping(),
+                    "at8=" + at8 + " once=" + once + " twice=" + twice + " tilt=" + tilt + " off=" + off.tipping());
+        });
+        scenario("dark_floor_record_and_notes_carry_the_tilt", n -> {
+            // A 5 deg roll while driving (no hazard): the floor record keeps the largest tilt.
+            int[] v = tiltedBy(5);
+            Rig rig = new Rig(tuning().darkTiltFast(0, 300).build(), t -> t >= 1600 && t < 1900
+                    ? darkAt(t, 16383, 0, v[0], v[1], v[2]) : darkFlat(t));
+            List<String> notes = traced(rig);
+            rig.brain.setDarkFloor(true);
+            rig.started();
+            rig.runUntil(4000);
+            String rec = null;
+            for (String x : notes) {
+                if (x.contains("floor: id=")) {
+                    rec = x;
+                    break;
+                }
+            }
+            check(n, rec != null && rec.contains("tiltMax=5 ") && rec.contains("fastMax=") && rec.contains("tiltEnd=")
+                            && anyNote(notes, "tilt: flat accel") && rig.count("startle") == 0,
+                    "record=" + rec + " notes=" + notes);
+        });
+        scenario("dark_floor_recover_probes_never_turn_after_a_stall", n -> {
+            // Robot 2026-10-02 18:28: after a stall in dark-floor mode the 10 s probe was a 52 deg
+            // turn (two back-ups had moved nothing), then he tipped over. Dark: straight probes only.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = darkCutoutRig(notes, escTuning().hopTicks(20), 12000, null);
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "the board is back") >= 0);
+            long stall = notedAt(notes, "wheels stalled while driving");
+            long back = notedAt(notes, "the board is back");
+            List<long[]> turns = turnCommands(rig, stall + 1, back + 1);
+            List<Long> backs = backDrives(rig, stall + 1, back + 1);
+            check(n, stall > 0 && back > stall && turns.isEmpty() && backs.size() >= 3
+                            && noted(notes, "recover probe at 10 s: nothing (tilt ")
+                            && noted(notes, "blocked by something low (1 in a row) (tilt ")
+                            && rig.violations.isEmpty(),
+                    "stall@" + stall + " back@" + back + " turns=" + turns.size() + " backs=" + backs.size()
+                            + " notes=" + notesAfter(notes, Math.max(0, stall - 200)));
+        });
+        scenario("dark_floor_tip_while_backing_out_stops_at_once_and_goes_forward_gently", n -> {
+            // Robot 2026-10-02 18:28: "backing straight out 8 back ticks", then 0.5 s later on his side.
+            // Now: the first readings tipping (15 deg, under the 28 deg TILT) stop the back-out, he
+            // goes 2 ticks forward, waits until flat, and turns away instead of backing again.
+            List<String> notes = new ArrayList<String>();
+            long[] tipFrom = {-1};
+            long[] undoneAt = {-1};
+            int[] v = tiltedBy(15);
+            Rig rig = darkCutoutRig(notes, escTuning().hopTicks(20), 7000, (r, t) -> {
+                if (tipFrom[0] < 0 && r.brain.state() == ExploreBrain.State.BACK_OFF
+                        && notedAt(notes, "backing straight out") >= 0) {
+                    tipFrom[0] = t + 300;
+                }
+                if (tipFrom[0] >= 0 && t >= tipFrom[0] && undoneAt[0] < 0 && "hop".equals(r.motion)) {
+                    undoneAt[0] = t;
+                }
+                return tipFrom[0] >= 0 && t >= tipFrom[0] && undoneAt[0] < 0 ? darkAt(t, 16383, 0, v[0], v[1], v[2])
+                        : null;
+            });
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "dark floor: flat again") >= 0);
+            long flat = notedAt(notes, "dark floor: flat again");
+            rig.runUntil(Math.max(flat, rig.now) + 3000);
+            long tip = notedAt(notes, "dark floor: tipping while backing up in BACK_OFF");
+            long undo = notedAt(notes, "dark floor: undoing it: forward 2 ticks");
+            Drive fwd = firstDrive(rig, "TIP", "hop", Math.max(tip, 0));
+            List<Long> backsAfter = backDrives(rig, Math.max(tip, 0), Math.max(flat, 0) + 3000);
+            List<long[]> turns = turnCommands(rig, Math.max(flat, 0), Math.max(flat, 0) + 3000);
+            check(n, tipFrom[0] > 0 && tip >= tipFrom[0] && tip <= tipFrom[0] + 200 && undo >= tip && fwd != null
+                            && fwd.end > 0 && fwd.end - fwd.t <= 600 && flat > undo && backsAfter.isEmpty()
+                            && !turns.isEmpty() && notedAt(notes, "eyes only", Math.max(tip, 0)) < 0
+                            && noted(notes, "escape#") && rig.violations.isEmpty(),
+                    "tipFrom@" + tipFrom[0] + " tip@" + tip + " undo@" + undo + " fwd=" + (fwd == null ? "-"
+                            : fwd.t + ".." + fwd.end) + " flat@" + flat + " backsAfter=" + backsAfter
+                            + " turns=" + turns.size() + " notes=" + notesAfter(notes, Math.max(0, tipFrom[0] - 1500)));
+        });
+        scenario("dark_floor_tip_during_a_turn_stops_and_turns_back", n -> {
+            // A roaming turn that rolls him 15 deg: stop, a short turn the other way, then on.
+            List<String> notes = new ArrayList<String>();
+            long[] tipFrom = {-1};
+            long[] undoneAt = {-1};
+            int[] v = tiltedBy(15);
+            Rig[] h = new Rig[1];
+            Rig rig = escRig(escTuning().turnChance(1.0), h, t -> {
+                Rig r = h[0];
+                if (r == null) {
+                    return darkFlat(t);
+                }
+                if (tipFrom[0] < 0 && r.brain.state() == ExploreBrain.State.TURN && "turn".equals(r.motion)) {
+                    tipFrom[0] = t + 100;
+                }
+                if (tipFrom[0] >= 0 && t > tipFrom[0] && undoneAt[0] < 0 && r.brain.state() == ExploreBrain.State.TIP
+                        && "turn".equals(r.motion)) {
+                    undoneAt[0] = t;
+                }
+                return tipFrom[0] >= 0 && t >= tipFrom[0] && undoneAt[0] < 0 ? darkAt(t, 16383, 0, v[0], v[1], v[2])
+                        : darkFlat(t);
+            }, (r, req, nth) -> CuriosityPort.WayOut.way(0, 0f));
+            rig.brain.setTrace(x -> notes.add(h[0].now + " " + x));
+            rig.brain.setDarkFloor(true);
+            rig.started();
+            runUntil(rig, 30000, r -> notedAt(notes, "dark floor: flat again") >= 0);
+            long tip = notedAt(notes, "dark floor: tipping while turning");
+            long undo = notedAt(notes, "dark floor: undoing it: turning");
+            check(n, tip > 0 && tip <= tipFrom[0] + 200 && undo >= tip && undoneAt[0] > 0
+                            && notedAt(notes, "dark floor: flat again") > undo
+                            && notedAt(notes, "eyes only", tip) < 0 && rig.violations.isEmpty(),
+                    "tipFrom@" + tipFrom[0] + " tip@" + tip + " undo@" + undo + " notes="
+                            + notesAfter(notes, Math.max(0, tipFrom[0] - 500)));
+        });
+        scenario("dark_floor_tipping_every_way_out_is_a_jam_not_a_loop", n -> {
+            // Tilted 15 deg whenever he moves after the board is back: two tips, then the jam path.
+            List<String> notes = new ArrayList<String>();
+            int[] v = tiltedBy(15);
+            long[] backAt = {-1};
+            Rig rig = darkCutoutRig(notes, escTuning().hopTicks(20), 7000, (r, t) -> {
+                if (backAt[0] < 0 && notedAt(notes, "the board is back") >= 0) {
+                    backAt[0] = t;
+                }
+                return backAt[0] >= 0 && r.moving && r.brain.state() != ExploreBrain.State.TIP
+                        ? darkAt(t, 16383, 0, v[0], v[1], v[2]) : null;
+            });
+            rig.started();
+            runUntil(rig, 60000, r -> notedAt(notes, "fully jammed") >= 0);
+            List<Long> tips = notedTimes(notes, "dark floor: tipping while");
+            check(n, tips.size() == 3 && noted(notes, "dark floor: tipped 3 times getting out: no more pushing")
+                            && noted(notes, "fully jammed: every way out tips him")
+                            && notedAt(notes, "eyes only", Math.max(backAt[0], 0)) < 0,
+                    "tips=" + tips + " notes=" + notesAfter(notes, Math.max(0, backAt[0] - 500)));
+        });
+
         scenario("dark_floor_off_no_return_tof_stays_eyes_only", n -> {
             Rig rig = new Rig(tuning().build(), ExploreBrainHarness::darkFlagged).started();
             rig.runUntil(8000);
@@ -17271,6 +17525,29 @@ public final class ExploreBrainHarness {
             check(n, hop >= 0 && rig.timeOf(stop) <= 1700 && back > stop && rig.count("startle") == 1
                             && anyNote(notes, "dark floor: tilt") && anyNote(notes, "end=tilt"),
                     "stop@" + rig.timeOf(stop) + " back=" + back + " " + rig.tail() + " notes=" + notes);
+        });
+        scenario("dark_floor_valid_low_tof_between_no_returns_stops_the_leg", n -> {
+            // Robot 2026-10-02 leg 10 (tofValid=18/32): no-return and valid readings alternate
+            // on a black floor. A valid low one (an object) must stop the leg as on a normal floor.
+            Rig rig = new Rig(tuning().build(), t -> t >= 1600 && t < 2400
+                    ? ((t / 100) % 2 == 0 ? darkFlat(t) : darkAt(t, 50, 0, 23100)) : darkFlat(t));
+            List<String> notes = traced(rig);
+            rig.brain.setDarkFloor(true);
+            rig.started();
+            rig.runUntil(4000);
+            int hop = rig.first("hop", 0);
+            int stop = rig.first("stop", hop);
+            String rec = null;
+            for (String x : notes) {
+                if (x.contains("floor: id=")) {
+                    rec = x;
+                    break;
+                }
+            }
+            check(n, hop >= 0 && rig.timeOf(hop) < 1600 && rig.timeOf(stop) <= 1800
+                            && rig.count("startle") == 1 && anyNote(notes, "end=obstacle")
+                            && rec != null && rec.contains("end=obstacle") && !rec.contains("tofValid=0/"),
+                    "hop@" + rig.timeOf(hop) + " stop@" + rig.timeOf(stop) + " record=" + rec + " " + rig.tail());
         });
         scenario("dark_floor_lifted_stops_and_waits_until_flat", n -> {
             Rig rig = new Rig(tuning().build(), t -> t >= 1600 && t < 5000 ? darkAt(t, 16383, 0, 8000)

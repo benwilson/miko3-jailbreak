@@ -39,7 +39,14 @@ package com.miko3.mode.explore;
  *  - the accelerometer stands in for the cliff sensor: darkTiltReadings readings in a row
  *    with z below darkFlatAccelZ * cos(darkTiltDeg) are a TILT hazard ahead (nose dip or
  *    climbing something); below cos(darkLiftDeg) he is lifted or tipped over, and the
- *    sensors are unavailable until recoveryStreak flat readings in a row.
+ *    sensors are unavailable until recoveryStreak flat readings in a row;
+ *  - robot 2026-10-02 18:28 (tipped onto his side backing out of a stall, z never read a
+ *    tilt first): the tilt is also the angle between the accel vector and the flat one
+ *    (learnFlat: still readings at session start, else darkFlatAccelX/Y/Z). Past darkTiltDeg
+ *    it is a TILT, past darkLiftDeg lifted or tipped, and a change over darkTiltFastDeg
+ *    within darkTiltFastMs is a TILT at once (darkTiltReadings readings in a row). tipping()
+ *    is the stricter guard for every move but a forward leg: darkEscapeTiltDeg, or the
+ *    fast change.
  */
 final class HazardClassifier {
     enum Status { UNAVAILABLE, HAZARD, CLEAR }
@@ -91,6 +98,22 @@ final class HazardClassifier {
     private int liftRun;
     private final int tiltBelowZ;
     private final int liftBelowZ;
+    /** The flat accel vector (learned or the tuning's), and the still readings toward learning it. */
+    private double flatX;
+    private double flatY;
+    private double flatZ;
+    private boolean flatLearned;
+    private long learnX;
+    private long learnY;
+    private long learnZ;
+    private int learnN;
+    /** The latest reading's angle to flat, its largest change within darkTiltFastMs, and the runs past them. */
+    private double tiltDeg = Double.NaN;
+    private double fastDeg = Double.NaN;
+    private int fastRun;
+    private int escRun;
+    /** Recent accel readings {t, x, y, z, tilt's double bits}, darkTiltFastMs back. */
+    private final java.util.ArrayDeque<long[]> recentAccel = new java.util.ArrayDeque<long[]>();
 
     HazardClassifier(ExploreTuning tuning) {
         this.tuning = tuning;
@@ -101,6 +124,77 @@ final class HazardClassifier {
         }
         tiltBelowZ = (int) Math.round(tuning.darkFlatAccelZ * Math.cos(Math.toRadians(tuning.darkTiltDeg)));
         liftBelowZ = (int) Math.round(tuning.darkFlatAccelZ * Math.cos(Math.toRadians(tuning.darkLiftDeg)));
+        flatX = tuning.darkFlatAccelX;
+        flatY = tuning.darkFlatAccelY;
+        flatZ = tuning.darkFlatAccelZ;
+    }
+
+    /** Degrees between two vectors; NaN when either is (near) zero. */
+    static double angleDeg(double ax, double ay, double az, double bx, double by, double bz) {
+        double na = Math.sqrt(ax * ax + ay * ay + az * az);
+        double nb = Math.sqrt(bx * bx + by * by + bz * bz);
+        if (na < 1 || nb < 1) {
+            return Double.NaN;
+        }
+        double c = (ax * bx + ay * by + az * bz) / (na * nb);
+        return Math.toDegrees(Math.acos(Math.max(-1, Math.min(1, c))));
+    }
+
+    /**
+     * A reading taken while he stands still, toward the flat vector: the first darkLearnReadings
+     * within darkLearnMaxDeg of the tuning's are averaged, once. True when it was just learned.
+     */
+    boolean learnFlat(SensorReading r) {
+        if (flatLearned || tuning.darkLearnReadings <= 0 || r == null || !r.hasAccel) {
+            return false;
+        }
+        double off = angleDeg(r.accelX, r.accelY, r.accelZ,
+                tuning.darkFlatAccelX, tuning.darkFlatAccelY, tuning.darkFlatAccelZ);
+        if (!(off <= tuning.darkLearnMaxDeg)) {
+            return false;
+        }
+        learnX += r.accelX;
+        learnY += r.accelY;
+        learnZ += r.accelZ;
+        learnN++;
+        if (learnN < tuning.darkLearnReadings) {
+            return false;
+        }
+        flatX = (double) learnX / learnN;
+        flatY = (double) learnY / learnN;
+        flatZ = (double) learnZ / learnN;
+        flatLearned = true;
+        return true;
+    }
+
+    /** The flat vector, for the log. */
+    String flat() {
+        return "(" + Math.round(flatX) + ", " + Math.round(flatY) + ", " + Math.round(flatZ) + ")"
+                + (flatLearned ? " from " + learnN + " still readings" : " (default)");
+    }
+
+    /** The latest reading's angle to flat, in degrees; NaN with no accel. */
+    double tiltDeg() {
+        return tiltDeg;
+    }
+
+    /** Dark-floor mode: the latest readings tipped away from flat fast (darkTiltFastDeg within darkTiltFastMs). */
+    boolean fastTipped() {
+        return darkFloor && fastRun >= tuning.darkTiltReadings;
+    }
+
+    /** The latest reading's largest angle change within darkTiltFastMs; NaN with no accel. */
+    double fastDeg() {
+        return fastDeg;
+    }
+
+    /**
+     * Dark-floor mode: the latest readings tip past darkEscapeTiltDeg, or tipped fast away from flat, or past
+     * the tilt limit. The guard every move but a forward leg (which has TILT) stops on.
+     */
+    boolean tipping() {
+        int n = tuning.darkTiltReadings;
+        return darkFloor && (escRun >= n || fastRun >= n || tiltRun >= n || liftRun >= n);
     }
 
     /**
@@ -116,6 +210,8 @@ final class HazardClassifier {
         available = false;
         tiltRun = 0;
         liftRun = 0;
+        fastRun = 0;
+        escRun = 0;
         if (cal != null) {
             reason = on ? "dark floor: on, waiting for readings" : "dark floor: off, waiting for readings";
         }
@@ -127,7 +223,7 @@ final class HazardClassifier {
 
     /** Dark-floor mode: the latest readings tip past the tilt limit (a TILT hazard while available). */
     boolean tilted() {
-        return darkFloor && tiltRun >= tuning.darkTiltReadings;
+        return darkFloor && (tiltRun >= tuning.darkTiltReadings || fastRun >= tuning.darkTiltReadings);
     }
 
     /** A new reading. Out-of-order or duplicate readings are ignored. */
@@ -144,8 +240,30 @@ final class HazardClassifier {
             streak = 0;
         }
         if (r.hasAccel) {
-            tiltRun = r.accelZ < tiltBelowZ ? tiltRun + 1 : 0;
-            liftRun = r.accelZ < liftBelowZ ? liftRun + 1 : 0;
+            tiltDeg = angleDeg(r.accelX, r.accelY, r.accelZ, flatX, flatY, flatZ);
+            double fast = Double.NaN;
+            while (!recentAccel.isEmpty() && r.timestampMs - recentAccel.peekFirst()[0] > tuning.darkTiltFastMs) {
+                recentAccel.pollFirst();
+            }
+            for (long[] a : recentAccel) {
+                // Only a change away from flat: being set down flat again is no tip.
+                if (!(tiltDeg > Double.longBitsToDouble(a[4]))) {
+                    continue;
+                }
+                double d = angleDeg(r.accelX, r.accelY, r.accelZ, a[1], a[2], a[3]);
+                if (Double.isNaN(fast) || d > fast) {
+                    fast = d;
+                }
+            }
+            recentAccel.addLast(new long[]{r.timestampMs, r.accelX, r.accelY, r.accelZ,
+                    Double.doubleToLongBits(tiltDeg)});
+            fastDeg = fast;
+            boolean past = tiltDeg >= tuning.darkTiltDeg;
+            boolean lifted = tiltDeg >= tuning.darkLiftDeg;
+            tiltRun = r.accelZ < tiltBelowZ || past ? tiltRun + 1 : 0;
+            liftRun = r.accelZ < liftBelowZ || lifted ? liftRun + 1 : 0;
+            fastRun = tuning.darkTiltFastDeg > 0 && fast >= tuning.darkTiltFastDeg ? fastRun + 1 : 0;
+            escRun = tiltDeg >= tuning.darkEscapeTiltDeg ? escRun + 1 : 0;
         }
         String bad = badReason(r);
         if (bad != null) {
@@ -347,7 +465,8 @@ final class HazardClassifier {
         }
         if (darkFloor) {
             if (liftRun >= tuning.darkTiltReadings) {
-                return "dark floor: lifted or tipped (accel z " + r.accelZ + ", flat " + tuning.darkFlatAccelZ + ")";
+                return "dark floor: lifted or tipped (accel z " + r.accelZ + ", flat " + tuning.darkFlatAccelZ
+                        + (Double.isNaN(tiltDeg) ? "" : ", tilt " + Math.round(tiltDeg) + " deg") + ")";
             }
             // No return from a black floor is constant by nature: only a valid tof can freeze.
             if (r.tof != tuning.tofFault && tuning.frozenTofWindowMs > 0

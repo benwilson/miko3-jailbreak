@@ -62,6 +62,25 @@ final class ExploreTuning {
     final float darkLiftDeg;
     final int darkTiltReadings;
     final int darkLegTicksMax;
+    /**
+     * Robot 2026-10-02 18:28: he tipped onto his side backing out of a stall, with no z-only
+     * tilt reading before it (BACK_OFF never looked). The tilt is now also the angle between
+     * the accel vector and the flat one (darkFlatAccelX/Y/Z, robot (-2200, 600, 23100); learned
+     * from darkLearnReadings still readings at session start when within darkLearnMaxDeg of
+     * it); a change over darkTiltFastDeg within darkTiltFastMs (darkTiltReadings readings in a
+     * row; 0 deg: off) is a tilt too. Any move but a forward leg stops at darkEscapeTiltDeg
+     * (or the fast change), then goes darkTipUndoTicks ticks the opposite way; more than
+     * darkTipMaxPerSpell tips in a stuck spell is a jam.
+     */
+    final int darkFlatAccelX;
+    final int darkFlatAccelY;
+    final int darkLearnReadings;
+    final float darkLearnMaxDeg;
+    final float darkTiltFastDeg;
+    final long darkTiltFastMs;
+    final float darkEscapeTiltDeg;
+    final int darkTipUndoTicks;
+    final int darkTipMaxPerSpell;
     /** tof unchanged for this long means frozen (leftover TOFDS); 0 turns the rule off (KTD3). */
     final long frozenTofWindowMs;
     /** Good readings in a row needed to go from unavailable back to available (KTD3). */
@@ -958,6 +977,15 @@ final class ExploreTuning {
         darkLiftDeg = Math.max(b.darkTiltDeg, b.darkLiftDeg);
         darkTiltReadings = Math.max(1, b.darkTiltReadings);
         darkLegTicksMax = Math.max(1, b.darkLegTicksMax);
+        darkFlatAccelX = b.darkFlatAccelX;
+        darkFlatAccelY = b.darkFlatAccelY;
+        darkLearnReadings = Math.max(0, b.darkLearnReadings);
+        darkLearnMaxDeg = b.darkLearnMaxDeg;
+        darkTiltFastDeg = b.darkTiltFastDeg;
+        darkTiltFastMs = Math.max(1, b.darkTiltFastMs);
+        darkEscapeTiltDeg = b.darkEscapeTiltDeg;
+        darkTipUndoTicks = Math.max(0, b.darkTipUndoTicks);
+        darkTipMaxPerSpell = Math.max(0, b.darkTipMaxPerSpell);
         frozenTofWindowMs = b.frozenTofWindowMs;
         recoveryStreak = Math.max(1, b.recoveryStreak);
         capHazards = Math.max(1, b.capHazards);
@@ -1317,6 +1345,18 @@ final class ExploreTuning {
         private float darkLiftDeg = 45f;
         private int darkTiltReadings = 2;
         private int darkLegTicksMax = 16;
+        // Robot 2026-10-02: still on the black floor, accel (-2200, 600, 23100) (about 5.6 deg
+        // off z, his own resting pitch).
+        private int darkFlatAccelX = -2200;
+        private int darkFlatAccelY = 600;
+        private int darkLearnReadings = 16;
+        private float darkLearnMaxDeg = 12f;
+        // Unmeasured on the robot: driving bobs z by 22654..23698 (about 2.5%), well under 8 deg.
+        private float darkTiltFastDeg = 8f;
+        private long darkTiltFastMs = 300;
+        private float darkEscapeTiltDeg = 10f;
+        private int darkTipUndoTicks = 2;
+        private int darkTipMaxPerSpell = 2;
         // A still robot's tof jitters by tens of counts, so identical values this
         // long mean a stuck sensor (docs/hardware/tof-sensor.md).
         private long frozenTofWindowMs = 3000;
@@ -1962,6 +2002,21 @@ final class ExploreTuning {
             darkLiftDeg = liftDeg;
             darkTiltReadings = tiltReadings;
             darkLegTicksMax = legTicksMax;
+            return this;
+        }
+        Builder darkFlat(int x, int y, int z, int learnReadings, float learnMaxDeg) {
+            darkFlatAccelX = x;
+            darkFlatAccelY = y;
+            darkFlatAccelZ = z;
+            darkLearnReadings = learnReadings;
+            darkLearnMaxDeg = learnMaxDeg;
+            return this;
+        }
+        Builder darkTiltFast(float deg, long ms) { darkTiltFastDeg = deg; darkTiltFastMs = ms; return this; }
+        Builder darkTip(float escapeTiltDeg, int undoTicks, int maxPerSpell) {
+            darkEscapeTiltDeg = escapeTiltDeg;
+            darkTipUndoTicks = undoTicks;
+            darkTipMaxPerSpell = maxPerSpell;
             return this;
         }
         Builder cplRetry(long pauseMs, long windowMs) { cplRetryPauseMs = pauseMs; cplRetryWindowMs = windowMs; return this; }
