@@ -431,6 +431,7 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "rename_changes_name_and_redirects",
         "rename_empty_makes_unnamed",
         "forget_removes_person_from_store_and_page",
+        "a_name_only_person_is_listed_without_a_photo_and_forget_deletes_them",
         "people_actions_on_unknown_id_change_nothing",
         "people_actions_with_stale_token_refused",
         "people_status_never_echoes_name",

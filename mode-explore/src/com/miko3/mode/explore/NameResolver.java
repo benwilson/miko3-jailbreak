@@ -55,6 +55,17 @@ final class NameResolver {
      */
     static Decision resolve(String name, float[] probe, List<String> candidateIds, List<FaceMatcher.Entry> gallery,
                             float close) {
+        return resolve(name, probe, candidateIds, gallery, close, null);
+    }
+
+    /**
+     * As resolve(), where nameOnly holds the candidates remembered by name alone (owner
+     * 2026-10-02: id -> stored name, no photo yet, from a faceless conversation): when no
+     * stored face is close, one whose stored name equals the name given is joined, so the
+     * face is enrolled under the name they gave before.
+     */
+    static Decision resolve(String name, float[] probe, List<String> candidateIds, List<FaceMatcher.Entry> gallery,
+                            float close, Map<String, String> nameOnly) {
         if (candidateIds == null || candidateIds.isEmpty()) {
             return new Decision(Kind.NEW, null, name, Float.NaN);
         }
@@ -77,6 +88,13 @@ final class NameResolver {
         }
         if (bestId != null && best >= close) {
             return new Decision(Kind.JOIN, bestId, name, best);
+        }
+        if (nameOnly != null) {
+            for (String id : candidateIds) {
+                if (nameOnly.containsKey(id) && AnswerParser.same(nameOnly.get(id), name)) {
+                    return new Decision(Kind.JOIN, id, name, Float.NaN);
+                }
+            }
         }
         if (words(name) == 2) {
             // A full name matches by full name: the last-name question would only repeat it.
@@ -101,6 +119,33 @@ final class NameResolver {
             }
         }
         return new Decision(Kind.NEW, null, titled(full), Float.NaN);
+    }
+
+    /**
+     * Owner 2026-10-02: a name given with no usable face, looked up by name alone over the
+     * store's idsNamed answer for it (storedNames: id -> stored name, in the store's order).
+     * A stored name equal to the name given wins, so a full name picks its person when
+     * several share the first name; else a first name only one person has finds them (JOIN,
+     * with the stored name); several sharing it and none equal is ambiguous (ASK_LAST_NAME:
+     * nothing is loaded or stored); nobody is someone NEW, kept by the name alone.
+     */
+    static Decision byName(String name, Map<String, String> storedNames) {
+        if (storedNames != null) {
+            for (Map.Entry<String, String> e : storedNames.entrySet()) {
+                if (AnswerParser.same(e.getValue(), name)) {
+                    return new Decision(Kind.JOIN, e.getKey(), e.getValue().trim(), Float.NaN);
+                }
+            }
+        }
+        if (storedNames == null || storedNames.isEmpty()) {
+            return new Decision(Kind.NEW, null, name == null ? null : name.trim(), Float.NaN);
+        }
+        if (words(name) == 1 && storedNames.size() == 1) {
+            Map.Entry<String, String> only = storedNames.entrySet().iterator().next();
+            return new Decision(Kind.JOIN, only.getKey(), only.getValue().trim(), Float.NaN);
+        }
+        return words(name) == 1 ? new Decision(Kind.ASK_LAST_NAME, null, name.trim(), Float.NaN)
+                : new Decision(Kind.NEW, null, name.trim(), Float.NaN);
     }
 
     /** First and last as one full name: trimmed, single-spaced. */

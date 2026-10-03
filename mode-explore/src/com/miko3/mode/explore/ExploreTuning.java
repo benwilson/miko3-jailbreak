@@ -531,12 +531,12 @@ final class ExploreTuning {
      */
     final long answerHoldMs;
     /**
-     * Robot 2026-10-01: a conversation that opened with no usable face retries the face
-     * check on a fresh look up to chatFaceTries times: each try's look is asked for
-     * chatFaceDelayMs into a listen (time to crouch down to him), at least chatFaceGapMs
-     * after the last try ended. Only a usable face lets him ask the name and store it.
+     * A conversation that opened with no usable face keeps checking for one in the
+     * background (owner 2026-10-02: "he should always be looking for their face"): a fresh
+     * look's face is checked chatFaceDelayMs into a listen, at least chatFaceGapMs after
+     * the last check ended, for the whole conversation until a usable face turns up. The
+     * checks are silent: he never asks to see their face and never speaks for one.
      */
-    final int chatFaceTries;
     final long chatFaceDelayMs;
     final long chatFaceGapMs;
     /**
@@ -1118,7 +1118,6 @@ final class ExploreTuning {
         headingSampleMs = Math.max(10, b.headingSampleMs);
         unansweredListenMs = Math.max(1, b.unansweredListenMs);
         answerHoldMs = Math.max(unansweredListenMs, b.answerHoldMs);
-        chatFaceTries = Math.max(0, b.chatFaceTries);
         chatFaceDelayMs = Math.max(0, b.chatFaceDelayMs);
         chatFaceGapMs = Math.max(0, b.chatFaceGapMs);
         callChatFirst = b.callChatFirst;
@@ -1562,10 +1561,9 @@ final class ExploreTuning {
         private long unansweredListenMs = 7000;
         // Robot 2026-10-01: LauncherProtocol.EARS_ANSWER_HOLD_MS (the answer cap, 60 s since 2026-10-02, plus 3 s).
         private long answerHoldMs = 63000;
-        // Robot 2026-10-01: about three tries, a few seconds apart, after the crouch invitation.
-        private int chatFaceTries = 3;
+        // Owner 2026-10-02: one silent face check about every 8 s for the whole conversation.
         private long chatFaceDelayMs = 1000;
-        private long chatFaceGapMs = 3000;
+        private long chatFaceGapMs = 8000;
         // Owner 2026-10-02: conversation first; the answer waits for the wake utterance's end
         // (a worded "Hey Miko, ..." runs about 1.5-2 s past the wake); three unanswered listens.
         private boolean callChatFirst = true;

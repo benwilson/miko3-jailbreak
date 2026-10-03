@@ -105,6 +105,9 @@ final class SettingsPage {
     static final String PEOPLE_NO_NOTES = "No notes yet.";
     /** A record from before names were required (KTD10): out of the matching
      * gallery, never given notes; the owner names it or deletes it. */
+    /** Owner 2026-10-02: someone remembered by name alone, from a faceless conversation. */
+    static final String PEOPLE_NAME_ONLY = "No face yet: remembered by the name they gave. He adds their face when "
+            + "he gets a good look at them in a conversation where they give this name.";
     static final String PEOPLE_LEGACY = "Legacy record: no name, so he no longer matches this face or keeps notes "
             + "on it. Give them a name, or Forget deletes it.";
 
@@ -807,11 +810,17 @@ final class SettingsPage {
             String id = escapeHtml(p.id);
             String name = escapeHtml(p.name);
             html.append("<article id=\"person-").append(id).append("\">");
-            html.append("<img src=\"").append(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH).append("?id=").append(id)
-                    .append("\" alt=\"").append(p.name.isEmpty() ? "unnamed person" : name)
-                    .append("\" width=\"112\" height=\"112\">");
+            boolean faced = store.hasFace(p.id);
+            if (faced) {
+                html.append("<img src=\"").append(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH).append("?id=").append(id)
+                        .append("\" alt=\"").append(p.name.isEmpty() ? "unnamed person" : name)
+                        .append("\" width=\"112\" height=\"112\">");
+            }
             html.append("<p><strong>").append(p.name.isEmpty() ? "<em>unnamed</em>" : name).append("</strong><br>");
             html.append("<small>Last seen ").append(escapeHtml(lastSeen(p.lastSeenMillis))).append("</small></p>");
+            if (!faced) {
+                html.append("<p class=\"name-only\"><small>").append(PEOPLE_NAME_ONLY).append("</small></p>");
+            }
             if (p.name.isEmpty()) {
                 html.append("<p class=\"legacy\"><small>").append(PEOPLE_LEGACY).append("</small></p>");
             } else {

@@ -21,6 +21,7 @@ tags:
 applies_when:
   - "Deciding whether a YOLOE person box is a real person: furniture and shadows score about 0.53 and people from the floor 0.55-0.75, and box persistence does not separate them"
   - "Learning or asking a name, where YuNet faces seen from the floor are 25-46 px, under FaceSettings minWidth 48"
+  - "Changing what a faceless conversation says or stores: it asks the name, keeps notes by the name alone, and checks the face silently in the background (R19 as changed 2026-10-02)"
   - "Opening a meeting from roaming or a voice cue versus a real call (wake word or name)"
   - "A call search on a slow detector that discards frames showing the caller as stale"
 resolution_type: code_fix
@@ -56,10 +57,7 @@ The rules on PR #29 (branch `feat/explore-hey-miko-always-answers`, not yet merg
 
 1. **Roaming and cue meetings need a usable face.** In `matchAnswered` (mode-explore/src/com/miko3/mode/explore/ExploreBrain.java:3090-3100), a roaming pick or a non-call voice-cue pick (`roamingPick`, `cuePick`, fields at ExploreBrain.java:664-674) whose face check is not usable goes to `phantomPerson` (ExploreBrain.java:3121-3128). It is dropped with nothing said and logged as `no usable face in the roaming person pick's box` or `no usable face in the cue's person box`. Roaming person picks are then ignored for `phantomPersonCooldownMs` (20000 ms, ExploreTuning.java:949; the check is at ExploreBrain.java:4948), so he does not go straight back to the same shadow.
 2. **A usable face** is defined in `usableFace` (ExploreBrain.java:3108-3111): a `KNOWN` match, or a `NEW` face that passed the quality gate (`!a.faceless`). No face, a crop rejected as too small, dark or blurry, face models not ready, and a failed or timed-out check all count as unusable.
-3. **Calls may be faceless.** Someone said "Hey Miko" or his name, so a call's meeting is never dropped (`!callsOwn()` in the same condition; `callsOwn` is at ExploreBrain.java:5595). With no usable face:
-   - The opener is `ExplorePrompts.FACELESS_OPENER` (ExplorePrompts.java:283). He greets them, says he can't see their face from down there, asks them to crouch to his level, and does not ask their name. `ClaudeCuriosity` picks it for faceless requests at ClaudeCuriosity.java:483.
-   - The conversation retries the face check on a fresh look up to `chatFaceTries` = 3 times. The first try comes `chatFaceDelayMs` = 1000 ms into a listen, with tries at least `chatFaceGapMs` = 3000 ms apart (ExploreTuning.java:1021-1023; logic in `ChatSession.faceAnswered`/`faceTryOver`, ChatSession.java:816-846, logged as `face try N of 3`).
-   - **He asks the name only once a usable face is in hand.** On a usable try, `FACE_SEEN` (ExplorePrompts.java:291) is appended to the next turn and tells him to ask the name now (ClaudeCuriosity.java:493). If they gave a name earlier, it is checked against the people stored. If all three tries fail, the conversation runs unnamed and nothing is stored (ChatSession.java:843-845).
+3. **Calls may be faceless.** Someone said "Hey Miko" or his name, so a call's meeting is never dropped (`!callsOwn()` in the same condition; `callsOwn` is at ExploreBrain.java:5595). What a faceless conversation does was changed by the owner on 2026-10-02 (see "R19 as changed" below): he asks the name and remembers by it, and checks the face silently. The first version, superseded the same day, asked people to crouch to his level, asked no name, retried the face 3 times and discarded the notes of anyone with no face.
 
 **Related fix in the same PR: a person in a stale frame still gives a bearing.** The detector takes 1.4-4.8 s per look. During a call search the robot is turning, so by the time a frame showing the caller is decoded he has turned past them. Such frames used to be discarded as stale, and the search went on blind; the owner was seen 37 and 61 deg off. Now:
 
@@ -69,6 +67,16 @@ The rules on PR #29 (branch `feat/explore-hey-miko-always-answers`, not yet merg
 This happens at most `callSeenRetargetsMax` = 2 times per call (ExploreTuning.java:1004, enforced at ExploreBrain.java:5771), so a series of blurred boxes cannot swing him back and forth.
 
 **Update 2026-10-02 (owner, at home: "he doesn't really talk to us").** Rule 1 was too strict: from the floor a face is almost never usable, so he met nobody unless called (home log 20:44: people at score 0.76 and 0.80 dropped). A roaming or cue pick with no usable face is now met as a faceless conversation (crouch invitation, no name asked) when its person box scored at least `facelessMeetMinScore` = 0.65 or a voice from the person's known side landed within `facelessMeetVoiceMs` = 5000 ms (`ExploreBrain.facelessMeetable`). Weaker picks with no voice stay phantoms; furniture scores about 0.53. A shove's cue has no side and never counts: at home, a stopped robot logged `shoved: ~3700 counts` every 0.5 s, and each one was noted as "a voice from the person's side".
+
+**R19 as changed 2026-10-02 (owner, at home: "There should be less interruptions as he tries to find your face. Rather than trying to force someone to show them their face, he should always be looking for their face to try and identify them. But he can ask a question and just say 'What's your name?' and then base his conversation off the name.").** The old R19 was "a faceless conversation asks no name and discards its notes". Now:
+
+- **He never asks to see a face.** The crouch invitation is gone: `CANT_SEE`, `FACE_SEEN` and the crouch text in `FACELESS_OPENER` were removed. `FACELESS_OPENER` greets them and asks their name ("What's your name?"); a call's opener still greets first, and `NAME_ASK` lets the next turn ask the name while he doesn't know it (`ChatRound.body`).
+- **The face is checked silently for the whole conversation.** `ChatSession.faceStep` takes one fresh look and runs the meeting's match `chatFaceDelayMs` (1000 ms) into a listen and at least `chatFaceGapMs` (8000 ms) after the last check, with no cap (`chatFaceTries` is gone). Checks run only in a listen with the camera open (`faceLooksAllowed`), never while he speaks (KTD7), and never cause a line: logged as `face check N: no usable face; he keeps looking quietly`.
+- **Memory by name.** A name given with no usable face is used at once and looked up by the name alone (`CuriosityPort.recallName`, `NameResolver.byName`): a stored name equal to the one given wins, so a full name picks its person when several share a first name; a first name only one person has finds them; several sharing it and none equal loads and stores nothing. Someone found lends their notes (the system prefix changes once; `ExplorePrompts.recalled` tells that turn who they are). Nobody found: the launcher keeps a new record **by the name alone** (`PeopleStore.addNamed`, Binder `addNamed`/`hasFace`, transactions 19-20), and the notes persist to it. Still no name, no notes: an unnamed conversation's notes are discarded.
+- **A usable face settles who they are, silently** (`ChatSession.faceAnswered`). Unnamed and the face is KNOWN: he goes on as that person, with their notes. Unnamed and the face is new: it waits for their name (the meeting's own resolve, then `keep`). Named by a record with no face: a new face is enrolled to it (`addPhoto`). A face that is not the stored face of the person the name found: the name stands and nothing more is stored. In a meeting with a face in hand, `NameResolver.resolve` joins a name-only record whose stored name equals the name given, so the face is enrolled there too.
+- **Privacy is unchanged.** Names never reach a log (ids and counts only); Forget on the Settings page deletes a name-only record and its notes (`PeopleStore.forget`, which also runs the forget hooks for other stores keyed by the same id, such as voice prints); owner's notes stay separate and still need the full name spoken.
+
+Not yet measured on the robot: whether the endless checks (one look and match about every 8 s) cost too much CPU or upset the camera HAL over a long conversation, and how often a bystander's face is matched instead of the partner's (the largest person box wins).
 
 ## Why This Matters
 
@@ -80,7 +88,8 @@ Approaches tried or considered and rejected:
 
 - **Persistence rescue** (a person box in 2 of 3 still looks counts as a person). This let static furniture through, since furniture stays in place as well as people do. Do not try it again.
 - **Claude person-confirmation** (send the crop to Claude and ask whether it is a person). This was considered and dropped in favour of the simpler face rule, which the owner chose. It also adds latency and cost and still would not give a face to store.
-- **Asking the name with no face.** This was pointless: `a name given; no face to keep them by, so nothing is stored`.
+- **Asking the name with no face, storing nothing.** This was pointless: `a name given; no face to keep them by, so nothing is stored`. Superseded on 2026-10-02 by memory by name, not by not asking.
+- **Asking people to crouch so he can see their face** (2026-10-01 to 10-02). The owner found it an interruption; the face is now checked silently instead.
 - **Higher-resolution face detection** (full-res head crop, 640x480 full frame). This found no more faces than the default half-res path (11 vs 12). The faces really are small.
 
 ## When to Apply
@@ -106,18 +115,20 @@ look in 1192 ms: [speaker 0.66 [...], person 0.54 [0.00,0.00,0.40,1.00], ...]   
 look in 1554 ms: [chair 0.87 [...], ..., person 0.53 [0.00,0.00,0.12,0.99], ...] <- dark chair edge
 ```
 
-A faceless call that gets its face on a retry (ChatSession notes):
+A faceless conversation since 2026-10-02 (ChatSession notes; no names in them):
 
 ```
-face try 1 of 3: no usable face
-face try 2 of 3: checking the face in a fresh look ...
-a usable face on try 2 of 3: he may ask the name now
+a name given with no usable face yet: looking the name up in the people stored
+nobody stored has that name: kept under the name alone, no face yet; the notes persist to it
+face check 2: no usable face; he keeps looking quietly
+a usable new face on check 3: enrolling it to the person kept by name alone
+the face is enrolled to the person kept by name alone
 ```
 
-When the face never comes:
+A later conversation where they give the same name:
 
 ```
-no usable face after 3 tries: the conversation runs unnamed and the name held is not stored
+the name belongs to someone stored by name alone: their notes join the conversation (2 questions on record)
 ```
 
 A call search that turns to a caller seen in a stale look (format of the note; the numbers are illustrative):

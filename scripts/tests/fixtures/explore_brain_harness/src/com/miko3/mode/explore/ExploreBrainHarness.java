@@ -615,6 +615,8 @@ public final class ExploreBrainHarness {
         final java.util.Set<String> refusePhoto = new java.util.HashSet<String>();
         /** The store's answer time for a resolve or an added photo. */
         long storeDelayMs = 300;
+        /** Owner 2026-10-02: the named people remembered by name alone (no face yet). */
+        final java.util.Set<String> nameOnly = new java.util.HashSet<String>();
     }
 
     static final class Rig implements ExploreBrain.Clock, ExploreBrain.Motor, ExploreBrain.Eyes, ExploreBrain.Sound,
@@ -797,6 +799,10 @@ public final class ExploreBrainHarness {
         final List<String> outcomes = new ArrayList<String>();
         int meetingOvers;
         String pendingFirst;
+        /** Owner 2026-10-02: every name looked up with no face, and the answer in flight. */
+        final List<String> recalls = new ArrayList<String>();
+        CuriosityPort.Recalled pendingRecall;
+        long pendingRecallAt;
         CuriosityPort.Resolved pendingResolved;
         long pendingResolvedAt;
         CuriosityPort.MatchAnswer pendingPhoto;
@@ -1956,7 +1962,14 @@ public final class ExploreBrainHarness {
         public void resolveName(String name, long timeoutMs) {
             resolves.add(name);
             List<String> ids = idsNamed(people, name);
-            NameResolver.Decision d = NameResolver.resolve(name, PROBE, ids, galleryOf(people, ids), people.close);
+            java.util.Map<String, String> nameOnly = new java.util.LinkedHashMap<String, String>();
+            for (String id : ids) {
+                if (people.nameOnly.contains(id)) {
+                    nameOnly.put(id, people.named.get(id));
+                }
+            }
+            NameResolver.Decision d = NameResolver.resolve(name, PROBE, ids, galleryOf(people, ids), people.close,
+                    nameOnly);
             if (d.kind == NameResolver.Kind.ASK_LAST_NAME) {
                 pendingFirst = d.name;
             }
@@ -1977,6 +1990,52 @@ public final class ExploreBrainHarness {
                     : resolvedOf(people, NameResolver.afterLastName(pendingFirst, lastName, stored));
             pendingResolvedAt = now + people.storeDelayMs;
             log.add(new Event(now, "resolve last " + lastName));
+        }
+
+        /** Owner 2026-10-02: the real NameResolver.byName over the fake store; nobody is kept by name alone. */
+        @Override
+        public void recallName(String name, long timeoutMs) {
+            recalls.add(name);
+            java.util.Map<String, String> stored = new java.util.LinkedHashMap<String, String>();
+            for (String id : idsNamed(people, name)) {
+                stored.put(id, people.named.get(id));
+            }
+            NameResolver.Decision d = NameResolver.byName(name, stored);
+            switch (d.kind) {
+                case JOIN:
+                    pendingRecall = CuriosityPort.Recalled.found(d.personId, d.name, people.notes.get(d.personId),
+                            people.asked.get(d.personId), !people.nameOnly.contains(d.personId));
+                    break;
+                case NEW: {
+                    String id = "named-" + recalls.size();
+                    people.named.put(id, d.name);
+                    people.nameOnly.add(id);
+                    pendingRecall = CuriosityPort.Recalled.created(id, d.name);
+                    break;
+                }
+                default:
+                    pendingRecall = CuriosityPort.Recalled.SHARED;
+                    break;
+            }
+            pendingRecallAt = now + people.storeDelayMs;
+            log.add(new Event(now, "recall"));
+        }
+
+        @Override
+        public CuriosityPort.Recalled recalledName() {
+            if (pendingRecall == null || now < pendingRecallAt) {
+                return null;
+            }
+            CuriosityPort.Recalled r = pendingRecall;
+            pendingRecall = null;
+            log.add(new Event(now, "recalled " + r));
+            return r;
+        }
+
+        @Override
+        public void cancelRecallName() {
+            pendingRecall = null;
+            log.add(new Event(now, "cancel recall"));
         }
 
         @Override
@@ -2001,6 +2060,9 @@ public final class ExploreBrainHarness {
             photos.add(personId);
             boolean refused = people.refusePhoto.contains(personId) || !people.named.containsKey(personId);
             CuriosityPort.MatchAnswer a = CuriosityPort.MatchAnswer.known(people.named.get(personId));
+            if (!refused) {
+                people.nameOnly.remove(personId);
+            }
             pendingPhoto = refused ? CuriosityPort.MatchAnswer.FAILED : people.persona == null ? a
                     : a.withConversation(people.persona, personId, people.notes.get(personId),
                             people.asked.get(personId));
@@ -13697,7 +13759,7 @@ public final class ExploreBrainHarness {
             check(n, chat > 0 && rig.count("match") == 1 && rig.violations.isEmpty(), "chat@" + chat + " "
                     + rig.tail());
         });
-        scenario("call_wake_word_with_no_face_still_opens_with_the_crouch_opener", n -> {
+        scenario("call_wake_word_with_no_face_still_opens_with_the_faceless_opener", n -> {
             Rig rig = cueRig(personAt(90, 25));
             rig.people.persona = PERSONA;
             rig.people.match = (r, k) -> noFace(r);
@@ -14376,14 +14438,15 @@ public final class ExploreBrainHarness {
         });
     }
 
-    // ---- a call with no usable face: the crouch opener, face retries, the name only with a face ----
+    // ---- a conversation with no usable face: the name asked, the face checked quietly ----
     //
-    // Robot 2026-10-01: from the floor the face was out of frame or under 48 px, so he asked
-    // three office regulars their names and remembered none of them. A call (someone asked for
-    // him) still converses facelessly, but the opener invites them down to his level instead
-    // of asking the name; he retries the face on a fresh look up to chatFaceTries times; the
-    // name is asked (or one already given is used) only once a usable face is in hand, and
-    // then it is stored with the face. With no usable face he chats unnamed, as before.
+    // Robot 2026-10-01: from the floor the face was out of frame or under 48 px. Owner
+    // 2026-10-02 (at home): "less interruptions as he tries to find your face ... he can just
+    // say 'What's your name?' and then base his conversation off the name." He never asks to
+    // see their face; the opener asks the name; the name given is used and looked up by name
+    // alone (someone stored lends their notes, else they are kept by the name alone); the face
+    // is checked silently about every 8 s all conversation, and a usable one settles who they
+    // are (a match: he goes on as them; new: enrolled under the name).
 
     /** A call from Priya on his left whose face is usable from the usableFrom-th match on (0: never). */
     private static Rig facelessCallRig(int usableFrom, TurnScript turns, Hearing... listens) {
@@ -14406,14 +14469,41 @@ public final class ExploreBrainHarness {
         return h;
     }
 
-    /** The index of the first turn request carrying faceSeen, or -1. */
-    private static int firstFaceSeen(Rig rig) {
+    /** The indexes of the turn requests saying he just found out who they are (TurnRequest.recalled). */
+    private static List<Integer> recalledAsks(Rig rig) {
+        List<Integer> out = new ArrayList<Integer>();
         for (int i = 0; i < rig.turnAsks.size(); i++) {
-            if (rig.turnAsks.get(i).request.faceSeen) {
-                return i;
+            if (rig.turnAsks.get(i).request.recalled) {
+                out.add(i);
             }
         }
-        return -1;
+        return out;
+    }
+
+    /** No turn request came from anything but their words (or the opener, or a nudge): a face never makes him speak. */
+    private static boolean onlyHeardTurns(Rig rig) {
+        for (int i = 1; i < rig.turnAsks.size(); i++) {
+            if (rig.turnAsks.get(i).request.heard == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The times of the face checks' matches after the meeting's own (the first). */
+    private static List<Long> checkTimes(Rig rig) {
+        List<Long> out = new ArrayList<Long>();
+        boolean first = true;
+        for (Event e : rig.log) {
+            if ("match".equals(e.what)) {
+                if (first) {
+                    first = false;
+                } else {
+                    out.add(e.t);
+                }
+            }
+        }
+        return out;
     }
 
 
@@ -15286,11 +15376,11 @@ public final class ExploreBrainHarness {
             List<long[]> turns = wheelTurns(rig, open, over);
             System.out.println("REPORT bare Hey Miko: " + notesAfter(notes, 400));
             check(n, open > 0 && over > 0 && first != null && first.request.heard == null && first.request.called
-                            && !first.request.cantSee && first.t - 400 <= 1500 && !searchedBeforeTheConversation(rig, 400)
+                            && first.t - 400 <= 1500 && !searchedBeforeTheConversation(rig, 400)
                             && !turns.isEmpty() && turns.get(0)[1] == -1 && rig.chatTurns == turns.size()
                             && noted(notes, "looking for the caller during the conversation")
                             && noted(notes, "search look") && rig.violations.isEmpty(),
-                    "open@" + open + " over@" + over + " first=" + first + " cantSee=" + (first == null ? null : first.request.cantSee)
+                    "open@" + open + " over@" + over + " first=" + first
                             + " turns=" + turns.size() + " chatTurns=" + rig.chatTurns + " first turn=" + (turns.isEmpty() ? null : turns.get(0)[1])
                             + " searchedBefore=" + searchedBeforeTheConversation(rig, 400) + " v=" + rig.violations);
         });
@@ -15299,19 +15389,20 @@ public final class ExploreBrainHarness {
             Rig rig = callChatRig(personAt(bearingOf(45f), 20), replies(7));
             rig.people.match = (r, k) -> CuriosityPort.MatchAnswer.stranger()
                     .withMatch(FaceMatcher.Band.WEAK, null, 0.1f, 40L + k).withConversation(r.people.persona, null, null, null);
-            rig.turns = (r, req, k) -> req.faceSeen && req.name == null ? named(k, "Priya") : turnLine(k);
+            // Owner 2026-10-02: the name comes after the face was found; the face waits for it.
+            rig.turns = (r, req, k) -> k == 6 ? named(k, "Priya") : turnLine(k);
             List<String> notes = traced(rig);
             rig.started();
             heyMiko(rig, 400, Ears.Side.RIGHT, 800, "");
             rig.runUntil(400);
             long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
             long over = chatOver(rig, open);
-            long usable = notedAt(notes, "a usable face");
-            int seen = firstFaceSeen(rig);
+            long usable = notedAt(notes, "a usable new face");
+            int seen = rig.turnAsks.size() >= 6 ? 5 : -1;
             List<Long> looks = notedTimes(notes, "search look");
             int turnsAfter = wheelTurns(rig, usable, over).size();
             check(n, open > 0 && over > 0 && usable > open && seen > 0 && rig.turnAsks.get(seen).t > usable
-                            && looks.size() >= 3 && rig.count("match") >= 1 && turnsAfter <= 1
+                            && looks.size() >= 3 && rig.count("match") >= 1 && turnsAfter <= 1 && onlyHeardTurns(rig)
                             && rig.kept.equals(java.util.Arrays.asList("Priya")) && noted(notes, "they said goodbye")
                             && !searchedBeforeTheConversation(rig, 400) && rig.violations.isEmpty(),
                     "usable@" + usable + " seen=" + seen + " looks=" + looks + " turnsAfter=" + turnsAfter + " at="
@@ -15328,17 +15419,15 @@ public final class ExploreBrainHarness {
             rig.runUntil(400);
             long open = runUntilState(rig, ExploreBrain.State.CHAT_THINK, 400, 20000);
             long over = chatOver(rig, open);
-            boolean cantSee = false;
-            for (TurnAsk a : rig.turnAsks) {
-                cantSee |= a.request.cantSee;
-            }
             // Owner 2026-10-02: the second unanswered listen gets one follow-up turn; the third ends it.
+            // Not finding them never asks them to come down to him: he keeps checking quietly.
             check(n, open > 0 && over > 0 && rig.tuning.callChatUnansweredMax == 3 && rig.turnAsks.size() == 7
                             && noted(notes, "2 unanswered listen(s): one gentle follow-up before the sign-off")
                             && noted(notes, "3 unanswered listens in a row") && !noted(notes, "walked off")
-                            && !noted(notes, "one look for them") && noted(notes, "nobody found in the search")
-                            && cantSee && rig.violations.isEmpty(),
-                    "asks=" + rig.turnAsks.size() + " cantSee=" + cantSee + " notes=" + notes + " " + rig.tail());
+                            && !noted(notes, "one look for them")
+                            && noted(notes, "nobody found in the search after") && noted(notes, "keeps checking for a face quietly")
+                            && rig.violations.isEmpty(),
+                    "asks=" + rig.turnAsks.size() + " notes=" + notes + " " + rig.tail());
         });
         scenario("callchat_an_answer_with_no_words_gets_one_didnt_catch_that_and_does_not_count", n -> {
             // Wordless, then two silences: had the wordless one counted, the third would end it.
@@ -15455,62 +15544,142 @@ public final class ExploreBrainHarness {
     }
 
     private static void facelessCallScenarios() {
-        scenario("call_faceless_meeting_opener_invites_them_down_and_does_not_ask_the_name", n -> {
+        scenario("call_faceless_meeting_opener_asks_the_name_and_never_asks_to_see_their_face", n -> {
             Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k), replies(1));
+            List<String> notes = traced(rig);
             rig.started();
             long open = openChat(rig);
             long over = chatOver(rig, open);
             TurnAsk first = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(0);
             boolean allFaceless = !rig.turnAsks.isEmpty();
             for (TurnAsk t : rig.turnAsks) {
-                allFaceless &= t.request.faceless && !t.request.faceSeen;
+                allFaceless &= t.request.faceless && !t.request.recalled;
             }
             check(n, open > 0 && over > 0 && first != null && first.request.heard == null && first.request.name == null
-                            && allFaceless && rig.kept.isEmpty() && rig.violations.isEmpty(),
+                            && allFaceless && rig.kept.isEmpty() && onlyHeardTurns(rig) && !noted(notes, "his level")
+                            && !noted(notes, "crouch") && rig.violations.isEmpty(),
                     "open@" + open + " asks=" + rig.turnAsks + " " + rig.tail());
         });
-        scenario("call_faceless_usable_face_on_a_retry_asks_the_name_then_stores_name_and_face", n -> {
-            // The face is usable on the third match (the meeting's, then two retries).
-            Rig rig = facelessCallRig(3, (r, req, k) -> req.faceSeen && req.name == null ? named(k, "Priya")
-                    : turnLine(k), replies(6));
+        scenario("call_faceless_name_given_is_used_and_the_notes_are_kept_under_the_name", n -> {
+            Rig rig = facelessCallRig(0, turnsOf(turnLine(1), named(2, "Priya")), replies(6));
             List<String> notes = traced(rig);
             rig.started();
             long open = openChat(rig);
             long over = chatOver(rig, open);
-            int seen = firstFaceSeen(rig);
-            int third = rig.first("match NEW", rig.first("match NEW", rig.first("match NEW", 0) + 1) + 1);
-            check(n, open > 0 && over > 0 && rig.count("match") == 3 && seen > 0
-                            && rig.turnAsks.get(seen).t > rig.timeOf(third)
-                            && rig.kept.equals(java.util.Arrays.asList("Priya"))
-                            && rig.resolves.equals(java.util.Arrays.asList("Priya")) && !rig.notesDeltas.isEmpty()
-                            && allStartWith(rig.notesDeltas, "kept-1: ") && !noted(notes, "discarded (R19)")
-                            && noted(notes, "a usable face on try 2 of 3") && rig.violations.isEmpty(),
-                    "seen=" + seen + " kept=" + rig.kept + " deltas=" + rig.notesDeltas + " asks=" + rig.turnAsks + " "
+            TurnAsk last = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(rig.turnAsks.size() - 1);
+            check(n, open > 0 && over > 0 && rig.recalls.equals(java.util.Arrays.asList("Priya"))
+                            && rig.people.nameOnly.contains("named-1") && "Priya".equals(rig.people.named.get("named-1"))
+                            && last != null && "Priya".equals(last.request.name) && rig.kept.isEmpty()
+                            && rig.resolves.isEmpty() && rig.notesDeltas.size() >= 2
+                            && allStartWith(rig.notesDeltas, "named-1: ") && noted(notes, "kept under the name alone")
+                            && !noted(notes, "discarded (R19)") && recalledAsks(rig).isEmpty() && rig.violations.isEmpty(),
+                    "recalls=" + rig.recalls + " deltas=" + rig.notesDeltas + " " + rig.tail());
+        });
+        scenario("call_faceless_a_later_conversation_with_the_same_name_loads_their_notes", n -> {
+            // Priya was kept by name alone in an earlier faceless conversation, with notes.
+            Rig rig = facelessCallRig(0, turnsOf(turnLine(1), named(2, "priya")), replies(5));
+            rig.people.named.put("named-7", "Priya");
+            rig.people.nameOnly.add("named-7");
+            rig.people.notes.put("named-7", "{\"interests\":[\"bouldering\"]}");
+            rig.people.asked.put("named-7", java.util.Arrays.asList("what do you climb"));
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            List<Integer> told = recalledAsks(rig);
+            TurnAsk after = told.size() == 1 ? rig.turnAsks.get(told.get(0)) : null;
+            TurnAsk last = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(rig.turnAsks.size() - 1);
+            check(n, open > 0 && over > 0 && rig.recalls.equals(java.util.Arrays.asList("Priya")) && after != null
+                            && "Priya".equals(after.request.name) && after.request.notes.contains("bouldering")
+                            && last != null && last.request.notes != null && last.request.notes.contains("bouldering")
+                            && !last.request.recalled && rig.people.named.size() == 1 && !rig.notesDeltas.isEmpty()
+                            && allStartWith(rig.notesDeltas, "named-7: ") && noted(notes, "their notes join the conversation")
+                            && rig.violations.isEmpty(),
+                    "told=" + told + " after=" + (after == null ? null : after.request.name + "/" + after.request.notes)
+                            + " last=" + (last == null ? null : last.request.notes + "/" + last.request.recalled)
+                            + " recalls=" + rig.recalls + " deltas=" + rig.notesDeltas + " named=" + rig.people.named
+                            + " " + rig.tail());
+        });
+        scenario("call_faceless_a_face_mid_conversation_is_matched_silently_and_he_goes_on_as_them", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k), replies(7));
+            rig.people.match = (r, k) -> k >= 3
+                    ? CuriosityPort.MatchAnswer.known("Sam").withMatch(FaceMatcher.Band.CONFIDENT, "p-sam", 0.8f, 40L + k)
+                            .withConversation(r.people.persona, "p-sam", "{\"interests\":[\"chess\"]}", null)
+                    : noFace(r);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            long usable = notedAt(notes, "matches someone stored");
+            List<Integer> told = recalledAsks(rig);
+            TurnAsk after = told.size() == 1 ? rig.turnAsks.get(told.get(0)) : null;
+            int matchesAfter = 0;
+            for (Long t : checkTimes(rig)) {
+                matchesAfter += t > usable ? 1 : 0;
+            }
+            check(n, open > 0 && over > 0 && usable > open && after != null && after.t > usable
+                            && "Sam".equals(after.request.name) && after.request.notes.contains("chess")
+                            && onlyHeardTurns(rig) && matchesAfter == 0 && !rig.notesDeltas.isEmpty()
+                            && allStartWith(rig.notesDeltas, "p-sam: ") && rig.kept.isEmpty() && rig.recalls.isEmpty()
+                            && rig.violations.isEmpty(),
+                    "usable@" + usable + " told=" + told + " after=" + matchesAfter + " deltas=" + rig.notesDeltas + " "
                             + rig.tail());
         });
-        scenario("call_faceless_name_given_is_held_and_stored_when_a_face_arrives_on_a_retry", n -> {
-            Rig rig = facelessCallRig(3, turnsOf(turnLine(1), named(2, "Priya")), replies(6));
+        scenario("call_faceless_face_checks_go_on_all_conversation_about_every_8_s_and_never_make_him_speak", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k), replies(12));
             List<String> notes = traced(rig);
             rig.started();
             long open = openChat(rig);
             long over = chatOver(rig, open);
-            check(n, open > 0 && over > 0 && rig.count("match") == 3 && noted(notes, "the name is held")
-                            && rig.kept.equals(java.util.Arrays.asList("Priya"))
-                            && rig.resolves.equals(java.util.Arrays.asList("Priya")) && firstFaceSeen(rig) < 0
-                            && allStartWith(rig.notesDeltas, "kept-1: ") && rig.notesDeltas.size() >= 2
-                            && !noted(notes, "discarded (R19)") && rig.violations.isEmpty(),
+            List<Long> checks = checkTimes(rig);
+            long minGap = Long.MAX_VALUE;
+            for (int i = 1; i < checks.size(); i++) {
+                minGap = Math.min(minGap, checks.get(i) - checks.get(i - 1));
+            }
+            long lastCheck = checks.isEmpty() ? -1 : checks.get(checks.size() - 1);
+            check(n, open > 0 && over > 0 && rig.tuning.chatFaceGapMs == 8000 && checks.size() > 3
+                            && minGap >= rig.tuning.chatFaceGapMs && lastCheck > over - 3 * rig.tuning.chatFaceGapMs
+                            && onlyHeardTurns(rig) && rig.turnAsks.size() == 13 && noted(notes, "he keeps looking quietly")
+                            && noted(notes, "discarded (R19)") && rig.violations.isEmpty(),
+                    "checks=" + checks + " over@" + over + " asks=" + rig.turnAsks.size() + " " + rig.tail());
+        });
+        scenario("call_faceless_a_new_face_later_is_enrolled_to_the_person_kept_by_name", n -> {
+            // The name on turn 2 keeps them by name alone; a usable new face turns up on the 4th match.
+            Rig rig = facelessCallRig(4, turnsOf(turnLine(1), named(2, "Priya")), replies(9));
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.recalls.equals(java.util.Arrays.asList("Priya"))
+                            && rig.photos.equals(java.util.Arrays.asList("named-1")) && !rig.people.nameOnly.contains("named-1")
+                            && rig.kept.isEmpty() && rig.resolves.isEmpty() && allStartWith(rig.notesDeltas, "named-1: ")
+                            && noted(notes, "the face is enrolled to the person kept by name alone") && onlyHeardTurns(rig)
+                            && rig.violations.isEmpty(),
+                    "photos=" + rig.photos + " recalls=" + rig.recalls + " deltas=" + rig.notesDeltas + " " + rig.tail());
+        });
+        scenario("call_faceless_usable_face_before_the_name_stores_name_and_face", n -> {
+            // The face is usable on the third match (the meeting's, then two checks); the name comes later.
+            Rig rig = facelessCallRig(3, turnsOf(turnLine(1), turnLine(2), turnLine(3), turnLine(4), turnLine(5),
+                    named(6, "Priya")), replies(8));
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            check(n, open > 0 && over > 0 && rig.count("match") == 3 && rig.kept.equals(java.util.Arrays.asList("Priya"))
+                            && rig.resolves.equals(java.util.Arrays.asList("Priya")) && rig.recalls.isEmpty()
+                            && !rig.notesDeltas.isEmpty() && allStartWith(rig.notesDeltas, "kept-1: ")
+                            && noted(notes, "a usable new face on check 2") && !noted(notes, "discarded (R19)")
+                            && onlyHeardTurns(rig) && rig.violations.isEmpty(),
                     "kept=" + rig.kept + " deltas=" + rig.notesDeltas + " " + rig.tail());
         });
-        scenario("call_faceless_with_no_usable_face_on_any_retry_chats_unnamed_and_discards_the_notes", n -> {
-            Rig rig = facelessCallRig(0, turnsOf(turnLine(1), named(2, "Priya")), replies(8));
+        scenario("call_faceless_unnamed_with_no_face_keeps_nothing", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k), replies(4));
             List<String> notes = traced(rig);
             rig.started();
             long open = openChat(rig);
             long over = chatOver(rig, open);
-            check(n, open > 0 && over > 0 && rig.count("match") == 1 + rig.tuning.chatFaceTries
-                            && rig.tuning.chatFaceTries == 3 && rig.kept.isEmpty() && rig.resolves.isEmpty()
-                            && noted(notes, "no usable face after 3 tries") && noted(notes, "discarded (R19)")
-                            && firstFaceSeen(rig) < 0 && rig.violations.isEmpty(),
+            check(n, open > 0 && over > 0 && rig.kept.isEmpty() && rig.resolves.isEmpty() && rig.recalls.isEmpty()
+                            && rig.notesDeltas.isEmpty() && noted(notes, "discarded (R19)") && rig.violations.isEmpty(),
                     "matches=" + rig.count("match") + " " + rig.tail());
         });
     }
@@ -15596,7 +15765,7 @@ public final class ExploreBrainHarness {
         return java.util.Objects.equals(a.persona, b.persona) && java.util.Objects.equals(a.name, b.name)
                 && java.util.Objects.equals(a.notes, b.notes) && java.util.Objects.equals(a.heard, b.heard)
                 && java.util.Objects.equals(a.avoidQuestion, b.avoidQuestion) && a.faceless == b.faceless
-                && a.faceSeen == b.faceSeen && a.called == b.called && a.cantSee == b.cantSee;
+                && a.recalled == b.recalled && a.called == b.called;
     }
 
     private static Rig sarahRig(boolean known) {
@@ -16539,7 +16708,8 @@ public final class ExploreBrainHarness {
                             + (signOff2 < 0 ? -1 : stalled.timeOf(signOff2)) + " end=" + stalled.brain.state() + " "
                             + stalled.tail());
         });
-        scenario("chat_eyes_only_wake_word_opens_a_stranger_conversation_without_a_turn_or_a_match_and_stores_nothing", n -> {
+        // Owner 2026-10-02: with no face to keep, a name given still keeps them by the name alone.
+        scenario("chat_eyes_only_wake_word_opens_a_stranger_conversation_without_a_match_and_keeps_them_by_name", n -> {
             Rig rig = chatRig(EMPTY_ROOM, false);
             rig.people.lines = STRANGER.withConversation(PERSONA, null, null, null);
             rig.turns = turnsOf(turnLine(1), CuriosityPort.Turn.line("Line 2.", null, "Sam", false, false, null));
@@ -16551,7 +16721,8 @@ public final class ExploreBrainHarness {
             check(n, open > 0 && over > 0 && rig.count("match") == 0 && rig.countPrefix("turn LEFT", 0, over) == 0
                             && rig.countPrefix("turn RIGHT", 0, over) == 0 && rig.count("camera open") == 0
                             && rig.turnAsks.size() == 2 && rig.turnAsks.get(0).request.name == null
-                            && rig.kept.isEmpty() && rig.notesDeltas.isEmpty() && rig.count("react sign-off") == 1
+                            && rig.kept.isEmpty() && rig.recalls.equals(java.util.Arrays.asList("Sam"))
+                            && allStartWith(rig.notesDeltas, "named-1: ") && rig.count("react sign-off") == 1
                             && rig.brain.state() == ExploreBrain.State.EYES_ONLY && rig.violations.isEmpty(),
                     "open@" + open + " over@" + over + " end=" + rig.brain.state() + " " + rig.tail());
         });

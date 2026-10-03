@@ -559,7 +559,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "chat_tool_round_says_the_preamble_then_looks_with_the_detector_and_waits_for_the_line",
         "chat_tool_look_in_do_not_disturb_or_bathroom_privacy_is_refused_without_a_frame",
         "chat_lease_lost_mid_conversation_continues_without_the_look_and_a_6_s_sensor_stall_ends_it",
-        "chat_eyes_only_wake_word_opens_a_stranger_conversation_without_a_turn_or_a_match_and_stores_nothing",
+        "chat_eyes_only_wake_word_opens_a_stranger_conversation_without_a_match_and_keeps_them_by_name",
         "chat_the_owners_note_is_looked_up_by_a_face_matched_stored_name_or_the_spoken_name_only",
         "chat_the_transcript_never_appears_in_the_trace",
         # The call: slot, verdict and answer (hey-miko plan U5; R1-R4, R11; KTD1-KTD5; AE1-AE3, AE6)
@@ -651,7 +651,7 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "seek_claudes_doorway_reading_open_zero_with_clear_floor_drives_to_it_and_arrives",
         "seek_claudes_doorway_reading_blocked_with_a_tof_obstacle_at_1_m_stops_on_the_hazard_then_the_seek_blocked_handling_runs",
         "seek_the_least_familiar_fallback_target_reading_blocked_still_gives_up",
-        "call_wake_word_with_no_face_still_opens_with_the_crouch_opener",
+        "call_wake_word_with_no_face_still_opens_with_the_faceless_opener",
         # The caller talks while he looks for them (owner 2026-09-30): the conversation opens at once
         "call_caller_talking_during_the_search_opens_the_conversation_before_the_search_ends",
         "call_a_repeated_wake_word_during_the_search_opens_the_conversation",
@@ -676,11 +676,16 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "roaming_person_with_the_face_models_not_ready_is_not_met",
         "roaming_person_whose_face_check_failed_is_not_met",
         "roaming_person_with_a_usable_new_face_is_met_and_the_opener_asks_the_name",
-        # A faceless call: the crouch opener, face retries, the name only with a face (robot 2026-10-01)
-        "call_faceless_meeting_opener_invites_them_down_and_does_not_ask_the_name",
-        "call_faceless_usable_face_on_a_retry_asks_the_name_then_stores_name_and_face",
-        "call_faceless_name_given_is_held_and_stored_when_a_face_arrives_on_a_retry",
-        "call_faceless_with_no_usable_face_on_any_retry_chats_unnamed_and_discards_the_notes",
+        # A faceless conversation (owner 2026-10-02): the name asked, never the face; memory by name;
+        # the face checked silently all conversation
+        "call_faceless_meeting_opener_asks_the_name_and_never_asks_to_see_their_face",
+        "call_faceless_name_given_is_used_and_the_notes_are_kept_under_the_name",
+        "call_faceless_a_later_conversation_with_the_same_name_loads_their_notes",
+        "call_faceless_a_face_mid_conversation_is_matched_silently_and_he_goes_on_as_them",
+        "call_faceless_face_checks_go_on_all_conversation_about_every_8_s_and_never_make_him_speak",
+        "call_faceless_a_new_face_later_is_enrolled_to_the_person_kept_by_name",
+        "call_faceless_usable_face_before_the_name_stores_name_and_face",
+        "call_faceless_unnamed_with_no_face_keeps_nothing",
         # Conversation first, the caller found during it (owner 2026-10-02)
         "callchat_wake_with_words_opens_with_their_words_as_the_first_message_within_2_s",
         "callchat_bare_wake_opens_at_once_with_a_greeting_question_and_searches_during_it",

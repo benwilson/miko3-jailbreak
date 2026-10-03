@@ -5739,9 +5739,9 @@ final class ExploreBrain {
 
     /**
      * Owner 2026-10-02 (at home, "he doesn't really talk to us"): a roaming or cue pick with no
-     * usable face is still met, facelessly (no name asked; the crouch invitation), when its box
-     * scored at least facelessMeetMinScore or a voice from the person's known side landed within
-     * facelessMeetVoiceMs. Only a faceless NEW answer with a conversation qualifies: a failed
+     * usable face is still met, facelessly (he asks the name; the face is checked again quietly),
+     * when its box scored at least facelessMeetMinScore or a voice from the person's known side
+     * landed within facelessMeetVoiceMs. Only a faceless NEW answer with a conversation qualifies: a failed
      * check, or no conversation possible, stays a phantom. Null: a phantom; else why it is met.
      */
     private String facelessMeetable(long now, CuriosityPort.MatchAnswer a) {

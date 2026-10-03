@@ -425,6 +425,28 @@ interface CuriosityPort extends AnswerParser.Names {
     /** Abandon the running addPhoto(), if any. */
     void cancelAddPhoto();
 
+    // ---- a name given with no usable face (owner 2026-10-02) ----
+
+    /**
+     * A name given in a conversation with no usable face, looked up in the people store by
+     * the name alone (NameResolver.byName): FOUND a stored person (their id, stored name,
+     * notes and questions on record, and whether they have a face yet), CREATED someone new
+     * remembered by the name alone (their id), SHARED when several stored people share the
+     * first name and none has the name given (nothing loaded or stored), FAILED when the
+     * store could not answer. Never logs a name; names never reach Claude from here.
+     */
+    default void recallName(String name, long timeoutMs) {
+    }
+
+    /** The answer to the last recallName(), or null while it runs. */
+    default Recalled recalledName() {
+        return Recalled.FAILED;
+    }
+
+    /** Abandon the running recallName(), if any. */
+    default void cancelRecallName() {
+    }
+
     /**
      * This meeting's face check gets its outcome (KTD8), with the id the crop
      * joined (null: none). Fire and forget. A new person's outcome is recorded by
@@ -995,6 +1017,50 @@ interface CuriosityPort extends AnswerParser.Names {
         }
     }
 
+    /** recallName()'s answer (owner 2026-10-02). */
+    final class Recalled {
+        enum Status { FOUND, CREATED, SHARED, FAILED }
+
+        static final Recalled FAILED = new Recalled(Status.FAILED, null, null, null, null, false);
+        static final Recalled SHARED = new Recalled(Status.SHARED, null, null, null, null, false);
+
+        final Status status;
+        final String personId;
+        final String name;
+        /** Their notes as PersonNotes JSON, or null. */
+        final String notes;
+        final List<String> questionsAsked;
+        /** The record has a stored face (false: remembered by name alone). */
+        final boolean hasFace;
+
+        private Recalled(Status status, String personId, String name, String notes, List<String> questionsAsked,
+                         boolean hasFace) {
+            this.status = status;
+            this.personId = personId;
+            this.name = name;
+            this.notes = notes;
+            this.questionsAsked = questionsAsked == null ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(questionsAsked));
+            this.hasFace = hasFace;
+        }
+
+        static Recalled found(String personId, String storedName, String notes, List<String> asked, boolean hasFace) {
+            return personId == null || storedName == null || storedName.trim().isEmpty() ? FAILED
+                    : new Recalled(Status.FOUND, personId, storedName.trim(), notes, asked, hasFace);
+        }
+
+        static Recalled created(String personId, String name) {
+            return personId == null || name == null || name.trim().isEmpty() ? FAILED
+                    : new Recalled(Status.CREATED, personId, name.trim(), null, null, false);
+        }
+
+        /** Ids and status only: never a name. */
+        @Override
+        public String toString() {
+            return status + (personId == null ? "" : " " + personId);
+        }
+    }
+
     /** What listen() heard: the words, or nothing (no reply, R12), or a failure. */
     final class Heard {
         enum Status { WORDS, SILENCE, FAILED }
@@ -1407,47 +1473,20 @@ interface CuriosityPort extends AnswerParser.Names {
          */
         final String avoidQuestion;
         /**
-         * The conversation opened with no usable face (robot 2026-10-01): the opener
-         * invites them down to his level and never asks the name, since nothing could
-         * be stored without a face (R19). Fixed for the conversation, so the replayed
-         * opener reads as it was sent.
+         * The conversation opened with no usable face (robot 2026-10-01): its opener
+         * (ExplorePrompts.FACELESS_OPENER) greets them and may ask their name; he never
+         * asks them to show him their face (owner 2026-10-02). Fixed for the
+         * conversation, so the replayed opener reads as it was sent.
          */
         final boolean faceless;
-        /** A usable face arrived on a retry since: he may ask the name of someone still unnamed. */
-        final boolean faceSeen;
         /**
          * Owner 2026-10-02: the conversation opened on a call, before he had seen them. Its opener
          * is a short greeting-question (ExplorePrompts.CALL_OPENER), or, when they said words with
          * the wake word, those words are turn 1's heard. Fixed for the conversation.
          */
         final boolean called;
-        /**
-         * Owner 2026-10-02: he now knows he can't see them (the search found nobody, or found
-         * them with no usable face): this turn invites them down to his level. Once.
-         */
-        final boolean cantSee;
         /** Owner 2026-10-03: what robot_status and places answer with for this turn. */
         final ToolFacts facts;
-
-        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard) {
-            this(persona, name, notes, transcript, heard, null);
-        }
-
-        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
-                    String avoidQuestion) {
-            this(persona, name, notes, transcript, heard, avoidQuestion, false, false);
-        }
-
-        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
-                    String avoidQuestion, boolean faceless, boolean faceSeen) {
-            this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, false, false);
-        }
-
-        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
-                    String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee) {
-            this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called, cantSee, null);
-        }
-
         /**
          * Owner 2026-10-03: the owner's note about the person he is talking to, by name (from the
          * launcher's Settings page), and the name it was found by; null when none. Goes into the
@@ -1455,31 +1494,27 @@ interface CuriosityPort extends AnswerParser.Names {
          */
         final String ownerName;
         final String ownerNote;
-
-        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
-                    String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee,
-                    ToolFacts facts) {
-            this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called, cantSee, facts,
-                    null, null);
-        }
-
         /**
          * Review 2026-10-03: the name the owner's note may be looked up by: a face-matched known
          * person's stored name, or the name the person spoke (the launcher matches the note's full
          * name exactly); null when neither. Never sent, never logged.
          */
         final String noteName;
+        /**
+         * Owner 2026-10-02: he has just found out who they are mid-conversation (the name they gave
+         * found someone stored, or a background face check matched them): this turn says so
+         * (ExplorePrompts.recalled), once, and the notes are now theirs.
+         */
+        final boolean recalled;
 
-        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
-                    String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee,
-                    ToolFacts facts, String ownerName, String ownerNote) {
-            this(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called, cantSee, facts,
-                    ownerName, ownerNote, null);
+        TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard) {
+            this(persona, name, notes, transcript, heard, null, false, false, null, null, null, null, false);
         }
 
         TurnRequest(String persona, String name, String notes, List<Exchange> transcript, String heard,
-                    String avoidQuestion, boolean faceless, boolean faceSeen, boolean called, boolean cantSee,
-                    ToolFacts facts, String ownerName, String ownerNote, String noteName) {
+                    String avoidQuestion, boolean faceless, boolean called, ToolFacts facts, String ownerName,
+                    String ownerNote, String noteName, boolean recalled) {
+            this.recalled = recalled && name != null && !name.trim().isEmpty();
             this.noteName = noteName == null || noteName.trim().isEmpty() ? null : noteName.trim();
             boolean noted = ownerName != null && !ownerName.trim().isEmpty() && ownerNote != null
                     && !ownerNote.trim().isEmpty();
@@ -1487,7 +1522,6 @@ interface CuriosityPort extends AnswerParser.Names {
             this.ownerNote = noted ? ownerNote.trim() : null;
             this.facts = facts == null ? ToolFacts.NONE : facts;
             this.called = called;
-            this.cantSee = cantSee;
             this.persona = persona;
             this.name = name;
             this.notes = notes;
@@ -1495,43 +1529,48 @@ interface CuriosityPort extends AnswerParser.Names {
             this.heard = heard;
             this.avoidQuestion = avoidQuestion;
             this.faceless = faceless;
-            this.faceSeen = faceSeen;
         }
 
         /** This request again, with the repeated question to avoid. */
         TurnRequest avoiding(String question) {
-            return new TurnRequest(persona, name, notes, transcript, heard, question, faceless, faceSeen, called,
-                    cantSee, facts, ownerName, ownerNote, noteName);
+            return new TurnRequest(persona, name, notes, transcript, heard, question, faceless, called, facts,
+                    ownerName, ownerNote, noteName, recalled);
         }
 
-        /** This request as one in a conversation that opened faceless, with or without a face since. */
-        TurnRequest face(boolean openedFaceless, boolean seenSince) {
-            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, openedFaceless, seenSince,
-                    called, cantSee, facts, ownerName, ownerNote, noteName);
+        /** This request as one in a conversation that opened faceless (or not). */
+        TurnRequest face(boolean openedFaceless) {
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, openedFaceless, called,
+                    facts, ownerName, ownerNote, noteName, recalled);
         }
 
-        /** This request in a conversation a call opened (owner 2026-10-02), with or without the crouch invitation. */
-        TurnRequest call(boolean openedOnACall, boolean cantSeeThem) {
-            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen,
-                    openedOnACall, cantSeeThem, facts, ownerName, ownerNote, noteName);
+        /** This request in a conversation a call opened (owner 2026-10-02), or not. */
+        TurnRequest call(boolean openedOnACall) {
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, openedOnACall,
+                    facts, ownerName, ownerNote, noteName, recalled);
         }
 
         /** Review 2026-10-03: this request with the name its owner's note may be looked up by (null: none). */
         TurnRequest noteBy(String n) {
-            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
-                    cantSee, facts, ownerName, ownerNote, n);
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, called, facts,
+                    ownerName, ownerNote, n, recalled);
         }
 
         /** This request with the owner's note about its partner, found by this name (null: none). */
         TurnRequest withOwnerNote(String byName, String note) {
-            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
-                    cantSee, facts, byName, note, noteName);
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, called, facts,
+                    byName, note, noteName, recalled);
+        }
+
+        /** Owner 2026-10-02: this request as the one right after he found out who they are (or not). */
+        TurnRequest recalledNow(boolean now) {
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, called, facts,
+                    ownerName, ownerNote, noteName, now);
         }
 
         /** This request with what robot_status and places answer (owner 2026-10-03). */
         TurnRequest withFacts(ToolFacts f) {
-            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, faceSeen, called,
-                    cantSee, f, ownerName, ownerNote, noteName);
+            return new TurnRequest(persona, name, notes, transcript, heard, avoidQuestion, faceless, called, f,
+                    ownerName, ownerNote, noteName, recalled);
         }
 
         /** The opener: nothing heard yet. */

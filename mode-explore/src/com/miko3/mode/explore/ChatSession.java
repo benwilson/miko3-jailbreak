@@ -23,8 +23,8 @@ import java.util.Set;
  *                unanswered timer, the single walked-off look after the first
  *                unanswered listen, the newcomer glance and "one sec" at the
  *                listen's end, goodbye and forget-me on the speaker's side;
- *                in a conversation that opened with no usable face, the face
- *                retries' looks (robot 2026-10-01: faceStep)
+ *                in a conversation that opened with no usable face, the silent
+ *                background face checks' looks (owner 2026-10-02: faceStep)
  *   CHAT_NOTES   the buffered notes deltas drained through the People store,
  *                then the brain resumes roaming on a leg turned away
  *
@@ -304,12 +304,12 @@ final class ChatSession {
     private long photoDeadline;
     private String photoFor;
 
-    // ---- the face retries (robot 2026-10-01) ----
+    // ---- the background face checks (robot 2026-10-01; owner 2026-10-02) ----
     /**
-     * The conversation opened with no usable face: the opener invited them down to his
-     * level instead of asking the name (TurnRequest.faceless), and a fresh look's face is
-     * checked again up to chatFaceTries times. faceSeen: a retry found a usable face, so an
-     * unnamed person may now be asked their name.
+     * The conversation opened with no usable face (TurnRequest.faceless): the opener asks
+     * their name, never to see their face, and a fresh look's face is checked silently every
+     * chatFaceGapMs for the whole conversation until a usable one turns up. faceSeen: one did
+     * (for the learning log only).
      */
     private boolean openedFaceless;
     private boolean faceSeen;
@@ -326,6 +326,17 @@ final class ChatSession {
     private long heldResolveDeadline;
     /** The held name's resolver asked for the last name: asked in place of the next turn's line. */
     private boolean lastNameNext;
+
+    // ---- a name given with no usable face (owner 2026-10-02) ----
+    /** The name given is being looked up in the store by name alone (port.recallName). */
+    private boolean recallPending;
+    private long recallDeadline;
+    /** The person the name found or kept has no face stored yet: a usable face is enrolled to them. */
+    private boolean nameOnly;
+    /** The photo being added is a face enrolled to the person remembered by name alone. */
+    private boolean enrolling;
+    /** He has just found out who they are: the next turn says so (TurnRequest.recalled), once. */
+    private boolean recalledDue;
     /** The face retry's box when the look has no person box: the whole frame. */
     private static final Detection WHOLE_FRAME = new Detection("person", 1f, 0f, 0f, 1f, 1f);
 
@@ -335,13 +346,11 @@ final class ChatSession {
     /** Looking for the caller between utterances; centring: turning to face the one found. */
     private boolean seeking;
     private boolean centring;
-    /** The face look in flight is a search look: nobody in it spends no face try. */
+    /** The face look in flight is a search look (it counts as a face check only with someone in it). */
     private boolean seekLooking;
     private int seekLooks;
     /** The person box a search look found, while its face is checked. */
     private Detection seekFound;
-    /** He knows he can't see them: the next turn invites them down to his level, once. */
-    private boolean cantSeeDue;
     /**
      * Owner 2026-10-02 ("he doesn't really talk to us"): this run of unanswered listens has had
      * its one gentle follow-up (ExplorePrompts.NUDGE), asked at the second unanswered listen in
@@ -563,6 +572,7 @@ final class ChatSession {
             lateTurn(now, late);
         }
         keepStep(now);
+        recallStep(now);
         photoStep(now);
         faceStep(now);
         notesStep(now);
@@ -577,7 +587,7 @@ final class ChatSession {
                 listenStep(now);
                 break;
             case CHAT_NOTES:
-                if (!deltaInFlight && !keepPending && !photoPending && !heldResolving && !faceMatching
+                if (!deltaInFlight && !keepPending && !photoPending && !heldResolving && !faceMatching && !recallPending
                         && !port.turnTailPending() && (!persistWanted || buffer.isEmpty() || personId == null)) {
                     finished = true;
                     learnFinish(learnEndWhy == null ? "other" : learnEndWhy);
@@ -617,7 +627,7 @@ final class ChatSession {
         attempt = 1;
         reRequested = false;
         request = turnRequest(heardText);
-        cantSeeDue = false;
+        recalledDue = false;
         turnHeld = false;
         secSaid = false;
         heldSince = -1;
@@ -673,8 +683,8 @@ final class ChatSession {
     /** The turn request for what was heard, as it stands now; building it changes nothing. */
     private CuriosityPort.TurnRequest turnRequest(String heardText) {
         return new CuriosityPort.TurnRequest(persona, name, notes, window(), heardText)
-                .face(openedFaceless, faceSeen && name == null).call(called, cantSeeDue).withFacts(host.toolFacts())
-                .noteBy(noteName);
+                .face(openedFaceless).call(called).withFacts(host.toolFacts()).noteBy(noteName)
+                .recalledNow(recalledDue);
     }
 
     /**
@@ -1046,16 +1056,23 @@ final class ChatSession {
             return false;
         }
         if (faceless) {
-            // Robot 2026-10-01: from the floor the face is out of frame or too small. The name is
-            // used for the rest of the conversation, in memory only; it is stored only if a face
-            // retry finds a usable face, else it goes with the conversation (R19).
-            host.note(faceRetrying() ? "a name given; no usable face yet, so the name is held for this conversation"
-                    + " while he looks for one" : "a name given; no face to keep them by, so nothing is stored");
+            // Owner 2026-10-02: from the floor the face is out of frame or too small. The name is
+            // used for the rest of the conversation and looked up by name alone: someone stored
+            // under it lends their notes, else they are kept under the name alone (R19), and a
+            // usable face from the background checks is enrolled to them later.
+            host.note("a name given with no usable face yet: looking the name up in the people stored");
             name = given;
             noteName = given;
             personId = null;
+            nameOnly = false;
             asked.clear();
             notes = null;
+            if (recallPending) {
+                port.cancelRecallName();
+            }
+            recallPending = true;
+            recallDeadline = now + tuning.meetTimeoutMs;
+            port.recallName(given, tuning.meetTimeoutMs);
             return false;
         }
         if (heldResolving) {
@@ -1219,10 +1236,26 @@ final class ChatSession {
             }
             port.cancelAddPhoto();
             photoPending = false;
+            if (enrolling) {
+                enrolling = false;
+                host.note("the store did not answer the face in time: the conversation goes on as before");
+                return;
+            }
             host.note("the store did not answer the photo in time; the conversation runs unnamed");
             return;
         }
         photoPending = false;
+        if (enrolling) {
+            // Owner 2026-10-02: the person kept by name alone has a face now; the notes stay as loaded.
+            enrolling = false;
+            if (a.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
+                nameOnly = false;
+                host.note("the face is enrolled to the person kept by name alone");
+            } else {
+                host.note("the store refused the face (forgotten meanwhile?): the conversation goes on as before");
+            }
+            return;
+        }
         if (a.status == CuriosityPort.MatchAnswer.Status.KNOWN) {
             personId = photoFor;
             persistWanted = true;
@@ -1260,19 +1293,67 @@ final class ChatSession {
         }
     }
 
-    // ---- the face retries (robot 2026-10-01) ----
-
-    /** Another face try may still come: the conversation opened faceless and the tries are not spent. */
-    private boolean faceRetrying() {
-        return faceless && !ending && (seeking || faceLooking || faceMatching || faceTries < tuning.chatFaceTries);
+    /**
+     * Owner 2026-10-02: the name given with no usable face, looked up by name alone. FOUND:
+     * the conversation goes on as that person, their notes loaded (the next turn says he
+     * remembers them); CREATED: kept under the name alone, the notes persist to it; SHARED
+     * or FAILED: the name is only used, and a usable face may still settle who they are.
+     */
+    private void recallStep(long now) {
+        if (!recallPending) {
+            return;
+        }
+        CuriosityPort.Recalled r = port.recalledName();
+        if (r == null) {
+            if (now < recallDeadline) {
+                return;
+            }
+            port.cancelRecallName();
+            r = CuriosityPort.Recalled.FAILED;
+        }
+        recallPending = false;
+        switch (r.status) {
+            case FOUND:
+                personId = r.personId;
+                name = r.name;
+                nameOnly = !r.hasFace;
+                notes = r.notes;
+                asked.clear();
+                for (String q : r.questionsAsked) {
+                    String n = normalize(q);
+                    if (!n.isEmpty()) {
+                        asked.add(n);
+                    }
+                }
+                persistWanted = true;
+                recalledDue = !ending;
+                host.note("the name belongs to someone stored" + (r.hasFace ? "" : " by name alone")
+                        + ": their notes join the conversation (" + asked.size() + " questions on record)");
+                break;
+            case CREATED:
+                personId = r.personId;
+                nameOnly = true;
+                persistWanted = true;
+                host.note("nobody stored has that name: kept under the name alone, no face yet; the notes persist to it");
+                break;
+            case SHARED:
+                host.note("several people stored share that first name: nothing is loaded or stored by it");
+                break;
+            default:
+                host.note("the name could not be looked up: nothing is stored by it");
+                break;
+        }
     }
 
+    // ---- the background face checks (robot 2026-10-01; owner 2026-10-02) ----
+
     /**
-     * A faceless conversation's face retries: chatFaceDelayMs into a listen (time to crouch
-     * down to him) and chatFaceGapMs after the last try, one look; the face in its person box
+     * A faceless conversation's face checks, silent and for the whole conversation (owner
+     * 2026-10-02: "he should always be looking for their face"): chatFaceDelayMs into a
+     * listen and chatFaceGapMs after the last check, one look; the face in its person box
      * (the whole frame when it has none) goes through the meeting's own match (port.match).
-     * A usable face lets him ask the name, or stores a name already given (R19 then keeps the
-     * notes). The look runs only while he is not speaking (KTD7).
+     * A usable face settles who they are (faceAnswered); he never says anything for it. The
+     * look runs only while he is not speaking (KTD7).
      */
     private void faceStep(long now) {
         if (heldResolving) {
@@ -1284,7 +1365,7 @@ final class ChatSession {
                 if (now < faceMatchDeadline) {
                     return;
                 }
-                host.note("face try " + faceTries + ": no answer about the face in " + tuning.meetTimeoutMs + " ms");
+                host.note("face check " + faceTries + ": no answer about the face in " + tuning.meetTimeoutMs + " ms");
                 a = CuriosityPort.MatchAnswer.FAILED;
             }
             faceMatching = false;
@@ -1304,12 +1385,12 @@ final class ChatSession {
                 return;
             }
             if (!arrived) {
-                host.note("face try " + faceTries + " of " + tuning.chatFaceTries + ": no look in time");
+                host.note("face check " + faceTries + ": no look in time");
                 faceTryOver(now);
                 return;
             }
             Detection box = personBox(look.detections);
-            host.note("face try " + faceTries + " of " + tuning.chatFaceTries + ": checking the face in a fresh look"
+            host.note("face check " + faceTries + ": checking the face in a fresh look"
                     + (box == null ? " (no person box: the whole frame)" : ""));
             faceMatching = true;
             faceMatchDeadline = now + tuning.meetTimeoutMs;
@@ -1320,8 +1401,7 @@ final class ChatSession {
             seekStep(now);
             return;
         }
-        if (faceless && !ending && faceTries < tuning.chatFaceTries && state == State.CHAT_LISTEN
-                && phase == Phase.LISTENING && now >= listenStartedAt + tuning.chatFaceDelayMs
+        if (faceless && !ending && state == State.CHAT_LISTEN && phase == Phase.LISTENING && now >= listenStartedAt + tuning.chatFaceDelayMs
                 && now >= faceTryEndedAt + tuning.chatFaceGapMs && host.faceLooksAllowed()) {
             faceTries++;
             faceLooking = true;
@@ -1345,7 +1425,14 @@ final class ChatSession {
         return best;
     }
 
-    /** A face try's answer: usable (a match, or a new face past the quality gate), or another try later. */
+    /**
+     * A face check's answer: usable (a match, or a new face past the quality gate), or another
+     * check later. Owner 2026-10-02: a usable face settles who they are, silently. KNOWN with
+     * no name yet: the conversation goes on as that person, with their notes. A face that
+     * belongs to the person the name found: nothing more. A new face for someone kept by
+     * name alone: enrolled to them. A name held that found nobody for sure: checked against
+     * the store with this face. Unnamed: the face waits for their name (the meeting's path).
+     */
     private void faceAnswered(long now, CuriosityPort.MatchAnswer a) {
         boolean usable = a.status == CuriosityPort.MatchAnswer.Status.KNOWN
                 || a.status == CuriosityPort.MatchAnswer.Status.NEW && !a.faceless;
@@ -1358,26 +1445,71 @@ final class ChatSession {
             host.faceCaller(box);
             host.note("the caller found on search look " + seekLooks + (usable ? " with a usable face" : " with no usable face")
                     + ": the search stops, facing them");
-            if (!usable) {
-                cantSeeDue = !ending;
-            }
         }
         if (!usable) {
-            host.note("face try " + faceTries + " of " + tuning.chatFaceTries + ": no usable face");
+            host.note("face check " + faceTries + ": no usable face; he keeps looking quietly");
             faceTryOver(now);
             return;
         }
         faceless = false;
-        // The retry's match opened its own face check, which now waits for this conversation's outcome.
+        faceSeen = true;
+        // The check's match opened its own face check, which now waits for this conversation's outcome.
         checkOpen = true;
-        if (name == null) {
-            faceSeen = true;
-            host.note("a usable face on try " + faceTries + " of " + tuning.chatFaceTries
-                    + (ending ? ", but the conversation is ending: nothing is stored" : ": he may ask the name now"));
+        boolean known = a.status == CuriosityPort.MatchAnswer.Status.KNOWN && a.name != null
+                && !a.name.trim().isEmpty();
+        if (ending) {
+            host.note("a usable face on check " + faceTries + ", but the conversation is ending: nothing more is stored");
             return;
         }
-        host.note("a usable face on try " + faceTries + " of " + tuning.chatFaceTries
-                + ": checking the name held against the people stored");
+        // Owner 2026-10-02: when voice identification lands (VoiceId, keyed by the same person id),
+        // a voice match is primary and the face verifies it; a confident face alone still
+        // identifies them when no voice match is available, as here.
+        if (name == null) {
+            if (known) {
+                name = a.name.trim();
+                noteName = name;
+                personId = a.personId;
+                notes = a.notes;
+                asked.clear();
+                for (String q : a.questionsAsked) {
+                    String n = normalize(q);
+                    if (!n.isEmpty()) {
+                        asked.add(n);
+                    }
+                }
+                checkOpen = false;
+                persistWanted = personId != null;
+                recalledDue = true;
+                host.note("a usable face on check " + faceTries + " matches someone stored: the conversation goes on"
+                        + " as them, with their notes (" + asked.size() + " questions on record)");
+            } else {
+                host.note("a usable new face on check " + faceTries + ": kept for when they give their name");
+            }
+            return;
+        }
+        if (personId != null) {
+            if (known && personId.equals(a.personId)) {
+                checkOpen = false;
+                host.note("a usable face on check " + faceTries + " matches the person the name found");
+            } else if (!known && nameOnly) {
+                host.note("a usable new face on check " + faceTries + ": enrolling it to the person kept by name alone");
+                checkOpen = false;
+                enrolling = true;
+                photoPending = true;
+                photoFor = personId;
+                photoDeadline = now + tuning.meetTimeoutMs;
+                port.addPhoto(personId, tuning.meetTimeoutMs);
+            } else {
+                host.note("a usable face on check " + faceTries + " that is not the stored face of the person the name"
+                        + " found: the name stands and nothing more is stored");
+            }
+            return;
+        }
+        if (recallPending) {
+            recallPending = false;
+            port.cancelRecallName();
+        }
+        host.note("a usable face on check " + faceTries + ": checking the name held against the people stored");
         pendingFirst = name;
         heldResolving = true;
         heldResolveDeadline = now + tuning.meetTimeoutMs;
@@ -1421,9 +1553,8 @@ final class ChatSession {
                 break;
             case DONE:
                 seeking = false;
-                cantSeeDue = true;
                 host.note("nobody found in the search after " + seekLooks + " look(s): the conversation goes on,"
-                        + " and he asks them down to his level");
+                        + " and he keeps checking for a face quietly");
                 break;
             default:
                 break;
@@ -1456,8 +1587,7 @@ final class ChatSession {
         }
         faceTries++;
         seekFound = p;
-        host.note("search look " + seekLooks + ": someone here; checking their face (try " + faceTries + " of "
-                + tuning.chatFaceTries + ")");
+        host.note("search look " + seekLooks + ": someone here; checking their face (check " + faceTries + ")");
         faceMatching = true;
         faceMatchDeadline = now + tuning.meetTimeoutMs;
         port.match(look.jpeg, p, tuning.meetTimeoutMs);
@@ -1465,10 +1595,6 @@ final class ChatSession {
 
     private void faceTryOver(long now) {
         faceTryEndedAt = now;
-        if (faceTries >= tuning.chatFaceTries) {
-            host.note("no usable face after " + faceTries + " tries: the conversation runs unnamed"
-                    + (name != null ? " and the name held is not stored" : ""));
-        }
     }
 
     /**
@@ -1522,7 +1648,7 @@ final class ChatSession {
         }
     }
 
-    /** The conversation is ending: no new face try; a match in flight is waited for only to store a name held. */
+    /** The conversation is ending: no new face check; a match in flight is waited for only to store a name held. */
     private void endFaceRetries() {
         seeking = false;
         centring = false;
@@ -1962,7 +2088,7 @@ final class ChatSession {
         state = State.CHAT_NOTES;
         phase = Phase.PERSISTING;
         host.eyes(ExploreBrain.EyeState.THINKING, null);
-        if (personId == null && !keepPending && !photoPending && !heldResolving && !faceMatching) {
+        if (personId == null && !keepPending && !photoPending && !heldResolving && !faceMatching && !recallPending) {
             if (!buffer.isEmpty()) {
                 host.note("unnamed: " + buffer.size() + " note delta(s) discarded (R19)");
                 buffer.clear();

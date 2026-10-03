@@ -247,6 +247,27 @@ public final class RobotPeopleClient {
         });
     }
 
+    /** Remembers someone by name alone (owner 2026-10-02); answers their id.
+     * IOException with the store's fixed reason for a blank name. */
+    public static String addNamed(Context context, final String name) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<String>() {
+            @Override
+            public String run(RobotPeople people) throws RemoteException {
+                return people.addNamed(name);
+            }
+        });
+    }
+
+    /** Whether the person has a photo (false: remembered by name alone, or unknown). */
+    public static boolean hasFace(Context context, final String id) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.hasFace(id);
+            }
+        });
+    }
+
     private static PersonNotes parseNotes(String json) {
         try {
             return PersonNotes.parse(json);

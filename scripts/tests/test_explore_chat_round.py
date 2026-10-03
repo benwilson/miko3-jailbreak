@@ -41,6 +41,10 @@ class ChatRoundIsPlainJavaTest(unittest.TestCase):
 class ChatRoundHarnessTest(unittest.TestCase):
     SCENARIOS = (
         "round_history_is_respond_calls_each_answered_by_said_before_the_next_words",
+        # Owner 2026-10-02: faceless conversations ask the name, never to see their face.
+        "round_the_faceless_opener_asks_the_name_and_never_their_face",
+        "round_a_calls_next_turn_may_ask_the_name_once_while_unknown",
+        "round_the_turn_after_he_finds_out_who_they_are_says_so_once",
         "round_first_request_offers_every_tool_with_auto_choice_and_no_json_format",
         "round_a_respond_reply_is_one_request_with_addressed_told_early",
         "round_a_look_says_the_preamble_waits_for_the_frame_and_forces_respond",

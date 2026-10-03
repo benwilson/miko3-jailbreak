@@ -1153,6 +1153,28 @@ public final class SettingsPageHarness {
             }
         });
 
+        // Owner 2026-10-02: someone remembered by name alone (a faceless conversation) is
+        // listed with their notes and no photo; Forget deletes them and their notes.
+        scenario("a_name_only_person_is_listed_without_a_photo_and_forget_deletes_them", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.addNamed("Priya");
+                f.people.mergeNotes(id, "{\"interests\":[\"bouldering\"]}");
+                String before = get(f);
+                int at = before.indexOf("person-" + id);
+                String card = at < 0 ? "" : before.substring(at, before.indexOf("</article>", at));
+                boolean listed = card.contains("Priya") && card.contains("bouldering")
+                        && card.contains(SettingsPage.PEOPLE_NAME_ONLY) && !card.contains("<img");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + token(f) + "&id=" + id);
+                String after = get(f);
+                check(n, listed && f.people.nameOf(id) == null && f.people.notes(id).interests.isEmpty()
+                                && !after.contains(id) && !after.contains("bouldering")
+                                && SettingsPage.PEOPLE_FORGOTTEN.equals(r.status()),
+                        "listed=" + listed + " " + r.head);
+            }
+        });
+
         scenario("people_actions_on_unknown_id_change_nothing", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();

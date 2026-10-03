@@ -131,8 +131,8 @@ final class ChatRound {
         String system = ExplorePrompts.systemPrefix(request.persona, request.notes, request.ownerName,
                 request.ownerNote);
         List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
-        // A conversation that opened faceless invites them down instead of asking the name (robot 2026-10-01);
-        // one a call opened greets them first, before he has seen them (owner 2026-10-02).
+        // A conversation that opened faceless greets them and asks their name, never asking to see their face
+        // (owner 2026-10-02); one a call opened greets them first, before he has seen them.
         String first = request.called ? ExplorePrompts.CALL_OPENER
                 : request.faceless ? ExplorePrompts.FACELESS_OPENER : ExplorePrompts.openerAsk(request.name);
         String saidBefore = null;
@@ -149,11 +149,11 @@ final class ChatRound {
         if (request.called && request.heard != null && request.transcript.isEmpty()) {
             ask = ask + "\n\n" + ExplorePrompts.CALL_WORDS;
         }
-        if (request.cantSee) {
-            ask = ask + "\n\n" + ExplorePrompts.CANT_SEE;
+        if (request.called && request.name == null && request.heard != null && request.transcript.size() == 1) {
+            ask = ask + "\n\n" + ExplorePrompts.NAME_ASK;
         }
-        if (request.faceSeen) {
-            ask = ask + "\n\n" + ExplorePrompts.FACE_SEEN;
+        if (request.recalled) {
+            ask = ask + "\n\n" + ExplorePrompts.recalled(request.name);
         }
         messages.add(userMessage(saidBefore, face, ask));
         return new Body(system, messages, system + "\u0000" + Json.write(messages));

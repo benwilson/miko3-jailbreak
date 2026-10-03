@@ -128,6 +128,19 @@ public class PeopleService extends Service {
         }
 
         @Override
+        public String addNamed(String name) {
+            enforceCaller();
+            // Owner 2026-10-02: someone remembered by name alone; the name is never logged.
+            return people().addNamed(name);
+        }
+
+        @Override
+        public boolean hasFace(String id) {
+            enforceCaller();
+            return people().hasFace(id);
+        }
+
+        @Override
         public boolean setEmbedding(String id, int slot, long addedAtMillis, String modelId, float[] embedding) {
             enforceCaller();
             return people().setEmbedding(id, slot, addedAtMillis, modelId, embedding);

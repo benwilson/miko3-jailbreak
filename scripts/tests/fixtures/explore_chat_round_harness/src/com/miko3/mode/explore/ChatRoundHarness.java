@@ -25,6 +25,7 @@ public final class ChatRoundHarness {
 
     public static void main(String[] args) {
         history();
+        facelessNames();
         firstRequest();
         respondReply();
         lookRound();
@@ -174,6 +175,50 @@ public final class ChatRoundHarness {
     }
 
     // ---- scenarios ----
+
+    /** The last user message's last text block. */
+    private static String lastText(CuriosityPort.TurnRequest req) {
+        List<Map<String, Object>> m = ChatRound.body(req, null).messages;
+        Object c = m.get(m.size() - 1).get("content");
+        if (c instanceof String) {
+            return (String) c;
+        }
+        List<Map<String, Object>> blocks = content(m.get(m.size() - 1));
+        return (String) blocks.get(blocks.size() - 1).get("text");
+    }
+
+    /**
+     * Owner 2026-10-02: a faceless conversation never asks to see their face. Its opener asks
+     * the name; a call's next turn may ask it while he doesn't know it; once he finds out who
+     * they are mid-conversation, that turn says so, once.
+     */
+    private static void facelessNames() {
+        String opener = lastText(new CuriosityPort.TurnRequest("", null, null, null, null).face(true));
+        check("round_the_faceless_opener_asks_the_name_and_never_their_face",
+                opener.equals(ExplorePrompts.FACELESS_OPENER) && opener.contains("What's your name?")
+                        && !opener.contains("down to his level"), opener);
+        List<CuriosityPort.Exchange> t = new ArrayList<CuriosityPort.Exchange>();
+        t.add(new CuriosityPort.Exchange(null, "Oh hi! What are you up to?"));
+        String second = lastText(new CuriosityPort.TurnRequest("", null, null, t, "Just making tea.").face(true)
+                .call(true));
+        t.add(new CuriosityPort.Exchange("Just making tea.", "Nice. What's your name?"));
+        String third = lastText(new CuriosityPort.TurnRequest("", null, null, t, "Pasta.").face(true).call(true));
+        String named = lastText(new CuriosityPort.TurnRequest("", "Priya", null, t.subList(0, 1), "I'm Priya.")
+                .face(true).call(true));
+        check("round_a_calls_next_turn_may_ask_the_name_once_while_unknown",
+                second.equals("Just making tea.\n\n" + ExplorePrompts.NAME_ASK) && third.equals("Pasta.")
+                        && named.equals("I'm Priya."), second + " | " + third + " | " + named);
+        String recalled = lastText(new CuriosityPort.TurnRequest("", "Priya", "{\"interests\":[\"tea\"]}", t,
+                "I'm Priya.").face(true).recalledNow(true));
+        String after = lastText(new CuriosityPort.TurnRequest("", "Priya", "{\"interests\":[\"tea\"]}", t,
+                "Yes.").face(true));
+        String nameless = lastText(new CuriosityPort.TurnRequest("", null, null, t, "Yes.").face(true)
+                .recalledNow(true));
+        check("round_the_turn_after_he_finds_out_who_they_are_says_so_once",
+                recalled.equals("I'm Priya.\n\n" + ExplorePrompts.recalled("Priya")) && recalled.contains("Priya")
+                        && after.equals("Yes.") && nameless.equals("Yes."),
+                recalled + " | " + after + " | " + nameless);
+    }
 
     private static void history() {
         List<CuriosityPort.Exchange> t = new ArrayList<CuriosityPort.Exchange>();
