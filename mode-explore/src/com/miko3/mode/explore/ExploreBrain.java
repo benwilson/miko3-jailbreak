@@ -1019,6 +1019,11 @@ final class ExploreBrain {
     private int legTofMin;
     private int legCpl;
     private int legHiccups;
+    /** Dark-floor mode's per-leg floor record: readings, valid tofs, stalls and tilts in the leg. */
+    private int legReadings;
+    private int legTofValid;
+    private int legStalls;
+    private int legTilts;
     private boolean legPrivate;
     /** Why the leg ended, set where it ends; null: read from the state it ended in. */
     private String legEnd;
@@ -1513,6 +1518,26 @@ final class ExploreBrain {
     private long mutedGlanceUntil = NEVER;
     private EyeState glanceBackState;
     private Direction glanceBackGaze;
+
+    /**
+     * Dark-floor mode on or off (owner 2026-10-02; persist.miko3.explore.dark_floor, read
+     * by ExploreLoop's DarkFloor, which also switches the MCU's ToF check off and on). The
+     * classifier takes no floor reading as clear and guards nose dips with the
+     * accelerometer instead (HazardClassifier), and legs are capped at darkLegTicksMax,
+     * since only the camera and wheel stalls catch obstacles. Each leg also writes a
+     * "floor:" record. Brain thread only.
+     */
+    void setDarkFloor(boolean on) {
+        if (on == classifier.darkFloor() || state == State.STOPPED) {
+            return;
+        }
+        classifier.setDarkFloor(on);
+        step(false);
+    }
+
+    boolean darkFloor() {
+        return classifier.darkFloor();
+    }
 
     /** The speaker was muted (or turned all the way down), or is audible again. */
     void setMuted(boolean m) {
@@ -3164,6 +3189,12 @@ final class ExploreBrain {
         if (legNo != 0 && state == State.HOP && reading.tof > 0 && reading.tof < 16383 && reading.tof < legTofMin) {
             legTofMin = reading.tof;
         }
+        if (legNo != 0 && state == State.HOP) {
+            legReadings++;
+            if (reading.tof > 0 && reading.tof != tuning.tofFault) {
+                legTofValid++;
+            }
+        }
         compass.offer(reading, moving);
         headingHistory.offer(reading.timestampMs,
                 compass.usable(reading.timestampMs) ? compass.degrees() : Double.NaN,
@@ -3444,6 +3475,7 @@ final class ExploreBrain {
                     // The sensor can't say when he is past it, so each stall in a row
                     // backs off further and turns a set, growing amount (escapeTurn()).
                     stallStreak++;
+                    legStalls++;
                     note("wheels stalled while driving: blocked by something low (" + stallStreak + " in a row)");
                     compass.legStalled(now - tuning.stallWindowMs);
                     stampStall(now);
@@ -4164,6 +4196,14 @@ final class ExploreBrain {
         if (h != null && h.kind == HazardClassifier.Kind.CPL) {
             recordRefusal(now, true);
         }
+        if (h != null && h.kind == HazardClassifier.Kind.TILT) {
+            SensorReading r = lastReading;
+            note("dark floor: tilt (accel z " + (r != null && r.hasAccel ? String.valueOf(r.accelZ) : "-")
+                    + ", flat " + tuning.darkFlatAccelZ + "): stopping and backing off");
+            if (legNo != 0) {
+                legTilts++;
+            }
+        }
         trustLegHazard();
         if (h == null) {
             endSeek(now, false, "blocked: wheels stalled");
@@ -4176,7 +4216,8 @@ final class ExploreBrain {
         if (state == State.HOP) {
             aheadBlocked();
             legEnd = h == null ? "stall" : h.kind == HazardClassifier.Kind.CPL ? "cpl"
-                    : h.kind == HazardClassifier.Kind.EDGE ? "edge" : "obstacle";
+                    : h.kind == HazardClassifier.Kind.EDGE ? "edge"
+                    : h.kind == HazardClassifier.Kind.TILT ? "tilt" : "obstacle";
             legCpl += h != null && h.kind == HazardClassifier.Kind.CPL ? 1 : 0;
         }
         stopMotors();
@@ -11215,6 +11256,10 @@ final class ExploreBrain {
         aimHeading = Double.NaN;
         int ticks = plannedTicks > 0 ? plannedTicks : drawTicks();
         plannedTicks = -1;
+        if (classifier.darkFloor() && ticks > tuning.darkLegTicksMax) {
+            // Dark floor: only the camera and stalls see obstacles, so legs stay short.
+            ticks = tuning.darkLegTicksMax;
+        }
         if (bathTurnAway(now, ticks)) {
             return;
         }
@@ -11279,6 +11324,10 @@ final class ExploreBrain {
         legTofMin = Integer.MAX_VALUE;
         legCpl = 0;
         legHiccups = 0;
+        legReadings = 0;
+        legTofValid = 0;
+        legStalls = 0;
+        legTilts = 0;
         legPrivate = bathroom;
         legEnd = null;
         legDecClear();
@@ -11308,6 +11357,10 @@ final class ExploreBrain {
                 + " hdg=" + (hdg ? Math.round(legHdg0) % 360 + ">" + Math.round(compass.degrees()) % 360 : "-")
                 + " end=" + end + " tofMin=" + (legTofMin == Integer.MAX_VALUE ? "-" : String.valueOf(legTofMin))
                 + " cpl=" + legCpl + " hiccups=" + legHiccups);
+        if (classifier.darkFloor()) {
+            note("floor: id=" + legNo + " dark=1 tofValid=" + legTofValid + "/" + legReadings
+                    + " stalls=" + legStalls + " tilts=" + legTilts + " end=" + end);
+        }
         legNo = 0;
         legLook0 = null;
         legEnd = null;

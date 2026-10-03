@@ -27,11 +27,25 @@ package com.miko3.mode.explore;
  * During an approach the brain asks approach() instead (KTD4): the same ir flag
  * and CPL=2 refusal fire both for something close and for a drop-off, and the
  * direction tof left the controller's safe band tells them apart.
+ *
+ * Dark-floor mode (setDarkFloor; owner 2026-10-02, drop-free floors only): on a black
+ * floor the ToF gets no return and reads its fault value all the time, and the MCU's own
+ * check is switched off (TOFDS), so:
+ *  - tof at its fault value means "no floor reading": neither unavailable, nor an edge,
+ *    nor frozen;
+ *  - a valid tof still gives an obstacle below obstacleTofBelow; edgeTofAbove and the
+ *    ir edge flag are ignored;
+ *  - CPL=2 and the charger latch are still motion refused;
+ *  - the accelerometer stands in for the cliff sensor: darkTiltReadings readings in a row
+ *    with z below darkFlatAccelZ * cos(darkTiltDeg) are a TILT hazard ahead (nose dip or
+ *    climbing something); below cos(darkLiftDeg) he is lifted or tipped over, and the
+ *    sensors are unavailable until recoveryStreak flat readings in a row.
  */
 final class HazardClassifier {
     enum Status { UNAVAILABLE, HAZARD, CLEAR }
 
-    enum Kind { EDGE, OBSTACLE, CPL }
+    /** TILT: dark-floor mode's accelerometer nose-dip guard (treated as a hazard ahead). */
+    enum Kind { EDGE, OBSTACLE, CPL, TILT }
 
     /**
      * The verdict while approaching something (KTD4). CLOSE and CLOSE_REFUSED are
@@ -71,6 +85,12 @@ final class HazardClassifier {
     /** When tof took its current value, for the frozen rule. */
     private long tofSinceMs;
     private String reason = "no readings yet";
+    private boolean darkFloor;
+    /** Dark-floor mode: accelerometer readings in a row past the tilt and the lift limits. */
+    private int tiltRun;
+    private int liftRun;
+    private final int tiltBelowZ;
+    private final int liftBelowZ;
 
     HazardClassifier(ExploreTuning tuning) {
         this.tuning = tuning;
@@ -79,6 +99,35 @@ final class HazardClassifier {
         if (cal == null) {
             reason = c == null ? "uncalibrated" : "calibration incomplete";
         }
+        tiltBelowZ = (int) Math.round(tuning.darkFlatAccelZ * Math.cos(Math.toRadians(tuning.darkTiltDeg)));
+        liftBelowZ = (int) Math.round(tuning.darkFlatAccelZ * Math.cos(Math.toRadians(tuning.darkLiftDeg)));
+    }
+
+    /**
+     * Dark-floor mode on or off (see the class comment). Either way the readings must earn
+     * a fresh recovery streak under the new rules before the sensors are available again.
+     */
+    void setDarkFloor(boolean on) {
+        if (on == darkFloor) {
+            return;
+        }
+        darkFloor = on;
+        streak = 0;
+        available = false;
+        tiltRun = 0;
+        liftRun = 0;
+        if (cal != null) {
+            reason = on ? "dark floor: on, waiting for readings" : "dark floor: off, waiting for readings";
+        }
+    }
+
+    boolean darkFloor() {
+        return darkFloor;
+    }
+
+    /** Dark-floor mode: the latest readings tip past the tilt limit (a TILT hazard while available). */
+    boolean tilted() {
+        return darkFloor && tiltRun >= tuning.darkTiltReadings;
     }
 
     /** A new reading. Out-of-order or duplicate readings are ignored. */
@@ -93,6 +142,10 @@ final class HazardClassifier {
         }
         if (prev == null || r.timestampMs - prev.timestampMs >= tuning.staleMs) {
             streak = 0;
+        }
+        if (r.hasAccel) {
+            tiltRun = r.accelZ < tiltBelowZ ? tiltRun + 1 : 0;
+            liftRun = r.accelZ < liftBelowZ ? liftRun + 1 : 0;
         }
         String bad = badReason(r);
         if (bad != null) {
@@ -137,6 +190,9 @@ final class HazardClassifier {
         if (r == null || cal == null) {
             return null;
         }
+        if (darkFloor) {
+            return darkHazard(r);
+        }
         if (cal.edgeIr >= 0) {
             boolean e1 = irEdge(r.ir1);
             boolean e2 = irEdge(r.ir2);
@@ -155,6 +211,20 @@ final class HazardClassifier {
             return new Hazard(Kind.EDGE, null);
         }
         if (cal.obstacleTofBelow >= 0 && r.tof < cal.obstacleTofBelow) {
+            return new Hazard(Kind.OBSTACLE, null);
+        }
+        if (refused(r)) {
+            return new Hazard(Kind.CPL, null);
+        }
+        return null;
+    }
+
+    /** hazard() in dark-floor mode: tilt, a valid low tof, or a refusal; no edge rules. */
+    private Hazard darkHazard(SensorReading r) {
+        if (tilted()) {
+            return new Hazard(Kind.TILT, null);
+        }
+        if (cal.obstacleTofBelow >= 0 && r.tof > 0 && r.tof != tuning.tofFault && r.tof < cal.obstacleTofBelow) {
             return new Hazard(Kind.OBSTACLE, null);
         }
         if (refused(r)) {
@@ -184,6 +254,11 @@ final class HazardClassifier {
      */
     boolean plainFloor() {
         SensorReading r = latest;
+        if (darkFloor) {
+            // No floor reading is the black floor itself; a valid one must not read close.
+            return r != null && cal != null && !r.fault && !tilted()
+                    && (r.tof == tuning.tofFault || cal.obstacleTofBelow < 0 || r.tof >= cal.obstacleTofBelow);
+        }
         if (r == null || cal == null || r.fault || r.tof == tuning.tofFault || cal.obstacleTofBelow < 0
                 || (cal.edgeTofAbove < 0 && cal.edgeIr < 0)) {
             return false;
@@ -214,6 +289,16 @@ final class HazardClassifier {
         SensorReading r = latest;
         boolean refused = refused(r);
         ApproachVerdict close = refused ? ApproachVerdict.CLOSE_REFUSED : ApproachVerdict.CLOSE;
+        if (darkFloor) {
+            // A tilt is the edge-like verdict he backs away from; no floor reading is clear.
+            if (tilted()) {
+                return ApproachVerdict.EDGE;
+            }
+            if (cal.obstacleTofBelow >= 0 && r.tof > 0 && r.tof != tuning.tofFault && r.tof < cal.obstacleTofBelow) {
+                return close;
+            }
+            return refused ? ApproachVerdict.CLOSE_REFUSED : ApproachVerdict.CLEAR;
+        }
         if (r.tof == tuning.tofFault) {
             return ApproachVerdict.EDGE;
         }
@@ -259,6 +344,17 @@ final class HazardClassifier {
     private String badReason(SensorReading r) {
         if (r.fault) {
             return "fault reply";
+        }
+        if (darkFloor) {
+            if (liftRun >= tuning.darkTiltReadings) {
+                return "dark floor: lifted or tipped (accel z " + r.accelZ + ", flat " + tuning.darkFlatAccelZ + ")";
+            }
+            // No return from a black floor is constant by nature: only a valid tof can freeze.
+            if (r.tof != tuning.tofFault && tuning.frozenTofWindowMs > 0
+                    && r.timestampMs - tofSinceMs >= tuning.frozenTofWindowMs) {
+                return "tof frozen at " + r.tof + " for " + (r.timestampMs - tofSinceMs) + " ms";
+            }
+            return null;
         }
         // Over an edge the ToF can read its out-of-range value; when a calibrated IR
         // edge flag agrees, the reading is an edge to back away from, not a dead sensor.

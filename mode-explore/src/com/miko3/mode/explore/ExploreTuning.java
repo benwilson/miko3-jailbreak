@@ -47,6 +47,21 @@ final class ExploreTuning {
     final long spinLegMs;
     /** tof's fault value (KTD3). */
     final int tofFault;
+    /**
+     * Dark-floor mode (owner 2026-10-02, persist.miko3.explore.dark_floor=1; drop-free
+     * floors only): the ToF never sees a black floor, so the MCU's check is off (TOFDS) and
+     * the nose-dip/lift guard comes from the accelerometer instead. darkFlatAccelZ is accel
+     * z standing flat on the floor (robot 2026-10-02: 23065..23202 still, 22944..23560 driving). darkTiltReadings
+     * readings in a row with z below darkFlatAccelZ * cos(darkTiltDeg) are a tilt hazard
+     * ahead (stop, back off); below cos(darkLiftDeg), lifted or tipped: the sensors read
+     * unavailable until he is flat again. Legs are at most darkLegTicksMax ticks (~1 m at
+     * 16), since only the camera and stalls catch obstacles.
+     */
+    final int darkFlatAccelZ;
+    final float darkTiltDeg;
+    final float darkLiftDeg;
+    final int darkTiltReadings;
+    final int darkLegTicksMax;
     /** tof unchanged for this long means frozen (leftover TOFDS); 0 turns the rule off (KTD3). */
     final long frozenTofWindowMs;
     /** Good readings in a row needed to go from unavailable back to available (KTD3). */
@@ -938,6 +953,11 @@ final class ExploreTuning {
         spinStillMs = b.spinStillMs;
         spinLegMs = b.spinLegMs;
         tofFault = b.tofFault;
+        darkFlatAccelZ = b.darkFlatAccelZ;
+        darkTiltDeg = b.darkTiltDeg;
+        darkLiftDeg = Math.max(b.darkTiltDeg, b.darkLiftDeg);
+        darkTiltReadings = Math.max(1, b.darkTiltReadings);
+        darkLegTicksMax = Math.max(1, b.darkLegTicksMax);
         frozenTofWindowMs = b.frozenTofWindowMs;
         recoveryStreak = Math.max(1, b.recoveryStreak);
         capHazards = Math.max(1, b.capHazards);
@@ -1290,6 +1310,13 @@ final class ExploreTuning {
         private long spinStillMs = 3000;
         private long spinLegMs = 20000;
         private int tofFault = 16383;
+        private int darkFlatAccelZ = 23100;
+        // 23100 * cos(28 deg) = 20396, ~2700 below flat: well outside the bobs while driving
+        // on the black floor (robot 2026-10-02: z 22944..23560 driving, 23095..23202 still).
+        private float darkTiltDeg = 28f;
+        private float darkLiftDeg = 45f;
+        private int darkTiltReadings = 2;
+        private int darkLegTicksMax = 16;
         // A still robot's tof jitters by tens of counts, so identical values this
         // long mean a stuck sensor (docs/hardware/tof-sensor.md).
         private long frozenTofWindowMs = 3000;
@@ -1929,6 +1956,14 @@ final class ExploreTuning {
             return this;
         }
         Builder reaimOff() { reaimMinDeg = 0; return this; }
+        Builder darkFloor(int flatAccelZ, float tiltDeg, float liftDeg, int tiltReadings, int legTicksMax) {
+            darkFlatAccelZ = flatAccelZ;
+            darkTiltDeg = tiltDeg;
+            darkLiftDeg = liftDeg;
+            darkTiltReadings = tiltReadings;
+            darkLegTicksMax = legTicksMax;
+            return this;
+        }
         Builder cplRetry(long pauseMs, long windowMs) { cplRetryPauseMs = pauseMs; cplRetryWindowMs = windowMs; return this; }
         Builder steer(float minConfidence, int bandBins, float blocked, float open, float minGain) {
             steerMinConfidence = minConfidence;

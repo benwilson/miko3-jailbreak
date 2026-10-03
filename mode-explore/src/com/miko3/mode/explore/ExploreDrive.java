@@ -57,7 +57,8 @@ import java.io.IOException;
  *                       camera opens only at each leg decision; read once as
  *                       Explore starts (lookThenGo()), so set it before starting
  */
-final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, ExploreLoop.Lease, ExploreLoop.Hooks {
+final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, ExploreLoop.Lease, ExploreLoop.Hooks,
+        DarkFloor.Source {
     private static final String TAG = "ExploreDrive";
     private static final String CLIENT_ID = LauncherProtocol.MODE_EXPLORE;
     private static final long RENEW_INTERVAL_MS = 1000; // comfortably under the lease's ~2.25s TTL
@@ -80,6 +81,9 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
      * keepalive thread (mid-backoff) running beside the new one. */
     private volatile DirectMotorDriver driver;
     private volatile boolean driverConnected;
+    /** A TOFDS went out on this driver and no TOFEN since (dark-floor mode): the MCU's ToF
+     * check must be switched back on before the driver is let go. */
+    private volatile boolean tofCheckOff;
     private final LeaseTrust trust = new LeaseTrust(LEASE_TRUST_MS);
     /** Set first thing in release(); every lease callback checks it. */
     private volatile boolean released;
@@ -191,8 +195,23 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         } catch (IOException e) {
             Log.w(TAG, "stop before disconnect failed", e);
         }
+        restoreTofCheck(d);
         d.disconnect();
         driver = null;
+    }
+
+    /** Never leave a TOFDS behind (dark-floor mode): TOFEN before the driver is let go. */
+    private void restoreTofCheck(DirectMotorDriver d) {
+        if (!tofCheckOff) {
+            return;
+        }
+        try {
+            d.enableTofCheck();
+            tofCheckOff = false;
+            Log.i(TAG, "dark floor: TOFEN sent (driver let go)");
+        } catch (IOException e) {
+            Log.w(TAG, "TOFEN before disconnect failed", e);
+        }
     }
 
     /** Exit: release the lease, then disconnect. The loop has already stopped the wheels. */
@@ -201,6 +220,11 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         trust.lost();
         handler.removeCallbacks(renewLoop);
         handler.removeCallbacks(leaseRetry);
+        DirectMotorDriver held = driver;
+        if (held != null) {
+            // Before the lease goes back, while the UART is still ours.
+            restoreTofCheck(held);
+        }
         DriveLease l = lease;
         if (leaseHeld && l != null) {
             try {
@@ -280,6 +304,12 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         long delay = Math.min(LEASE_RETRY_BASE_MS << Math.min(leaseRetryAttempt - 1, 4), LEASE_RETRY_MAX_MS);
         Log.i(TAG, "retrying the drive lease in " + delay + "ms (attempt " + leaseRetryAttempt + ")");
         handler.postDelayed(leaseRetry, delay);
+    }
+
+    /** Dark-floor mode wanted: persist.miko3.explore.dark_floor (DarkFloor reads it every ~5 s). */
+    @Override
+    public boolean darkFloor() {
+        return DarkFloor.parse(DetectorConfig.systemProperty(DarkFloor.PROPERTY));
     }
 
     /** The MikoExploreLookThenGo hook: look-then-go navigation instead of continuous (KTD7). */
@@ -365,6 +395,11 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
         return hook("MikoExploreSpin");
     }
 
+    @Override
+    public boolean fwdProbe() {
+        return hook("MikoExploreFwdProbe");
+    }
+
     // ---- ExploreLoop.Wheels ----
 
     @Override
@@ -380,6 +415,19 @@ final class ExploreDrive implements ExploreLoop.Wheels, ExploreLoop.Sensors, Exp
     @Override
     public void backTick() throws IOException {
         requireLease().driveContinuous(-2, 0);
+    }
+
+    @Override
+    public void disableTofCheck() throws IOException {
+        DirectMotorDriver d = requireLease();
+        tofCheckOff = true;
+        d.disableTofCheck();
+    }
+
+    @Override
+    public void enableTofCheck() throws IOException {
+        requireDriver().enableTofCheck();
+        tofCheckOff = false;
     }
 
     @Override

@@ -217,6 +217,8 @@ public class ModeApp extends Application {
                     ears, drive, trace, BRAIN_TICK_MS, STOP_TIMER_MS);
             loop.setGauges(gauges);
             loop.setMute(new SpeakerMute());
+            // Dark-floor mode (owner 2026-10-02): persist.miko3.explore.dark_floor=1, re-read every ~5 s.
+            loop.setDarkFloor(drive);
             loop.start();
             Log.i(TAG, "explore started");
         }

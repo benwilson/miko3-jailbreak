@@ -3960,6 +3960,7 @@ public final class ExploreBrainHarness {
         mutedScenarios();
         bathroomScenarios();
         navLogScenarios();
+        darkFloorScenarios();
         System.out.println(failures == 0 ? "ALL OK" : ("FAILURES " + failures));
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -17096,6 +17097,234 @@ public final class ExploreBrainHarness {
 
     private static String lastNotes(List<String> notes) {
         return notes.subList(Math.max(0, notes.size() - 25), notes.size()).toString();
+    }
+
+    // ---- dark-floor mode (owner 2026-10-02: a black floor the ToF never sees) ----
+
+    /** Flat on a black floor: tof at its no-return value, the MCU's flag off (TOFDS), accel z flat. */
+    static SensorReading darkFlat(long t) {
+        return darkAt(t, 16383, 0, 23100 + jitter(t));
+    }
+
+    /** As darkFlat, with the MCU's ir2 flag up (its check still on, as before any TOFDS). */
+    static SensorReading darkFlagged(long t) {
+        return darkAt(t, 16383, 1, 23100 + jitter(t));
+    }
+
+    static SensorReading darkAt(long t, int tof, int ir2, int accelZ) {
+        return new SensorReading(t, tof, SensorReadingAbsent.ABSENT, ir2, null, false, false, 0, 0, false, 0, 0, 0,
+                false, true, -2120, 310, accelZ);
+    }
+
+    /** SensorSnapshot's absent-field value, without pulling in the shared parser. */
+    static final class SensorReadingAbsent {
+        static final int ABSENT = -1;
+    }
+
+    private static HazardClassifier darkClassifier() {
+        HazardClassifier c = new HazardClassifier(tuning().build());
+        c.setDarkFloor(true);
+        return c;
+    }
+
+    private static boolean anyNote(List<String> notes, String part) {
+        for (String x : notes) {
+            if (x.contains(part)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void darkFloorScenarios() {
+        scenario("dark_classifier_no_return_tof_is_clear_past_the_frozen_window", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, t -> darkFlagged(t), 100, 5000);
+            HazardClassifier.Status s = c.status(5000);
+            check(n, s == HazardClassifier.Status.CLEAR, "status=" + s + " reason=" + c.reason());
+        });
+        scenario("dark_classifier_off_no_return_tof_stays_unavailable", n -> {
+            HazardClassifier c = new HazardClassifier(tuning().build());
+            feedClassifier(c, t -> darkFlat(t), 100, 2000);
+            HazardClassifier.Status s = c.status(2000);
+            check(n, s == HazardClassifier.Status.UNAVAILABLE, "status=" + s);
+        });
+        scenario("dark_classifier_ignores_the_ir_edge_flag", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, ExploreBrainHarness::edgeAhead, 100, 1000);
+            HazardClassifier.Status s = c.status(1000);
+            check(n, s == HazardClassifier.Status.CLEAR, "status=" + s + " hazard=" + c.hazard());
+        });
+        scenario("dark_classifier_valid_low_tof_is_still_an_obstacle", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, t -> darkFlat(t), 100, 1000);
+            c.offer(darkAt(1100, 50, 0, 23100));
+            HazardClassifier.Status s = c.status(1100);
+            HazardClassifier.Hazard h = c.hazard();
+            check(n, s == HazardClassifier.Status.HAZARD && h != null && h.kind == HazardClassifier.Kind.OBSTACLE,
+                    "status=" + s + " hazard=" + h);
+        });
+        scenario("dark_classifier_cpl2_is_still_a_refusal", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, t -> darkFlat(t), 100, 1000);
+            c.offer(new SensorReading(1100, 16383, -1, 0, 2, false));
+            HazardClassifier.Hazard h = c.hazard();
+            check(n, c.status(1100) == HazardClassifier.Status.HAZARD && h != null
+                    && h.kind == HazardClassifier.Kind.CPL, "hazard=" + h);
+        });
+        scenario("dark_classifier_tilt_needs_two_readings_and_is_a_tilt_hazard", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, t -> darkFlat(t), 100, 1000);
+            // 23100 * cos(28 deg) = 20396 (robot 2026-10-02: driving bobs 22944..23560): 19500 is
+            // past it, 21000 is not.
+            c.offer(darkAt(1100, 16383, 0, 21000));
+            HazardClassifier.Status slight = c.status(1100);
+            c.offer(darkAt(1200, 16383, 0, 19500));
+            HazardClassifier.Status one = c.status(1200);
+            c.offer(darkAt(1300, 16383, 0, 19400));
+            HazardClassifier.Status two = c.status(1300);
+            HazardClassifier.Hazard h = c.hazard();
+            c.offer(darkAt(1400, 16383, 0, 23100));
+            HazardClassifier.Status flat = c.status(1400);
+            check(n, slight == HazardClassifier.Status.CLEAR && one == HazardClassifier.Status.CLEAR
+                            && two == HazardClassifier.Status.HAZARD && h != null
+                            && h.kind == HazardClassifier.Kind.TILT && flat == HazardClassifier.Status.CLEAR,
+                    "slight=" + slight + " one=" + one + " two=" + two + " hazard=" + h + " flat=" + flat);
+        });
+        scenario("dark_classifier_lifted_is_unavailable_until_flat_again", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, t -> darkFlat(t), 100, 1000);
+            // 23100 * cos(45 deg) = 16334.
+            c.offer(darkAt(1100, 16383, 0, 9000));
+            c.offer(darkAt(1200, 16383, 0, 9000));
+            HazardClassifier.Status lifted = c.status(1200);
+            String why = c.reason();
+            c.offer(darkAt(1300, 16383, 0, 23100));
+            HazardClassifier.Status first = c.status(1300);
+            c.offer(darkAt(1400, 16383, 0, 23101));
+            c.offer(darkAt(1500, 16383, 0, 23102));
+            HazardClassifier.Status back = c.status(1500);
+            check(n, lifted == HazardClassifier.Status.UNAVAILABLE && why.startsWith("dark floor: lifted")
+                            && first == HazardClassifier.Status.UNAVAILABLE && back == HazardClassifier.Status.CLEAR,
+                    "lifted=" + lifted + " why=" + why + " first=" + first + " back=" + back);
+        });
+        scenario("dark_classifier_off_ignores_the_accelerometer", n -> {
+            HazardClassifier c = new HazardClassifier(tuning().build());
+            feedClassifier(c, CLEAR, 100, 1000);
+            c.offer(new SensorReading(1100, 303, 100, 100, null, false, false, 0, 0, false, 0, 0, 0,
+                    false, true, -2120, 310, 9000));
+            c.offer(new SensorReading(1200, 304, 100, 100, null, false, false, 0, 0, false, 0, 0, 0,
+                    false, true, -2120, 310, 9000));
+            HazardClassifier.Status s = c.status(1200);
+            check(n, s == HazardClassifier.Status.CLEAR, "status=" + s);
+        });
+        scenario("dark_approach_no_return_tof_is_clear_not_edge", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, t -> darkFlagged(t), 100, 1000);
+            HazardClassifier.ApproachVerdict v = c.approach(1000);
+            check(n, v == HazardClassifier.ApproachVerdict.CLEAR, "verdict=" + v);
+        });
+        scenario("dark_classifier_switching_off_needs_floor_readings_again", n -> {
+            HazardClassifier c = darkClassifier();
+            feedClassifier(c, t -> darkFlat(t), 100, 1000);
+            HazardClassifier.Status on = c.status(1000);
+            c.setDarkFloor(false);
+            c.offer(darkFlat(1100));
+            HazardClassifier.Status off = c.status(1100);
+            check(n, on == HazardClassifier.Status.CLEAR && off == HazardClassifier.Status.UNAVAILABLE,
+                    "on=" + on + " off=" + off);
+        });
+
+        scenario("dark_floor_off_no_return_tof_stays_eyes_only", n -> {
+            Rig rig = new Rig(tuning().build(), ExploreBrainHarness::darkFlagged).started();
+            rig.runUntil(8000);
+            check(n, rig.motions(0, 8001) == 0 && rig.brain.state() == ExploreBrain.State.EYES_ONLY,
+                    "state=" + rig.brain.state() + " " + rig.tail());
+        });
+        scenario("dark_floor_on_leaves_eyes_only_and_roams_on_no_return_tof", n -> {
+            Rig rig = new Rig(tuning().build(), ExploreBrainHarness::darkFlat);
+            rig.brain.setDarkFloor(true);
+            rig.started();
+            rig.runUntil(8000);
+            check(n, rig.count("hop") >= 3 && rig.count("startle") == 0 && rig.violations.isEmpty(),
+                    "hops=" + rig.count("hop") + " state=" + rig.brain.state() + " " + rig.tail());
+        });
+        scenario("dark_floor_switched_on_live_leaves_eyes_only", n -> {
+            Rig rig = new Rig(tuning().build(), ExploreBrainHarness::darkFlat).started();
+            rig.at(3000, () -> rig.brain.setDarkFloor(true));
+            rig.runUntil(8000);
+            check(n, rig.motions(0, 3000) == 0 && rig.countPrefix("hop", 3000, 8001) >= 1,
+                    "before=" + rig.motions(0, 3000) + " after=" + rig.countPrefix("hop", 3000, 8001) + " "
+                            + rig.tail());
+        });
+        scenario("dark_floor_tilt_stops_backs_off_and_logs_it", n -> {
+            // Flat until the first hop is under way, then the nose dips for 300 ms.
+            Rig rig = new Rig(tuning().build(), t -> t >= 1600 && t < 1900 ? darkAt(t, 16383, 0, 19000)
+                    : darkFlat(t));
+            List<String> notes = traced(rig);
+            rig.brain.setDarkFloor(true);
+            rig.started();
+            rig.runUntil(4000);
+            int hop = rig.first("hop", 0);
+            int stop = rig.first("stop", hop);
+            int back = rig.first("back", stop);
+            check(n, hop >= 0 && rig.timeOf(stop) <= 1700 && back > stop && rig.count("startle") == 1
+                            && anyNote(notes, "dark floor: tilt") && anyNote(notes, "end=tilt"),
+                    "stop@" + rig.timeOf(stop) + " back=" + back + " " + rig.tail() + " notes=" + notes);
+        });
+        scenario("dark_floor_lifted_stops_and_waits_until_flat", n -> {
+            Rig rig = new Rig(tuning().build(), t -> t >= 1600 && t < 5000 ? darkAt(t, 16383, 0, 8000)
+                    : darkFlat(t));
+            rig.brain.setDarkFloor(true);
+            rig.started();
+            rig.runUntil(9000);
+            int stop = rig.first("stop", rig.first("hop", 0));
+            check(n, rig.timeOf(stop) <= 1800 && rig.motions(1800, 5000) == 0
+                            && rig.statesSeen.contains(ExploreBrain.State.EYES_ONLY)
+                            && rig.countPrefix("hop", 5000, 9001) >= 1,
+                    "stop@" + rig.timeOf(stop) + " moves while lifted=" + rig.motions(1800, 5000) + " "
+                            + rig.tail());
+        });
+        scenario("dark_floor_caps_the_leg_length", n -> {
+            Rig rig = new Rig(tuning().hopTicks(30).darkFloor(23100, 28f, 45f, 2, 4).build(),
+                    ExploreBrainHarness::darkFlat);
+            List<String> notes = traced(rig);
+            rig.brain.setDarkFloor(true);
+            rig.started();
+            rig.runUntil(6000);
+            check(n, anyNote(notes, "plan=4t") && !anyNote(notes, "plan=30t"), "notes=" + notes);
+        });
+        scenario("dark_floor_off_legs_are_not_capped", n -> {
+            Rig rig = new Rig(tuning().hopTicks(30).darkFloor(23100, 28f, 45f, 2, 4).build(), CLEAR);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(6000);
+            check(n, !anyNote(notes, "plan=4t"), "notes=" + notes);
+        });
+        scenario("dark_floor_leg_writes_a_floor_record", n -> {
+            Rig rig = new Rig(tuning().build(), ExploreBrainHarness::darkFlat);
+            List<String> notes = traced(rig);
+            rig.brain.setDarkFloor(true);
+            rig.started();
+            rig.runUntil(4000);
+            String rec = null;
+            for (String x : notes) {
+                if (x.contains("floor: id=")) {
+                    rec = x;
+                    break;
+                }
+            }
+            check(n, rec != null && rec.contains("tofValid=0/") && rec.contains("stalls=0")
+                            && rec.contains("tilts=0") && LearnLog.wanted(rec.substring(rec.indexOf("floor: "))),
+                    "record=" + rec);
+        });
+        scenario("dark_floor_off_writes_no_floor_record", n -> {
+            Rig rig = new Rig(tuning().build(), CLEAR);
+            List<String> notes = traced(rig);
+            rig.started();
+            rig.runUntil(4000);
+            check(n, !anyNote(notes, "floor: id="), "notes=" + notes);
+        });
     }
 
     private static void navLogScenarios() {
