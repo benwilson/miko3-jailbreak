@@ -97,7 +97,7 @@ class ReplayTest(unittest.TestCase):
                  "sink 0.26 [0.32,0.00,1.00,0.53]")
         self.assertEqual(run([look(0, *chair), look(1, *chair), look(2, *chair)])["triggers"], [])
         # Demoted to weak, it still counts with another weak label.
-        r = run([look(0, *chair), look(1, "mirror 0.45 [0.10,0.10,0.30,0.50]")])
+        r = run([look(0, *chair), look(1, "mirror 0.55 [0.10,0.10,0.30,0.50]")])
         self.assertEqual([(x["rule"], [b[0] for b in x["boxes"]]) for x in r["triggers"]],
                          [("weak2", ["toilet", "mirror"])])
         # A rival under 0.25, or one that overlaps less, leaves it strong.
@@ -109,12 +109,12 @@ class ReplayTest(unittest.TestCase):
     def test_toilet_paper_alone_never_triggers_and_with_a_sink_does(self):
         r = run([look(0, "toilet paper 0.80 [0.30,0.30,0.50,0.60]")])
         self.assertEqual(r["triggers"], [])
-        r = run([look(0, "toilet paper 0.50 [0.30,0.30,0.50,0.60]", "sink 0.40 [0.55,0.35,0.85,0.65]")])
+        r = run([look(0, "toilet paper 0.55 [0.30,0.30,0.50,0.60]", "sink 0.55 [0.55,0.35,0.85,0.65]")])
         self.assertEqual([(x["rule"], [b[0] for b in x["boxes"]]) for x in r["triggers"]],
                          [("weak2", ["toilet paper", "sink"])])
 
     def test_two_weak_within_three_looks_and_ten_s_but_not_further_apart(self):
-        sink, soap = "sink 0.40 [0.30,0.30,0.60,0.60]", "soap 0.40 [0.30,0.30,0.60,0.60]"
+        sink, soap = "sink 0.55 [0.30,0.30,0.60,0.60]", "soap 0.55 [0.30,0.30,0.60,0.60]"
         near = run([look(0, sink), look(1, "chair 0.5 [0,0,1,1]"), look(2, soap)])
         self.assertEqual([x["looks"] for x in near["triggers"]], [2])
         many_looks = run([look(0, sink), look(1), look(2), look(3, soap)])
@@ -123,8 +123,8 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(slow["triggers"], [])
 
     def test_a_new_pid_starts_afresh_and_logged_triggers_are_matched(self):
-        r = run([look(0, "sink 0.40 [0.30,0.30,0.60,0.60]", pid=1),
-                 look(1, "soap 0.40 [0.30,0.30,0.60,0.60]", pid=2),
+        r = run([look(0, "sink 0.55 [0.30,0.30,0.60,0.60]", pid=1),
+                 look(1, "soap 0.55 [0.30,0.30,0.60,0.60]", pid=2),
                  look(49, "toilet 0.60 [0.35,0.40,0.65,0.80]"),
                  look(50, "toilet 0.60 [0.35,0.40,0.65,0.80]"),
                  L(50.5, "bathroom: toilet; leaving and beeping (privacy)", tag="ExploreBrain"),

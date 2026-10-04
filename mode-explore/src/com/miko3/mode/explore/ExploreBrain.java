@@ -2755,7 +2755,16 @@ final class ExploreBrain {
     /** A box smaller than this share of the frame never counts: from the floor a real fixture is big. */
     static final float BATHROOM_MIN_AREA = 0.006f;
     /** 0.4, not 0.3: the same replay found office pairs like sink 0.31 + paper towel, mirror 0.30 + bathtub 0.38. */
-    static final float BATHROOM_WEAK_MIN = 0.4f;
+    /** 0.5, not 0.4: home 2026-10-02 a living room read mirror 0.45 + bathtub 0.42. */
+    static final float BATHROOM_WEAK_MIN = 0.5f;
+    /** A box less tall than this share of the frame never counts (that bathtub was a 0.09-tall floor strip). */
+    static final float BATHROOM_MIN_HEIGHT = 0.15f;
+    /** Out without driving (home 2026-10-03: stationary, a false trigger never cleared): this many clean looks
+     *  in a row and BATHROOM_OUT_STILL_MS with no bathroom label at all. */
+    /** When a bathroom label was last seen while private (the still exit counts from it). */
+    private long bathLabelAt;
+    static final int BATHROOM_OUT_LOOKS_STILL = 6;
+    static final long BATHROOM_OUT_STILL_MS = 30000;
     static final int BATHROOM_WEAK_LOOKS = 3;
     static final long BATHROOM_WEAK_WINDOW_MS = 10000;
     /**
@@ -2831,7 +2840,7 @@ final class ExploreBrain {
         List<Detection> weak = new ArrayList<Detection>();
         if (look.detections != null) {
             for (Detection d : look.detections) {
-                if ((d.x1 - d.x0) * (d.y1 - d.y0) < BATHROOM_MIN_AREA) {
+                if ((d.x1 - d.x0) * (d.y1 - d.y0) < BATHROOM_MIN_AREA || d.y1 - d.y0 < BATHROOM_MIN_HEIGHT) {
                     continue;
                 }
                 boolean strongLabel = BATHROOM_STRONG.contains(d.label) && d.score >= BATHROOM_STRONG_MIN;
@@ -2902,6 +2911,9 @@ final class ExploreBrain {
         List<Detection> weak = hits.get(1);
         if (bathroom) {
             bathCleanLooks = strong.isEmpty() && weak.isEmpty() ? bathCleanLooks + 1 : 0;
+            if (!strong.isEmpty() || !weak.isEmpty()) {
+                bathLabelAt = now;
+            }
             return;
         }
         bathLooks.addLast(new Object[]{look.frameMs, weak, strong});
@@ -3021,6 +3033,7 @@ final class ExploreBrain {
         bathCounts = 0;
         bathWheels = null;
         bathCleanLooks = 0;
+        bathLabelAt = now;
         bathBeepAt = now;
         cancelAsk();
         cancelDoorway(now, "bathroom privacy");
@@ -3049,7 +3062,8 @@ final class ExploreBrain {
             }
             bathBeepAt = now + BATHROOM_BEEP_MS;
         }
-        if (bathCounts >= BATHROOM_OUT_M * tuning.coverageCountsPerMetre && bathCleanLooks >= BATHROOM_OUT_LOOKS) {
+        if (bathCounts >= BATHROOM_OUT_M * tuning.coverageCountsPerMetre && bathCleanLooks >= BATHROOM_OUT_LOOKS
+                || bathCleanLooks >= BATHROOM_OUT_LOOKS_STILL && now - bathLabelAt >= BATHROOM_OUT_STILL_MS) {
             bathroom = false;
             bathEscapePending = false;
             camera.setPrivate(false);

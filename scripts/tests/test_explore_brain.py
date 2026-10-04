@@ -801,6 +801,8 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "bathroom_a_real_toilet_needs_two_of_three_looks",
         "bathroom_a_single_mirror_or_weak_labels_below_threshold_never_trigger",
         "bathroom_toilet_paper_alone_or_a_tiny_box_never_triggers",
+        "bathroom_living_room_mirror_and_a_thin_floor_strip_never_trigger",
+        "bathroom_privacy_clears_after_clean_looks_even_without_driving",
         "bathroom_toilet_paper_and_a_sink_together_still_trigger",
         "bathroom_a_sink_and_soap_within_three_looks_trigger_and_five_looks_apart_do_not",
         "bathroom_privacy_a_due_curiosity_stop_asks_claude_nothing_and_stores_no_place_print",

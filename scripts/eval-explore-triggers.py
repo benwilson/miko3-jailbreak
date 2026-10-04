@@ -27,7 +27,7 @@ leaving" note within --match-s, so a changed rule's new and lost triggers stand 
 
 Usage:
   scripts/eval-explore-triggers.py LOG [LOG ...] [--json out.json|-] [--strong-min 0.5]
-                                   [--weak-min 0.4] [--min-area 0.006] [--year 2026]
+                                   [--weak-min 0.5] [--min-area 0.006] [--year 2026]
 """
 import argparse
 import datetime as dt
@@ -43,8 +43,9 @@ HERE = Path(__file__).resolve().parent
 BATHROOM_STRONG = ("toilet",)
 BATHROOM_STRONG_MIN = 0.5
 BATHROOM_WEAK = ("toilet paper", "sink", "mirror", "soap", "paper towel", "towel", "bathtub")
-BATHROOM_WEAK_MIN = 0.4
+BATHROOM_WEAK_MIN = 0.5
 BATHROOM_MIN_AREA = 0.006
+BATHROOM_MIN_HEIGHT = 0.15
 BATHROOM_WEAK_LOOKS = 3
 BATHROOM_WEAK_WINDOW_MS = 10000
 BATHROOM_RIVAL_IOU = 0.8
@@ -92,7 +93,7 @@ def hits(boxes, strong_min, weak_min, min_area):
     a strong box with a rival label counts as weak."""
     strong, weak = [], []
     for label, score, (x0, y0, x1, y1) in boxes:
-        if (x1 - x0) * (y1 - y0) < min_area:
+        if (x1 - x0) * (y1 - y0) < min_area or y1 - y0 < BATHROOM_MIN_HEIGHT:
             continue
         box = (label, score, (x0, y0, x1, y1))
         if label in BATHROOM_STRONG and score >= strong_min and not rivalled(box[2], boxes):

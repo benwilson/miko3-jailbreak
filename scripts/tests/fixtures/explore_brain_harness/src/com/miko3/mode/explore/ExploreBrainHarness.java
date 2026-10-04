@@ -3865,6 +3865,30 @@ public final class ExploreBrainHarness {
                             && mirror.violations.isEmpty() && faint.violations.isEmpty(),
                     "mirror notes=" + lastNotes(notes, 10) + " faint notes=" + lastNotes(notes2, 10));
         });
+        scenario("bathroom_living_room_mirror_and_a_thin_floor_strip_never_trigger", n -> {
+            // Home 2026-10-02 21:35: "mirror 0.45 [0.03,0.28,0.66,0.84] + bathtub 0.42 [0.37,0.91,1.00,1.00]" in
+            // a living room: the bathtub was a thin strip along the frame's bottom edge.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning(), (r, t) -> list(box("mirror", 0.45f, 0.345f, 0.56f, 0.63f, 0.56f),
+                    box("bathtub", 0.42f, 0.685f, 0.955f, 0.63f, 0.09f)), notes);
+            rig.started();
+            rig.runUntil(30000);
+            check(n, !anyContains(notes, "bathroom:") && rig.privacyOns == 0 && rig.violations.isEmpty(),
+                    "notes=" + lastNotes(notes, 6));
+        });
+        scenario("bathroom_privacy_clears_after_clean_looks_even_without_driving", n -> {
+            // Home 2026-10-03: a false trigger while he was barely moving kept him private for good (out needed
+            // 2 m driven), beeping every 5 s and only glancing at calls. Six clean looks in a row now end it.
+            List<String> notes = new ArrayList<String>();
+            Rig rig = bathRig(bathTuning(), byLook(k -> k <= 4 ? list(box("toilet", 0.7f, 0.5f, 0.6f, 0.3f, 0.4f)) : list()),
+                    notes);
+            rig.simWheels = false;
+            rig.started();
+            runUntil(rig, 120000, r -> anyContains(notes, "bathroom: out"));
+            String out = firstNote(notes, "bathroom: out");
+            check(n, anyContains(notes, "leaving and beeping (privacy)") && out != null && rig.violations.isEmpty(),
+                    "out=" + out + " " + lastNotes(notes, 8));
+        });
         scenario("bathroom_toilet_paper_alone_or_a_tiny_box_never_triggers", n -> {
             // Robot 2026-10-02 12:52: a small white thing on the office floor read "toilet paper" 0.35
             // (a 5% wide box) beside a desk and a storage bin, and he beeped his way out of the office.
@@ -3890,8 +3914,8 @@ public final class ExploreBrainHarness {
         });
         scenario("bathroom_toilet_paper_and_a_sink_together_still_trigger", n -> {
             List<String> notes = new ArrayList<String>();
-            Rig rig = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("toilet paper", 0.5f, 0.4f, 0.6f, 0.15f, 0.2f),
-                    box("sink", 0.4f, 0.7f, 0.5f, 0.3f, 0.3f)) : list()), notes);
+            Rig rig = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("toilet paper", 0.55f, 0.4f, 0.6f, 0.15f, 0.2f),
+                    box("sink", 0.55f, 0.7f, 0.5f, 0.3f, 0.3f)) : list()), notes);
             rig.started();
             rig.runUntil(20000);
             String trig = firstNote(notes, "bathroom: ");
@@ -3900,13 +3924,13 @@ public final class ExploreBrainHarness {
         });
         scenario("bathroom_a_sink_and_soap_within_three_looks_trigger_and_five_looks_apart_do_not", n -> {
             List<String> notes = new ArrayList<String>();
-            Rig near = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.4f, 0.4f, 0.6f, 0.3f, 0.3f))
-                    : k == 5 ? list(box("soap", 0.4f, 0.6f, 0.6f, 0.1f, 0.1f)) : list()), notes);
+            Rig near = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.55f, 0.4f, 0.6f, 0.3f, 0.3f))
+                    : k == 5 ? list(box("soap", 0.55f, 0.6f, 0.6f, 0.2f, 0.2f)) : list()), notes);
             near.started();
             near.runUntil(20000);
             List<String> notes2 = new ArrayList<String>();
-            Rig apart = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.4f, 0.4f, 0.6f, 0.3f, 0.3f))
-                    : k == 8 ? list(box("soap", 0.4f, 0.6f, 0.6f, 0.1f, 0.1f)) : list()), notes2);
+            Rig apart = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.55f, 0.4f, 0.6f, 0.3f, 0.3f))
+                    : k == 8 ? list(box("soap", 0.55f, 0.6f, 0.6f, 0.2f, 0.2f)) : list()), notes2);
             apart.started();
             apart.runUntil(20000);
             String trig = firstNote(notes, "bathroom: ");
@@ -18664,21 +18688,21 @@ public final class ExploreBrainHarness {
             rig.runUntil(20000);
             List<String> strong = records(notes, "trig: ");
             List<String> notes2 = new ArrayList<String>();
-            Rig weak = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("toilet paper", 0.5f, 0.4f, 0.6f, 0.15f, 0.2f),
-                    box("sink", 0.4f, 0.7f, 0.5f, 0.3f, 0.3f)) : list()), notes2);
+            Rig weak = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("toilet paper", 0.55f, 0.4f, 0.6f, 0.15f, 0.2f),
+                    box("sink", 0.55f, 0.7f, 0.5f, 0.3f, 0.3f)) : list()), notes2);
             weak.started();
             weak.runUntil(20000);
             List<String> two = records(notes2, "trig: ");
             List<String> notes3 = new ArrayList<String>();
-            Rig apart = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.5f, 0.4f, 0.6f, 0.3f, 0.3f))
-                    : k == 4 ? list(box("soap", 0.45f, 0.6f, 0.6f, 0.2f, 0.2f)) : list()), notes3);
+            Rig apart = bathRig(bathTuning(), byLook(k -> k == 3 ? list(box("sink", 0.55f, 0.4f, 0.6f, 0.3f, 0.3f))
+                    : k == 4 ? list(box("soap", 0.55f, 0.6f, 0.6f, 0.2f, 0.2f)) : list()), notes3);
             apart.started();
             apart.runUntil(20000);
             List<String> looks2 = records(notes3, "trig: ");
             check(n, strong.size() == 1 && strong.get(0).equals(
                             "trig: kind=bathroom rule=strong label=toilet score=0.60 box=0.35,0.40,0.65,0.80 looks=2")
                             && two.size() == 1 && two.get(0).startsWith("trig: kind=bathroom rule=weak2 label=toilet_paper+sink"
-                            + " score=0.50+0.40 box=") && two.get(0).endsWith(",0.65 looks=1")
+                            + " score=0.55+0.55 box=") && two.get(0).endsWith(",0.65 looks=1")
                             && field(two.get(0), "box").split("\\+").length == 2
                             && looks2.size() == 1 && "sink+soap".equals(field(looks2.get(0), "label"))
                             && "2".equals(field(looks2.get(0), "looks")) && rig.violations.isEmpty(),
