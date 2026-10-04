@@ -49,7 +49,8 @@ public final class ClaudeApi {
      * object come to about 90-130 tokens on Haiku 4.5; 400 leaves room for a long notes
      * update without letting a runaway reply run on.
      */
-    public static final int CONVERSATION_MAX_TOKENS = 400;
+    // 700, not 400 (home 2026-10-03: a chatty reply plus its notes ran out and came back as BAD_REPLY).
+    public static final int CONVERSATION_MAX_TOKENS = 700;
     /** A streamed body is cut off past this many characters, as ClaudeHttpsTransport cuts a whole one. */
     private static final int MAX_STREAM_CHARS = 1024 * 1024;
 

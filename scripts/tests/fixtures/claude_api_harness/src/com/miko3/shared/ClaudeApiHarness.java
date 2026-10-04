@@ -651,9 +651,9 @@ public final class ClaudeApiHarness {
                         && "PREFIX".equals(b.get("system")) && t.requests.get(0).url.equals(BASE + "/v1/messages"),
                 describe(r) + " " + order);
         Object cc = b.get("cache_control");
-        check("conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_400",
+        check("conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_700",
                 cc instanceof Map && "ephemeral".equals(((Map<?, ?>) cc).get("type"))
-                        && Long.valueOf(400).equals(b.get("max_tokens")) && !b.containsKey("stream") && t.requests.get(0).readTimeoutMs == 5000,
+                        && Long.valueOf(700).equals(b.get("max_tokens")) && !b.containsKey("stream") && t.requests.get(0).readTimeoutMs == 5000,
                 "cache_control=" + cc + " max_tokens=" + b.get("max_tokens") + " timeout=" + t.requests.get(0).readTimeoutMs);
         Object oc = b.get("output_config");
         Object fmt = oc instanceof Map ? ((Map<?, ?>) oc).get("format") : null;
@@ -854,7 +854,7 @@ public final class ClaudeApiHarness {
                 EARLY, e);
         Map<?, ?> b = t.requests.isEmpty() ? Collections.emptyMap() : body(t.requests.get(0));
         check("conversation_streamed_asks_for_a_stream",
-                Boolean.TRUE.equals(b.get("stream")) && Long.valueOf(400).equals(b.get("max_tokens")),
+                Boolean.TRUE.equals(b.get("stream")) && Long.valueOf(700).equals(b.get("max_tokens")),
                 "stream=" + b.get("stream") + " max_tokens=" + b.get("max_tokens"));
         boolean early = e.calls == 1 && e.fields != null && "Camping? Nice.".equals(e.fields.get("line"))
                 && "Camping?".equals(e.fields.get("question_asked")) && "Sam".equals(e.fields.get("name_given"));

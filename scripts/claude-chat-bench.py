@@ -4,7 +4,7 @@ configured Claude model, timed the way the robot will run it (meeting plan U2;
 KTD9, KTD10, KTD14). Runs on the Mac, never on the robot.
 
 Each turn is built exactly the way the robot's ChatRound does it on
-shared/ClaudeApi (model, max_tokens 400, system, messages, the tools and
+shared/ClaudeApi (model, max_tokens 700, system, messages, the tools and
 tool_choice; x-api-key and Authorization: Bearer, anthropic-version 2023-06-01)
 plus what KTD9 adds for the conversation: the frozen system prefix (guard block,
 persona as quoted data, reminder, notes under a fixed heading, the respond
@@ -56,7 +56,7 @@ from urllib.parse import urlsplit
 
 # Mirrors shared/src/com/miko3/shared/ClaudeApi.java.
 VERSION = "2023-06-01"
-MAX_TOKENS = 400  # ClaudeApi.CONVERSATION_MAX_TOKENS (robot 2026-10-02)
+MAX_TOKENS = 700  # ClaudeApi.CONVERSATION_MAX_TOKENS (robot 2026-10-03: 400 cut chatty replies off)
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 RECOMMENDED_MODEL = "claude-sonnet-5"
 EFFORT = "low"

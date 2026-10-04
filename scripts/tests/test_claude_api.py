@@ -157,7 +157,7 @@ class ClaudeApiHarnessTest(unittest.TestCase):
         "messages_not_set_up_makes_no_request",
         "jpeg_block_base64_has_no_newlines",
         "conversation_sends_the_message_list_in_order_with_its_roles",
-        "conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_400",
+        "conversation_sets_the_top_level_cache_breakpoint_and_max_tokens_700",
         "conversation_sends_effort_beside_the_json_schema_format",
         "conversation_effort_400_retries_once_without_effort_keeping_the_schema_format",
         "conversation_later_calls_send_no_effort_and_keep_the_format",

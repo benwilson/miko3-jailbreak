@@ -119,7 +119,7 @@ class RequestShapeTest(unittest.TestCase):
     def test_body_mirrors_the_java_client(self):
         body = bench.build_body("claude-sonnet-5", "SYSTEM", [{"role": "user", "content": "hi"}], effort="low")
         self.assertEqual(body["model"], "claude-sonnet-5")
-        self.assertEqual(body["max_tokens"], 400)  # robot 2026-10-02: ClaudeApi.CONVERSATION_MAX_TOKENS
+        self.assertEqual(body["max_tokens"], 700)  # robot 2026-10-03: ClaudeApi.CONVERSATION_MAX_TOKENS
         self.assertEqual(body["system"], "SYSTEM")
         self.assertEqual(body["messages"], [{"role": "user", "content": "hi"}])
         # Owner 2026-10-03: the reply is the respond tool's input; no JSON-schema format.
