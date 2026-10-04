@@ -27,7 +27,21 @@ import java.util.List;
  *
  * Partial utterances (the deaf window clipped them) are held rather than
  * enqueued: the next whole utterance within PARTIAL_JOIN_MS takes the stronger
- * of the two tiers, and a partial with nothing after it is dropped.
+ * of the two tiers, and a partial with nothing after it is dropped. A partial
+ * with words while a reply is armed is that reply's answer (robot 2026-10-02:
+ * they spoke as his line ended, and the launcher ends its listen on them).
+ *
+ * The wake word (Hey Miko plan KTD4): the launcher sends it as an early cue
+ * (empty text) as soon as it is spotted, and marks the utterance's own
+ * delivery at its end as already called. The mark rides the cue into the
+ * queue, and a held partial keeps it. An already-called partial is never
+ * joined into a later cue: that would be a second call with a new at. An
+ * early cue has no words, so it never goes to an armed reply; it reaches the
+ * queue while the reply stays armed for the words.
+ *
+ * A conversation listen's answer that has started (robot 2026-10-01): the
+ * launcher says so once, before the words, and the armed reply hears it, so
+ * ClaudeCuriosity holds the listen past its maxMs for the words.
  *
  * The accelerometer arrives on the drive's readings (ExploreDrive.ReadingListener):
  * a magnitude step above the resting level is a shove spike for the brain, which
@@ -36,13 +50,18 @@ import java.util.List;
  * (the meeting's name reply) routes through the session while it is open, so
  * the one microphone capture is never contended (KTD1).
  *
- * Privacy (R21): the text is classified into a kind and forgotten; nothing here
- * logs an utterance, only counts and fixed reasons.
+ * Privacy (R21): the text is classified into a kind and forgotten, except a
+ * call's own words besides the address (owner 2026-10-02), which ride its cue
+ * to the brain as the conversation's first message and leave the robot only
+ * inside that conversation; nothing here logs an utterance, only counts and
+ * fixed reasons.
  */
 final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.ReadingListener {
     private static final String TAG = "ExploreEars";
     /** Cues waiting for the brain's next tick; older ones are dropped when it fills. */
     static final int QUEUE_MAX = 8;
+    /** Owner 2026-10-02: voice identifications waiting for the conversation; older ones are dropped when it fills. */
+    static final int VOICE_MAX = 6;
     /** A whole utterance this soon after a clipped one is the same address. */
     static final long PARTIAL_JOIN_MS = 1500;
     /**
@@ -58,6 +77,15 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     /** A conversation listen's answer (KTD1), delivered on the client's thread. */
     interface Reply {
         void heard(String transcript);
+
+        /** Robot 2026-10-01: the launcher says this listen's answer has started (speech began at at). */
+        void answering(long at);
+
+        /** Review 2026-10-01 (P2-2): the launcher says that answer ended without words. */
+        void answerOver(long at);
+
+        /** Robot 2026-10-02: the launcher's words so far for this listen's answer (its provisional answer). */
+        void provisional(String transcript);
     }
 
     private final Context app;
@@ -75,6 +103,7 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     private Ears.Shove shove;
     private Ears.Cue partial;
     private Reply reply;
+    private final ArrayDeque<Ears.Voice> voices = new ArrayDeque<Ears.Voice>();
     /** The conversation listen's newcomer angle (KTD8), or NaN for a meeting listen. */
     private float replyAngleDeg = Float.NaN;
     private volatile boolean charger;
@@ -127,6 +156,7 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         open = false;
         client = null;
         queue.clear();
+        voices.clear();
         partial = null;
         reply = null;
     }
@@ -204,13 +234,15 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
     // ---- RobotEarsClient.Listener: the launcher's thread ----
 
     @Override
-    public void onHeard(String text, int side, float angle, int tier, long at, boolean partialUtterance, int kind) {
+    public void onHeard(String text, int side, float angle, int tier, long at, boolean partialUtterance, int kind,
+                        boolean called, String message) {
         Ears.Tier t = tier == RobotEars.TIER_STRONG ? Ears.Tier.STRONG : Ears.Tier.WEAK;
         Ears.Side s = side == RobotEars.SIDE_LEFT ? Ears.Side.LEFT
                 : side == RobotEars.SIDE_RIGHT ? Ears.Side.RIGHT : Ears.Side.UNKNOWN;
         Ears.Kind k = kindOf(kind, t);
         // The DSP's angle is already signed the brain's way (VoiceDirection: negative left); NaN passes through.
-        Ears.Cue cue = new Ears.Cue(k, t, s, angle, at);
+        // Owner 2026-10-02: a call's words besides the address ride its cue (null: an older launcher).
+        Ears.Cue cue = new Ears.Cue(k, t, s, angle, at, called, message);
         boolean words = text != null && !text.trim().isEmpty();
         Reply r = null;
         synchronized (lock) {
@@ -218,18 +250,24 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
                 return;
             }
             heardCount++;
-            if (partialUtterance) {
+            boolean newcomer = cue.strong() && !Float.isNaN(replyAngleDeg) && cue.hasAngle()
+                    && Math.abs(angle) > replyAngleDeg;
+            if (partialUtterance && !(reply != null && words && !newcomer)) {
                 partialCount++;
                 partial = cue;
                 return;
             }
-            boolean newcomer = cue.strong() && !Float.isNaN(replyAngleDeg) && cue.hasAngle()
-                    && Math.abs(angle) > replyAngleDeg;
+            if (partialUtterance) {
+                // Robot 2026-10-02: they answered as his line ended, so the deaf window flagged the
+                // answer partial; the launcher ended its listen on these words, so the reply takes them.
+                partialCount++;
+            }
             if (reply != null && words && !newcomer) {
                 r = reply;
                 reply = null;
             } else {
-                if (partial != null && at - partial.at <= PARTIAL_JOIN_MS && partial.strong() && !cue.strong()) {
+                if (partial != null && !partial.alreadyCalled() && at - partial.at <= PARTIAL_JOIN_MS
+                        && partial.strong() && !cue.strong()) {
                     cue = new Ears.Cue(partial.kind, Ears.Tier.STRONG, s, angle, at);
                 }
                 partial = null;
@@ -242,6 +280,77 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
         }
         if (r != null) {
             r.heard(text);
+        }
+    }
+
+    /**
+     * Robot 2026-10-01: the launcher's conversation listen claimed an utterance, so its
+     * answer has started. It goes to the armed reply, which stays armed for the words;
+     * with none armed (the listen already ended, or none was open) it is dropped: no cue.
+     */
+    @Override
+    public void onAnswering(long at) {
+        Reply r;
+        synchronized (lock) {
+            r = open ? reply : null;
+        }
+        if (r != null) {
+            r.answering(at);
+        }
+    }
+
+    /**
+     * Review 2026-10-01 (P2-2): the answer the launcher announced ended without words. It
+     * goes to the armed reply (which ends its hold); with none armed it is dropped: no cue.
+     */
+    @Override
+    public void onAnswerOver(long at) {
+        Reply r;
+        synchronized (lock) {
+            r = open ? reply : null;
+        }
+        if (r != null) {
+            r.answerOver(at);
+        }
+    }
+
+    /**
+     * Robot 2026-10-02: the launcher's provisional answer (the words so far, at an endpoint
+     * inside the conversation listen's answer). It goes to the armed reply, which stays armed
+     * for the final words; with none armed it is dropped: never a cue.
+     */
+    @Override
+    public void onProvisional(long at, String text) {
+        Reply r;
+        synchronized (lock) {
+            r = open ? reply : null;
+        }
+        if (r != null && text != null) {
+            r.provisional(text);
+        }
+    }
+
+    /**
+     * Owner 2026-10-02: whose voice said a conversation answer (after its words). It waits for
+     * the conversation (pollVoice), never a cue; the id is opaque and never logged.
+     */
+    @Override
+    public void onVoice(long at, String person, float score, int band) {
+        synchronized (lock) {
+            if (!open) {
+                return;
+            }
+            if (voices.size() >= VOICE_MAX) {
+                voices.pollFirst();
+            }
+            voices.addLast(new Ears.Voice(at, person, score, band));
+        }
+    }
+
+    /** The oldest waiting voice identification, or null. */
+    Ears.Voice pollVoice() {
+        synchronized (lock) {
+            return voices.pollFirst();
         }
     }
 

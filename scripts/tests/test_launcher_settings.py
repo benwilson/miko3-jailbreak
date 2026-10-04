@@ -47,6 +47,11 @@ SETTINGS_PATHS = (
     "SETTINGS_PEOPLE_PHOTO_DELETE_PATH",
     "SETTINGS_FACE_THRESHOLDS_PATH",
     "SETTINGS_FACE_STATE_PATH",
+    "SETTINGS_FEEDBACK_CLEAR_PATH",
+    "SETTINGS_FEEDBACK_STATE_PATH",
+    "SETTINGS_OWNER_NOTES_ADD_PATH",
+    "SETTINGS_OWNER_NOTES_EDIT_PATH",
+    "SETTINGS_OWNER_NOTES_DELETE_PATH",
 )
 PROBE = LAUNCHER / "EarsProbe.java"
 CONVERSATION = SHARED_SRC / "com" / "miko3" / "shared" / "ConversationSettings.java"
@@ -253,6 +258,11 @@ class SettingsPageSourceTest(unittest.TestCase):
             "SETTINGS_PEOPLE_PHOTO_DELETE_PATH": "/settings/people/photo/delete",
             "SETTINGS_FACE_THRESHOLDS_PATH": "/settings/face/thresholds",
             "SETTINGS_FACE_STATE_PATH": "/settings/face/state",
+            "SETTINGS_FEEDBACK_CLEAR_PATH": "/settings/feedback/clear",
+            "SETTINGS_FEEDBACK_STATE_PATH": "/settings/feedback/state",
+            "SETTINGS_OWNER_NOTES_ADD_PATH": "/settings/owner-notes/add",
+            "SETTINGS_OWNER_NOTES_EDIT_PATH": "/settings/owner-notes/edit",
+            "SETTINGS_OWNER_NOTES_DELETE_PATH": "/settings/owner-notes/delete",
         }
         for name, path in expected.items():
             self.assertRegex(src, rf'public static final String {name} = "{re.escape(path)}";')
@@ -389,6 +399,7 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "oversized_form_rejected",
         "get_on_action_paths_refused",
         "refresh_stores_ids_and_page_suggests_them",
+        "save_picked_model_wins_and_an_empty_pick_keeps_the_typed_name",
         "refresh_uses_saved_credentials",
         "saved_model_missing_from_list_marked",
         "refresh_failure_shows_reason_and_keeps_model",
@@ -420,6 +431,7 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "rename_changes_name_and_redirects",
         "rename_empty_makes_unnamed",
         "forget_removes_person_from_store_and_page",
+        "a_name_only_person_is_listed_without_a_photo_and_forget_deletes_them",
         "people_actions_on_unknown_id_change_nothing",
         "people_actions_with_stale_token_refused",
         "people_status_never_echoes_name",
@@ -432,6 +444,7 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "ears_probe_is_404_with_a_wrong_nonce_or_no_token",
         "ears_probe_is_404_fifteen_minutes_after_the_property_was_first_read",
         "ears_probe_rows_carry_counts_and_match_flags_never_text",
+        "ears_probe_rows_carry_the_chips_raw_value_for_calibration",
         "ears_probe_clamps_seconds_and_reports_a_busy_microphone",
         "ears_probe_path_is_tls_only",
         "conversation_section_shows_default_persona_and_switch_on",
@@ -472,6 +485,18 @@ class SettingsPageHarnessTest(unittest.TestCase):
         "face_state_carries_checks_people_and_thresholds_without_images",
         "face_paths_are_tls_only",
         "get_on_face_action_paths_refused",
+        "feedback_section_lists_entries_newest_first",
+        "feedback_section_says_when_there_is_none",
+        "feedback_clear_needs_the_token_and_empties_the_log",
+        "feedback_state_needs_the_token_and_carries_entries_newest_first_without_ids",
+        "forget_on_page_deletes_their_feedback",
+        # Owner 2026-10-03: the owner's notes about people by name.
+        "owner_notes_section_explains_and_offers_an_add_form",
+        "owner_notes_add_lists_the_entry_escaped_with_edit_and_delete",
+        "owner_notes_edit_and_delete_change_only_that_entry",
+        "owner_notes_need_the_token_and_post",
+        "owner_notes_refusals_and_statuses_never_echo_the_name_or_note",
+        "owner_notes_paths_are_tls_only",
     )
 
     @classmethod

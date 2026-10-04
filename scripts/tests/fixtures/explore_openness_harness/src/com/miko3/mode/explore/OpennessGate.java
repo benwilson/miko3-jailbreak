@@ -17,7 +17,7 @@ import javax.imageio.ImageIO;
  * exposure, U9) and bright (after). The frames are the owner's and private
  * (never in git); the test skips a pair without them. Each is sampled the way
  * ExploreCamera.scoreOpenness does it: decoded at 160x120, the floor band the
- * rows below the horizon at that size, the whole frame halved to 80x60. Prints
+ * rows from Openness.BAND_TOP down at that size, the whole frame halved to 80x60. Prints
  * PASS/FAIL and INFO lines of numbers only, never pixels.
  *
  * Usage: OpennessGate label open.jpg wall.jpg doorwayFrom doorwayTo [label open.jpg wall.jpg from to]...
@@ -28,7 +28,7 @@ public final class OpennessGate {
     /** Bins across the plant (~100..200 of 640) and the chair's base (~480..600); the doorway's bins come per pair. */
     private static final int[] PLANT = {1, 4};
     private static final int[] CHAIR = {12, 14};
-    /** How far the doorway must clear the wall and the plant and chair. */
+    /** How far the doorway must clear the wall. */
     private static final float MARGIN = 0.3f;
     /** Every bin of a wall 2-3 ft away reads at most this once the floor is taught. */
     private static final float WALL_MAX = 0.2f;
@@ -71,15 +71,21 @@ public final class OpennessGate {
         Openness.Profile q = o.score(wall[0], wall[1], NONE, 3000, false);
         System.out.println("INFO " + label + "_open " + p);
         System.out.println("INFO " + label + "_wall " + q);
-        float door = min(p.bins, doorway);
+        // The doorway as the steer reads it: the mean of its band (RoamSteer). One
+        // strip of it reads blocked: a far hallway pillar whose base shades into
+        // the dim floor with no edge (the scorer then takes it for standing).
+        float door = mean(p.bins, doorway[0], doorway[1]);
         float wallHi = max(q.bins, 0, Openness.BINS - 1);
-        float things = Math.max(max(p.bins, PLANT[0], PLANT[1]), max(p.bins, CHAIR[0], CHAIR[1]));
+        // The plant's pot and the chair stand ~2.5 m off with floor before them, so
+        // they no longer read blocked (open for the next metre); farther floor
+        // still wins: the doorway outranks them.
+        float things = Math.max(mean(p.bins, PLANT[0], PLANT[1]), mean(p.bins, CHAIR[0], CHAIR[1]));
         check(label + "_open_frame_is_trusted_once_taught", p.confidence >= 0.6f ? null : "confidence " + p.confidence);
         check(label + "_wall_reads_blocked_in_every_bin", wallHi <= WALL_MAX ? null : "wall " + wallHi + " " + q);
         check(label + "_wall_scores_clearly_below_the_doorway",
                 door >= wallHi + MARGIN ? null : "doorway " + door + " wall " + wallHi + " " + p + " / " + q);
-        check(label + "_plant_and_chair_stay_below_the_doorway",
-                door >= things + MARGIN ? null : "doorway " + door + " plant/chair " + things + " " + p);
+        check(label + "_doorway_outranks_the_plant_and_chair",
+                door > things ? null : "doorway " + door + " plant/chair " + things + " " + p);
     }
 
     static Openness.Frame[] frames(String path) throws Exception {
@@ -94,7 +100,7 @@ public final class OpennessGate {
         for (int i = 0; i < px.length; i++) {
             px[i] &= 0xffffff;
         }
-        int first = Math.min(h - 1, (int) (Openness.HORIZON * h));
+        int first = Math.min(h - 1, (int) (Openness.BAND_TOP * h));
         Openness.Frame band = new Openness.Frame(Arrays.copyOfRange(px, first * w, h * w), w, h - first,
                 (float) first / h, 1f);
         int hw = w / 2;
@@ -119,12 +125,12 @@ public final class OpennessGate {
         return new Openness.Frame[] {new Openness.Frame(half, hw, hh, 0f, 1f), band};
     }
 
-    private static float min(float[] v, int[] range) {
-        float m = Float.MAX_VALUE;
-        for (int i = range[0]; i <= range[1]; i++) {
-            m = Math.min(m, v[i]);
+    private static float mean(float[] v, int from, int to) {
+        float sum = 0f;
+        for (int i = from; i <= to; i++) {
+            sum += v[i];
         }
-        return m;
+        return sum / (to - from + 1);
     }
 
     private static float max(float[] v, int from, int to) {

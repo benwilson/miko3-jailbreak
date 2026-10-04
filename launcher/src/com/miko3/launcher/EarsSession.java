@@ -1,8 +1,11 @@
 package com.miko3.launcher;
 
+import com.miko3.shared.CueWords;
+import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.VoiceDirection;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -14,9 +17,10 @@ import java.util.List;
  *
  * One client (Explore, by uid) opens the session and renews it every
  * RENEW_PERIOD_MS through a LeaseKeeper; three missed renews, a Binder death
- * or a close release the microphone. The capture runs only while the charger
- * latch the client reports is clear (KTD6), except that a conversation listen
- * already running finishes first. One capture loop feeds every chunk to the
+ * or a close release the microphone. The capture runs whenever the session
+ * is held, on the charger too (Hey Miko plan KTD5, replacing the meeting
+ * plan's KTD6 close): a docked robot still answers his name. The client's
+ * charger latch is logged on open and otherwise ignored. One capture loop feeds every chunk to the
  * wake-word engine and the VAD gate, and to the recogniser only while speech
  * is present (plus a short hangover so its endpoint rule sees silence). The
  * direction angle is sampled at DIRECTION_PERIOD_MS on the sampler's own
@@ -26,11 +30,28 @@ import java.util.List;
  * plus the tuned tail, or for a clip window's stated duration plus the tail:
  * chunks inside it are dropped, an utterance the window cut short is
  * delivered flagged partial, and the streams are reset when it closes. An
- * utterance is delivered as {text, side, angle, tier, at, partial, kind} when
- * the classifier gives it a tier and it carries words, the wake word or a
- * side; kind is the classifier's naming of the cue, appended last on the wire.
+ * utterance is delivered as {text, side, angle, tier, at, partial, kind,
+ * called} when the classifier gives it a tier and it carries words, the wake
+ * word or a side; kind is the classifier's naming of the cue.
  *
- * Logs counters through Diag, never words.
+ * The wake word (Hey Miko plan KTD4): when the engine fires while speech is
+ * present, an early cue goes out in that same chunk (empty text, the median
+ * angle so far, at = the speech start, KIND_WAKE_WORD), once per utterance.
+ * The utterance's own delivery at its end, for the same at, is then marked
+ * called so the mode makes no second call from it. The engine firing with the
+ * gate closed still sends a bare wake cue at once, as before.
+ *
+ * The wake gate (EarsTuning, off by default): while it is on and the
+ * classifier would ignore the words anyway (CueClassifier.wordsMatter: no
+ * conversation listen and the "answers when spoken to" switch off), the
+ * utterance's audio is held instead of decoded; the recogniser gets the held
+ * audio and then every chunk as soon as the wake engine fires in the utterance
+ * or a listen opens, so it hears what it would have heard. Shut, the
+ * recogniser's endpoint cannot end the utterance; the hangover does.
+ *
+ * Logs counters through Diag, never words, and the recogniser's cost: each
+ * utterance's decode milliseconds per 80 ms chunk fed, as p50 and p95 over the
+ * utterances since the last summary, with the worst single chunk.
  */
 final class EarsSession {
     static final int SAMPLE_RATE = ListenSession.SAMPLE_RATE;
@@ -48,13 +69,53 @@ final class EarsSession {
     static final long DIRECTION_PERIOD_MS = 100;
     /** Speech already present this soon after the deaf window closed lost its head. */
     static final long PARTIAL_HEAD_MS = 120;
+    /** Robot 2026-10-01: a conversation listen's maxMs is the window to start answering; an
+     * answer begun in it runs until ANSWER_SILENCE_MS of no speech, but never past this long
+     * after the listen opened (60 s since owner 2026-10-02). */
+    static final long LISTEN_HARD_CAP_MS = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS;
+    /**
+     * Owner 2026-10-02 ("it cuts me off"): a conversation listen's answer ends after this much
+     * with no speech, not at the recogniser's 0.8 s endpoint. The segments the recogniser
+     * endpoints inside it are joined into one answer, delivered once.
+     */
+    static final long ANSWER_SILENCE_MS = 2000;
+    /** Speech that began this soon before a listen opened (they answered as his question ended) is its answer. */
+    static final long LISTEN_EARLY_START_MS = 500;
+    /**
+     * Review 2026-10-01 (P3-10): an answer must start this much before maxMs to be claimed. The
+     * mode's own maxMs timer starts when it queues the listen, before the window opens
+     * here (its worker queue and the Binder hop), so an answer claimed in the window's
+     * last moments told the mode "answering" after it had already ended the listen as
+     * silence. 300 ms covers the 80 ms chunk that claims it plus both hops.
+     */
+    static final long LISTEN_EDGE_MS = 300;
+    /**
+     * The pre-roll (TODO 2026-10-01): the VAD opens after a word has begun, so the
+     * recogniser first hears this much of the audio just before the onset, or
+     * "Miko" decodes as "O". Host sweep on synthetic clips (relative guidance only),
+     * launcher decoding, at 0/160/240/300/400/500 ms: name hits 44/102/101/98/98/105
+     * of 162 (flat past 160), greetings 7/19/24/26/22/21 of 54, chatter WER
+     * 42.7/30.1/27.5/22.1/23.9/24.4 %, decode CPU +9/+15/+18/+25/+28 %.
+     */
+    static final long DEFAULT_PREROLL_MS = 300;
+    static final long MAX_PREROLL_MS = 1000;
+    static final String PREROLL_PROP = "persist.miko3.ears.preroll_ms";
     static final long SUMMARY_MS = 60000;
+    /** The wake gate holds at most this much of an utterance (the oldest goes first). */
+    static final int HELD_MAX_SAMPLES = SAMPLE_RATE * 10;
+    /** Utterance decode costs kept for one summary's percentiles. */
+    static final int DECODE_SAMPLES_MAX = 256;
 
     static final String REFUSE_HELD = "ears held by another app";
     static final String REFUSE_EARS_OPEN = "ears session open";
 
     interface Clock {
         long nowMs();
+
+        /** For the decode timing only. */
+        default long nanoTime() {
+            return System.nanoTime();
+        }
     }
 
     /** An open microphone handing out 16 kHz mono PCM. */
@@ -100,6 +161,15 @@ final class EarsSession {
     /** The direction library: one sampling per utterance, on its own thread. */
     interface Direction {
         Sampling start();
+
+        /** True when the angle is a side and not a bearing: the NC chip in side mode
+         * (robot, 2026-09-29) measures only how far left or right a voice is and
+         * cannot tell front from back, so its -90/+90 says which side, never where.
+         * The utterance then carries the side and no angle, and the brain's side
+         * search looks toward that side first, then behind, then the other side. */
+        default boolean sideOnly() {
+            return false;
+        }
     }
 
     interface Sampling {
@@ -111,6 +181,39 @@ final class EarsSession {
     /** The opener's callback. Called on the capture thread; must not block. */
     interface Client {
         void heard(Utterance u);
+
+        /**
+         * Robot 2026-10-01: the open conversation listen claimed an utterance (it
+         * began inside the start window, or just before the listen opened), so its
+         * answer has started; at is when the speech began. Once per listen, before
+         * the answer's delivery. Called on the capture thread; must not block.
+         */
+        void answering(long at);
+
+        /**
+         * Review 2026-10-01 (P2-2): the listen that said answering(at) has ended
+         * without delivering words (a cough, a door, speech the recogniser heard as
+         * ""), so the mode stops holding it. At most once per listen, after its
+         * answering(). Called on the capture or ticker thread; must not block.
+         */
+        void answerOver(long at);
+
+        /**
+         * Robot 2026-10-02: the open conversation listen's answer so far (text, its
+         * segments joined), sent each time the recogniser endpoints inside it with new
+         * words, about 0.8 s after the last word, while ANSWER_SILENCE_MS still runs. The
+         * answer is delivered by heard() as before; this only lets the mode start early.
+         * at is when the answer's speech began. Called on the capture thread; must not block.
+         */
+        void provisional(long at, String text);
+
+        /**
+         * Owner 2026-10-02: who said the answer whose speech began at at, by voice: the best
+         * stored person id (or null), the cosine score and VoiceStore.BAND_*. Sent after that
+         * answer's heard(), from the voice thread, only for a clean answer long enough to embed.
+         */
+        default void voice(long at, String person, float score, int band) {
+        }
     }
 
     /** Where counters and refusals go. Never given words. */
@@ -130,21 +233,39 @@ final class EarsSession {
         final boolean partial;
         /** CueClassifier.KIND_*: what the tier came from. */
         final int kind;
+        /** Hey Miko plan KTD4: the early wake cue for this at was already sent, so this delivery makes no call. */
+        final boolean called;
+        /**
+         * Owner 2026-10-02: a call's words besides the address ("how's it going" from "Hey Miko,
+         * how's it going?"), normalised; "" for a bare call, an early cue and any other utterance.
+         */
+        final String message;
 
         Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind) {
+            this(text, side, angle, tier, at, partial, kind, false);
+        }
+
+        Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind, boolean called) {
+            this(text, side, angle, tier, at, partial, kind, called, "");
+        }
+
+        Utterance(String text, int side, Float angle, int tier, long at, boolean partial, int kind, boolean called,
+                  String message) {
             this.text = text;
+            this.message = message == null ? "" : message;
             this.side = side;
             this.angle = angle;
             this.tier = tier;
             this.at = at;
             this.partial = partial;
             this.kind = kind;
+            this.called = called;
         }
 
         @Override
         public String toString() {
-            return "tier " + tier + " kind " + kind + " side " + side + (partial ? " partial" : "") + " at " + at
-                    + " (" + text.length() + " chars)";
+            return "tier " + tier + " kind " + kind + " side " + side + (partial ? " partial" : "")
+                    + (called ? " called" : "") + " at " + at + " (" + text.length() + " chars)";
         }
     }
 
@@ -158,11 +279,22 @@ final class EarsSession {
     private final long deafTailMs;
     private final Diag diag;
     private final LeaseKeeper keeper;
+    private final boolean gateWake;
+    private final long prerollMs;
 
     // Guarded by this.
     private Client client;
-    private boolean charger;
-    private long listenUntil; // 0 when no conversation listen is active
+    private long listenUntil; // 0 when no conversation listen is active; else the end of its start window
+    private long listenOpenedAt;
+    private long listenCapAt; // listenOpenedAt + LISTEN_HARD_CAP_MS
+    private boolean answering; // the utterance in progress is the open listen's answer
+    private boolean answerAnnounced; // Client.answering went out for this listen (robot 2026-10-01)
+    private long answerStartMs; // the announced answer's speech start
+    /** Robot 2026-10-02: why the announced answer had no words, for the "answer over" log line. */
+    private String answerOverWhy = "";
+    /** The pre-roll fed at this utterance's onset, in ms. */
+    private long uttHeadMs;
+    private boolean answerOverDue; // review P2-2: the announced listen ended without words; tell the client
     private Thread captureThread;
     private boolean captureWanted;
     private long captureFailedAt = Long.MIN_VALUE / 4;
@@ -175,6 +307,16 @@ final class EarsSession {
     // The capture thread's own state (feed() is serialized on feedLock).
     private final Object feedLock = new Object();
     private final float[] samples = new float[CHUNK_SAMPLES];
+    /**
+     * The pre-roll ring: the latest heard audio no recogniser or hold has taken,
+     * oldest at preStart. Emptied at every onset (it is fed first), in and after
+     * the deaf window, and when a capture starts, so it never repeats audio or
+     * carries the robot's own line.
+     */
+    private final short[] pre;
+    private final float[] preOut;
+    private int preStart;
+    private int preLen;
     private boolean wasDeaf;
     private boolean inSpeech;
     private boolean partialHead;
@@ -183,6 +325,29 @@ final class EarsSession {
     private long lastSpeechMs;
     private long hearingSince = Long.MIN_VALUE / 4;
     private Sampling sampling;
+    /** Every angle drained during the utterance so far: the early cue's median takes some, the end all. */
+    private final List<Float> angles = new ArrayList<Float>();
+    /** False while the wake gate holds this utterance's audio instead of decoding it. */
+    private boolean recognising;
+    private float[] held = new float[0];
+    private int heldLen;
+    private long uttDecodeNs;
+    private long uttFed;
+    /** When the utterance in progress, a listen's answer, is cut; Long.MAX_VALUE when it is no answer. */
+    private long uttCapAt = Long.MAX_VALUE;
+    /** The words of the segments the recogniser already endpointed in this utterance (an answer's), joined. */
+    private final StringBuilder segmentWords = new StringBuilder();
+    /** Owner 2026-10-02: the voice identification fed with the recogniser's audio, or null (none loaded). */
+    private volatile VoiceId voice;
+
+    /** Robot 2026-10-02: how much of segmentWords already went out as the provisional answer. */
+    private int provisionalSent;
+
+    // Decode cost per utterance (ms per chunk) and the worst chunk, since the last summary.
+    private final Object statsLock = new Object();
+    private final double[] decodeMs = new double[DECODE_SAMPLES_MAX];
+    private int decodeCount;
+    private double decodeMaxMs;
 
     // Counters, for Diag.
     private long chunks;
@@ -194,9 +359,24 @@ final class EarsSession {
     private long wakes;
     private long strong;
     private long weak;
+    private long fed;
+    private long gated;
 
     EarsSession(Clock clock, Capture capture, Spotter spotter, Gate gate, Recognizer recognizer, Direction direction,
                 CueClassifier classifier, long deafTailMs, Diag diag) {
+        this(clock, capture, spotter, gate, recognizer, direction, classifier, deafTailMs, diag, false);
+    }
+
+    EarsSession(Clock clock, Capture capture, Spotter spotter, Gate gate, Recognizer recognizer, Direction direction,
+                CueClassifier classifier, long deafTailMs, Diag diag, boolean gateWake) {
+        this(clock, capture, spotter, gate, recognizer, direction, classifier, deafTailMs, diag, gateWake,
+                DEFAULT_PREROLL_MS);
+    }
+
+    /** gateWake: EarsTuning's wake gate (see the class comment); false is the plain session.
+     * prerollMs: how much audio before the VAD onset the recogniser hears first (0: none). */
+    EarsSession(Clock clock, Capture capture, Spotter spotter, Gate gate, Recognizer recognizer, Direction direction,
+                CueClassifier classifier, long deafTailMs, Diag diag, boolean gateWake, long prerollMs) {
         this.clock = clock;
         this.capture = capture;
         this.spotter = spotter;
@@ -206,6 +386,10 @@ final class EarsSession {
         this.classifier = classifier;
         this.deafTailMs = deafTailMs;
         this.diag = diag;
+        this.gateWake = gateWake;
+        this.prerollMs = Math.max(0, Math.min(MAX_PREROLL_MS, prerollMs));
+        this.pre = new short[(int) (this.prerollMs * SAMPLE_RATE / 1000)];
+        this.preOut = new float[pre.length];
         this.keeper = new LeaseKeeper(TTL_MS, new LeaseKeeper.Released() {
             @Override
             public void released(String holder, String reason) {
@@ -235,8 +419,8 @@ final class EarsSession {
             throw new IllegalStateException("client already dead");
         }
         this.client = client;
-        this.charger = chargerLatched;
-        this.listenUntil = 0;
+        closeListen();
+        answerOverDue = false;
         this.lastSummaryMs = clock.nowMs();
         diag.log("opened by uid " + holder + (chargerLatched ? " (charger latched)" : ""));
         reconcile();
@@ -248,7 +432,6 @@ final class EarsSession {
             diag.log("renew refused from uid " + holder);
             return false;
         }
-        charger = chargerLatched;
         reconcile();
         return true;
     }
@@ -263,23 +446,132 @@ final class EarsSession {
     }
 
     /**
-     * A conversation listen: for up to maxMs (clamped as a one-shot listen's
-     * cap) the switch does not apply and the capture keeps running even when
-     * the charger latches. Ends at the first utterance delivered or at the
-     * cap. False for a non-holder, or while docked with the capture closed.
+     * A conversation listen: the switch does not apply while it is open. maxMs
+     * (clamped as a one-shot listen's cap) is the window to start answering
+     * (robot 2026-10-01): an utterance that starts inside it (up to LISTEN_EDGE_MS
+     * before its end), or at most
+     * LISTEN_EARLY_START_MS before it opened, is its answer and holds it open
+     * until ANSWER_SILENCE_MS with no speech (owner 2026-10-02: the recogniser's
+     * endpoints inside it only close segments, joined into one answer), cut at
+     * LISTEN_HARD_CAP_MS after the listen opened with the words so far. Ends
+     * at the first utterance delivered with words or strong (an early wake cue
+     * does not end it), at an answer's end once the start window is over, or,
+     * with no answer, at maxMs. False for a non-holder.
      */
     synchronized boolean listen(String holder, long maxMs) {
         if (!isHolder(holder)) {
             diag.log("listen refused from uid " + holder);
             return false;
         }
-        if (charger && !captureWanted) {
-            diag.log("listen refused: charger latched");
-            return false;
-        }
-        listenUntil = clock.nowMs() + ListenSession.clampCap(maxMs);
+        long now = clock.nowMs();
+        listenOpenedAt = now;
+        listenUntil = now + ListenSession.clampCap(maxMs);
+        listenCapAt = now + LISTEN_HARD_CAP_MS;
+        answering = false; // the next chunk claims an utterance in progress if it started in time
+        answerAnnounced = false;
+        answerOverDue = false; // the mode's new listen replaces the old one's hold
+        diag.log("conversation listen open: " + (listenUntil - now) + " ms to start answering");
         reconcile();
         return true;
+    }
+
+    /**
+     * Caller holds the lock. No conversation listen. A listen that said answering and
+     * ends here without words owes the client "answer over" (review P2-2), sent by
+     * flushAnswerOver outside the lock.
+     */
+    private void closeListen() {
+        if (listenUntil != 0 && answerAnnounced) {
+            answerOverDue = true;
+        }
+        listenUntil = 0;
+        answering = false;
+        answerAnnounced = false;
+    }
+
+    /**
+     * Review P2-2: tells the client its announced answer ended without words, once.
+     * Called without this lock held (the client may be a one-way Binder).
+     */
+    private void flushAnswerOver() {
+        Client c;
+        long at;
+        synchronized (this) {
+            if (!answerOverDue) {
+                return;
+            }
+            answerOverDue = false;
+            c = client;
+            at = answerStartMs;
+            diag.log("conversation listen answer over: no words (" + answerOverWhy + ")");
+        }
+        if (c != null) {
+            try {
+                c.answerOver(at);
+            } catch (RuntimeException e) {
+                diag.log("answer over delivery failed: " + e.getClass().getSimpleName());
+            }
+        }
+    }
+
+    /**
+     * Caller holds feedLock. Whether the utterance that started at startMs is
+     * the open listen's answer: its hard cap if so (marking the listen as
+     * answering), else Long.MAX_VALUE.
+     */
+    private long claimAnswer(long startMs) {
+        Client announce = null;
+        long cap;
+        synchronized (this) {
+            // Review P3-10: speech begun in the window's last LISTEN_EDGE_MS is not claimed: its
+            // "answering" would reach the mode after its own maxMs had already ended the listen.
+            if (listenUntil == 0 || startMs < listenOpenedAt - LISTEN_EARLY_START_MS
+                    || startMs >= listenUntil - LISTEN_EDGE_MS) {
+                return Long.MAX_VALUE;
+            }
+            answering = true;
+            cap = listenCapAt;
+            if (!answerAnnounced) {
+                // Robot 2026-10-01: the mode hears once that the answer started, so it holds its listen.
+                answerAnnounced = true;
+                answerStartMs = startMs;
+                announce = client;
+                diag.log("conversation listen answering: speech began " + (startMs - listenOpenedAt)
+                        + " ms after it opened");
+            }
+        }
+        if (announce != null) {
+            try {
+                announce.answering(startMs);
+            } catch (RuntimeException e) {
+                diag.log("answering delivery failed: " + e.getClass().getSimpleName());
+            }
+        }
+        return cap;
+    }
+
+    /**
+     * Caller holds feedLock. The answer in progress ended; past its start window the listen
+     * ends with it. withWords: it is about to be delivered with words, so no "answer over".
+     */
+    private void answerEnded(long now, boolean withWords, String why) {
+        synchronized (this) {
+            if (!answering) {
+                return;
+            }
+            answering = false;
+            if (withWords) {
+                answerAnnounced = false;
+            } else if (answerAnnounced) {
+                // Robot 2026-10-02: the "answer over" line says why there were no words.
+                long toEnd = listenUntil == 0 ? 0 : listenUntil - now;
+                answerOverWhy = why + ", ended " + Math.abs(toEnd) + " ms " + (toEnd >= 0 ? "before" : "after")
+                        + " the listen's end";
+            }
+            if (listenUntil != 0 && now >= listenUntil) {
+                closeListen();
+            }
+        }
     }
 
     /** Opens the deaf window for durationMs plus the tail, as a spoken line would. */
@@ -317,11 +609,21 @@ final class EarsSession {
     }
 
     /** The keeper's TTL, the listen cap, a capture retry and the summary; run about twice a second. */
-    synchronized void tick() {
+    void tick() {
+        synchronized (this) {
+            tickLocked();
+        }
+        flushAnswerOver();
+    }
+
+    private void tickLocked() {
         long now = clock.nowMs();
         keeper.check(now);
-        if (listenUntil != 0 && now >= listenUntil) {
-            listenUntil = 0;
+        // An answer in progress holds the listen open; the capture cuts it at the hard
+        // cap, and this backstop ends the listen should the capture stall.
+        if (listenUntil != 0 && now >= listenUntil
+                && (!answering || now >= listenCapAt + ListenSession.BACKSTOP_MS)) {
+            closeListen();
         }
         reconcile();
         if (keeper.holder() != null && now - lastSummaryMs >= SUMMARY_MS) {
@@ -370,7 +672,7 @@ final class EarsSession {
         synchronized (this) {
             diag.log("released uid " + holder + ": " + reason + "; " + summary());
             client = null;
-            listenUntil = 0;
+            closeListen();
             reconcile();
         }
     }
@@ -415,7 +717,8 @@ final class EarsSession {
 
     /** Caller holds the lock. Starts or stops the capture to match the rules. */
     private void reconcile() {
-        boolean want = keeper.holder() != null && (!charger || listenUntil != 0);
+        // Capture runs whenever held, charger included (KTD5).
+        boolean want = keeper.holder() != null;
         captureWanted = want;
         if (want && captureThread == null && clock.nowMs() - captureFailedAt >= RETRY_MS) {
             Thread t = new Thread(new Runnable() {
@@ -435,6 +738,9 @@ final class EarsSession {
         Mic mic = null;
         try {
             mic = capture.open();
+            synchronized (feedLock) {
+                preLen = 0; // a new capture: the last one's audio is not this utterance's head
+            }
             capturing = true;
             diag.log("capture open");
             short[] pcm = new short[CHUNK_SAMPLES];
@@ -493,6 +799,7 @@ final class EarsSession {
                 if (inSpeech) {
                     endUtterance(now, true);
                 }
+                preLen = 0;
                 wasDeaf = true;
                 dropped++;
                 return;
@@ -502,6 +809,7 @@ final class EarsSession {
                 gate.reset();
                 spotter.reset();
                 resets++;
+                preLen = 0;
                 wasDeaf = false;
                 hearingSince = now;
             }
@@ -514,16 +822,51 @@ final class EarsSession {
                 if (!inSpeech) {
                     inSpeech = true;
                     wake = false;
+                    angles.clear();
                     speechStartMs = now;
+                    voiceStart();
                     partialHead = now - hearingSince < PARTIAL_HEAD_MS;
                     sampling = direction.start();
+                    recognising = !gateWake || wordsMatter();
+                    heldLen = 0;
+                    uttDecodeNs = 0;
+                    uttFed = 0;
+                    segmentWords.setLength(0);
+                    provisionalSent = 0;
+                    // The word began before the gate saw it: its head goes in first.
+                    int head = drainPreroll();
+                    uttHeadMs = head * 1000L / SAMPLE_RATE;
+                    if (head > 0) {
+                        if (recognising) {
+                            decode(preOut, head);
+                        } else {
+                            hold(preOut, head);
+                        }
+                    }
                 }
                 lastSpeechMs = now;
+            }
+            if (inSpeech) {
+                // Every chunk: a listen opened mid-utterance claims it if it began in time.
+                uttCapAt = claimAnswer(speechStartMs);
             }
             if (hit) {
                 wakes++;
                 if (inSpeech) {
-                    wake = true;
+                    if (!wake) {
+                        // KTD4: the call goes out now, not 0.8-1 s after the speaker stops.
+                        wake = true;
+                        utterances++;
+                        Float so = latchAngle();
+                        int soSide = CueClassifier.side(so);
+                        // A side-only chip's angle is not a bearing: send the side alone.
+                        if (direction.sideOnly()) {
+                            so = null;
+                        }
+                        // It leaves a conversation listen armed: the words at the end are the reply.
+                        deliver(new Utterance("", soSide, so, CueClassifier.TIER_STRONG, speechStartMs,
+                                false, CueClassifier.KIND_WAKE_WORD), false);
+                    }
                 } else {
                     // The engine fired with the gate closed: a bare wake cue.
                     utterances++;
@@ -532,24 +875,206 @@ final class EarsSession {
                 }
             }
             if (inSpeech) {
-                recognizer.accept(samples, n);
-                if (recognizer.isEndpoint() || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
+                if (!recognising && (wake || wordsMatter())) {
+                    recognising = true;
+                    if (heldLen > 0) {
+                        decode(held, heldLen);
+                        heldLen = 0;
+                    }
+                }
+                if (recognising) {
+                    decode(samples, n);
+                } else {
+                    hold(samples, n);
+                }
+                if (speech) {
+                    voiceSpeech();
+                }
+                boolean endpoint = recognising && recognizer.isEndpoint();
+                if (uttCapAt != Long.MAX_VALUE) {
+                    // Owner 2026-10-02: a listen's answer ends on ANSWER_SILENCE_MS of no speech, so a
+                    // pause mid-answer does not cut it; the recogniser's endpoint closes a segment.
+                    // An answer that will not stop is cut at the hard cap with the words so far.
+                    if (now >= uttCapAt || (!speech && now - lastSpeechMs >= ANSWER_SILENCE_MS)) {
+                        endUtterance(now, false);
+                    } else if (endpoint) {
+                        closeSegment();
+                        sendProvisional();
+                    }
+                } else if (endpoint || (!speech && now - lastSpeechMs >= ENDPOINT_HANGOVER_MS)) {
                     endUtterance(now, false);
                 }
+            } else {
+                keepPreroll(pcm, n); // nobody took it: the next onset's head
             }
         }
     }
 
+    /** Caller holds feedLock. An answer's segment ended: its words are kept, the recogniser starts afresh. */
+    private void closeSegment() {
+        appendWords(recognizer.text());
+        recognizer.reset();
+    }
+
+    /**
+     * Caller holds feedLock. Robot 2026-10-02: the answer's words so far go to the client
+     * as its provisional answer when the segment just closed added words; never logged.
+     */
+    private void sendProvisional() {
+        if (segmentWords.length() == provisionalSent) {
+            return;
+        }
+        provisionalSent = segmentWords.length();
+        Client c;
+        synchronized (this) {
+            c = client;
+        }
+        if (c == null) {
+            return;
+        }
+        try {
+            c.provisional(speechStartMs, segmentWords.toString());
+        } catch (RuntimeException e) {
+            diag.log("provisional delivery failed: " + e.getClass().getSimpleName());
+        }
+    }
+
+    /** Caller holds feedLock. Adds words to the segments so far, a space between. */
+    private void appendWords(String words) {
+        String t = words == null ? "" : words.trim();
+        if (t.isEmpty()) {
+            return;
+        }
+        if (segmentWords.length() > 0) {
+            segmentWords.append(' ');
+        }
+        segmentWords.append(t);
+    }
+
+    /** Caller holds feedLock. Appends a chunk no one took to the pre-roll ring, the oldest audio going first. */
+    private void keepPreroll(short[] pcm, int n) {
+        int cap = pre.length;
+        if (cap == 0) {
+            return;
+        }
+        int from = 0;
+        if (n > cap) {
+            from = n - cap;
+        }
+        for (int i = from; i < n; i++) {
+            if (preLen < cap) {
+                pre[(preStart + preLen) % cap] = pcm[i];
+                preLen++;
+            } else {
+                pre[preStart] = pcm[i];
+                preStart = (preStart + 1) % cap;
+            }
+        }
+    }
+
+    /** Caller holds feedLock. Empties the ring into preOut, oldest first, as samples; returns how many. */
+    private int drainPreroll() {
+        int cap = pre.length;
+        int len = preLen;
+        for (int i = 0; i < len; i++) {
+            preOut[i] = pre[(preStart + i) % cap] / 32768f;
+        }
+        preLen = 0;
+        preStart = 0;
+        return len;
+    }
+
+    /** "persist.miko3.ears.preroll_ms": a length in ms within [0, MAX_PREROLL_MS], else the default. */
+    static long prerollMs(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return DEFAULT_PREROLL_MS;
+        }
+        try {
+            return Math.max(0, Math.min(MAX_PREROLL_MS, Long.parseLong(raw.trim())));
+        } catch (NumberFormatException e) {
+            return DEFAULT_PREROLL_MS;
+        }
+    }
+
+    /** Caller holds feedLock. Whether the classifier could use this utterance's words (the wake gate). */
+    private boolean wordsMatter() {
+        boolean listening;
+        synchronized (this) {
+            listening = listenUntil != 0;
+        }
+        return classifier.wordsMatter(listening);
+    }
+
+    /** Caller holds feedLock. Hands audio to the recogniser, timing it for the summary. */
+    private void decode(float[] buf, int n) {
+        long t0 = clock.nanoTime();
+        recognizer.accept(buf, n);
+        long dt = clock.nanoTime() - t0;
+        VoiceId v = voice;
+        if (v != null) {
+            v.append(buf, n);
+        }
+        int chunksIn = Math.max(1, (n + CHUNK_SAMPLES - 1) / CHUNK_SAMPLES);
+        uttDecodeNs += dt;
+        uttFed += chunksIn;
+        fed += chunksIn;
+        double ms = dt / 1e6 / chunksIn; // a held utterance's catch-up counts per chunk
+        synchronized (statsLock) {
+            if (ms > decodeMaxMs) {
+                decodeMaxMs = ms;
+            }
+        }
+    }
+
+    /** Caller holds feedLock. The wake gate keeps the chunk for a later decode; past the cap the oldest goes. */
+    private void hold(float[] buf, int n) {
+        gated++;
+        if (held.length < HELD_MAX_SAMPLES) {
+            held = java.util.Arrays.copyOf(held, Math.min(HELD_MAX_SAMPLES, Math.max(heldLen + n, held.length * 2)));
+        }
+        int over = heldLen + n - held.length;
+        if (over > 0) {
+            System.arraycopy(held, over, held, 0, heldLen - over);
+            heldLen -= over;
+        }
+        System.arraycopy(buf, 0, held, heldLen, n);
+        heldLen += n;
+    }
+
+    /** Caller holds feedLock. Records the utterance's decode cost per chunk fed, if it was decoded. */
+    private void recordDecode() {
+        if (uttFed > 0) {
+            double perChunk = uttDecodeNs / 1e6 / uttFed;
+            synchronized (statsLock) {
+                if (decodeCount < decodeMs.length) {
+                    decodeMs[decodeCount++] = perChunk;
+                }
+            }
+        }
+        uttDecodeNs = 0;
+        uttFed = 0;
+        heldLen = 0;
+    }
+
     /** Caller holds feedLock. Closes the utterance in progress and delivers it if it earns a tier. */
     private void endUtterance(long now, boolean cutShort) {
-        String text = recognizer.text();
-        text = text == null ? "" : text.trim();
-        Float angle = null;
+        boolean answer = uttCapAt != Long.MAX_VALUE;
+        if (!recognising && heldLen > 0 && (wake || wordsMatter())) {
+            recognising = true; // a listen opened in this very chunk
+            decode(held, heldLen);
+        }
+        long fedHere = uttFed;
+        recordDecode();
+        appendWords(recognising ? recognizer.text() : "");
+        String text = segmentWords.toString();
+        segmentWords.setLength(0);
+        provisionalSent = 0;
+        Float angle = latchAngle();
         if (sampling != null) {
-            angle = VoiceDirection.median(sampling.drain());
             sampling.stop();
             sampling = null;
         }
+        angles.clear();
         boolean partial = cutShort || partialHead;
         boolean wasWake = wake;
         long at = speechStartMs;
@@ -563,15 +1088,55 @@ final class EarsSession {
             listening = listenUntil != 0;
         }
         int tier = classifier.tier(text, wasWake, listening, at);
+        if (uttCapAt != Long.MAX_VALUE) {
+            // The listen's answer: tiered as heard in it, and the listen ends with it once its window is over.
+            uttCapAt = Long.MAX_VALUE;
+            answerEnded(now, !text.isEmpty() && tier != CueClassifier.TIER_NONE,
+                    "answer " + (now - at) + " ms long, " + fedHere + " chunks fed, "
+                            + (cutShort ? "deaf-clipped (a line began mid-answer)"
+                            : partial ? "deaf-clipped (it began as the deaf window closed)" : "not deaf-clipped")
+                            + ", began " + Math.max(0, at - hearingSince) + " ms after the deaf window, pre-roll "
+                            + uttHeadMs + " ms" + (text.isEmpty() ? "" : ", words but no tier"));
+        }
         int side = CueClassifier.side(angle);
+        if (direction.sideOnly()) {
+            // The chip's -90/+90 is a side, not a bearing: the brain searches that side.
+            angle = null;
+        }
         if (tier == CueClassifier.TIER_NONE || (text.isEmpty() && !wasWake && side == CueClassifier.SIDE_NONE)) {
+            voiceReset();
+            flushAnswerOver();
             return;
         }
         if (partial) {
             partials++;
         }
         int kind = CueClassifier.kind(text, wasWake, tier);
-        deliver(new Utterance(text, side, angle, tier, at, partial, kind));
+        // Owner 2026-10-02: a call's words besides the address are the caller's first message.
+        String message = tier == CueClassifier.TIER_STRONG
+                && (kind == CueClassifier.KIND_WAKE_WORD || kind == CueClassifier.KIND_NAME) ? CueWords.message(text) : "";
+        // wasWake: the early cue for this at already went out (every in-speech hit sends one).
+        deliver(new Utterance(text, side, angle, tier, at, partial, kind, wasWake, message));
+        // Owner 2026-10-02: after the words went out, so they never wait on it. Only a listen's
+        // answer with words that the robot's own speech did not clip says whose voice it was.
+        // Robot 2026-10-03: so does a strong call ("Hey Miko ...") not clipped, from 1.2 s of
+        // speech, so the conversation's first voice (the TV gate's reference) is the caller's.
+        boolean call = tier == CueClassifier.TIER_STRONG
+                && (kind == CueClassifier.KIND_WAKE_WORD || kind == CueClassifier.KIND_NAME);
+        if (call && !answer) {
+            voiceCalled(at, !partial);
+        } else {
+            voiceAnswered(at, answer && !partial && !text.isEmpty());
+        }
+        flushAnswerOver();
+    }
+
+    /** Caller holds feedLock. The median of every angle drained this utterance, or null when none. */
+    private Float latchAngle() {
+        if (sampling != null) {
+            angles.addAll(sampling.drain());
+        }
+        return angles.isEmpty() ? null : VoiceDirection.median(angles);
     }
 
     /** Caller holds feedLock. The capture is closing: nothing is delivered. */
@@ -582,10 +1147,89 @@ final class EarsSession {
         }
         inSpeech = false;
         wake = false;
+        angles.clear();
+        recordDecode();
         recognizer.reset();
+        segmentWords.setLength(0);
+        provisionalSent = 0;
+        preLen = 0;
+        voiceReset();
+        if (uttCapAt != Long.MAX_VALUE) {
+            uttCapAt = Long.MAX_VALUE;
+            answerEnded(clock.nowMs(), false, "the capture closed mid-answer");
+        }
+        flushAnswerOver();
     }
 
     private void deliver(Utterance u) {
+        deliver(u, true);
+    }
+
+    // ---- voice identification (owner 2026-10-02) ----
+
+    /** The voice identification the ears feed, or null for none. Set once at start. */
+    void setVoice(VoiceId v) {
+        voice = v;
+    }
+
+    /** Caller holds feedLock. An utterance began. */
+    private void voiceStart() {
+        VoiceId v = voice;
+        if (v != null) {
+            v.start();
+        }
+    }
+
+    /** Caller holds feedLock. Speech was heard in the chunk just fed. */
+    private void voiceSpeech() {
+        VoiceId v = voice;
+        if (v != null) {
+            v.speech();
+        }
+    }
+
+    /** Caller holds feedLock. The utterance was dropped. */
+    private void voiceReset() {
+        VoiceId v = voice;
+        if (v != null) {
+            v.reset();
+        }
+    }
+
+    /** Caller holds feedLock. The utterance was delivered; returns at once (the embedding runs elsewhere). */
+    private void voiceAnswered(long at, boolean clean) {
+        VoiceId v = voice;
+        if (v != null) {
+            v.answered(at, clean);
+        }
+    }
+
+    /** Caller holds feedLock. A call was delivered; returns at once (the embedding runs elsewhere). */
+    private void voiceCalled(long at, boolean clean) {
+        VoiceId v = voice;
+        if (v != null) {
+            v.called(at, clean);
+        }
+    }
+
+    /** VoiceId's result, from the voice thread, to the session's current client. */
+    void voiceHeard(long at, String person, float score, int band) {
+        Client c;
+        synchronized (this) {
+            c = client;
+        }
+        if (c == null) {
+            return;
+        }
+        try {
+            c.voice(at, person, score, band);
+        } catch (RuntimeException e) {
+            diag.log("voice delivery failed: " + e.getClass().getSimpleName());
+        }
+    }
+
+    /** endsListen: false only for the early wake cue, which must not take a conversation listen's reply. */
+    private void deliver(Utterance u, boolean endsListen) {
         Client c;
         synchronized (this) {
             c = client;
@@ -594,8 +1238,11 @@ final class EarsSession {
             } else {
                 weak++;
             }
-            if (listenUntil != 0 && (!u.text.isEmpty() || u.tier == CueClassifier.TIER_STRONG)) {
-                listenUntil = 0;
+            if (endsListen && listenUntil != 0 && (!u.text.isEmpty() || u.tier == CueClassifier.TIER_STRONG)) {
+                if (!u.text.isEmpty()) {
+                    answerAnnounced = false; // the words answer it: no "answer over"
+                }
+                closeListen();
                 reconcile();
             }
         }
@@ -613,6 +1260,34 @@ final class EarsSession {
     private String summary() {
         return "chunks=" + chunks + " utterances=" + utterances + " delivered=" + delivered + " strong=" + strong
                 + " weak=" + weak + " partial=" + partials + " dropped=" + dropped + " resets=" + resets
-                + " wakes=" + wakes;
+                + " wakes=" + wakes + " " + decodeSummary() + " fed=" + fed + " gated=" + gated;
+    }
+
+    /** "decode_p50=… decode_p95=… decode_max=… decoded=N" (ms per 80 ms chunk) since the last summary, then cleared. */
+    private String decodeSummary() {
+        synchronized (statsLock) {
+            String out;
+            if (decodeCount == 0) {
+                out = "decode_p50=- decode_p95=- decode_max=- decoded=0";
+            } else {
+                double[] sorted = java.util.Arrays.copyOf(decodeMs, decodeCount);
+                java.util.Arrays.sort(sorted);
+                out = "decode_p50=" + ms(percentile(sorted, 50)) + " decode_p95=" + ms(percentile(sorted, 95))
+                        + " decode_max=" + ms(decodeMaxMs) + " decoded=" + decodeCount;
+            }
+            decodeCount = 0;
+            decodeMaxMs = 0;
+            return out;
+        }
+    }
+
+    /** Nearest-rank percentile of an ascending, non-empty array. */
+    static double percentile(double[] sorted, int p) {
+        int rank = (int) Math.ceil(p / 100.0 * sorted.length);
+        return sorted[Math.max(0, Math.min(sorted.length - 1, rank - 1))];
+    }
+
+    private static String ms(double v) {
+        return String.valueOf(Math.round(v * 10) / 10.0);
     }
 }

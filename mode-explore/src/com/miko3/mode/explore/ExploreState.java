@@ -14,7 +14,7 @@ import com.miko3.shared.EyesPage;
  * /state route never takes a lock the brain holds.
  *
  * STATE_CSS and GAZE_JS restyle the shared eyes per state and hold the gaze
- * on the look direction; the shared EyesPage itself is unchanged.
+ * on the look direction; the shared EyesPage itself carries no explore logic.
  *
  * Polling rather than pushing into the WebView so the same page works in a
  * LAN browser, as the voice mode's does. No android.* here: host-JVM tests
@@ -46,9 +46,11 @@ final class ExploreState {
 
     static final ExploreState IDLE_STATE = new ExploreState(IDLE, 0, 0);
 
-    /** Page poll interval while the mode is up (KTD10: about 150 ms, so a "look"
-     * lands within one poll of the brain's ~500 ms lead before a turn). */
-    static final int POLL_MS = 150;
+    /** Page poll interval while the mode is up (KTD10: a "look" lands within one poll of
+     * the brain's ~500 ms lead before a turn). 400 ms, not 150: robot 2026-10-02 on the
+     * dock, Explore's main thread ran ~45% of a core and WebView's IO thread ~10-14% with
+     * the detector parked, and every poll is a full HTTP round trip. */
+    static final int POLL_MS = 400;
 
     /** The page's "s-" class suffix and /state's "state" field: lowercase letters,
      * digits and dashes only, so it drops into CSS and JSON without escaping. */
@@ -99,9 +101,9 @@ final class ExploreState {
      */
     static final class Gauges {
         static final String[] COUNTERS = {"cues", "strongCues", "weakCues", "leanIns", "searches", "facesFound",
-                "quietResumes", "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats"};
+                "quietResumes", "cuesHeld", "cuesDropped", "retargets", "shoves", "repeats", "remarks"};
         static final String[] STAGES = {"cueAt", "turnDone", "faceFound", "matchAnswered", "lineRequested",
-                "firstSound"};
+                "firstSound", "callHeard", "callAnswered", "callFacing", "callArrived"};
         static final Gauges NONE = new Gauges(new int[COUNTERS.length], new long[STAGES.length]);
 
         private final int[] counts;
@@ -210,10 +212,13 @@ final class ExploreState {
     // Per-state looks, as overrides on the shared eyes keyed by a class on #rig.
     // idle is the other modes' look unchanged (R6). The animations go on
     // .glow-core, never .glow: .glow's transform carries the gaze, and a keyframe
-    // transform on the same element would override it. The shared eyes start
-    // their blink as an inline style on each .glow-core, and an inline animation
-    // beats any stylesheet rule, so every look that replaces the blink says so
-    // with !important (an !important declaration also outranks the animation).
+    // transform on the same element would override it. Every look that replaces
+    // the blink says so with !important: the shared eyes' blink used to be an
+    // inline style, which beat any other rule. It is now a one-shot .blink class
+    // their script adds every 6.5 s, which these selectors outrank anyway.
+    // Idle (also the docked look) runs no endless animation, so a still face
+    // costs the WebView's compositor nothing between glances and blinks; the
+    // endless ones (resting, thinking, listening) last only as long as their state.
     private static final String STATE_CSS =
             // Look: a slightly brighter core while he eyes the way ahead.
             "#rig.s-" + LOOK + " .glow-core{filter:brightness(1.15)}"
@@ -228,9 +233,20 @@ final class ExploreState {
             // Resting (cornered cool-down): drowsy, slowly breathing lids.
             + "@keyframes drowse{from{transform:scale(1,.6);opacity:.85}to{transform:scale(1,.3);opacity:.55}}"
             + "#rig.s-" + RESTING + " .glow-core{animation:drowse 2.4s ease-in-out infinite alternate!important}"
-            // Thinking (waiting for Claude): a slow bright-dim pulse; the gaze goes up (GAZE_JS).
-            + "@keyframes ponder{from{filter:brightness(.8)}to{filter:brightness(1.25)}}"
-            + "#rig.s-" + THINKING + " .glow-core{animation:ponder 1.2s ease-in-out infinite alternate!important}"
+            // Thinking (waiting for Claude): the eye keeps its normal glow but two
+            // gold arcs spin around the hot centre once a second, a "working on it"
+            // pinwheel; the gaze goes up (GAZE_JS). The core stops its blink
+            // (animation:none!important), which would squash the spinner
+            // with it. The spinner is a pseudo-element of the core, so it follows
+            // the gaze and vanishes the instant the class changes. Only its
+            // transform animates (one composited layer, no repaint per frame).
+            // Border arcs, not conic-gradient: the robot's WebView is old.
+            + "@keyframes pinwheel{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"
+            + "#rig.s-" + THINKING + " .glow-core{animation:none!important;position:relative}"
+            + "#rig.s-" + THINKING + " .glow-core::after{content:'';position:absolute;"
+            + "left:21%;top:21%;width:58%;height:58%;box-sizing:border-box;border-radius:50%;"
+            + "border:2.6vmin solid transparent;border-top-color:#ffd23f;border-bottom-color:#ffd23f;"
+            + "opacity:.9;will-change:transform;animation:pinwheel 1s linear infinite}"
             // Listening (meeting plan KTD12): wide open and bright, a slow attentive swell, no blink.
             + "@keyframes attend{from{transform:scale(1.06,1.1);filter:brightness(1.1)}"
             + "to{transform:scale(1.1,1.16);filter:brightness(1.25)}}"

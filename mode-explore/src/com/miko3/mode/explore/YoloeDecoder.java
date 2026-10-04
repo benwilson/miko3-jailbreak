@@ -16,6 +16,12 @@ import java.util.List;
  * de-duplicated, so overlapping boxes of the same name are merged here with
  * standard non-maximum suppression.
  *
+ * The faster variants (scripts/bench-explore-detector.py: topk, rgba, ...) do
+ * the best-name-per-anchor step in the graph and output only the top K anchors
+ * as "detections" [1, 6, K]: centre x, centre y, width, height as fractions of
+ * the frame, the score, and the name's index, best first. decodeTopK reads that;
+ * both end in the same suppression.
+ *
  * Plain Java so it runs on the host JVM (scripts/tests/test_explore_sighting.py).
  */
 final class YoloeDecoder {
@@ -69,6 +75,40 @@ final class YoloeDecoder {
             float h = out[3 * anchors + a];
             candidates.add(new Candidate(best[a], bestScore[a], cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2));
         }
+        return suppress(candidates, maxIou, maxCount, inputWidth, inputHeight);
+    }
+
+    /**
+     * @param det      the top-k output flattened row-major: det[row * k + i], rows
+     *                 cx, cy, w, h (frame fractions), score, name index
+     * @param k        the number of candidates (the tensor's last dimension)
+     */
+    List<Detection> decodeTopK(float[] det, int k, float minScore, float maxIou, int maxCount) {
+        if (det.length < 6 * k) {
+            throw new IllegalArgumentException("top-k output has " + det.length + " values, need " + 6 * k);
+        }
+        List<Candidate> candidates = new ArrayList<Candidate>();
+        for (int i = 0; i < k; i++) {
+            float score = det[4 * k + i];
+            int cls = Math.round(det[5 * k + i]);
+            if (score < minScore || cls < 0 || cls >= names.length) {
+                continue;
+            }
+            float cx = det[i];
+            float cy = det[k + i];
+            float w = det[2 * k + i];
+            float h = det[3 * k + i];
+            candidates.add(new Candidate(cls, score, cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2));
+        }
+        return suppress(candidates, maxIou, maxCount, 1f, 1f);
+    }
+
+    /**
+     * Highest score first; a box is dropped when a kept box of the same name
+     * overlaps it more than maxIou. Boxes are divided by width/height last.
+     */
+    private List<Detection> suppress(List<Candidate> candidates, float maxIou, int maxCount, float width,
+                                     float height) {
         Collections.sort(candidates, new Comparator<Candidate>() {
             @Override
             public int compare(Candidate p, Candidate q) {
@@ -93,8 +133,8 @@ final class YoloeDecoder {
         }
         List<Detection> result = new ArrayList<Detection>(kept.size());
         for (Candidate c : kept) {
-            result.add(new Detection(names[c.cls], c.score, c.x0 / inputWidth, c.y0 / inputHeight,
-                    c.x1 / inputWidth, c.y1 / inputHeight));
+            result.add(new Detection(names[c.cls], c.score, c.x0 / width, c.y0 / height, c.x1 / width,
+                    c.y1 / height));
         }
         return result;
     }

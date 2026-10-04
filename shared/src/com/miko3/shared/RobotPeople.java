@@ -134,6 +134,55 @@ public interface RobotPeople extends IInterface {
      * ring or been purged by forget. */
     boolean updateCheck(long handle, int outcome, String joinedId) throws RemoteException;
 
+    // Owner 2026-10-02 (the feedback log). Appended as above.
+
+    /** Appends one piece of feedback about the robot to the launcher's
+     * feedback log: from the person with this id (null or an unknown id:
+     * "someone"), its kind, summary and quote (Feedback's rules; anything
+     * else is refused, answering false) and a few words of context. */
+    boolean recordFeedback(String id, String kind, String summary, String quote, String context)
+            throws RemoteException;
+
+    // Owner 2026-10-03 (the owner's notes about people by name). Appended as above.
+
+    /** The owner's note about the person with this name (OwnerNotes.noteFor's
+     * rules: a full name, or a first name only one note has), or null. The
+     * caller may only use it to shape how it approaches that person. */
+    String ownerNoteFor(String name) throws RemoteException;
+
+    // Owner 2026-10-02 (a person remembered by name alone). Appended as above.
+
+    /** Remembers a new person by name alone, with no photo (a faceless
+     * conversation where they said their name), and answers their id; notes
+     * follow through mergeNotes(), a face later through addPhoto().
+     * IllegalArgumentException with the store's fixed reason for a blank
+     * name. */
+    String addNamed(String name) throws RemoteException;
+
+    /** True when the person has at least one photo; false for a person
+     * remembered by name alone or an unknown id. */
+    boolean hasFace(String id) throws RemoteException;
+
+    // Owner 2026-10-02 (voice prints in the same person record). Appended as above.
+
+    /** Enrols the voice of the conversation answer whose speech began at at
+     * (the at of its heard and voice callbacks) to this person, capped per
+     * person; false when that answer has no embedding (too short, too old) or
+     * the id is null. Never carries audio. */
+    boolean enrolVoice(String id, long at) throws RemoteException;
+
+    /** How many voice embeddings are stored for this person. */
+    int voiceCount(String id) throws RemoteException;
+
+    /** How close the answer at at is to this person's stored voice (cosine
+     * with their mean); NaN when that answer has no embedding or they have no
+     * voice stored. */
+    float voiceScore(String id, long at) throws RemoteException;
+
+    /** How close two answers' voices are (cosine); NaN when either has no
+     * embedding. The mode compares a conversation's answers with its first. */
+    float voiceSimilarity(long atA, long atB) throws RemoteException;
+
     /** One stored photo as gallery() answers it: never a name or an image. */
     final class GalleryPhoto {
         public final String id;
@@ -193,6 +242,14 @@ public interface RobotPeople extends IInterface {
         static final int TRANSACTION_markUnusable = 14;
         static final int TRANSACTION_recordCheck = 15;
         static final int TRANSACTION_updateCheck = 16;
+        static final int TRANSACTION_recordFeedback = 17;
+        static final int TRANSACTION_ownerNoteFor = 18;
+        static final int TRANSACTION_addNamed = 19;
+        static final int TRANSACTION_hasFace = 20;
+        static final int TRANSACTION_enrolVoice = 21;
+        static final int TRANSACTION_voiceCount = 22;
+        static final int TRANSACTION_voiceScore = 23;
+        static final int TRANSACTION_voiceSimilarity = 24;
 
         public Stub() {
             attachInterface(this, DESCRIPTOR);
@@ -378,6 +435,69 @@ public interface RobotPeople extends IInterface {
                     boolean updated = updateCheck(handle, outcome, data.readString());
                     reply.writeNoException();
                     reply.writeInt(updated ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_recordFeedback: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    String kind = data.readString();
+                    String summary = data.readString();
+                    String quote = data.readString();
+                    boolean kept = recordFeedback(id, kind, summary, quote, data.readString());
+                    reply.writeNoException();
+                    reply.writeInt(kept ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_ownerNoteFor: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String note = ownerNoteFor(data.readString());
+                    reply.writeNoException();
+                    reply.writeString(note);
+                    return true;
+                }
+                case TRANSACTION_addNamed: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = addNamed(data.readString());
+                    reply.writeNoException();
+                    reply.writeString(id);
+                    return true;
+                }
+                case TRANSACTION_hasFace: {
+                    data.enforceInterface(DESCRIPTOR);
+                    boolean has = hasFace(data.readString());
+                    reply.writeNoException();
+                    reply.writeInt(has ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_enrolVoice: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    boolean ok = enrolVoice(id, data.readLong());
+                    reply.writeNoException();
+                    reply.writeInt(ok ? 1 : 0);
+                    return true;
+                }
+                case TRANSACTION_voiceCount: {
+                    data.enforceInterface(DESCRIPTOR);
+                    int count = voiceCount(data.readString());
+                    reply.writeNoException();
+                    reply.writeInt(count);
+                    return true;
+                }
+                case TRANSACTION_voiceScore: {
+                    data.enforceInterface(DESCRIPTOR);
+                    String id = data.readString();
+                    float score = voiceScore(id, data.readLong());
+                    reply.writeNoException();
+                    reply.writeFloat(score);
+                    return true;
+                }
+                case TRANSACTION_voiceSimilarity: {
+                    data.enforceInterface(DESCRIPTOR);
+                    long a = data.readLong();
+                    float score = voiceSimilarity(a, data.readLong());
+                    reply.writeNoException();
+                    reply.writeFloat(score);
                     return true;
                 }
                 case IBinder.INTERFACE_TRANSACTION: {
@@ -739,6 +859,158 @@ public interface RobotPeople extends IInterface {
                     }
                     reply.readException();
                     return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public boolean recordFeedback(String id, String kind, String summary, String quote, String context)
+                    throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeString(kind);
+                    data.writeString(summary);
+                    data.writeString(quote);
+                    data.writeString(context);
+                    if (!remote.transact(TRANSACTION_recordFeedback, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public String ownerNoteFor(String name) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(name);
+                    if (!remote.transact(TRANSACTION_ownerNoteFor, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readString();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public String addNamed(String name) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(name);
+                    if (!remote.transact(TRANSACTION_addNamed, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readString();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public boolean hasFace(String id) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    if (!remote.transact(TRANSACTION_hasFace, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public boolean enrolVoice(String id, long at) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeLong(at);
+                    if (!remote.transact(TRANSACTION_enrolVoice, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt() != 0;
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public int voiceCount(String id) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    if (!remote.transact(TRANSACTION_voiceCount, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readInt();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public float voiceScore(String id, long at) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeString(id);
+                    data.writeLong(at);
+                    if (!remote.transact(TRANSACTION_voiceScore, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readFloat();
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                }
+            }
+
+            @Override
+            public float voiceSimilarity(long atA, long atB) throws RemoteException {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken(DESCRIPTOR);
+                    data.writeLong(atA);
+                    data.writeLong(atB);
+                    if (!remote.transact(TRANSACTION_voiceSimilarity, data, reply, 0)) {
+                        throw new UnsupportedOperationException(LauncherProtocol.LAUNCHER_TOO_OLD);
+                    }
+                    reply.readException();
+                    return reply.readFloat();
                 } finally {
                     reply.recycle();
                     data.recycle();

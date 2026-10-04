@@ -26,7 +26,6 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
@@ -113,8 +112,9 @@ public class LauncherApp extends Application {
                     }
                     throw e;
                 }
-                Log.i(TAG, "ears probe: " + seconds + " s, " + rows.size() + " rows, direction "
-                        + VoiceDirection.open().backend() + " (" + VoiceDirection.open().detail() + ")");
+                VoiceDirection dir = VoiceDirection.open();
+                Log.i(TAG, "ears probe: " + seconds + " s, " + rows.size() + " rows, direction backend "
+                        + dir.backend() + " (" + dir.detail() + ") raw reply " + dir.firstReplyHex());
                 return rows;
             } finally {
                 probeDirection.stop();
@@ -131,12 +131,23 @@ public class LauncherApp extends Application {
 
         @Override
         public String backend() {
-            return VoiceDirection.open().backend().name().toLowerCase(Locale.ROOT);
+            return VoiceDirection.open().backend().name();
+        }
+
+        @Override
+        public String rawReply() {
+            return VoiceDirection.open().firstReplyHex();
+        }
+
+        @Override
+        public Integer raw() {
+            int raw = VoiceDirection.open().lastRaw();
+            return raw < 0 ? null : raw;
         }
 
         synchronized void start() {
             stop();
-            sampler = VoiceDirection.open().sample(PERIOD_MS);
+            sampler = VoiceDirection.sampleLazily(PERIOD_MS);
         }
 
         @Override
@@ -245,6 +256,15 @@ public class LauncherApp extends Application {
         // the listen thread; each listen waits for the speech queue to go idle.
         listen = new ListenEngine(this, speech.queue(), claudeSettings);
         listen.start();
+        // Owner 2026-10-02: one person record holds name, notes, faces and voice prints, so a
+        // Forget also wipes the voice prints kept under the same id.
+        final VoicePrints prints = listen.voicePrints();
+        people.addForgetHook(new PeopleStore.ForgetHook() {
+            @Override
+            public void forgotten(String id) {
+                prints.forgetVoice(id);
+            }
+        });
         wifi = new WifiHttpHandler(this);
         startServer();
 
@@ -276,6 +296,12 @@ public class LauncherApp extends Application {
     /** The robot's voice and its queue of lines, for SpeechService. */
     SpeechEngine speech() {
         return speech;
+    }
+
+    /** The ears' voice prints (owner 2026-10-02), for PeopleService; null before the ears exist. */
+    VoicePrints voicePrints() {
+        ListenEngine l = listen;
+        return l == null ? null : l.voicePrints();
     }
 
     /** The robot's ears, for ListenService. */
@@ -401,6 +427,11 @@ public class LauncherApp extends Application {
         server.route(LauncherProtocol.SETTINGS_PEOPLE_PHOTO_DELETE_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_FACE_STATE_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_FEEDBACK_STATE_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH, settingsHandler);
+        server.route(LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH, settingsHandler);
         server.route(LauncherProtocol.SETTINGS_EARS_PROBE_PATH, new RoutingHttpServer.RouteHandler() {
             @Override
             public void handle(HttpRequest req, HttpResponse res) throws IOException {

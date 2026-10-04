@@ -222,6 +222,92 @@ public final class RobotPeopleClient {
         });
     }
 
+    /** Owner 2026-10-02: appends feedback about the robot to the launcher's
+     * feedback log, from the person with this id (null: someone unknown).
+     * False when the launcher refused it. Throws LAUNCHER_TOO_OLD as an
+     * IOException when the launcher predates the log. */
+    public static boolean recordFeedback(Context context, final String id, final Feedback feedback,
+                                         final String where) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.recordFeedback(id, feedback.kind, feedback.summary, feedback.quote, where);
+            }
+        });
+    }
+
+    /** The owner's note about the person with this name (owner 2026-10-03), or
+     * null when the owner wrote none for them. Never log the name or the note. */
+    public static String ownerNoteFor(Context context, final String name) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<String>() {
+            @Override
+            public String run(RobotPeople people) throws RemoteException {
+                return people.ownerNoteFor(name);
+            }
+        });
+    }
+
+    /** Remembers someone by name alone (owner 2026-10-02); answers their id.
+     * IOException with the store's fixed reason for a blank name. */
+    public static String addNamed(Context context, final String name) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<String>() {
+            @Override
+            public String run(RobotPeople people) throws RemoteException {
+                return people.addNamed(name);
+            }
+        });
+    }
+
+    /** Whether the person has a photo (false: remembered by name alone, or unknown). */
+    public static boolean hasFace(Context context, final String id) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.hasFace(id);
+            }
+        });
+    }
+
+    /** Enrols the voice of the answer at at to this person (owner 2026-10-02); false when it has no embedding. */
+    public static boolean enrolVoice(Context context, final String id, final long at) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Boolean>() {
+            @Override
+            public Boolean run(RobotPeople people) throws RemoteException {
+                return people.enrolVoice(id, at);
+            }
+        });
+    }
+
+    /** How many voice embeddings this person has. */
+    public static int voiceCount(Context context, final String id) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Integer>() {
+            @Override
+            public Integer run(RobotPeople people) throws RemoteException {
+                return people.voiceCount(id);
+            }
+        });
+    }
+
+    /** How close the answer at at is to this person's voice; NaN when unknown. */
+    public static float voiceScore(Context context, final String id, final long at) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Float>() {
+            @Override
+            public Float run(RobotPeople people) throws RemoteException {
+                return people.voiceScore(id, at);
+            }
+        });
+    }
+
+    /** How close two answers' voices are; NaN when unknown. */
+    public static float voiceSimilarity(Context context, final long atA, final long atB) throws IOException {
+        return call(context, DEFAULT_TIMEOUT_MS, new Call<Float>() {
+            @Override
+            public Float run(RobotPeople people) throws RemoteException {
+                return people.voiceSimilarity(atA, atB);
+            }
+        });
+    }
+
     private static PersonNotes parseNotes(String json) {
         try {
             return PersonNotes.parse(json);

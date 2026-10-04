@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.os.IBinder;
 
 import com.miko3.shared.FaceCheck;
+import com.miko3.shared.Feedback;
 import com.miko3.shared.LauncherProtocol;
 import com.miko3.shared.RobotPeople;
 
@@ -127,6 +128,48 @@ public class PeopleService extends Service {
         }
 
         @Override
+        public String addNamed(String name) {
+            enforceCaller();
+            // Owner 2026-10-02: someone remembered by name alone; the name is never logged.
+            return people().addNamed(name);
+        }
+
+        @Override
+        public boolean hasFace(String id) {
+            enforceCaller();
+            return people().hasFace(id);
+        }
+
+        @Override
+        public boolean enrolVoice(String id, long at) {
+            enforceCaller();
+            // Owner 2026-10-02: the voice prints sit in the same person record, keyed by the same id.
+            VoicePrints v = voicePrints();
+            return v != null && v.enrolVoice(id, at);
+        }
+
+        @Override
+        public int voiceCount(String id) {
+            enforceCaller();
+            VoicePrints v = voicePrints();
+            return v == null ? 0 : v.voiceCount(id);
+        }
+
+        @Override
+        public float voiceScore(String id, long at) {
+            enforceCaller();
+            VoicePrints v = voicePrints();
+            return v == null ? Float.NaN : v.voiceScore(id, at);
+        }
+
+        @Override
+        public float voiceSimilarity(long atA, long atB) {
+            enforceCaller();
+            VoicePrints v = voicePrints();
+            return v == null ? Float.NaN : v.voiceSimilarity(atA, atB);
+        }
+
+        @Override
         public boolean setEmbedding(String id, int slot, long addedAtMillis, String modelId, float[] embedding) {
             enforceCaller();
             return people().setEmbedding(id, slot, addedAtMillis, modelId, embedding);
@@ -152,6 +195,21 @@ public class PeopleService extends Service {
             }
             return checks().updateOutcome(handle, outcome, joinedId);
         }
+
+        @Override
+        public boolean recordFeedback(String id, String kind, String summary, String quote, String context) {
+            enforceCaller();
+            // Re-checked here with the same rules Explore applied: a bad entry is refused, never stored.
+            Feedback f = Feedback.of(kind, summary, quote);
+            return f != null && people().recordFeedback(id, f, context);
+        }
+
+        @Override
+        public String ownerNoteFor(String name) {
+            enforceCaller();
+            // Owner 2026-10-03: never logged; only the matched note goes back.
+            return people().ownerNotes().noteFor(name);
+        }
     };
 
     @Override
@@ -161,6 +219,11 @@ public class PeopleService extends Service {
 
     private PeopleStore people() {
         return ((LauncherApp) getApplication()).people();
+    }
+
+    /** The ears' voice prints (owner 2026-10-02), or null before the ears exist. */
+    private VoicePrints voicePrints() {
+        return ((LauncherApp) getApplication()).voicePrints();
     }
 
     private FaceChecks checks() {

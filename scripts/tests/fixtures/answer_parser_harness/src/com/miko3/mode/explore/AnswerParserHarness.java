@@ -157,6 +157,44 @@ public final class AnswerParserHarness {
                 NameResolver.askedName("Priya", 3));
         check("asked_name_blank_is_none", NameResolver.askedName("  ", 1) == null, "");
 
+        // Owner 2026-10-02: a person remembered by name alone (no photo) gets the face given with their exact name.
+        Map<String, String> nameOnly = new LinkedHashMap<String, String>();
+        nameOnly.put("p-priya", "Priya");
+        NameResolver.Decision enrol = NameResolver.resolve("priya", probe, Arrays.asList("p-priya"), gallery, close,
+                nameOnly);
+        check("resolve_joins_a_name_only_record_with_the_exact_name", enrol.kind == NameResolver.Kind.JOIN
+                && "p-priya".equals(enrol.personId), "got " + enrol);
+        NameResolver.Decision faced = NameResolver.resolve("Sarah", probe, Arrays.asList("p-sarah", "p-priya"),
+                gallery, close, nameOnly);
+        check("resolve_a_close_face_still_wins_over_a_name_only_record", faced.kind == NameResolver.Kind.JOIN
+                && "p-sarah".equals(faced.personId), "got " + faced);
+
+        // Owner 2026-10-02: a faceless conversation's name, looked up by name alone.
+        Map<String, String> people = new LinkedHashMap<String, String>();
+        people.put("p-ben", "Ben Wilson");
+        people.put("p-ben2", "Ben Smith");
+        people.put("p-priya", "Priya");
+        NameResolver.Decision exact = NameResolver.byName("ben smith", people);
+        check("by_name_the_full_name_given_wins", exact.kind == NameResolver.Kind.JOIN
+                && "p-ben2".equals(exact.personId) && "Ben Smith".equals(exact.name), "got " + exact);
+        Map<String, String> bens = new LinkedHashMap<String, String>();
+        bens.put("p-ben", "Ben Wilson");
+        bens.put("p-ben2", "Ben Smith");
+        NameResolver.Decision shared = NameResolver.byName("Ben", bens);
+        check("by_name_a_first_name_several_share_is_ambiguous", shared.kind == NameResolver.Kind.ASK_LAST_NAME
+                && shared.personId == null, "got " + shared);
+        Map<String, String> oneBen = new LinkedHashMap<String, String>();
+        oneBen.put("p-ben", "Ben Wilson");
+        NameResolver.Decision unique = NameResolver.byName("Ben", oneBen);
+        check("by_name_a_unique_first_name_finds_them", unique.kind == NameResolver.Kind.JOIN
+                && "p-ben".equals(unique.personId) && "Ben Wilson".equals(unique.name), "got " + unique);
+        NameResolver.Decision nobody = NameResolver.byName("Priya", new LinkedHashMap<String, String>());
+        check("by_name_nobody_is_new", nobody.kind == NameResolver.Kind.NEW && "Priya".equals(nobody.name),
+                "got " + nobody);
+        NameResolver.Decision fullNobody = NameResolver.byName("Ben Jones", bens);
+        check("by_name_a_full_name_matching_nobody_is_new", fullNobody.kind == NameResolver.Kind.NEW,
+                "got " + fullNobody);
+
         List<String> words = new ArrayList<String>();
         check("decision_to_string_carries_no_name", !NameResolver.resolve("Sarah", probe, Arrays.asList("p-sarah"),
                 gallery, close).toString().contains("Sarah") && !smith.toString().contains("Smith"), words.toString());

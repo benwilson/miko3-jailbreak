@@ -31,8 +31,39 @@ import java.util.concurrent.TimeUnit;
  */
 public final class RobotEarsClient {
     public interface Listener {
-        /** One heard utterance; see RobotEars.Callback.heard. kind is RobotEars.KIND_*, never KIND_MISSING. */
-        void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind);
+        /**
+         * One heard utterance; see RobotEars.Callback.heard. kind is RobotEars.KIND_*, never KIND_MISSING;
+         * called marks the end of an utterance whose wake word already went out as an early cue;
+         * message is a call's words besides the address, "" or null (an older launcher) for none.
+         */
+        void onHeard(String text, int side, float angle, int tier, long at, boolean partial, int kind,
+                     boolean called, String message);
+
+        /**
+         * Robot 2026-10-01: the conversation listen's answer has started (speech began at at);
+         * see RobotEars.Callback.answering. At most once per listen, before its onHeard.
+         */
+        void onAnswering(long at);
+
+        /**
+         * Review 2026-10-01 (P2-2): the listen that said onAnswering ended without words;
+         * see RobotEars.Callback.answerOver. At most once per listen, after its onAnswering.
+         */
+        void onAnswerOver(long at);
+
+        /**
+         * Robot 2026-10-02: the conversation listen's answer so far (text), at an endpoint
+         * inside it; see RobotEars.Callback.provisional. Before that answer's onHeard.
+         */
+        void onProvisional(long at, String text);
+
+        /**
+         * Owner 2026-10-02: whose voice said the answer whose speech began at at (the at of its
+         * onHeard): person is the launcher's opaque person id or null, band RobotEars.VOICE_*;
+         * see RobotEars.Callback.voice. After that answer's onHeard. A no-op unless overridden.
+         */
+        default void onVoice(long at, String person, float score, int band) {
+        }
 
         /** The session is gone; reason is fixed text. Called at most once per open(). */
         void onLost(String reason);
@@ -355,7 +386,7 @@ public final class RobotEarsClient {
 
         @Override
         public void heard(final String text, final int side, final float angle, final int tier, final long at,
-                          final boolean partial, final int kind) {
+                          final boolean partial, final int kind, final boolean called, final String message) {
             if (ended) {
                 return;
             }
@@ -367,7 +398,71 @@ public final class RobotEarsClient {
                 @Override
                 public void run() {
                     if (!ended) {
-                        listener.onHeard(text, side, angle, tier, at, partial, kind);
+                        listener.onHeard(text, side, angle, tier, at, partial, kind, called, message);
+                    }
+                }
+            });
+        }
+
+        /** On the worker, in order with heard(): the answer's words always come after it. */
+        @Override
+        public void answering(final long at) {
+            if (ended) {
+                return;
+            }
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!ended) {
+                        listener.onAnswering(at);
+                    }
+                }
+            });
+        }
+
+        /** On the worker, in order with heard(): the answer's words always come after it. */
+        @Override
+        public void provisional(final long at, final String text) {
+            if (ended) {
+                return;
+            }
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!ended) {
+                        listener.onProvisional(at, text);
+                    }
+                }
+            });
+        }
+
+        /** On the worker, in order with heard(): always after the answer it names. */
+        @Override
+        public void voice(final long at, final String person, final float score, final int band) {
+            if (ended) {
+                return;
+            }
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!ended) {
+                        listener.onVoice(at, person, score, band);
+                    }
+                }
+            });
+        }
+
+        /** On the worker, in order with answering(): the hold it ends always started first. */
+        @Override
+        public void answerOver(final long at) {
+            if (ended) {
+                return;
+            }
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!ended) {
+                        listener.onAnswerOver(at);
                     }
                 }
             });

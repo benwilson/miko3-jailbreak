@@ -113,6 +113,14 @@ class PeopleStoreHarnessTest(unittest.TestCase):
         "a_corrupt_faces_file_reads_as_pending",
         "photo_by_slot_validates_id_and_slot",
         "forget_racing_photo_writes_leaves_nothing_behind",
+        # Owner 2026-10-02: a person remembered by name alone (a faceless conversation).
+        "add_named_keeps_a_name_and_notes_with_no_face_across_a_reload",
+        "add_named_refuses_a_blank_name_and_writes_nothing",
+        "a_name_only_person_is_out_of_recent_and_the_gallery_but_ids_named_finds_them",
+        "a_face_enrolled_later_joins_the_name_only_person",
+        "forget_deletes_a_name_only_person_and_their_notes",
+        "a_name_only_person_cannot_be_renamed_blank",
+        "forget_runs_the_forget_hooks_with_the_id_and_a_failing_hook_still_forgets",
     )
 
     @classmethod
@@ -218,7 +226,10 @@ class StoreSourceTest(unittest.TestCase):
         self.assertLess(add.index("REFUSE_NO_NAME"), add.index("writeDurably"))
         read = _method_body(src, "private boolean readIndex") or ""
         self.assertNotIn("REFUSE_NO_NAME", read)
-        self.assertNotIn("isEmpty()", read)
+        # A nameless row loads whenever it has a photo; only a row with neither is skipped
+        # (owner 2026-10-02: a named row with no photo is a person remembered by name alone).
+        self.assertIn("|| !hasPhoto(f[0]) && cleanName(f[2]).isEmpty()) {", read)
+        self.assertEqual(read.count("isEmpty()"), 1)
 
     def test_a_torn_index_read_skips_the_orphan_sweep(self):
         src = _read(STORE)
@@ -483,3 +494,69 @@ class ProtocolManifestAndAppTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NameOnlyBinderTest(unittest.TestCase):
+    """Owner 2026-10-02: a person remembered by name alone reaches the mode through two
+    appended transactions; the service checks the caller and never logs the name."""
+
+    def test_add_named_and_has_face_are_appended_transactions(self):
+        iface = _read(INTERFACE)
+        self.assertIn("static final int TRANSACTION_addNamed = 19;", iface)
+        self.assertIn("static final int TRANSACTION_hasFace = 20;", iface)
+        self.assertIn("String addNamed(String name) throws RemoteException;", iface)
+        self.assertIn("boolean hasFace(String id) throws RemoteException;", iface)
+
+    def test_service_checks_the_caller_and_logs_no_name(self):
+        service = _read(SERVICE)
+        for name in ("public String addNamed", "public boolean hasFace"):
+            body = _method_body(service, name) or ""
+            self.assertIn("enforceCaller();", body, name)
+            self.assertNotIn("Log.", body, name)
+        client = _read(CLIENT)
+        self.assertIn("public static String addNamed(Context context, final String name) throws IOException", client)
+        self.assertIn("public static boolean hasFace(Context context, final String id) throws IOException", client)
+
+
+class VoiceBinderTest(unittest.TestCase):
+    """Owner 2026-10-02: one person record holds name, notes, faces and voice prints. The mode
+    enrols an answer's voice to a person, counts and scores their prints, and compares two answers
+    (the voice gate) through four appended transactions backed by the ears' VoicePrints; Forget
+    wipes the voice prints with the rest of the record (LauncherApp registers the hook)."""
+
+    CALLS = (("enrolVoice", 21, "boolean enrolVoice(String id, long at) throws RemoteException;"),
+             ("voiceCount", 22, "int voiceCount(String id) throws RemoteException;"),
+             ("voiceScore", 23, "float voiceScore(String id, long at) throws RemoteException;"),
+             ("voiceSimilarity", 24, "float voiceSimilarity(long atA, long atB) throws RemoteException;"))
+
+    def test_the_voice_calls_are_appended_transactions(self):
+        iface = _read(INTERFACE)
+        for name, code, decl in self.CALLS:
+            self.assertIn(f"static final int TRANSACTION_{name} = {code};", iface)
+            self.assertIn(decl, iface.split("abstract class Stub", 1)[0])
+            self.assertRegex(iface, rf"case TRANSACTION_{name}: \{{\s*data\.enforceInterface\(DESCRIPTOR\);")
+            self.assertRegex(iface, rf"if\s*\(\s*!remote\.transact\(\s*TRANSACTION_{name}")
+
+    def test_the_service_checks_the_caller_and_asks_the_voice_prints(self):
+        service = _read(SERVICE)
+        for name in ("public boolean enrolVoice", "public int voiceCount", "public float voiceScore",
+                     "public float voiceSimilarity"):
+            body = _method_body(service, name) or ""
+            self.assertIn("enforceCaller();", body, name)
+            self.assertIn("voicePrints()", body, name)
+            self.assertNotIn("Log.", body, name)
+        self.assertIn("((LauncherApp) getApplication()).voicePrints()", service)
+        client = _read(CLIENT)
+        for sig in ("public static boolean enrolVoice(Context context, final String id, final long at)",
+                    "public static int voiceCount(Context context, final String id)",
+                    "public static float voiceScore(Context context, final String id, final long at)",
+                    "public static float voiceSimilarity(Context context, final long atA, final long atB)"):
+            self.assertIn(sig, client)
+
+    def test_forget_wipes_the_voice_prints_through_the_hook_launcher_app_registers(self):
+        app = _read(LAUNCHER / "LauncherApp.java")
+        on_create = _method_body(app, "public void onCreate") or ""
+        self.assertIn("people.addForgetHook(", on_create)
+        self.assertIn(".forgetVoice(", on_create)
+        # After the ears exist, so the voice prints are there to wipe.
+        self.assertLess(on_create.index("listen = new ListenEngine("), on_create.index("people.addForgetHook("))

@@ -38,7 +38,10 @@ final class RoamSteer {
     static final int RIGHT = Heading.RIGHT;
     static final int STRAIGHT = 0;
 
-    /** How new the ground is along a heading bearingDeg off his facing (left positive): 0..1, NaN unknown. */
+    /**
+     * How new the ground is along a heading bearingDeg off his facing (left positive):
+     * 0..1, NaN unknown. The brain's is the lower of Coverage's and PlaceMemory's.
+     */
     interface Novelty {
         double at(double bearingDeg);
     }
@@ -125,10 +128,18 @@ final class RoamSteer {
      * 0: as before).
      */
     Plan plan(Openness.Profile p, double doorwayDeg, Novelty novelty) {
-        return choose(p, doorwayDeg, tuning.coverageWeight > 0 ? novelty : null);
+        return plan(p, doorwayDeg, novelty, tuning.doorwayWeight);
     }
 
-    private Plan choose(Openness.Profile p, double doorwayDeg, Novelty nov) {
+    /**
+     * As above, with the goal at doorwayDeg pulling the open bands nearest it by up to
+     * pull instead of doorwayWeight (a seek's target pulls harder: seekWeight).
+     */
+    Plan plan(Openness.Profile p, double doorwayDeg, Novelty novelty, float pull) {
+        return choose(p, doorwayDeg, tuning.coverageWeight > 0 ? novelty : null, pull);
+    }
+
+    private Plan choose(Openness.Profile p, double doorwayDeg, Novelty nov, float pull) {
         if (!confident(p)) {
             return null;
         }
@@ -143,7 +154,7 @@ final class RoamSteer {
             return new Plan(doorwayDeg > 0 ? LEFT : RIGHT, Math.abs(doorwayDeg), ahead, true, false, 0f, true);
         }
         double doorX = door ? offsetOf(doorwayDeg) : 0;
-        Best b = best(p, door, doorX, nov);
+        Best b = best(p, door, doorX, nov, pull);
         if (b.score <= tuning.steerBlocked) {
             int side = b.offset > 0 ? RIGHT : LEFT;
             if (turnsOnly < tuning.steerTurnsOnlyMax) {
@@ -177,7 +188,7 @@ final class RoamSteer {
         double deg = 0;
         float open = ahead;
         double goOffset = offset((n - w) / 2, w, n);
-        if (b.weighted - weighted(ahead, goOffset, door, doorX, nov, w, n) >= tuning.steerMinGain) {
+        if (b.weighted - weighted(ahead, goOffset, door, doorX, nov, w, n, pull) >= tuning.steerMinGain) {
             deg = Math.abs(b.offset) * tuning.cameraHalfFovDeg;
             if (deg >= tuning.turnToleranceDeg) {
                 side = b.offset < 0 ? LEFT : RIGHT;
@@ -226,14 +237,20 @@ final class RoamSteer {
      * turn-only count and its turn toward new ground are left as they were.
      */
     double reaimDeg(Openness.Profile p, double doorwayDeg, Novelty novelty) {
+        return reaimDeg(p, doorwayDeg, novelty, tuning.doorwayWeight);
+    }
+
+    /** As above, the goal at doorwayDeg pulling by up to pull (a seek's target: seekWeight). */
+    double reaimDeg(Openness.Profile p, double doorwayDeg, Novelty novelty, float pull) {
         if (!confident(p)) {
             return 0;
         }
         Novelty nov = tuning.coverageWeight > 0 ? novelty : null;
         boolean door = !Double.isNaN(doorwayDeg) && Math.abs(doorwayDeg) <= tuning.cameraHalfFovDeg;
         double doorX = door ? offsetOf(doorwayDeg) : 0;
-        Best b = best(p, door, doorX, nov);
-        if (b.score <= tuning.steerBlocked || b.weighted - aheadWeighted(p, door, doorX, nov) < tuning.steerMinGain) {
+        Best b = best(p, door, doorX, nov, pull);
+        if (b.score <= tuning.steerBlocked
+                || b.weighted - aheadWeighted(p, door, doorX, nov, pull) < tuning.steerMinGain) {
             return 0;
         }
         return bearing(b.offset);
@@ -246,14 +263,14 @@ final class RoamSteer {
         double offset;
     }
 
-    private Best best(Openness.Profile p, boolean door, double doorX, Novelty nov) {
+    private Best best(Openness.Profile p, boolean door, double doorX, Novelty nov, float pull) {
         int n = p.bins.length;
         int w = Math.min(tuning.steerBandBins, n);
         Best b = new Best();
         for (int i = 0; i + w <= n; i++) {
             float score = mean(p.bins, i, w);
             double offset = offset(i, w, n);
-            float weighted = weighted(score, offset, door, doorX, nov, w, n);
+            float weighted = weighted(score, offset, door, doorX, nov, w, n, pull);
             // Ties go to the band nearest straight ahead.
             if (weighted > b.weighted + 1e-6f || (Math.abs(weighted - b.weighted) <= 1e-6f
                     && Math.abs(offset) < Math.abs(b.offset))) {
@@ -266,15 +283,16 @@ final class RoamSteer {
     }
 
     /** The band straight ahead, weighted as best() weighs every band. */
-    private float aheadWeighted(Openness.Profile p, boolean door, double doorX, Novelty nov) {
+    private float aheadWeighted(Openness.Profile p, boolean door, double doorX, Novelty nov, float pull) {
         int n = p.bins.length;
         int w = Math.min(tuning.steerBandBins, n);
-        return weighted(aheadOpen(p), offset((n - w) / 2, w, n), door, doorX, nov, w, n);
+        return weighted(aheadOpen(p), offset((n - w) / 2, w, n), door, doorX, nov, w, n, pull);
     }
 
     /** A band's openness plus its pulls toward the doorway (when one is in view) and new ground. */
-    private float weighted(float score, double offset, boolean door, double doorX, Novelty nov, int w, int n) {
-        return score + (door ? doorwayBonus(score, offset, doorX, w, n) : 0f) + noveltyBonus(nov, score, offset);
+    private float weighted(float score, double offset, boolean door, double doorX, Novelty nov, int w, int n,
+                           float pull) {
+        return score + (door ? doorwayBonus(score, offset, doorX, w, n, pull) : 0f) + noveltyBonus(nov, score, offset);
     }
 
     /** A band's pull toward new ground: coverageWeight x its novelty, none on a blocked band. */
@@ -313,21 +331,95 @@ final class RoamSteer {
         if (!confident(p) || Double.isNaN(doorwayDeg) || Math.abs(doorwayDeg) > tuning.doorwayFacingDeg) {
             return false;
         }
+        return openAt(p, doorwayDeg) <= tuning.steerBlocked;
+    }
+
+    /**
+     * The mean openness of the band centred bearingDeg off his facing (left positive;
+     * clamped to the frame), -1 when p is not confident or bearingDeg is NaN.
+     */
+    float openAt(Openness.Profile p, double bearingDeg) {
+        if (!confident(p) || Double.isNaN(bearingDeg)) {
+            return -1f;
+        }
         int n = p.bins.length;
         int w = Math.min(tuning.steerBandBins, n);
-        double x = offsetOf(doorwayDeg);
+        double x = offsetOf(bearingDeg);
         int start = (int) Math.round((x + 1) / 2 * n - w / 2.0);
         start = Math.max(0, Math.min(n - w, start));
-        return mean(p.bins, start, w) <= tuning.steerBlocked;
+        return mean(p.bins, start, w);
     }
 
     /** The doorway's pull on a band: full at its column, none a band's width away or on a blocked band. */
-    private float doorwayBonus(float score, double offset, double doorX, int w, int n) {
+    private float doorwayBonus(float score, double offset, double doorX, int w, int n, float pull) {
         if (score <= tuning.steerBlocked) {
             return 0f;
         }
         double span = 2.0 * w / n;
-        return (float) (tuning.doorwayWeight * Math.max(0, 1 - Math.abs(offset - doorX) / span));
+        return (float) (pull * Math.max(0, 1 - Math.abs(offset - doorX) / span));
+    }
+
+    /**
+     * The exact bearing (left positive) of a frame position x (-1 at the frame's left
+     * edge .. 1 at its right) for a camera with this half view pitched up pitchDeg
+     * (measured on the robot, 2026-10-01): atan2(x tan(halfFov), cos(pitch)). Within
+     * about 2 deg of the linear x * halfFov the steer uses for its bands.
+     */
+    static double bearingOf(double x, double halfFovDeg, double pitchDeg) {
+        return -Math.toDegrees(Math.atan2(x * Math.tan(Math.toRadians(halfFovDeg)), Math.cos(Math.toRadians(pitchDeg))));
+    }
+
+    /**
+     * The centre (-1..1) of the most open band in p, ties going to the band nearest
+     * straight ahead; NaN when p is not confident or nothing in it is open.
+     */
+    double mostOpenX(Openness.Profile p) {
+        if (!confident(p)) {
+            return Double.NaN;
+        }
+        Best b = best(p, false, 0, null, 0f);
+        return b.score <= tuning.steerBlocked ? Double.NaN : b.offset;
+    }
+
+    /**
+     * The raw openness of the most open band in p (no doorway, new-ground or seek
+     * weight; ties to the band nearest straight ahead), -1 when p is not confident.
+     */
+    float mostOpen(Openness.Profile p) {
+        return confident(p) ? best(p, false, 0, null, 0f).score : -1f;
+    }
+
+    /** That band's centre as a bearing off his facing (left positive), NaN when p is not confident. */
+    double mostOpenBearing(Openness.Profile p) {
+        return confident(p) ? bearing(best(p, false, 0, null, 0f).offset) : Double.NaN;
+    }
+
+    /**
+     * The exact bearing of the most open band in p whose centre lies within maxDeg of
+     * expectedDeg (both off his facing, left positive), ties going to the band nearest
+     * expectedDeg; NaN when p is not confident or no band there is open.
+     */
+    double openBandNear(Openness.Profile p, double expectedDeg, double maxDeg) {
+        if (!confident(p)) {
+            return Double.NaN;
+        }
+        int n = p.bins.length;
+        int w = Math.min(tuning.steerBandBins, n);
+        double found = Double.NaN;
+        float bestScore = tuning.steerBlocked;
+        for (int i = 0; i + w <= n; i++) {
+            double deg = bearingOf(offset(i, w, n), tuning.cameraHalfFovDeg, tuning.cameraPitchDeg);
+            if (Math.abs(deg - expectedDeg) > maxDeg) {
+                continue;
+            }
+            float score = mean(p.bins, i, w);
+            if (score > bestScore + 1e-6f || (Math.abs(score - bestScore) <= 1e-6f && !Double.isNaN(found)
+                    && Math.abs(deg - expectedDeg) < Math.abs(found - expectedDeg))) {
+                bestScore = score;
+                found = deg;
+            }
+        }
+        return found;
     }
 
     /** The leg's forward ticks after this plan, given the leg length drawn as before (0: turn only);
