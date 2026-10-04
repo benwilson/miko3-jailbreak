@@ -335,7 +335,7 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
      * the conversation (pollVoice), never a cue; the id is opaque and never logged.
      */
     @Override
-    public void onVoice(long at, String person, float score, int band) {
+    public void onVoice(long at, String person, float score, int band, float margin) {
         synchronized (lock) {
             if (!open) {
                 return;
@@ -343,7 +343,7 @@ final class EarsAdapter implements Ears, RobotEarsClient.Listener, ExploreDrive.
             if (voices.size() >= VOICE_MAX) {
                 voices.pollFirst();
             }
-            voices.addLast(new Ears.Voice(at, person, score, band));
+            voices.addLast(new Ears.Voice(at, person, score, band, margin));
         }
     }
 

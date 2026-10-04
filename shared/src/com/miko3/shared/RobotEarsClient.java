@@ -62,7 +62,7 @@ public final class RobotEarsClient {
          * onHeard): person is the launcher's opaque person id or null, band RobotEars.VOICE_*;
          * see RobotEars.Callback.voice. After that answer's onHeard. A no-op unless overridden.
          */
-        default void onVoice(long at, String person, float score, int band) {
+        default void onVoice(long at, String person, float score, int band, float margin) {
         }
 
         /** The session is gone; reason is fixed text. Called at most once per open(). */
@@ -438,7 +438,7 @@ public final class RobotEarsClient {
 
         /** On the worker, in order with heard(): always after the answer it names. */
         @Override
-        public void voice(final long at, final String person, final float score, final int band) {
+        public void voice(final long at, final String person, final float score, final int band, final float margin) {
             if (ended) {
                 return;
             }
@@ -446,7 +446,7 @@ public final class RobotEarsClient {
                 @Override
                 public void run() {
                     if (!ended) {
-                        listener.onVoice(at, person, score, band);
+                        listener.onVoice(at, person, score, band, margin);
                     }
                 }
             });

@@ -212,7 +212,7 @@ final class EarsSession {
          * stored person id (or null), the cosine score and VoiceStore.BAND_*. Sent after that
          * answer's heard(), from the voice thread, only for a clean answer long enough to embed.
          */
-        default void voice(long at, String person, float score, int band) {
+        default void voice(long at, String person, float score, int band, float margin) {
         }
     }
 
@@ -1213,7 +1213,7 @@ final class EarsSession {
     }
 
     /** VoiceId's result, from the voice thread, to the session's current client. */
-    void voiceHeard(long at, String person, float score, int band) {
+    void voiceHeard(long at, String person, float score, int band, float margin) {
         Client c;
         synchronized (this) {
             c = client;
@@ -1222,7 +1222,7 @@ final class EarsSession {
             return;
         }
         try {
-            c.voice(at, person, score, band);
+            c.voice(at, person, score, band, margin);
         } catch (RuntimeException e) {
             diag.log("voice delivery failed: " + e.getClass().getSimpleName());
         }

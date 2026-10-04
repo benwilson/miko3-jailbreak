@@ -19,8 +19,9 @@ import java.util.Map;
  * Owner 2026-10-02: the voices the robot knows, as speaker embeddings only (never audio),
  * up to a cap per person, keyed by an opaque person id the people layer supplies. A probe
  * embedding is scored against each person's centroid (the mean of their normalised
- * embeddings) by cosine; the best person and a band (VoiceTuning) come back, a close
- * runner-up making a strong match only weak. Kept in one app-private file, rewritten
+ * embeddings) by cosine; the best person and a band (VoiceTuning) come back. Owner
+ * 2026-10-03: a strong band needs a clear lead over the runner-up (or, alone, a higher score)
+ * and at least VoiceTuning.MIN_PRINTS prints (VoiceTuning.confident); otherwise it is weak. Kept in one app-private file, rewritten
  * whole (through a .tmp and a rename) on every change. Plain Java, proven in the host
  * harness; never logs an id.
  */
@@ -41,16 +42,32 @@ final class VoiceStore {
         final String id;
         final float score;
         final int band;
+        /** The second-best person's score, NaN when nobody else is stored. */
+        final float second;
+        /** How many prints the best person has. */
+        final int prints;
 
         Match(String id, float score, int band) {
+            this(id, score, band, Float.NaN, 0);
+        }
+
+        Match(String id, float score, int band, float second, int prints) {
             this.id = id;
             this.score = score;
             this.band = band;
+            this.second = second;
+            this.prints = prints;
+        }
+
+        /** score's lead over the second-best person; NaN when nobody else is stored. */
+        float margin() {
+            return Float.isNaN(second) ? Float.NaN : score - second;
         }
 
         @Override
         public String toString() {
-            return String.format(Locale.US, "%s %.3f %s", id, score, VoiceTuning.bandName(band));
+            return String.format(Locale.US, "%s %.3f %s second=%.3f prints=%d", id, score, VoiceTuning.bandName(band),
+                    second, prints);
         }
     }
 
@@ -121,6 +138,7 @@ final class VoiceStore {
         String bestId = null;
         float best = -2f;
         float second = -2f;
+        int bestPrints = 0;
         for (Map.Entry<String, List<float[]>> e : people.entrySet()) {
             float[] centroid = centroid(e.getValue(), probe.length);
             if (centroid == null) {
@@ -131,6 +149,7 @@ final class VoiceStore {
                 second = best;
                 best = s;
                 bestId = e.getKey();
+                bestPrints = sized(e.getValue(), probe.length);
             } else if (s > second) {
                 second = s;
             }
@@ -138,11 +157,47 @@ final class VoiceStore {
         if (bestId == null) {
             return new Match(null, 0f, BAND_NONE);
         }
+        float runnerUp = second > -2f ? second : Float.NaN;
         int band = tuning.band(best);
-        if (band == BAND_STRONG && best - second < VoiceTuning.TIE_MARGIN) {
+        // Owner 2026-10-03: strong only with a clear lead (or a high solo score) and enough prints.
+        if (band == BAND_STRONG && !tuning.confident(best, Float.isNaN(runnerUp) ? Float.NaN : best - runnerUp,
+                bestPrints)) {
             band = BAND_WEAK;
         }
-        return new Match(band == BAND_NONE ? null : bestId, best, band);
+        return new Match(band == BAND_NONE ? null : bestId, best, band, runnerUp, bestPrints);
+    }
+
+    /**
+     * Owner 2026-10-03 (the voice evaluation's ground truth): the best score of embedding against
+     * everyone stored except id, NaN when nobody else has prints of its size.
+     */
+    synchronized float bestOther(String id, float[] embedding) {
+        load();
+        float[] probe = embedding == null ? null : unit(embedding);
+        if (probe == null) {
+            return Float.NaN;
+        }
+        float best = Float.NaN;
+        for (Map.Entry<String, List<float[]>> e : people.entrySet()) {
+            if (e.getKey().equals(id)) {
+                continue;
+            }
+            float[] centroid = centroid(e.getValue(), probe.length);
+            if (centroid != null) {
+                float s = dot(probe, centroid);
+                best = Float.isNaN(best) || s > best ? s : best;
+            }
+        }
+        return best;
+    }
+
+    /** How many of list are of size dim. */
+    private static int sized(List<float[]> list, int dim) {
+        int n = 0;
+        for (float[] v : list) {
+            n += v.length == dim ? 1 : 0;
+        }
+        return n;
     }
 
     /**

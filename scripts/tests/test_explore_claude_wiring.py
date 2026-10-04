@@ -1077,7 +1077,7 @@ class ConversationWiringTest(unittest.TestCase):
             if "voice" in line:
                 self.assertNotIn("personId", line)
         ears = code_only(src("EarsAdapter.java"))
-        self.assertIn("public void onVoice(long at, String person, float score, int band)", ears)
+        self.assertIn("public void onVoice(long at, String person, float score, int band, float margin)", ears)
 
     def test_the_adapter_binds_every_new_port_method(self):
         a = code_only(src("ClaudeCuriosity.java"))

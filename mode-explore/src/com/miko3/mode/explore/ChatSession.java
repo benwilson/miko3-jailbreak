@@ -378,6 +378,17 @@ final class ChatSession {
     private Ears.Voice earlyCallVoice;
     /** The identified person's voice print count (identity by voice). */
     private int partnerPrints;
+    /**
+     * Owner 2026-10-03 (CAM++ took the owner's wife for him): the person the latest clean answers'
+     * strong voice matched, and how many answers in a row did. Voice adopts them only after
+     * tuning.voiceAdoptRun in a row, or at once when a face agrees.
+     */
+    private String voiceCandidate;
+    private int voiceRun;
+    /** The person a voice look-up (port.recallPerson) is under way for. */
+    private String voiceRecallId;
+    /** A face disagreed with the voice: no adoption by voice for the rest of this conversation. */
+    private boolean voiceVetoed;
     // The voice gate (owner 2026-10-02, a TV in the background): words held for their voice.
     private String gateText;
     private long gateFrom = ExploreBrain.NEVER;
@@ -1430,7 +1441,8 @@ final class ChatSession {
         lastNameRecall = false;
         boolean correction = nameCorrection;
         nameCorrection = false;
-        if (byVoice && (name != null || personId != null)) {
+        voiceRecallId = null;
+        if (byVoice && (name != null || personId != null || voiceVetoed)) {
             return;
         }
         if (r.status == CuriosityPort.Recalled.Status.FOUND && !byVoice && !full && !correction && voiceFarOff(r)) {
@@ -1614,10 +1626,23 @@ final class ChatSession {
         // a voice match is primary and the face verifies it; a confident face alone still
         // identifies them when no voice match is available, as here.
         if (name == null) {
+            // Owner 2026-10-03: a face checks the voice's candidate (or the person being looked up
+            // by voice): the same person completes the adoption, anyone else vetoes the voice.
+            String byVoice = voiceVetoed ? null : voiceRecall && recallPending ? voiceRecallId : voiceCandidate;
+            if (byVoice != null && !(known && byVoice.equals(a.personId))) {
+                host.note("a usable face on check " + faceTries + " that is not the person the voice matched");
+                faceVetoesVoice();
+                return;
+            }
             if (known && voiceRecall && recallPending) {
                 // Owner 2026-10-02: voice first; the face waits for the voice's look-up.
                 host.note("identity: a face while the voice is being looked up: the voice decides");
+                host.note("identity: face agrees");
                 return;
+            }
+            if (byVoice != null) {
+                host.note("identity: face agrees with the voice candidate");
+                host.note("identity: voice adopted");
             }
             if (known) {
                 name = a.name.trim();
@@ -1657,6 +1682,11 @@ final class ChatSession {
                 photoFor = personId;
                 photoDeadline = now + tuning.meetTimeoutMs;
                 port.addPhoto(personId, tuning.meetTimeoutMs);
+            } else if (identityByVoice) {
+                // Owner 2026-10-03 (robot: the owner's wife was called by his name): the face wins.
+                host.note("a usable face on check " + faceTries + " that is not the stored face of the person the voice"
+                        + " found: the voice's identity is dropped");
+                faceVetoesVoice();
             } else {
                 host.note("a usable face on check " + faceTries + " that is not the stored face of the person the name"
                         + " found: the name stands and nothing more is stored");
@@ -2023,7 +2053,11 @@ final class ChatSession {
         return identityByVoice && personId != null && partnerPrints > 0 ? personId : null;
     }
 
-    /** The held words' voice came: decided by the ids when both are strong matches, else by its score. */
+    /**
+     * The held words' voice came: decided by the ids when both are strong matches, else by its score.
+     * Owner 2026-10-03: strong is the launcher's band, which already needs the same clear lead over
+     * the second-best person (VoiceTuning.MARGIN) as adoption, so a close call is scored instead.
+     */
     private void gateArrived(long now) {
         String ref = gateRefPerson();
         String refId = ref != null ? ref : partnerVoice.strong() ? partnerVoice.personId : null;
@@ -2141,20 +2175,71 @@ final class ChatSession {
         if (voiceOwner != null && !(v.strong() && !v.personId.equals(voiceOwner))) {
             enrolVoices(voiceOwner, Collections.singletonList(v.at));
         }
+        // Owner 2026-10-03: the launcher's strong band already needs a clear lead over the
+        // second-best person and enough prints; the same person must also win answers in a row.
         if (v.strong()) {
-            if (name == null && personId == null && !recallPending && !heldResolving && resolving == Resolving.NONE
-                    && !keepPending && !photoPending && !askingLastName) {
+            voiceRun = v.personId.equals(voiceCandidate) ? voiceRun + 1 : 1;
+            voiceCandidate = v.personId;
+            host.note("identity: voice candidate (margin " + v.marginWord() + ", run " + voiceRun + ")");
+        } else {
+            voiceCandidate = null;
+            voiceRun = 0;
+        }
+        if (v.strong()) {
+            if (!voiceVetoed && voiceRun >= tuning.voiceAdoptRun && name == null && personId == null
+                    && !recallPending && !heldResolving && resolving == Resolving.NONE && !keepPending
+                    && !photoPending && !askingLastName) {
+                host.note("identity: voice adopted");
                 host.note("a strong voice match with nobody known yet: looking them up by their voice");
-                voiceRecall = true;
-                recallPending = true;
-                recallDeadline = now + tuning.meetTimeoutMs;
-                port.recallPerson(v.personId, tuning.meetTimeoutMs);
+                adoptByVoice(now, v.personId);
             }
         } else if (v.band == Ears.Voice.WEAK && name == null && personId == null && !nameAskedByVoice) {
             nameAskedByVoice = true;
             nameAskDue = true;
             host.note("identity: voice weak → the next turn may ask the name");
         }
+    }
+
+    /** Looks personId up to go on as them (Recalled, voiceRecall). */
+    private void adoptByVoice(long now, String id) {
+        voiceRecall = true;
+        voiceRecallId = id;
+        recallPending = true;
+        recallDeadline = now + tuning.meetTimeoutMs;
+        port.recallPerson(id, tuning.meetTimeoutMs);
+    }
+
+    /**
+     * Owner 2026-10-03: a face that is not the voice's person. The voice is not trusted for the
+     * rest of the conversation: a look-up by voice is dropped, an identity voice gave is undone
+     * (their unsaved notes stay for the name they give), and the next turn asks the name.
+     */
+    private void faceVetoesVoice() {
+        voiceVetoed = true;
+        voiceCandidate = null;
+        voiceRun = 0;
+        if (voiceRecall && recallPending) {
+            recallPending = false;
+            port.cancelRecallName();
+        }
+        voiceRecall = false;
+        voiceRecallId = null;
+        if (identityByVoice) {
+            identityByVoice = false;
+            name = null;
+            noteName = null;
+            personId = null;
+            notes = null;
+            nameOnly = false;
+            asked.clear();
+            persistWanted = false;
+            recalledDue = false;
+            byVoiceDue = false;
+            partnerPrints = 0;
+        }
+        nameAskedByVoice = true;
+        nameAskDue = !ending;
+        host.note("identity: face disagrees → asking the name");
     }
 
     /** This conversation's answers with a voice, for a name's check. */

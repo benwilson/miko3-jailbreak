@@ -142,8 +142,11 @@ public interface RobotEars extends IInterface {
          * few hundred ms later). Appended as its own code (5), handled exactly like codes 2-4:
          * an older mode's Stub has no case for it (onTransact returns false, which a one-way
          * sender never sees); a newer mode under an older launcher never receives one.
+         * Owner 2026-10-03: margin is the score's lead over the second-best stored person, NaN
+         * when only one person has prints; written after band, and read as NaN from a launcher
+         * that does not write it.
          */
-        void voice(long at, String person, float score, int band) throws RemoteException;
+        void voice(long at, String person, float score, int band, float margin) throws RemoteException;
 
         abstract class Stub extends Binder implements Callback {
             private static final String DESCRIPTOR = "com.miko3.shared.RobotEars.Callback";
@@ -211,7 +214,10 @@ public interface RobotEars extends IInterface {
                         long at = data.readLong();
                         String person = data.readString();
                         float score = data.readFloat();
-                        voice(at, person, score, data.readInt());
+                        int band = data.readInt();
+                        // Owner 2026-10-03: the margin over the second-best person, appended last.
+                        float margin = data.dataAvail() >= 4 ? data.readFloat() : Float.NaN;
+                        voice(at, person, score, band, margin);
                         return true;
                     }
                     case IBinder.INTERFACE_TRANSACTION:
@@ -298,7 +304,7 @@ public interface RobotEars extends IInterface {
 
                 /** One-way, like answering(). */
                 @Override
-                public void voice(long at, String person, float score, int band) throws RemoteException {
+                public void voice(long at, String person, float score, int band, float margin) throws RemoteException {
                     Parcel data = Parcel.obtain();
                     try {
                         data.writeInterfaceToken(DESCRIPTOR);
@@ -306,6 +312,7 @@ public interface RobotEars extends IInterface {
                         data.writeString(person);
                         data.writeFloat(score);
                         data.writeInt(band);
+                        data.writeFloat(margin);
                         remote.transact(TRANSACTION_voice, data, null, IBinder.FLAG_ONEWAY);
                     } finally {
                         data.recycle();

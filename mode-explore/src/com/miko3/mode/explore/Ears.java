@@ -223,12 +223,28 @@ interface Ears {
         final String personId;
         final float score;
         final int band;
+        /**
+         * Owner 2026-10-03: the score's lead over the second-best stored person, NaN when only
+         * one person has prints (or an older launcher sent none). The launcher's STRONG band
+         * already requires it to be wide (VoiceTuning.MARGIN); it is here for the identity log.
+         */
+        final float margin;
 
         Voice(long at, String personId, float score, int band) {
+            this(at, personId, score, band, Float.NaN);
+        }
+
+        Voice(long at, String personId, float score, int band, float margin) {
             this.at = at;
             this.band = band == STRONG || band == WEAK ? band : NONE;
             this.personId = this.band == NONE || personId == null || personId.isEmpty() ? null : personId;
             this.score = score;
+            this.margin = margin;
+        }
+
+        /** The margin for a log line: two decimals, or "solo" when nobody else has prints. */
+        String marginWord() {
+            return Float.isNaN(margin) ? "solo" : String.format(java.util.Locale.US, "%.2f", margin);
         }
 
         boolean strong() {

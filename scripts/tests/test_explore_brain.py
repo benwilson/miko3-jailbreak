@@ -688,13 +688,17 @@ class ExploreBrainHarnessTest(unittest.TestCase):
         "call_faceless_usable_face_before_the_name_stores_name_and_face",
         "call_faceless_unnamed_with_no_face_keeps_nothing",
         # Whose voice (owner 2026-10-02: voice first, the face verifies; a TV is not the partner)
-        "voice_a_strong_voice_with_nobody_known_adopts_them_and_says_their_name_once",
+        "voice_two_strong_answers_in_a_row_adopt_them_and_say_their_name_once",
+        # Owner 2026-10-03: a candidate needs a run or a face that agrees; a face that disagrees stops it.
+        "voice_one_strong_answer_is_only_a_candidate_and_a_break_starts_the_run_over",
+        "voice_a_face_that_agrees_with_the_candidate_adopts_at_once",
+        "voice_a_face_that_disagrees_with_the_candidate_stops_voice_adoption_and_asks_the_name",
         "voice_a_weak_voice_asks_the_name_and_adopts_nobody",
         "voice_a_name_the_voice_agrees_with_is_accepted_and_a_few_answers_enrolled",
         "voice_a_name_whose_voice_is_far_off_asks_the_last_name_and_the_same_full_name_is_that_person",
         "voice_far_off_and_a_different_full_name_is_a_new_person_with_the_voice",
         "voice_someone_who_says_they_are_someone_else_is_that_name_and_the_voice_goes_there",
-        "voice_a_face_that_disagrees_keeps_the_voice_identity_and_stores_no_face",
+        "voice_a_face_that_disagrees_after_adoption_drops_the_voice_identity_and_asks_the_name",
         "voice_gate_an_answer_in_another_voice_is_not_said_to_him",
         "voice_gate_with_no_voice_in_time_the_turn_goes_as_before",
         # Robot 2026-10-03: the call's own voice is the gate's reference, whenever it comes.

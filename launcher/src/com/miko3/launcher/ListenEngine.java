@@ -84,6 +84,8 @@ final class ListenEngine implements ListenSession.Ears {
     private static final String WAKE_MODEL_ASSET = "miko_wakeword_model.tflite";
     /** Owner 2026-10-02: the speaker-embedding model (3D-Speaker CAM++), stamped like the listen model. */
     private static final String VOICE_ASSETS = "voiceid";
+    /** Owner 2026-10-03: the voice evaluation's files: models/ (pushed) and prints/ (its embeddings). */
+    static final String VOICE_EVAL_DIR = "voiceeval";
     private static final String VOICE_MODEL = "model.onnx";
     /** How long a listen waits for the robot to finish speaking. */
     static final long IDLE_TIMEOUT_MS = 20000;
@@ -119,6 +121,8 @@ final class ListenEngine implements ListenSession.Ears {
     private final EarsInject inject;
     /** Owner 2026-10-02: who is speaking, by voice; fed by the ears, its model loaded on its own thread. */
     private final VoiceId voiceId;
+    /** The opt-in multi-model voice evaluation, or null (VoiceTuning.EVAL_PROP). */
+    private final VoiceEval voiceEval;
     private final SpeechTuning tuning;
     /** KTD2's threads, active paths and decoding unless a property switches them. */
     private final EarsTuning earsTuning;
@@ -208,12 +212,27 @@ final class ListenEngine implements ListenSession.Ears {
                 VoiceTuning.MAX_PER_PERSON, voiceDiag), voiceTuning, voiceDiag);
         voiceId.setListener(new VoiceId.Listener() {
             @Override
-            public void voice(long at, String person, float score, int band) {
-                ears.voiceHeard(at, person, score, band);
+            public void voice(long at, String person, float score, int band, float margin) {
+                ears.voiceHeard(at, person, score, band, margin);
             }
         });
         ears.setVoice(voiceId);
         Log.i(TAG, "voice: " + voiceTuning);
+        if (voiceTuning.legacySet) {
+            // Owner 2026-10-03: the 0.95/0.90 stop-gap is replaced by the margin rule.
+            Log.w(TAG, "voice: the old stop-gap " + VoiceTuning.LEGACY_STRONG_PROP + "/" + VoiceTuning.LEGACY_WEAK_PROP
+                    + " is set and ignored; clear it: setprop " + VoiceTuning.LEGACY_STRONG_PROP + " '\"\"'");
+        }
+        File evalDir = new File(context.getFilesDir(), VOICE_EVAL_DIR);
+        if ("1".equals(SpeechEngine.systemProperty(VoiceTuning.EVAL_PROP))) {
+            this.voiceEval = new VoiceEval(new File(evalDir, "prints"), voiceTuning, voiceDiag);
+            voiceId.setEval(voiceEval);
+        } else {
+            this.voiceEval = null;
+            if (VoiceEval.deletePrints(new File(evalDir, "prints"))) {
+                Log.i(TAG, "voice eval: off, its prints deleted");
+            }
+        }
         // KTD1: the deaf window follows the speech queue's line start and idle.
         speech.setSpeaking(new SpeechQueue.Speaking() {
             @Override
@@ -367,13 +386,13 @@ final class ListenEngine implements ListenSession.Ears {
 
             /** Owner 2026-10-02: on the same delivery thread, so it always follows the answer's heard(). */
             @Override
-            public void voice(final long at, final String person, final float score, final int band) {
+            public void voice(final long at, final String person, final float score, final int band, final float margin) {
                 try {
                     deliver.execute(new Runnable() {
                         @Override
                         public void run() {
                             try {
-                                callback.voice(at, person, score, band);
+                                callback.voice(at, person, score, band, margin);
                             } catch (RemoteException | RuntimeException e) {
                                 // The client is gone; its death releases the session.
                             }
@@ -477,6 +496,37 @@ final class ListenEngine implements ListenSession.Ears {
                 if (bench) {
                     voiceId.bench(new long[] {1500, 3000, 5000, 8000}, 3);
                 }
+            }
+        });
+        if (voiceEval != null) {
+            loadVoiceEval();
+        }
+    }
+
+    /**
+     * Owner 2026-10-03 (VoiceTuning.EVAL_PROP): every extra speaker model pushed into
+     * files/voiceeval/models/ (scripts/push-voice-eval-models.py), loaded on the evaluation's
+     * own thread; a model that fails to load is skipped.
+     */
+    private void loadVoiceEval() {
+        final VoiceEval ev = voiceEval;
+        final File dir = new File(new File(context.getFilesDir(), VOICE_EVAL_DIR), "models");
+        ev.run(new Runnable() {
+            @Override
+            public void run() {
+                for (File f : VoiceEval.modelFiles(dir)) {
+                    String model = VoiceEval.modelName(f.getName());
+                    long t0 = SystemClock.elapsedRealtime();
+                    try {
+                        SherpaVoiceEmbedder e = new SherpaVoiceEmbedder(f.getAbsolutePath());
+                        ev.addModel(model, e);
+                        Log.i(TAG, "voice eval: model=" + model + " ready in " + (SystemClock.elapsedRealtime() - t0)
+                                + " ms (dim " + e.dim() + ")");
+                    } catch (Throwable t) {
+                        Log.e(TAG, "voice eval: model=" + model + " failed to load", t);
+                    }
+                }
+                Log.i(TAG, "voice eval: on, " + ev.models() + " extra model(s) beside " + VoiceEval.CAMPPLUS);
             }
         });
     }

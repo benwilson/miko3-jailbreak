@@ -131,10 +131,48 @@ public final class VoiceIdHarness {
         final CountDownLatch one = new CountDownLatch(1);
 
         @Override
-        public void voice(long at, String person, float score, int band) {
+        public void voice(long at, String person, float score, int band, float margin) {
             results.add(at + ":" + person + ":" + band + ":" + Math.round(score * 100));
+            margins.add(margin);
             one.countDown();
         }
+
+        final List<Float> margins = Collections.synchronizedList(new ArrayList<Float>());
+
+        /** Waits until k results came. */
+        boolean await(int k) throws InterruptedException {
+            for (int i = 0; i < 500 && results.size() < k; i++) {
+                Thread.sleep(10);
+            }
+            return results.size() >= k;
+        }
+    }
+
+    /** Adds k copies of v for id (a person needs VoiceTuning.MIN_PRINTS to be a strong match). */
+    static void addN(VoiceStore s, String id, float[] v, int k) {
+        for (int i = 0; i < k; i++) {
+            s.add(id, v);
+        }
+    }
+
+    /** Waits for everything queued on the evaluation's thread so far. */
+    static void flush(VoiceEval ev) throws InterruptedException {
+        final CountDownLatch l = new CountDownLatch(1);
+        ev.run(new Runnable() {
+            public void run() {
+                l.countDown();
+            }
+        });
+        l.await(5, TimeUnit.SECONDS);
+    }
+
+    /** An embedder returning a fixed vector (an extra model in the evaluation). */
+    static VoiceId.Embedder fixed(final float[] out) {
+        return new VoiceId.Embedder() {
+            public float[] embed(float[] s, int n) {
+                return out;
+            }
+        };
     }
 
     /** Feeds ms of audio in 80 ms chunks, each sample its chunk's index + 1 (scaled), marking speech when asked. */
@@ -173,7 +211,10 @@ public final class VoiceIdHarness {
                                 && t.band(0.65f) == VoiceStore.BAND_STRONG && t.band(0.5f) == VoiceStore.BAND_WEAK
                                 && t.band(0.45f) == VoiceStore.BAND_WEAK && t.band(0.44f) == VoiceStore.BAND_NONE
                                 && VoiceTuning.MIN_SPEECH_MS == 1500 && VoiceTuning.MAX_BUFFER_MS == 8000
-                                && VoiceTuning.MAX_PER_PERSON == 10,
+                                && VoiceTuning.MAX_PER_PERSON == 20 && VoiceTuning.MARGIN == 0.10f
+                                && VoiceTuning.SOLO_EXTRA == 0.08f && VoiceTuning.MIN_PRINTS == 4
+                                && VoiceTuning.STRONG_PROP.equals("persist.miko3.voiceid.strong")
+                                && VoiceTuning.WEAK_PROP.equals("persist.miko3.voiceid.weak") && !t.legacySet,
                         "t=" + t);
             }
         });
@@ -210,7 +251,7 @@ public final class VoiceIdHarness {
         scenario("store_bands_follow_the_thresholds", new Scenario() {
             public void run(String n) throws Exception {
                 VoiceStore s = new VoiceStore(tempFile(), 10, new Lines());
-                s.add("p1", axis(8, 0));
+                addN(s, "p1", axis(8, 0), 4);
                 // cos = 1/sqrt(1+t^2): t=0.5 -> 0.894 strong, t=1.2 -> 0.640 weak, t=3 -> 0.316 none
                 VoiceStore.Match strong = s.match(vec(8, 0, 1, 0.5f), tuning());
                 VoiceStore.Match weak = s.match(vec(8, 0, 1, 1.2f), tuning());
@@ -227,11 +268,12 @@ public final class VoiceIdHarness {
             public void run(String n) throws Exception {
                 VoiceStore s = new VoiceStore(tempFile(), 10, new Lines());
                 s.add("p1", axis(8, 0));
-                s.add("p2", axis(8, 1));
+                addN(s, "p2", axis(8, 1), 3);
                 s.add("p2", vec(8, 1, 2, 0.2f));
                 VoiceStore.Match m = s.match(vec(8, 1, 0, 0.1f), tuning());
                 check(n, "p2".equals(m.id) && m.band == VoiceStore.BAND_STRONG && s.people() == 2
-                        && s.count("p2") == 2 && s.count("p1") == 1, "m=" + m);
+                        && s.count("p2") == 4 && s.count("p1") == 1 && m.prints == 4
+                        && Math.abs(m.margin() - (m.score - m.second)) < 1e-6, "m=" + m);
             }
         });
         scenario("store_near_tie_is_only_weak", new Scenario() {
@@ -276,10 +318,10 @@ public final class VoiceIdHarness {
                 File f = tempFile();
                 VoiceStore s = new VoiceStore(f, 10, new Lines());
                 s.add("person-7", vec(8, 2, 3, 0.3f));
-                s.add("person-7", axis(8, 2));
+                addN(s, "person-7", axis(8, 2), 3);
                 VoiceStore r = new VoiceStore(f, 10, new Lines());
                 VoiceStore.Match m = r.match(axis(8, 2), tuning());
-                check(n, f.isFile() && r.count("person-7") == 2 && "person-7".equals(m.id)
+                check(n, f.isFile() && r.count("person-7") == 4 && "person-7".equals(m.id)
                         && m.band == VoiceStore.BAND_STRONG && !new File(f.getPath() + ".tmp").exists(), "m=" + m);
             }
         });
@@ -509,7 +551,7 @@ public final class VoiceIdHarness {
                 Heard h = new Heard();
                 Lines lines = new Lines();
                 VoiceStore store = new VoiceStore(tempFile(), 10, new Lines());
-                store.add("pid-9", axis(8, 0));
+                addN(store, "pid-9", axis(8, 0), 4);
                 VoiceId v = new VoiceId(store, tuning(), lines);
                 v.setEmbedder(e);
                 v.setListener(h);
@@ -521,7 +563,8 @@ public final class VoiceIdHarness {
                 v.shutdown();
                 check(n, h.results.size() == 1 && h.results.get(0).equals("77:pid-9:" + VoiceStore.BAND_STRONG + ":89")
                                 && lines.has("voice: embedding in ") && lines.has("(dur 2000 ms of 2000 ms)")
-                                && lines.has("voice: match band=strong score=0.89") && !lines.all().contains("pid-9"),
+                                && lines.has("voice: match band=strong score=0.89 margin=solo")
+                                && Float.isNaN(h.margins.get(0)) && !lines.has("voice eval") && !lines.all().contains("pid-9"),
                         "results=" + h.results + " lines=" + lines.all());
             }
         });
@@ -607,6 +650,194 @@ public final class VoiceIdHarness {
                 v.awaitIdle(5000);
                 check(n, h.results.isEmpty() && lines.has("voice: embedding failed: IllegalStateException"),
                         "lines=" + lines.all());
+            }
+        });
+
+        // ---- Owner 2026-10-03: the margin rule (CAM++ took the owner's wife for him at 0.67-0.82) ----
+        scenario("tuning_old_stopgap_properties_are_ignored", new Scenario() {
+            public void run(String n) {
+                final java.util.Map<String, String> p = new java.util.HashMap<String, String>();
+                VoiceTuning.Props props = new VoiceTuning.Props() {
+                    public String get(String key) {
+                        return p.get(key);
+                    }
+                };
+                p.put(VoiceTuning.LEGACY_STRONG_PROP, "0.95");
+                p.put(VoiceTuning.LEGACY_WEAK_PROP, "0.90");
+                VoiceTuning a = VoiceTuning.from(props);
+                p.put(VoiceTuning.LEGACY_STRONG_PROP, "");
+                p.put(VoiceTuning.LEGACY_WEAK_PROP, "\"\"");
+                VoiceTuning cleared = VoiceTuning.from(props);
+                check(n, a.strong == 0.65f && a.weak == 0.45f && a.legacySet && !cleared.legacySet
+                                && VoiceTuning.LEGACY_STRONG_PROP.equals("persist.miko3.voice.strong")
+                                && a.toString().contains("margin=0.10"),
+                        "a=" + a + " legacy=" + a.legacySet + " cleared=" + cleared.legacySet);
+            }
+        });
+        scenario("store_strong_needs_a_clear_lead_over_the_second_best", new Scenario() {
+            public void run(String n) throws Exception {
+                VoiceStore s = new VoiceStore(tempFile(), 20, new Lines());
+                addN(s, "p1", axis(8, 0), 4);
+                addN(s, "p2", axis(8, 1), 4);
+                // probe (1, t): p1 1/sqrt(1+t^2), p2 t/sqrt(1+t^2)
+                VoiceStore.Match close = s.match(vec(8, 0, 1, 0.9f), tuning()); // 0.743 vs 0.669: lead 0.074
+                VoiceStore.Match clear = s.match(vec(8, 0, 1, 0.8f), tuning()); // 0.781 vs 0.625: lead 0.156
+                check(n, "p1".equals(close.id) && close.band == VoiceStore.BAND_WEAK
+                                && Math.abs(close.score - 0.743f) < 0.01f && Math.abs(close.second - 0.669f) < 0.01f
+                                && Math.abs(close.margin() - 0.074f) < 0.01f
+                                && "p1".equals(clear.id) && clear.band == VoiceStore.BAND_STRONG
+                                && Math.abs(clear.margin() - 0.156f) < 0.01f,
+                        "close=" + close + " clear=" + clear);
+            }
+        });
+        scenario("store_one_person_needs_strong_plus_0_08", new Scenario() {
+            public void run(String n) throws Exception {
+                VoiceStore s = new VoiceStore(tempFile(), 20, new Lines());
+                addN(s, "p1", axis(8, 0), 4);
+                VoiceStore.Match low = s.match(vec(8, 0, 1, 1.02f), tuning()); // 0.700: strong, not +0.08
+                VoiceStore.Match high = s.match(vec(8, 0, 1, 0.88f), tuning()); // 0.751
+                check(n, low.band == VoiceStore.BAND_WEAK && "p1".equals(low.id) && Float.isNaN(low.second)
+                                && Float.isNaN(low.margin()) && high.band == VoiceStore.BAND_STRONG,
+                        "low=" + low + " high=" + high);
+            }
+        });
+        scenario("store_strong_needs_four_prints", new Scenario() {
+            public void run(String n) throws Exception {
+                VoiceStore s = new VoiceStore(tempFile(), 20, new Lines());
+                addN(s, "p1", axis(8, 0), 3);
+                VoiceStore.Match three = s.match(axis(8, 0), tuning());
+                s.add("p1", axis(8, 0));
+                VoiceStore.Match four = s.match(axis(8, 0), tuning());
+                check(n, three.band == VoiceStore.BAND_WEAK && three.prints == 3 && four.band == VoiceStore.BAND_STRONG
+                        && four.prints == 4, "three=" + three + " four=" + four);
+            }
+        });
+        scenario("store_keeps_twenty_prints_per_person", new Scenario() {
+            public void run(String n) throws Exception {
+                VoiceStore s = new VoiceStore(tempFile(), VoiceTuning.MAX_PER_PERSON, new Lines());
+                for (int i = 0; i < 25; i++) {
+                    s.add("p1", axis(32, i));
+                }
+                VoiceStore.Match m4 = s.match(axis(32, 4), tuning());
+                VoiceStore.Match m5 = s.match(axis(32, 5), tuning());
+                check(n, s.count("p1") == 20 && m4.score < 0.01f && m5.score > 0.2f, "count=" + s.count("p1"));
+            }
+        });
+        scenario("store_best_other_leaves_the_person_out", new Scenario() {
+            public void run(String n) throws Exception {
+                VoiceStore s = new VoiceStore(tempFile(), 20, new Lines());
+                s.add("p1", axis(8, 0));
+                s.add("p2", vec(8, 1, 0, 0.5f));
+                s.add("p3", axis(8, 2));
+                float other = s.bestOther("p1", axis(8, 0));
+                float none = new VoiceStore(tempFile(), 20, new Lines()).bestOther("p1", axis(8, 0));
+                check(n, Math.abs(other - 0.447f) < 0.01f && Float.isNaN(none), "other=" + other);
+            }
+        });
+
+        // ---- Owner 2026-10-03: the multi-model evaluation (debug.miko3.voice_eval) ----
+        scenario("eval_logs_every_model_per_answer_and_the_truth_on_enrolment", new Scenario() {
+            public void run(String n) throws Exception {
+                File f = tempFile();
+                File printsDir = new File(f.getParentFile(), "voiceeval/prints");
+                Lines lines = new Lines();
+                VoiceStore store = new VoiceStore(f, 20, lines);
+                VoiceId v = new VoiceId(store, tuning(), lines);
+                FakeEmbedder e = new FakeEmbedder();
+                e.out = axis(8, 0);
+                v.setEmbedder(e);
+                Heard h = new Heard();
+                v.setListener(h);
+                VoiceEval ev = new VoiceEval(printsDir, tuning(), lines);
+                ev.addModel("modelA", fixed(axis(4, 1)));
+                ev.addModel("modelB", fixed(vec(6, 2, 3, 0.5f)));
+                v.setEval(ev);
+                int[] c = {0};
+                v.start();
+                feed(v, 2000, true, c);
+                v.answered(100, true);
+                h.await(1);
+                flush(ev);
+                boolean first = lines.has("voice eval: model=campplus best=0.000 second=nan margin=nan ms=")
+                        && lines.has("voice eval: model=modelA best=0.000 second=nan margin=nan ms=")
+                        && lines.has("voice eval: model=modelB best=0.000");
+                v.enrolVoice("secret-p1", 100);
+                flush(ev);
+                boolean noTruthYet = !lines.has("voice eval: truth");
+                v.start();
+                feed(v, 2000, true, c);
+                v.answered(200, true);
+                h.await(2);
+                flush(ev);
+                boolean second = lines.has("voice eval: model=modelA best=1.000 second=nan margin=nan ms=");
+                v.enrolVoice("secret-p1", 200);
+                flush(ev);
+                boolean truth = lines.has("voice eval: truth model=campplus true=1.000 other_best=nan")
+                        && lines.has("voice eval: truth model=modelA true=1.000 other_best=nan")
+                        && lines.has("voice eval: truth model=modelB true=1.000 other_best=nan");
+                int countA = ev.count("modelA", "secret-p1");
+                int countB = ev.count("modelB", "secret-p1");
+                File[] files = printsDir.listFiles();
+                java.util.Arrays.sort(files);
+                // Embeddings only: a magic, a count, the id, a count, a size and 2 x 4 floats.
+                boolean small = files.length == 2 && files[0].getName().equals("modelA.bin")
+                        && files[1].getName().equals("modelB.bin") && files[0].length() < 200 && files[1].length() < 200;
+                v.forgetVoice("secret-p1");
+                v.shutdown();
+                ev.shutdown();
+                check(n, first && noTruthYet && second && truth && countA == 2 && countB == 2 && small
+                                && ev.count("modelA", "secret-p1") == 0 && store.count("secret-p1") == 0
+                                && !lines.all().contains("secret-p1"),
+                        "first=" + first + " noTruthYet=" + noTruthYet + " second=" + second + " truth=" + truth
+                                + " counts=" + countA + "/" + countB + " small=" + small + " lines=" + lines.all());
+            }
+        });
+        scenario("eval_without_extra_models_or_a_failing_model_still_reports_campplus", new Scenario() {
+            public void run(String n) throws Exception {
+                File f = tempFile();
+                Lines lines = new Lines();
+                VoiceId v = new VoiceId(new VoiceStore(f, 20, lines), tuning(), lines);
+                v.setEmbedder(new FakeEmbedder());
+                Heard h = new Heard();
+                v.setListener(h);
+                VoiceEval ev = new VoiceEval(new File(f.getParentFile(), "prints"), tuning(), lines);
+                ev.addModel("broken", new VoiceId.Embedder() {
+                    public float[] embed(float[] s, int k) {
+                        throw new IllegalStateException("boom");
+                    }
+                });
+                v.setEval(ev);
+                v.start();
+                int[] c = {0};
+                feed(v, 2000, true, c);
+                v.answered(7, true);
+                h.await(1);
+                flush(ev);
+                v.shutdown();
+                ev.shutdown();
+                check(n, h.results.size() == 1 && lines.has("voice eval: model=campplus best=")
+                                && lines.has("voice eval: model=broken failed: IllegalStateException"),
+                        "lines=" + lines.all());
+            }
+        });
+        scenario("eval_prints_are_deleted_and_model_files_listed", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = Files.createTempDirectory("voice_eval").toFile();
+                File prints = new File(dir, "prints");
+                prints.mkdirs();
+                new FileOutputStream(new File(prints, "m.bin")).close();
+                File models = new File(dir, "models");
+                models.mkdirs();
+                new FileOutputStream(new File(models, "b_model.onnx")).close();
+                new FileOutputStream(new File(models, "a_model.onnx")).close();
+                new FileOutputStream(new File(models, "notes.txt")).close();
+                List<File> found = VoiceEval.modelFiles(models);
+                boolean deleted = VoiceEval.deletePrints(prints);
+                check(n, deleted && !prints.exists() && found.size() == 2
+                                && VoiceEval.modelName(found.get(0).getName()).equals("a_model")
+                                && VoiceEval.modelFiles(new File(dir, "absent")).isEmpty()
+                                && !VoiceEval.deletePrints(prints),
+                        "found=" + found);
             }
         });
 

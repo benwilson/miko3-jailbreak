@@ -471,6 +471,8 @@ public final class ExploreBrainHarness {
         String voicePerson;
         float voiceScore = Float.NaN;
         int voiceBand = -1;
+        /** Owner 2026-10-03: the lead over the second-best person (NaN: only one person stored). */
+        float voiceMargin = Float.NaN;
         long voiceAfterMs = 100;
         /** What the voice gate's score of this answer against the partner answers (NaN: unknown). */
         float gateScore = Float.NaN;
@@ -493,6 +495,12 @@ public final class ExploreBrainHarness {
             return h;
         }
 
+        Hearing voice(String person, float score, int band, float margin) {
+            Hearing h = voice(person, score, band);
+            h.voiceMargin = margin;
+            return h;
+        }
+
         Hearing voiceAfter(long ms) {
             Hearing h = copy();
             h.voiceAfterMs = ms;
@@ -510,6 +518,7 @@ public final class ExploreBrainHarness {
             h.voicePerson = voicePerson;
             h.voiceScore = voiceScore;
             h.voiceBand = voiceBand;
+            h.voiceMargin = voiceMargin;
             h.voiceAfterMs = voiceAfterMs;
             h.gateScore = gateScore;
             return h;
@@ -521,6 +530,7 @@ public final class ExploreBrainHarness {
             h.voicePerson = voicePerson;
             h.voiceScore = voiceScore;
             h.voiceBand = voiceBand;
+            h.voiceMargin = voiceMargin;
             h.voiceAfterMs = voiceAfterMs;
             h.gateScore = gateScore;
             return h;
@@ -1679,7 +1689,8 @@ public final class ExploreBrainHarness {
             if (hearing != null && hearing.voiceBand >= 0 && h.status == CuriosityPort.Heard.Status.WORDS) {
                 long at = 100000L + listens;
                 voiceQueue.add(new Object[] {now + hearing.voiceAfterMs,
-                        new Ears.Voice(at, hearing.voicePerson, hearing.voiceScore, hearing.voiceBand)});
+                        new Ears.Voice(at, hearing.voicePerson, hearing.voiceScore, hearing.voiceBand,
+                                hearing.voiceMargin)});
                 gateScores.put(at, hearing.gateScore);
             }
             pendingAnsweringAt = Long.MAX_VALUE;
@@ -15791,10 +15802,12 @@ public final class ExploreBrainHarness {
     }
 
     private static void voiceScenarios() {
-        scenario("voice_a_strong_voice_with_nobody_known_adopts_them_and_says_their_name_once", n -> {
+        scenario("voice_two_strong_answers_in_a_row_adopt_them_and_say_their_name_once", n -> {
+            // Owner 2026-10-03: one strong answer is a candidate; the same person twice in a row is adopted.
             Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
-                    hearWords("not bad, busy day").voice("p-sam", 0.8f, STRONG), hearWords("sure"), hearWords("sure"),
-                    hearWords("bye"));
+                    hearWords("not bad, busy day").voice("p-sam", 0.8f, STRONG, 0.15f),
+                    hearWords("yes it was a long one").voice("p-sam", 0.78f, STRONG, 0.13f), hearWords("sure"),
+                    hearWords("sure"), hearWords("bye"));
             rig.people.named.put("p-sam", "Sam");
             rig.people.notes.put("p-sam", "{\"interests\":[\"chess\"]}");
             rig.people.voicePrints.put("p-sam", 4);
@@ -15812,6 +15825,9 @@ public final class ExploreBrainHarness {
                             && last != null && "Sam".equals(last.request.name) && !last.request.recalled
                             && rig.recalls.isEmpty() && rig.enrolled.isEmpty() && !rig.notesDeltas.isEmpty()
                             && allStartWith(rig.notesDeltas, "p-sam: ") && noted(notes, "identity: voice strong → known")
+                            && noted(notes, "identity: voice candidate (margin 0.15, run 1)")
+                            && noted(notes, "identity: voice candidate (margin 0.13, run 2)")
+                            && noted(notes, "identity: voice adopted")
                             && noted(turns, " voice=strong ") && noted(turns, " voice=- ")
                             && identityLinesClean(notes, "Sam", "p-sam") && rig.violations.isEmpty(),
                     "voiceRecalls=" + rig.voiceRecalls + " byVoice=" + byVoice + " turns=" + turns + " " + rig.tail());
@@ -15897,7 +15913,7 @@ public final class ExploreBrainHarness {
         });
         scenario("voice_someone_who_says_they_are_someone_else_is_that_name_and_the_voice_goes_there", n -> {
             Rig rig = facelessCallRig(0, turnsOf(turnLine(1), turnLine(2), turnLine(3), named(4, "Priya")),
-                    hearWords("hello").voice("p-sam", 0.8f, STRONG), hearWords("not quite"),
+                    hearWords("hello").voice("p-sam", 0.8f, STRONG), hearWords("not quite").voice("p-sam", 0.8f, STRONG),
                     hearWords("I'm actually Priya"), hearWords("sure"), hearWords("bye"));
             rig.people.named.put("p-sam", "Sam");
             rig.people.voicePrints.put("p-sam", 4);
@@ -15920,11 +15936,14 @@ public final class ExploreBrainHarness {
                     "voiceRecalls=" + rig.voiceRecalls + " recalls=" + rig.recalls + " enrolled=" + rig.enrolled
                             + " deltas=" + rig.notesDeltas + " " + rig.tail());
         });
-        scenario("voice_a_face_that_disagrees_keeps_the_voice_identity_and_stores_no_face", n -> {
+        scenario("voice_a_face_that_disagrees_after_adoption_drops_the_voice_identity_and_asks_the_name", n -> {
+            // Robot 2026-10-03: the owner's wife was called by his name; the face check was right.
             Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
-                    hearWords("hello").voice("p-sam", 0.8f, STRONG), replies(6)[0], replies(6)[1], replies(6)[2],
-                    replies(6)[3], replies(6)[4], hearWords("bye"));
+                    hearWords("hello").voice("p-sam", 0.8f, STRONG, 0.2f),
+                    hearWords("good thanks").voice("p-sam", 0.8f, STRONG, 0.2f), replies(6)[0], replies(6)[1],
+                    replies(6)[2], replies(6)[3], replies(6)[4], hearWords("bye"));
             rig.people.named.put("p-sam", "Sam");
+            rig.people.notes.put("p-sam", "{\"interests\":[\"chess\"]}");
             rig.people.voicePrints.put("p-sam", 4);
             rig.people.match = (r, k) -> k >= 3
                     ? CuriosityPort.MatchAnswer.known("Ben").withMatch(FaceMatcher.Band.CONFIDENT, "p-ben", 0.8f, 40L + k)
@@ -15935,11 +15954,96 @@ public final class ExploreBrainHarness {
             long open = openChat(rig);
             long over = chatOver(rig, open);
             TurnAsk last = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(rig.turnAsks.size() - 1);
-            check(n, open > 0 && over > 0 && noted(notes, "identity: face disagrees") && rig.photos.isEmpty()
-                            && rig.kept.isEmpty() && last != null && "Sam".equals(last.request.name)
+            List<TurnAsk> asks = cued(rig, CuriosityPort.TurnRequest.IdCue.ASK_NAME);
+            check(n, open > 0 && over > 0 && rig.voiceRecalls.equals(java.util.Arrays.asList("p-sam"))
+                            && noted(notes, "identity: voice adopted")
+                            && noted(notes, "identity: face disagrees → asking the name") && asks.size() == 1
+                            && asks.get(0).request.name == null && rig.photos.isEmpty() && rig.kept.isEmpty()
+                            && last != null && last.request.name == null
                             && (last.request.notes == null || !last.request.notes.contains("golf"))
-                            && allStartWith(rig.notesDeltas, "p-sam: ") && rig.violations.isEmpty(),
-                    "photos=" + rig.photos + " last=" + (last == null ? null : last.request.name) + " " + rig.tail());
+                            && (last.request.notes == null || !last.request.notes.contains("chess"))
+                            && rig.enrolled.isEmpty() && identityLinesClean(notes, "Sam", "Ben", "p-sam", "p-ben")
+                            && rig.violations.isEmpty(),
+                    "asks=" + asks.size() + " last=" + (last == null ? null : last.request.name) + " enrolled="
+                            + rig.enrolled + " " + rig.tail());
+        });
+        scenario("voice_one_strong_answer_is_only_a_candidate_and_a_break_starts_the_run_over", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                    hearWords("hello there").voice("p-sam", 0.8f, STRONG, 0.12f),
+                    hearWords("not much").voice("p-sam", 0.55f, WEAK, 0.04f),
+                    hearWords("yes I suppose").voice("p-sam", 0.8f, STRONG, 0.12f), hearWords("bye"));
+            rig.people.named.put("p-sam", "Sam");
+            rig.people.voicePrints.put("p-sam", 4);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            int runOnes = 0;
+            for (String x : notes) {
+                runOnes += x.contains("identity: voice candidate (margin 0.12, run 1)") ? 1 : 0;
+            }
+            check(n, open > 0 && over > 0 && rig.voiceRecalls.isEmpty() && runOnes == 2
+                            && !noted(notes, "run 2)") && !noted(notes, "identity: voice adopted")
+                            && rig.notesDeltas.isEmpty() && rig.enrolled.isEmpty()
+                            && cued(rig, CuriosityPort.TurnRequest.IdCue.ASK_NAME).size() == 1
+                            && identityLinesClean(notes, "Sam", "p-sam") && rig.violations.isEmpty(),
+                    "runOnes=" + runOnes + " voiceRecalls=" + rig.voiceRecalls + " " + rig.tail());
+        });
+        scenario("voice_a_face_that_agrees_with_the_candidate_adopts_at_once", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                    hearWords("hello").voice("p-sam", 0.8f, STRONG, 0.2f), replies(6)[0], replies(6)[1],
+                    replies(6)[2], replies(6)[3], replies(6)[4], hearWords("bye"));
+            rig.people.named.put("p-sam", "Sam");
+            rig.people.voicePrints.put("p-sam", 4);
+            rig.people.match = (r, k) -> k >= 3
+                    ? CuriosityPort.MatchAnswer.known("Sam").withMatch(FaceMatcher.Band.CONFIDENT, "p-sam", 0.8f, 40L + k)
+                            .withConversation(r.people.persona, "p-sam", "{\"interests\":[\"chess\"]}", null)
+                    : noFace(r);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            TurnAsk last = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(rig.turnAsks.size() - 1);
+            check(n, open > 0 && over > 0 && rig.voiceRecalls.isEmpty()
+                            && noted(notes, "identity: face agrees with the voice candidate")
+                            && noted(notes, "identity: voice adopted") && last != null && "Sam".equals(last.request.name)
+                            && enrolledOnlyTo(rig, "p-sam") && rig.enrolled.size() == 1
+                            && identityLinesClean(notes, "Sam", "p-sam") && rig.violations.isEmpty(),
+                    "voiceRecalls=" + rig.voiceRecalls + " enrolled=" + rig.enrolled + " last="
+                            + (last == null ? null : last.request.name) + " " + rig.tail());
+        });
+        scenario("voice_a_face_that_disagrees_with_the_candidate_stops_voice_adoption_and_asks_the_name", n -> {
+            Rig rig = facelessCallRig(0, (r, req, k) -> turnLine(k),
+                    hearWords("hello").voice("p-sam", 0.8f, STRONG, 0.2f), replies(6)[0], replies(6)[1],
+                    replies(6)[2], hearWords("more or less").voice("p-sam", 0.8f, STRONG, 0.2f),
+                    hearWords("I think so").voice("p-sam", 0.8f, STRONG, 0.2f), hearWords("bye"));
+            rig.people.named.put("p-sam", "Sam");
+            rig.people.voicePrints.put("p-sam", 4);
+            rig.people.match = (r, k) -> k >= 3
+                    ? CuriosityPort.MatchAnswer.known("Ben").withMatch(FaceMatcher.Band.CONFIDENT, "p-ben", 0.8f, 40L + k)
+                            .withConversation(r.people.persona, "p-ben", "{\"interests\":[\"golf\"]}", null)
+                    : noFace(r);
+            List<String> notes = traced(rig);
+            rig.started();
+            long open = openChat(rig);
+            long over = chatOver(rig, open);
+            int veto = -1;
+            int laterRun = -1;
+            for (int i = 0; i < notes.size(); i++) {
+                if (veto < 0 && notes.get(i).contains("identity: face disagrees → asking the name")) {
+                    veto = i;
+                }
+                if (veto >= 0 && notes.get(i).contains("run 2)")) {
+                    laterRun = i;
+                }
+            }
+            TurnAsk last = rig.turnAsks.isEmpty() ? null : rig.turnAsks.get(rig.turnAsks.size() - 1);
+            List<TurnAsk> asks = cued(rig, CuriosityPort.TurnRequest.IdCue.ASK_NAME);
+            check(n, open > 0 && over > 0 && veto >= 0 && laterRun > veto && rig.voiceRecalls.isEmpty()
+                            && !noted(notes, "identity: voice adopted") && asks.size() == 1 && last != null
+                            && last.request.name == null && rig.enrolled.isEmpty()
+                            && identityLinesClean(notes, "Sam", "Ben", "p-sam", "p-ben") && rig.violations.isEmpty(),
+                    "veto=" + veto + " laterRun=" + laterRun + " asks=" + asks.size() + " " + rig.tail());
         });
         scenario("voice_gate_an_answer_in_another_voice_is_not_said_to_him", n -> {
             String tv = "'S CURIOUS U 'S 'S AND THERE'S A HUNDRED TWENTY WOMEN";

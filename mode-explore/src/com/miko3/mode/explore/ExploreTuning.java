@@ -553,6 +553,13 @@ final class ExploreTuning {
     final float voiceFarScore;
     final int voiceFarPrints;
     final int voiceEnrolMax;
+    /**
+     * Owner 2026-10-03 (CAM++ took the owner's wife for him): a strong voice match (the launcher's
+     * band already needs a clear lead over the second-best person and 4+ prints) adopts that
+     * person only after this many clean answers in a row matched them, or at once when a face
+     * agrees; a face that disagrees stops voice adoption for the conversation.
+     */
+    final int voiceAdoptRun;
     final long chatVoiceGateMs;
     final long chatVoiceScoreMs;
     /**
@@ -1139,6 +1146,7 @@ final class ExploreTuning {
         voiceFarScore = b.voiceFarScore;
         voiceFarPrints = Math.max(1, b.voiceFarPrints);
         voiceEnrolMax = Math.max(0, b.voiceEnrolMax);
+        voiceAdoptRun = Math.max(1, b.voiceAdoptRun);
         chatVoiceGateMs = Math.max(0, b.chatVoiceGateMs);
         chatVoiceScoreMs = Math.max(0, b.chatVoiceScoreMs);
         callChatFirst = b.callChatFirst;
@@ -1590,6 +1598,7 @@ final class ExploreTuning {
         private float voiceFarScore = 0.30f;
         private int voiceFarPrints = 3;
         private int voiceEnrolMax = 3;
+        private int voiceAdoptRun = 2;
         private long chatVoiceGateMs = 1000;
         private long chatVoiceScoreMs = 200;
         // Owner 2026-10-02: conversation first; the answer waits for the wake utterance's end

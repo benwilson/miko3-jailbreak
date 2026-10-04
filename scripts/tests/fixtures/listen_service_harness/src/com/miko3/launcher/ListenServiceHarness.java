@@ -502,7 +502,7 @@ public final class ListenServiceHarness {
         final CountDownLatch voiced = new CountDownLatch(1);
 
         @Override
-        public void voice(long at, String person, float score, int band) {
+        public void voice(long at, String person, float score, int band, float margin) {
             heardBeforeVoice.add(heard.size());
             voice.add(at + ":" + person + ":" + band);
             voiced.countDown();
@@ -733,8 +733,8 @@ public final class ListenServiceHarness {
             final EarsSession session = r.session;
             id.setListener(new VoiceId.Listener() {
                 @Override
-                public void voice(long at, String person, float score, int band) {
-                    session.voiceHeard(at, person, score, band);
+                public void voice(long at, String person, float score, int band, float margin) {
+                    session.voiceHeard(at, person, score, band, margin);
                 }
             });
             session.setVoice(id);

@@ -128,6 +128,17 @@ VOICEID_MODEL_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/sp
 VOICEID_MODEL_SHA256 = "357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b"
 VOICEID_ASSET = "voiceid/model.onnx"
 VOICEID_CACHE = REPO / "tools" / "third_party" / "voiceid"
+# Owner 2026-10-03: two more speaker models for the opt-in voice evaluation (VoiceEval). Never
+# bundled in the APK (66 MB): scripts/push-voice-eval-models.py fetches them through
+# voice_eval_models() and pushes them to the launcher's files/voiceeval/models/.
+VOICE_EVAL_MODELS = {
+    "3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx":
+        "c59158379255ad66e161679cca6af8d52d51e389e3224ab7d7a7baae295c2db5",
+    "nemo_en_titanet_small.onnx":
+        "ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e",
+}
+VOICE_EVAL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+VOICE_EVAL_CACHE = REPO / "tools" / "third_party" / "voiceeval"
 # The hotwords file lives at the APK asset root, outside the staged model directory.
 HOTWORDS = LAUNCHER_ASSETS / "hotwords.txt"
 STAMP = "stamp.txt"
@@ -348,6 +359,19 @@ def voiceid_model(cache=VOICEID_CACHE, fetch=fetch):
     return root
 
 
+def voice_eval_models(cache=VOICE_EVAL_CACHE, fetch=fetch):
+    """The voice evaluation's extra models, each fetched (checksummed) into cache once: a list
+    of local paths in VOICE_EVAL_MODELS order. Raises BuildError naming the model that failed."""
+    out = []
+    for name, sha in VOICE_EVAL_MODELS.items():
+        dest = Path(cache) / name
+        try:
+            out.append(Path(fetch(VOICE_EVAL_URL + name, dest, sha)))
+        except BuildError as e:
+            raise BuildError(f"!! cannot fetch {name} for the voice evaluation\n   {e}")
+    return out
+
+
 def placeholder_voice(cache=SHERPA_CACHE):
     """Asset root holding voice/ for the stock placeholder voice."""
     root = Path(cache) / PLACEHOLDER_VOICE
@@ -408,7 +432,15 @@ def main():
     ap.add_argument("--sdk", help="Android SDK root (default: auto-detect)")
     ap.add_argument("--no-bootstrap", action="store_true",
                     help="fail if the toolchain is missing instead of installing it")
+    ap.add_argument("--voice-eval-models", action="store_true",
+                    help="also fetch the voice evaluation's extra speaker models into "
+                         "tools/third_party/voiceeval/ (never bundled; push them with "
+                         "scripts/push-voice-eval-models.py)")
     args = ap.parse_args()
+
+    if args.voice_eval_models:
+        for p in voice_eval_models():
+            print(f"== voice eval model ready: {p} ==")
 
     # Checked first, so a missing library or asset never costs toolchain work.
     vendor_native_libs()

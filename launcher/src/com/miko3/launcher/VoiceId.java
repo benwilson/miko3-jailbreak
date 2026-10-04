@@ -32,9 +32,13 @@ final class VoiceId implements VoicePrints {
         float[] embed(float[] samples, int n) throws Exception;
     }
 
-    /** Told once per embedded answer, on the voice thread: the best person (or null), score and band. */
+    /**
+     * Told once per embedded answer, on the voice thread: the best person (or null), score, band
+     * and (owner 2026-10-03) the score's lead over the second-best person, NaN when nobody else
+     * has prints.
+     */
     interface Listener {
-        void voice(long at, String person, float score, int band);
+        void voice(long at, String person, float score, int band, float margin);
     }
 
     private static final int CAP = (int) (VoiceTuning.SAMPLE_RATE * VoiceTuning.MAX_BUFFER_MS / 1000);
@@ -56,6 +60,8 @@ final class VoiceId implements VoicePrints {
     private final VoiceStore.Diag diag;
     private volatile Embedder embedder;
     private volatile Listener listener;
+    /** Owner 2026-10-03: the opt-in multi-model evaluation, or null (VoiceTuning.EVAL_PROP). */
+    private volatile VoiceEval eval;
 
     // The buffer: written only on the capture thread, guarded by itself for the snapshot.
     private final float[] buf = new float[CAP];
@@ -90,6 +96,10 @@ final class VoiceId implements VoicePrints {
 
     void setListener(Listener l) {
         listener = l;
+    }
+
+    void setEval(VoiceEval e) {
+        eval = e;
     }
 
     /** Runs r on the voice thread (the model's load, the bench); false when it is busy or shut down. */
@@ -219,11 +229,19 @@ final class VoiceId implements VoicePrints {
         diag.log("voice: embedding in " + ms + " ms (dur " + durMs + " ms of " + ofMs + " ms)");
         remember(at, embedding);
         VoiceStore.Match m = store.match(embedding, tuning);
-        diag.log(String.format(Locale.US, "voice: match band=%s score=%.2f", VoiceTuning.bandName(m.band), m.score));
+        float margin = m.margin();
+        diag.log(String.format(Locale.US, "voice: match band=%s score=%.2f margin=%s", VoiceTuning.bandName(m.band),
+                m.score, Float.isNaN(margin) ? "solo" : String.format(Locale.US, "%.2f", margin)));
+        VoiceEval ev = eval;
+        if (ev != null) {
+            // Queued before the mode hears of this answer, so its enrol call always follows.
+            ev.answerLine(VoiceEval.CAMPPLUS, m, ms);
+            ev.submit(at, clip, take);
+        }
         Listener l = listener;
         if (l != null) {
             try {
-                l.voice(at, m.id, m.score, m.band);
+                l.voice(at, m.id, m.score, m.band, margin);
             } catch (RuntimeException ex) {
                 diag.log("voice: delivery failed: " + ex.getClass().getSimpleName());
             }
@@ -301,11 +319,24 @@ final class VoiceId implements VoicePrints {
     @Override
     public boolean enrolVoice(String personId, long at) {
         float[] e = lastEmbeddingFor(at);
-        return e != null && enrolVoice(personId, e);
+        if (e == null || personId == null) {
+            return false;
+        }
+        VoiceEval ev = eval;
+        if (ev != null) {
+            // The evaluation's ground truth: this answer against its true person, before it joins them.
+            ev.truthLine(VoiceEval.CAMPPLUS, store.score(personId, e), store.bestOther(personId, e));
+            ev.enrol(personId, at);
+        }
+        return enrolVoice(personId, e);
     }
 
     @Override
     public boolean forgetVoice(String personId) {
+        VoiceEval ev = eval;
+        if (ev != null) {
+            ev.forget(personId);
+        }
         boolean ok = store.forget(personId);
         if (ok) {
             diag.log("voice: forgot a person's voice");

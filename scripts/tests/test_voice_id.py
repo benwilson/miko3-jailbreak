@@ -31,6 +31,8 @@ VOICE_ID = LAUNCHER / "VoiceId.java"
 VOICE_STORE = LAUNCHER / "VoiceStore.java"
 VOICE_TUNING = LAUNCHER / "VoiceTuning.java"
 VOICE_PRINTS = LAUNCHER / "VoicePrints.java"
+VOICE_EVAL = LAUNCHER / "VoiceEval.java"
+PUSH_EVAL_PY = REPO / "scripts" / "push-voice-eval-models.py"
 EMBEDDER = LAUNCHER / "SherpaVoiceEmbedder.java"
 EARS = LAUNCHER / "EarsSession.java"
 ENGINE = LAUNCHER / "ListenEngine.java"
@@ -95,6 +97,16 @@ class VoiceIdHarnessTest(unittest.TestCase):
         "score_an_answer_against_a_person_or_another_answer",
         "only_the_most_recent_embeddings_are_kept_for_enrolment",
         "a_failing_embedder_is_logged_by_kind_and_reports_nothing",
+        # Owner 2026-10-03: the margin rule and the multi-model evaluation.
+        "tuning_old_stopgap_properties_are_ignored",
+        "store_strong_needs_a_clear_lead_over_the_second_best",
+        "store_one_person_needs_strong_plus_0_08",
+        "store_strong_needs_four_prints",
+        "store_keeps_twenty_prints_per_person",
+        "store_best_other_leaves_the_person_out",
+        "eval_logs_every_model_per_answer_and_the_truth_on_enrolment",
+        "eval_without_extra_models_or_a_failing_model_still_reports_campplus",
+        "eval_prints_are_deleted_and_model_files_listed",
     )
 
     @classmethod
@@ -137,7 +149,7 @@ jvm_harness.add_scenario_tests(VoiceIdHarnessTest)
 class PlainJavaTest(unittest.TestCase):
     def test_store_tuning_and_buffer_are_plain_java(self):
         """Proven in the host harness, so none may touch android.* or sherpa."""
-        for path in (VOICE_ID, VOICE_STORE, VOICE_TUNING, VOICE_PRINTS):
+        for path in (VOICE_ID, VOICE_STORE, VOICE_TUNING, VOICE_PRINTS, VOICE_EVAL):
             src = path.read_text()
             self.assertNotIn("import android.", src, path.name)
             self.assertNotIn("com.k2fsa", src, path.name)
@@ -146,7 +158,7 @@ class PlainJavaTest(unittest.TestCase):
 class PrivacyTest(unittest.TestCase):
     def test_no_audio_is_ever_written(self):
         """Embeddings only: the buffer lives in memory, and only VoiceStore writes a file."""
-        for path in (VOICE_ID, VOICE_TUNING, VOICE_PRINTS, EMBEDDER):
+        for path in (VOICE_ID, VOICE_TUNING, VOICE_PRINTS, EMBEDDER, VOICE_EVAL):
             src = _read(path)
             for needle in ("FileOutputStream", "RandomAccessFile", "Files.write", "FileWriter", ".wav"):
                 self.assertNotIn(needle, src, f"{path.name} writes {needle}")
@@ -162,7 +174,7 @@ class PrivacyTest(unittest.TestCase):
     def test_logs_never_carry_names_ids_or_audio(self):
         """Every log line is built from counts, timings, scores and bands; never an id, a name or samples."""
         offenders = []
-        for path in (VOICE_ID, VOICE_STORE, EMBEDDER):
+        for path in (VOICE_ID, VOICE_STORE, EMBEDDER, VOICE_EVAL):
             for stmt in re.findall(r"diag\.log\((.*?)\);", _read(path), flags=re.S):
                 bare = re.sub(r'"(?:\\.|[^"\\])*"', "", stmt)
                 if re.search(r"\b(id|personId|person|name|text|samples|snapshot|buf|embedding)\b", bare):
@@ -245,20 +257,23 @@ class WiringTest(unittest.TestCase):
         launcher never receives one."""
         src = _read(EARS_INTERFACE)
         head = src.split("abstract class Stub", 1)[0]
-        self.assertRegex(head, r"void voice\(long at, String person, float score, int band\) throws RemoteException;")
+        self.assertRegex(head, r"void voice\(long at, String person, float score, int band, float margin\) "
+                               r"throws RemoteException;")
         for name, value in (("VOICE_NONE", 0), ("VOICE_WEAK", 1), ("VOICE_STRONG", 2)):
             self.assertRegex(src, rf"int {name}\s*=\s*{value};")
         self.assertIn("static final int TRANSACTION_voice = 5;", src)
         stub = src.split("case TRANSACTION_voice:", 1)[1].split("return true;", 1)[0]
         self.assertRegex(stub, r"long at = data\.readLong\(\);\s*String person = data\.readString\(\);\s*"
-                               r"float score = data\.readFloat\(\);\s*voice\(at, person, score, data\.readInt\(\)\);")
+                               r"float score = data\.readFloat\(\);\s*int band = data\.readInt\(\);\s*"
+                               r"float margin = data\.dataAvail\(\) >= 4 \? data\.readFloat\(\) : Float\.NaN;\s*"
+                               r"voice\(at, person, score, band, margin\);")
         proxy = src.split("private static class Proxy implements Callback", 1)[1]
         self.assertRegex(proxy, r"data\.writeLong\(at\);\s*data\.writeString\(person\);\s*data\.writeFloat\(score\);\s*"
-                                r"data\.writeInt\(band\);\s*remote\.transact\(TRANSACTION_voice, data, null, "
+                                r"data\.writeInt\(band\);\s*data\.writeFloat\(margin\);\s*remote\.transact\(TRANSACTION_voice, data, null, "
                                 r"IBinder\.FLAG_ONEWAY\);")
         client = _read(EARS_CLIENT)
-        self.assertRegex(client, r"default void onVoice\(long at, String person, float score, int band\)\s*\{\s*\}")
-        self.assertIn("listener.onVoice(at, person, score, band);", client)
+        self.assertRegex(client, r"default void onVoice\(long at, String person, float score, int band, float margin\)\s*\{\s*\}")
+        self.assertIn("listener.onVoice(at, person, score, band, margin);", client)
         # The band constants agree on both sides.
         store = _read(VOICE_STORE)
         for name, value in (("BAND_NONE", 0), ("BAND_WEAK", 1), ("BAND_STRONG", 2)):
@@ -267,11 +282,11 @@ class WiringTest(unittest.TestCase):
     def test_engine_relays_the_result_on_the_delivery_thread(self):
         engine = _read(ENGINE)
         self.assertRegex(engine, r"public void voice\(final long at, final String person, final float score, "
-                                 r"final int band\)")
-        self.assertIn("callback.voice(at, person, score, band);", engine)
+                                 r"final int band, final float margin\)")
+        self.assertIn("callback.voice(at, person, score, band, margin);", engine)
         ears = _read(EARS)
-        self.assertRegex(ears, r"default void voice\(long at, String person, float score, int band\)\s*\{\s*\}")
-        self.assertIn("void voiceHeard(long at, String person, float score, int band)", ears)
+        self.assertRegex(ears, r"default void voice\(long at, String person, float score, int band, float margin\)\s*\{\s*\}")
+        self.assertIn("void voiceHeard(long at, String person, float score, int band, float margin)", ears)
 
     def test_people_layer_interface(self):
         src = _read(VOICE_PRINTS)
@@ -294,6 +309,36 @@ class WiringTest(unittest.TestCase):
         bench = BENCH_PY.read_text()
         self.assertIn("debug.miko3.voice_bench", bench)
         self.assertIn("voice: bench", bench)
+
+
+class EvalWiringTest(unittest.TestCase):
+    """Owner 2026-10-03: the opt-in multi-model evaluation and the stop-gap properties."""
+
+    def test_engine_turns_the_evaluation_on_by_property_and_deletes_its_prints_when_off(self):
+        engine = _read(ENGINE)
+        self.assertIn('"1".equals(SpeechEngine.systemProperty(VoiceTuning.EVAL_PROP))', engine)
+        self.assertIn('VOICE_EVAL_DIR = "voiceeval";', engine)
+        self.assertIn("voiceId.setEval(voiceEval);", engine)
+        self.assertIn('VoiceEval.deletePrints(new File(evalDir, "prints"))', engine)
+        self.assertIn('VoiceEval.modelFiles(dir)', _method_body(engine, "private void loadVoiceEval("))
+        self.assertIn('EVAL_PROP = "debug.miko3.voice_eval"', _read(VOICE_TUNING))
+
+    def test_engine_warns_when_the_old_stopgap_properties_are_set(self):
+        engine = _read(ENGINE)
+        self.assertIn("if (voiceTuning.legacySet)", engine)
+        self.assertIn("VoiceTuning.LEGACY_STRONG_PROP", engine)
+
+    def test_eval_feeds_on_the_same_clip_before_the_mode_hears_and_enrols_with_the_people_layer(self):
+        vid = _read(VOICE_ID)
+        identify = _method_body(vid, "private void identify(")
+        self.assertLess(identify.index("ev.submit(at, clip, take);"), identify.index("l.voice(at, m.id, m.score"))
+        enrol = _method_body(vid, "public boolean enrolVoice(String personId, long at)")
+        self.assertLess(enrol.index("ev.truthLine("), enrol.index("return enrolVoice(personId, e);"))
+        self.assertIn("ev.enrol(personId, at);", enrol)
+        self.assertIn("ev.forget(personId);", _method_body(vid, "public boolean forgetVoice("))
+
+    def test_push_script_exists_and_is_python(self):
+        self.assertTrue(PUSH_EVAL_PY.is_file())
 
 
 class BenchScriptTest(unittest.TestCase):

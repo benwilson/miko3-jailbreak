@@ -339,20 +339,22 @@ public final class EarsAdapterHarness {
     /** Owner 2026-10-02: each answer's voice waits, oldest first and capped, until polled; closing drops them. */
     private static String voiceWaitsForTheBrain() {
         EarsAdapter a = opened();
-        a.onVoice(1000, "pid-1", 0.8f, RobotEars.VOICE_STRONG);
-        a.onVoice(2000, null, 0.2f, RobotEars.VOICE_NONE);
+        a.onVoice(1000, "pid-1", 0.8f, RobotEars.VOICE_STRONG, 0.12f);
+        a.onVoice(2000, null, 0.2f, RobotEars.VOICE_NONE, Float.NaN);
         Ears.Voice first = a.pollVoice();
         Ears.Voice second = a.pollVoice();
         Ears.Voice none = a.pollVoice();
         for (int i = 0; i < EarsAdapter.VOICE_MAX + 2; i++) {
-            a.onVoice(10 + i, "pid-2", 0.5f, RobotEars.VOICE_WEAK);
+            a.onVoice(10 + i, "pid-2", 0.5f, RobotEars.VOICE_WEAK, 0.01f);
         }
         Ears.Voice oldest = a.pollVoice();
         a.close();
         Ears.Voice afterClose = a.pollVoice();
         EarsAdapter closed = new EarsAdapter(new Context());
-        closed.onVoice(5, "pid-3", 0.9f, RobotEars.VOICE_STRONG);
+        closed.onVoice(5, "pid-3", 0.9f, RobotEars.VOICE_STRONG, 0.2f);
         if (first == null || first.at != 1000 || !"pid-1".equals(first.personId) || !first.strong()
+                || Math.abs(first.margin - 0.12f) > 1e-6 || !"0.12".equals(first.marginWord())
+                || (second != null && (!Float.isNaN(second.margin) || !"solo".equals(second.marginWord())))
                 || second == null || second.at != 2000 || second.personId != null || second.band != Ears.Voice.NONE
                 || none != null || oldest == null || oldest.at != 12 || afterClose != null || closed.pollVoice() != null
                 || !a.drain().isEmpty()) {
