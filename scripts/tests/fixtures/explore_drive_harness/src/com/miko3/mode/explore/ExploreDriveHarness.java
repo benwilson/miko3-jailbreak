@@ -40,6 +40,8 @@ public final class ExploreDriveHarness {
         @Override public void forwardTick() throws IOException { record("forward"); }
         @Override public void turn(ExploreBrain.Direction d) throws IOException { record("turn-" + d); }
         @Override public void backTick() throws IOException { record("back"); }
+        @Override public void disableTofCheck() throws IOException { calls.add("tofds"); }
+        @Override public void enableTofCheck() throws IOException { calls.add("tofen"); }
         @Override public void stop() throws IOException {
             calls.add("stop");
             if (failStops > 0) {
@@ -92,6 +94,8 @@ public final class ExploreDriveHarness {
         @Override public boolean freezeBrain() { return frozen; }
         @Override public boolean curiousNow() { return false; }
         @Override public boolean spinInPlace() { return spin; }
+        volatile boolean probe;
+        @Override public boolean fwdProbe() { return probe; }
     }
 
     /** Records trace notes, for the spin phases the QA script segments by. */
@@ -464,5 +468,152 @@ public final class ExploreDriveHarness {
                 spinForward == 0 && spinLefts >= 1 && afterSpinOff.equals("stop"),
                 "forward/back=" + spinForward + " lefts=" + spinLefts + " first after off=" + afterSpinOff
                         + " calls=" + pw.calls);
+
+        // The fwd probe (dark floor, 2026-10-02): TOFDS as it starts, forward legs whatever
+        // the floor reads, and TOFEN when the hook goes off.
+        FakeWheels pqw = new FakeWheels();
+        FakeLease pql = new FakeLease();
+        pql.held = true;
+        Hooks probeHooks = new Hooks();
+        probeHooks.probe = true;
+        ExploreLoop probing = new ExploreLoop(spinTuning(null), REAL, pqw, new ClearSensors(REAL), pql,
+                NO_EYES, NO_SOUND, probeHooks, null, 10, 600);
+        probing.start();
+        sleep(100);
+        boolean dsFirst = pqw.calls.indexOf("tofds") >= 0 && pqw.count("tofen") == 0;
+        probeHooks.probe = false;
+        sleep(100);
+        int enAfterOff = pqw.count("tofen");
+        probing.stop();
+        check("loop_fwd_probe_sends_tofds_at_start_and_tofen_when_it_ends", dsFirst && enAfterOff == 1,
+                "tofds before off=" + dsFirst + " tofen after off=" + enAfterOff + " calls=" + pqw.calls);
+
+        FakeWheels pqw2 = new FakeWheels();
+        FakeLease pql2 = new FakeLease();
+        pql2.held = true;
+        Hooks probeHooks2 = new Hooks();
+        probeHooks2.probe = true;
+        ExploreLoop probing2 = new ExploreLoop(spinTuning(null), REAL, pqw2, new ClearSensors(REAL), pql2,
+                NO_EYES, NO_SOUND, probeHooks2, null, 10, 600);
+        probing2.start();
+        sleep(100);
+        probing2.stop();
+        check("loop_stop_during_fwd_probe_sends_tofen", pqw2.count("tofds") >= 1 && pqw2.count("tofen") == 1,
+                "calls=" + pqw2.calls);
+
+        darkFloorScenarios();
+    }
+
+    /** A settable dark-floor switch, as the system property would be. */
+    static final class Switch implements DarkFloor.Source {
+        volatile boolean on;
+        @Override public boolean darkFloor() { return on; }
+    }
+
+    static SensorReading flagged(long t, int ir2, Integer cpl) {
+        return new SensorReading(t, 16383, SensorSnapshotAbsent.ABSENT, ir2, cpl, false);
+    }
+
+    /** A reading every 100 ms from..to (inclusive), each passed to df while held. */
+    static void feed(DarkFloor df, long from, long to, int ir2, Integer cpl) {
+        for (long t = from; t <= to; t += 100) {
+            df.onPass(t, true, flagged(t, ir2, cpl));
+        }
+    }
+
+    static boolean noted(Notes n, String part) {
+        synchronized (n.notes) {
+            for (String x : n.notes) {
+                if (x.contains(part)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    static void darkFloorScenarios() {
+        // The loop: the switch read at start and every pollMs, TOFDS while held, TOFEN on off and stop.
+        FakeWheels dw = new FakeWheels();
+        FakeLease dl = new FakeLease();
+        dl.held = true;
+        Switch sw = new Switch();
+        sw.on = true;
+        Notes dn = new Notes();
+        ExploreLoop dark = new ExploreLoop(quickTuning(), REAL, dw, new ClearSensors(REAL), dl,
+                NO_EYES, NO_SOUND, new Hooks(), dn, 10, 600);
+        dark.setDarkFloor(sw, 50);
+        dark.start();
+        sleep(300);
+        int dsHeld = dw.count("tofds");
+        check("loop_dark_floor_on_sends_tofds_once_while_held",
+                dsHeld == 1 && dw.count("tofen") == 0 && noted(dn, "dark floor: on")
+                        && noted(dn, "dark floor: TOFDS sent (drive session start)"),
+                "tofds=" + dsHeld + " calls=" + dw.calls + " notes=" + dn.notes);
+        dl.held = false;
+        sleep(100);
+        dl.held = true;
+        sleep(200);
+        check("loop_dark_floor_lease_regained_sends_tofds_again", dw.count("tofds") == 2
+                        && noted(dn, "dark floor: TOFDS sent (lease re-acquired)"),
+                "tofds=" + dw.count("tofds") + " notes=" + dn.notes);
+        sw.on = false;
+        sleep(200);
+        int enOff = dw.count("tofen");
+        check("loop_dark_floor_switched_off_sends_tofen", enOff == 1 && noted(dn, "dark floor: off")
+                        && noted(dn, "dark floor: TOFEN sent (dark floor switched off)"),
+                "tofen=" + enOff + " notes=" + dn.notes);
+        sw.on = true;
+        sleep(200);
+        dark.stop();
+        check("loop_dark_floor_stop_sends_tofen", dw.count("tofds") == 3 && dw.count("tofen") == 2
+                        && dw.calls.get(dw.calls.size() - 1).equals("tofen")
+                        && noted(dn, "dark floor: TOFEN sent (explore stopped)"),
+                "calls tail=" + dw.calls.subList(Math.max(0, dw.calls.size() - 4), dw.calls.size()));
+
+        FakeWheels ow = new FakeWheels();
+        FakeLease ol = new FakeLease();
+        ol.held = true;
+        ExploreLoop off = new ExploreLoop(quickTuning(), REAL, ow, new ClearSensors(REAL), ol,
+                NO_EYES, NO_SOUND, new Hooks(), null, 10, 600);
+        off.start();
+        sleep(200);
+        off.stop();
+        check("loop_dark_floor_off_by_default_sends_neither", ow.count("tofds") == 0 && ow.count("tofen") == 0,
+                "calls=" + ow.calls);
+
+        // DarkFloor itself on a made-up clock: re-sending when the MCU may have reset.
+        FakeWheels gw = new FakeWheels();
+        FakeLease gl = new FakeLease();
+        gl.held = true;
+        Notes gn = new Notes();
+        Switch gs = new Switch();
+        gs.on = true;
+        DarkFloor df = new DarkFloor(gs, new DriveGate(gw, gl, gn), gn, 5000);
+        df.poll(0);
+        feed(df, 0, 1900, 1, null);
+        int early = gw.count("tofds");
+        feed(df, 2000, 5100, 1, null);
+        check("dark_floor_resends_tofds_when_ir2_comes_back_at_most_every_5s",
+                early == 1 && gw.count("tofds") == 2 && noted(gn, "the MCU flag is back (ir2=1)"),
+                "early=" + early + " tofds=" + gw.count("tofds") + " notes=" + gn.notes);
+        feed(df, 6800, 6800, 0, null);
+        check("dark_floor_resends_tofds_when_readings_resume_after_a_gap",
+                gw.count("tofds") == 3 && noted(gn, "readings resumed after 1700 ms"),
+                "tofds=" + gw.count("tofds") + " notes=" + gn.notes);
+        feed(df, 6900, 11800, 0, Integer.valueOf(2));
+        check("dark_floor_resends_tofds_when_cpl2_comes_back",
+                gw.count("tofds") == 4 && noted(gn, "the MCU flag is back (cpl=2)"),
+                "tofds=" + gw.count("tofds") + " notes=" + gn.notes);
+        gl.held = false;
+        df.onPass(11900, false, flagged(11900, 0, null));
+        gs.on = false;
+        df.poll(20000);
+        check("dark_floor_lease_loss_leaves_the_tofen_to_the_drive",
+                gw.count("tofen") == 0 && gw.count("tofds") == 4, "calls=" + gw.calls);
+        check("dark_floor_property_values",
+                DarkFloor.parse("1") && DarkFloor.parse(" true ") && DarkFloor.parse("ON") && !DarkFloor.parse("0")
+                        && !DarkFloor.parse("") && !DarkFloor.parse(null) && !DarkFloor.parse("2"),
+                "parse");
     }
 }

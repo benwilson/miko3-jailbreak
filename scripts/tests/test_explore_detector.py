@@ -8,6 +8,12 @@ floor, same-name non-maximum suppression, ordering and the cap, and that the
 exporter bakes into the model and the file the app decodes against identical in
 meaning: no duplicate names, people first, and the same comment rules; and
 Detection.nameClip names each clip exactly as gen-explore-voice.py writes it.
+
+The detector speed plan adds: decodeTopK over the faster variants' "detections"
+output (and that it agrees with the raw decode), DetectorStages' nearest-rank
+percentile and log lines (qa-detector-bench.py parses them), and
+DetectorConfig's switches, which must all default to the shipped model on the
+CPU with nothing set.
 """
 import importlib.util
 import subprocess
@@ -26,7 +32,8 @@ EXPLORE_SRC = REPO / "mode-explore" / "src"
 PKG = EXPLORE_SRC / "com" / "miko3" / "mode" / "explore"
 HARNESS = TESTS / "fixtures" / "explore_detector_harness" / "src"
 HARNESS_MAIN = HARNESS / "com" / "miko3" / "mode" / "explore" / "DetectorHarness.java"
-PLAIN_JAVA = [PKG / "YoloeDecoder.java", PKG / "Detection.java"]
+PLAIN_JAVA = [PKG / "YoloeDecoder.java", PKG / "Detection.java", PKG / "DetectorStages.java",
+              PKG / "DetectorConfig.java"]
 VOCABULARY = REPO / "mode-explore" / "assets" / "vocabulary.txt"
 EXPORT_PY = REPO / "scripts" / "export-explore-detector.py"
 VOICE_PY = REPO / "scripts" / "gen-explore-voice.py"
@@ -55,6 +62,14 @@ class DetectorDecodeTest(unittest.TestCase):
         "short_output_rejected",
         "detection_clamps_to_frame",
         "center_x_spans_minus_one_to_one",
+        "topk_decodes_fractions_and_names",
+        "topk_matches_raw_decode",
+        "topk_floor_bad_index_and_short_rejected",
+        "stages_percentile_nearest_rank",
+        "stages_line_and_summary",
+        "config_defaults_and_parsing",
+        "config_fallback_attempts",
+        "config_bench_switches",
     )
 
     @classmethod

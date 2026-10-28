@@ -34,11 +34,19 @@ public final class RootOps {
     /** neuterd (arm64 ELF, freestanding) as base64 — regenerated from native/neuterd by build-bootagent.py. */
     private static final String NEUTERD_B64 = "@@NEUTERD_B64@@";
 
+    /**
+     * The mute-button watcher (native/miko3-mute-watch.sh) as base64, injected by
+     * build-bootagent.py. The button is a switch on its own input device that only root can
+     * read; the watcher relays each press to the launcher's non-exported MuteKeyReceiver.
+     */
+    private static final String MUTEWATCH_B64 = "@@MUTEWATCH_B64@@";
+
     /** Root shell script run at every boot. Every step logs to /data/local/tmp/miko3-boot.log. */
     private static final String PAYLOAD =
             "D=/data/local/tmp/neuterd\n" +
             "LOG=/data/local/tmp/miko3-boot.log\n" +
             "W=/data/local/tmp/miko3-usb-watch.sh\n" +
+            "M=/data/local/tmp/miko3-mute-watch.sh\n" +
             "echo \"[boot up=$(cut -d' ' -f1 /proc/uptime)] miko3 bootagent\" >> \"$LOG\"\n" +
             // 1) materialize the self-healing global-namespace neuter daemon from embedded base64
             "echo '" + NEUTERD_B64 + "' | base64 -d > \"$D\" 2>>\"$LOG\"; chmod 755 \"$D\"\n" +
@@ -79,7 +87,13 @@ public final class RootOps {
             "chmod 755 \"$W\"\n" +
             "pkill -f /data/local/tmp/miko3-usb-watch.sh 2>/dev/null\n" +
             "setsid \"$W\" </dev/null >>\"$LOG\" 2>&1 &\n" +
-            // 6) keep adb alive with the screen idle (the unit lives on its charger)
+            // 6) mute-button watcher: root reads the switch, the launcher toggles the mute. Detached
+            // and backgrounded like the USB watcher, so it can never hold up the rest of this payload.
+            "echo '" + MUTEWATCH_B64 + "' | base64 -d > \"$M\" 2>>\"$LOG\"; chmod 755 \"$M\"\n" +
+            "pkill -f /data/local/tmp/miko3-mute-watch.sh 2>/dev/null\n" +
+            "setsid \"$M\" </dev/null >/dev/null 2>&1 &\n" +
+            "echo '  mute watcher started (logcat tag Miko3MuteKey)' >> \"$LOG\"\n" +
+            // 7) keep adb alive with the screen idle (the unit lives on its charger)
             "settings put global stay_on_while_plugged_in 3 2>>\"$LOG\" || echo '  !! stay_on set failed' >> \"$LOG\"\n" +
             "echo '  done.' >> \"$LOG\"\n";
 

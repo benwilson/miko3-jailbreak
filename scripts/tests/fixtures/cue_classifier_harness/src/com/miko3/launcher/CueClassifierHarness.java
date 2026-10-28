@@ -186,5 +186,31 @@ public final class CueClassifierHarness {
                                 + CueClassifier.kind("excuse me", false, excuse));
             }
         });
+        scenario("a_calls_message_is_its_words_besides_the_address", new Scenario() {
+            public void run(String n) {
+                // Owner 2026-10-02: "Hey Miko, how's it going?" is the caller's first message,
+                // "how's it going". The address alone (a bare wake, his name alone) leaves nothing.
+                String[][] cases = {
+                        {"Hey Miko, how's it going?", "how's it going"},
+                        {"hey miko", ""},
+                        {"Miko", ""},
+                        {"hi mikey what are you up to", "what are you up to"},
+                        {"Miko, come over here", "come over here"},
+                        {"how's it going miko", "how's it going"},
+                        {"so hey miko did you see that", "so did you see that"},
+                        {"ok miko", ""},
+                        {"", ""},
+                        {null, ""},
+                };
+                StringBuilder bad = new StringBuilder();
+                for (String[] c : cases) {
+                    String got = com.miko3.shared.CueWords.message(c[0]);
+                    if (!c[1].equals(got)) {
+                        bad.append("[").append(c[0]).append(" -> ").append(got).append("] ");
+                    }
+                }
+                check(n, bad.length() == 0, bad.toString());
+            }
+        });
     }
 }

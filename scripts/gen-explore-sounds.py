@@ -10,7 +10,8 @@ reads as a voice rather than a beep. The idle songs are short original runs of
 voiced syllables (pitch glides, vowel tones, warble and rasp) that he babbles while
 sitting still, in the style of WALL-E's processed-voice babble; they copy none of
 his lines or tunes. The curiosity reactions (curious, thinking, disappointed,
-delighted, puzzled) are the same babble voice, lower. Output is deterministic, so the committed
+delighted, puzzled) are the same babble voice, lower. The bathroom privacy beep
+(react-privacy-1) is a plain two-tone beep, not his voice. Output is deterministic, so the committed
 WAVs can be checked against this script (scripts/tests/test_gen_explore_sounds.py).
 
   python3 scripts/gen-explore-sounds.py            # write mode-explore/assets/
@@ -24,14 +25,20 @@ import wave
 from pathlib import Path
 
 RATE = 22050
-PEAK = 0.62  # of full scale; loud enough for the robot's small speaker without clipping
 
-# (name, seconds, start Hz, top Hz, end Hz): three voicings so repeated startles vary.
-VARIANTS = (
-    ("startle-1", 0.34, 520.0, 1180.0, 640.0),
-    ("startle-2", 0.28, 600.0, 1320.0, 760.0),
-    ("startle-3", 0.40, 460.0, 1040.0, 520.0),
+# Startles: a soft, falling "oops" in the songs' voice (owner 2026-10-02: the old rising
+# "whoa" chirp at 0.62 of full scale was "pretty loud and annoying" when the floor sensor fires often).
+# Three voicings so repeated startles vary; rendered by render_song at STARTLE_PEAK.
+STARTLE_PEAK = 0.2
+STARTLES = (
+    ("startle-1", [("oo", 0.09, 392, 370, "glide", 0.0, 0.0, 0.03),
+                   ("ah", 0.16, 330, 247, "down", 0.012, 0.05, 0.0)]),
+    ("startle-2", [("oh", 0.08, 349, 330, "glide", 0.0, 0.0, 0.03),
+                   ("oo", 0.17, 311, 233, "down", 0.012, 0.05, 0.0)]),
+    ("startle-3", [("oo", 0.10, 415, 392, "glide", 0.0, 0.0, 0.02),
+                   ("oh", 0.15, 349, 262, "down", 0.015, 0.05, 0.0)]),
 )
+STARTLE_SEED = 900  # seeds for startles, clear of the songs', reactions' and beeps' seeds
 
 # Idle songs: WALL-E-style babble rather than tunes. Each song is a run of voiced
 # syllables, like the processed-voice warbles, "ooh?" rises, "bip-bip" chirps and
@@ -138,52 +145,42 @@ REACTIONS = (
          ("ah", 0.10, 330, 330, "glide", 0.0, 0.15, 0.06),
          ("oh", 0.45, 247, 392, "arc", 0.02, 0.15, 0.0)],
     )),
-    ("puzzled", (  # a questioning "hm?"
-        [("mm", 0.18, 196, 185, "glide", 0.01, 0.1, 0.05),
-         ("mm", 0.45, 175, 294, "up", 0.012, 0.1, 0.0)],
-        [("ah", 0.12, 220, 220, "glide", 0.0, 0.05, 0.05),
-         ("oo", 0.50, 185, 311, "up", 0.015, 0.0, 0.0)],
-        [("mm", 0.30, 196, 165, "down", 0.012, 0.1, 0.05),
-         ("mm", 0.35, 175, 277, "up", 0.012, 0.1, 0.0)],
+    ("puzzled", (  # a confused, questioning WALL-E warble: a dip, then a rising "ooh?"
+        [("oh", 0.20, 294, 247, "down", 0.012, 0.05, 0.04),
+         ("oo", 0.42, 233, 466, "up", 0.02, 0.05, 0.0)],
+        [("ah", 0.12, 262, 262, "glide", 0.0, 0.05, 0.04),
+         ("ee", 0.45, 220, 440, "up", 0.02, 0.0, 0.0)],
+        [("oo", 0.30, 262, 208, "down", 0.015, 0.05, 0.04),
+         ("ee", 0.32, 208, 415, "up", 0.02, 0.05, 0.0)],
+    )),
+    # The acknowledgement when he turns to a voice (owner, 2026-10-01: "a quizzical,
+    # confused WALL-E style noise", replacing the spoken "hm?"/"yes?" clips).
+    ("acknowledge", (  # a short chirp, then a warbly rise: "eh-ooh?"
+        [("ee", 0.08, 392, 440, "up", 0.0, 0.0, 0.04),
+         ("oo", 0.38, 294, 587, "up", 0.025, 0.05, 0.0)],
+        [("oh", 0.14, 330, 262, "down", 0.01, 0.05, 0.03),
+         ("ee", 0.36, 262, 523, "up", 0.02, 0.05, 0.0)],
+        [("ah", 0.07, 440, 440, "glide", 0.0, 0.0, 0.03),
+         ("ah", 0.07, 392, 392, "glide", 0.0, 0.0, 0.04),
+         ("oo", 0.40, 311, 622, "up", 0.03, 0.05, 0.0)],
     )),
 )
 REACTION_SEED = 100  # seeds for reactions start here, clear of the songs' seeds
 
+# The bathroom privacy beep (owner 2026-10-02: "if he thinks he's in a bathroom, he beeps
+# every five seconds and tries to escape the bathroom as quickly as possible"). Not his
+# voice: one short, unmistakable two-tone beep, like a reversing truck's but friendlier
+# (rounded tones a fourth apart, soft edges). Written as react-<group>-<n>.wav so the
+# brain plays it through the reaction path. Each beep is a list of
+#   (Hz, seconds, gap after in seconds)
+BEEP_PEAK = 0.6
+BEEPS = (
+    ("privacy", (
+        [(988.0, 0.11, 0.025), (740.0, 0.115, 0.0)],
+    )),
+)
+
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "mode-explore" / "assets"
-
-
-def pitch_at(t, seconds, start, top, end):
-    """Rises to the top in the first 30% of the clip, then falls to the end pitch."""
-    rise = 0.3 * seconds
-    if t < rise:
-        x = t / rise
-        return start + (top - start) * math.sin(x * math.pi / 2)
-    x = (t - rise) / (seconds - rise)
-    return top + (end - top) * (1 - math.cos(x * math.pi / 2))
-
-
-def envelope(t, seconds):
-    """Short fade in and a longer fade out, so the clip has no click at either end."""
-    attack, release = 0.015, 0.12 * seconds
-    if t < attack:
-        return t / attack
-    if t > seconds - release:
-        return max(0.0, (seconds - t) / release)
-    return 1.0
-
-
-def render(seconds, start, top, end):
-    n = int(seconds * RATE)
-    samples = array.array("h")
-    phase = 0.0
-    for i in range(n):
-        t = i / RATE
-        freq = pitch_at(t, seconds, start, top, end) * (1 + 0.025 * math.sin(2 * math.pi * 11 * t))
-        phase += 2 * math.pi * freq / RATE
-        # A touch of second harmonic keeps it from sounding like a pure test tone.
-        value = math.sin(phase) + 0.25 * math.sin(2 * phase)
-        samples.append(int(round(value / 1.25 * PEAK * envelope(t, seconds) * 32767)))
-    return samples
 
 
 def syllable_pitch(x, f0, f1, shape):
@@ -197,7 +194,7 @@ def syllable_pitch(x, f0, f1, shape):
     return f0 + (f1 - f0) * x
 
 
-def render_song(syllables, seed):
+def render_song(syllables, seed, peak=None):
     """One song: each voiced syllable glides in pitch, wobbles, and is shaped by its own
     short envelope; gaps are silence. Deterministic for a given seed."""
     rng = random.Random(seed)
@@ -218,11 +215,28 @@ def render_song(syllables, seed):
             value = sum(w * math.sin((k + 1) * phase) for k, w in enumerate(weights)) / norm
             buzz = 1 - rasp * (0.5 + 0.5 * math.sin(2 * math.pi * rasp_hz * t))
             edge = min(1.0, t / 0.015, (dur - t) / 0.03)
-            samples.append(int(round(value * buzz * edge * SONG_PEAK * 32767)))
+            samples.append(int(round(value * buzz * edge * (SONG_PEAK if peak is None else peak) * 32767)))
         t_song += dur
         samples.extend([0] * int(gap * RATE))
         t_song += gap
     samples.extend([0] * int(0.05 * RATE))
+    return samples
+
+
+def render_beep(tones):
+    """A beep: each tone held steady (fundamental plus a soft third harmonic, rounder than
+    a square wave), with 8 ms raised-cosine edges so there is no click; gaps are silence."""
+    samples = array.array("h")
+    edge = 0.008
+    for hz, dur, gap in tones:
+        n = int(dur * RATE)
+        for i in range(n):
+            t = i / RATE
+            ramp = min(1.0, t / edge, (dur - t) / edge)
+            ramp = 0.5 - 0.5 * math.cos(math.pi * max(0.0, ramp))
+            value = (math.sin(2 * math.pi * hz * t) + 0.2 * math.sin(6 * math.pi * hz * t)) / 1.2
+            samples.append(int(round(value * ramp * BEEP_PEAK * 32767)))
+        samples.extend([0] * int(gap * RATE))
     return samples
 
 
@@ -235,13 +249,13 @@ def write_wav(path, samples):
 
 
 def generate(out_dir):
-    """Write every startle, then every song, then every reaction into out_dir; returns
-    their paths in that order."""
+    """Write every startle, then every song, then every reaction, then every beep into
+    out_dir; returns their paths in that order."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
-    for name, seconds, start, top, end in VARIANTS:
+    for n, (name, syllables) in enumerate(STARTLES):
         path = out_dir / f"{name}.wav"
-        write_wav(path, render(seconds, start, top, end))
+        write_wav(path, render_song(syllables, STARTLE_SEED + n, peak=STARTLE_PEAK))
         paths.append(path)
     for seed, (name, syllables) in enumerate(SONGS):
         path = out_dir / f"{name}.wav"
@@ -254,6 +268,11 @@ def generate(out_dir):
             write_wav(path, render_song(syllables, seed))
             paths.append(path)
             seed += 1
+    for group, variants in BEEPS:
+        for n, tones in enumerate(variants, start=1):
+            path = out_dir / f"react-{group}-{n}.wav"
+            write_wav(path, render_beep(tones))
+            paths.append(path)
     return paths
 
 

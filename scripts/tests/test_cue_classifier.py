@@ -49,6 +49,7 @@ class CueClassifierHarnessTest(unittest.TestCase):
         "normalisation_ignores_case_and_punctuation",
         "kinds_follow_the_wake_flag_the_words_and_the_tier",
         "excuse_me_and_my_bad_after_a_shove_are_strong_apologies",
+        "a_calls_message_is_its_words_besides_the_address",
     )
 
     @classmethod

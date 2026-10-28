@@ -26,6 +26,12 @@ final class ExploreLoop {
         void backTick() throws IOException;
 
         void stop() throws IOException;
+
+        /** TOFDS: the MCU's own ToF safe-band check off (dark-floor mode only). */
+        void disableTofCheck() throws IOException;
+
+        /** TOFEN: the MCU's ToF check back on. Goes out whether or not the lease is trusted. */
+        void enableTofCheck() throws IOException;
     }
 
     /** The newest reading, or null before the first; the loop skips repeats by timestamp. */
@@ -51,7 +57,26 @@ final class ExploreLoop {
         /** Turn in place one way, then the other, instead of wandering, for the gyro
          * capture (ExploreSpin; explore nav plan U1). */
         boolean spinInPlace();
+
+        /** The MikoExploreFwdProbe debug hook: forward and back legs whatever the floor sensor reads. */
+        boolean fwdProbe();
     }
+
+    /**
+     * Whether the speaker is muted or turned all the way down with the volume keys
+     * (owner 2026-10-02): the brain's do-not-disturb. Polled every pass on the brain
+     * thread, so it must be cheap; ModeApp's caches the audio service's answer.
+     */
+    interface Mute {
+        boolean muted();
+    }
+
+    static final Mute NEVER_MUTED = new Mute() {
+        @Override
+        public boolean muted() {
+            return false;
+        }
+    };
 
     static final Hooks NO_HOOKS = new Hooks() {
         @Override
@@ -73,6 +98,11 @@ final class ExploreLoop {
         public boolean spinInPlace() {
             return false;
         }
+
+        @Override
+        public boolean fwdProbe() {
+            return false;
+        }
     };
 
     private final ExploreBrain.Clock clock;
@@ -84,9 +114,14 @@ final class ExploreLoop {
     private final long tickMs;
     private final ExploreBrain brain;
     private final ExploreSpin spin;
+    private final ExploreFwdProbe fwdProbe;
+    private final DriveGate gate;
+    /** Dark-floor mode (owner 2026-10-02): off unless setDarkFloor() gives a source that says on. */
+    private DarkFloor darkFloor;
     private final StopTimer stopTimer;
 
     private volatile boolean running;
+    private volatile Mute mute = NEVER_MUTED;
     private Thread brainThread;
     private Thread stopTimerThread;
 
@@ -124,8 +159,11 @@ final class ExploreLoop {
         this.trace = trace;
         this.tickMs = tickMs;
         DriveGate gate = new DriveGate(wheels, lease, trace);
+        this.gate = gate;
+        this.darkFloor = new DarkFloor(DarkFloor.OFF, gate, trace, DarkFloor.POLL_MS);
         this.brain = new ExploreBrain(tuning, clock, gate, eyes, sound, camera, port, ears, new Random());
         this.spin = new ExploreSpin(gate, trace, tuning);
+        this.fwdProbe = new ExploreFwdProbe(gate, trace, tuning);
         if (trace != null) {
             brain.setTrace(trace);
         }
@@ -172,11 +210,32 @@ final class ExploreLoop {
         }
         join(b);
         brain.shutdown();
+        if (fwdProbe.active()) {
+            // The brain thread is done, so this is the only caller; ends with TOFEN.
+            fwdProbe.end();
+        }
+        // The MCU's ToF check back on (dark-floor mode) before the caller lets the lease go.
+        darkFloor.end();
         join(s);
     }
 
     boolean isRunning() {
         return running;
+    }
+
+    /** Where the speaker's mute comes from (null: never muted); set before start(). */
+    void setMute(Mute mute) {
+        this.mute = mute == null ? NEVER_MUTED : mute;
+    }
+
+    /** Where dark-floor mode's switch comes from (ExploreDrive: the system property); set before start(). */
+    void setDarkFloor(DarkFloor.Source source) {
+        setDarkFloor(source, DarkFloor.POLL_MS);
+    }
+
+    /** As above, re-read every pollMs (the harness's short runs). */
+    void setDarkFloor(DarkFloor.Source source, long pollMs) {
+        darkFloor = new DarkFloor(source, gate, trace, pollMs);
     }
 
     /** Where the brain's cue counters and stage stamps go (meeting plan U7, KTD14): the state page. */
@@ -187,9 +246,16 @@ final class ExploreLoop {
     private void runBrain() {
         brain.start();
         boolean leaseReported = false;
+        boolean mutedReported = false;
         long lastReadingMs = Long.MIN_VALUE;
         while (running) {
-            if (!hooks.freezeBrain() && hooks.spinInPlace()) {
+            if (!hooks.freezeBrain() && hooks.fwdProbe()) {
+                fwdProbe.onTick(clock.nowMs(), hooks.staleSensors() ? null : sensors.latest(), lease.held());
+                stopTimer.feed(clock.nowMs());
+            } else if (!hooks.freezeBrain() && hooks.spinInPlace()) {
+                if (fwdProbe.active()) {
+                    fwdProbe.end();
+                }
                 // The brain sits out the spin (no readings, no ticks), so nothing it
                 // decides competes for the wheels; it catches up when the hook goes off.
                 spin.onTick(clock.nowMs(), hooks.staleSensors() ? null : sensors.latest(), lease.held());
@@ -198,12 +264,27 @@ final class ExploreLoop {
                 if (spin.active()) {
                     spin.end();
                 }
+                if (fwdProbe.active()) {
+                    // The probe ended with TOFEN: dark-floor mode sends its TOFDS again.
+                    fwdProbe.end();
+                    darkFloor.checkUnknown();
+                }
                 boolean held = lease.held();
                 if (held != leaseReported) {
                     leaseReported = held;
                     brain.onLeaseChanged(held);
                 }
+                long now = clock.nowMs();
+                if (darkFloor.poll(now)) {
+                    brain.setDarkFloor(darkFloor.on());
+                }
+                boolean muted = mute.muted();
+                if (muted != mutedReported) {
+                    mutedReported = muted;
+                    brain.setMuted(muted);
+                }
                 SensorReading reading = hooks.staleSensors() ? null : sensors.latest();
+                darkFloor.onPass(now, held, reading);
                 if (reading != null && reading.timestampMs > lastReadingMs) {
                     lastReadingMs = reading.timestampMs;
                     brain.onReading(reading);

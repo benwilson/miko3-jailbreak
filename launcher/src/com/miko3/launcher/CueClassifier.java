@@ -109,6 +109,15 @@ final class CueClassifier {
     }
 
     /**
+     * Whether tier() could read an utterance's words without the wake word:
+     * while a conversation listen is active, or with the switch on. Off and
+     * not listening, it returns TIER_NONE whatever was said (the ears' wake gate).
+     */
+    boolean wordsMatter(boolean listening) {
+        return listening || answers.answersWhenSpokenTo();
+    }
+
+    /**
      * The kind of an utterance the tier() call above has already tiered: text
      * as the recogniser gave it, wake when the vendor engine fired inside it,
      * tier its TIER_*. The engine's flag is authoritative; without it, nothing

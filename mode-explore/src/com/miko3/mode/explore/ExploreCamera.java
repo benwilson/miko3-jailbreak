@@ -11,6 +11,10 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.Face;
+import android.graphics.Rect;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
@@ -55,8 +59,8 @@ import java.util.concurrent.TimeUnit;
  *
  * Each look also carries an openness profile (explore nav plan U3, KTD3): the
  * kept JPEG is decoded a second time at a quarter scale, the whole frame
- * averaged down again and the floor band below the horizon kept at that
- * sharper scale, and scored by Openness with the look's boxes. Only the
+ * averaged down again and the floor band (from just above the horizon down)
+ * kept at that sharper scale, and scored by Openness with the look's boxes. Only the
  * scoring time is logged, never pixels or profiles (R15). The brain's
  * floor-clear flag rides with each captured frame so Openness learns the
  * floor only from frames he could safely drive onto.
@@ -79,6 +83,22 @@ final class ExploreCamera implements ExploreBrain.Camera {
      * last-nav.txt), overwritten each time. Never shared storage, never the log.
      */
     static final String NAV_DEBUG_TAG = "MikoExploreNavDebug";
+    /** Spike (2026-09-30): log.tag.MikoExploreHwFace=DEBUG turns on the camera's own
+     * face detection (SIMPLE) and logs the faces it reports, twice a second at most. */
+    static final String HW_FACE_TAG = "MikoExploreHwFace";
+    /** log.tag.MikoExploreStages=DEBUG adds a "look stages: ..." line after each
+     * "look in N ms" (detector speed plan): JPEG decode, preprocess, run, output
+     * copy and detection decode. (A non-default provider or model is logged once,
+     * by OnnxRecognizer, when it loads.) */
+    static final String STAGES_TAG = "MikoExploreStages";
+    /** Camera calibration (scripts/calibrate-camera-fov.py): log.tag.MikoExploreFrames=DEBUG
+     * saves each decoded look's JPEG, unchanged, to files/frames/frame-<wall ms>.jpg
+     * (wall clock at frame arrival), the newest FRAME_RING_SIZE kept. Private files only. */
+    static final String FRAMES_TAG = "MikoExploreFrames";
+    private static final int FRAME_RING_SIZE = 400;
+    private FrameRing frameRing;
+    private Rect activeArray;
+    private long hwFaceLoggedMs;
     static final String LAST_NAV = "last-nav.jpg";
     static final String LAST_NAV_PROFILE = "last-nav.txt";
     /** The openness decode: a quarter of the camera's 640x480 (160x120). */
@@ -126,6 +146,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private final BitmapFactory.Options decode = new BitmapFactory.Options();
     private final BitmapFactory.Options small = new BitmapFactory.Options();
     private int[] smallPixels = new int[0];
+    /** The newest look's place-memory fingerprint, from scoreOpenness; null when it failed. */
+    private PlaceMemory.Print lastPrint;
     /** halve()'s output, reused frame to frame (Openness keeps no pixels). */
     private int[] halfPixels = new int[0];
     /** Holds the floor model; used on the detect thread (the brain's calls are posted there). */
@@ -148,6 +170,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
     private volatile boolean busy;
 
     private volatile boolean parked;
+    /** Bathroom privacy: no frame saved while set (setPrivate). */
+    private volatile boolean privateFrames;
     /** close() has run on the camera thread and open() has not been called since. */
     private volatile boolean closedDone = true;
     private volatile ExploreBrain.Look latest;
@@ -244,6 +268,16 @@ final class ExploreCamera implements ExploreBrain.Camera {
     @Override
     public void park(boolean p) {
         parked = p;
+    }
+
+    /**
+     * Bathroom privacy (owner 2026-10-02), set by the brain: while on, no frame is saved
+     * anywhere (the NavDebug last-nav files, the calibration frame ring), whatever the
+     * debug tags say.
+     */
+    @Override
+    public void setPrivate(boolean on) {
+        privateFrames = on;
     }
 
     /** Closed on the camera thread, and no detector run in flight (the brain speaks only then, R6). */
@@ -363,6 +397,7 @@ final class ExploreCamera implements ExploreBrain.Camera {
             final Range<Integer> fps = fixedFpsRange(c);
             final int ev = maxCompensation(c);
             manualExposure = manualExposureRanges(c);
+            activeArray = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
             Size size = jpegSize(c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP));
             reader = ImageReader.newInstance(size.getWidth(), size.getHeight(), android.graphics.ImageFormat.JPEG, 2);
             reader.setOnImageAvailableListener(onImage, cameraHandler);
@@ -466,6 +501,32 @@ final class ExploreCamera implements ExploreBrain.Camera {
      * either these manual settings (AE off, as remote-control's CameraCapture) or,
      * when null, auto exposure at the largest compensation. False when it failed.
      */
+    /** The spike's per-frame result reader: faces as boxes 0..1 of the active array. */
+    private final CameraCaptureSession.CaptureCallback hwFaces = new CameraCaptureSession.CaptureCallback() {
+        @Override
+        public void onCaptureCompleted(CameraCaptureSession s, CaptureRequest r, TotalCaptureResult result) {
+            Face[] found = result.get(CaptureResult.STATISTICS_FACES);
+            Integer mode = result.get(CaptureResult.STATISTICS_FACE_DETECT_MODE);
+            long now = SystemClock.elapsedRealtime();
+            int n = found == null ? -1 : found.length;
+            if (n <= 0 && now - hwFaceLoggedMs < 2000 || n > 0 && now - hwFaceLoggedMs < 500) {
+                return;
+            }
+            hwFaceLoggedMs = now;
+            StringBuilder sb = new StringBuilder("hw faces mode=" + mode + " n=" + n);
+            if (found != null && activeArray != null) {
+                float w = activeArray.width(), h = activeArray.height();
+                for (Face f : found) {
+                    Rect b = f.getBounds();
+                    sb.append(String.format(java.util.Locale.US, " [%.2f,%.2f,%.2f,%.2f s=%d]",
+                            (b.left - activeArray.left) / w, (b.top - activeArray.top) / h,
+                            (b.right - activeArray.left) / w, (b.bottom - activeArray.top) / h, f.getScore()));
+                }
+            }
+            Log.i(HW_FACE_TAG, sb.toString());
+        }
+    };
+
     private boolean repeat(Brightness.Settings manual) {
         try {
             CaptureRequest.Builder b = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
@@ -483,7 +544,13 @@ final class ExploreCamera implements ExploreBrain.Camera {
                 b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
                 b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, sessionEv);
             }
-            session.setRepeatingRequest(b.build(), null, cameraHandler);
+            CameraCaptureSession.CaptureCallback faces = null;
+            if (Log.isLoggable(HW_FACE_TAG, Log.DEBUG)) {
+                b.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE);
+                faces = hwFaces;
+                Log.i(HW_FACE_TAG, "hardware face detection on (SIMPLE), active array " + activeArray);
+            }
+            session.setRepeatingRequest(b.build(), faces, cameraHandler);
             return true;
         } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
             Log.e(TAG, "setRepeatingRequest failed", e);
@@ -532,14 +599,21 @@ final class ExploreCamera implements ExploreBrain.Camera {
             }
             try {
                 // Parked (meeting plan U8, KTD7): the stream runs, the detector does not.
-                if (busy || !wanted || parked) {
+                if (!wanted) {
                     return;
                 }
+                // Review 2026-10-03: only frames the detector runs on are copied (the look tool's
+                // fast path sends the newest detected one, ExploreBrain.fastToolLook).
+                if (busy || parked) {
+                    return;
+                }
+                long t = clock.nowMs();
                 ByteBuffer buf = image.getPlanes()[0].getBuffer();
+                long wallMs = System.currentTimeMillis();
                 byte[] jpeg = new byte[buf.remaining()];
                 buf.get(jpeg);
                 busy = true;
-                recognize(jpeg, clock.nowMs(), generation, floorClear);
+                recognize(jpeg, t, wallMs, generation, floorClear);
             } finally {
                 image.close();
             }
@@ -548,7 +622,8 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     // ---- detect thread ----
 
-    private void recognize(final byte[] jpeg, final long frameMs, final int gen, final boolean teachable) {
+    private void recognize(final byte[] jpeg, final long frameMs, final long wallMs, final int gen,
+                           final boolean teachable) {
         detectHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -567,22 +642,30 @@ final class ExploreCamera implements ExploreBrain.Camera {
                     if (recognizer == null || gen != generation) {
                         return;
                     }
+                    long d0 = System.nanoTime();
                     Bitmap frame = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, decode);
                     if (frame == null) {
                         return;
                     }
+                    long decodeNs = System.nanoTime() - d0;
                     decode.inBitmap = frame;
+                    saveFrame(wallMs, jpeg);
                     long t0 = clock.nowMs();
                     List<Detection> found = recognizer.detect(frame);
                     if (gen == generation) {
                         Log.i(TAG, "look in " + (clock.nowMs() - t0) + " ms: " + found);
+                        DetectorStages stages = recognizer.stages();
+                        if (stages != null && Log.isLoggable(STAGES_TAG, Log.DEBUG)) {
+                            stages.set(DetectorStages.DECODE, decodeNs);
+                            Log.i(TAG, "look stages: " + stages.line());
+                        }
                         long s0 = clock.nowMs();
                         Openness.Profile profile = scoreOpenness(jpeg, found, frameMs, teachable);
                         Log.i(TAG, "openness in " + (clock.nowMs() - s0) + " ms");
                         adjustBrightness(frameMs, gen);
                         if (gen == generation) {
                             // The JPEG rides along for Claude's look request (explore on Claude U4, R1).
-                            latest = new ExploreBrain.Look(frameMs, found, jpeg, profile);
+                            latest = new ExploreBrain.Look(frameMs, found, jpeg, profile, lastPrint);
                             debugNav(jpeg, profile);
                         }
                     }
@@ -597,11 +680,13 @@ final class ExploreCamera implements ExploreBrain.Camera {
 
     /**
      * Detect thread: the frame again at a quarter scale, as a whole frame averaged
-     * down to an eighth and the floor band below the horizon kept at a quarter,
+     * down to an eighth and the floor band from Openness.BAND_TOP (just above
+     * the horizon, so a surface can be followed past it) kept at a quarter,
      * scored with the look's boxes. Null when it can't be decoded.
      */
     private Openness.Profile scoreOpenness(byte[] jpeg, List<Detection> found, long frameMs, boolean teachable) {
         decodedLuma = Double.NaN;
+        lastPrint = null;
         try {
             Bitmap bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, small);
             if (bmp == null) {
@@ -615,13 +700,17 @@ final class ExploreCamera implements ExploreBrain.Camera {
             }
             bmp.getPixels(smallPixels, 0, w, 0, 0, w, h);
             decodedLuma = Brightness.meanLuma(smallPixels, w * h);
-            int first = Math.min(h - 1, (int) (Openness.HORIZON * h));
+            int first = Math.min(h - 1, (int) (Openness.BAND_TOP * h));
             Openness.Frame floorBand = new Openness.Frame(smallPixels, w, h - first, (float) first / h, 1f, first);
-            return openness.score(halve(smallPixels, w, h), floorBand, found, frameMs, teachable);
+            Openness.Frame whole = halve(smallPixels, w, h);
+            // The place memory's fingerprint of this view, from the same halved frame.
+            lastPrint = PlaceMemory.Print.of(whole.rgb, whole.width, whole.height);
+            return openness.score(whole, floorBand, found, frameMs, teachable);
         } catch (RuntimeException | OutOfMemoryError e) {
             Log.w(TAG, "openness decode failed: " + e.getClass().getSimpleName());
             small.inBitmap = null;
             decodedLuma = Double.NaN;
+            lastPrint = null;
             return null;
         }
     }
@@ -671,9 +760,24 @@ final class ExploreCamera implements ExploreBrain.Camera {
         return new Openness.Frame(out, hw, hh, 0f, 1f);
     }
 
+    /** Detect thread: the calibration frame ring (FRAMES_TAG), off unless the tag is DEBUG. */
+    private void saveFrame(long wallMs, byte[] jpeg) {
+        if (privateFrames || !Log.isLoggable(FRAMES_TAG, Log.DEBUG)) {
+            return;
+        }
+        if (frameRing == null) {
+            frameRing = new FrameRing(new File(context.getFilesDir(), "frames"), FRAME_RING_SIZE);
+        }
+        try {
+            frameRing.save(wallMs, jpeg);
+        } catch (IOException e) {
+            Log.w(FRAMES_TAG, "could not save frame: " + e.getMessage());
+        }
+    }
+
     /** The owner's gate check (NAV_DEBUG_TAG): the look and its numbers, private files only. */
     private void debugNav(byte[] jpeg, Openness.Profile profile) {
-        if (profile == null || !Log.isLoggable(NAV_DEBUG_TAG, Log.DEBUG)) {
+        if (profile == null || privateFrames || !Log.isLoggable(NAV_DEBUG_TAG, Log.DEBUG)) {
             return;
         }
         File dir = context.getFilesDir();

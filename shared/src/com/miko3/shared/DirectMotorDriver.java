@@ -122,9 +122,17 @@ public final class DirectMotorDriver {
 
     /** "TOFEN" + 0x58 padding to 500 bytes: switches the front ToF sensor on, exactly as
      * SocialInteraction_SpeechChat.startTof() does (generate500ByteData("TOFEN", 500)).
-     * ServiceExam sends the matching TOFDS on some boot and login paths, which would
-     * leave the ToF reporting a stuck value; enableTof() undoes that. */
+     * ServiceExam sends the matching TOFDS on some boot and login paths, which leaves the
+     * MCU's ToF safe-band check off (see TOF_DISABLE_FRAME); enableTof() undoes that. */
     private static final byte[] TOF_ENABLE_FRAME = buildTaggedFrame("TOFEN", POWER_FRAME_SIZE);
+
+    /** "TOFDS" + 0x58 padding to 500 bytes: switches the MCU's own ToF safe-band check off,
+     * as SocialInteraction_SpeechChat.stopTof() / loginStopTof() do. Per the MCU firmware
+     * (v6.1 disassembly, 2026-10-02) the check's enable flag gates only the hazard: no
+     * CPL=2 refusal and no ir2 flag from the ToF, while TOFIR readings keep flowing.
+     * TOFEN or an MCU reset (enable=1 at boot) turns it back on. Only for dark-floor
+     * mode on a floor the owner has said has no drops. */
+    private static final byte[] TOF_DISABLE_FRAME = buildTaggedFrame("TOFDS", POWER_FRAME_SIZE);
 
     private SensorModule sensorModule;
     private Thread keepaliveThread;
@@ -243,6 +251,17 @@ public final class DirectMotorDriver {
 
     /** Switches the front ToF sensor on (see TOF_ENABLE_FRAME). Safe to repeat. */
     public synchronized void enableTof() throws IOException {
+        sendFrame(TOF_ENABLE_FRAME);
+    }
+
+    /** TOFDS: the MCU stops refusing forward (CPL=2) and flagging ir2 on its ToF band
+     * (see TOF_DISABLE_FRAME). Dark-floor mode only; always undo with enableTofCheck(). */
+    public synchronized void disableTofCheck() throws IOException {
+        sendFrame(TOF_DISABLE_FRAME);
+    }
+
+    /** TOFEN: the MCU's ToF check back on. The same frame as enableTof(). Safe to repeat. */
+    public synchronized void enableTofCheck() throws IOException {
         sendFrame(TOF_ENABLE_FRAME);
     }
 

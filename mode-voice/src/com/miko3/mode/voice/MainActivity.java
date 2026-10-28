@@ -8,10 +8,12 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.KeyEvent;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 
 import com.miko3.shared.LauncherProtocol;
+import com.miko3.shared.VolumeKeys;
 
 /**
  * Full-screen WebView shell for the voice mode, launched by the launcher via
@@ -55,6 +57,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        VolumeKeys.attach(this);
         requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
 
         webView = new WebView(this);
@@ -196,5 +199,11 @@ public class MainActivity extends Activity {
                 Log.i(TAG, permissions[i] + " granted=" + (grantResults[i] == PackageManager.PERMISSION_GRANTED));
             }
         }
+    }
+
+    /** The volume keys on top move the speaker's volume and mute (shared VolumeKeys), before the WebView sees them. */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        return VolumeKeys.dispatch(this, event) || super.dispatchKeyEvent(event);
     }
 }

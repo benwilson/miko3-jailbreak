@@ -81,18 +81,21 @@ A_NOT_AN = {"ukulele", "usb stick"}
 
 # The conversation's line clips in the same cloned voice (meeting plan U8, KTD12):
 # ClipPlayer plays a random variant of react-<group>-<n>.webm, so each group is a
-# list of phrasings. "acknowledge" plays when a facing face is found (KTD14),
-# "sign-off" ends a conversation in one line (R11), "one-sec" is what a newcomer
+# list of phrasings. ("acknowledge" is a synthesized WALL-E chirp now, made by
+# gen-explore-sounds.py.) "sign-off" ends a conversation in one line (R11), "one-sec" is what a newcomer
 # hears mid-conversation (R15), "deflect" answers a refused turn (KTD9) and
-# "nothing-kept" is the forget reply to someone unnamed (R18). The forget
+# "nothing-kept" is the forget reply to someone unnamed (R18), "answer" is what he
+# says the moment a call lands, before he turns (hey-miko plan R4, KTD3), and
+# "where" is his line when a call's search finds nobody (R10). The forget
 # confirmation itself is not a clip: it carries the stored name, so the
 # on-device voice says it from ChatSession's template.
 LINE_CLIPS = {
-    "acknowledge": ["hm?", "yes?"],
     "sign-off": ["catch you later.", "see you around."],
     "one-sec": ["one sec.", "hang on a sec."],
     "deflect": ["nice try, but no.", "not my department."],
     "nothing-kept": ["nothing to forget; I keep nothing on you.", "I have nothing on you to forget."],
+    "answer": ["oh hi?", "what?", "yes?"],
+    "where": ["where'd you go?"],
 }
 
 

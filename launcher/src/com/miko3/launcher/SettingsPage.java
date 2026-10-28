@@ -8,6 +8,7 @@ import com.miko3.shared.HttpRequest;
 import com.miko3.shared.HttpResponse;
 import com.miko3.shared.Json;
 import com.miko3.shared.LauncherProtocol;
+import com.miko3.shared.OwnerNotes;
 import com.miko3.shared.PageToken;
 import com.miko3.shared.PersonNotes;
 
@@ -104,6 +105,9 @@ final class SettingsPage {
     static final String PEOPLE_NO_NOTES = "No notes yet.";
     /** A record from before names were required (KTD10): out of the matching
      * gallery, never given notes; the owner names it or deletes it. */
+    /** Owner 2026-10-02: someone remembered by name alone, from a faceless conversation. */
+    static final String PEOPLE_NAME_ONLY = "No face yet: remembered by the name they gave. He adds their face when "
+            + "he gets a good look at them in a conversation where they give this name.";
     static final String PEOPLE_LEGACY = "Legacy record: no name, so he no longer matches this face or keeps notes "
             + "on it. Give them a name, or Forget deletes it.";
 
@@ -121,6 +125,23 @@ final class SettingsPage {
     static final String FACE_NOT_A_NUMBER = "Not saved: every face threshold must be a number.";
     static final String FACE_THRESHOLDS_LOOPBACK_ONLY = "Face thresholds can only be set from the robot itself "
             + "(scripts/robot-faces.py over adb).";
+    // Owner 2026-10-02: the feedback log.
+    static final String FEEDBACK_EMPTY = "No feedback yet.";
+    static final String FEEDBACK_CLEARED = "Feedback log cleared.";
+    // Owner 2026-10-03: the owner's notes about people by name. Fixed text: never the name or the note.
+    static final String OWNER_NOTES_EMPTY = "No notes yet.";
+    static final String OWNER_NOTE_ADDED = "Note added.";
+    static final String OWNER_NOTE_SAVED = "Note saved.";
+    static final String OWNER_NOTE_DELETED = "Note deleted.";
+    static final String OWNER_NOTE_UNKNOWN = "Nothing changed: that note is not stored.";
+    static final String OWNER_NOTE_NO_NAME = "Not saved: give the person's name (at most "
+            + OwnerNotes.MAX_NAME_CHARS + " characters).";
+    static final String OWNER_NOTE_EMPTY = "Not saved: write a note.";
+    static final String OWNER_NOTE_TOO_LONG = "Not saved: a note is at most " + OwnerNotes.MAX_NOTE_CHARS
+            + " characters.";
+    static final String OWNER_NOTE_FULL = "Not saved: there are already " + OwnerNotes.MAX_ENTRIES + " notes.";
+    static final String OWNER_NOTE_NOT_SAVED = "Nothing changed: the change could not be saved.";
+
     /** What the photo route answers for a slot whose photo was replaced or deleted. */
     static final String REPLACED_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"112\" height=\"112\" "
             + "viewBox=\"0 0 112 112\"><rect width=\"112\" height=\"112\" fill=\"#ddd\"/>"
@@ -177,6 +198,10 @@ final class SettingsPage {
         }
         if (LauncherProtocol.SETTINGS_FACE_STATE_PATH.equals(req.path)) {
             sendFaceState(req, res, token, settings, people, checks);
+            return;
+        }
+        if (LauncherProtocol.SETTINGS_FEEDBACK_STATE_PATH.equals(req.path)) {
+            sendFeedbackState(req, res, token, people);
             return;
         }
         // The thresholds save (KTD5) is loopback-only, checked before the body is read.
@@ -237,7 +262,56 @@ final class SettingsPage {
         if (LauncherProtocol.SETTINGS_FACE_THRESHOLDS_PATH.equals(path)) {
             return saveFace(form, settings);
         }
+        if (LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH.equals(path)) {
+            people.feedback().clear();
+            return FEEDBACK_CLEARED;
+        }
+        if (LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH.equals(path)) {
+            return addOwnerNote(form.get("name"), form.get("note"), people.ownerNotes());
+        }
+        if (LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH.equals(path)) {
+            return editOwnerNote(form.get("id"), form.get("name"), form.get("note"), people.ownerNotes());
+        }
+        if (LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH.equals(path)) {
+            return people.ownerNotes().delete(form.get("id")) ? OWNER_NOTE_DELETED : OWNER_NOTE_UNKNOWN;
+        }
         return "Nothing changed: unknown action.";
+    }
+
+    /** Owner 2026-10-03: fixed text only, never the name or note typed. */
+    private static String addOwnerNote(String name, String note, OwnerNotesStore notes) {
+        try {
+            return notes.add(name, note) != null ? OWNER_NOTE_ADDED : OWNER_NOTE_NOT_SAVED;
+        } catch (IllegalArgumentException e) {
+            return ownerNoteRefusal(e.getMessage());
+        }
+    }
+
+    private static String editOwnerNote(String id, String name, String note, OwnerNotesStore notes) {
+        if (!notes.has(id)) {
+            return OWNER_NOTE_UNKNOWN;
+        }
+        try {
+            return notes.edit(id, name, note) ? OWNER_NOTE_SAVED : OWNER_NOTE_NOT_SAVED;
+        } catch (IllegalArgumentException e) {
+            return ownerNoteRefusal(e.getMessage());
+        }
+    }
+
+    private static String ownerNoteRefusal(String reason) {
+        if (OwnerNotes.REFUSE_NAME.equals(reason)) {
+            return OWNER_NOTE_NO_NAME;
+        }
+        if (OwnerNotes.REFUSE_NOTE_EMPTY.equals(reason)) {
+            return OWNER_NOTE_EMPTY;
+        }
+        if (OwnerNotes.REFUSE_NOTE_TOO_LONG.equals(reason)) {
+            return OWNER_NOTE_TOO_LONG;
+        }
+        if (OwnerNotes.REFUSE_FULL.equals(reason)) {
+            return OWNER_NOTE_FULL;
+        }
+        return OWNER_NOTE_NOT_SAVED;
     }
 
     /** The face JPEG for ?id=, or 404 for anything that isn't a remembered
@@ -405,6 +479,39 @@ final class SettingsPage {
                 faceStateJson(settings.faceSettings(), people, checks) + "\n");
     }
 
+    /**
+     * The feedback log as JSON for scripts/pull-feedback.py (owner 2026-10-02):
+     * the entries newest first, never a person's id. POST with the page token
+     * in the body; 403 without it.
+     */
+    private static void sendFeedbackState(HttpRequest req, HttpResponse res, PageToken token, PeopleStore people)
+            throws IOException {
+        Map<String, String> form = readForm(req);
+        if (form == null || !token.check(form.get("t"))) {
+            res.sendText(403, "Forbidden", "text/plain; charset=utf-8", "page token missing or expired\n");
+            return;
+        }
+        res.sendText(200, "OK", "application/json; charset=utf-8", feedbackJson(people.feedback()) + "\n");
+    }
+
+    static String feedbackJson(FeedbackStore log) {
+        List<Object> rows = new ArrayList<Object>();
+        for (FeedbackStore.Entry e : log.newestFirst()) {
+            Map<String, Object> row = new LinkedHashMap<String, Object>();
+            row.put("at", e.atMillis);
+            row.put("kind", e.kind);
+            row.put("summary", e.summary);
+            row.put("quote", e.quote);
+            row.put("who", e.who);
+            row.put("context", e.context);
+            rows.add(row);
+        }
+        Map<String, Object> root = new LinkedHashMap<String, Object>();
+        root.put("max", FeedbackStore.MAX_ENTRIES);
+        root.put("entries", rows);
+        return Json.write(root);
+    }
+
     static String faceStateJson(FaceSettings f, PeopleStore store, FaceChecks checks) {
         Map<String, Object> th = new LinkedHashMap<String, Object>();
         th.put("confident", decimal(f.confident));
@@ -486,7 +593,10 @@ final class SettingsPage {
 
     private static String save(Map<String, String> form, ClaudeSettings settings) {
         try {
-            settings.save(form.get("base_url"), form.get("key"), form.get("model"));
+            // A model picked from the list wins; the default entry ("") keeps the typed name.
+            String pick = form.get("model_pick");
+            String model = pick != null && !pick.trim().isEmpty() ? pick.trim() : form.get("model");
+            settings.save(form.get("base_url"), form.get("key"), model);
         } catch (ClaudeSettings.InvalidException e) {
             // Fixed text by contract (ClaudeSettings), never what was typed.
             return "Not saved: " + e.getMessage();
@@ -591,21 +701,28 @@ final class SettingsPage {
         html.append("<input type=\"password\" id=\"key\" name=\"key\" autocomplete=\"off\" "
                 + "autocapitalize=\"off\" spellcheck=\"false\">");
         html.append("<small>Leave empty to keep the saved key.</small></label>");
+        // A plain select, not a datalist: a datalist only suggests entries matching the
+        // text already in the box (the current model), so it showed nothing (owner, 2026-10-01).
+        if (!models.isEmpty()) {
+            html.append("<label for=\"model_pick\">Pick a model");
+            html.append("<select id=\"model_pick\" name=\"model_pick\">");
+            html.append("<option value=\"\" selected>Use the name typed below</option>");
+            for (String id : models) {
+                html.append("<option value=\"").append(escapeHtml(id)).append("\">").append(escapeHtml(id))
+                        .append(id.equals(st.model) ? " (current)" : "").append("</option>");
+            }
+            html.append("</select></label>");
+        }
         html.append("<label for=\"model\">Model");
-        html.append("<input type=\"text\" id=\"model\" name=\"model\" list=\"claude-models\" value=\"")
+        html.append("<input type=\"text\" id=\"model\" name=\"model\" value=\"")
                 .append(escapeHtml(st.model))
                 .append("\" autocomplete=\"off\" autocapitalize=\"off\" spellcheck=\"false\">");
-        html.append("<datalist id=\"claude-models\">");
-        for (String id : models) {
-            html.append("<option value=\"").append(escapeHtml(id)).append("\">");
-        }
-        html.append("</datalist>");
         if (!models.isEmpty() && !st.model.isEmpty() && !models.contains(st.model)) {
             // KTD5: kept, since the endpoint's list may be incomplete.
             html.append("<small id=\"model-unlisted\">").append(escapeHtml(st.model))
                     .append(" is not listed by endpoint.</small>");
         } else {
-            html.append("<small>Pick from the list after Refresh models, or type a model name.</small>");
+            html.append("<small>Pick from the list above after Refresh models, or type a model name.</small>");
         }
         html.append("</label>");
         html.append("<button type=\"submit\">Save</button>");
@@ -640,6 +757,8 @@ final class SettingsPage {
         appendFaceChecks(html, people, checks);
         appendThresholds(html, face);
         appendPeople(html, t, people);
+        appendFeedback(html, t, people.feedback());
+        appendOwnerNotes(html, t, people.ownerNotes());
 
         html.append("</main></body></html>");
         return html.toString();
@@ -691,11 +810,17 @@ final class SettingsPage {
             String id = escapeHtml(p.id);
             String name = escapeHtml(p.name);
             html.append("<article id=\"person-").append(id).append("\">");
-            html.append("<img src=\"").append(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH).append("?id=").append(id)
-                    .append("\" alt=\"").append(p.name.isEmpty() ? "unnamed person" : name)
-                    .append("\" width=\"112\" height=\"112\">");
+            boolean faced = store.hasFace(p.id);
+            if (faced) {
+                html.append("<img src=\"").append(LauncherProtocol.SETTINGS_PEOPLE_FACE_PATH).append("?id=").append(id)
+                        .append("\" alt=\"").append(p.name.isEmpty() ? "unnamed person" : name)
+                        .append("\" width=\"112\" height=\"112\">");
+            }
             html.append("<p><strong>").append(p.name.isEmpty() ? "<em>unnamed</em>" : name).append("</strong><br>");
             html.append("<small>Last seen ").append(escapeHtml(lastSeen(p.lastSeenMillis))).append("</small></p>");
+            if (!faced) {
+                html.append("<p class=\"name-only\"><small>").append(PEOPLE_NAME_ONLY).append("</small></p>");
+            }
             if (p.name.isEmpty()) {
                 html.append("<p class=\"legacy\"><small>").append(PEOPLE_LEGACY).append("</small></p>");
             } else {
@@ -719,6 +844,88 @@ final class SettingsPage {
             html.append("</article>");
         }
         html.append("</section>");
+    }
+
+    /**
+     * Owner 2026-10-02: what people told the robot about himself, newest first:
+     * when, the kind, who (a first name or "someone"), the context, the summary
+     * and their quoted words, all escaped (the model and people wrote them).
+     * Never a person's id. A token-only Clear button empties the log.
+     */
+    private static void appendFeedback(StringBuilder html, String t, FeedbackStore log) {
+        List<FeedbackStore.Entry> entries = log.newestFirst();
+        html.append("<section id=\"feedback\"><h2>Feedback from conversations</h2>");
+        html.append("<p>Suggestions, complaints, praise and bugs people told the robot about himself, newest first: ")
+                .append(entries.size()).append(entries.size() == 1 ? " entry" : " entries").append(" (at most ")
+                .append(FeedbackStore.MAX_ENTRIES).append("; the oldest go first). Only their key sentence is kept, "
+                + "never the conversation. Forgetting a person deletes their entries.</p>");
+        if (entries.isEmpty()) {
+            html.append("<p id=\"feedback-empty\">").append(FEEDBACK_EMPTY).append("</p>");
+        }
+        for (FeedbackStore.Entry e : entries) {
+            html.append("<article class=\"feedback\">");
+            html.append("<p><strong>").append(escapeHtml(e.kind)).append("</strong> from ")
+                    .append(escapeHtml(e.who));
+            if (!e.context.isEmpty()) {
+                html.append(", ").append(escapeHtml(e.context));
+            }
+            html.append("<br><small>").append(escapeHtml(lastSeen(e.atMillis))).append("</small></p>");
+            html.append("<p>").append(escapeHtml(e.summary)).append("</p>");
+            if (!e.quote.isEmpty()) {
+                html.append("<blockquote>\u201c").append(escapeHtml(e.quote)).append("\u201d</blockquote>");
+            }
+            html.append("</article>");
+        }
+        if (!entries.isEmpty()) {
+            tokenForm(html, t, LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, "Clear the feedback log", "contrast");
+        }
+        html.append("</section>");
+    }
+
+    /**
+     * Owner 2026-10-03: the owner's notes about people by name, each with an edit form
+     * and a delete button, and a form to add one. Names and notes are escaped (typed).
+     * Ids are digits only (OwnerNotes.isValidId), so safe in an attribute.
+     */
+    private static void appendOwnerNotes(StringBuilder html, String t, OwnerNotesStore store) {
+        List<OwnerNotes.Entry> entries = store.all();
+        html.append("<section id=\"owner-notes\"><h2>Notes about people by name</h2>");
+        html.append("<p>A note per person, by the name they give him: these notes stay on the robot and are never "
+                + "logged; Miko follows them for how to approach that person, but never reveals them, never "
+                + "deceives anyone and always leaves when asked.</p>");
+        if (entries.isEmpty()) {
+            html.append("<p id=\"owner-notes-empty\">").append(OWNER_NOTES_EMPTY).append("</p>");
+        }
+        for (OwnerNotes.Entry e : entries) {
+            String id = escapeHtml(e.id);
+            html.append("<article class=\"owner-note\">");
+            html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH)
+                    .append("\">");
+            html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+            html.append("<input type=\"hidden\" name=\"id\" value=\"").append(id).append("\">");
+            ownerNoteFields(html, e.name, e.note);
+            html.append("<button type=\"submit\" class=\"secondary\">Save</button></form>");
+            html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH)
+                    .append("\">");
+            html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+            html.append("<input type=\"hidden\" name=\"id\" value=\"").append(id).append("\">");
+            html.append("<button type=\"submit\" class=\"contrast\">Delete</button></form>");
+            html.append("</article>");
+        }
+        html.append("<form method=\"post\" action=\"").append(LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH)
+                .append("\">");
+        html.append("<input type=\"hidden\" name=\"t\" value=\"").append(t).append("\">");
+        ownerNoteFields(html, "", "");
+        html.append("<button type=\"submit\">Add note</button></form>");
+        html.append("</section>");
+    }
+
+    private static void ownerNoteFields(StringBuilder html, String name, String note) {
+        html.append("<label>Name<input type=\"text\" name=\"name\" value=\"").append(escapeHtml(name))
+                .append("\" maxlength=\"").append(OwnerNotes.MAX_NAME_CHARS).append("\" autocomplete=\"off\">")
+                .append("</label>");
+        html.append("<label>Note<textarea name=\"note\" rows=\"4\" maxlength=\"").append(OwnerNotes.MAX_NOTE_CHARS)
+                .append("\">").append(escapeHtml(note)).append("</textarea></label>");
     }
 
     /**

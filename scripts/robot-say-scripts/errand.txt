@@ -1,0 +1,4 @@
+# An errand (a task): call him, then send him to look for people in the kitchen.
+# python3 scripts/robot-say.py --script scripts/robot-say-scripts/errand.txt --tail 90
+@wake
+go to the kitchen and see if anyone's there

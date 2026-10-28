@@ -63,6 +63,18 @@ class ExploreDriveHarnessTest(unittest.TestCase):
         "spin_needs_calibrated_floor_sensors",
         "reading_carries_the_gyro",
         "loop_spin_hook_turns_in_place_and_ends_in_stop",
+        "loop_fwd_probe_sends_tofds_at_start_and_tofen_when_it_ends",
+        "loop_stop_during_fwd_probe_sends_tofen",
+        "loop_dark_floor_on_sends_tofds_once_while_held",
+        "loop_dark_floor_lease_regained_sends_tofds_again",
+        "loop_dark_floor_switched_off_sends_tofen",
+        "loop_dark_floor_stop_sends_tofen",
+        "loop_dark_floor_off_by_default_sends_neither",
+        "dark_floor_resends_tofds_when_ir2_comes_back_at_most_every_5s",
+        "dark_floor_resends_tofds_when_readings_resume_after_a_gap",
+        "dark_floor_resends_tofds_when_cpl2_comes_back",
+        "dark_floor_lease_loss_leaves_the_tofen_to_the_drive",
+        "dark_floor_property_values",
     )
 
     @classmethod

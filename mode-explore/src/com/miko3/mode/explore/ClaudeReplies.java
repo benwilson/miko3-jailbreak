@@ -67,7 +67,21 @@ final class ClaudeReplies {
      * or anything missing is a failure; way_out false is NONE.
      */
     static CuriosityPort.WayOut wayOut(Map<String, Object> json, int[] widths) {
-        Object way = json.get("way_out");
+        return framePick(json, "way_out", widths);
+    }
+
+    /**
+     * The seek reply (seeking the unfamiliar): read like the way-out reply, with
+     * "unexplored" in place of "way_out": the frame and x of the most unexplored-looking
+     * place to go, or NONE.
+     */
+    static CuriosityPort.WayOut seek(Map<String, Object> json, int[] widths) {
+        return framePick(json, "unexplored", widths);
+    }
+
+    /** A frame and x behind a yes/no flag (the way-out and seek replies). */
+    private static CuriosityPort.WayOut framePick(Map<String, Object> json, String flag, int[] widths) {
+        Object way = json.get(flag);
         if (Boolean.FALSE.equals(way)) {
             return CuriosityPort.WayOut.none();
         }
@@ -195,14 +209,53 @@ final class ClaudeReplies {
      * is a failure. The brain caps the sentences and validates the name.
      */
     static CuriosityPort.Turn turn(Map<String, Object> json, String notesUpdateJson) {
+        // Owner 2026-10-02: a message not said to him (people talking nearby) has no line to
+        // say and no action; "addressed" missing (an older reply) reads as said to him.
+        boolean addressed = !Boolean.FALSE.equals(json.get("addressed"));
         String line = text(json.get("line"));
-        if (line == null) {
+        if (line == null && addressed) {
             return CuriosityPort.Turn.failed();
         }
         String notes = notesUpdateJson == null || notesUpdateJson.trim().isEmpty() || "{}".equals(notesUpdateJson.trim())
                 ? null : notesUpdateJson;
-        return CuriosityPort.Turn.line(line, text(json.get("question_asked")), text(json.get("name_given")),
-                Boolean.TRUE.equals(json.get("ends_conversation")), Boolean.TRUE.equals(json.get("deflected")), notes);
+        CuriosityPort.Turn t = CuriosityPort.Turn.line(line == null ? "" : line, text(json.get("question_asked")),
+                text(json.get("name_given")), Boolean.TRUE.equals(json.get("ends_conversation")),
+                Boolean.TRUE.equals(json.get("deflected")), notes)
+                .withFeedback(feedback(json.get("feedback")));
+        if (!addressed) {
+            return t.withAddressed(false);
+        }
+        String target = text(json.get("target"));
+        if (target != null && target.length() > MAX_TARGET) {
+            target = target.substring(0, MAX_TARGET).trim();
+        }
+        // Owner 2026-10-03: instructions now come as action tools (ChatActions); a reply that still
+        // writes the old action field is taken only for its five instructions, never a tool's.
+        CuriosityPort.Action a = CuriosityPort.Action.of(json.get("action"));
+        return t.withAction(a.ordinal() <= CuriosityPort.Action.BE_QUIET.ordinal() ? a : CuriosityPort.Action.NONE,
+                target);
+    }
+
+    /** The longest action target kept: a short name or place. */
+    static final int MAX_TARGET = 60;
+
+    /**
+     * Owner 2026-10-02: the turn's "feedback" field, an object with string kind, summary
+     * and quote, or null. JSON null, the kind "none", an empty summary or anything
+     * malformed is no feedback; the line goes on either way.
+     */
+    static CuriosityPort.Feedback feedback(Object v) {
+        if (!(v instanceof Map)) {
+            return null;
+        }
+        Map<?, ?> m = (Map<?, ?>) v;
+        Object kind = m.get("kind");
+        Object summary = m.get("summary");
+        Object quote = m.get("quote");
+        if (!(kind instanceof String) || !(summary instanceof String) || quote != null && !(quote instanceof String)) {
+            return null;
+        }
+        return CuriosityPort.Feedback.of((String) kind, (String) summary, (String) quote);
     }
 
     /** Claude's named line with the stored name put in (the robot's side of KTD7: names are never sent). */

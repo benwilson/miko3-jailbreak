@@ -241,6 +241,90 @@ class RunTest(unittest.TestCase):
         self.assertEqual(robot.property_writes()[-1], '""')
 
 
+NC_DUMP = json.dumps({
+    "backend": "NC",
+    "raw_reply": "58585542030103000000a620d0e70100",
+    "seconds": 2,
+    "rows": [
+        {"second": 1, "angle": None, "raw": 138, "rms": 900, "decode_ms": 200, "decode_max_ms": 20, "chunks": 13,
+         "words": 0, "matched": False},
+        {"second": 2, "angle": None, "raw": None, "rms": 850, "decode_ms": 210, "decode_max_ms": 22, "chunks": 13,
+         "words": 0, "matched": False},
+    ],
+})
+
+
+class RawChipValueTest(unittest.TestCase):
+    """The NC chip's raw 0..255 reading rides along each row (U2) so the owner can
+    calibrate zero, sign and scale (KTD12); an older launcher simply omits it."""
+
+    def test_raw_and_the_nc_reply_are_parsed_when_present(self):
+        answer = qa.parse_answer(NC_DUMP)
+        self.assertEqual(answer.backend, "NC")
+        self.assertEqual(answer.nc_reply, "58585542030103000000a620d0e70100")
+        self.assertEqual(answer.rows[0][qa.RAW_FIELD], 138)
+        self.assertIsNone(answer.rows[1][qa.RAW_FIELD])
+
+    def test_a_dump_without_raw_keeps_the_old_shape(self):
+        answer = qa.parse_answer(SAMPLE_DUMP)
+        self.assertIsNone(answer.nc_reply)
+        self.assertNotIn(qa.RAW_FIELD, answer.rows[0])
+
+    def test_raw_outside_a_byte_or_not_a_number_is_refused(self):
+        for bad_value in (256, -1, "138", 12.5, True):
+            bad = json.loads(NC_DUMP)
+            bad["rows"][0]["raw"] = bad_value
+            with self.assertRaises(ValueError, msg=repr(bad_value)):
+                qa.parse_answer(json.dumps(bad))
+
+    def test_the_nc_reply_must_be_a_string_or_list_of_strings(self):
+        bad = json.loads(NC_DUMP)
+        bad["raw_reply"] = 42
+        with self.assertRaises(ValueError):
+            qa.parse_answer(json.dumps(bad))
+        ok = json.loads(NC_DUMP)
+        ok["raw_reply"] = ["58585542aa", "58585542bb"]
+        self.assertEqual(qa.parse_answer(json.dumps(ok)).nc_reply, ["58585542aa", "58585542bb"])
+
+    def test_table_prints_the_raw_value_next_to_the_angle(self):
+        text = qa.format_rows(qa.parse_answer(NC_DUMP).rows)
+        header, first, second = text.splitlines()[:3]
+        self.assertRegex(header, r"angle\s+raw")
+        self.assertRegex(first, r"^\s*1\s+-\s+138\s")
+        self.assertRegex(second, r"^\s*2\s+-\s+-\s")
+        self.assertNotIn("raw", qa.format_rows(qa.parse_answer(SAMPLE_DUMP).rows))
+
+    def test_csvs_carry_the_raw_column_after_the_angle_when_present(self):
+        rows = qa.parse_answer(NC_DUMP).rows
+        with tempfile.TemporaryDirectory() as td:
+            plain = Path(td) / "probe.csv"
+            qa.write_csv(rows, plain)
+            step = Path(td) / "front.csv"
+            qa.write_step_csv(rows, [], step)
+            plain_lines = plain.read_text().splitlines()
+            step_header = step.read_text().splitlines()[0].split(",")
+        header = plain_lines[0].split(",")
+        self.assertEqual(header[header.index("angle") + 1], "raw")
+        self.assertEqual(dict(zip(header, plain_lines[1].split(",")))["raw"], "138")
+        self.assertEqual(dict(zip(header, plain_lines[2].split(",")))["raw"], "")
+        self.assertEqual(step_header[step_header.index("angle") + 1], "raw")
+
+    def test_step_summary_reports_the_raw_readings(self):
+        text = qa.format_step_summary(qa.parse_answer(NC_DUMP).rows, [])
+        self.assertIn("raw: 1 of 2 seconds", text)
+        self.assertIn("138", text)
+        self.assertNotIn("raw:", qa.format_step_summary(qa.parse_answer(SAMPLE_DUMP).rows, []))
+
+    def test_run_prints_the_raw_column(self):
+        robot, http = FakeRobot(), FakeHttp(post_body=NC_DUMP)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            answer = qa.run(robot, seconds=2, phrase=None, http=http)
+        self.assertEqual(answer.nc_reply, "58585542030103000000a620d0e70100")
+        self.assertIn("direction backend: NC", out.getvalue())
+        self.assertIn("138", out.getvalue())
+
+
 class MainTest(unittest.TestCase):
     def test_parser_defaults(self):
         args = qa.build_parser().parse_args([])

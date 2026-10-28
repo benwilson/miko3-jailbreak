@@ -36,10 +36,13 @@ package com.miko3.shared;
  * .housing > .glass > .glow > .glow-core. A caller restyles them by class on
  * #rig from its own CSS (the voice mode does this per conversation state), and
  * its after-eyes script may wrap the global gazeTo(x,y,speedMs) that every
- * glance goes through. The script sets the blink as an INLINE style on each
- * .glow-core (and gazeTo sets .glow's transform inline), so a caller rule that
- * changes .glow-core's animation, transform or opacity must be !important or
- * it silently loses (docs/solutions/ui-bugs/
+ * glance goes through, or replace blinkEvery() (the blink period, ms). The
+ * blink is a one-shot .blink class the script adds to each .glow-core every
+ * period, never an infinite animation, so a still face costs the compositor
+ * nothing between glances and blinks. gazeTo sets .glow's transform INLINE, so
+ * a caller rule on .glow's transform must be !important; caller rules that
+ * change .glow-core's animation stay !important too, from when the blink was
+ * inline (docs/solutions/ui-bugs/
  * per-mode-eye-css-overridden-by-inline-blink-animation.md). Pure string
  * building, no android.* — the host-JVM tests compile it directly.
  */
@@ -82,7 +85,12 @@ public final class EyesPage {
             // nothing before it would hit the lens edge in any direction gaze sends it.
             + ".glow{position:absolute;width:70%;height:70%;left:15%;top:15%;"
             + "transition:transform ease}"
-            + ".glow-core{width:100%;height:100%;border-radius:50%;"
+            // will-change keeps .glow and .glow-core on their own composited layers
+            // for good: a glance or blink then only moves/fades an existing layer
+            // instead of promoting it, re-rastering the gradient, and demoting it
+            // again around every one-shot animation.
+            + ".glow{will-change:transform}"
+            + ".glow-core{width:100%;height:100%;border-radius:50%;will-change:transform,opacity;"
             + "background:radial-gradient(circle at center,#fff6d6 0%,#ffd23f 8%,#ff8a1e 22%,"
             + "#e2331c 42%,#7a0f0a 62%,rgba(0,0,0,0) 78%)}"
             // Fixed curved highlights — light catching the lens's convex glass, per
@@ -98,8 +106,13 @@ public final class EyesPage {
             // Blink crossed with a fade-out: the glow squashes AND fades all the way
             // to fully transparent at the peak (opacity:0, not just dimmed), standing
             // in for an eyelid HAL's lens doesn't physically have.
-            + "@keyframes blink{0%,90%,100%{transform:scale(1);opacity:1}"
-            + "95%{transform:scale(0.85,0.08);opacity:0}}";
+            // One-shot, added as a class by EYES_JS: an infinite animation kept the
+            // WebView compositing 60 frames a second even while the eyes sat still
+            // (robot 2026-10-02, docked: RenderThread ~16% of a core). .65s is the
+            // last 10% of the old 6.5s infinite cycle, so each blink looks the same.
+            + "@keyframes blink{0%,100%{transform:scale(1);opacity:1}"
+            + "50%{transform:scale(0.85,0.08);opacity:0}}"
+            + ".glow-core.blink{animation:blink .65s 1}";
 
     private static final String LENS =
             "<div class=\"housing\">"
@@ -114,10 +127,26 @@ public final class EyesPage {
     private static final String EYES_JS =
             "var glows=document.getElementsByClassName('glow');"
             + "var cores=document.getElementsByClassName('glow-core');"
-            + "for(var g=0;g<cores.length;g++){"
-            + "cores[g].style.animation='blink 6.5s infinite';"
-            + "cores[g].style.animationDelay=(g*0.2)+'s';"
+            // The blink, scheduled by script: every blinkEvery() ms each core gets
+            // the one-shot .blink class (the second eye 0.2 s behind, as before),
+            // taken off again on animationend. A state whose CSS suppresses the
+            // blink fires no animationend, so a timer at a fifth of the period
+            // takes the class off too; a stale class would otherwise blink the eye
+            // the moment that state ends. A caller may replace blinkEvery (the
+            // voice mode slows it while unreachable).
+            + "function blinkEvery(){return 6500;}"
+            + "function unblink(c){c.classList.remove('blink');}"
+            + "function blink(c){"
+            + "if(c.classList.contains('blink')){unblink(c);void c.offsetWidth;}"
+            + "c.classList.add('blink');"
+            + "var every=blinkEvery();"
+            + "setTimeout(function(){unblink(c);},every/5);"
+            + "setTimeout(function(){blink(c);},every);"
             + "}"
+            + "for(var g=0;g<cores.length;g++){(function(c,lag){"
+            + "c.addEventListener('animationend',function(){unblink(c);});"
+            + "setTimeout(function(){blink(c);},blinkEvery()*0.9+lag);"
+            + "})(cores[g],g*200);}"
             // "Watching something happening": both glows drift together to one
             // shared, periodically retargeted point rather than idly wandering on a
             // uniform clock — mixes quick glances (short hold, fast move) with

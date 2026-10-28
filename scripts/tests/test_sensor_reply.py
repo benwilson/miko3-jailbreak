@@ -64,6 +64,13 @@ class SensorReplyHarnessTest(unittest.TestCase):
         "a_reply_without_cpl_keeps_the_charger_latch",
         "a_later_ack_with_cpl_one_clears_the_charger_latch",
         "cpl_two_clears_the_latch_and_never_reads_as_charging",
+        "power_off_the_dock_is_read",
+        "power_on_the_dock_is_read",
+        "power_strings_alone_are_read",
+        "power_docked_is_any_state_above_zero_or_a_charging_current",
+        "the_snapshot_carries_power_even_with_a_faulted_tof",
+        "cut_off_or_malformed_power_is_absent",
+        "power_without_a_percentage_still_says_docked",
     )
 
     @classmethod

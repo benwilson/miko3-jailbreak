@@ -1,7 +1,7 @@
 ---
 title: "The Miko 3 front ToF is a downward cliff sensor gated by the MCU's own safe band, not a forward rangefinder"
 date: 2026-09-22
-last_updated: 2026-09-25
+last_updated: 2026-10-02
 category: best-practices
 module: "Miko 3 front ToF/edge sensor (shared DirectMotorDriver + SensorReply, mode-explore HazardClassifier)"
 problem_type: best_practice
@@ -21,12 +21,15 @@ tags:
   - "hazard-classification"
   - "carpet"
   - "surface-change"
+  - "tofds"
+  - "dark-floor"
 applies_when:
   - "Tuning explore mode's hazard thresholds or cornered cap, or reading its startle logs"
   - "Writing another autonomous mode that drives forward on the ToF/TOFIR readings"
   - "The robot stops well short of a desk edge, or startles on an open desk"
   - "A reply reads TOFIR=16383 and you need to decide between edge, lifted, and dead sensor"
   - "The robot moved to a new surface (desk to floor, or a different carpet) and now spins or startles in open space"
+  - "The floor is black (or otherwise gives the ToF no return): tof reads 16383 all the time, the MCU refuses forward and Explore sits in eyes-only"
 ---
 
 # The Miko 3 front ToF is a downward cliff sensor gated by the MCU's own safe band, not a forward rangefinder
@@ -43,7 +46,7 @@ The mode was designed as if the ToF were a forward rangefinder with an independe
 
 **2. `ir2` is the MCU's own hazard flag, and `ir1` is absent.** The `TOFIR=` section is `<tof, 5 digits>,<ir1: always all-X padding = absent>,<ir2: one digit>,<X padding>`. `ir2` goes to 1 for **both** a near object and an edge, so it is a single "outside my safe band" flag, not an edge-only flag. `SensorReply` returns the all-X field as `ABSENT` (`SensorReply.java:97-109`), and `HazardClassifier.irEdge()` never treats an absent field as an edge (`HazardClassifier.java:153-159`). One consequence: with the calibration the session produced (`edgeIr>0`), the EDGE rule (`HazardClassifier.java:120-131`) fires before the OBSTACLE rule (`:135-137`). A hand in front is therefore reported as `EDGE`, not `OBSTACLE`. Do not rely on the hazard *kind* to tell an edge from an object. The `side` is also meaningless while only `ir2` exists (`ir1IsLeft` is unverified, `ExploreTuning.java:51-52`).
 
-**3. The MCU keeps its own safe band of about tof 170-280, and it refuses forward motion outside it with `CPL=2`. Never override that.** Outside the band the MCU sets `ir2=1` and acks a forward command with `CPL=2` instead of driving. `CPL` appears in the `POWER` replies while the robot moves (`CPL=1` during motion, `CPL=2` when refused). Device captures recorded refusals at tof 166 (too close) and 289 (too far). The driver timestamps any reply that carries `CPL=2` in `lastRefusalMs` (`DirectMotorDriver.java:135-136, 252-256, 320-322`). `ExploreDrive` attaches `cpl=2` to a reading when a refusal landed no more than 250 ms before it, or at any time after it (`mode-explore/src/com/miko3/mode/explore/ExploreDrive.java:46-47, 234-235`), and the classifier reports that as a `CPL` hazard (`HazardClassifier.java:138-140`). The MCU's refusal is the last line of defence against driving off the desk. Treat it as authoritative. Do not resend forward to push past it, and do not widen app thresholds past the band expecting the robot to go there.
+**3. The MCU keeps its own safe band of about tof 170-280, and it refuses forward motion outside it with `CPL=2`. Never override that.** Outside the band the MCU sets `ir2=1` and acks a forward command with `CPL=2` instead of driving. `CPL` appears in the `POWER` replies while the robot moves (`CPL=1` during motion, `CPL=2` when refused). Device captures recorded refusals at tof 166 (too close) and 289 (too far). The driver timestamps any reply that carries `CPL=2` in `lastRefusalMs` (`DirectMotorDriver.java:135-136, 252-256, 320-322`). `ExploreDrive` attaches `cpl=2` to a reading when a refusal landed no more than 250 ms before it, or at any time after it (`mode-explore/src/com/miko3/mode/explore/ExploreDrive.java:46-47, 234-235`), and the classifier reports that as a `CPL` hazard (`HazardClassifier.java:138-140`). The MCU's refusal is the last line of defence against driving off the desk. Treat it as authoritative. Do not resend forward to push past it, and do not widen app thresholds past the band expecting the robot to go there. The one owner-approved exception is dark-floor mode on a drop-free floor (point 9), which switches the MCU's check off with its own `TOFDS` command instead of fighting the refusal.
 
 **4. The robot's nose bobs by 40-60 counts when a hop starts, stops, or turns.** The chassis rocks, so the downward beam sweeps nearer and farther along the desk. A reading can briefly leave the MCU's band on open desk. The MCU then refuses forward (`CPL=2`, `ir2=1`), and a brain that treats `ir2`/`CPL=2` as a hazard startles. Three of those within `capWindowMs` (20 s) and no successful hop in between trips the cornered rest (`ExploreTuning.java:47-50, 141-143`). Once the robot is still, readings settle back into range within about 250 ms. Some startles on open desk are therefore bounce artifacts rather than real hazards. Real clutter shows up differently: a steady fall in tof across several readings, not a single spike.
 
@@ -65,6 +68,21 @@ Two related facts from the same session:
 - The ToF does not see a cabinet or wall the robot is pressed against: with his face on a cabinet it read about 175, plain floor. Walls and furniture are for the camera and wheel-stall detection, not this sensor.
 
 **8. Available option, not adopted: a settle filter.** One way to cut bounce startles: stop at once on a hazard, wait about 300 ms still, and startle only if the hazard is still there. This was prototyped during the session, and the owner **declined** it. They accepted the edge margin and the occasional bounce startle as they are, so the current tree does not include it. If bounce startles become a problem later, this is the known lever. Keep the immediate stop and delay only the startle and cornered-count reaction, because the MCU refusal must still take effect at once.
+
+**9. `TOFDS` switches the MCU's ToF check off; dark-floor mode uses it on drop-free floors only (owner-approved 2026-10-02).** At the owner's home the floor is black. The ToF gets no return from it, so it reads `16383` all the time with `ir2=1`, and the MCU refuses every forward command (`CPL=2`). Our classifier read `16383` without a calibrated agreeing flag as unavailable, so Explore stayed in eyes-only. The owner said there are no drops anywhere and asked for him to drive there. What the firmware does (disassembly of MCU firmware v6.1 on the robot, plus the vendor app):
+- There is no tuning command. The band is hard-coded: a hazard is tof < 150, tof > 300, or more than 40 away from the running average.
+- `TOFDS` (ASCII `TOFDS` padded with `X` to 500 bytes, the same shape as `POWER`, `MTSTP` and `TOFEN`) clears the check's enable flag. With it off there is no `CPL=2` from the ToF, `ir2` stays 0, and `TOFIR` readings keep flowing. `TOFEN` turns it back on, and so does an MCU reset (enable=1 at boot). The vendor app sends `TOFDS` itself (`SocialInteraction_SpeechChat.stopTof()`, `loginStopTof()`), which is why a leftover `TOFDS` was one of the `16383` suspects in point 5.
+- Robot check, 2026-10-02 18:07 and 18:2x, black floor, `MikoExploreFwdProbe` hook. Without `TOFDS`: forward wheels L=0 R=0 (refused), `ir2=1` on 66/66 readings, tof valid 0/66; back drove fine (-871/-865). With `TOFDS`: forward wheels 1119/1121 and 1199/1197, `cpl2` 0/67, `ir2=1` on 0 readings; tof still valid 0/67. Accel z read 23095..23202 standing still and 22944..23560 while driving. `TOFEN` at the end of the probe went out fine.
+
+`DirectMotorDriver.disableTofCheck()` / `enableTofCheck()` send the two frames (`scripts/tests/test_motor_driver_frames.py` pins the exact bytes). Explore's dark-floor mode (`persist.miko3.explore.dark_floor=1`, read at start and every ~5 s; `mode-explore/.../DarkFloor.java`) does the following:
+- It sends `TOFDS` once per drive session. It sends it again after the lease comes back, after the readings stop for 1 s or more and then resume, and when `ir2=1` or `CPL=2` reappears (at most every 5 s), since any of these can mean the MCU reset.
+- It sends `TOFEN` when the property goes off and when Explore stops. `ExploreDrive` also sends it before it lets a driver go or releases the lease, and the existing `TOFEN` at every connect covers an app start with the mode off.
+- `HazardClassifier.setDarkFloor(true)`: `16383` means "no floor reading", which is clear, not unavailable and not an edge. The `ir2` flag and `edgeTofAbove` are ignored. A valid low tof is still an obstacle, and `CPL=2` and the charger latch still refuse motion.
+- The accelerometer stands in for the cliff sensor. If z stays below 23100·cos 28° (about 20400) for two readings in a row, that is a `TILT` hazard ahead: he stops, startles, backs off and logs `dark floor: tilt`. Below cos 45° (about 16300) he has been lifted or tipped over. The sensors read unavailable (eyes-only) until he has had three flat readings in a row.
+- Robot 2026-10-02 18:28: he tipped onto his side 0.5 s into the straight back-out after a stall (a 52 deg turn probe had come first), and nothing caught it, because `BACK_OFF` ignored hazards. The tilt is now also the angle between the accel vector and the flat one, learned from still readings at start (default `(-2200, 600, 23100)`). A change of more than 8 deg away from flat within 300 ms is a `TILT` at once. In dark mode, every move except a forward leg stops at 10 deg (`HazardClassifier.tipping()`), goes 2 ticks the opposite way, and waits until he is flat. More than 2 tips in a stuck spell counts as a jam. Stall recover probes never turn. `floor:` records carry `tiltMax`, `fastMax` and `tiltEnd`. The 8 deg fast trigger is untested on the robot: check `fastMax` on clean legs for false trips.
+- Obstacles come only from the camera and from wheel stalls, so legs are capped at 16 ticks (about 1 m). Each leg writes a `floor:` record to the learning log with valid tof readings, stalls and tilts.
+
+Never use `TOFDS` on a desk or anywhere with a drop: with the check off, nothing stops him driving over an edge. Dark-floor mode is off by default, and with it off nothing changes.
 
 ## Why This Matters
 

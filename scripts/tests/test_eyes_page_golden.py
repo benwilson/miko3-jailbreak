@@ -193,7 +193,8 @@ const vm = require('vm');
 const fs = require('fs');
 const script = fs.readFileSync(process.argv[2], 'utf8');
 const answers = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
-function el() { return {style: {}, className: ''}; }
+function el() { return {style: {}, className: '', offsetWidth: 1, addEventListener: function () {},
+  classList: {add: function () {}, remove: function () {}, contains: function () { return false; }}}; }
 const rig = el(), glows = [el(), el()], cores = [el(), el()];
 const timers = [], requests = [];
 function XHR() {}
@@ -225,7 +226,7 @@ for (const [status, body] of answers) {
   const polls = timers.slice(mark).filter(function (t) { return t.fn === ctx.pollVoiceState; });
   ctx.nextGlance();
   out.steps.push({req: req, cls: rig.className, delays: polls.map(function (t) { return t.d; }),
-                  gaze: glows[0].style.transform});
+                  gaze: glows[0].style.transform, blinkEvery: ctx.blinkEvery()});
   if (polls.length !== 1) { out.error = 'polls scheduled: ' + polls.length; break; }
   polls[0].fn();
 }
@@ -322,6 +323,17 @@ class VoicePollRateTest(unittest.TestCase):
         self.assertEqual(gaze["connecting"], (0.0, 0.0))
         for steady in ("conversing", "speaking"):
             self.assertLess(max(gaze[steady]), 4, steady)
+
+    def test_unreachable_blinks_slower(self):
+        # The old look ran the infinite blink at 13 s, not 6.5 s, while unreachable: the
+        # scheduled blink keeps that by replacing blinkEvery, and stretches the blink
+        # itself to the same tenth of the period (1.3 s, as before).
+        seq = ["listening", "unreachable", "listening"]
+        out = self.drive([[200, s] for s in seq])
+        self.assertEqual([step["blinkEvery"] for step in out["steps"]], [6500, 13000, 6500])
+        page = self.script.parent / "voice.html"
+        self.assertRegex(page.read_text(encoding="utf-8"),
+                         r"#rig\.s-unreachable \.glow-core\.blink\{animation-duration:1\.3s!important\}")
 
 
 if __name__ == "__main__":

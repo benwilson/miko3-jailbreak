@@ -1,8 +1,10 @@
 package com.miko3.mode.explore;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -36,6 +38,8 @@ final class Coverage {
     private boolean tracking;
     private SensorReading lastWheels;
     private long lastMs;
+    /** Spots to stay away from (bathroom privacy, owner 2026-10-02): {x, y, radius m, until ms}. */
+    private final List<double[]> avoided = new ArrayList<double[]>();
 
     Coverage(ExploreTuning tuning) {
         this.tuning = tuning;
@@ -113,6 +117,58 @@ final class Coverage {
         return seen.isEmpty() ? 1.0 : 1.0 - sum / seen.size();
     }
 
+    /**
+     * Stay away from the cells within radiusM of where he is now until untilMs (bathroom
+     * privacy). Nothing while not tracking: there is no position to remember.
+     */
+    void avoid(double radiusM, long untilMs) {
+        if (tracking && radiusM > 0) {
+            avoided.add(new double[]{x, y, radiusM, untilMs});
+        }
+    }
+
+    /** The newest spot avoided stays avoided until untilMs, if that is later. */
+    void extendAvoid(long untilMs) {
+        if (!avoided.isEmpty()) {
+            double[] a = avoided.get(avoided.size() - 1);
+            a[3] = Math.max(a[3], untilMs);
+        }
+    }
+
+    /**
+     * Whether the next reachM along headingDeg passes through a spot avoided at nowMs.
+     * A spot he is inside does not count (every way leads through it; the heading rules
+     * there). False while not tracking.
+     */
+    boolean avoided(double headingDeg, double reachM, long nowMs) {
+        if (!tracking || avoided.isEmpty()) {
+            return false;
+        }
+        double rad = Math.toRadians(headingDeg);
+        double cx = Math.cos(rad);
+        double cy = Math.sin(rad);
+        for (Iterator<double[]> it = avoided.iterator(); it.hasNext(); ) {
+            double[] a = it.next();
+            if (nowMs >= a[3]) {
+                it.remove();
+                continue;
+            }
+            double dx = a[0] - x;
+            double dy = a[1] - y;
+            if (dx * dx + dy * dy <= a[2] * a[2]) {
+                continue;
+            }
+            // The nearest point of the segment from here, reachM along the heading, to its centre.
+            double along = Math.max(0, Math.min(reachM, dx * cx + dy * cy));
+            double ex = dx - along * cx;
+            double ey = dy - along * cy;
+            if (ex * ex + ey * ey <= a[2] * a[2]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Cells visited within coverageFadeMs of nowMs (older ones are dropped). */
     int cells(long nowMs) {
         for (Iterator<Long> it = visited.values().iterator(); it.hasNext(); ) {
@@ -131,6 +187,7 @@ final class Coverage {
     /** Forget everything (Explore stopping). */
     void clear() {
         visited.clear();
+        avoided.clear();
         x = 0;
         y = 0;
         tracking = false;

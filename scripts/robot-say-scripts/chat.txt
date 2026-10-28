@@ -1,0 +1,7 @@
+# Small talk: call him, three turns of chat, then goodbye.
+# python3 scripts/robot-say.py --script scripts/robot-say-scripts/chat.txt
+@wake
+how's your day going
+what have you seen around the office today
+that sounds fun, what's your favourite place to explore
+bye

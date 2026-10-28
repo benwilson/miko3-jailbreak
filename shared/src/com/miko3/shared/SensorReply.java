@@ -23,6 +23,50 @@ public final class SensorReply {
     private static final String RIGHT = "Right=";
     private static final String IMUGY = "IMUGY=";
     private static final String IMUAC = "IMUAC=";
+    private static final String POWER = "POWER=";
+
+    /**
+     * The charging current, in the 4th POWER field's own units (mA by the look of it), from
+     * which a reply reads as docked even when the 1st field is 0. Measured 2026-10-01/02:
+     * -357 and -234 off the charger (draining), +1002 on it (charging). Fully charged on
+     * the dock the current may fall toward 0, which the 1st field (2 there) still covers;
+     * +200 is far above any draining value and far below a real charge, so neither noise
+     * around 0 nor a small positive blip off the dock reads as docked.
+     */
+    public static final int DOCKED_CURRENT_MIN = 200;
+
+    /**
+     * The MCU's POWER section (docs/hardware/motors-wheels.md), as far as it is read here:
+     * "POWER=state,?,mV,current,mV,current,percent,..". Off the charger state was 0
+     * (2026-10-01 and the older doc sample), on the dock 2 (2026-10-02, charging). What a
+     * fully charged dock reports is unmeasured (1 or 3 are both plausible), so any state
+     * above 0 reads as docked, as does a current of at least DOCKED_CURRENT_MIN.
+     */
+    public static final class Power {
+        /** The 1st field: 0 off the dock, 2 on it charging (others unmeasured). */
+        public final int state;
+        /** The 4th field, signed: negative while draining, positive while charging. */
+        public final int current;
+        /** The 7th field, which reads like a battery percentage (56 off, 100 on); ABSENT when not read. */
+        public final int percent;
+
+        public Power(int state, int current, int percent) {
+            this.state = state;
+            this.current = current;
+            this.percent = percent;
+        }
+
+        /** On the dock: the state field above 0, or a charging current of at least DOCKED_CURRENT_MIN. */
+        public boolean docked() {
+            return state > 0 || current >= DOCKED_CURRENT_MIN;
+        }
+
+        @Override
+        public String toString() {
+            return "power state=" + state + " current=" + current
+                    + (percent == SensorSnapshot.ABSENT ? "" : " percent=" + percent) + (docked() ? " DOCKED" : "");
+        }
+    }
 
     private SensorReply() {
     }
@@ -69,7 +113,37 @@ public final class SensorReply {
         }
         return new SensorSnapshot(timestampMs, tof, ir1, ir2, wheels, wheels ? left : SensorSnapshot.ABSENT,
                 wheels ? right : SensorSnapshot.ABSENT, hasGyro, gyro[0], gyro[1], gyro[2],
-                hasAccel, accel[0], accel[1], accel[2]);
+                hasAccel, accel[0], accel[1], accel[2], parsePower(text));
+    }
+
+    /**
+     * The POWER section in {@code text}, or null when there is none or it cannot be read
+     * confidently. The state (1st field) must be 1-5 digits and the current (4th) an
+     * optional '-' and 1-10 digits, each ended by a comma: a field cut off at the end
+     * of the section ("01002" could be the front of "010020") never reads as a value.
+     * The percentage (7th) is ABSENT unless it too is whole and comma-terminated. Works
+     * on a POWER reply whether or not it carried TOFIR, so a dock is seen with the ToF
+     * dead.
+     */
+    public static Power parsePower(String text) {
+        if (text == null) {
+            return null;
+        }
+        int start = text.indexOf(POWER);
+        if (start < 0) {
+            return null;
+        }
+        String[] fields = sectionBody(text, start + POWER.length()).split(",", -1);
+        if (fields.length < 5) {
+            return null;
+        }
+        int state = number(fields[0]);
+        Integer current = signed(fields[3]);
+        if (state == SensorSnapshot.ABSENT || current == null) {
+            return null;
+        }
+        int percent = fields.length > 7 ? number(fields[6]) : SensorSnapshot.ABSENT;
+        return new Power(state, current, percent);
     }
 
     /** The three signed fields after {@code key}: the gyro rates after IMUGY=

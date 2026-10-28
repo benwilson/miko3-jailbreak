@@ -231,14 +231,14 @@ class ChecksTest(unittest.TestCase):
                    "leanIns": 1, "quietResumes": 1},                             # after behind
                   {"cueAt": 20000, "turnDone": 24000, "faceFound": 26000, "matchAnswered": 29000,
                    "lineRequested": 29100, "firstSound": 31000}),
-            state({"cues": 4, "strongCues": 3, "weakCues": 1, "searches": 3, "facesFound": 2,
-                   "leanIns": 1, "quietResumes": 1, "repeats": 1},               # after charger: a cue got through
+            state({"cues": 4, "strongCues": 3, "weakCues": 1, "searches": 4, "facesFound": 2,
+                   "leanIns": 1, "quietResumes": 1, "repeats": 1},               # after charger: he searched off the dock
                   {"cueAt": 20000, "turnDone": 24000, "faceFound": 26000, "matchAnswered": 29000,
                    "lineRequested": 29100, "firstSound": 31000}),
         ]
         robot = FakeRobot(states=states, logs=["", LOG_OPENED_TO_NOBODY, "", ""])
         # hallway: yes + greeted by name; leanin: yes; behind: no + not by name;
-        # charger: yes, but a cue got through.
+        # charger: yes, but he searched although docked.
         ask = ScriptedAsk([True, True, True, False, False, True])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -256,7 +256,8 @@ class ChecksTest(unittest.TestCase):
             self.assertIn(label, text)
         self.assertIn("first sound +8.2 s", text)
         self.assertIn("turn done +2.1 s", text)
-        # Counter evidence: the lean-in counted at nobody, the cue that got through on the charger.
+        # Counter evidence: the lean-in counted at nobody; the ears stay open on the charger
+        # (hey-miko plan KTD5), so the cue is heard, and the search off the dock fails the check.
         self.assertIn("leanIns +1", text)
         self.assertIn("cues +1", text)
         self.assertEqual(summary["face_match"], (1, 2))
@@ -319,9 +320,14 @@ class ChecksTest(unittest.TestCase):
     def test_every_listed_acceptance_example_has_a_check_in_the_plans_order(self):
         self.assertEqual(list(qa.CHECKS), ["greet", "close", "notme", "samename", "neartie", "dark", "silent",
                                            "midname", "hallway", "leanin", "behind", "wedge", "stranger", "goodbye",
-                                           "walkoff", "newcomer", "forget", "bait", "switch", "charger", "persona"])
+                                           "walkoff", "newcomer", "forget", "bait", "switch", "charger", "persona",
+                                           "callmet", "callbackoff", "callchat", "callbehind", "callwhere",
+                                           "calldock", "callfar", "callten"])
         aes = {a for c in qa.CHECKS.values() for a in c.ae.split(", ") if a}
         for ae in ("AE1", "AE2", "AE3", "AE5", "AE6", "AE7", "AE8", "AE9", "AE10", "AE11", "AE12", "AE13"):
+            self.assertIn(ae, aes)
+        # The hey-miko plan's acceptance examples and its ten-call run.
+        for ae in ("call AE1", "call AE2", "call AE3", "call AE4", "call AE5", "call AE6"):
             self.assertIn(ae, aes)
         # The face plan's acceptance examples, beside the meeting plan's.
         for ae in ("face AE1", "face AE2", "face AE3", "face AE4", "face AE5", "face AE6", "face AE7",
@@ -555,6 +561,80 @@ class LatencyTest(unittest.TestCase):
         self.expected_cleanup(robot)
 
     expected_cleanup = lambda self, robot: CleanupTest.expected_cleanup(self, robot)
+
+
+class CallChecksTest(unittest.TestCase):
+    """The hey-miko plan's call checks (U7): the call stamps on /state time the answer,
+    the facing and the arrival against the Success Criteria budgets."""
+
+    CALL = {"callHeard": 10000, "callAnswered": 10600, "callFacing": 12400, "callArrived": 17000}
+
+    def run_one(self, name, counters, stages, answers):
+        robot = FakeRobot(states=[state(), state(counters, stages)], logs=[""])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            results, _ = qa.run_checks(robot, [name], ScriptedAsk(answers))
+        return results[0][1], out.getvalue()
+
+    def test_call_times_pass_the_one_second_and_three_second_budgets(self):
+        lines, ok = qa.call_lines(None, {"stages": {**{k: 0 for k in qa.STAGES}, **self.CALL}}, facing_budget_s=3.0)
+        text = "\n".join(lines)
+        self.assertTrue(ok)
+        self.assertIn("answered +0.6 s", text)
+        self.assertIn("facing +2.4 s", text)
+        self.assertIn("arrived +7.0 s", text)
+        self.assertNotIn("over", text)
+
+    def test_an_answer_after_1_4_s_fails_answers_within_a_second(self):
+        late = {**self.CALL, "callAnswered": 11400}
+        lines, ok = qa.call_lines(None, {"stages": {**{k: 0 for k in qa.STAGES}, **late}}, facing_budget_s=3.0)
+        self.assertFalse(ok)
+        self.assertIn("answered +1.4 s (over the 1.0 s budget)", "\n".join(lines))
+
+    def test_facing_budget_is_12_s_without_the_chip(self):
+        slow = {**self.CALL, "callFacing": 21000}
+        lines, ok = qa.call_lines(None, {"stages": {**{k: 0 for k in qa.STAGES}, **slow}}, facing_budget_s=12.0)
+        self.assertTrue(ok)
+        lines, ok = qa.call_lines(None, {"stages": {**{k: 0 for k in qa.STAGES}, **slow}}, facing_budget_s=3.0)
+        self.assertFalse(ok)
+
+    def test_a_call_stamp_from_before_the_check_is_not_counted(self):
+        before = {"stages": {**{k: 0 for k in qa.STAGES}, **self.CALL}}
+        lines, ok = qa.call_lines(before, before, facing_budget_s=12.0)
+        self.assertFalse(ok)
+        self.assertIn("no fresh call", "\n".join(lines))
+
+    def test_callmet_passes_on_fresh_call_stamps_and_the_owners_yes(self):
+        ok, text = self.run_one("callmet", {"cues": 1, "strongCues": 1, "searches": 1}, self.CALL, [True])
+        self.assertTrue(ok)
+        self.assertIn("answered +0.6 s", text)
+
+    def test_calldock_fails_if_he_searched_off_the_dock(self):
+        ok, _ = self.run_one("calldock", {"cues": 1, "strongCues": 1, "searches": 1}, self.CALL, [True])
+        self.assertFalse(ok)
+        ok, _ = self.run_one("calldock", {"cues": 1, "strongCues": 1},
+                             {**self.CALL, "callFacing": 0}, [True])
+        self.assertTrue(ok)
+
+    def test_callfar_needs_the_arrival_stamp(self):
+        ok, _ = self.run_one("callfar", {"cues": 1, "strongCues": 1, "searches": 1},
+                             {**self.CALL, "callArrived": 0}, [True])
+        self.assertFalse(ok)
+
+    def test_callten_rests_on_the_owners_count(self):
+        ok, _ = self.run_one("callten", {"cues": 10, "strongCues": 10, "searches": 10}, self.CALL, [False])
+        self.assertFalse(ok)
+
+    def test_chip_run_holds_facing_to_three_seconds(self):
+        slow = {**self.CALL, "callFacing": 16000}
+        robot = FakeRobot(states=[state(), state({"cues": 1, "strongCues": 1, "searches": 1}, slow)], logs=[""])
+        with contextlib.redirect_stdout(io.StringIO()):
+            results, _ = qa.run_checks(robot, ["callbehind"], ScriptedAsk([True]),
+                                       facing_budget_s=qa.CALL_FACING_CHIP_S)
+        self.assertEqual(results, [("callbehind", False)])
+
+    def test_the_call_checks_run_in_ae_order_through_only(self):
+        self.assertEqual(qa.parse_only("callmet,callten"), ["callmet", "callten"])
 
 
 class ParsingTest(unittest.TestCase):

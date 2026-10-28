@@ -27,7 +27,9 @@ import java.util.Set;
  *   rms         the capture level in 16-bit terms,
  *   decode_ms   time spent in the recogniser that second (and its worst chunk),
  *   words       how many words the transcript holds so far, and
- *   matched     whether every word of the phrase the script sent is in it.
+ *   matched     whether every word of the phrase the script sent is in it,
+ * after the direction "backend" (NONE, CONEXANT or NC) and "raw_reply", the NC
+ * chip's first raw reply in lowercase hex ("58585542..."), or null.
  *
  * Gate: it answers only while the debug system property PROPERTY holds the
  * per-run nonce scripts/qa-ears-probe.py generated, and only for WINDOW_MS
@@ -67,7 +69,19 @@ final class EarsProbe {
 
     /** The direction backend: which one answered, and its samples since the last drain. */
     interface Direction {
+        /** The backend's name: NONE, CONEXANT or NC (VoiceDirection.Backend). */
         String backend();
+
+        /** The chip's first raw reply in hex, or null (explore plan U2: U1 places the reply CRC from it). */
+        default String rawReply() {
+            return null;
+        }
+
+        /** The chip's latest raw value (0 to 255), or null: each row carries it so
+         * qa-direction-chip.py --calibrate can fit zero, sign and scale (hey-miko plan KTD12). */
+        default Integer raw() {
+            return null;
+        }
 
         /** Angle readings since the last call, oldest first; null for a failed read. */
         List<Float> drain();
@@ -90,9 +104,11 @@ final class EarsProbe {
         final int chunks;
         final int words;
         final boolean matched;
+        final Integer raw;
 
         Row(int second, Float angle, int rms, long decodeMs, long decodeMaxMs, int chunks, int words,
-            boolean matched) {
+            boolean matched, Integer raw) {
+            this.raw = raw;
             this.second = second;
             this.angle = angle;
             this.rms = rms;
@@ -113,6 +129,9 @@ final class EarsProbe {
             m.put("chunks", chunks);
             m.put("words", words);
             m.put("matched", matched);
+            if (raw != null) {
+                m.put("raw", raw);
+            }
             return m;
         }
     }
@@ -193,14 +212,24 @@ final class EarsProbe {
 
                 @Override
                 public void close() {
+                    // Close the last partial second while the recogniser can still be read:
+                    // after real.close() its native stream is released, and reading it in
+                    // rows() segfaulted the launcher on the robot (2026-09-29).
+                    synchronized (Tap.this) {
+                        if (chunks > 0) {
+                            closeRow();
+                        }
+                        rec = null;
+                    }
                     real.close();
                 }
             };
         }
 
-        /** The rows so far, with the partial last second closed if it heard anything. */
+        /** The rows so far, with the partial last second closed if it heard anything;
+         * after the recogniser closed, the last second was already closed by close(). */
         synchronized List<Row> rows() {
-            if (chunks > 0) {
+            if (chunks > 0 && rec != null) {
                 closeRow();
             }
             return new ArrayList<Row>(rows);
@@ -212,7 +241,8 @@ final class EarsProbe {
             boolean matched = !phrase.isEmpty() && heard.containsAll(phrase);
             int rms = samples == 0 ? 0 : (int) Math.round(Math.sqrt(sumSquares / samples) * 32768);
             rows.add(new Row(++second, VoiceDirection.median(direction.drain()), rms, decodeNs / 1000000L,
-                    decodeMaxNs / 1000000L, chunks, heard.isEmpty() ? 0 : wordCount(text), matched));
+                    decodeMaxNs / 1000000L, chunks, heard.isEmpty() ? 0 : wordCount(text), matched,
+                    direction.raw()));
             sumSquares = 0;
             samples = 0;
             decodeNs = 0;
@@ -280,16 +310,17 @@ final class EarsProbe {
                     "probe failed: " + e.getClass().getSimpleName() + "\n");
             return;
         }
-        res.sendText(200, "OK", "application/json; charset=utf-8", json(direction.backend(), seconds, rows));
+        res.sendText(200, "OK", "application/json; charset=utf-8", json(direction.backend(), direction.rawReply(), seconds, rows));
     }
 
     private static void notFound(HttpResponse res) throws IOException {
         res.sendText(404, "Not Found", "text/plain; charset=utf-8", "not found\n");
     }
 
-    static String json(String backend, int seconds, List<Row> rows) {
+    static String json(String backend, String rawReply, int seconds, List<Row> rows) {
         Map<String, Object> m = new LinkedHashMap<String, Object>();
         m.put("backend", backend);
+        m.put("raw_reply", rawReply);
         m.put("seconds", seconds);
         List<Object> out = new ArrayList<Object>();
         for (Row r : rows) {

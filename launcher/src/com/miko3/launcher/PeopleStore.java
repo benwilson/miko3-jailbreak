@@ -63,6 +63,17 @@ import java.util.regex.Pattern;
  * a delete drops the entry before the photo, so a crash leaves at worst a
  * pending photo, never one paired with another photo's embedding.
  *
+ * A person remembered by name alone (owner 2026-10-02): a faceless
+ * conversation where they said their name keeps its notes under addNamed()'s
+ * record, which has a name and no photo. It is out of recent() and the
+ * gallery (there is no face to match) but idsNamed() finds it, a face
+ * captured later is enrolled with addPhoto(), and forget() wipes it like
+ * anyone else. A record with no photo loads only when it has a name, and
+ * rename() refuses to blank one. The name may carry a last name ("Ben
+ * Wilson"), which tells apart people who share a first name. One person
+ * record is one id: name, notes, face embeddings here, and voice embeddings
+ * kept elsewhere under the same id, wiped through the forget hooks.
+ *
  * Plain Java (no android.*), so scripts/tests runs it on the host JVM over a
  * temp directory. Thread-safe: every public method is synchronized, since the
  * Binder service and the web server call it from their own threads.
@@ -193,6 +204,12 @@ final class PeopleStore {
     private final List<Person> people = new ArrayList<Person>();
     // Each person's MAX_PHOTOS slots; a null slot has no photo.
     private final Map<String, Entry[]> slots = new HashMap<String, Entry[]>();
+    /** What people told him about himself (owner 2026-10-02); forget() deletes a person's entries. */
+    private final FeedbackStore feedback;
+    /** Owner 2026-10-02: what else forget() wipes by id (the voice prints a VoiceStore keeps). */
+    private final List<ForgetHook> forgetHooks = new ArrayList<ForgetHook>();
+    /** The owner's notes about people by name (owner 2026-10-03); keyed by name, not by id. */
+    private final OwnerNotesStore ownerNotes;
 
     PeopleStore(File dir, Clock clock) {
         this(dir, clock, FILE_OPENER);
@@ -203,6 +220,32 @@ final class PeopleStore {
         this.clock = clock;
         this.indexOpener = indexOpener;
         load();
+        this.feedback = new FeedbackStore(new File(dir, FeedbackStore.FILE), clock);
+        this.ownerNotes = new OwnerNotesStore(new File(dir, OwnerNotesStore.FILE));
+    }
+
+    /** The owner's notes about people by name, for the Settings page and PeopleService. */
+    OwnerNotesStore ownerNotes() {
+        return ownerNotes;
+    }
+
+    /** The feedback log, for the Settings page. */
+    FeedbackStore feedback() {
+        return feedback;
+    }
+
+    /**
+     * Appends feedback from the person with this id, or from someone unknown
+     * (null, an unknown id, or a nameless record): the entry names a known,
+     * named person by first name only, anyone else as "someone", and keeps the
+     * id only for a named person, so forget() can delete it. False for no
+     * feedback or a failed write.
+     */
+    synchronized boolean recordFeedback(String id, com.miko3.shared.Feedback f, String context) {
+        int i = isValidId(id) ? indexOf(id) : -1;
+        String name = i < 0 ? "" : people.get(i).name;
+        boolean named = !name.isEmpty();
+        return feedback.record(f, named ? FeedbackStore.whoOf(name) : FeedbackStore.SOMEONE, named ? id : "", context);
     }
 
     /** True for the only id shape the store ever issues. */
@@ -265,6 +308,48 @@ final class PeopleStore {
             throw new IllegalArgumentException(REFUSE_NOT_SAVED);
         }
         return id;
+    }
+
+    /**
+     * Remembers a new person, seen now, by name alone, with no photo (owner
+     * 2026-10-02: a faceless conversation where they said their name), and
+     * answers their id. Only the index is written; notes follow through
+     * mergeNotes() and a face through addPhoto(). Throws
+     * IllegalArgumentException with REFUSE_NO_NAME, writing nothing, for a
+     * blank name, or REFUSE_NOT_SAVED when the index can't be written.
+     */
+    synchronized String addNamed(String name) {
+        String cleanName = cleanName(name);
+        if (cleanName.isEmpty()) {
+            throw new IllegalArgumentException(REFUSE_NO_NAME);
+        }
+        String id = newId();
+        try {
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                throw new IOException("no people directory");
+            }
+            slots.put(id, new Entry[MAX_PHOTOS]);
+            people.add(0, new Person(id, cleanName, clock.nowMillis()));
+            saveIndex();
+        } catch (IOException e) {
+            remove(id);
+            throw new IllegalArgumentException(REFUSE_NOT_SAVED);
+        }
+        return id;
+    }
+
+    /** True when the person has at least one photo; false for a person
+     * remembered by name alone, or an unknown id. */
+    synchronized boolean hasFace(String id) {
+        if (indexOf(id) < 0) {
+            return false;
+        }
+        for (Entry e : slots.get(id)) {
+            if (e != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -432,10 +517,12 @@ final class PeopleStore {
     }
 
     /** Changes the name he uses next time; a blank name makes them unnamed.
-     * Keeps their place in the list. False if unknown. */
+     * Keeps their place in the list. False if unknown, or for a blank name
+     * on a person remembered by name alone (with no photo either, the record
+     * would not load again). */
     synchronized boolean rename(String id, String name) {
         int i = indexOf(id);
-        if (i < 0) {
+        if (i < 0 || cleanName(name).isEmpty() && !hasFace(id)) {
             return false;
         }
         Person p = people.get(i);
@@ -443,13 +530,39 @@ final class PeopleStore {
         return saveIndexQuietly();
     }
 
+    /**
+     * Owner 2026-10-02: anything else kept by person id (a VoiceStore's voice
+     * prints) registers here, and forget() calls it with the id once the
+     * person is gone from the index, so one Forget wipes the whole record:
+     * name, notes, face embeddings and voice embeddings. Ids never change
+     * once handed out, so they are safe to key other stores by.
+     */
+    interface ForgetHook {
+        void forgotten(String id);
+    }
+
+    synchronized void addForgetHook(ForgetHook hook) {
+        if (hook != null) {
+            forgetHooks.add(hook);
+        }
+    }
+
     /** Deletes a person's photos, embeddings, name and notes for good (R16,
-     * R18, AE6; face plan R8). False if unknown. */
+     * R18, AE6; face plan R8), and runs the forget hooks (voice prints). False
+     * if unknown. */
     synchronized boolean forget(String id) {
         if (indexOf(id) < 0) {
             return false;
         }
         remove(id);
+        feedback.purgePerson(id);
+        for (ForgetHook hook : forgetHooks) {
+            try {
+                hook.forgotten(id);
+            } catch (RuntimeException e) {
+                // A hook's failure never keeps the person: the store's forget stands.
+            }
+        }
         // Index first: once it no longer names them, a failed delete leaves
         // only orphan files, which load() never reads and sweeps away (KTD10).
         saveIndexQuietly();
@@ -635,7 +748,8 @@ final class PeopleStore {
             if (out.size() >= n) {
                 break;
             }
-            if (!p.name.isEmpty()) {
+            // Owner 2026-10-02: a person remembered by name alone has no face to match.
+            if (!p.name.isEmpty() && hasFace(p.id)) {
                 out.add(p);
             }
         }
@@ -813,9 +927,9 @@ final class PeopleStore {
         writeDurably(facesFile(id), out.toString().getBytes(StandardCharsets.UTF_8));
     }
 
-    /** Reads the index, skipping any line that is malformed or that has no
-     * photo in any slot (a hand edit, or a crash between writing a face and
-     * the index), then deletes every photo, notes or .faces file whose id the
+    /** Reads the index, skipping any line that is malformed or that has
+     * neither a name nor a photo in any slot (a hand edit, or a crash between
+     * writing a face and the index), then deletes every photo, notes or .faces file whose id the
      * index does not name: what a crash mid-add or mid-forget leaves behind (KTD10). The
      * sweep needs the whole index: after a read that failed partway, the
      * people it never reached would look like orphans. */
@@ -849,7 +963,9 @@ final class PeopleStore {
             String line;
             while ((line = in.readLine()) != null) {
                 String[] f = line.split("\t", -1);
-                if (f.length != 3 || !isValidId(f[0]) || indexOf(f[0]) >= 0 || !hasPhoto(f[0])) {
+                // Owner 2026-10-02: a named record may have no photo (remembered by name alone).
+                if (f.length != 3 || !isValidId(f[0]) || indexOf(f[0]) >= 0
+                        || !hasPhoto(f[0]) && cleanName(f[2]).isEmpty()) {
                     continue;
                 }
                 long seen;

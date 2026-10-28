@@ -78,6 +78,13 @@ class AnswerParserHarnessTest(unittest.TestCase):
         "asked_name_one_word_stored",
         "asked_name_blank_is_none",
         "decision_to_string_carries_no_name",
+        "resolve_joins_a_name_only_record_with_the_exact_name",
+        "resolve_a_close_face_still_wins_over_a_name_only_record",
+        "by_name_the_full_name_given_wins",
+        "by_name_a_first_name_several_share_is_ambiguous",
+        "by_name_a_unique_first_name_finds_them",
+        "by_name_nobody_is_new",
+        "by_name_a_full_name_matching_nobody_is_new",
     )
 
     @classmethod

@@ -64,6 +64,31 @@ final class DriveGate implements ExploreBrain.Motor {
         }
     }
 
+    /** TOFDS (dark-floor mode): only while the lease is held. True when it went out. */
+    boolean tofCheckOff() {
+        if (!lease.held()) {
+            return false;
+        }
+        try {
+            wheels.disableTofCheck();
+            return true;
+        } catch (IOException e) {
+            note("TOFDS failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** TOFEN: always goes out, like stop(). True when it went out. */
+    boolean tofCheckOn() {
+        try {
+            wheels.enableTofCheck();
+            return true;
+        } catch (IOException e) {
+            note("TOFEN failed: " + e.getMessage());
+            return false;
+        }
+    }
+
     private void failed(String what, IOException e) {
         note(what + " failed (" + e.getMessage() + ") -- stopping");
         stop();

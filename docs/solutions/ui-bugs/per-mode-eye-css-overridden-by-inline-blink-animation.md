@@ -28,6 +28,8 @@ tags:
 
 # Per-mode eye looks silently overridden by the shared eyes' inline blink
 
+> **Update 2026-10-02:** the shared `EyesPage` no longer sets the blink inline. An infinite CSS animation kept the WebView compositing every frame while the face sat still (robot, docked: RenderThread ~16% of a core), so the blink is now a one-shot `.glow-core.blink` class the eyes' script adds every `blinkEvery()` ms (6.5 s; the voice mode returns 13 s while unreachable). `#rig.s-<state> .glow-core` rules now outrank it by specificity alone; the mode looks keep their `!important` anyway. `gazeTo` still sets `.glow`'s transform inline, so the lesson stands for `.glow`. The regression test below was renamed `test_animated_looks_override_the_blink` and no longer asserts `cores[g].style.animation=`.
+
 ## Problem
 
 Every custom mode on the Miko 3 renders the same eyes page, built by `shared/src/com/miko3/shared/EyesPage.java`. The page is a `#rig` containing two lenses, each `.housing > .glass > .glow > .glow-core`. The class javadoc invites callers to "restyle them by class on #rig from its own CSS (the voice mode does this per conversation state)" and to wrap the global `gazeTo(x,y,speedMs)` (`shared/src/com/miko3/shared/EyesPage.java:35-40`).

@@ -52,9 +52,12 @@ KEEPER = LAUNCHER / "LeaseKeeper.java"
 DRIVE_LEASE = LAUNCHER / "DriveLeaseService.java"
 QUEUE = LAUNCHER / "SpeechQueue.java"
 TUNING = LAUNCHER / "SpeechTuning.java"
+EARS_TUNING = LAUNCHER / "EarsTuning.java"
 EARS_INTERFACE = SHARED / "RobotEars.java"
 EARS_CLIENT = SHARED / "RobotEarsClient.java"
 HOTWORDS = REPO / "launcher" / "assets" / "hotwords.txt"
+INJECT = LAUNCHER / "EarsInject.java"
+INJECT_RECEIVER = LAUNCHER / "EarsInjectReceiver.java"
 WAKEWORD_LIBS = ("libnative_wakeword_vad_lib.so", "libncnn.so", "libtensorflowlite_gpu_delegate.so")
 
 
@@ -81,6 +84,13 @@ def _method_body(src, name):
 
 class ListenServiceHarnessTest(unittest.TestCase):
     SCENARIOS = (
+        # Owner 2026-10-02: the ears feed the voice identification; only clean answers are embedded.
+        "ears_voice_a_clean_answer_is_identified_after_its_words",
+        "ears_voice_cues_short_answers_and_clipped_answers_are_not_identified",
+        # Robot 2026-10-03: a call of 1.2 s or more is embedded too (the TV gate's reference).
+        "ears_voice_a_call_of_1_2_s_is_identified_and_a_shorter_one_is_not",
+        # Robot 2026-10-03: the minute mic level line's window survives Mic reopens.
+        "mic_level_window_spans_reopened_mics_and_reports_once_a_minute",
         # ListenSession stops at the endpoint, at the cap, and hears silence as "no speech".
         "stops_at_endpoint",
         "stops_at_cap",
@@ -114,14 +124,78 @@ class ListenServiceHarnessTest(unittest.TestCase):
         "ears_client_death_releases_capture",
         "ears_close_releases_capture",
         "ears_capture_that_will_not_open_retries_on_tick",
-        "ears_charger_closes_idle_session_keeps_conversation_listen",
-        "ears_opens_closed_while_docked",
+        # Hey Miko plan U3 (KTD5): the ears stay open on the charger; these replace
+        # the meeting plan's charger-closes-capture scenarios.
+        "ears_charger_keeps_capturing_and_delivers_the_wake_word",
+        "ears_charger_latch_changes_never_close_the_capture",
         "ears_wake_word_is_strong_with_the_switch_off",
+        # Hey Miko plan U3 (KTD4): the wake word is delivered as soon as it is spotted.
+        "ears_wake_mid_speech_delivers_an_early_cue_at_once",
+        "ears_end_of_a_called_utterance_is_marked_already_called",
+        "ears_a_called_utterance_carries_the_callers_message",
+        "ears_a_name_call_carries_its_message_and_other_utterances_none",
+        "ears_two_hits_in_one_utterance_send_one_early_cue",
+        "ears_wake_inside_the_deaf_window_delivers_nothing",
+        "ears_early_cue_keeps_the_conversation_listen_for_the_words",
+        "ears_bare_wake_with_the_gate_closed_is_unchanged",
+        "ears_side_only_direction_sends_the_side_without_an_angle",
         "ears_direction_sampled_only_while_speech",
         "ears_burst_without_words_or_side_is_dropped",
         "ears_shove_then_sorry_is_strong",
         "ears_listen_expires_at_its_cap",
+        # Robot 2026-10-01: maxMs is the window to start answering; an answer begun
+        # in it (or just before it) runs to its endpoint, up to the hard cap.
+        "ears_answer_started_in_the_window_runs_past_max",
+        "ears_silent_listen_still_ends_at_max",
+        "ears_endless_answer_is_cut_at_the_hard_cap",
+        "ears_answer_begun_just_before_the_listen_is_its_answer",
+        "ears_wake_word_inside_a_long_answer_keeps_the_early_cue",
+        # Owner 2026-10-02: the answer ends on 2 s of no speech; its segments are joined.
+        "ears_answer_with_pauses_is_delivered_once_joined_after_the_silence",
+        # Robot 2026-10-02: the words so far go to the mode at each endpoint inside an answer.
+        "ears_each_endpoint_inside_an_answer_sends_the_words_so_far_as_provisional",
+        "ears_speech_outside_a_listens_answer_sends_no_provisional",
+        "ears_a_40_s_answer_is_delivered_whole_not_cut_at_20_s",
+        "ears_a_line_mid_answer_delivers_the_joined_words_as_partial",
+        "ears_outside_a_listen_utterances_still_end_at_the_fast_endpoint",
+        # Robot 2026-10-01: "answering", once per listen, as its answer starts.
+        "ears_answer_started_in_the_window_says_answering_once_before_the_words",
+        "ears_answer_begun_just_before_the_listen_says_answering",
+        "ears_silent_or_unlistened_speech_says_no_answering",
+        "ears_each_listen_says_answering_at_most_once",
+        # Review P2-2: a wordless answer ends the mode's hold ("answer over", code 3).
+        "ears_wordless_answer_says_answer_over_once_when_the_listen_ends",
+        "ears_answer_over_logs_why_the_answer_had_no_words",
+        "ears_wordless_answer_past_the_window_says_answer_over_as_it_ends",
+        "ears_answer_with_words_or_no_answer_says_no_answer_over",
+        # Review P3-10: the start window closes early enough for "answering" to reach the mode in time.
+        "ears_speech_in_the_last_300_ms_of_the_window_is_not_claimed",
         "ears_logs_counters_not_words",
+        # Ears CPU switches (2026-09-30): off by default, KTD2 unchanged.
+        "ears_tuning_unset_is_ktd2",
+        "ears_tuning_switches_and_clamps",
+        "ears_gate_off_decodes_every_speech_chunk",
+        "ears_gate_holds_audio_while_the_words_cannot_matter",
+        "ears_gate_feeds_the_held_utterance_when_the_engine_fires",
+        "ears_gate_stays_open_with_the_switch_on",
+        "ears_gate_opens_for_a_conversation_listen",
+        "ears_summary_reports_decode_ms_per_chunk",
+        "ears_preroll_feeds_the_head_before_the_onset_in_order",
+        "ears_preroll_never_feeds_a_sample_twice",
+        "ears_preroll_is_held_with_the_utterance_under_the_wake_gate",
+        "ears_preroll_holds_nothing_from_before_the_deaf_window",
+        "ears_preroll_holds_nothing_from_before_a_capture_restart",
+        "ears_preroll_tuning_parses_and_clamps",
+        # robot-say.py (2026-10-02): debug-only heard-text injection, gated by a property.
+        "ears_inject_refused_while_the_property_is_off",
+        "ears_inject_wake_call_sends_the_early_cue_then_the_called_words",
+        "ears_inject_answer_runs_the_listens_answer_path",
+        "ears_inject_waits_out_the_deaf_window",
+        "ears_inject_ignores_real_audio_while_it_plays_then_passes_it_through",
+        "ears_inject_next_offer_starts_once_the_words_are_spent",
+        "ears_inject_stale_offer_is_dropped",
+        "ears_inject_normalises_like_the_models_tokens",
+        "ears_inject_logs_no_words",
         "keeper_acquire_renew_release",
         "keeper_ttl_expiry",
         "keeper_death_and_stale_death_ignored",
@@ -292,9 +366,23 @@ class EngineWiringTest(unittest.TestCase):
 
     def test_records_16k_mono_on_voice_modes_source(self):
         for needle in ("new AudioRecord(", "AudioFormat.CHANNEL_IN_MONO", "AudioFormat.ENCODING_PCM_16BIT",
-                       "MediaRecorder.AudioSource.VOICE_COMMUNICATION", "AudioRecord.getMinBufferSize("):
+                       "MicGain.source(", "AudioRecord.getMinBufferSize("):
             self.assertIn(needle, self.src)
+        # The source defaults to VOICE_COMMUNICATION; persist.miko3.ears.source picks another (owner 2026-10-02).
+        gain = _read(SESSION.parent / "MicGain.java")
+        for needle in ('"persist.miko3.ears.source"', "AudioSource.VOICE_COMMUNICATION",
+                       "AudioSource.VOICE_RECOGNITION", "AudioSource.UNPROCESSED", 'default:\n                return "VOICE_COMMUNICATION"'):
+            self.assertIn(needle, gain)
         self.assertRegex(_read(SESSION), r"SAMPLE_RATE\s*=\s*16000")
+
+    def test_mic_level_window_is_shared_by_every_mic(self):
+        """Robot 2026-10-03: the per-Mic window reset on every reopen, so the minute line never
+        printed; one static MicLevel collects every Mic's reads."""
+        self.assertRegex(self.src, r"private static final MicLevel MIC_LEVEL = new MicLevel\(\);")
+        body = _method_body(self.src, "public ListenSession.Mic openMic()") or ""
+        self.assertIn("MIC_LEVEL.add(now, chunkSq, n, chunkPeak, chunkClipped, gain)", body)
+        self.assertNotIn("windowStart", body)
+        self.assertIn("WINDOW_MS = 60000;", _read(SESSION.parent / "MicLevel.java"))
 
     def test_streaming_zipformer_with_endpointing(self):
         for needle in ("new OnlineRecognizer(", "OnlineTransducerModelConfig", "setEnableEndpoint(true)",
@@ -330,17 +418,44 @@ class EngineWiringTest(unittest.TestCase):
         """Meeting plan KTD2: modified_beam_search with the hotwords file at the
         asset root, bpe modelling unit with the vocabulary beside tokens.txt, 2
         threads, 2 active paths, endpoints 0.8 s after words and 2 s of nothing."""
-        for needle in ('"modified_beam_search"', "setMaxActivePaths(MAX_ACTIVE_PATHS)", "setHotwordsFile(",
+        for needle in ("setDecodingMethod(t.decoding)", "setMaxActivePaths(t.paths)", "setHotwordsFile(",
                        'setModelingUnit("bpe")', "setBpeVocab(", '"bpe.vocab"', '"hotwords.txt"',
-                       "setMinTrailingSilence(0.8f)", "setMinTrailingSilence(2.0f)", "setNumThreads(THREADS)"):
+                       "setMinTrailingSilence(0.8f)", "setMinTrailingSilence(2.0f)", "setNumThreads(t.threads)",
+                       "EarsTuning.from("):
             self.assertIn(needle, self.src)
-        self.assertRegex(self.src, r"\bTHREADS\s*=\s*2;")
-        self.assertRegex(self.src, r"MAX_ACTIVE_PATHS\s*=\s*2;")
+        # Ears CPU switches: unset, EarsTuning is exactly KTD2.
+        tuning = _read(EARS_TUNING)
+        self.assertRegex(tuning, r'BEAM\s*=\s*"modified_beam_search";')
+        self.assertRegex(tuning, r"DEFAULT_DECODING\s*=\s*BEAM;")
+        self.assertRegex(tuning, r"DEFAULT_THREADS\s*=\s*2;")
+        self.assertRegex(tuning, r"DEFAULT_PATHS\s*=\s*2;")
         self.assertEqual(self.src.count("new OnlineRecognizer("), 1, "one recogniser serves both listens")
+
+    def test_hotwords_only_with_beam_search(self):
+        """sherpa-onnx's config check refuses a hotwords file with greedy_search."""
+        body = _method_body(self.src, "config")
+        self.assertIsNotNone(body)
+        guard = body.find("if (t.hotwords())")
+        self.assertGreaterEqual(guard, 0, "the hotwords file is not guarded by the decoding")
+        self.assertGreater(body.find("setHotwordsFile("), guard)
+        self.assertIn("BEAM.equals(decoding)", _read(EARS_TUNING))
+
+    def test_ears_switch_properties_and_gate_wiring(self):
+        tuning = _read(EARS_TUNING)
+        for prop, name in (("DECODING_PROP", "decoding"), ("PATHS_PROP", "paths"), ("THREADS_PROP", "threads"),
+                           ("GATE_PROP", "gate")):
+            self.assertRegex(tuning, prop + r'\s*=\s*"persist\.miko3\.ears\.' + name + '"')
+        self.assertIn("earsTuning.gateWake,", self.src)
+        self.assertIn("earsTuning + \")\")", self.src, "the ready line names the switches for the QA script")
+
+    def test_ears_preroll_is_a_property_read_at_start(self):
+        """TODO 2026-10-01: the recogniser hears the last N ms before the VAD onset first; N is tunable."""
+        self.assertRegex(_read(EARS), r'PREROLL_PROP\s*=\s*"persist\.miko3\.ears\.preroll_ms"')
+        self.assertRegex(self.src, r"earsTuning\.gateWake,\s*EarsSession\.prerollMs\(props\.get\(EarsSession\.PREROLL_PROP\)\)\)")
 
     def test_ears_feed_the_wake_word_engine_a_silero_gate_and_the_direction_sampler(self):
         for needle in ("new WakeWord(", "processChunk(", "SileroVadModelConfig", "new Vad(", "isSpeechDetected()",
-                       "VoiceDirection.open()", ".sample(EarsSession.DIRECTION_PERIOD_MS)", "setSpeaking(",
+                       "VoiceDirection.sampleLazily(EarsSession.DIRECTION_PERIOD_MS)", "setSpeaking(",
                        "new EarsSession("):
             self.assertIn(needle, self.src)
         # The switch (KTD11) is read at classify time through ClaudeSettings, the
@@ -453,7 +568,8 @@ class InterfaceAndClientTest(unittest.TestCase):
                   r"void listen\(long \w+\) throws RemoteException;",
                   r"void clipWindow\(long \w+\) throws RemoteException;",
                   r"void shoved\(long \w+\) throws RemoteException;",
-                  r"void heard\(String \w+, int \w+, float \w+, int \w+, long \w+, boolean \w+, int \w+\)"):
+                  r"void heard\(String \w+, int \w+, float \w+, int \w+, long \w+, boolean \w+, int \w+,\s+"
+                  r"boolean \w+, String \w+\)"):
             self.assertRegex(head, m)
 
     def test_ears_callback_kind_is_appended_last_and_an_older_launcher_ends_the_session(self):
@@ -469,19 +585,69 @@ class InterfaceAndClientTest(unittest.TestCase):
         self.assertIsNotNone(stub)
         self.assertRegex(stub, r"boolean partial = data\.readInt\(\) != 0;\s*"
                                r"int kind = data\.dataAvail\(\) > 0 \? data\.readInt\(\) : KIND_MISSING;\s*"
-                               r"heard\(text, side, angle, tier, at, partial, kind\);")
+                               r"boolean called = data\.dataAvail\(\) > 0 && data\.readInt\(\) != 0;\s*"
+                               r"String message = data\.dataAvail\(\) > 0 \? data\.readString\(\) : null;\s*"
+                               r"heard\(text, side, angle, tier, at, partial, kind, called, message\);")
         proxy = src.split("private static class Proxy implements Callback", 1)[1]
         self.assertRegex(proxy, r"data\.writeInt\(partial \? 1 : 0\);\s*data\.writeInt\(kind\);\s*"
+                                r"data\.writeInt\(called \? 1 : 0\);\s*data\.writeString\(message\);\s*"
                                 r"remote\.transact\(TRANSACTION_heard")
         client = _read(EARS_CLIENT)
         self.assertRegex(client, r"void onHeard\(String \w+, int \w+, float \w+, int \w+, long \w+, "
-                                 r"boolean \w+, int \w+\);")
+                                 r"boolean \w+, int \w+,\s+boolean \w+, String \w+\);")
         self.assertRegex(client, r'NO_KIND\s*=\s*"the launcher\'s ears session sends no cue kind '
                                  r'\(install both APKs together\)"')
         heard = _method_body(client, "public void heard")
         self.assertIsNotNone(heard)
         self.assertRegex(heard, r"if \(kind == RobotEars\.KIND_MISSING\)\s*\{\s*lost\(NO_KIND\);\s*return;")
-        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind)", heard)
+        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind, called, message)", heard)
+
+    def test_ears_callback_already_called_flag_is_appended_after_the_kind(self):
+        """Hey Miko plan U3 (KTD4): the end-of-utterance delivery of a call the
+        early cue already made carries a flag, appended after the kind (never
+        reordered). An older launcher's parcel ends before it: read as false."""
+        src = _read(EARS_INTERFACE)
+        head = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(head, r"void heard\(String text, int side, float angle, int tier, long at, boolean partial, "
+                               r"int kind,\s*boolean called, String message\)")
+        self.assertEqual(src.count("TRANSACTION_heard = 1;"), 1)
+        ears = _read(EARS)
+        self.assertIn("final boolean called;", ears)
+        self.assertRegex(ears, r"Utterance\(String \w+, int \w+, Float \w+, int \w+, long \w+, boolean \w+, "
+                               r"int \w+, boolean called\)")
+        engine = _read(LAUNCHER / "ListenEngine.java")
+        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind, u\.called, "
+                                 r"u\.message\);")
+
+    def test_a_calls_message_is_appended_last_and_an_older_launcher_sends_none(self):
+        """Owner 2026-10-02: the caller's words besides the address ride heard() as a String
+        appended after called, as kind and called were: an older mode ignores the trailing
+        string, and a newer mode under an older launcher reads none (null), the bare call."""
+        ears = _read(EARS_INTERFACE)
+        self.assertRegex(ears, r"void heard\(String text, int side, float angle, int tier, long at, boolean partial, "
+                               r"int kind,\s*boolean called, String message\) throws RemoteException;")
+        stub = ears.split("case TRANSACTION_heard:", 1)[1].split("return true;", 1)[0]
+        self.assertRegex(stub, r"boolean called = data\.dataAvail\(\) > 0 && data\.readInt\(\) != 0;\s*"
+                               r"String message = data\.dataAvail\(\) > 0 \? data\.readString\(\) : null;")
+        self.assertIn("heard(text, side, angle, tier, at, partial, kind, called, message);", stub)
+        proxy = ears.split("private static class Proxy implements Callback", 1)[1]
+        self.assertRegex(proxy, r"data\.writeInt\(called \? 1 : 0\);\s*data\.writeString\(message\);\s*"
+                                r"remote\.transact\(TRANSACTION_heard")
+        client = _read(SHARED / "RobotEarsClient.java")
+        self.assertRegex(client, r"void onHeard\(String text, int side, float angle, int tier, long at, boolean partial, "
+                                 r"int kind,\s*boolean called, String message\);")
+        self.assertIn("listener.onHeard(text, side, angle, tier, at, partial, kind, called, message);", client)
+
+    def test_ears_session_capture_ignores_the_charger_latch(self):
+        """Hey Miko plan U3 (KTD5): the capture rule no longer closes on the
+        charger latch, and a conversation listen is no longer refused docked."""
+        body = _method_body(_read(EARS), "private void reconcile")
+        self.assertIsNotNone(body)
+        self.assertRegex(body, r"boolean want = keeper\.holder\(\) != null;")
+        self.assertNotIn("charger", body)
+        listen = _method_body(_read(EARS), "synchronized boolean listen")
+        self.assertIsNotNone(listen)
+        self.assertNotIn("charger", listen)
 
     def test_ears_session_names_the_kind_and_the_engine_relays_it_last(self):
         ears = _read(EARS)
@@ -489,11 +655,12 @@ class InterfaceAndClientTest(unittest.TestCase):
                                r"int kind\)")
         self.assertIn("final int kind;", ears)
         self.assertIn("int kind = CueClassifier.kind(text, wasWake, tier);", ears)
-        self.assertIn("new Utterance(text, side, angle, tier, at, partial, kind)", ears)
+        self.assertIn("new Utterance(text, side, angle, tier, at, partial, kind, wasWake, message)", ears)
         self.assertRegex(ears, r"new Utterance\(\"\", CueClassifier\.SIDE_NONE, null, CueClassifier\.TIER_STRONG, "
                                r"now, false,\s*CueClassifier\.KIND_WAKE_WORD\)")
         engine = _read(LAUNCHER / "ListenEngine.java")
-        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind\);")
+        self.assertRegex(engine, r"callback\.heard\(u\.text, u\.side, [^;]*?u\.partial,\s*u\.kind, u\.called, "
+                                 r"u\.message\);")
 
     def test_ears_proxy_detects_an_older_launcher(self):
         """KTD11: every new proxy method checks the transaction result."""
@@ -515,7 +682,100 @@ class InterfaceAndClientTest(unittest.TestCase):
         codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", ears)]
         self.assertEqual([n for n, _ in codes], ["open", "renew", "close", "listen", "clipWindow", "shoved"])
         self.assertEqual([c for _, c in codes], list(range(1, 7)))
-        self.assertRegex(callback, r"TRANSACTION_heard\s*=\s*1;")
+        # The callback's codes are appended too: heard stays 1, answering (robot 2026-10-01) is 2,
+        # answerOver (review 2026-10-01, P2-2) is 3, voice (owner 2026-10-02) is 5.
+        callback_codes = [(n, int(c)) for n, c in re.findall(r"TRANSACTION_(\w+)\s*=\s*(\d+);", callback)]
+        self.assertEqual(callback_codes, [("heard", 1), ("answering", 2), ("answerOver", 3), ("provisional", 4),
+                                          ("voice", 5)])
+
+    def test_no_per_utterance_cap_is_shorter_than_the_answer_cap(self):
+        """Owner 2026-10-02: a 40 s run-on answer is not cut at 20 s. The Silero VAD's
+        max-speech split and the recogniser's rule 3 (longest utterance) were both 20 s;
+        both now follow the conversation listen's hard cap."""
+        engine = _read(LAUNCHER / "ListenEngine.java")
+        self.assertIn("LONGEST_UTTERANCE_S = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS / 1000f;", engine)
+        self.assertIn(".setMaxSpeechDuration(LONGEST_UTTERANCE_S)", engine)
+        self.assertRegex(engine, r"\.setRule3\(EndpointRule\.builder\(\)\.setMustContainNonSilence\(false\)\s*"
+                                 r"\.setMinTrailingSilence\(0f\)\.setMinUtteranceLength\(LONGEST_UTTERANCE_S\)")
+        self.assertNotIn("VAD_MAX_SPEECH_S", engine)
+        ears = _read(EARS)
+        self.assertIn("static final long ANSWER_SILENCE_MS = 2000;", ears)
+
+    def test_ears_callback_answering_is_a_one_way_appended_transaction(self):
+        """Robot 2026-10-01: "answering" tells the mode a conversation listen's
+        answer has started. A new one-way code (2) on the callback, appended:
+        an older mode's Stub has no case for it and Binder.onTransact returns
+        false, which a one-way sender never sees; a newer mode under an older
+        launcher never receives it and its listens end at maxMs as before."""
+        src = _read(EARS_INTERFACE)
+        head = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(head, r"void answering\(long at\) throws RemoteException;")
+        protocol = _read(SHARED / "LauncherProtocol.java")
+        self.assertRegex(protocol, r"public static final long EARS_LISTEN_HARD_CAP_MS = 60000;")
+        self.assertRegex(protocol, r"public static final long EARS_ANSWER_HOLD_MS = EARS_LISTEN_HARD_CAP_MS \+ 3000;")
+        stub = _method_body(src, "public boolean onTransact")
+        self.assertRegex(stub, r"case TRANSACTION_answering: \{\s*data\.enforceInterface\(DESCRIPTOR\);\s*"
+                               r"answering\(data\.readLong\(\)\);\s*return true;")
+        proxy = src.split("private static class Proxy implements Callback", 1)[1].split("abstract class Stub", 1)[0]
+        self.assertRegex(proxy, r"data\.writeLong\(at\);\s*"
+                                r"remote\.transact\(TRANSACTION_answering, data, null, IBinder\.FLAG_ONEWAY\);")
+        ears = _read(EARS)
+        self.assertIn("static final long LISTEN_HARD_CAP_MS = LauncherProtocol.EARS_LISTEN_HARD_CAP_MS;", ears)
+        self.assertRegex(ears, r"void answering\(long at\);")
+        engine = _read(LAUNCHER / "ListenEngine.java")
+        self.assertIn("callback.answering(at);", engine)
+        client = _read(EARS_CLIENT)
+        self.assertRegex(client, r"void onAnswering\(long \w+\);")
+        answering = _method_body(client, "public void answering")
+        self.assertIsNotNone(answering)
+        self.assertIn("listener.onAnswering(at)", answering)
+
+    def test_ears_callback_answer_over_is_a_one_way_appended_transaction(self):
+        """Review 2026-10-01 (P2-2): "answer over" tells the mode the listen that said
+        answering ended without words, so it stops holding it. Code 3, one-way, handled
+        like code 2: an older mode's Stub has no case for it (onTransact returns false,
+        which a one-way sender never sees) and holds as before; a newer mode under an
+        older launcher never receives it and holds to EARS_ANSWER_HOLD_MS as before."""
+        src = _read(EARS_INTERFACE)
+        head = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(head, r"void answerOver\(long at\) throws RemoteException;")
+        stub = _method_body(src, "public boolean onTransact")
+        self.assertRegex(stub, r"case TRANSACTION_answerOver: \{\s*data\.enforceInterface\(DESCRIPTOR\);\s*"
+                               r"answerOver\(data\.readLong\(\)\);\s*return true;")
+        proxy = src.split("private static class Proxy implements Callback", 1)[1].split("abstract class Stub", 1)[0]
+        self.assertRegex(proxy, r"data\.writeLong\(at\);\s*"
+                                r"remote\.transact\(TRANSACTION_answerOver, data, null, IBinder\.FLAG_ONEWAY\);")
+        self.assertRegex(_read(EARS), r"void answerOver\(long at\);")
+        self.assertIn("callback.answerOver(at);", _read(LAUNCHER / "ListenEngine.java"))
+        client = _read(EARS_CLIENT)
+        self.assertRegex(client, r"void onAnswerOver\(long \w+\);")
+        over = _method_body(client, "public void answerOver")
+        self.assertIsNotNone(over)
+        self.assertIn("listener.onAnswerOver(at)", over)
+
+    def test_ears_callback_provisional_is_a_one_way_appended_transaction(self):
+        """Robot 2026-10-02: "provisional" carries an answer's words so far, at each
+        recogniser endpoint inside it, so the mode can start its turn while the 2 s
+        silence rule runs. Code 4, one-way, handled like codes 2 and 3: an older
+        mode's Stub has no case for it (onTransact returns false, which a one-way
+        sender never sees); a newer mode under an older launcher never receives it
+        and asks after the final answer, as before."""
+        src = _read(EARS_INTERFACE)
+        head = src.split("abstract class Stub", 1)[0]
+        self.assertRegex(head, r"void provisional\(long at, String text\) throws RemoteException;")
+        stub = _method_body(src, "public boolean onTransact")
+        self.assertRegex(stub, r"case TRANSACTION_provisional: \{\s*data\.enforceInterface\(DESCRIPTOR\);\s*"
+                               r"long at = data\.readLong\(\);\s*provisional\(at, data\.readString\(\)\);\s*return true;")
+        proxy = src.split("private static class Proxy implements Callback", 1)[1].split("abstract class Stub", 1)[0]
+        self.assertRegex(proxy, r"data\.writeLong\(at\);\s*data\.writeString\(text\);\s*"
+                                r"remote\.transact\(TRANSACTION_provisional, data, null, IBinder\.FLAG_ONEWAY\);")
+        self.assertRegex(_read(EARS), r"void provisional\(long at, String text\);")
+        self.assertIn("callback.provisional(at, text);", _read(LAUNCHER / "ListenEngine.java"))
+        client = _read(EARS_CLIENT)
+        self.assertRegex(client, r"void onProvisional\(long \w+, String \w+\);")
+        prov = _method_body(client, "public void provisional")
+        self.assertIsNotNone(prov)
+        self.assertIn("listener.onProvisional(at, text)", prov)
 
     def test_ears_client_binds_renews_and_closes(self):
         src = _read(EARS_CLIENT)
@@ -689,20 +949,93 @@ class BuildScriptTest(unittest.TestCase):
         self.assertTrue(raw, "VoiceDirection.java missing")
         self.assertEqual([ln for ln in raw.splitlines() if ln.startswith("import android")], [])
         src = _strip_comments(raw)
-        for needle in ("enum Backend", "NONE", "CONEXANT", "NC", "getDSPRawDOA(", "getCurrentDOAStatus(",
-                       "initDSPComm(", "createUART(", "initNCUART("):
+        for needle in ("enum Backend", "NONE", "CONEXANT", "NC", "getDSPRawDOA(", "NcFrames.parseStream(",
+                       "initDSPComm(", "stty"):
             self.assertIn(needle, src)
         # KTD4: the angle is sampled on its own thread at a caller-set cadence.
         self.assertRegex(src, r"sample\(\s*(final\s+)?long\s+\w+")
 
-    def test_voice_direction_tries_nc_only_when_its_uart_exists(self):
+    def test_the_ears_never_open_the_direction_chip_on_the_capture_thread(self):
+        # Review P1 (2026-09-29): EarsSession.feed starts direction sampling while holding
+        # feedLock, so the first chip open must happen on VoiceDirection's own thread.
+        engine = _strip_comments(ENGINE.read_text())
+        self.assertIn("VoiceDirection.sampleLazily(", engine)
+        self.assertNotIn("VoiceDirection.open().sample(", engine)
+
+    def test_voice_direction_tries_nc_only_on_the_confirmed_port_property_and_node(self):
         # Seen live 2026-09-28: with no /dev/ttyMT2, createUART still answers a handle and
         # initNCUART answers 1, so the next native call (getCurrentDOAStatus) segfaulted the
-        # whole launcher on the first speech the ears heard. The node must exist first.
+        # whole launcher on the first speech the ears heard. Explore plan U2 (KTD10): the
+        # port now comes only from the owner-confirmed property, its node must exist before
+        # any NC native call, only 0 from initNCUART is success, and the vendor's blocking
+        # native reads are never made. The behaviour runs in scripts/tests/test_nc_frames.py.
         src = _strip_comments(DIRECTION.read_text())
-        nc = src[src.index("new NCDsp()") - 400:src.index("createUART(")]
-        self.assertRegex(nc, r"new\s+File\(\s*NC_UART\s*\)\s*\.exists\(\)")
-        self.assertIn("import java.io.File;", DIRECTION.read_text())
+        self.assertNotIn("/dev/ttyMT2", src)
+        self.assertIn('"persist.miko3.voice_dir.port"', src)
+        body = _method_body(src, "private static VoiceDirection openNc") or ""
+        port, node, setup = body.find("isEmpty()"), body.find(".exists(node)"), body.find("configure(node)")
+        self.assertGreaterEqual(port, 0, "the NC path never checks the port property")
+        self.assertGreater(node, port, "the NC path does not check the node after the property")
+        self.assertGreater(setup, node, "the port is configured before the node check")
+        self.assertRegex(body, r"status\s*!=\s*0")
+        # 2026-09-29: with the vendor's createUART/initNCUART in the process the launcher
+        # segfaulted seconds after every chip open; the NC path now runs no vendor code.
+        for vendor_call in ("NCDsp", "createUART(", "initNCUART(", "getCurrentDOAStatus(", "toggleDOA(",
+                            "getFWVersion("):
+            self.assertNotIn(vendor_call, src)
+        self.assertIn("new File(path).exists()", src)
+        # 2026-09-29: the chip streams a direction frame a second by itself, and the vendor's
+        # DOA calls are gone.
+        for gone in ("doaQuery(", "doaToggle(", "parseDoa("):
+            self.assertNotIn(gone, src)
+        # 2026-09-30: after a cold boot the chip's reporting is off. The only port writes are
+        # the vendor's status query and its reporting toggle, one each, both inside openNc;
+        # sampling never writes.
+        files_at = src.find("Nodes FILES")
+        files_end = src.find("public Sampler sample(", files_at)
+        self.assertGreater(files_at, 0, "the real node implementation moved")
+        nc_path = src[:files_at] + src[files_end:]
+        writes = re.findall(r"\.write\(([^;]*)\);", nc_path)
+        self.assertEqual(sorted(writes), ["NcFrames.reportingToggle()", "NcFrames.statusQuery()", "frame"],
+                         "the NC path writes something other than the status query, the toggle and ncWrite")
+        self.assertEqual(nc_path.count(".write("), 3)
+        # 2026-10-02: the DSP settings check writes only through ncWrite, under the instance lock,
+        # and only NcFrames.Setting's read requests and NcFrames.plan()'s sets and toggles.
+        self.assertIn("private synchronized void ncWrite(byte[] frame)", src)
+        callers = re.findall(r"\bncWrite\(([^;{]*)\);", nc_path)
+        self.assertEqual(sorted(callers), ["f", "s.read()"], callers)
+        self.assertIn("List<byte[]> plan = NcFrames.plan(", src)
+        for sampling in ("private synchronized int freshRaw", "private void drain", "private void sampleOnce"):
+            body_s = _method_body(src, sampling) or ""
+            self.assertNotIn("write(", body_s, sampling)
+        self.assertEqual(body.count(".write(NcFrames.statusQuery())"), 1, "the status query is not written in openNc")
+        self.assertEqual(body.count(".write(NcFrames.reportingToggle())"), 1, "the toggle is not written in openNc")
+        self.assertGreater(body.find(".write(NcFrames.statusQuery())"), setup,
+                           "the status query is written before the port is configured")
+        # toybox 0.7.6 stty: `raw` sets icrnl/ixon/ixoff/inpck, so the input flags are zeroed
+        # through the -g string and checked afterwards.
+        self.assertNotIn('"raw"', src)
+        self.assertIn('"-g"', src)
+        self.assertIn("inputFlagsZero(", src)
+        # The launcher reads the properties and hands them over before the first open().
+        engine = _read(ENGINE)
+        for prop in ("PORT_PROPERTY", "ZERO_PROPERTY", "SIGN_PROPERTY", "SCALE_PROPERTY", "LEFT_PROPERTY",
+                     "RIGHT_PROPERTY"):
+            self.assertIn(f"SpeechEngine.systemProperty(VoiceDirection.{prop})", engine)
+        self.assertIn("VoiceDirection.configure(", engine)
+        # 2026-10-02: the DSP settings are read (and, opted in, applied) at each ears open.
+        open_at, check_at = engine.find("ears.open(String.valueOf(uid)"), engine.find("VoiceDirection.checkNcLater(")
+        self.assertGreater(open_at, 0)
+        self.assertGreater(check_at, open_at, "the NC check is not made after the ears open")
+        self.assertEqual(engine.count("VoiceDirection.checkNcLater("), 1)
+        for prop in ("NC_STATUS_PROPERTY", "NC_APPLY_PROPERTY", "NC_GAIN_PROPERTY", "NC_DGAIN_PROPERTY"):
+            self.assertIn(f"SpeechEngine.systemProperty(VoiceDirection.{prop})", engine)
+        for prop in ("nc_status", "nc_apply", "nc_gain", "nc_dgain"):
+            self.assertIn(f'"persist.miko3.ears.{prop}"', src)
+        # Side mode (robot, 2026-09-29): the ears are told the chip's angle is a side only.
+        self.assertIn("VoiceDirection.sideOnlyConfigured()", engine)
+        self.assertIn('LEFT_PROPERTY = "persist.miko3.voice_dir.left"', src)
+        self.assertIn('RIGHT_PROPERTY = "persist.miko3.voice_dir.right"', src)
 
     def test_built_apk_bundles_the_listen_model_when_present(self):
         apk = REPO / "launcher" / "miko3-launcher.apk"
@@ -733,14 +1066,45 @@ def _log_word_offenders(paths):
     return offenders
 
 
+class InjectWiringTest(unittest.TestCase):
+    """robot-say.py (2026-10-02): the debug-only heard-text injection is off by default,
+    reachable only by root, and enters at the ears session's own engine, gate and recogniser."""
+
+    def test_property_is_a_debug_prop_read_as_one(self):
+        src = _read(INJECT)
+        self.assertRegex(src, r'PROPERTY\s*=\s*"debug\.miko3\.ears_inject"')
+        self.assertIn('"1".equals(props.get(PROPERTY)', src)
+
+    def test_receiver_is_unexported_with_no_intent_filter(self):
+        manifest = MANIFEST.read_text()
+        self.assertRegex(manifest, r'<receiver android:name="\.EarsInjectReceiver" android:exported="false"\s*/>')
+
+    def test_receiver_checks_the_gate_before_reading_the_words(self):
+        body = _method_body(_read(INJECT_RECEIVER), "onReceive")
+        self.assertIsNotNone(body)
+        self.assertIn("EarsInject.ACTION.equals(intent.getAction())", body)
+        self.assertLess(body.index("armed()"), body.index("getStringExtra"))
+        self.assertIn("offer(", body)
+
+    def test_engine_wraps_the_real_engine_gate_and_recogniser(self):
+        src = _read(ENGINE)
+        for needle in ("inject.spotter(earsSpotter)", "inject.gate(earsGate)", "inject.recognizer(earsRecognizer)",
+                       "new EarsInject("):
+            self.assertIn(needle, src)
+
+    def test_a_listen_opening_is_logged_for_the_script_to_wait_on(self):
+        body = _method_body(_read(EARS), "listen")
+        self.assertIn('diag.log("conversation listen open', body)
+
+
 class ListenPrivacyLogTest(unittest.TestCase):
     def test_log_calls_never_carry_spoken_or_heard_words(self):
         self.assertEqual(_log_word_offenders((SERVICE, ENGINE, SESSION, APP, PROBE, LAUNCHER / "PeopleService.java",
                                               LAUNCHER / "PeopleStore.java", EARS, CLASSIFIER, KEEPER,
-                                              EARS_INTERFACE, EARS_CLIENT)), [])
+                                              EARS_INTERFACE, EARS_CLIENT, INJECT, INJECT_RECEIVER)), [])
 
     def test_ears_session_and_classifier_never_print(self):
-        for path in (EARS, CLASSIFIER, KEEPER):
+        for path in (EARS, CLASSIFIER, KEEPER, INJECT, INJECT_RECEIVER):
             src = _read(path)
             with self.subTest(file=path.name):
                 for needle in ("System.out", "System.err", "printStackTrace"):

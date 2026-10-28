@@ -33,7 +33,7 @@ public final class OpennessHarness {
         check("taught_floor_raises_confidence", taughtConfidence());
         check("profile_has_sixteen_bins_in_range", binsInRange());
         check("all_dark_frame_has_low_confidence", allDark());
-        check("no_detections_and_no_taught_floor_is_low_confidence", untaughtNoBoxes());
+        check("no_taught_floor_still_scores_the_geometry_and_is_trusted", untaughtNoBoxes());
         check("textured_bottom_rows_are_not_a_floor_sample", texturedBottom());
         check("floor_patches_are_capped", patchesCapped());
         check("band_optional_whole_frame_alone_still_scores", wholeOnly());
@@ -51,6 +51,12 @@ public final class OpennessHarness {
         check("standing_thing_stands_where_the_floor_run_ends", standsWhereTheRunEnds());
         check("grey_wall_the_colour_of_a_bright_taught_carpet_still_reads_blocked", greyWallOverGreyCarpet());
         check("a_stray_floor_row_at_a_chairs_foot_is_not_a_view_past_it", strayRowAtTheFoot());
+        // Robot 2026-10-01 (scripts/eval-explore-openness.py): the model was taught walls
+        check("a_wall_he_faces_is_never_taught_as_floor", wallNeverTaught());
+        check("a_wall_he_once_faced_never_makes_a_white_wall_read_open", wallFacedThenDoorway());
+        check("carpet_the_model_never_saw_under_a_hallway_end_reads_unsure_not_blocked", untaughtHallway());
+        check("grainy_carpet_in_a_dim_frame_teaches", grainyCarpetTeaches());
+        check("free_floor_scores_by_its_distance", scoresByDistance());
     }
 
     // ---- scenes ----
@@ -123,10 +129,10 @@ public final class OpennessHarness {
             return sample(80, 60, 0f, 1f);
         }
 
-        /** The floor band: the rows below the horizon, twice as sharp. */
+        /** The floor band: the rows from Openness.BAND_TOP (just above the horizon) down, twice as sharp. */
         Openness.Frame band() {
-            int rows = Math.round((1f - Openness.HORIZON) * 120);
-            return sample(160, rows, Openness.HORIZON, 1f);
+            int first = (int) (Openness.BAND_TOP * 120);
+            return sample(160, 120 - first, first / 120f, 1f);
         }
 
         private Openness.Frame sample(int w, int h, float top, float bottom) {
@@ -176,9 +182,10 @@ public final class OpennessHarness {
 
     // ---- scenarios ----
 
+    /** A wall about 1 m off on the left: its base in the frame's bottom rows (this camera's nearest floor is ~1 m out). */
     private static String wallOnTheLeft() {
         Openness o = taughtRoom();
-        Openness.Profile p = score(o, room().paint(0f, 0f, 0.35f, ground(0.73f), NEAR_WALL), NONE, 200, false);
+        Openness.Profile p = score(o, room().paint(0f, 0f, 0.35f, ground(0.92f), NEAR_WALL), NONE, 200, false);
         float left = max(p.bins, 0, 3);
         float right = min(p.bins, 8, 15);
         if (left >= 0.4f || right <= 0.8f) {
@@ -226,7 +233,7 @@ public final class OpennessHarness {
 
     private static String rugAndUntaught() {
         Openness o = taughtRoom();
-        teach(o, room().paint(0.2f, 0.8f, 0.8f, 1f, RUG), 150);
+        teach(o, room().paint(0.2f, ground(0.27f), 0.8f, 1f, RUG), 150);
         Scene s = room().paint(0f, ground(0.27f), 0.5f, 1f, RUG).paint(0.5f, ground(0.27f), 1f, 1f, GREEN);
         Openness.Profile p = score(o, s, NONE, 200, false);
         float rug = min(p.bins, 0, 6);
@@ -241,12 +248,13 @@ public final class OpennessHarness {
         return null;
     }
 
+    /** The boundary needs no taught floor, so untaught is trusted (the steer's 0.5), taught more so. */
     private static String taughtConfidence() {
         Openness o = new Openness();
         float before = score(o, room(), NONE, 50, false).confidence;
         teach(o, room(), 100);
         float after = score(o, room(), NONE, 200, false).confidence;
-        if (before >= 0.4f || after < 0.7f) {
+        if (before < 0.5f || after < 0.7f || after <= before) {
             return "untaught " + before + ", taught " + after;
         }
         return null;
@@ -283,14 +291,23 @@ public final class OpennessHarness {
         return q.confidence < 0.2f ? null : "untaught dark confidence " + q.confidence;
     }
 
+    /**
+     * Nothing taught, no boxes: the open room reads open but unsure (KTD9), a wall
+     * about 1 m off on the left still reads blocked, and the profile is trusted.
+     */
     private static String untaughtNoBoxes() {
         Openness o = new Openness();
         Openness.Profile p = score(o, room(), NONE, 200, false);
-        Openness.Profile q = score(o, room(), null, 300, false);
-        if (p.confidence >= 0.4f || q.confidence >= 0.4f) {
+        Openness.Profile q = score(o, room().paint(0f, 0f, 0.35f, ground(0.92f), NEAR_WALL), null, 300, false);
+        if (p.confidence < 0.5f || q.confidence < 0.5f) {
             return "confidence " + p.confidence + " / " + q.confidence;
         }
-        return null;
+        float lo = min(p.bins, 0, Openness.BINS - 1);
+        float hi = max(p.bins, 0, Openness.BINS - 1);
+        if (lo < 0.35f || hi > Openness.UNSURE) {
+            return "untaught open room reads " + p;
+        }
+        return max(q.bins, 0, 3) < 0.35f && min(q.bins, 8, 15) >= 0.35f ? null : "untaught wall " + q;
     }
 
     private static String texturedBottom() {
@@ -322,7 +339,7 @@ public final class OpennessHarness {
         if (o.patches() != 1) {
             return "whole-frame sample not taught: patches " + o.patches();
         }
-        Openness.Profile p = o.score(room().paint(0f, 0f, 0.35f, ground(0.73f), NEAR_WALL).whole(), null, NONE, 200, false);
+        Openness.Profile p = o.score(room().paint(0f, 0f, 0.35f, ground(0.92f), NEAR_WALL).whole(), null, NONE, 200, false);
         float left = max(p.bins, 0, 3);
         float right = min(p.bins, 8, 15);
         return left < 0.4f && right > 0.8f ? null : "left " + left + " right " + right + " " + p;
@@ -470,8 +487,8 @@ public final class OpennessHarness {
         if (lo <= 0.8f || p.confidence < 0.6f) {
             return "dim taught room reads " + p;
         }
-        // Shading across the carpet (a lamp nearer one side) is still the carpet.
-        Openness.Profile q = score(o, dimRoom().paint(0.5f, Openness.HORIZON, 1f, 1f, rgb(27, 27, 30)), NONE, 300,
+        // Shading across the carpet (a lamp-lit patch nearer him) is still the carpet.
+        Openness.Profile q = score(o, dimRoom().paint(0.5f, ground(0.5f), 1f, 1f, rgb(27, 27, 30)), NONE, 300,
                 false);
         float lit = min(q.bins, 0, Openness.BINS - 1);
         return lit > 0.8f ? null : "a slightly brighter patch of the same carpet reads " + q;
@@ -516,8 +533,8 @@ public final class OpennessHarness {
      */
     private static String standsWhereTheRunEnds() {
         Openness o = taughtRoom();
-        Scene s = room().paint(0.25f, 0.3f, 0.5f, ground(0.5f), rgb(30, 30, 40))
-                .paint(0.25f, ground(0.5f), 0.5f, ground(0.8f), rgb(200, 200, 200));
+        Scene s = room().paint(0.25f, 0.3f, 0.5f, ground(0.6f), rgb(30, 30, 40))
+                .paint(0.25f, ground(0.6f), 0.5f, ground(0.9f), rgb(200, 200, 200));
         Openness.Profile p = score(o, s, NONE, 200, false);
         float chair = max(p.bins, 4, 7);
         float clear = min(p.bins, 10, 15);
@@ -560,12 +577,99 @@ public final class OpennessHarness {
     private static String strayRowAtTheFoot() {
         Openness o = taughtRoom();
         float gap = 1f / 120f;
-        Scene s = room().paint(0.25f, 0.3f, 0.5f, ground(0.7f), rgb(30, 30, 40))
-                .paint(0.25f, ground(0.5f), 0.5f, ground(0.5f) + gap, FLOOR);
+        Scene s = room().paint(0.25f, 0.3f, 0.5f, ground(0.9f), rgb(30, 30, 40))
+                .paint(0.25f, ground(0.7f), 0.5f, ground(0.7f) + gap, FLOOR);
         Openness.Profile p = score(o, s, NONE, 200, false);
         float chair = max(p.bins, 5, 7);
         float clear = min(p.bins, 10, 15);
         return chair < 0.35f && clear > 0.8f ? null : "chair " + chair + " clear " + clear + " " + p;
+    }
+
+    /** A white, finely textured wall (orange-peel plaster) filling the frame, as he sees one he faces (robot 2026-10-01). */
+    private static Scene whiteWall() {
+        return room().weave(0f, 0f, 1f, 1f, rgb(225, 225, 230), rgb(200, 200, 207));
+    }
+
+    /**
+     * He stood facing a plain wall (floor clear, wheels free), then drove a short
+     * way with no hazard: its bottom patch is as even as any floor, but it carries
+     * on past the horizon, so it is never taught.
+     */
+    private static String wallNeverTaught() {
+        Openness o = new Openness();
+        teach(o, whiteWall(), 100);
+        teach(o, room().paint(0f, 0f, 1f, 1f, NEAR_WALL), 200);
+        return o.patches() == 0 ? null : "a wall was taught as floor: patches " + o.patches();
+    }
+
+    /**
+     * Robot 2026-10-01 16:35, in a doorway: having once faced a white wall, the
+     * white door jamb filling the right half read 0.56-0.81 and the carpet in
+     * the doorway 0.00. Now the jamb reads blocked and the doorway open.
+     */
+    private static String wallFacedThenDoorway() {
+        Openness o = new Openness();
+        teach(o, whiteWall(), 100);
+        Scene doorway = room().weave(0.55f, 0f, 1f, 1f, rgb(225, 225, 230), rgb(200, 200, 207));
+        Openness.Profile p = score(o, doorway, NONE, 200, false);
+        float jamb = max(p.bins, 9, 15);
+        float door = min(p.bins, 0, 7);
+        return jamb < 0.2f && door >= 0.35f ? null : "jamb " + jamb + " doorway " + door + " " + p;
+    }
+
+    /**
+     * Taught one floor, he looks down a hallway of another carpet whose end wall
+     * stands ~2.5 m off: open but unsure (KTD9), never blocked. (The old colour
+     * run read the hallway's end wall reaching down with no taught floor below
+     * it as standing right in front of him: every bin 0.00.)
+     */
+    private static String untaughtHallway() {
+        Openness o = taughtRoom();
+        Scene hallway = room().paint(0f, 0f, 1f, ground(0.3f), FAR_WALL).paint(0f, ground(0.3f), 1f, 1f, GREEN);
+        Openness.Profile p = score(o, hallway, NONE, 200, false);
+        float lo = min(p.bins, 0, Openness.BINS - 1);
+        float hi = max(p.bins, 0, Openness.BINS - 1);
+        return lo >= 0.35f && hi <= Openness.UNSURE ? null : "an untaught hallway reads " + lo + ".." + hi + " " + p;
+    }
+
+    /**
+     * Carpet at ISO 3200: a fine weave whose pixels differ a lot (luma 30 to 90)
+     * though the carpet is one floor. The old per-pixel evenness test refused
+     * every such sample and taught only plain walls; strip means accept it.
+     */
+    private static String grainyCarpetTeaches() {
+        Openness o = new Openness();
+        Scene carpet = dimRoom().weave(0f, ground(0.09f), 1f, 1f, rgb(90, 90, 94), rgb(30, 30, 32));
+        teach(o, carpet, 100);
+        if (o.patches() != 1) {
+            return "a grainy carpet was not taught: patches " + o.patches();
+        }
+        Openness.Profile p = score(o, carpet, NONE, 200, false);
+        return min(p.bins, 0, Openness.BINS - 1) > 0.8f ? null : "the taught grainy carpet reads " + p;
+    }
+
+    /**
+     * A wall across the room at several distances: the nearer its base (lower in
+     * the frame), the lower every bin, blocked once it stands within ~1.2 m
+     * (its base in the bottom ~3% of the frame), fully open past ~2 m.
+     */
+    private static String scoresByDistance() {
+        Openness o = taughtRoom();
+        float[] bases = {0.3f, 0.6f, 0.75f, 0.9f};
+        float last = 2f;
+        StringBuilder seen = new StringBuilder();
+        for (float base : bases) {
+            Openness.Profile p = score(o, room().paint(0f, 0f, 1f, ground(base), NEAR_WALL), NONE, 200, false);
+            float v = min(p.bins, 0, Openness.BINS - 1);
+            seen.append(String.format(java.util.Locale.US, " %.2f@%.2f", v, ground(base)));
+            if (v >= last || max(p.bins, 0, Openness.BINS - 1) - v > 0.01f) {
+                return "not falling evenly with distance:" + seen;
+            }
+            last = v;
+        }
+        Openness.Profile far = score(o, room().paint(0f, 0f, 1f, ground(0.3f), NEAR_WALL), NONE, 200, false);
+        Openness.Profile near = score(o, room().paint(0f, 0f, 1f, ground(0.9f), NEAR_WALL), NONE, 200, false);
+        return min(far.bins, 0, 15) >= 0.7f && max(near.bins, 0, 15) < 0.35f ? null : "far/near:" + seen;
     }
 
     // ---- helpers ----

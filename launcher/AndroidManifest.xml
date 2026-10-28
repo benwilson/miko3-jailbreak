@@ -86,5 +86,15 @@
                 <action android:name="com.miko3.launcher.ROBOT_EARS"/>
             </intent-filter>
         </service>
+
+        <!-- The physical mute button: a switch only root can read. The boot agent's
+             root watcher sends each press here as an explicit broadcast. Not exported
+             and no intent filter, so only root and the system can deliver it. -->
+        <receiver android:name=".MuteKeyReceiver" android:exported="false"/>
+
+        <!-- Debug only: scripts/robot-say.py's injected "heard text". Inert unless the
+             debug.miko3.ears_inject property is 1. Not exported and no intent filter,
+             so only root (adb shell am broadcast) and the system can deliver it. -->
+        <receiver android:name=".EarsInjectReceiver" android:exported="false"/>
     </application>
 </manifest>

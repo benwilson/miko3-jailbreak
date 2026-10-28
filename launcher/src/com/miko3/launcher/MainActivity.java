@@ -9,8 +9,11 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
+import android.view.KeyEvent;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+
+import com.miko3.shared.VolumeKeys;
 
 /**
  * The home screen itself (U9): a full-screen WebView pointed at the
@@ -46,6 +49,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        VolumeKeys.attach(this);
         wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
 
         webView = new WebView(this);
@@ -102,5 +106,11 @@ public class MainActivity extends Activity {
             // was never registered (e.g. destroyed before onCreate finished) — fine
         }
         super.onDestroy();
+    }
+
+    /** The volume keys on top move the speaker's volume and mute (shared VolumeKeys), before the WebView sees them. */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        return VolumeKeys.dispatch(this, event) || super.dispatchKeyEvent(event);
     }
 }

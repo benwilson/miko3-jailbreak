@@ -21,9 +21,13 @@ import java.util.Random;
  * MediaPlayer on STREAM_MUSIC, the same path mode-remote-control's SongPlayer
  * uses.
  *
- * Singing: while he sits still (resting or eyes-only) he hums a short phrase
- * every so often, like Wall-E. The first phrase waits a few seconds, so a
- * brief stop (the moment at start-up before readings arrive) stays quiet, and
+ * Singing: while he sits still off the charger (resting or eyes-only) he hums a
+ * short phrase now and then, like Wall-E: one phrase every 45-90 s (owner
+ * 2026-10-02: every 6-12 s was a nonstop chirp). There is no quick first phrase:
+ * the first waits a full gap too, so the short rests (a cornered cool-down, the
+ * moment at start-up before readings arrive) stay quiet and only a long sit gets
+ * a hum, and phrases are never closer than the minimum gap, even across a stop
+ * and restart. On the charger the brain shows DOCKED, which never sings.
  * stopSinging() cuts any phrase off the moment he moves again. All song state
  * lives on the clip thread.
  *
@@ -42,16 +46,20 @@ import java.util.Random;
  * too many names to hold a prepared player for each, so these are prepared on the
  * clip thread when asked and released when they finish. Only one plays at a time:
  * a new one cuts off the one still playing.
+ *
+ * The answer to a call (hey-miko plan KTD3) is the exception: it must start in
+ * the brain step that takes the call, so one answer variant is held prepared
+ * and the next is prepared after it plays.
  */
 final class ClipPlayer {
     private static final String TAG = "ClipPlayer";
     private static final String[] STARTLE_CLIPS = {"startle-1.wav", "startle-2.wav", "startle-3.wav"};
     private static final String[] SONG_CLIPS = {"song-1.wav", "song-2.wav", "song-3.wav", "song-4.wav"};
-    /** Still for this long before the first phrase. */
-    private static final long FIRST_SONG_DELAY_MS = 3000;
-    /** Quiet gap between phrases, drawn from this range. */
-    private static final long SONG_GAP_MIN_MS = 6000;
-    private static final long SONG_GAP_MAX_MS = 12000;
+    /** The reaction group held prepared, so a call's answer skips the prepare delay. */
+    static final String ANSWER_GROUP = "answer";
+    /** Quiet gap before the first phrase and between phrases, drawn from this range. */
+    private static final long SONG_GAP_MIN_MS = 45000;
+    private static final long SONG_GAP_MAX_MS = 90000;
 
     private final Context context;
     private final HandlerThread thread = new HandlerThread("explore-clips");
@@ -64,6 +72,8 @@ final class ClipPlayer {
     /** Clip thread only: reaction group -> its variant assets, and the one-shot playing now. */
     private final Map<String, List<String>> reactions = new HashMap<>();
     private MediaPlayer currentOneShot;
+    /** Clip thread only: the next answer variant, prepared and waiting. */
+    private MediaPlayer readyAnswer;
     private final Random random = new Random();
 
     ClipPlayer(final Context context) {
@@ -80,6 +90,7 @@ final class ClipPlayer {
                     songs[i] = prepare(context, SONG_CLIPS[i]);
                 }
                 indexReactions();
+                prepareNextAnswer();
             }
         });
     }
@@ -103,9 +114,19 @@ final class ClipPlayer {
         }
     }
 
-    /** One of the startle clips, chosen at random so repeated startles vary. Returns at
-     * once; a clip that failed to prepare is skipped. */
+    /** Startles at most this often (owner 2026-10-02: the floor sensor fires often and a
+     * startle each time was annoying); later ones in the gap are silent flinches. */
+    static final long STARTLE_MIN_GAP_MS = 20000;
+    private long lastStartleMs = Long.MIN_VALUE / 2;
+
+    /** One of the startle clips, chosen at random so repeated startles vary, at most once
+     * per STARTLE_MIN_GAP_MS. Returns at once; a clip that failed to prepare is skipped. */
     void playStartle() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastStartleMs < STARTLE_MIN_GAP_MS) {
+            return;
+        }
+        lastStartleMs = now;
         final int i = random.nextInt(STARTLE_CLIPS.length);
         handler.post(new Runnable() {
             @Override
@@ -138,11 +159,19 @@ final class ClipPlayer {
     }
 
     /** A random variant of a reaction group: "curious", "thinking", "disappointed",
-     * "delighted" or "puzzled". Returns at once; an unknown group is logged and skipped. */
+     * "delighted" or "puzzled", or "privacy" (the bathroom beep, react-privacy-1.wav, every
+     * 5 s while he leaves one). Returns at once; an unknown group is logged and skipped. */
     void playReaction(final String group) {
         handler.post(new Runnable() {
             @Override
             public void run() {
+                if (ANSWER_GROUP.equals(group) && readyAnswer != null) {
+                    MediaPlayer p = readyAnswer;
+                    readyAnswer = null;
+                    startOneShot(p, ANSWER_GROUP);
+                    prepareNextAnswer();
+                    return;
+                }
                 List<String> variants = reactions.get(group);
                 if (variants == null || variants.isEmpty()) {
                     Log.w(TAG, "no clips for reaction " + group + "; skipping");
@@ -185,14 +214,31 @@ final class ClipPlayer {
         }
     }
 
+    /** Clip thread: hold a random answer variant prepared for the next call. */
+    private void prepareNextAnswer() {
+        List<String> variants = reactions.get(ANSWER_GROUP);
+        if (variants == null || variants.isEmpty()) {
+            Log.w(TAG, "no clips for reaction " + ANSWER_GROUP + "; the answer will be skipped");
+            return;
+        }
+        readyAnswer = prepare(context, variants.get(random.nextInt(variants.size())));
+    }
+
     /** Clip thread: prepare an asset, play it once and release it when it ends (or
      * fails), cutting off any one-shot still playing. */
     private void playOneShot(String asset) {
-        stopOneShot();
-        final MediaPlayer p = prepare(context, asset);
+        MediaPlayer p = prepare(context, asset);
         if (p == null) {
+            stopOneShot();
             return;
         }
+        startOneShot(p, asset);
+    }
+
+    /** Clip thread: play a prepared player once and release it when it ends (or fails),
+     * cutting off any one-shot still playing. */
+    private void startOneShot(MediaPlayer p, String asset) {
+        stopOneShot();
         // Created on the clip thread, so these callbacks run on it too.
         p.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
             @Override
@@ -230,6 +276,31 @@ final class ClipPlayer {
         }
     }
 
+    /**
+     * The speaker was muted (owner 2026-10-02): cut off the clip and the song phrase now
+     * playing, so neither carries on aloud when it is unmuted. Singing stays on; its next
+     * phrase plays as usual. Returns at once.
+     */
+    void hush() {
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                stopOneShot();
+                if (currentSong != null) {
+                    try {
+                        if (currentSong.isPlaying()) {
+                            currentSong.pause();
+                        }
+                        currentSong.seekTo(0);
+                    } catch (IllegalStateException e) {
+                        Log.w(TAG, "could not hush the song", e);
+                    }
+                    currentSong = null;
+                }
+            }
+        });
+    }
+
     /** Start humming now and then until stopSinging(). Idempotent; returns at once. */
     void startSinging() {
         handler.post(new Runnable() {
@@ -239,7 +310,7 @@ final class ClipPlayer {
                     return;
                 }
                 singing = true;
-                handler.postDelayed(singPhrase, FIRST_SONG_DELAY_MS);
+                handler.postDelayed(singPhrase, songGap());
             }
         });
     }
@@ -274,7 +345,7 @@ final class ClipPlayer {
                 return;
             }
             MediaPlayer p = songs[random.nextInt(songs.length)];
-            long gap = SONG_GAP_MIN_MS + (long) (random.nextDouble() * (SONG_GAP_MAX_MS - SONG_GAP_MIN_MS));
+            long gap = songGap();
             if (p != null) {
                 try {
                     p.seekTo(0);
@@ -289,6 +360,11 @@ final class ClipPlayer {
         }
     };
 
+    /** Clip thread only: a quiet gap drawn from SONG_GAP_MIN_MS..SONG_GAP_MAX_MS. */
+    private long songGap() {
+        return SONG_GAP_MIN_MS + (long) (random.nextDouble() * (SONG_GAP_MAX_MS - SONG_GAP_MIN_MS));
+    }
+
     void release() {
         handler.post(new Runnable() {
             @Override
@@ -297,6 +373,10 @@ final class ClipPlayer {
                 handler.removeCallbacks(singPhrase);
                 currentSong = null;
                 stopOneShot();
+                if (readyAnswer != null) {
+                    readyAnswer.release();
+                    readyAnswer = null;
+                }
                 releaseAll(startles);
                 releaseAll(songs);
             }

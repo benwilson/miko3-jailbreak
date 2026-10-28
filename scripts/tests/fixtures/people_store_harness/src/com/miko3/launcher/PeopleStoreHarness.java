@@ -305,11 +305,14 @@ public final class PeopleStoreHarness {
                 PeopleStore s = new PeopleStore(dir, clock);
                 String a = s.add(jpeg(1), "Ann");
                 java.io.FileOutputStream out = new java.io.FileOutputStream(new File(dir, PeopleStore.INDEX_FILE), true);
-                out.write(("garbage\n../../etc/passwd\t1\tEve\nfedcba9876543210\t1\tNoFace\n")
-                        .getBytes("UTF-8"));
+                // Owner 2026-10-02: a named row with no photo is a person remembered by name
+                // alone and loads; a row with neither a name nor a photo does not.
+                out.write(("garbage\n../../etc/passwd\t1\tEve\nfedcba9876543210\t1\tNoFace\n"
+                        + "0123456789abcdef\t1\t\n").getBytes("UTF-8"));
                 out.close();
                 PeopleStore r = new PeopleStore(dir, clock);
-                check(n, ids(r.all()).equals(Arrays.asList(a)), ids(r.all()).toString());
+                check(n, ids(r.all()).equals(Arrays.asList(a, "fedcba9876543210"))
+                        && !r.hasFace("fedcba9876543210"), ids(r.all()).toString());
             }
         });
 
@@ -1209,6 +1212,135 @@ public final class PeopleStoreHarness {
                                 && s.photo(id, PeopleStore.MAX_PHOTOS) == null && s.photo("../" + id, 0) == null
                                 && s.photo(null, 0) == null && s.photos("nope").isEmpty(),
                         "slot reads leaked");
+            }
+        });
+
+        // ---- owner 2026-10-02: a person remembered by name alone ----
+        // A faceless conversation where they said their name: the notes are kept
+        // under the name; a face is enrolled later, when one is captured.
+
+        scenario("add_named_keeps_a_name_and_notes_with_no_face_across_a_reload", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addNamed("  Priya  ");
+                s.mergeNotes(id, "{\"interests\":[\"climbing\"]}");
+                PeopleStore r = new PeopleStore(dir, clock);
+                check(n, PeopleStore.isValidId(id) && "Priya".equals(r.nameOf(id)) && !r.hasFace(id)
+                                && r.face(id) == null && r.photos(id).isEmpty() && ids(r.all()).equals(Arrays.asList(id))
+                                && r.notes(id).interests.contains("climbing")
+                                && sortedFiles(dir).equals(Arrays.asList(id + ".json", PeopleStore.INDEX_FILE)),
+                        "files=" + sortedFiles(dir) + " name=" + r.nameOf(id));
+            }
+        });
+
+        scenario("add_named_refuses_a_blank_name_and_writes_nothing", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                PeopleStore s = new PeopleStore(dir, new FakeClock());
+                String wrong = "";
+                for (String bad : new String[] {null, "", "   "}) {
+                    try {
+                        s.addNamed(bad);
+                        wrong += "accepted [" + bad + "] ";
+                    } catch (IllegalArgumentException e) {
+                        if (!PeopleStore.REFUSE_NO_NAME.equals(e.getMessage())) {
+                            wrong += "reason " + e.getMessage() + " ";
+                        }
+                    }
+                }
+                check(n, wrong.isEmpty() && s.all().isEmpty() && !new File(dir, PeopleStore.INDEX_FILE).exists(),
+                        wrong + " files=" + sortedFiles(dir));
+            }
+        });
+
+        scenario("a_name_only_person_is_out_of_recent_and_the_gallery_but_ids_named_finds_them", new Scenario() {
+            public void run(String n) throws Exception {
+                PeopleStore s = new PeopleStore(tempDir(), new FakeClock());
+                String ann = s.addPerson(jpeg(1), "Ann Lee", SFACE, emb(1));
+                String priya = s.addNamed("Priya Shah");
+                boolean galleryClean = true;
+                for (PeopleStore.Photo p : s.gallery()) {
+                    galleryClean &= p.id.equals(ann);
+                }
+                check(n, ids(s.recent(10)).equals(Arrays.asList(ann)) && galleryClean && s.hasFace(ann)
+                                && s.idsNamed("priya").equals(Arrays.asList(priya))
+                                && s.idsNamed("Priya Shah").equals(Arrays.asList(priya)) && s.touch(priya),
+                        "recent=" + ids(s.recent(10)) + " named=" + s.idsNamed("priya"));
+            }
+        });
+
+        scenario("a_face_enrolled_later_joins_the_name_only_person", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addNamed("Priya");
+                s.mergeNotes(id, "{\"interests\":[\"tea\"]}");
+                int slot = s.addPhoto(id, jpeg(3), SFACE, emb(3));
+                PeopleStore r = new PeopleStore(dir, clock);
+                boolean inGallery = false;
+                for (PeopleStore.Photo p : r.gallery()) {
+                    inGallery |= p.id.equals(id) && p.slot == 0 && SFACE.equals(p.modelId);
+                }
+                check(n, slot == 0 && r.hasFace(id) && Arrays.equals(r.face(id), jpeg(3)) && inGallery
+                                && ids(r.recent(10)).equals(Arrays.asList(id)) && r.notes(id).interests.contains("tea")
+                                && "Priya".equals(r.nameOf(id)),
+                        "slot=" + slot + " files=" + sortedFiles(dir));
+            }
+        });
+
+        scenario("forget_deletes_a_name_only_person_and_their_notes", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addNamed("Priya");
+                s.mergeNotes(id, "{\"interests\":[\"tea\"]}");
+                boolean forgot = s.forget(id);
+                PeopleStore r = new PeopleStore(dir, clock);
+                check(n, forgot && s.nameOf(id) == null && r.nameOf(id) == null && r.all().isEmpty()
+                                && r.idsNamed("Priya").isEmpty()
+                                && sortedFiles(dir).equals(Arrays.asList(PeopleStore.INDEX_FILE)),
+                        "files=" + sortedFiles(dir));
+            }
+        });
+
+        // Owner 2026-10-02: one record per id; forget() also wipes what other stores keep by it.
+        scenario("forget_runs_the_forget_hooks_with_the_id_and_a_failing_hook_still_forgets", new Scenario() {
+            public void run(String n) throws Exception {
+                PeopleStore s = new PeopleStore(tempDir(), new FakeClock());
+                String id = s.addNamed("Priya Shah");
+                final List<String> wiped = new ArrayList<String>();
+                s.addForgetHook(new PeopleStore.ForgetHook() {
+                    public void forgotten(String x) {
+                        throw new IllegalStateException("voice store down");
+                    }
+                });
+                s.addForgetHook(new PeopleStore.ForgetHook() {
+                    public void forgotten(String x) {
+                        wiped.add(x);
+                    }
+                });
+                boolean unknown = s.forget("0123456789abcdef");
+                boolean forgot = s.forget(id);
+                check(n, !unknown && forgot && wiped.equals(Arrays.asList(id)) && s.nameOf(id) == null,
+                        "wiped=" + wiped + " forgot=" + forgot);
+            }
+        });
+
+        scenario("a_name_only_person_cannot_be_renamed_blank", new Scenario() {
+            public void run(String n) throws Exception {
+                File dir = tempDir();
+                FakeClock clock = new FakeClock();
+                PeopleStore s = new PeopleStore(dir, clock);
+                String id = s.addNamed("Priya");
+                boolean blank = s.rename(id, "  ");
+                boolean renamed = s.rename(id, "Priya Shah");
+                PeopleStore r = new PeopleStore(dir, clock);
+                check(n, !blank && renamed && "Priya Shah".equals(r.nameOf(id)),
+                        "blank=" + blank + " renamed=" + renamed + " name=" + r.nameOf(id));
             }
         });
 

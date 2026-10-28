@@ -1,8 +1,10 @@
 package com.miko3.shared;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.URL;
 import java.net.URLConnection;
@@ -23,7 +25,7 @@ import javax.net.ssl.HttpsURLConnection;
  * Logs nothing: the request carries the key. java.net and javax.net.ssl only,
  * so it also compiles on the host JVM.
  */
-public final class ClaudeHttpsTransport implements ClaudeApi.Transport {
+public final class ClaudeHttpsTransport implements ClaudeApi.StreamingTransport {
     private static final int CONNECT_TIMEOUT_MS = 10000;
     /** The default, for a one-token reply or a page of models; a Request may set its own
      * (readTimeoutMs). Anything slower counts as unreachable. */
@@ -33,6 +35,20 @@ public final class ClaudeHttpsTransport implements ClaudeApi.Transport {
 
     @Override
     public ClaudeApi.Response send(ClaudeApi.Request request) throws IOException {
+        return exchange(request, null);
+    }
+
+    /**
+     * Robot 2026-10-02: a 2xx event stream goes to sink line by line as it arrives,
+     * under the same timeouts (the read timeout then bounds each wait for the next
+     * line); any other answer comes back whole, as send() returns it.
+     */
+    @Override
+    public ClaudeApi.Response stream(ClaudeApi.Request request, ClaudeApi.LineSink sink) throws IOException {
+        return exchange(request, sink);
+    }
+
+    private ClaudeApi.Response exchange(ClaudeApi.Request request, ClaudeApi.LineSink sink) throws IOException {
         URLConnection opened = new URL(request.url).openConnection();
         if (!(opened instanceof HttpsURLConnection)) {
             throw new IOException("not an https URL"); // normalizeBaseUrl already ensures https
@@ -60,7 +76,13 @@ public final class ClaudeHttpsTransport implements ClaudeApi.Transport {
             }
             int status = conn.getResponseCode();
             InputStream in = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            return new ClaudeApi.Response(status, readBody(in));
+            String type = conn.getContentType();
+            if (sink != null && status >= 200 && status <= 299 && type != null
+                    && type.toLowerCase(java.util.Locale.US).startsWith("text/event-stream")) {
+                readLines(in, sink);
+                return new ClaudeApi.Response(status, "", conn.getHeaderField("retry-after"));
+            }
+            return new ClaudeApi.Response(status, readBody(in), conn.getHeaderField("retry-after"));
         } catch (RuntimeException e) {
             // HttpURLConnection throws unchecked exceptions for some bad input and
             // broken connections; ClaudeApi only maps IOExceptions. Message dropped:
@@ -68,6 +90,24 @@ public final class ClaudeHttpsTransport implements ClaudeApi.Transport {
             throw new IOException("request failed: " + e.getClass().getSimpleName());
         } finally {
             conn.disconnect();
+        }
+    }
+
+    /** An event stream, line by line as it arrives, cut off at MAX_BODY_BYTES characters. */
+    private static void readLines(InputStream in, ClaudeApi.LineSink sink) throws IOException {
+        if (in == null) {
+            return;
+        }
+        BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+        try {
+            long seen = 0;
+            String line;
+            while (seen < MAX_BODY_BYTES && (line = r.readLine()) != null) {
+                seen += line.length() + 1;
+                sink.line(line);
+            }
+        } finally {
+            r.close();
         }
     }
 

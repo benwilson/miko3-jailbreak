@@ -213,6 +213,62 @@ public final class SensorReplyHarness {
                         && SensorReply.parseCpl("tof and edge detectionCPL=2") == 2,
                 "CPL=2 is a forward refusal, not the charger");
 
+        // ---- POWER (2026-10-02): the first field and the signed current say "on the dock" ----
+        String rest = "FLBTN=0,0,0,0,00000,00000TOFIR=00251,XXXX,0,XXXX";
+        String off1001 = "POWER=0,0,07589,-0357,07580,-0357,056,07,34,11";
+        String offDoc = "POWER=0,0,07884,-0234,07887,-0234,076,14,15,23";
+        String onDock = "POWER=2,0,08268,01002,08271,-0255,100,00,00,00";
+        SensorReply.Power p1 = SensorReply.parsePower(off1001 + rest);
+        SensorReply.Power p2 = SensorReply.parsePower(offDoc + rest);
+        SensorReply.Power p3 = SensorReply.parsePower(onDock + rest);
+        check("power_off_the_dock_is_read",
+                p1 != null && p1.state == 0 && p1.current == -357 && p1.percent == 56 && !p1.docked()
+                        && p2 != null && p2.state == 0 && p2.current == -234 && p2.percent == 76 && !p2.docked(),
+                "2026-10-01 " + p1 + " / doc sample " + p2);
+        check("power_on_the_dock_is_read",
+                p3 != null && p3.state == 2 && p3.current == 1002 && p3.percent == 100 && p3.docked(),
+                "got " + p3);
+        SensorReply.Power b1 = SensorReply.parsePower(off1001);
+        SensorReply.Power b3 = SensorReply.parsePower(onDock);
+        check("power_strings_alone_are_read",
+                b1 != null && !b1.docked() && b1.current == -357 && b3 != null && b3.docked() && b3.state == 2,
+                "the measured strings with nothing after them: " + b1 + " / " + b3);
+        SensorReply.Power fullCharge = SensorReply.parsePower("POWER=0,0,08300,00200,08300,00000,100,00,00,00" + rest);
+        SensorReply.Power trickle = SensorReply.parsePower("POWER=0,0,08300,00199,08300,00000,100,00,00,00" + rest);
+        SensorReply.Power state1 = SensorReply.parsePower("POWER=1,0,08300,00000,08300,00000,100,00,00,00" + rest);
+        SensorReply.Power state3 = SensorReply.parsePower("POWER=3,0,08300,-0010,08300,00000,100,00,00,00" + rest);
+        check("power_docked_is_any_state_above_zero_or_a_charging_current",
+                fullCharge != null && fullCharge.docked() && trickle != null && !trickle.docked()
+                        && state1 != null && state1.docked() && state3 != null && state3.docked(),
+                "+200 " + fullCharge + " / +199 " + trickle + " / state 1 " + state1 + " / state 3 " + state3);
+        SensorSnapshot dockFault = SensorReply.parse(bytes(onDock + "FLBTN=0,0,0,0,00000,00000TOFIR=16383,XXXX,0,XXXX"), T);
+        SensorSnapshot offSnap = SensorReply.parse(padded(captured), T);
+        check("the_snapshot_carries_power_even_with_a_faulted_tof",
+                dockFault != null && dockFault.fault && dockFault.power != null && dockFault.power.docked()
+                        && offSnap != null && offSnap.power != null && !offSnap.power.docked()
+                        && offSnap.power.current == -234,
+                "dock " + dockFault + " / captured " + offSnap);
+        SensorSnapshot noPower = SensorReply.parse(bytes("POWER=2,0,08268,010FLBTN=0TOFIR=00251,XXXX,0,XXXX"), T);
+        check("cut_off_or_malformed_power_is_absent",
+                SensorReply.parsePower("POWER=2,0,08268,010") == null
+                        && SensorReply.parsePower("POWER=2,0,08268,01002") == null
+                        && SensorReply.parsePower("POWER=2") == null
+                        && SensorReply.parsePower("POWER=") == null
+                        && SensorReply.parsePower("POWER=X,0,08268,01002,08271" + rest) == null
+                        && SensorReply.parsePower("POWER=2,0,08268,01X02,08271" + rest) == null
+                        && SensorReply.parsePower("POWER=2,0,08268,-,08271" + rest) == null
+                        && SensorReply.parsePower("POWER=-2,0,08268,01002,08271" + rest) == null
+                        && SensorReply.parsePower("POWER=2,0,08268,01002FLBTN=0" + rest) == null
+                        && SensorReply.parsePower(rest) == null
+                        && SensorReply.parsePower("") == null
+                        && SensorReply.parsePower(null) == null
+                        && noPower != null && noPower.power == null && noPower.tof == 251,
+                "a cut-off or malformed POWER must read as absent, and leave the rest of the record");
+        SensorReply.Power noPercent = SensorReply.parsePower("POWER=2,0,08268,01002,08271" + rest);
+        check("power_without_a_percentage_still_says_docked",
+                noPercent != null && noPercent.docked() && noPercent.percent == SensorSnapshot.ABSENT,
+                "got " + noPercent);
+
         check("malformed_cpl_is_unknown",
                 SensorReply.parseCpl(bytes("CPL=X,")) == SensorSnapshot.ABSENT
                         && SensorReply.parseCpl((byte[]) null) == SensorSnapshot.ABSENT, "expected ABSENT");

@@ -115,8 +115,9 @@ public class ListenService extends Service {
             enforceCaller();
             int uid = Binder.getCallingUid();
             boolean ok = engine().ears().listen(String.valueOf(uid), maxMs);
-            Log.i(TAG, "uid " + uid + " conversation listen " + (ok ? "for up to " + ListenSession.clampCap(maxMs)
-                    + " ms" : "refused"));
+            Log.i(TAG, "uid " + uid + " conversation listen " + (ok ? "for a start within "
+                    + ListenSession.clampCap(maxMs) + " ms (an answer is cut at " + EarsSession.LISTEN_HARD_CAP_MS
+                    + " ms)" : "refused"));
         }
 
         @Override

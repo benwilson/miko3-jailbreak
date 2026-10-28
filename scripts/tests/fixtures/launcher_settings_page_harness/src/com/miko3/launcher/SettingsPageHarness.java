@@ -178,9 +178,19 @@ public final class SettingsPageHarness {
     /** Answers the scripted sample lists, one per drain, then nothing. */
     static final class FakeDirection implements EarsProbe.Direction {
         final List<List<Float>> drains = new ArrayList<List<Float>>();
+        Integer raw;
+        String reply;
 
         public String backend() {
             return "fake";
+        }
+
+        public Integer raw() {
+            return raw;
+        }
+
+        public String rawReply() {
+            return reply;
         }
 
         public List<Float> drain() {
@@ -219,6 +229,11 @@ public final class SettingsPageHarness {
         }
 
         public String text() {
+            // The real one reads a native stream that close() released: reading it after
+            // close segfaulted the launcher on the robot (2026-09-29).
+            if (closed) {
+                throw new IllegalStateException("text() after close(): use after free");
+            }
             return samples < 20000 ? "hello" : "hello robot friend";
         }
 
@@ -234,7 +249,8 @@ public final class SettingsPageHarness {
      * ListenSession.capture, the very loop the real listen uses. */
     static final class FakeRunner implements EarsProbe.Runner {
         final FakeMic mic = new FakeMic();
-        final FakeRecognizer rec = new FakeRecognizer();
+        /** The last capture's recogniser: the launcher creates a fresh one per capture. */
+        FakeRecognizer rec = new FakeRecognizer();
         int seconds = -1;
         RuntimeException fail;
 
@@ -243,6 +259,7 @@ public final class SettingsPageHarness {
             if (fail != null) {
                 throw fail;
             }
+            rec = new FakeRecognizer();
             ListenSession.Mic m = tap.mic(mic);
             ListenSession.Recognizer r = tap.recognizer(rec);
             ListenSession.capture(m, r, seconds * 1000L);
@@ -586,6 +603,22 @@ public final class SettingsPageHarness {
             }
         });
 
+        // The model picked from the list wins over the typed box; an empty pick keeps the typed name.
+        scenario("save_picked_model_wins_and_an_empty_pick_keeps_the_typed_name", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = withKey();
+                String base = "t=" + token(f) + "&base_url=" + enc(ClaudeSettings.DEFAULT_BASE_URL + "/v1/") + "&key=";
+                request(f, "POST", "/settings/claude", "", base + "&model=" + enc("claude-a") + "&model_pick="
+                        + enc("claude-b"));
+                String picked = f.settings.credentialsForRequests().model;
+                request(f, "POST", "/settings/claude", "", "t=" + token(f) + "&base_url="
+                        + enc(ClaudeSettings.DEFAULT_BASE_URL + "/v1/") + "&key=&model=" + enc("claude-c")
+                        + "&model_pick=");
+                String typed = f.settings.credentialsForRequests().model;
+                check(n, "claude-b".equals(picked) && "claude-c".equals(typed), "picked=" + picked + " typed=" + typed);
+            }
+        });
+
         // AE2: a blank key keeps the stored one; the model updates.
         scenario("save_blank_key_keeps_key_and_updates_model", new Scenario() {
             public void run(String n) throws Exception {
@@ -699,8 +732,10 @@ public final class SettingsPageHarness {
                 Resp r = action(f, "/settings/claude/models");
                 String html = get(f);
                 check(n, Arrays.asList("claude-a", "claude-b").equals(f.settings.models())
-                                && html.contains("<datalist") && html.contains("<option value=\"claude-a\">")
-                                && html.contains("<option value=\"claude-b\">")
+                                && html.contains("<select id=\"model_pick\"")
+                                && html.contains("<option value=\"claude-a\">claude-a")
+                                && html.contains("<option value=\"claude-b\">claude-b")
+                                && !html.contains("<datalist")
                                 && r.status().contains("2"),
                         "status=" + r.status() + " models=" + f.settings.models());
             }
@@ -1118,6 +1153,28 @@ public final class SettingsPageHarness {
             }
         });
 
+        // Owner 2026-10-02: someone remembered by name alone (a faceless conversation) is
+        // listed with their notes and no photo; Forget deletes them and their notes.
+        scenario("a_name_only_person_is_listed_without_a_photo_and_forget_deletes_them", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String id = f.people.addNamed("Priya");
+                f.people.mergeNotes(id, "{\"interests\":[\"bouldering\"]}");
+                String before = get(f);
+                int at = before.indexOf("person-" + id);
+                String card = at < 0 ? "" : before.substring(at, before.indexOf("</article>", at));
+                boolean listed = card.contains("Priya") && card.contains("bouldering")
+                        && card.contains(SettingsPage.PEOPLE_NAME_ONLY) && !card.contains("<img");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + token(f) + "&id=" + id);
+                String after = get(f);
+                check(n, listed && f.people.nameOf(id) == null && f.people.notes(id).interests.isEmpty()
+                                && !after.contains(id) && !after.contains("bouldering")
+                                && SettingsPage.PEOPLE_FORGOTTEN.equals(r.status()),
+                        "listed=" + listed + " " + r.head);
+            }
+        });
+
         scenario("people_actions_on_unknown_id_change_nothing", new Scenario() {
             public void run(String n) throws Exception {
                 Fixture f = new Fixture();
@@ -1294,6 +1351,28 @@ public final class SettingsPageHarness {
                                 && "fake".equals(((Map<?, ?>) parsed).get("backend"))
                                 && p.runner.mic.closed && p.runner.rec.closed,
                         "code=" + r.code() + " body=" + r.body);
+            }
+        });
+        scenario("ears_probe_rows_carry_the_chips_raw_value_for_calibration", new Scenario() {
+            public void run(String n) throws Exception {
+                // hey-miko plan U1/KTD12: qa-direction-chip.py --calibrate fits zero, sign and
+                // scale from each row's raw chip value, and confirms the port from raw_reply.
+                Probe p = new Probe().armed("abc");
+                p.direction.raw = 138;
+                p.direction.reply = "58585542aa";
+                Resp r = probePost(p, "abc", 1, null);
+                Object parsed = r.code() == 200 ? Json.parse(r.body) : null;
+                List<?> rows = parsed instanceof Map ? (List<?>) ((Map<?, ?>) parsed).get("rows") : null;
+                Map<?, ?> row1 = rows != null && rows.size() == 1 ? (Map<?, ?>) rows.get(0) : null;
+                Probe none = new Probe().armed("abc");
+                Resp r2 = probePost(none, "abc", 1, null);
+                Object parsed2 = r2.code() == 200 ? Json.parse(r2.body) : null;
+                List<?> rows2 = parsed2 instanceof Map ? (List<?>) ((Map<?, ?>) parsed2).get("rows") : null;
+                Map<?, ?> row2 = rows2 != null && rows2.size() == 1 ? (Map<?, ?>) rows2.get(0) : null;
+                check(n, row1 != null && Long.valueOf(138).equals(row1.get("raw"))
+                                && "58585542aa".equals(((Map<?, ?>) parsed).get("raw_reply"))
+                                && row2 != null && !row2.containsKey("raw"),
+                        "body=" + r.body + " none=" + r2.body);
             }
         });
         scenario("ears_probe_clamps_seconds_and_reports_a_busy_microphone", new Scenario() {
@@ -1887,6 +1966,190 @@ public final class SettingsPageHarness {
                         "t=" + token(f) + "&confident=0.9", null, true);
                 check(n, del.code() == 405 && th.code() == 405 && f.people.photos(id).size() == 2
                         && f.settings.faceSettings().confident == 0.5f, del.head + "|" + th.head);
+            }
+        });
+
+        // ---- Owner 2026-10-02: the feedback log ----
+        scenario("feedback_section_lists_entries_newest_first", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sarah = personWithPhotos(f, "Sarah Connor", 1);
+                f.people.recordFeedback(sarah, com.miko3.shared.Feedback.of("complaint", "He keeps interrupting.",
+                        "you talk over me every time"), "in a call's conversation");
+                f.peopleClock.now += 60_000;
+                f.people.recordFeedback(null, com.miko3.shared.Feedback.of("suggestion", "Learn <b>names</b> faster.",
+                        "learn names & faces"), "while docked");
+                String sec = section(get(f), "feedback");
+                int newer = sec.indexOf("Learn &lt;b&gt;names&lt;/b&gt; faster.");
+                int older = sec.indexOf("He keeps interrupting.");
+                check(n, sec.contains("Feedback from conversations") && newer > 0 && older > newer
+                                && sec.contains("you talk over me every time") && sec.contains("learn names &amp; faces")
+                                && sec.contains("Sarah") && !sec.contains("Connor") && sec.contains("someone")
+                                && sec.contains("while docked") && sec.contains("complaint") && sec.contains("suggestion")
+                                && sec.contains("2 entries") && !sec.contains(sarah) && !sec.contains("<b>names")
+                                && !form(sec, LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH).isEmpty(),
+                        sec);
+            }
+        });
+        scenario("feedback_section_says_when_there_is_none", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sec = section(get(f), "feedback");
+                check(n, sec.contains(SettingsPage.FEEDBACK_EMPTY), sec);
+            }
+        });
+        scenario("feedback_clear_needs_the_token_and_empties_the_log", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                f.people.recordFeedback(null, com.miko3.shared.Feedback.of("bug", "He froze.", ""), "x");
+                Resp stale = request(f, "POST", LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, "", "t=deadbeef");
+                int afterStale = f.people.feedback().size();
+                Resp get = request(f, "GET", LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH, "t=" + token(f), null);
+                int afterGet = f.people.feedback().size();
+                Resp ok = action(f, LauncherProtocol.SETTINGS_FEEDBACK_CLEAR_PATH);
+                String sec = section(get(f), "feedback");
+                check(n, afterStale == 1 && afterGet == 1 && get.code() == 405
+                                && SettingsPage.FEEDBACK_CLEARED.equals(ok.status())
+                                && f.people.feedback().size() == 0 && sec.contains(SettingsPage.FEEDBACK_EMPTY),
+                        stale.head + " | " + ok.head);
+            }
+        });
+        scenario("feedback_state_needs_the_token_and_carries_entries_newest_first_without_ids", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String tom = personWithPhotos(f, "Tom", 1);
+                f.people.recordFeedback(tom, com.miko3.shared.Feedback.of("praise", "Likes his voice.", "nice voice"),
+                        "while roaming");
+                f.peopleClock.now += 1000;
+                f.people.recordFeedback(null, com.miko3.shared.Feedback.of("bug", "He froze.", ""), "x");
+                Resp refused = request(f, "POST", LauncherProtocol.SETTINGS_FEEDBACK_STATE_PATH, "", "t=nope");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_FEEDBACK_STATE_PATH, "", "t=" + token(f));
+                @SuppressWarnings("unchecked")
+                Map<String, Object> root = (Map<String, Object>) Json.parse(r.body);
+                @SuppressWarnings("unchecked")
+                List<Object> entries = (List<Object>) root.get("entries");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> first = (Map<String, Object>) entries.get(0);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> second = (Map<String, Object>) entries.get(1);
+                check(n, refused.code() == 403 && r.code() == 200 && entries.size() == 2
+                                && "He froze.".equals(first.get("summary")) && "someone".equals(first.get("who"))
+                                && "Likes his voice.".equals(second.get("summary")) && "Tom".equals(second.get("who"))
+                                && "nice voice".equals(second.get("quote")) && "while roaming".equals(second.get("context"))
+                                && "praise".equals(second.get("kind")) && second.get("at") instanceof Number
+                                && !r.body.contains(tom) && !second.containsKey("person"),
+                        refused.head + " " + r.body);
+            }
+        });
+        scenario("forget_on_page_deletes_their_feedback", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sarah = personWithPhotos(f, "Sarah", 1);
+                f.people.recordFeedback(sarah, com.miko3.shared.Feedback.of("complaint", "Too loud.", "too loud"), "x");
+                f.people.recordFeedback(null, com.miko3.shared.Feedback.of("bug", "He froze.", ""), "x");
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_PEOPLE_FORGET_PATH, "",
+                        "t=" + token(f) + "&id=" + sarah);
+                String sec = section(get(f), "feedback");
+                check(n, SettingsPage.PEOPLE_FORGOTTEN.equals(r.status()) && f.people.feedback().size() == 1
+                                && !sec.contains("Too loud.") && sec.contains("He froze."),
+                        sec);
+            }
+        });
+
+        // ---- owner 2026-10-03: the owner's notes about people by name ----
+        scenario("owner_notes_section_explains_and_offers_an_add_form", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String sec = section(get(f), "owner-notes");
+                String add = form(sec, LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH);
+                check(n, sec.contains("Notes about people by name") && sec.contains(SettingsPage.OWNER_NOTES_EMPTY)
+                                && sec.contains("never logged") && sec.contains("never reveals")
+                                && fieldNames(add).equals(java.util.Arrays.asList("t", "name", "note"))
+                                && textarea(add, "note").contains("maxlength=\"600\""),
+                        sec);
+            }
+        });
+        scenario("owner_notes_add_lists_the_entry_escaped_with_edit_and_delete", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp r = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=" + enc("Priya <b>Shah</b>") + "&note=" + enc("Ask about <i>runs</i> & dogs"));
+                String sec = section(get(f), "owner-notes");
+                String id = f.people.ownerNotes().all().get(0).id;
+                String edit = form(sec, LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH);
+                String del = form(sec, LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH);
+                check(n, SettingsPage.OWNER_NOTE_ADDED.equals(r.status())
+                                && sec.contains("Priya &lt;b&gt;Shah&lt;/b&gt;") && !sec.contains("<b>Shah")
+                                && sec.contains("Ask about &lt;i&gt;runs&lt;/i&gt; &amp; dogs") && !sec.contains("<i>runs")
+                                && edit.contains("value=\"" + id + "\"") && del.contains("value=\"" + id + "\"")
+                                && fieldNames(edit).equals(java.util.Arrays.asList("t", "id", "name", "note"))
+                                && !sec.contains(SettingsPage.OWNER_NOTES_EMPTY)
+                                && "Ask about <i>runs</i> & dogs".equals(f.people.ownerNotes().noteFor("priya <b>shah</b>"))
+                                && f.people.ownerNotes().noteFor("priya") == null,
+                        r.status() + " | " + sec);
+            }
+        });
+        scenario("owner_notes_edit_and_delete_change_only_that_entry", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                String a = f.people.ownerNotes().add("Sam", "old");
+                f.people.ownerNotes().add("Ann", "keep");
+                Resp e = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH, "",
+                        "t=" + token(f) + "&id=" + a + "&name=Sam+Lee&note=new");
+                String afterEdit = f.people.ownerNotes().noteFor("Sam Lee");
+                Resp d = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=" + a);
+                Resp unknown = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH, "",
+                        "t=" + token(f) + "&id=" + a);
+                check(n, SettingsPage.OWNER_NOTE_SAVED.equals(e.status()) && "new".equals(afterEdit)
+                                && SettingsPage.OWNER_NOTE_DELETED.equals(d.status())
+                                && SettingsPage.OWNER_NOTE_UNKNOWN.equals(unknown.status())
+                                && f.people.ownerNotes().all().size() == 1 && "keep".equals(f.people.ownerNotes().noteFor("ann")),
+                        e.status() + "|" + d.status() + "|" + unknown.status());
+            }
+        });
+        scenario("owner_notes_need_the_token_and_post", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp stale = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=deadbeef&name=Sam&note=x");
+                Resp get = request(f, "GET", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH,
+                        "t=" + token(f) + "&name=Sam&note=x", null);
+                String a = f.people.ownerNotes().add("Ann", "keep");
+                Resp staleDel = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH, "",
+                        "t=nope&id=" + a);
+                check(n, get.code() == 405 && f.people.ownerNotes().all().size() == 1
+                                && stale.status() != null && stale.status().contains("expired")
+                                && staleDel.status() != null && staleDel.status().contains("expired"),
+                        stale.head);
+            }
+        });
+        scenario("owner_notes_refusals_and_statuses_never_echo_the_name_or_note", new Scenario() {
+            public void run(String n) throws Exception {
+                Fixture f = new Fixture();
+                Resp noName = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=&note=" + enc("secret plan"));
+                Resp noNote = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=Zelda&note=+");
+                Resp tooLong = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=Zelda&note=" + repeat('a', 601));
+                Resp ok = request(f, "POST", LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH, "",
+                        "t=" + token(f) + "&name=Zelda&note=" + enc("secret plan"));
+                String all = noName.head + noNote.head + tooLong.head + ok.head;
+                check(n, SettingsPage.OWNER_NOTE_NO_NAME.equals(noName.status())
+                                && SettingsPage.OWNER_NOTE_EMPTY.equals(noNote.status())
+                                && SettingsPage.OWNER_NOTE_TOO_LONG.equals(tooLong.status())
+                                && SettingsPage.OWNER_NOTE_ADDED.equals(ok.status())
+                                && !all.contains("Zelda") && !all.contains("secret") && f.people.ownerNotes().all().size() == 1,
+                        all);
+            }
+        });
+        scenario("owner_notes_paths_are_tls_only", new Scenario() {
+            public void run(String n) throws Exception {
+                check(n, LauncherProtocol.SETTINGS_OWNER_NOTES_ADD_PATH.startsWith(LauncherProtocol.SETTINGS_PATH + "/")
+                                && LauncherProtocol.SETTINGS_OWNER_NOTES_EDIT_PATH.startsWith(LauncherProtocol.SETTINGS_PATH + "/")
+                                && LauncherProtocol.SETTINGS_OWNER_NOTES_DELETE_PATH.startsWith(LauncherProtocol.SETTINGS_PATH + "/"),
+                        "");
             }
         });
 

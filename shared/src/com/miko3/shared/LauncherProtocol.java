@@ -35,6 +35,20 @@ public final class LauncherProtocol {
 
     public static final String LAUNCHER_PACKAGE = "com.miko3.launcher";
 
+    /**
+     * Robot 2026-10-01: an ears conversation listen's maxMs is the window to start
+     * answering; an answer begun in it runs until 2 s with no speech
+     * (EarsSession.ANSWER_SILENCE_MS, owner 2026-10-02), but the launcher cuts it
+     * this long after the listen opened (EarsSession.LISTEN_HARD_CAP_MS).
+     */
+    public static final long EARS_LISTEN_HARD_CAP_MS = 60000;
+    /**
+     * How long from its start a mode holds an ears listen whose answer has started
+     * (RobotEars.Callback.answering): the hard cap plus 3 s for the decode and the
+     * delivery. Explore's brain mirrors it as ExploreTuning.answerHoldMs.
+     */
+    public static final long EARS_ANSWER_HOLD_MS = EARS_LISTEN_HARD_CAP_MS + 3000;
+
     /** A mode's fixed reason when the launcher does not answer a Binder
      * transaction the mode's build knows (meeting plan U4, KTD11): the two
      * APKs are installed together, and every proxy method added since checks
@@ -104,6 +118,18 @@ public final class LauncherProtocol {
      * their photo counts and the thresholds as JSON, names included, no images.
      * Owner tooling: scripts/robot-faces.py. */
     public static final String SETTINGS_FACE_STATE_PATH = "/settings/face/state";
+
+    /** POST with the page token deletes every entry in the feedback log
+     * (owner 2026-10-02: what people told the robot about himself). */
+    public static final String SETTINGS_FEEDBACK_CLEAR_PATH = "/settings/feedback/clear";
+
+    /** POST with the page token answers the feedback log as JSON, newest
+     * first, with no person ids. Owner tooling: scripts/pull-feedback.py. */
+    public static final String SETTINGS_FEEDBACK_STATE_PATH = "/settings/feedback/state";
+    /** Owner 2026-10-03: add, edit and delete the owner's notes about people by name (POST, page token). */
+    public static final String SETTINGS_OWNER_NOTES_ADD_PATH = "/settings/owner-notes/add";
+    public static final String SETTINGS_OWNER_NOTES_EDIT_PATH = "/settings/owner-notes/edit";
+    public static final String SETTINGS_OWNER_NOTES_DELETE_PATH = "/settings/owner-notes/delete";
 
     /** The launcher's fixed HTTPS port, where the Settings page lives. */
     public static final int LAUNCHER_HTTPS_PORT = 8443;

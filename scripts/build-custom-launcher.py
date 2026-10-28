@@ -30,6 +30,8 @@ ListenService runs sherpa-onnx's streaming zipformer-en-20M. The build
 downloads that model's pinned, checksummed release into tools/third_party/,
 and stages its int8 encoder, decoder and joiner plus tokens.txt into the APK's
 assets/listen/ under fixed names, with a stamp.txt like the voice's.
+The voice identification's speaker-embedding model (3D-Speaker CAM++) is fetched
+the same way and staged as assets/voiceid/model.onnx with its own stamp.txt.
 
 Usage:
   python3 scripts/build-custom-launcher.py
@@ -117,6 +119,26 @@ BPE_VOCAB = "bpe.vocab"
 VAD_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
 VAD_MODEL_SHA256 = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
 VAD_MODEL = "silero_vad.onnx"
+# Owner 2026-10-02: voice identification. sherpa-onnx's speaker embedding extractor runs
+# 3D-Speaker's CAM++ (English, VoxCeleb, 16 kHz, ~28 MB), staged as assets/voiceid/model.onnx
+# with a stamp.txt like the listen model's. The release tag really is spelled "recongition".
+VOICEID_MODEL = "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
+VOICEID_MODEL_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+                     + VOICEID_MODEL)
+VOICEID_MODEL_SHA256 = "357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b"
+VOICEID_ASSET = "voiceid/model.onnx"
+VOICEID_CACHE = REPO / "tools" / "third_party" / "voiceid"
+# Owner 2026-10-03: two more speaker models for the opt-in voice evaluation (VoiceEval). Never
+# bundled in the APK (66 MB): scripts/push-voice-eval-models.py fetches them through
+# voice_eval_models() and pushes them to the launcher's files/voiceeval/models/.
+VOICE_EVAL_MODELS = {
+    "3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx":
+        "c59158379255ad66e161679cca6af8d52d51e389e3224ab7d7a7baae295c2db5",
+    "nemo_en_titanet_small.onnx":
+        "ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e",
+}
+VOICE_EVAL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+VOICE_EVAL_CACHE = REPO / "tools" / "third_party" / "voiceeval"
 # The hotwords file lives at the APK asset root, outside the staged model directory.
 HOTWORDS = LAUNCHER_ASSETS / "hotwords.txt"
 STAMP = "stamp.txt"
@@ -322,6 +344,34 @@ def listen_model(cache=LISTEN_CACHE):
     return listen_extras(root)
 
 
+def voiceid_model(cache=VOICEID_CACHE, fetch=fetch):
+    """Asset root holding voiceid/model.onnx, the pinned speaker-embedding model, fetched
+    (checksummed) into cache once. Raises BuildError naming the model when it cannot be had."""
+    root = Path(cache)
+    staged = root / VOICEID_ASSET
+    if not staged.is_file():
+        try:
+            src = fetch(VOICEID_MODEL_URL, root / VOICEID_MODEL, VOICEID_MODEL_SHA256)
+        except BuildError as e:
+            raise BuildError(f"!! cannot stage {VOICEID_MODEL}: the voice-id model is unavailable\n   {e}")
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, staged)
+    return root
+
+
+def voice_eval_models(cache=VOICE_EVAL_CACHE, fetch=fetch):
+    """The voice evaluation's extra models, each fetched (checksummed) into cache once: a list
+    of local paths in VOICE_EVAL_MODELS order. Raises BuildError naming the model that failed."""
+    out = []
+    for name, sha in VOICE_EVAL_MODELS.items():
+        dest = Path(cache) / name
+        try:
+            out.append(Path(fetch(VOICE_EVAL_URL + name, dest, sha)))
+        except BuildError as e:
+            raise BuildError(f"!! cannot fetch {name} for the voice evaluation\n   {e}")
+    return out
+
+
 def placeholder_voice(cache=SHERPA_CACHE):
     """Asset root holding voice/ for the stock placeholder voice."""
     root = Path(cache) / PLACEHOLDER_VOICE
@@ -382,7 +432,15 @@ def main():
     ap.add_argument("--sdk", help="Android SDK root (default: auto-detect)")
     ap.add_argument("--no-bootstrap", action="store_true",
                     help="fail if the toolchain is missing instead of installing it")
+    ap.add_argument("--voice-eval-models", action="store_true",
+                    help="also fetch the voice evaluation's extra speaker models into "
+                         "tools/third_party/voiceeval/ (never bundled; push them with "
+                         "scripts/push-voice-eval-models.py)")
     args = ap.parse_args()
+
+    if args.voice_eval_models:
+        for p in voice_eval_models():
+            print(f"== voice eval model ready: {p} ==")
 
     # Checked first, so a missing library or asset never costs toolchain work.
     vendor_native_libs()
@@ -401,6 +459,8 @@ def main():
           + (" (stock placeholder until the trained voice is committed)" if placeholder else "") + " ==")
     listen_root = listen_model()
     print(f"== listening model: {LISTEN_MODEL} (int8) ==")
+    voiceid_root = voiceid_model()
+    print(f"== voice-id model: {VOICEID_MODEL} ==")
     with tempfile.TemporaryDirectory(prefix="launcher-voice-stamp-") as td:
         # The stamp goes in its own asset root, merged into assets/voice/ by
         # stage_assets, so neither voice source is ever written to.
@@ -411,6 +471,8 @@ def main():
         (stamp_root / "voice" / LABEL).write_text(("stock lessac medium" if placeholder else "trained") + "\n")
         (stamp_root / "listen").mkdir()
         (stamp_root / "listen" / STAMP).write_text(voice_stamp(listen_root / "listen") + "\n")
+        (stamp_root / "voiceid").mkdir()
+        (stamp_root / "voiceid" / STAMP).write_text(voice_stamp(voiceid_root / "voiceid") + "\n")
         # The wake-word model at the asset root, where recognizer.WakeWord looks for it
         # (meeting plan U3): the same file mode-voice ships, never a second copy in git.
         shutil.copy(bc.WAKEWORD_MODEL, stamp_root / bc.WAKEWORD_MODEL.name)
@@ -424,7 +486,7 @@ def main():
             apk_out=APK,
             # stage_assets skips a source that does not exist.
             asset_sources=[LAUNCHER_ASSETS] + ([placeholder] if placeholder else [])
-            + [listen_root, stamp_root, SHARED_ASSETS],
+            + [listen_root, voiceid_root, stamp_root, SHARED_ASSETS],
             res_dir=RES,
             native_libs=native_libs,
             jars=[sherpa_jar],

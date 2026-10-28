@@ -10,6 +10,7 @@ What to do when the robot is back, in the order to do it. The robot was last rea
 | #20 nobody stored without a name | A nameless reply gets a hello and nothing is stored | One nameless reply |
 | #21 cue kind over the wire | "Excuse me" or "my bad" after a bump is a strong cue | One bump plus apology |
 | #23 on-device face recognition | Matching on the robot, "Is that you?", face checks on the Settings page | The thresholds bench (plan U9) and the QA with before/after latency (plan U10) |
+| Hey Miko always answers | "Hey Miko" is a call every state answers: an answer within a second, a turn to the caller, an approach if far, "Where'd you go?"; the NC direction chip on a confirmed port | Chip identification and calibration, and the call walkthrough (step 9) |
 
 Tick items off here as they pass, and move anything that fails into `docs/TODO.md` with what you saw.
 
@@ -95,6 +96,23 @@ Do this early. Three of its results can overturn design decisions, which changes
 - [ ] **Brightness.** After a face stop, open a face-check crop on the Settings page and compare it with the dark crop from 2026-09-25.
 - [ ] **Remote-control mode** still drives forward after the shared motor-driver change. Someone needs to watch the robot.
 
+## 9. Hey Miko always answers
+
+The plan is `docs/plans/2026-09-28-1427-feat-explore-hey-miko-always-answers-plan.md` (PR #29, unmerged). On 2026-09-29 the chip on `/dev/ttyS1` was confirmed and put in side mode (`persist.miko3.voice_dir.port=/dev/ttyS1`, `.left=100`, `.right=60`). It tells left from right but not front from back, and it streams frames by itself; the launcher only listens.
+
+- [ ] **Install the branch build.** From the branch: `python3 scripts/build-custom-launcher.py` and `python3 scripts/build-mode-explore.py`, then `adb install -r` both APKs and `adb shell am start -n com.miko3.launcher/.MainActivity` (the HOME key won't restart the launcher). Both `versionName`s must match the branch head.
+- [ ] **The ears probe no longer crashes the launcher.** `python3 scripts/qa-ears-probe.py --seconds 3` should print rows, and `adb logcat -d | grep -E 'has died|SIG_DFL'` should show nothing new. It used to segfault every time, on `main` too (a use-after-free, fixed on this branch).
+  - If it still crashes, bisect with the diagnostic build kept in `.claude/worktrees/agent-a4ced16e8c78cdffb/` (`diag-launcher.apk` and `PROBE-BISECTION.md`; never merge that branch), then reinstall the branch launcher.
+- [ ] **The chip still streams after a cold boot.** Say something to him, then `adb logcat -d | grep 'voice direction'` should show `backend NC (nc on /dev/ttyS1, side)` and `nc raw <v> (side)` lines. `NONE ... no frames` means the chip needs something after a boot that we haven't seen yet: record it in `docs/TODO.md`.
+- [ ] **Re-check the side thresholds (optional).** `python3 scripts/qa-direction-chip.py --calibrate`: stand front, left, right and behind, press Enter and count aloud. It suggests left/right thresholds; add `--apply` to set them. Yesterday's numbers suggest left 95 and right 60.
+- [ ] **Side test on the stream.** On the charger, `python3 scripts/qa-direction-chip.py --watch --seconds 15` while you talk from his left, then his right: the frames should read `left`, then `right`.
+- [ ] **Side test in Explore.** Off the charger, on open floor: call "Hey Miko" from his left side. He should answer, then look left first. Repeat from his right. From ahead or behind he has no side and uses the full circle.
+- [ ] **The call walkthrough.** `python3 scripts/qa-conversation.py --only callmet,callbackoff,callchat,callbehind,callwhere,calldock,callfar,callten`. Leave out `--chip`: that flag is for a chip that gives an angle, and side mode keeps the 12 s facing budget. Each check prints the answer, facing and arrival times.
+  - `callchat` now also checks the fix for a second caller during the first caller's meeting: the second call must be answered when the first conversation ends.
+  - Record the times in the plan. The look budget per stop (`callLookMs`, 700 ms) is a placeholder: the chip showed frames once or twice a second and the camera is similar, so if he circles past people, raise it and note the new time for someone behind.
+  - Note any false wake word on the dock: the ears stay open there.
+- [ ] **Floor sensor fault.** On 2026-09-29 Explore dropped to eyes-only with `tof at fault value 16383`. If it recurs, note when (cold start, after docking) in `docs/TODO.md`.
+
 ---
 
 ## After the session: record results and finish each plan
@@ -104,6 +122,7 @@ Do this early. Three of its results can overturn design decisions, which changes
 | Camera navigation (`docs/plans/2026-09-25-1030-feat-explore-camera-navigation-plan.md`) | Step 7 passes | The plan, and `docs/TODO.md` for anything that failed |
 | Meeting and small talk (`docs/plans/2026-09-25-1611-feat-explore-meeting-small-talk-plan.md`) | Step 4 numbers are recorded and no stop condition fired; step 6 meeting checks pass | The plan (its KTD13 asks for the U2 numbers), and `docs/TODO.md` |
 | On-device face recognition (`docs/plans/2026-09-26-2239-feat-explore-on-device-face-recognition-plan.md`) | Steps 2, 3, 5 and 6 face checks pass with no wrong names | PR #23 (merged; add a comment), `docs/hardware/camera-vision.md` section 12, and `docs/TODO.md` |
+| Hey Miko always answers (`docs/plans/2026-09-28-1427-feat-explore-hey-miko-always-answers-plan.md`) | Step 9's call checks pass; the chip is confirmed and calibrated, or the owner has decided it stays off | The plan, and `docs/TODO.md` for any placeholder the times contradict |
 | Explore on Claude (`docs/plans/2026-09-24-1545-feat-explore-on-claude-plan.md`) | The greet-by-name item in `docs/TODO.md` ticks off when `greet` passes | `docs/TODO.md` |
 
 Decisions the results may force:

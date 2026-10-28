@@ -52,6 +52,59 @@ public final class CueWords {
         return false;
     }
 
+    /** The words that make an address with his name ("hey miko"): dropped with it from a call's message. */
+    static final String[] ADDRESS_WORDS = {"hey", "hi", "hello", "ok", "okay", "yo", "oh"};
+
+    /**
+     * A call's message (owner 2026-10-02): the utterance's words besides the address itself,
+     * normalised, so "Hey Miko, how's it going?" is "how's it going" and a bare "Hey Miko" is
+     * "". The first of his name's spellings goes, with an address word just before it; with
+     * none of them, only a leading address word goes.
+     */
+    public static String message(String text) {
+        String norm = normalize(text);
+        if (norm.isEmpty()) {
+            return "";
+        }
+        String[] words = norm.split(" ");
+        int name = -1;
+        for (int i = 0; i < words.length && name < 0; i++) {
+            for (String want : NAMES) {
+                if (words[i].equals(want)) {
+                    name = i;
+                    break;
+                }
+            }
+        }
+        int dropFrom = name;
+        if (name < 0) {
+            dropFrom = isAddressWord(words[0]) ? 0 : -1;
+            name = dropFrom;
+        } else if (name > 0 && isAddressWord(words[name - 1])) {
+            dropFrom = name - 1;
+        }
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < words.length; i++) {
+            if (dropFrom >= 0 && i >= dropFrom && i <= name) {
+                continue;
+            }
+            if (b.length() > 0) {
+                b.append(' ');
+            }
+            b.append(words[i]);
+        }
+        return b.toString();
+    }
+
+    private static boolean isAddressWord(String word) {
+        for (String a : ADDRESS_WORDS) {
+            if (word.equals(a)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Whether the normalised text holds one of phrases as whole words. */
     public static boolean hasPhrase(String norm, String[] phrases) {
         for (String p : phrases) {
